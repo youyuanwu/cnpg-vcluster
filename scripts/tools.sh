@@ -9,6 +9,9 @@ require_command curl
 require_command tar
 require_command sha256sum
 
+mkdir -p -m 0700 "${CACHE_DIR}" "${BIN_DIR}"
+chmod 0700 "${CACHE_DIR}" "${BIN_DIR}"
+
 download_binary() {
   local name="$1"
   local version="$2"

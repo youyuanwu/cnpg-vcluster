@@ -10,6 +10,8 @@ source "${SCRIPT_DIR}/lib/platform.sh"
 source "${SCRIPT_DIR}/lib/workers.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/tenant.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/cnpg.sh"
 
 preflight() {
   [[ "${FORCE_PREFLIGHT_FAILURE:-0}" != 1 ]] \
@@ -96,7 +98,8 @@ main() {
     return
   fi
 
-  log "private-node bootstrap complete; Phase 3 installs CloudNativePG"
+  install_all_cnpg
+  log "private-node tenant and CloudNativePG environment is ready"
 }
 
 main "$@"

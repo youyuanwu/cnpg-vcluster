@@ -18,9 +18,6 @@ source "${REPO_ROOT}/config/settings.env"
 
 export PATH="${BIN_DIR}:${PATH}"
 
-mkdir -p -m 0700 "${RUNTIME_DIR}" "${CACHE_DIR}" "${BIN_DIR}"
-chmod 0700 "${RUNTIME_DIR}" "${CACHE_DIR}" "${BIN_DIR}"
-
 log() {
   printf '[cnpg-vcluster] %s\n' "$*"
 }

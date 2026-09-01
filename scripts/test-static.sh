@@ -73,6 +73,24 @@ check "forced preflight failure is supported" \
   has_text 'FORCE_PREFLIGHT_FAILURE' "${REPO_ROOT}/scripts/create.sh"
 check "Free-tier activation failure is explicit" \
   has_text 'platform-free-tier-activation-required' "${REPO_ROOT}/scripts/lib/tenant.sh"
+check "create installs CNPG in both tenants" \
+  has_text 'install_all_cnpg' "${REPO_ROOT}/scripts/create.sh"
+check "verification checks central Services" \
+  has_text 'pods services pvc pv' "${REPO_ROOT}/scripts/verify.sh"
+check "verification checks admission resources" \
+  has_text 'cnpg-validating-webhook-configuration' "${REPO_ROOT}/scripts/verify.sh"
+check "verification writes tenant-specific SQL markers" \
+  has_text 'marker=.*tenant.*private-node-marker' "${REPO_ROOT}/scripts/verify.sh"
+check "verification restarts replicas" \
+  has_text 'restart_replica' "${REPO_ROOT}/scripts/verify.sh"
+check "verification requires a different primary" \
+  has_text 'new_primary.*old_primary' "${REPO_ROOT}/scripts/verify.sh"
+check "verification checks cross-tenant identities" \
+  has_text 'verify_cross_tenant_identity' "${REPO_ROOT}/scripts/verify.sh"
+check "destroy targets labeled worker names" \
+  has_text 'worker_name' "${REPO_ROOT}/scripts/destroy.sh"
+check "destroy deletes only named kind cluster" \
+  has_text 'name.*KIND_CLUSTER_NAME' "${REPO_ROOT}/scripts/destroy.sh"
 check "two CNPG cluster manifests" \
   test "$(find "${REPO_ROOT}/manifests/cnpg" -maxdepth 1 -name 'cluster-tenant-*.yaml' | wc -l)" -eq 2
 check "both CNPG clusters have three instances" \
