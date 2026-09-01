@@ -115,6 +115,31 @@ check "runtime directories use restrictive mode" \
   has_text 'mkdir -p -m 0700' "${REPO_ROOT}/scripts/lib/common.sh"
 check "runtime shell uses restrictive umask" \
   has_text '^umask 077$' "${REPO_ROOT}/scripts/lib/common.sh"
+check "README documents exactly two private-node tenants" \
+  has_text 'two linked tenant control planes' "${REPO_ROOT}/README.md"
+check "design documents six exclusive workers" \
+  has_text 'Six systemd worker containers' "${REPO_ROOT}/docs/high-level-design.md"
+check "design documents no resource synchronization" \
+  has_text 'disables all vCluster resource synchronization' "${REPO_ROOT}/docs/high-level-design.md"
+check "design documents shared host kernel" \
+  has_text 'share its Linux kernel' "${REPO_ROOT}/docs/high-level-design.md"
+check "documentation records unsupported container workers" \
+  has_text 'does not name privileged Docker containers as supported' "${REPO_ROOT}/docs/high-level-design.md"
+check "documentation records Platform activation blocker" \
+  has_text 'platform-free-tier-activation-required' "${REPO_ROOT}/README.md"
+for version in \
+  "${KIND_VERSION#v}" \
+  "${KUBERNETES_VERSION#v}" \
+  "${KUBECTL_VERSION#v}" \
+  "${HELM_VERSION#v}" \
+  "${VCLUSTER_VERSION#v}" \
+  "${PLATFORM_VERSION}" \
+  "${CNPG_VERSION}" \
+  "18.4" \
+  "Ubuntu 24.04"; do
+  check "documentation names direct pin ${version}" \
+    grep -Fq "${version}" "${REPO_ROOT}/docs/high-level-design.md"
+done
 
 if (( failures > 0 )); then
   die "${failures} static check(s) failed"

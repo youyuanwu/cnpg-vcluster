@@ -1,349 +1,253 @@
-# CloudNativePG on vCluster: Local Experiment Design
+# CloudNativePG on Private-Node vCluster Tenants
 
 ## Status
 
-Proposed.
+Implemented as a local evaluation environment.
+
+The repository automation is complete. The local validation run created the
+kind control cluster and vCluster Platform, but current vCluster releases
+require interactive Free-tier activation before a linked private-node tenant
+can be created. The unactivated Platform rejected the first tenant with
+`license limits are exceeded`. Setup detects this state, records an explicit
+blocker, and never falls back to shared nodes or independent Docker clusters.
 
 ## Purpose
 
-Build a repeatable local environment for evaluating CloudNativePG (CNPG) inside
-a vCluster tenant cluster hosted by kind. The experiment should show whether
-CNPG installation, PostgreSQL lifecycle management, storage, networking, and
-failover behave as expected through the vCluster abstraction.
+Build a repeatable single-host environment for evaluating two independently
+operated CloudNativePG tenants. One kind cluster hosts vCluster Platform and
+both tenant control planes. Each tenant receives three exclusive private worker
+containers and owns its networking, service routing, storage, CNPG operator,
+CNPG CRDs, and one three-instance PostgreSQL cluster.
 
-This environment is for development and evaluation only. It is not a model for
-production database hosting.
+This is a development and compatibility experiment. It is not a production
+database platform or a hard infrastructure-isolation boundary.
 
-## Goals
+## Architecture decisions
 
-- Create the complete environment on a developer workstation.
-- Run the CNPG operator and its CRDs inside the tenant cluster.
-- Run PostgreSQL pods on the kind host cluster through vCluster shared nodes.
-- Provision PostgreSQL PVCs through the host cluster's local storage provider.
-- Connect to PostgreSQL and verify basic reads and writes.
-- Exercise CNPG reconciliation, scaling, restart, and primary failover.
-- Make tenant resources and their translated host resources easy to inspect.
-- Keep setup and teardown deterministic and suitable for later automation.
+### One central control cluster
 
-## Non-goals
+The Docker host runs exactly one kind cluster. Its single control-plane
+container hosts:
 
-- Production-grade durability, security, performance, or disaster recovery.
-- A supported multi-tenant database platform.
-- Benchmarking kind storage or drawing performance conclusions from it.
-- Testing cloud load balancers, external DNS, CSI snapshots, or object-store
-  backups in the first iteration.
-- Preserving database data after the kind cluster is deleted.
+- vCluster Platform.
+- The `tenant-a` vCluster control plane.
+- The `tenant-b` vCluster control plane.
 
-## Architecture decision
+Tenant workloads do not run on the kind node. kind provides control-plane
+hosting only.
 
-Install CNPG **inside the vCluster tenant cluster**, not on the kind host
-cluster.
+### Two private-node tenants
 
-CNPG installs cluster-scoped CRDs, admission webhooks, RBAC, and an operator
-that reconciles `Cluster` resources. A vCluster provides an isolated Kubernetes
-API and control plane, so CNPG can use those APIs as it would in a conventional
-cluster. The generated pods, services, secrets, and PVCs are translated by the
-vCluster syncer into a dedicated namespace on the host cluster, where kind
-provides actual scheduling, networking, and storage.
+Both tenant clusters enable `privateNodes` at creation. Private-node mode
+enables the tenant scheduler and disables all vCluster resource synchronization
+to the central cluster. Pods, Services, PVCs, PVs, CNPG CRDs, and CNPG custom
+resources therefore stay in the tenant API and on tenant workers.
 
-This arrangement tests the most useful hypothesis: a tenant can own and operate
-CNPG without installing CNPG CRDs or its operator into the host control plane.
-It also avoids custom-resource synchronization, which would instead delegate
-reconciliation to a host-installed operator and test a materially different
-architecture.
+Each tenant receives three fixed-name systemd-capable Ubuntu 24.04 Docker
+containers. A worker joins only one tenant through the official vCluster node
+join script and is labeled for that tenant. The containers run their own
+containerd, kubelet, and vCluster VPN services.
 
-## Logical architecture
+vCluster's support matrix names systemd-capable Linux machines such as Ubuntu
+22.04 and 24.04; it does not name privileged Docker containers as supported
+private-node machines. The worker implementation is therefore an experimental
+container-as-machine approximation. Setup fails clearly if it cannot pass node
+bootstrap.
+
+### Tenant-owned networking and storage
+
+Each private-node tenant retains vCluster's supported defaults:
+
+- Flannel for pod networking.
+- kube-proxy for Service routing.
+- CoreDNS as the tenant control-plane DNS component.
+- Rancher Local Path Provisioner and its default StorageClass.
+
+Tenant pod and Service CIDRs do not overlap. Workers share a Docker bridge and
+can reach one another directly, so only node-to-control-plane VPN is enabled.
+Node-to-node VPN remains disabled in accordance with upstream guidance to avoid
+VPN when direct connectivity is available.
+
+Local Path Provisioner stores each database volume on the selected private
+worker. A volume is not portable to another worker. PostgreSQL replication,
+not volume relocation, provides the failover path evaluated by this lab.
+
+### Per-tenant CloudNativePG ownership
+
+CloudNativePG 1.30.0 is installed independently through each tenant API. Each
+tenant owns its:
+
+- CNPG CRDs.
+- Operator Deployment and ServiceAccount.
+- ClusterRoles and bindings.
+- Admission webhook configurations and Service.
+- One CNPG `Cluster`.
+
+The two CNPG clusters are named `tenant-a-postgres` and
+`tenant-b-postgres`. Each uses PostgreSQL 18.4, three instances, one 1 GiB claim
+per instance, and required hostname anti-affinity so that the instances occupy
+three distinct tenant workers.
+
+## Logical topology
 
 ```mermaid
 flowchart TB
-    User["Developer workstation<br/>kubectl, Helm, vcluster CLI"]
+    User["Developer workstation<br/>make, Docker, repository-local tools"]
 
-    subgraph Host["kind host cluster"]
-        HostAPI["Host Kubernetes API"]
-        Storage["Default local StorageClass"]
-
-        subgraph HostNS["vCluster host namespace"]
-            VCP["vCluster control plane<br/>API server, controllers, syncer"]
-            Synced["Translated resources<br/>Pods, Services, Secrets, PVCs"]
+    subgraph DockerHost["Single Docker host and shared Linux kernel"]
+        subgraph Kind["kind control cluster"]
+            Platform["vCluster Platform"]
+            TenantACP["tenant-a control plane"]
+            TenantBCP["tenant-b control plane"]
         end
 
-        Nodes["kind worker nodes"]
-        PV["Local persistent volumes"]
+        subgraph TenantA["tenant-a private-node environment"]
+            A1["worker-a1<br/>systemd + containerd + kubelet"]
+            A2["worker-a2<br/>systemd + containerd + kubelet"]
+            A3["worker-a3<br/>systemd + containerd + kubelet"]
+            ANet["Flannel + kube-proxy + CoreDNS"]
+            AStorage["Local Path Provisioner<br/>tenant PVCs and PVs"]
+            ACNPG["Tenant CNPG operator + CRDs"]
+            APG["tenant-a-postgres<br/>primary + 2 replicas"]
+        end
+
+        subgraph TenantB["tenant-b private-node environment"]
+            B1["worker-b1<br/>systemd + containerd + kubelet"]
+            B2["worker-b2<br/>systemd + containerd + kubelet"]
+            B3["worker-b3<br/>systemd + containerd + kubelet"]
+            BNet["Flannel + kube-proxy + CoreDNS"]
+            BStorage["Local Path Provisioner<br/>tenant PVCs and PVs"]
+            BCNPG["Tenant CNPG operator + CRDs"]
+            BPG["tenant-b-postgres<br/>primary + 2 replicas"]
+        end
     end
 
-    subgraph Tenant["vCluster tenant control plane"]
-        TenantAPI["Tenant Kubernetes API"]
-        CNPG["CNPG operator + webhook"]
-        CRD["CNPG CRDs"]
-        DB["CNPG Cluster resource"]
-        PG["Logical PostgreSQL instances"]
-    end
-
-    User -->|"host context"| HostAPI
-    User -->|"tenant context"| TenantAPI
-    VCP --- TenantAPI
-    CNPG --> DB
-    DB --> PG
-    PG -->|"vCluster sync"| Synced
-    Synced --> Nodes
-    Synced --> Storage
-    Storage --> PV
+    User --> Platform
+    Platform --> TenantACP
+    Platform --> TenantBCP
+    TenantACP -->|"vCluster VPN"| A1
+    TenantACP -->|"vCluster VPN"| A2
+    TenantACP -->|"vCluster VPN"| A3
+    TenantBCP -->|"vCluster VPN"| B1
+    TenantBCP -->|"vCluster VPN"| B2
+    TenantBCP -->|"vCluster VPN"| B3
+    ACNPG --> APG
+    BCNPG --> BPG
+    APG --> AStorage
+    BPG --> BStorage
+    ANet --- APG
+    BNet --- BPG
 ```
 
-The tenant and host views are intentionally different:
+## Resource ownership
 
-| Resource | Tenant cluster | Host cluster |
-|---|---|---|
-| CNPG CRDs and `Cluster` | Native, tenant-owned | Not installed or visible |
-| CNPG operator and webhook | Native workloads | Translated pods/services |
-| PostgreSQL pods and services | Native names and namespaces | Translated into the vCluster host namespace |
-| PVCs | Created and observed by CNPG | Synced and bound by the host provisioner |
-| PVs and backing paths | Abstracted from the tenant | Owned by the host cluster |
+| Resource | kind control cluster | tenant-a | tenant-b |
+|---|---|---|---|
+| vCluster Platform | Hosted | Linked | Linked |
+| Tenant control plane | Hosted | Native API | Native API |
+| Private workers | Not Kubernetes nodes | Three exclusive nodes | Three exclusive nodes |
+| Tenant pods and Services | Not synchronized | Native | Native |
+| Flannel, kube-proxy, CoreDNS | Not tenant runtime | Tenant-owned | Tenant-owned |
+| StorageClass and provisioner | Not used by tenant data | Tenant-owned | Tenant-owned |
+| PostgreSQL PVCs and PVs | Absent | Tenant-owned | Tenant-owned |
+| CNPG operator, CRDs, webhooks, RBAC | Absent | Tenant-owned | Tenant-owned |
+| CNPG `Cluster` | Absent | One, three instances | One, three instances |
 
-## Components
+## Control and data flow
 
-### Local container runtime
+1. Repository-local pinned tools create the named kind cluster.
+2. vCluster Platform 4.11.2 starts on kind and publishes an HTTPS Loft Router
+   endpoint.
+3. The operator activates Platform Free mode through the upstream account/email
+   flow when required.
+4. The CLI creates and links `tenant-a` and `tenant-b` with private nodes
+   enabled from initial creation.
+5. Six systemd worker containers start on the kind Docker network.
+6. A tenant bootstrap token supplies the official join script. Three workers
+   join each tenant and establish node-to-control-plane VPN.
+7. Tenant Flannel, kube-proxy, CoreDNS, and Local Path Provisioner become ready.
+8. CNPG is installed independently in each tenant, then each three-instance
+   database is created.
+9. SQL clients use each tenant's CNPG read/write Service and generated
+   application secret.
 
-Docker is the preferred baseline because kind and vCluster are commonly tested
-with it. Podman or nerdctl may be evaluated later, but rootless networking and
-mount behavior can add unrelated variables.
+No tenant workload or storage object is translated through a vCluster syncer.
+The central cluster sees control-plane components, not tenant data-plane
+resources.
 
-### kind host cluster
+## Verification model
 
-Use a named kind cluster with one control-plane node and two worker nodes. This
-supports a three-instance PostgreSQL experiment and makes scheduling and
-failover behavior visible. A reduced one-node profile can be added later for
-resource-constrained workstations.
+`make verify` checks:
 
-The host cluster is responsible for:
+- One central kind cluster and exactly two Platform-linked tenants.
+- Three Ready, disjoint private worker names per tenant and no private workers
+  in kind.
+- Ready Flannel, kube-proxy, CoreDNS, default StorageClass, and local-path
+  provisioner in each tenant.
+- CNPG CRDs, operator, admission resources, and RBAC in each tenant and absent
+  from kind.
+- Exactly one healthy three-instance CNPG cluster per tenant.
+- Three bound claims and volumes and three distinct PostgreSQL worker names per
+  tenant.
+- Distinct SQL markers with no cross-tenant result.
+- Replica restart, PVC reuse, and data reread.
+- Primary deletion, promotion to a different primary, and post-failover data
+  reread.
 
-- Running the vCluster control plane and translated tenant workloads.
-- Supplying the default StorageClass used by translated CNPG PVCs.
-- Providing pod networking and DNS below the vCluster abstraction.
+`make status` is read-only and summarizes every layer. `make diagnose` adds
+events plus worker systemd, kubelet, containerd, and VPN state.
 
-The implementation must verify that exactly one default StorageClass exists
-before deploying PostgreSQL. If the selected kind/node image does not provide a
-working default provisioner, setup must install a pinned local-path provisioner
-on the host. The CNPG example should initially omit `storageClassName` so the
-host default is used.
+## Reproducibility
 
-Local volumes are suitable only for this experiment. Node loss can make a
-node-local volume unavailable even though CNPG can promote another replicated
-instance.
+Direct inputs are pinned:
 
-### vCluster
-
-Deploy one vCluster in a dedicated host namespace using shared nodes, the
-default and lowest-complexity mode for trusted local development.
-
-The vCluster configuration should:
-
-- Persist its control-plane state for the lifetime of the kind cluster.
-- Keep default synchronization enabled for pods, services, secrets, config
-  maps, and PVCs.
-- Avoid syncing CNPG custom resources to the host.
-- Avoid enabling a virtual scheduler until a test requires tenant-side
-  scheduling semantics.
-- Use explicit, pinned chart and image versions in the eventual implementation.
-
-Shared nodes provide API isolation, not a security boundary between untrusted
-workloads. That limitation is acceptable for a single-user local experiment.
-
-### CloudNativePG
-
-Install a pinned CNPG release against the tenant kubeconfig. All CNPG CRDs,
-RBAC, operator resources, and admission webhooks belong to the tenant API.
-
-Deploy an initial CNPG `Cluster` with:
-
-- Three PostgreSQL instances.
-- Small development PVCs, such as 1 GiB per instance.
-- A pinned PostgreSQL image version.
-- Default replication settings from the selected CNPG release.
-- No backup, WAL archive, tablespace, monitoring stack, or separate WAL volume
-  in the baseline.
-
-The three instances validate replication and failover behavior, but do not make
-the local environment highly available: all kind nodes still share one
-workstation and container runtime.
-
-### Client access
-
-Use two access paths:
-
-1. Run a disposable PostgreSQL client pod inside the tenant cluster for the
-   least ambiguous connectivity test.
-2. Port-forward the CNPG read/write service through the tenant kubeconfig for
-   interactive access from the workstation.
-
-Credentials must come from the CNPG-generated application secret. They should
-never be copied into committed manifests.
-
-## Resource and control flow
-
-1. The developer creates the kind host cluster.
-2. The host storage provisioner becomes ready and exposes a default
-   StorageClass.
-3. vCluster starts in its dedicated host namespace and publishes a tenant
-   kubeconfig/context.
-4. CNPG CRDs and the operator are installed through the tenant API.
-5. A CNPG `Cluster` resource is submitted to the tenant API.
-6. The tenant-side CNPG operator creates PostgreSQL pods, services, secrets,
-   and PVCs.
-7. The vCluster syncer translates those resources into the vCluster namespace
-   on the host.
-8. The host scheduler places pods on kind nodes and the host storage
-   provisioner binds the translated PVCs.
-9. Status updates flow back through the syncer. CNPG observes ready instances,
-   selects a primary, and reports cluster readiness in the tenant API.
-10. Clients use the CNPG read/write service, while operators can inspect both
-    tenant and host contexts to troubleshoot either side of the abstraction.
-
-## Experiment plan
-
-### Phase 1: Bootstrap
-
-- Check required tools and minimum versions.
-- Create the multi-node kind cluster.
-- Verify nodes, DNS, and the default StorageClass.
-- Create vCluster and obtain the tenant context.
-- Verify that host and tenant API contexts are clearly named and selectable.
-
-Success means both APIs are reachable and a basic tenant pod becomes ready on a
-kind node.
-
-### Phase 2: CNPG installation
-
-- Install CNPG into the tenant cluster.
-- Wait for its operator and webhook to become ready.
-- Confirm CNPG CRDs exist in the tenant and do not exist in the host.
-
-Success means the tenant API accepts a valid CNPG resource and rejects an
-invalid one through admission validation.
-
-### Phase 3: PostgreSQL lifecycle
-
-- Create the three-instance PostgreSQL cluster.
-- Wait for the CNPG `Cluster` to report ready.
-- Confirm each tenant PVC has a bound translated PVC and PV on the host.
-- Connect through the read/write service, create test data, and read it back.
-- Restart a replica and verify it rejoins.
-- Delete or stop the current primary and verify CNPG promotes a healthy replica.
-- Read the original test data through the read/write service after failover.
-- Scale the cluster down and back up, observing PVC and pod lifecycle.
-
-Success means CNPG converges without manual host-side resource changes and test
-data remains available through pod restarts and a primary transition.
-
-### Phase 4: Teardown
-
-Delete the PostgreSQL `Cluster`, CNPG installation, vCluster, and kind cluster
-in that order. At each boundary, verify which host resources and volumes are
-removed. Destructive cleanup should require an explicit command and target only
-the named local environment.
-
-## Observability and troubleshooting
-
-The implementation should expose concise status commands for:
-
-- CNPG cluster status, instances, and operator logs in the tenant.
-- Tenant pods, services, secrets, PVCs, events, and node views.
-- Translated pods, services, PVCs, events, and vCluster syncer logs on the host.
-- Mapping a tenant resource to its translated host resource.
-
-Metrics and Grafana are deferred. Kubernetes events, CNPG status, and component
-logs are sufficient to validate the first experiment.
-
-Failures should be diagnosed at the layer that owns them:
-
-| Symptom | First inspection point |
+| Component | Version |
 |---|---|
-| CNPG resource rejected or not reconciled | Tenant CNPG webhook/operator |
-| Tenant pod remains pending | Tenant events, then translated host pod events |
-| PVC remains pending | Host default StorageClass and provisioner |
-| Service cannot reach PostgreSQL | Tenant endpoints, translated service, pod readiness |
-| vCluster API unavailable | Host vCluster pod, service, and persistent state |
+| kind | 0.33.0 |
+| kind Kubernetes image | 1.36.4 with digest |
+| tenant Kubernetes | 1.36.0 |
+| kubectl | 1.36.4 |
+| Helm | 3.19.0 |
+| vCluster CLI/chart | 0.36.1 |
+| vCluster Platform | 4.11.2 |
+| CloudNativePG | 1.30.0 |
+| PostgreSQL | 18.4 system-trixie with digest |
+| Worker userspace | Ubuntu 24.04 with digest |
 
-## Risks and mitigations
+The pinned vCluster release controls transitive private-node components such as
+Flannel, kube-proxy, Local Path Provisioner, containerd, kubelet, and
+`vcluster-vpn`. Status and diagnostics report the resolved runtime versions and
+images; repository automation does not override supported bundled defaults.
 
-| Risk | Mitigation |
-|---|---|
-| Local machine lacks enough CPU or memory | Document a reduced single-worker/two-instance profile after the baseline works. |
-| CNPG depends on an API behavior not faithfully represented by vCluster | Pin versions, capture tenant and syncer events, and record any required vCluster setting as an explicit compatibility rule. |
-| Local PVC behavior is mistaken for durable storage | Label the environment as ephemeral and test only restart/failover within a running kind cluster. |
-| Primary failover succeeds but a node-local volume cannot move | Treat replication, not volume relocation, as the expected recovery path. |
-| Host and tenant commands are accidentally mixed | Require an explicit context for every automated `kubectl` and `helm` invocation. |
-| Floating versions make the experiment irreproducible | Pin kind node, vCluster chart/image, CNPG operator, and PostgreSQL image versions in implementation artifacts. |
-| Teardown leaves translated resources behind | Verify namespace ownership and enumerate leftovers before deleting the kind cluster. |
+## Security and isolation limits
 
-## Alternatives considered
+Private nodes prevent Kubernetes scheduling and API visibility across tenants,
+but all kind, Platform, tenant control-plane, worker, and database containers
+still run on one Docker host and share its Linux kernel. Privileged worker
+containers can access host kernel capabilities. The topology does not protect
+against host compromise, kernel failure, Docker daemon failure, resource
+exhaustion, or workstation loss.
 
-### Host-installed CNPG with custom-resource synchronization
+The environment must not be described as production multi-tenancy or high
+availability. Three PostgreSQL instances test replication and failover only
+within one shared host failure domain.
 
-Install CNPG and its CRDs on the host, then sync CNPG `Cluster` resources from
-the tenant. This can reduce per-tenant operator overhead, but it moves
-reconciliation and CRD ownership into the host and requires custom-resource
-sync configuration. It does not answer whether CNPG itself works inside a
-vCluster, so it is not the baseline.
+## Teardown
 
-### vind
-
-vCluster's Docker-based `vind` mode removes kind and offers a direct local
-tenant-cluster experience. It is a useful follow-up comparison, especially for
-simpler networking and load balancers, but kind remains the baseline because
-the experiment specifically needs the nested host/tenant boundary.
-
-### Minikube or k3d host
-
-Either can host vCluster and may offer simpler storage on some workstations.
-The design keeps host-cluster-specific configuration isolated so one can be
-substituted later, but supporting multiple providers in the first iteration
-would reduce reproducibility.
-
-## Expected implementation shape
-
-A later implementation should keep declarative configuration separate from
-orchestration:
-
-```text
-config/
-  kind.yaml
-  vcluster.yaml
-manifests/
-  cnpg-cluster.yaml
-scripts/
-  prerequisites
-  create
-  verify
-  destroy
-```
-
-The top-level entry points may be a `Makefile` or task runner already accepted
-by the repository. Scripts should be idempotent where practical, stop on
-errors, pin external dependencies, and always specify the intended Kubernetes
-context.
-
-## Acceptance criteria
-
-- A fresh workstation with the documented prerequisites can create the
-  environment using repository-owned configuration.
-- CNPG CRDs exist only in the tenant control plane.
-- The CNPG operator becomes ready in the tenant cluster.
-- A three-instance PostgreSQL cluster becomes healthy.
-- Every PostgreSQL PVC binds through the host storage provisioner.
-- A client can write and read data through the CNPG read/write service.
-- PostgreSQL remains reachable and test data remains readable after primary
-  failover.
-- Tenant resources can be correlated with translated host resources.
-- Teardown removes the named local environment without affecting other
-  Kubernetes contexts.
+Teardown removes tenant database resources, resets and removes private workers,
+deletes tenant control planes, uninstalls Platform, deletes the named kind
+cluster, and removes generated runtime state. All names and Docker labels use
+the `cnpg-private` prefix. Unrelated containers, clusters, and Kubernetes
+contexts are not targeted.
 
 ## Upstream references
 
-- [vCluster architecture](https://www.vcluster.com/docs/vcluster/introduction/architecture)
-- [vCluster shared-nodes quick start](https://www.vcluster.com/docs/vcluster/quick-start/shared-nodes)
-- [vCluster synchronization configuration](https://www.vcluster.com/docs/vcluster/configure/vcluster-yaml/sync)
-- [vCluster custom-resource synchronization](https://www.vcluster.com/docs/vcluster/configure/vcluster-yaml/sync/to-host/advanced/custom-resources)
-- [CloudNativePG quickstart](https://cloudnative-pg.io/documentation/current/quickstart/)
-- [CloudNativePG storage guidance](https://cloudnative-pg.io/documentation/current/storage/)
+- [vCluster Private Nodes Quick Start](https://www.vcluster.com/docs/vcluster/quick-start/private-nodes)
+- [vCluster Private Nodes](https://www.vcluster.com/docs/vcluster/deploy/worker-nodes/private-nodes)
+- [vCluster Node Requirements](https://www.vcluster.com/docs/vcluster/deploy/worker-nodes/private-nodes/node-requirements)
+- [vCluster VPN](https://www.vcluster.com/docs/vcluster/configure/vcluster-yaml/private-nodes/vpn)
+- [vCluster OSS and Free tiers](https://www.vcluster.com/docs/vcluster/introduction/oss-vs-free)
+- [vCluster AddOns](https://www.vcluster.com/docs/vcluster/configure/vcluster-yaml/deploy)
+- [CloudNativePG supported releases](https://cloudnative-pg.io/docs/devel/supported_releases)
+- [CloudNativePG scheduling](https://cloudnative-pg.io/docs/1.30/scheduling)
 - [kind quick start](https://kind.sigs.k8s.io/docs/user/quick-start/)

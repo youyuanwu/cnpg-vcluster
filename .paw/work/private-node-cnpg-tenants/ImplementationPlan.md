@@ -67,7 +67,7 @@ the worker substrate must remain explicitly experimental.
 - [x] **Phase 1: Repository Foundation and Reproducible Inputs** - Add pinned versions, declarative topology/database inputs, tool bootstrap, and static validation.
 - [x] **Phase 2: Central Platform and Private Worker Bootstrap** - Create kind and Platform, create two linked private-node tenants, and join three exclusive systemd workers to each.
 - [x] **Phase 3: Tenant Databases and Lifecycle Operations** - Install tenant-owned CNPG stacks and implement verification, status, failover, and scoped teardown.
-- [ ] **Phase 4: Documentation and End-to-End Validation** - Record the as-built system, update the high-level design, and run the complete local lifecycle.
+- [x] **Phase 4: Documentation and End-to-End Validation** - Record the as-built system, update the high-level design, and run the complete local lifecycle.
 
 ## Phase Candidates
 

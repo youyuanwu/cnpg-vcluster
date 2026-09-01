@@ -37,6 +37,8 @@ fi
 if platform_ready; then
   printf '\n== vCluster Platform ==\n'
   kubectl_host -n "${PLATFORM_NAMESPACE}" get deployment loft
+  kubectl_host -n "${PLATFORM_NAMESPACE}" get pods \
+    -o custom-columns='NAME:.metadata.name,IMAGES:.spec.containers[*].image'
   platform_url >/dev/null && printf 'URL: %s\n' "$(platform_url)"
 else
   fail_status "vCluster Platform is unavailable"
@@ -53,12 +55,15 @@ for tenant in ${TENANT_NAMES}; do
   kubectl_tenant "${tenant}" get nodes \
     -L cnpg-vcluster.io/tenant
   kubectl_tenant "${tenant}" -n kube-system get pods \
-    -o wide | grep -E 'NAME|coredns|flannel|kube-proxy|local-path' || true
+    -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,IMAGES:.spec.containers[*].image' \
+    | grep -E 'NAME|coredns|flannel|kube-proxy|local-path' || true
   kubectl_tenant "${tenant}" get storageclass
 
   if kubectl_tenant "${tenant}" get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
     kubectl_tenant "${tenant}" -n cnpg-system get deployment cnpg-controller-manager
     kubectl_tenant "${tenant}" -n database get cluster,pods,pvc
+    kubectl_tenant "${tenant}" -n database get pods \
+      -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,IMAGES:.spec.containers[*].image'
     cnpg_cluster_ready "${tenant}" \
       || fail_status "${tenant} PostgreSQL cluster is not fully ready"
   else
