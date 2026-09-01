@@ -47,6 +47,10 @@ set -e
 
 if [[ "${create_rc}" -eq 0 ]]; then
   "${SCRIPT_DIR}/create.sh" >>"${RESULT_LOG}" 2>&1
+  partial_worker="$(worker_name tenant-b "${WORKERS_PER_TENANT}")"
+  docker rm -f "${partial_worker}" >/dev/null
+  "${SCRIPT_DIR}/create.sh" >>"${RESULT_LOG}" 2>&1
+  docker inspect "${partial_worker}" >/dev/null
   "${SCRIPT_DIR}/status.sh" >>"${RESULT_LOG}" 2>&1
   "${SCRIPT_DIR}/verify.sh" >>"${RESULT_LOG}" 2>&1
   printf 'result=passed\n' >>"${RESULT_LOG}"

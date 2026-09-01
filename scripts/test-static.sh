@@ -93,6 +93,8 @@ check "destroy targets labeled worker names" \
   has_text 'worker_name' "${REPO_ROOT}/scripts/destroy.sh"
 check "destroy deletes only named kind cluster" \
   has_text 'name.*KIND_CLUSTER_NAME' "${REPO_ROOT}/scripts/destroy.sh"
+check "E2E recreates a missing worker partial state" \
+  has_text 'partial_worker' "${REPO_ROOT}/scripts/test-e2e.sh"
 check "two CNPG cluster manifests" \
   test "$(find "${REPO_ROOT}/manifests/cnpg" -maxdepth 1 -name 'cluster-tenant-*.yaml' | wc -l)" -eq 2
 check "both CNPG clusters have three instances" \
