@@ -45,6 +45,19 @@ verify_platform_and_topology() {
 verify_host_isolation() {
   ! kubectl_host get crd clusters.postgresql.cnpg.io >/dev/null 2>&1 \
     || die "CloudNativePG CRDs unexpectedly exist in the central cluster"
+  ! kubectl_host get validatingwebhookconfiguration \
+    cnpg-validating-webhook-configuration >/dev/null 2>&1 \
+    || die "CloudNativePG validating webhook unexpectedly exists in the central cluster"
+  ! kubectl_host get mutatingwebhookconfiguration \
+    cnpg-mutating-webhook-configuration >/dev/null 2>&1 \
+    || die "CloudNativePG mutating webhook unexpectedly exists in the central cluster"
+  ! kubectl_host get clusterrole cnpg-manager >/dev/null 2>&1 \
+    || die "CloudNativePG manager RBAC unexpectedly exists in the central cluster"
+  ! kubectl_host get clusterrolebinding cnpg-manager-rolebinding >/dev/null 2>&1 \
+    || die "CloudNativePG manager binding unexpectedly exists in the central cluster"
+  [[ -z "$(kubectl_host get services -A --no-headers 2>/dev/null \
+    | awk '$2 == "cnpg-webhook-service" {print}')" ]] \
+    || die "CloudNativePG webhook Service unexpectedly exists in the central cluster"
 
   local kind_nodes
   kind_nodes="$(kubectl_host get nodes -o name)"
@@ -91,6 +104,7 @@ raise SystemExit("missing running system components: "+", ".join(missing) if mis
   kubectl_tenant "${tenant}" -n cnpg-system get service cnpg-webhook-service >/dev/null
   kubectl_tenant "${tenant}" -n cnpg-system get serviceaccount cnpg-manager >/dev/null
   kubectl_tenant "${tenant}" get clusterrole cnpg-manager >/dev/null
+  kubectl_tenant "${tenant}" get clusterrolebinding cnpg-manager-rolebinding >/dev/null
   cnpg_cluster_ready "${tenant}" || die "${cluster} is not fully ready"
 
   pvc_count="$(kubectl_tenant "${tenant}" -n database get pvc \

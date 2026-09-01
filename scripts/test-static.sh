@@ -79,6 +79,8 @@ check "verification checks central Services" \
   has_text 'pods services pvc pv' "${REPO_ROOT}/scripts/verify.sh"
 check "verification checks admission resources" \
   has_text 'cnpg-validating-webhook-configuration' "${REPO_ROOT}/scripts/verify.sh"
+check "verification checks CNPG RBAC bindings" \
+  has_text 'cnpg-manager-rolebinding' "${REPO_ROOT}/scripts/verify.sh"
 check "verification writes tenant-specific SQL markers" \
   has_text 'marker=.*tenant.*private-node-marker' "${REPO_ROOT}/scripts/verify.sh"
 check "verification restarts replicas" \
