@@ -23,6 +23,24 @@ worker_container_owned() {
     && [[ "$(docker inspect -f '{{index .Config.Labels "cnpg-vcluster.role"}}' "${name}")" == private-worker ]]
 }
 
+worker_container_current() {
+  local name="$1"
+  local network="$2"
+  local expected_image expected_memory expected_cpus
+  expected_image="$(docker image inspect -f '{{.Id}}' "${WORKER_IMAGE}")"
+  expected_memory=$(( ${WORKER_MEMORY%g} * 1024 * 1024 * 1024 ))
+  expected_cpus=$(( WORKER_CPUS * 1000000000 ))
+
+  [[ "$(docker inspect -f '{{.Image}}' "${name}")" == "${expected_image}" ]] \
+    && [[ "$(docker inspect -f '{{.Config.Hostname}}' "${name}")" == "${name}" ]] \
+    && [[ "$(docker inspect -f '{{.HostConfig.Privileged}}' "${name}")" == true ]] \
+    && [[ "$(docker inspect -f '{{.HostConfig.CgroupnsMode}}' "${name}")" == private ]] \
+    && [[ "$(docker inspect -f '{{.HostConfig.Memory}}' "${name}")" == "${expected_memory}" ]] \
+    && [[ "$(docker inspect -f '{{.HostConfig.NanoCpus}}' "${name}")" == "${expected_cpus}" ]] \
+    && docker inspect -f '{{json .NetworkSettings.Networks}}' "${name}" | grep -Fq "\"${network}\"" \
+    && [[ "$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/var/lib"}}{{.Name}}{{end}}{{end}}' "${name}")" == "${name}-var-lib" ]]
+}
+
 worker_volume_owned() {
   local tenant="$1"
   local volume="$2"
@@ -42,10 +60,14 @@ ensure_worker_container() {
   if docker container inspect "${name}" >/dev/null 2>&1; then
     worker_container_owned "${tenant}" "${name}" \
       || die "refusing to adopt same-named unowned container: ${name}"
-    if [[ "$(docker inspect -f '{{.State.Running}}' "${name}")" != true ]]; then
-      docker start "${name}" >/dev/null
+    if worker_container_current "${name}" "${network}"; then
+      if [[ "$(docker inspect -f '{{.State.Running}}' "${name}")" != true ]]; then
+        docker start "${name}" >/dev/null
+      fi
+      return
     fi
-    return
+    log "recreating stale owned worker ${name}"
+    docker rm -f "${name}" >/dev/null
   fi
 
   log "starting private worker ${name}"

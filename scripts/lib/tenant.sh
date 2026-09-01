@@ -119,6 +119,13 @@ join_worker() {
     }
 }
 
+join_failure_is_substrate() {
+  local log_file="$1"
+  grep -Eqi \
+    'unsupported|SystemVerification|kernel|cgroup|swap|product_uuid|preflight.*(fatal|error)' \
+    "${log_file}"
+}
+
 label_tenant_nodes() {
   local tenant="$1"
   kubectl_tenant "${tenant}" label nodes --all --overwrite \
@@ -173,30 +180,29 @@ for component in required:
 ensure_tenant_workers() {
   local tenant index
   for tenant in ${TENANT_NAMES}; do
-    if ! tenant_expected_nodes_ready "${tenant}"; then
-      for index in $(seq 1 "${WORKERS_PER_TENANT}"); do
-        if ! join_worker "${tenant}" "${index}"; then
-          "${REPO_ROOT}/scripts/diagnose.sh" "${tenant}" >&2 || true
+    for index in $(seq 1 "${WORKERS_PER_TENANT}"); do
+      if ! join_worker "${tenant}" "${index}"; then
+        "${REPO_ROOT}/scripts/diagnose.sh" "${tenant}" >&2 || true
+        if join_failure_is_substrate \
+          "${RUNTIME_DIR}/logs/$(worker_name "${tenant}" "${index}")-join.log"; then
           record_blocker "private-worker-substrate-unsupported" \
             "The experimental systemd container $(worker_name "${tenant}" "${index}") could not join ${tenant} after supported prerequisites were checked."
-          die "private worker join failed for $(worker_name "${tenant}" "${index}"); container workers are outside vCluster's support matrix"
         fi
-      done
-    fi
+        die "private worker join failed for $(worker_name "${tenant}" "${index}")"
+      fi
+    done
 
     if ! wait_for "${NODE_TIMEOUT}" "${tenant} private nodes" \
       bash -c "KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl --request-timeout=30s wait --for=condition=Ready nodes --all --timeout=20s >/dev/null 2>&1 && [[ \$(KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl --request-timeout=30s get nodes --no-headers | wc -l) -eq ${WORKERS_PER_TENANT} ]]"; then
       "${REPO_ROOT}/scripts/diagnose.sh" "${tenant}" >&2 || true
-      record_blocker "private-worker-substrate-unsupported" \
-        "The experimental systemd workers for ${tenant} did not become Ready within ${NODE_TIMEOUT}."
       die "${tenant} private nodes did not become Ready"
     fi
     label_tenant_nodes "${tenant}"
     for index in $(seq 1 "${WORKERS_PER_TENANT}"); do
-      worker_services_ready "$(worker_name "${tenant}" "${index}")" \
+      wait_for "${WORKER_BOOT_TIMEOUT}" \
+        "joined services in $(worker_name "${tenant}" "${index}")" \
+        worker_services_ready "$(worker_name "${tenant}" "${index}")" \
         || {
-          record_blocker "private-worker-substrate-unsupported" \
-            "Joined worker services are unhealthy in $(worker_name "${tenant}" "${index}")."
           die "joined worker services are unhealthy for ${tenant}"
         }
     done

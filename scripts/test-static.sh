@@ -101,10 +101,16 @@ check "create uses Helm driver only" \
   has_text 'driver helm' "${REPO_ROOT}/scripts/lib/tenant.sh"
 check "join tokens are not executed as shell command strings" \
   not_has_text '(eval|bash -c.*join_url|sh -c.*join_url)' "${REPO_ROOT}/scripts/lib/tenant.sh"
+check "join script download verifies TLS" \
+  not_has_text 'curl[^\n]*-k' "${REPO_ROOT}/scripts/lib/tenant.sh"
+check "worker rejoin loop always reconciles each worker" \
+  has_text 'for index in .*WORKERS_PER_TENANT' "${REPO_ROOT}/scripts/lib/tenant.sh"
 check "worker containers have ownership labels" \
   has_text 'cnpg-vcluster.role=private-worker' "${REPO_ROOT}/scripts/lib/workers.sh"
 check "worker containers use private cgroup namespace" \
   has_text 'cgroupns=private' "${REPO_ROOT}/scripts/lib/workers.sh"
+check "owned workers validate runtime configuration" \
+  has_text 'worker_container_current' "${REPO_ROOT}/scripts/lib/workers.sh"
 check "worker identities use explicit unique hostnames" \
   has_text 'hostname' "${REPO_ROOT}/scripts/lib/workers.sh"
 check "all kubeconfig calls are explicit" \
@@ -137,6 +143,8 @@ check "destroy deletes only named kind cluster" \
   has_text 'name.*KIND_CLUSTER_NAME' "${REPO_ROOT}/scripts/destroy.sh"
 check "E2E recreates a missing worker partial state" \
   has_text 'partial_worker' "${REPO_ROOT}/scripts/test-e2e.sh"
+check "local-path data is persisted below var-lib" \
+  bash -c "for file in '${REPO_ROOT}'/config/tenants/*.yaml; do grep -Fq 'nodePath: /var/lib/local-path-provisioner' \"\$file\" || exit 1; done"
 check "two CNPG cluster manifests" \
   test "$(find "${REPO_ROOT}/manifests/cnpg" -maxdepth 1 -name 'cluster-tenant-*.yaml' | wc -l)" -eq 2
 check "both CNPG clusters have three instances" \
@@ -171,6 +179,8 @@ check "runtime directories use restrictive mode" \
   has_text 'mkdir -p -m 0700' "${REPO_ROOT}/scripts/lib/common.sh"
 check "runtime shell uses restrictive umask" \
   has_text '^umask 077$' "${REPO_ROOT}/scripts/lib/common.sh"
+check "external tools use repository-local temporary storage" \
+  has_text 'TMPDIR=.*TOOLS_TMP_DIR' "${REPO_ROOT}/scripts/lib/common.sh"
 check "README documents exactly two private-node tenants" \
   has_text 'two linked tenant control planes' "${REPO_ROOT}/README.md"
 check "design documents six exclusive workers" \

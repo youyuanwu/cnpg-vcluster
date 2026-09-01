@@ -29,3 +29,4 @@ deploy:
     enabled: true
   localPathProvisioner:
     enabled: true
+    nodePath: /var/lib/local-path-provisioner

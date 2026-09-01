@@ -83,6 +83,14 @@ verify_host_isolation() {
       -l cnpg.io/cluster --no-headers 2>/dev/null)" ]] \
       || die "tenant CNPG ${resource} unexpectedly exist in the central API"
   done
+  local tenant pv
+  for tenant in ${TENANT_NAMES}; do
+    while IFS= read -r pv; do
+      [[ -n "${pv}" ]] || continue
+      ! kubectl_host get pv "${pv}" >/dev/null 2>&1 \
+        || die "${tenant} PV ${pv} unexpectedly exists in the central API"
+    done < <(kubectl_tenant "${tenant}" get pv -o name 2>/dev/null | sed 's#persistentvolume/##')
+  done
 }
 
 verify_tenant_networking_and_no_sync() {
@@ -90,7 +98,7 @@ verify_tenant_networking_and_no_sync() {
   local namespace="cnpg-verify-${tenant}"
   local name="${tenant}-canary"
   local marker="${tenant}-network-marker"
-  local server_node client_node result
+  local server_node client_node result canary_pv
 
   kubectl_tenant "${tenant}" delete namespace "${namespace}" \
     --ignore-not-found --wait=false >/dev/null
@@ -159,6 +167,8 @@ YAML
     "pod/${name}" --timeout="${PVC_TIMEOUT}" >/dev/null
   kubectl_tenant "${tenant}" -n "${namespace}" get pvc "${name}-data" \
     -o jsonpath='{.status.phase}' | grep -qx Bound
+  canary_pv="$(kubectl_tenant "${tenant}" -n "${namespace}" get pvc "${name}-data" \
+    -o jsonpath='{.spec.volumeName}')"
   server_node="$(kubectl_tenant "${tenant}" -n "${namespace}" get pod "${name}" \
     -o jsonpath='{.spec.nodeName}')"
   client_node="$(kubectl_tenant "${tenant}" get nodes -o name \
@@ -185,6 +195,8 @@ YAML
   done
   ! kubectl_host get namespace "${namespace}" >/dev/null 2>&1 \
     || die "${tenant} verification namespace unexpectedly exists in kind"
+  ! kubectl_host get pv "${canary_pv}" >/dev/null 2>&1 \
+    || die "${tenant} verification PV unexpectedly exists in kind"
 
   kubectl_tenant "${tenant}" delete namespace "${namespace}" \
     --wait=false >/dev/null
@@ -204,15 +216,7 @@ print(sum(1 for item in items if any(item.get("metadata", {}).get("annotations",
 ')"
   assert_equals 1 "${default_count}" "${tenant} default StorageClass count"
 
-  kubectl_tenant "${tenant}" -n kube-system get pods -o json \
-    | python3 -c '
-import json, sys
-items=json.load(sys.stdin).get("items", [])
-need=("coredns", "flannel", "kube-proxy", "local-path")
-names=[item["metadata"]["name"] for item in items if item.get("status", {}).get("phase") == "Running"]
-missing=[part for part in need if not any(part in name for name in names)]
-raise SystemExit("missing running system components: "+", ".join(missing) if missing else 0)
-'
+  tenant_addons_ready "${tenant}" || die "${tenant} add-ons are not fully Ready"
 
   kubectl_tenant "${tenant}" get crd clusters.postgresql.cnpg.io >/dev/null
   kubectl_tenant "${tenant}" get validatingwebhookconfiguration \
@@ -223,6 +227,14 @@ raise SystemExit("missing running system components: "+", ".join(missing) if mis
   kubectl_tenant "${tenant}" -n cnpg-system get serviceaccount cnpg-manager >/dev/null
   kubectl_tenant "${tenant}" get clusterrole cnpg-manager >/dev/null
   kubectl_tenant "${tenant}" get clusterrolebinding cnpg-manager-rolebinding >/dev/null
+  kubectl_tenant "${tenant}" -n cnpg-system rollout status \
+    deployment/cnpg-controller-manager --timeout=30s >/dev/null
+  [[ -n "$(kubectl_tenant "${tenant}" -n cnpg-system get endpoints \
+    cnpg-webhook-service -o jsonpath='{.subsets[*].addresses[*].ip}')" ]] \
+    || die "${tenant} CNPG webhook Service has no ready endpoint"
+  [[ -n "$(kubectl_tenant "${tenant}" -n database get endpoints \
+    "${cluster}-rw" -o jsonpath='{.subsets[*].addresses[*].ip}')" ]] \
+    || die "${tenant} CNPG read/write Service has no ready endpoint"
   cnpg_cluster_ready "${tenant}" || die "${cluster} is not fully ready"
 
   cluster_count="$(kubectl_tenant "${tenant}" -n database get clusters.postgresql.cnpg.io \
@@ -309,7 +321,7 @@ print(claims[0] if claims else "")
 
   kubectl_tenant "${tenant}" -n database delete pod "${replica}" --wait=false >/dev/null
   wait_for "${POD_RESTART_TIMEOUT}" "${tenant} replica restart" \
-    bash -c "new_uid=\$(KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl -n database get pod '${replica}' -o jsonpath='{.metadata.uid}' 2>/dev/null) && [[ -n \"\$new_uid\" && \"\$new_uid\" != '${uid}' ]] && KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl -n database wait --for=condition=Ready pod/'${replica}' --timeout=20s >/dev/null 2>&1" \
+    bash -c "new_uid=\$(KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl --request-timeout=30s -n database get pod '${replica}' -o jsonpath='{.metadata.uid}' 2>/dev/null) && [[ -n \"\$new_uid\" && \"\$new_uid\" != '${uid}' ]] && KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl --request-timeout=30s -n database wait --for=condition=Ready pod/'${replica}' --timeout=20s >/dev/null 2>&1" \
     || {
       diagnose_failure "${tenant}"
       die "${tenant} replica did not restart within ${POD_RESTART_TIMEOUT}"
@@ -341,7 +353,7 @@ failover_primary() {
 
   kubectl_tenant "${tenant}" -n database delete pod "${old_primary}" --wait=false >/dev/null
   wait_for "${FAILOVER_TIMEOUT}" "${tenant} primary failover" \
-    bash -c "new_primary=\$(KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl -n database get cluster '${cluster}' -o jsonpath='{.status.currentPrimary}' 2>/dev/null) && [[ -n \"\$new_primary\" && \"\$new_primary\" != '${old_primary}' ]]" \
+    bash -c "new_primary=\$(KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl --request-timeout=30s -n database get cluster '${cluster}' -o jsonpath='{.status.currentPrimary}' 2>/dev/null) && [[ -n \"\$new_primary\" && \"\$new_primary\" != '${old_primary}' ]]" \
     || {
       diagnose_failure "${tenant}"
       die "${tenant} did not promote a different primary within ${FAILOVER_TIMEOUT}"

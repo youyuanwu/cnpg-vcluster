@@ -25,10 +25,10 @@ containers share a Docker bridge, so node-to-node VPN is intentionally
 disabled and direct cross-node connectivity is verified.
 
 The worker image uses Ubuntu 24.04 and systemd. Each worker has a fixed unique
-hostname/MAC, a private cgroup namespace, a 3 GiB memory ceiling, a 2 CPU burst
+hostname, a private cgroup namespace, a 3 GiB memory ceiling, a 2 CPU burst
 ceiling, and a dedicated Docker volume mounted at `/var/lib` for nested
-containerd, kubelet, and local-path data. Docker assigns a distinct MAC while
-each container exists; recreating a container can assign a different MAC.
+containerd, kubelet, and local-path data. Docker assigns a distinct MAC for the
+container lifetime; recreating a container can assign a different MAC.
 
 ### Design Decisions
 

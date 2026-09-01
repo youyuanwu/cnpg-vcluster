@@ -102,6 +102,28 @@ for tenant in ${TENANT_NAMES}; do
     kubectl_tenant "${tenant}" -n database get cluster,pods,pvc
     kubectl_tenant "${tenant}" -n database get pods \
       -o custom-columns='NAME:.metadata.name,NODE:.spec.nodeName,IMAGES:.spec.containers[*].image'
+    available="$(kubectl_tenant "${tenant}" -n cnpg-system get deployment \
+      cnpg-controller-manager -o jsonpath='{.status.availableReplicas}')"
+    [[ "${available:-0}" -ge 1 ]] \
+      || fail_status "${tenant} CNPG operator is unavailable"
+    cluster="$(cnpg_cluster_name "${tenant}")"
+    [[ -n "$(kubectl_tenant "${tenant}" -n database get endpoints "${cluster}-rw" \
+      -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null)" ]] \
+      || fail_status "${tenant} CNPG read/write Service has no ready endpoint"
+    bound_pvcs="$(kubectl_tenant "${tenant}" -n database get pvc \
+      -l "cnpg.io/cluster=${cluster}" --no-headers 2>/dev/null \
+      | awk '$2 == "Bound" {count++} END {print count + 0}')"
+    [[ "${bound_pvcs}" -eq 3 ]] \
+      || fail_status "${tenant} does not have three bound CNPG claims"
+    bound_pvs="$(kubectl_tenant "${tenant}" get pv -o json \
+      | python3 -c '
+import json, sys
+cluster=sys.argv[1]
+items=json.load(sys.stdin).get("items", [])
+print(sum(1 for item in items if item.get("spec", {}).get("claimRef", {}).get("name", "").startswith(cluster) and item.get("status", {}).get("phase") == "Bound"))
+' "${cluster}")"
+    [[ "${bound_pvs}" -eq 3 ]] \
+      || fail_status "${tenant} does not have three bound CNPG volumes"
     cnpg_cluster_ready "${tenant}" \
       || fail_status "${tenant} PostgreSQL cluster is not fully ready"
   else

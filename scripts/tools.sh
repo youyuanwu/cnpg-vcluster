@@ -43,19 +43,19 @@ download_binary \
   "https://github.com/loft-sh/vcluster/releases/download/${VCLUSTER_VERSION}/vcluster-linux-amd64"
 
 HELM_ARCHIVE="${CACHE_DIR}/helm-${HELM_VERSION}-linux-amd64.tar.gz"
-if [[ ! -x "${BIN_DIR}/helm" ]]; then
+if [[ ! -x "${BIN_DIR}/helm" ]] \
+  || ! "${BIN_DIR}/helm" version --short 2>/dev/null | grep -Fq "${HELM_VERSION}"; then
   log "downloading helm ${HELM_VERSION}"
-  curl -fL --retry 3 --retry-delay 2 \
-    "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
-    -o "${HELM_ARCHIVE}"
+  if ! sha256_matches "${HELM_SHA256}" "${HELM_ARCHIVE}"; then
+    curl -fL --retry 3 --retry-delay 2 \
+      "https://get.helm.sh/helm-${HELM_VERSION}-linux-amd64.tar.gz" \
+      -o "${HELM_ARCHIVE}"
+  fi
   sha256_check "${HELM_SHA256}" "${HELM_ARCHIVE}"
   rm -rf "${CACHE_DIR}/linux-amd64"
   tar -xzf "${HELM_ARCHIVE}" -C "${CACHE_DIR}"
   install -m 0755 "${CACHE_DIR}/linux-amd64/helm" "${BIN_DIR}/helm"
   rm -rf "${CACHE_DIR}/linux-amd64"
-else
-  "${BIN_DIR}/helm" version --short | grep -Fq "${HELM_VERSION}" \
-    || die "unexpected cached helm version"
 fi
 
 log "tool versions"
