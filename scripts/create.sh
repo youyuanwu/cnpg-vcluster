@@ -78,8 +78,8 @@ ensure_host_cluster() {
 
 main() {
   ensure_runtime_layout
-  rm -f "${RUNTIME_DIR}/blocker"
   preflight
+  rm -f "${RUNTIME_DIR}/blocker"
   ensure_host_cluster
   ensure_platform
   ensure_tenant_control_planes

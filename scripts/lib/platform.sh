@@ -104,8 +104,16 @@ ensure_platform() {
 
   retry_for "${PLATFORM_TIMEOUT}" "vCluster Platform deployment" platform_ready
   discover_platform_url "${log_file}" \
-    || die "could not discover Platform URL; set PLATFORM_HOST to a reachable HTTPS endpoint"
-  retry_for "${PLATFORM_TIMEOUT}" "Platform endpoint $(platform_url)" platform_reachable
+    || {
+      record_blocker "platform-endpoint-unavailable" \
+        "Could not discover the Platform HTTPS URL. Set PLATFORM_HOST to a reachable endpoint and rerun make create."
+      die "could not discover Platform URL; set PLATFORM_HOST to a reachable HTTPS endpoint"
+    }
+  if ! wait_for "${PLATFORM_TIMEOUT}" "Platform endpoint $(platform_url)" platform_reachable; then
+    record_blocker "platform-endpoint-unavailable" \
+      "The Platform URL is not reachable. Set PLATFORM_HOST to a reachable HTTPS endpoint and rerun make create."
+    die "timed out waiting for Platform endpoint $(platform_url)"
+  fi
   log "vCluster Platform ready at $(platform_url)"
 }
 

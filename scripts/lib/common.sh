@@ -103,18 +103,26 @@ seconds_from_duration() {
   esac
 }
 
-retry_for() {
+wait_for() {
   local duration="$1"
-  local description="$2"
+  local _description="$2"
   shift 2
   local deadline=$((SECONDS + $(seconds_from_duration "${duration}")))
 
   until "$@"; do
     if (( SECONDS >= deadline )); then
-      die "timed out waiting for ${description} after ${duration}"
+      return 1
     fi
     sleep 5
   done
+}
+
+retry_for() {
+  local duration="$1"
+  local description="$2"
+  shift 2
+  wait_for "${duration}" "${description}" "$@" \
+    || die "timed out waiting for ${description} after ${duration}"
 }
 
 sha256_check() {
