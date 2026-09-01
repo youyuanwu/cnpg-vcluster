@@ -44,30 +44,32 @@ install_all_cnpg() {
   done
 }
 
-cnpg_secret_value() {
-  local tenant="$1"
-  local key="$2"
-  local cluster
-  cluster="$(cnpg_cluster_name "${tenant}")"
-  kubectl_tenant "${tenant}" -n database get secret "${cluster}-app" \
-    -o "jsonpath={.data.${key}}" | base64 -d
-}
-
 with_psql_client() {
   local tenant="$1"
   shift
-  local cluster client password
+  local cluster client
   cluster="$(cnpg_cluster_name "${tenant}")"
-  client="cnpg-verify-client"
-  password="$(cnpg_secret_value "${tenant}" password)"
+  client="cnpg-verify-$(date +%s%N)"
 
-  kubectl_tenant "${tenant}" -n database delete pod "${client}" \
-    --ignore-not-found --wait=false >/dev/null
-  kubectl_tenant "${tenant}" -n database run "${client}" \
-    --restart=Never \
-    --image="${POSTGRES_IMAGE}" \
-    --env="PGPASSWORD=${password}" \
-    --command -- sleep 3600 >/dev/null
+  cat <<YAML | kubectl_tenant "${tenant}" apply -f - >/dev/null
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${client}
+  namespace: database
+spec:
+  restartPolicy: Never
+  containers:
+    - name: client
+      image: ${POSTGRES_IMAGE}
+      command: [sleep, "3600"]
+      env:
+        - name: PGPASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: ${cluster}-app
+              key: password
+YAML
   kubectl_tenant "${tenant}" -n database wait --for=condition=Ready \
     "pod/${client}" --timeout="${CNPG_TIMEOUT}" >/dev/null
 

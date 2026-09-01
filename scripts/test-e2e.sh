@@ -58,13 +58,21 @@ else
   if [[ -s "${RUNTIME_DIR}/blocker" ]] \
     && grep -Eq '^code=(platform-free-tier-activation-required|platform-endpoint-unavailable)$' \
       "${RUNTIME_DIR}/blocker"; then
+    :
+  elif [[ -s "${RUNTIME_DIR}/blocker" ]] \
+    && grep -q '^code=private-worker-substrate-unsupported$' "${RUNTIME_DIR}/blocker"; then
+    :
+  else
+    "${SCRIPT_DIR}/diagnose.sh" >>"${RESULT_LOG}" 2>&1 || true
+    die "environment creation failed without a recognized external blocker; see ${RESULT_LOG}"
+  fi
+  if [[ -s "${RUNTIME_DIR}/blocker" ]]; then
     "${SCRIPT_DIR}/status.sh" >>"${RESULT_LOG}" 2>&1 || true
     "${SCRIPT_DIR}/diagnose.sh" >>"${RESULT_LOG}" 2>&1 || true
     printf 'result=blocked\n' >>"${RESULT_LOG}"
     cat "${RUNTIME_DIR}/blocker" >>"${RESULT_LOG}"
   else
-    "${SCRIPT_DIR}/diagnose.sh" >>"${RESULT_LOG}" 2>&1 || true
-    die "environment creation failed without a recognized external blocker; see ${RESULT_LOG}"
+    die "blocked create did not record a blocker"
   fi
 fi
 
@@ -76,7 +84,7 @@ docker inspect "${SENTINEL}" >/dev/null
 [[ ! -e "${RUNTIME_DIR}" ]]
 
 if [[ "${create_rc}" -ne 0 ]]; then
-  warn "end-to-end runtime is blocked by a documented external Platform prerequisite; see ${RESULT_LOG}"
+  warn "end-to-end runtime is blocked by documented activation, endpoint, or worker-substrate evidence; see ${RESULT_LOG}"
   exit 2
 fi
 

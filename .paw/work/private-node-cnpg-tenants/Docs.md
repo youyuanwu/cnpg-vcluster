@@ -27,7 +27,8 @@ disabled and direct cross-node connectivity is verified.
 The worker image uses Ubuntu 24.04 and systemd. Each worker has a fixed unique
 hostname/MAC, a private cgroup namespace, a 3 GiB memory ceiling, a 2 CPU burst
 ceiling, and a dedicated Docker volume mounted at `/var/lib` for nested
-containerd, kubelet, and local-path data.
+containerd, kubelet, and local-path data. Docker assigns a distinct MAC while
+each container exists; recreating a container can assign a different MAC.
 
 ### Design Decisions
 
@@ -66,7 +67,8 @@ Platform's Loft Router URL is the default endpoint for private-node VPN.
 
 Direct versions are kind 0.33.0, kind Kubernetes 1.36.4, tenant Kubernetes
 1.36.0, kubectl 1.36.4, Helm 3.19.0, vCluster 0.36.1, Platform 4.11.2,
-CloudNativePG 1.30.0, PostgreSQL 18.4 system-trixie, and Ubuntu 24.04.
+CloudNativePG 1.30.0, PostgreSQL 18.4 system-trixie, BusyBox 1.37.0 for
+verification, and Ubuntu 24.04.
 
 ### Basic Usage
 
@@ -89,6 +91,8 @@ restart/failover checks. Run `make destroy` to remove the lab.
 - `SKIP_CNPG=1 make create`: bootstrap only through private-node add-ons.
 - `PLATFORM_HOST=https://... make create`: use an existing reachable Platform
   hostname instead of the generated Loft Router endpoint.
+- `PLATFORM_CA_FILE=path/to/ca.pem`: trust a custom CA for the Platform and join
+  endpoint without disabling TLS verification.
 - `make diagnose TENANT=tenant-a`: focus Kubernetes events and worker service
   logs on one tenant.
 - Override finite wait values from `config/settings.env` in the environment
@@ -134,9 +138,11 @@ runs status and verification, destroys twice, and proves the sentinel remains.
 ### Observed Result
 
 On 2026-09-01 the host passed tool, Docker capacity, kind, Platform, endpoint,
-worker-image, systemd/cgroup, static, read-only status, and idempotent scoped
-teardown tests. Platform 4.11.2 then rejected the first linked private-node
-tenant because Free mode had not been activated:
+static, read-only status, and idempotent scoped teardown tests. A separate
+repository worker-image probe booted the pinned image with systemd and a
+writable private cgroup v2 mount. The main lifecycle then reached Platform
+4.11.2, which rejected the first linked private-node tenant because Free mode
+had not been activated:
 
 `request is blocked because license limits are exceeded`
 

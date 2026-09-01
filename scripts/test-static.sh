@@ -18,6 +18,10 @@ check() {
   fi
 }
 
+check_fails() {
+  ! "$@"
+}
+
 has_text() {
   grep -Eq "$1" "$2"
 }
@@ -34,6 +38,44 @@ count_equals() {
   actual="$(grep -hEc "${pattern}" "$@" | awk '{sum += $1} END {print sum + 0}')"
   [[ "${actual}" -eq "${expected}" ]]
 }
+
+addon_gate_result() (
+  local broken_component="$1"
+  # shellcheck disable=SC1091
+  source "${REPO_ROOT}/scripts/lib/tenant.sh"
+  tenant_expected_nodes_ready() { return 0; }
+  kubectl_tenant() {
+    if [[ "$*" == *"get storageclass"* ]]; then
+      printf 'true\n'
+      return
+    fi
+    if [[ "$*" == *"get daemonsets"* ]]; then
+      printf '%s\n' '{"items":[{"metadata":{"name":"flannel"},"status":{"desiredNumberScheduled":3,"numberReady":3}},{"metadata":{"name":"kube-proxy"},"status":{"desiredNumberScheduled":3,"numberReady":3}}]}'
+      return
+    fi
+    if [[ "$*" == *"get deployments"* ]]; then
+      printf '%s\n' '{"items":[{"metadata":{"name":"coredns"},"status":{"availableReplicas":2}},{"metadata":{"name":"local-path"},"status":{"availableReplicas":1}}]}'
+      return
+    fi
+    python3 - "${broken_component}" <<'PY'
+import json
+import sys
+
+broken = sys.argv[1]
+items = []
+for name in ("coredns", "flannel", "kube-proxy", "local-path"):
+    items.append({
+        "metadata": {"name": name},
+        "status": {"conditions": [{
+            "type": "Ready",
+            "status": "False" if name == broken else "True",
+        }]},
+    })
+print(json.dumps({"items": items}))
+PY
+  }
+  tenant_addons_ready tenant-a
+)
 
 for script in "${REPO_ROOT}"/scripts/*.sh "${REPO_ROOT}"/scripts/lib/*.sh; do
   check "bash syntax: ${script#${REPO_ROOT}/}" bash -n "${script}"
@@ -90,7 +132,7 @@ check "verification requires a different primary" \
 check "verification checks cross-tenant identities" \
   has_text 'verify_cross_tenant_identity' "${REPO_ROOT}/scripts/verify.sh"
 check "destroy targets labeled worker names" \
-  has_text 'worker_name' "${REPO_ROOT}/scripts/destroy.sh"
+  has_text 'worker_container_owned' "${REPO_ROOT}/scripts/destroy.sh"
 check "destroy deletes only named kind cluster" \
   has_text 'name.*KIND_CLUSTER_NAME' "${REPO_ROOT}/scripts/destroy.sh"
 check "E2E recreates a missing worker partial state" \
@@ -109,8 +151,20 @@ check "PostgreSQL image digest is pinned" \
   has_text '^POSTGRES_IMAGE=.+@sha256:' "${REPO_ROOT}/config/versions.env"
 check "worker base image digest is pinned" \
   has_text '^WORKER_BASE_IMAGE=.+@sha256:' "${REPO_ROOT}/config/versions.env"
+check "verification image digest is pinned" \
+  has_text '^VERIFY_IMAGE=.+@sha256:' "${REPO_ROOT}/config/versions.env"
 check "finite configured timeouts" \
-  test "$(grep -Ec '^[A-Z_]+_TIMEOUT=[0-9]+[smh]$' "${REPO_ROOT}/config/settings.env")" -ge 8
+  test "$(grep -Ec '_TIMEOUT:=[0-9]+[smh]' "${REPO_ROOT}/config/settings.env")" -ge 10
+check "timeout environment overrides are preserved" \
+  bash -c "export KIND_TIMEOUT=37s; source '${REPO_ROOT}/config/settings.env'; [[ \"\$KIND_TIMEOUT\" == 37s ]]"
+while IFS= read -r timeout_var; do
+  check "timeout ${timeout_var} is consumed" \
+    grep -R -Fq --exclude=test-static.sh "\${${timeout_var}}" "${REPO_ROOT}/scripts"
+done < <(sed -n 's/^: "${\([A-Z_]*_TIMEOUT\):=.*/\1/p' "${REPO_ROOT}/config/settings.env")
+check "add-on gate accepts all Ready components" \
+  addon_gate_result ""
+check "add-on gate rejects an unready component" \
+  check_fails addon_gate_result flannel
 check "runtime state is ignored" \
   has_text '^\.runtime/$' "${REPO_ROOT}/.gitignore"
 check "runtime directories use restrictive mode" \
@@ -138,10 +192,17 @@ for version in \
   "${PLATFORM_VERSION}" \
   "${CNPG_VERSION}" \
   "18.4" \
+  "1.37.0" \
   "Ubuntu 24.04"; do
   check "documentation names direct pin ${version}" \
     grep -Fq "${version}" "${REPO_ROOT}/docs/high-level-design.md"
 done
+check "tenant manifests match Kubernetes version pin" \
+  bash -c "for file in '${REPO_ROOT}'/config/tenants/*.yaml; do grep -Fq 'tag: ${KUBERNETES_VERSION}' \"\$file\" || exit 1; done"
+check "CNPG manifests match PostgreSQL image pin" \
+  bash -c "for file in '${REPO_ROOT}'/manifests/cnpg/cluster-*.yaml; do grep -Fq 'imageName: ${POSTGRES_IMAGE}' \"\$file\" || exit 1; done"
+check "fixed topology is exactly two tenants and three workers each" \
+  bash -c "source '${REPO_ROOT}/config/settings.env'; [[ \"\$TENANT_NAMES\" == 'tenant-a tenant-b' && \"\$WORKERS_PER_TENANT\" == 3 ]]"
 
 if (( failures > 0 )); then
   die "${failures} static check(s) failed"

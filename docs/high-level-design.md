@@ -212,6 +212,7 @@ Direct inputs are pinned:
 | vCluster Platform | 4.11.2 |
 | CloudNativePG | 1.30.0 |
 | PostgreSQL | 18.4 system-trixie with digest |
+| Verification utility | BusyBox 1.37.0 with digest |
 | Worker userspace | Ubuntu 24.04 with digest |
 
 The pinned vCluster release controls transitive private-node components such as

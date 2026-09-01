@@ -11,9 +11,22 @@ source "${SCRIPT_DIR}/lib/tenant.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/cnpg.sh"
 
+CURRENT_TENANT=""
+VERIFY_SUCCEEDED=0
+
 diagnose_failure() {
   "${SCRIPT_DIR}/diagnose.sh" "${1:-}" >&2 || true
 }
+
+verify_exit() {
+  local rc=$?
+  trap - EXIT
+  if [[ "${rc}" -ne 0 && "${VERIFY_SUCCEEDED}" -eq 0 ]]; then
+    diagnose_failure "${CURRENT_TENANT}"
+  fi
+  exit "${rc}"
+}
+trap verify_exit EXIT
 
 assert_equals() {
   local expected="$1"
@@ -72,9 +85,114 @@ verify_host_isolation() {
   done
 }
 
+verify_tenant_networking_and_no_sync() {
+  local tenant="$1"
+  local namespace="cnpg-verify-${tenant}"
+  local name="${tenant}-canary"
+  local marker="${tenant}-network-marker"
+  local server_node client_node result
+
+  kubectl_tenant "${tenant}" delete namespace "${namespace}" \
+    --ignore-not-found --wait=false >/dev/null
+  kubectl_tenant "${tenant}" wait --for=delete "namespace/${namespace}" \
+    --timeout=60s >/dev/null 2>&1 || true
+
+  cat <<YAML | kubectl_tenant "${tenant}" apply -f - >/dev/null
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${namespace}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${name}-data
+  namespace: ${namespace}
+  labels:
+    cnpg-vcluster.io/verification: ${tenant}
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  labels:
+    app: ${name}
+    cnpg-vcluster.io/verification: ${tenant}
+spec:
+  containers:
+    - name: http
+      image: ${VERIFY_IMAGE}
+      command: [sh, -c]
+      args: ["echo '${marker}' > /data/index.html && httpd -f -p 8080 -h /data"]
+      ports:
+        - containerPort: 8080
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: ${name}-data
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: ${name}
+  namespace: ${namespace}
+  labels:
+    cnpg-vcluster.io/verification: ${tenant}
+spec:
+  selector:
+    app: ${name}
+  ports:
+    - port: 8080
+      targetPort: 8080
+YAML
+
+  kubectl_tenant "${tenant}" -n "${namespace}" wait --for=condition=Ready \
+    "pod/${name}" --timeout="${PVC_TIMEOUT}" >/dev/null
+  kubectl_tenant "${tenant}" -n "${namespace}" get pvc "${name}-data" \
+    -o jsonpath='{.status.phase}' | grep -qx Bound
+  server_node="$(kubectl_tenant "${tenant}" -n "${namespace}" get pod "${name}" \
+    -o jsonpath='{.spec.nodeName}')"
+  client_node="$(kubectl_tenant "${tenant}" get nodes -o name \
+    | sed 's#node/##' | grep -vx "${server_node}" | head -1)"
+  [[ -n "${client_node}" ]] || die "could not choose cross-node client for ${tenant}"
+
+  kubectl_tenant "${tenant}" -n "${namespace}" run "${name}-client" \
+    --restart=Never \
+    --image="${VERIFY_IMAGE}" \
+    --overrides="{\"spec\":{\"nodeName\":\"${client_node}\"}}" \
+    --command -- sh -c \
+    "wget -qO- http://${name}.${namespace}.svc.cluster.local:8080" >/dev/null
+  wait_for "${NETWORK_VERIFY_TIMEOUT}" "${tenant} cross-node DNS and Service check" \
+    bash -c "[[ \$(KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl --request-timeout=30s -n '${namespace}' get pod '${name}-client' -o jsonpath='{.status.phase}' 2>/dev/null) == Succeeded ]]" \
+    || die "${tenant} cross-node DNS/Service canary failed"
+  result="$(kubectl_tenant "${tenant}" -n "${namespace}" logs "${name}-client")"
+  assert_equals "${marker}" "${result}" "${tenant} cross-node Service marker"
+
+  local resource
+  for resource in pods services pvc; do
+    [[ -z "$(kubectl_host get "${resource}" -A \
+      -l "cnpg-vcluster.io/verification=${tenant}" --no-headers 2>/dev/null)" ]] \
+      || die "${tenant} verification ${resource} unexpectedly synchronized to kind"
+  done
+  ! kubectl_host get namespace "${namespace}" >/dev/null 2>&1 \
+    || die "${tenant} verification namespace unexpectedly exists in kind"
+
+  kubectl_tenant "${tenant}" delete namespace "${namespace}" \
+    --wait=false >/dev/null
+}
+
 verify_tenant_components() {
   local tenant="$1"
-  local cluster default_count pvc_count pv_count node_count
+  local cluster cluster_count pod_count default_count pvc_count pv_count node_count
   cluster="$(cnpg_cluster_name "${tenant}")"
 
   default_count="$(kubectl_tenant "${tenant}" get storageclass -o json \
@@ -107,6 +225,16 @@ raise SystemExit("missing running system components: "+", ".join(missing) if mis
   kubectl_tenant "${tenant}" get clusterrolebinding cnpg-manager-rolebinding >/dev/null
   cnpg_cluster_ready "${tenant}" || die "${cluster} is not fully ready"
 
+  cluster_count="$(kubectl_tenant "${tenant}" -n database get clusters.postgresql.cnpg.io \
+    --no-headers | wc -l)"
+  assert_equals 1 "${cluster_count}" "${tenant} CNPG Cluster count"
+  pod_count="$(kubectl_tenant "${tenant}" -n database get pods \
+    -l "cnpg.io/cluster=${cluster}" --no-headers | wc -l)"
+  assert_equals 3 "${pod_count}" "${tenant} PostgreSQL instance pod count"
+
+  wait_for "${PVC_TIMEOUT}" "${tenant} CNPG storage binding" \
+    bash -c "[[ \$(KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl --request-timeout=30s -n database get pvc -l 'cnpg.io/cluster=${cluster}' --no-headers 2>/dev/null | awk '\$2 == \"Bound\" {count++} END {print count + 0}') -eq 3 ]]" \
+    || die "${tenant} CNPG claims did not bind within ${PVC_TIMEOUT}"
   pvc_count="$(kubectl_tenant "${tenant}" -n database get pvc \
     -l "cnpg.io/cluster=${cluster}" --no-headers | awk '$2 == "Bound" {count++} END {print count + 0}')"
   assert_equals 3 "${pvc_count}" "${tenant} bound CNPG PVC count"
@@ -153,7 +281,7 @@ verify_marker() {
 
 restart_replica() {
   local tenant="$1"
-  local cluster primary replica uid pvc
+  local cluster primary replica uid pvc pv new_pvc new_pv
   cluster="$(cnpg_cluster_name "${tenant}")"
   primary="$(kubectl_tenant "${tenant}" -n database get cluster "${cluster}" \
     -o jsonpath='{.status.currentPrimary}')"
@@ -175,6 +303,9 @@ claims=[v["persistentVolumeClaim"]["claimName"] for v in volumes if "persistentV
 print(claims[0] if claims else "")
 ')"
   [[ -n "${pvc}" ]] || die "could not find replica PVC for ${tenant}"
+  pv="$(kubectl_tenant "${tenant}" -n database get pvc "${pvc}" \
+    -o jsonpath='{.spec.volumeName}')"
+  [[ -n "${pv}" ]] || die "could not find replica PV for ${tenant}"
 
   kubectl_tenant "${tenant}" -n database delete pod "${replica}" --wait=false >/dev/null
   wait_for "${POD_RESTART_TIMEOUT}" "${tenant} replica restart" \
@@ -185,6 +316,17 @@ print(claims[0] if claims else "")
     }
   kubectl_tenant "${tenant}" -n database get pvc "${pvc}" \
     -o jsonpath='{.status.phase}' | grep -qx Bound
+  new_pvc="$(kubectl_tenant "${tenant}" -n database get pod "${replica}" -o json \
+    | python3 -c '
+import json, sys
+volumes=json.load(sys.stdin).get("spec", {}).get("volumes", [])
+claims=[v["persistentVolumeClaim"]["claimName"] for v in volumes if "persistentVolumeClaim" in v]
+print(claims[0] if claims else "")
+')"
+  assert_equals "${pvc}" "${new_pvc}" "${tenant} restarted replica PVC"
+  new_pv="$(kubectl_tenant "${tenant}" -n database get pvc "${new_pvc}" \
+    -o jsonpath='{.spec.volumeName}')"
+  assert_equals "${pv}" "${new_pv}" "${tenant} restarted replica PV"
   retry_for "${CNPG_TIMEOUT}" "${tenant} cluster after replica restart" cnpg_cluster_ready "${tenant}"
   verify_marker "${tenant}"
 }
@@ -217,6 +359,11 @@ verify_cross_tenant_identity() {
       <(kubectl_tenant tenant-b get "${kind}" -A -o name | sort))"
     [[ -z "${overlap}" ]] || die "${kind} identities overlap across tenants: ${overlap}"
   done
+  local clusters_a clusters_b
+  clusters_a="$(kubectl_tenant tenant-a -n database get clusters.postgresql.cnpg.io -o name | sort)"
+  clusters_b="$(kubectl_tenant tenant-b -n database get clusters.postgresql.cnpg.io -o name | sort)"
+  [[ -z "$(comm -12 <(printf '%s\n' "${clusters_a}") <(printf '%s\n' "${clusters_b}"))" ]] \
+    || die "database Cluster identities overlap across tenants"
   local result
   result="$(with_psql_client tenant-a -c \
     "SELECT marker FROM verification WHERE marker='tenant-b-private-node-marker';")"
@@ -234,6 +381,8 @@ main() {
 
   local tenant
   for tenant in ${TENANT_NAMES}; do
+    CURRENT_TENANT="${tenant}"
+    verify_tenant_networking_and_no_sync "${tenant}"
     verify_tenant_components "${tenant}" || {
       diagnose_failure "${tenant}"
       exit 1
@@ -243,9 +392,11 @@ main() {
 
   verify_cross_tenant_identity
   for tenant in ${TENANT_NAMES}; do
+    CURRENT_TENANT="${tenant}"
     restart_replica "${tenant}"
     failover_primary "${tenant}"
   done
+  VERIFY_SUCCEEDED=1
   log "all private-node, storage, CloudNativePG, SQL, restart, and failover checks passed"
 }
 

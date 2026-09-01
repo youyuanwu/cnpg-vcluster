@@ -8,6 +8,10 @@ source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/platform.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/cnpg.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/tenant.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/workers.sh"
 
 healthy=0
 
@@ -20,6 +24,32 @@ printf 'Pinned versions: kind=%s host-k8s=%s tenant-k8s=%s vcluster=%s platform=
   "${KIND_VERSION}" "${KIND_NODE_IMAGE%%@*}" "${KUBERNETES_VERSION}" \
   "${VCLUSTER_VERSION}" "${PLATFORM_VERSION}" "${CNPG_VERSION}" \
   "${POSTGRES_IMAGE%%@*}"
+
+printf '\n== Docker private workers ==\n'
+docker ps -a --filter "label=cnpg-vcluster.lab=${LAB_PREFIX}" \
+  --format 'table {{.Names}}\t{{.Status}}\t{{.Networks}}'
+for tenant in ${TENANT_NAMES}; do
+  for index in $(seq 1 "${WORKERS_PER_TENANT}"); do
+    name="$(worker_name "${tenant}" "${index}")"
+    if ! docker container inspect "${name}" >/dev/null 2>&1; then
+      fail_status "${name} is absent"
+      continue
+    fi
+    worker_container_owned "${tenant}" "${name}" \
+      || fail_status "${name} ownership labels do not match"
+    if ! worker_prerequisites_ready "${name}"; then
+      fail_status "${name} systemd/cgroup/iptables/swap prerequisites are unhealthy"
+      continue
+    fi
+    worker_services_ready "${name}" \
+      || fail_status "${name} containerd/kubelet/vcluster-vpn services are unhealthy"
+    printf '%s: ' "${name}"
+    docker exec "${name}" sh -c \
+      'containerd --version 2>/dev/null; kubelet --version 2>/dev/null; vcluster version 2>/dev/null; systemctl show -p ExecStart --value vcluster-vpn 2>/dev/null' \
+      | tr '\n' ';'
+    printf '\n'
+  done
+done
 
 if [[ -s "${RUNTIME_DIR}/blocker" ]]; then
   printf 'Bootstrap blocker:\n'
@@ -54,10 +84,18 @@ for tenant in ${TENANT_NAMES}; do
 
   kubectl_tenant "${tenant}" get nodes \
     -L cnpg-vcluster.io/tenant
+  tenant_expected_nodes_ready "${tenant}" \
+    || fail_status "${tenant} does not have exactly ${WORKERS_PER_TENANT} Ready labeled workers"
+  platform_has_tenant "${tenant}" \
+    || fail_status "${tenant} is not linked to vCluster Platform"
   kubectl_tenant "${tenant}" -n kube-system get pods \
     -o custom-columns='NAME:.metadata.name,STATUS:.status.phase,IMAGES:.spec.containers[*].image' \
     | grep -E 'NAME|coredns|flannel|kube-proxy|local-path' || true
+  tenant_addons_ready "${tenant}" \
+    || fail_status "${tenant} networking, DNS, or storage add-ons are unhealthy"
   kubectl_tenant "${tenant}" get storageclass
+  kubectl_tenant "${tenant}" get services,pvc -A
+  kubectl_tenant "${tenant}" get pv
 
   if kubectl_tenant "${tenant}" get crd clusters.postgresql.cnpg.io >/dev/null 2>&1; then
     kubectl_tenant "${tenant}" -n cnpg-system get deployment cnpg-controller-manager

@@ -68,11 +68,33 @@ platform_url() {
   cat "$(platform_url_file)"
 }
 
+platform_curl() {
+  local url="$1"
+  shift
+  local tls_args=()
+  if [[ -n "${PLATFORM_CA_FILE:-}" ]]; then
+    [[ -f "${PLATFORM_CA_FILE}" ]] || die "PLATFORM_CA_FILE does not exist: ${PLATFORM_CA_FILE}"
+    tls_args=(--cacert "${PLATFORM_CA_FILE}")
+  fi
+  curl -fsS --max-time 20 "${tls_args[@]}" "${url}" "$@"
+}
+
 platform_reachable() {
   local url
   url="$(platform_url)" || return 1
-  curl -kfsS --max-time 15 "${url}/healthz" >/dev/null 2>&1 \
-    || curl -kfsS --max-time 15 "${url}" >/dev/null 2>&1
+  platform_curl "${url}/version" >/dev/null 2>&1
+}
+
+platform_reachable_from_kind() {
+  local url node ca_args=()
+  url="$(platform_url)"
+  node="${KIND_CLUSTER_NAME}-control-plane"
+  if [[ -n "${PLATFORM_CA_FILE:-}" ]]; then
+    docker cp "${PLATFORM_CA_FILE}" "${node}:/root/platform-ca.crt" >/dev/null
+    ca_args=(--cacert /root/platform-ca.crt)
+  fi
+  docker exec "${node}" curl -fsS --max-time 20 \
+    "${ca_args[@]}" "${url}/version" >/dev/null 2>&1
 }
 
 ensure_platform() {
@@ -114,6 +136,11 @@ ensure_platform() {
       "The Platform URL is not reachable. Set PLATFORM_HOST to a reachable HTTPS endpoint and rerun make create."
     die "timed out waiting for Platform endpoint $(platform_url)"
   fi
+  if ! wait_for "${PLATFORM_TIMEOUT}" "Platform endpoint from kind" platform_reachable_from_kind; then
+    record_blocker "platform-endpoint-unavailable" \
+      "The Platform URL is not reachable from the kind control cluster."
+    die "Platform endpoint $(platform_url) is not reachable from kind"
+  fi
   log "vCluster Platform ready at $(platform_url)"
 }
 
@@ -124,7 +151,12 @@ platform_has_tenant() {
 import json, sys
 needle = sys.argv[1]
 data = json.load(sys.stdin)
-items = data if isinstance(data, list) else data.get("virtualClusters", data.get("items", []))
+if data is None:
+    items = []
+elif isinstance(data, list):
+    items = data
+else:
+    items = data.get("virtualClusters", data.get("items", []))
 raise SystemExit(0 if any(
     needle in (item.get("name"), item.get("metadata", {}).get("name"))
     for item in items

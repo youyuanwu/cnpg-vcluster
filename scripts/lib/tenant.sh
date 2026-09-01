@@ -48,10 +48,9 @@ write_tenant_kubeconfig() {
 
   KUBECONFIG="${HOST_KUBECONFIG}" \
     vcluster_cli --silent connect "${tenant}" \
-      --driver helm \
-      --context "$(host_context)" \
-      --namespace "$(tenant_namespace "${tenant}")" \
-      --background-proxy=true \
+      --driver platform \
+      --project "${PLATFORM_PROJECT}" \
+      --background-proxy=false \
       --print >"${destination}"
   chmod 0600 "${destination}"
   KUBECONFIG="${destination}" kubectl version --request-timeout=20s >/dev/null
@@ -81,17 +80,13 @@ ensure_join_script() {
   local token_output="${RUNTIME_DIR}/join/${tenant}.token-output"
   local join_url
 
-  if [[ -s "${script_file}" ]]; then
-    printf '%s\n' "${script_file}"
-    return
-  fi
-
+  rm -f "${script_file}" "${token_output}"
   KUBECONFIG="$(tenant_kubeconfig "${tenant}")" \
     vcluster_cli token create --expires=1h >"${token_output}"
   chmod 0600 "${token_output}"
   join_url="$(grep -Eo 'https://[^[:space:]]+/node/join\?token=[^[:space:]]+' "${token_output}" | head -1)"
   [[ -n "${join_url}" ]] || die "could not extract private-node join URL for ${tenant}"
-  curl -kfsSL "${join_url}" -o "${script_file}"
+  platform_curl "${join_url}" -o "${script_file}"
   chmod 0600 "${script_file}"
   rm -f "${token_output}"
   printf '%s\n' "${script_file}"
@@ -103,15 +98,20 @@ join_worker() {
   local name script_file
   name="$(worker_name "${tenant}" "${index}")"
 
-  if kubectl_tenant "${tenant}" get node "${name}" >/dev/null 2>&1; then
+  if kubectl_tenant "${tenant}" wait --for=condition=Ready \
+    "node/${name}" --timeout=10s >/dev/null 2>&1 \
+    && docker exec "${name}" systemctl is-active kubelet >/dev/null 2>&1; then
     return
   fi
 
+  kubectl_tenant "${tenant}" delete node "${name}" \
+    --ignore-not-found --wait=false >/dev/null
   script_file="$(ensure_join_script "${tenant}")"
   log "joining ${name} to ${tenant}"
   docker cp "${script_file}" "${name}:/root/vcluster-join.sh"
   docker exec "${name}" chmod 0700 /root/vcluster-join.sh
-  docker exec "${name}" /root/vcluster-join.sh --node-name "${name}" \
+  docker exec "${name}" /root/vcluster-join.sh \
+    --force-join --node-name "${name}" \
     >"${RUNTIME_DIR}/logs/${name}-join.log" 2>&1 \
     || {
       tail -40 "${RUNTIME_DIR}/logs/${name}-join.log" >&2
@@ -128,32 +128,78 @@ label_tenant_nodes() {
 
 tenant_addons_ready() {
   local tenant="$1"
-  tenant_expected_nodes_ready "${tenant}" \
-    && kubectl_tenant "${tenant}" get storageclass \
-      -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' \
-      | grep -qx true \
-    && kubectl_tenant "${tenant}" -n kube-system get pods --no-headers \
-      | awk 'BEGIN {found=0} /coredns|flannel|kube-proxy|local-path/ {found=1; if ($3 != "Running" && $3 != "Completed") exit 1} END {exit found ? 0 : 1}'
+  tenant_expected_nodes_ready "${tenant}" || return 1
+  kubectl_tenant "${tenant}" get storageclass \
+    -o jsonpath='{range .items[*]}{.metadata.annotations.storageclass\.kubernetes\.io/is-default-class}{"\n"}{end}' \
+    | grep -qx true || return 1
+  kubectl_tenant "${tenant}" -n kube-system get pods -o json \
+    | python3 -c '
+import json, sys
+items=json.load(sys.stdin).get("items", [])
+required=("coredns", "flannel", "kube-proxy", "local-path")
+ready=[]
+for item in items:
+    conditions=item.get("status", {}).get("conditions", [])
+    if any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+        ready.append(item.get("metadata", {}).get("name", ""))
+missing=[name for name in required if not any(name in pod for pod in ready)]
+raise SystemExit(0 if not missing else 1)
+' || return 1
+  kubectl_tenant "${tenant}" -n kube-system get daemonsets -o json \
+    | python3 -c '
+import json, sys
+items=json.load(sys.stdin).get("items", [])
+required=("flannel", "kube-proxy")
+for component in required:
+    matches=[item for item in items if component in item.get("metadata", {}).get("name", "")]
+    if not matches:
+        raise SystemExit(1)
+    status=matches[0].get("status", {})
+    if status.get("desiredNumberScheduled") != status.get("numberReady") or status.get("numberReady", 0) < 1:
+        raise SystemExit(1)
+' || return 1
+  kubectl_tenant "${tenant}" -n kube-system get deployments -o json \
+    | python3 -c '
+import json, sys
+items=json.load(sys.stdin).get("items", [])
+required=("coredns", "local-path")
+for component in required:
+    matches=[item for item in items if component in item.get("metadata", {}).get("name", "")]
+    if not matches or matches[0].get("status", {}).get("availableReplicas", 0) < 1:
+        raise SystemExit(1)
+' || return 1
 }
 
 ensure_tenant_workers() {
-  local tenant index name
+  local tenant index
   for tenant in ${TENANT_NAMES}; do
     if ! tenant_expected_nodes_ready "${tenant}"; then
       for index in $(seq 1 "${WORKERS_PER_TENANT}"); do
-        join_worker "${tenant}" "${index}" \
-          || die "private worker join failed for $(worker_name "${tenant}" "${index}"); container workers are outside vCluster's support matrix"
+        if ! join_worker "${tenant}" "${index}"; then
+          "${REPO_ROOT}/scripts/diagnose.sh" "${tenant}" >&2 || true
+          record_blocker "private-worker-substrate-unsupported" \
+            "The experimental systemd container $(worker_name "${tenant}" "${index}") could not join ${tenant} after supported prerequisites were checked."
+          die "private worker join failed for $(worker_name "${tenant}" "${index}"); container workers are outside vCluster's support matrix"
+        fi
       done
     fi
 
-    retry_for "${NODE_TIMEOUT}" "${tenant} private nodes" \
-      bash -c "KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl wait --for=condition=Ready nodes --all --timeout=20s >/dev/null 2>&1 && [[ \$(KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl get nodes --no-headers | wc -l) -eq ${WORKERS_PER_TENANT} ]]"
+    if ! wait_for "${NODE_TIMEOUT}" "${tenant} private nodes" \
+      bash -c "KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl --request-timeout=30s wait --for=condition=Ready nodes --all --timeout=20s >/dev/null 2>&1 && [[ \$(KUBECONFIG='$(tenant_kubeconfig "${tenant}")' kubectl --request-timeout=30s get nodes --no-headers | wc -l) -eq ${WORKERS_PER_TENANT} ]]"; then
+      "${REPO_ROOT}/scripts/diagnose.sh" "${tenant}" >&2 || true
+      record_blocker "private-worker-substrate-unsupported" \
+        "The experimental systemd workers for ${tenant} did not become Ready within ${NODE_TIMEOUT}."
+      die "${tenant} private nodes did not become Ready"
+    fi
     label_tenant_nodes "${tenant}"
-    retry_for "${ADDON_TIMEOUT}" "${tenant} networking and storage" tenant_addons_ready "${tenant}"
-
     for index in $(seq 1 "${WORKERS_PER_TENANT}"); do
-      name="$(worker_name "${tenant}" "${index}")"
-      retry_for 2m "Platform reachability from ${name}" platform_reachable_from_worker "${name}"
+      worker_services_ready "$(worker_name "${tenant}" "${index}")" \
+        || {
+          record_blocker "private-worker-substrate-unsupported" \
+            "Joined worker services are unhealthy in $(worker_name "${tenant}" "${index}")."
+          die "joined worker services are unhealthy for ${tenant}"
+        }
     done
+    retry_for "${ADDON_TIMEOUT}" "${tenant} networking and storage" tenant_addons_ready "${tenant}"
   done
 }

@@ -76,7 +76,8 @@ idempotent creation, verification, repeated teardown, and preservation of an
 unrelated sentinel container. If Platform Free activation is unavailable, it
 validates the fail-closed blocker and teardown path, writes
 `.tools/cache/e2e-last-result.log`, and exits with status 2 without claiming the
-database checks passed.
+database checks passed. The same blocked result is used for a verified
+unsupported worker-container substrate.
 
 ## Remove
 

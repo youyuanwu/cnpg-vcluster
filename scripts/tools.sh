@@ -9,8 +9,8 @@ require_command curl
 require_command tar
 require_command sha256sum
 
-mkdir -p -m 0700 "${CACHE_DIR}" "${BIN_DIR}"
-chmod 0700 "${CACHE_DIR}" "${BIN_DIR}"
+mkdir -p -m 0700 "${CACHE_DIR}" "${BIN_DIR}" "${TOOLS_TMP_DIR}"
+chmod 0700 "${CACHE_DIR}" "${BIN_DIR}" "${TOOLS_TMP_DIR}"
 
 download_binary() {
   local name="$1"
@@ -20,7 +20,7 @@ download_binary() {
   local destination="${BIN_DIR}/${name}"
   local cache_file="${CACHE_DIR}/${name}-${version}"
 
-  if [[ -x "${destination}" ]] && sha256_check "${expected}" "${destination}"; then
+  if [[ -x "${destination}" ]] && sha256_matches "${expected}" "${destination}"; then
     return
   fi
 

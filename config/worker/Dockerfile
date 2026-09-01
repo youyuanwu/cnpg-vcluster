@@ -13,6 +13,7 @@ RUN apt-get update \
         ethtool \
         gnupg \
         iproute2 \
+        iputils-ping \
         iptables \
         kmod \
         procps \

@@ -8,6 +8,7 @@ RUNTIME_DIR="${REPO_ROOT}/.runtime"
 TOOLS_DIR="${REPO_ROOT}/.tools"
 BIN_DIR="${TOOLS_DIR}/bin"
 CACHE_DIR="${TOOLS_DIR}/cache"
+TOOLS_TMP_DIR="${TOOLS_DIR}/tmp"
 HOST_KUBECONFIG="${RUNTIME_DIR}/kubeconfigs/host.yaml"
 VCLUSTER_CONFIG="${RUNTIME_DIR}/vcluster-config.json"
 
@@ -17,6 +18,7 @@ source "${REPO_ROOT}/config/versions.env"
 source "${REPO_ROOT}/config/settings.env"
 
 export PATH="${BIN_DIR}:${PATH}"
+export TMPDIR="${TOOLS_TMP_DIR}"
 
 log() {
   printf '[cnpg-vcluster] %s\n' "$*"
@@ -67,13 +69,15 @@ host_context() {
 }
 
 kubectl_host() {
-  KUBECONFIG="${HOST_KUBECONFIG}" kubectl --context "$(host_context)" "$@"
+  KUBECONFIG="${HOST_KUBECONFIG}" kubectl \
+    --request-timeout=30s --context "$(host_context)" "$@"
 }
 
 kubectl_tenant() {
   local tenant="$1"
   shift
-  KUBECONFIG="$(tenant_kubeconfig "${tenant}")" kubectl "$@"
+  KUBECONFIG="$(tenant_kubeconfig "${tenant}")" kubectl \
+    --request-timeout=30s "$@"
 }
 
 vcluster_cli() {
@@ -129,4 +133,11 @@ sha256_check() {
   actual="$(sha256sum "${file}" | awk '{print $1}')"
   [[ "${actual}" == "${expected}" ]] \
     || die "checksum mismatch for ${file}: expected ${expected}, got ${actual}"
+}
+
+sha256_matches() {
+  local expected="$1"
+  local file="$2"
+  [[ -f "${file}" ]] \
+    && [[ "$(sha256sum "${file}" | awk '{print $1}')" == "${expected}" ]]
 }

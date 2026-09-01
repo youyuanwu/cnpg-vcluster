@@ -86,6 +86,7 @@ main() {
   ensure_platform
   ensure_tenant_control_planes
   ensure_all_workers
+  ensure_worker_connectivity
   ensure_tenant_workers
 
   for tenant in ${TENANT_NAMES}; do
