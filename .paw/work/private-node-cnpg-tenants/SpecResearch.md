@@ -46,20 +46,26 @@ or independent vind clusters.
 
 ### Question 1: What are the current prerequisites, licensing requirements, and supported installation flow?
 
-**Answer**: Private nodes require vCluster Platform, and Platform free mode is
-explicitly supported. Platform installation requires cluster-admin access,
-Helm 3.10 or later, kubectl, and egress to the Platform licensing service.
-The preferred install flow is `vcluster platform start`; a pinned Helm install
-is also documented. The current stable Platform release is 4.11.2 and the
-current stable vCluster release is 0.36.1.
+**Answer**: Private nodes require vCluster Platform, and Platform Free mode is
+explicitly supported. Private Nodes are not part of unlicensed OSS mode; Free
+mode requires Platform connectivity and interactive account/email activation,
+but no credit card. Platform installation requires cluster-admin access, Helm
+3.10 or later, kubectl, and egress to the Platform licensing service. The
+preferred install flow is `vcluster platform start`; a pinned Helm install is
+also documented. The current stable Platform release is 4.11.2 and the current
+stable vCluster release is 0.36.1.
 
-**Evidence**: vCluster “Private Nodes Quick Start”; Platform “Install with CLI”
-and “Install with Helm”; GitHub release APIs for `loft-sh/loft` and
-`loft-sh/vcluster`, checked 2026-09-01.
+**Evidence**: vCluster “Private Nodes Quick Start” and “Compare open source and
+free tiers”; Platform “Install with CLI” and “Install with Helm”; GitHub
+release APIs for `loft-sh/loft` and `loft-sh/vcluster`, checked 2026-09-01.
+The local Platform 4.11.2 test returned `license limits are exceeded` when the
+first linked private-node tenant was created before Free activation.
 
-**Implications**: Setup must install Platform in kind, use free mode, pin both
-Platform and vCluster versions, and verify administrative and egress
-prerequisites.
+**Implications**: Setup must install Platform in kind, pin Platform and
+vCluster versions, verify administrative and egress prerequisites, and stop
+with explicit activation guidance when Free mode has not yet been activated.
+The activation itself cannot be completed non-interactively without a user's
+email/account action.
 
 ### Question 2: How do private nodes join, and what node requirements apply?
 
@@ -76,8 +82,10 @@ runtime, and swap disabled or explicitly tolerated.
 Nodes”; Kubernetes “Installing kubeadm”.
 
 **Implications**: Each worker container must boot systemd, run nested
-containerd and kubelet, have a unique hostname/MAC, expose required kernel
-features, and pass preflight checks before joining.
+containerd and kubelet, have a unique hostname and MAC, expose required kernel
+features, and pass preflight checks before joining. Docker does not expose the
+host DMI product UUID inside these containers, so join behavior must be
+established by the runtime test rather than assumed.
 
 ### Question 3: Are privileged systemd Docker containers supported private nodes?
 
@@ -218,6 +226,9 @@ each boundary.
 - Whether Loft Router can provide a stable enough Platform endpoint from this
   non-interactive local environment depends on external service availability
   during execution.
+- Private-worker join and database validation remain blocked in the current
+  environment until the self-hosted Platform Free tier is activated through
+  the user/account flow required by upstream.
 
 ## User-Provided External Knowledge
 

@@ -55,6 +55,24 @@ check "no sync configuration exists" \
   not_has_text '^[[:space:]]*sync:' "${REPO_ROOT}"/config/tenants/*.yaml
 check "no Docker/vind tenant driver fallback" \
   bash -c "for file in '${REPO_ROOT}'/scripts/*.sh; do [[ \"\${file##*/}\" == test-static.sh ]] && continue; ! grep -Eq '(--driver[ =]+docker|vind)' \"\$file\" || exit 1; done"
+check "create uses Helm driver only" \
+  has_text 'driver helm' "${REPO_ROOT}/scripts/lib/tenant.sh"
+check "join tokens are not executed as shell command strings" \
+  not_has_text '(eval|bash -c.*join_url|sh -c.*join_url)' "${REPO_ROOT}/scripts/lib/tenant.sh"
+check "worker containers have ownership labels" \
+  has_text 'cnpg-vcluster.role=private-worker' "${REPO_ROOT}/scripts/lib/workers.sh"
+check "worker containers use private cgroup namespace" \
+  has_text 'cgroupns=private' "${REPO_ROOT}/scripts/lib/workers.sh"
+check "worker identities use explicit unique hostnames" \
+  has_text 'hostname' "${REPO_ROOT}/scripts/lib/workers.sh"
+check "all kubeconfig calls are explicit" \
+  not_has_text '(^|[[:space:]])kubectl[[:space:]]' "${REPO_ROOT}/scripts/create.sh"
+check "Platform credentials remain runtime-only" \
+  has_text 'credentials/platform-admin-password' "${REPO_ROOT}/scripts/lib/platform.sh"
+check "forced preflight failure is supported" \
+  has_text 'FORCE_PREFLIGHT_FAILURE' "${REPO_ROOT}/scripts/create.sh"
+check "Free-tier activation failure is explicit" \
+  has_text 'platform-free-tier-activation-required' "${REPO_ROOT}/scripts/lib/tenant.sh"
 check "two CNPG cluster manifests" \
   test "$(find "${REPO_ROOT}/manifests/cnpg" -maxdepth 1 -name 'cluster-tenant-*.yaml' | wc -l)" -eq 2
 check "both CNPG clusters have three instances" \

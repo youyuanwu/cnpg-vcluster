@@ -65,7 +65,7 @@ the worker substrate must remain explicitly experimental.
 ## Phase Status
 
 - [x] **Phase 1: Repository Foundation and Reproducible Inputs** - Add pinned versions, declarative topology/database inputs, tool bootstrap, and static validation.
-- [ ] **Phase 2: Central Platform and Private Worker Bootstrap** - Create kind and Platform, create two linked private-node tenants, and join three exclusive systemd workers to each.
+- [x] **Phase 2: Central Platform and Private Worker Bootstrap** - Create kind and Platform, create two linked private-node tenants, and join three exclusive systemd workers to each.
 - [ ] **Phase 3: Tenant Databases and Lifecycle Operations** - Install tenant-owned CNPG stacks and implement verification, status, failover, and scoped teardown.
 - [ ] **Phase 4: Documentation and End-to-End Validation** - Record the as-built system, update the high-level design, and run the complete local lifecycle.
 
@@ -212,6 +212,9 @@ No unresolved phase candidates.
 - [ ] If the Platform endpoint is unavailable after bounded retries and no
   explicit reachable `PLATFORM_HOST` is supplied, diagnostics record an
   external-endpoint blocker with the same fail-closed, no-fallback contract.
+- [ ] If Platform Free mode has not been activated, setup records
+  `platform-free-tier-activation-required`, explains the upstream account/email
+  requirement, and stops before changing tenancy mode.
 
 ---
 

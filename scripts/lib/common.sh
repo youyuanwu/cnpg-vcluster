@@ -8,6 +8,8 @@ RUNTIME_DIR="${REPO_ROOT}/.runtime"
 TOOLS_DIR="${REPO_ROOT}/.tools"
 BIN_DIR="${TOOLS_DIR}/bin"
 CACHE_DIR="${TOOLS_DIR}/cache"
+HOST_KUBECONFIG="${RUNTIME_DIR}/kubeconfigs/host.yaml"
+VCLUSTER_CONFIG="${RUNTIME_DIR}/vcluster-config.json"
 
 # shellcheck disable=SC1091
 source "${REPO_ROOT}/config/versions.env"
@@ -17,6 +19,7 @@ source "${REPO_ROOT}/config/settings.env"
 export PATH="${BIN_DIR}:${PATH}"
 
 mkdir -p -m 0700 "${RUNTIME_DIR}" "${CACHE_DIR}" "${BIN_DIR}"
+chmod 0700 "${RUNTIME_DIR}" "${CACHE_DIR}" "${BIN_DIR}"
 
 log() {
   printf '[cnpg-vcluster] %s\n' "$*"
@@ -52,7 +55,42 @@ ensure_runtime_layout() {
     "${RUNTIME_DIR}/kubeconfigs" \
     "${RUNTIME_DIR}/credentials" \
     "${RUNTIME_DIR}/join" \
-    "${RUNTIME_DIR}/logs"
+    "${RUNTIME_DIR}/logs" \
+    "${RUNTIME_DIR}/workers"
+  chmod 0700 \
+    "${RUNTIME_DIR}/kubeconfigs" \
+    "${RUNTIME_DIR}/credentials" \
+    "${RUNTIME_DIR}/join" \
+    "${RUNTIME_DIR}/logs" \
+    "${RUNTIME_DIR}/workers"
+}
+
+host_context() {
+  printf 'kind-%s\n' "${KIND_CLUSTER_NAME}"
+}
+
+kubectl_host() {
+  KUBECONFIG="${HOST_KUBECONFIG}" kubectl --context "$(host_context)" "$@"
+}
+
+kubectl_tenant() {
+  local tenant="$1"
+  shift
+  KUBECONFIG="$(tenant_kubeconfig "${tenant}")" kubectl "$@"
+}
+
+vcluster_cli() {
+  vcluster --config "${VCLUSTER_CONFIG}" "$@"
+}
+
+record_blocker() {
+  local code="$1"
+  shift
+  {
+    printf 'code=%s\n' "${code}"
+    printf 'message=%s\n' "$*"
+  } >"${RUNTIME_DIR}/blocker"
+  chmod 0600 "${RUNTIME_DIR}/blocker"
 }
 
 seconds_from_duration() {

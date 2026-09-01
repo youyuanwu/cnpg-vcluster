@@ -269,12 +269,12 @@ Acceptance Scenarios:
   qualified approximation of a supported Linux machine; failure to pass
   private-node bootstrap is a visible unsupported-substrate result, not grounds
   for changing the architecture.
-- If the required Platform endpoint is unavailable or bounded remediation
-  cannot make the private workers Ready, the repository still delivers complete
-  automation and evidence-backed documentation, while recording
-  environment-dependent criteria SC-001 through SC-007, SC-011, and SC-012 as
-  blocked by the external endpoint or unsupported substrate rather than
-  claiming success.
+- If Platform Free activation or the required Platform endpoint is unavailable,
+  or bounded remediation cannot make the private workers Ready, the repository
+  still delivers complete automation and evidence-backed documentation, while
+  recording environment-dependent criteria SC-001 through SC-007, SC-011, and
+  SC-012 as blocked by activation, the external endpoint, or unsupported
+  substrate rather than claiming success.
 
 ## Scope
 
