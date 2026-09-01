@@ -63,6 +63,8 @@ check "both CNPG clusters require hostname anti-affinity" \
   count_equals 2 '^[[:space:]]+podAntiAffinityType: required$' "${REPO_ROOT}"/manifests/cnpg/cluster-tenant-*.yaml
 check "CNPG operator manifest checksum" \
   sha256_check "${CNPG_MANIFEST_SHA256}" "${REPO_ROOT}/manifests/cnpg/operator.yaml"
+check "CNPG operator provenance is pinned" \
+  has_text '^CNPG_MANIFEST_URL=.*/v1\.30\.0/releases/cnpg-1\.30\.0\.yaml$' "${REPO_ROOT}/config/versions.env"
 check "PostgreSQL image digest is pinned" \
   has_text '^POSTGRES_IMAGE=.+@sha256:' "${REPO_ROOT}/config/versions.env"
 check "worker base image digest is pinned" \
