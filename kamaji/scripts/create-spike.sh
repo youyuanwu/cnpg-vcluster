@@ -99,6 +99,7 @@ blocked() {
 
 require_exact_just
 refuse_spike_with_final_state
+require_host_inotify_capacity
 clear_owned_spike_evidence
 trap finish_spike EXIT
 cleanup_spike_resources
@@ -152,7 +153,7 @@ if ! install_spike_storage_addon \
   || ! validate_spike_allocatable \
   || ! verify_spike_addon_images; then
   blocked persistent-worker-storage "${current_rung}" \
-    "default Local Path storage, bound PVC, or allocatable resource cap failed"
+    "add-on image verification, default Local Path storage, bound PVC, or allocatable resource cap failed"
 fi
 delete_spike_storage_writer_pod
 if ! recreate_persistent_spike_worker \

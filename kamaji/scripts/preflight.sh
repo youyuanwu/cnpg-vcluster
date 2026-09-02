@@ -94,6 +94,8 @@ detected_cpus="${KAMAJI_PREFLIGHT_CPU_FIXTURE:-$(docker info --format '{{.NCPU}}
 detected_memory="${KAMAJI_PREFLIGHT_MEMORY_BYTES_FIXTURE:-$(docker info --format '{{.MemTotal}}')}"
 docker_root="$(docker info --format '{{.DockerRootDir}}')"
 detected_storage="${KAMAJI_PREFLIGHT_STORAGE_BYTES_FIXTURE:-$(( $(df -Pk "${docker_root}" | awk 'NR == 2 {print $4}') * 1024 ))}"
+detected_inotify_instances="${KAMAJI_PREFLIGHT_INOTIFY_INSTANCES_FIXTURE:-$(read_inotify_value max_user_instances)}"
+detected_inotify_watches="${KAMAJI_PREFLIGHT_INOTIFY_WATCHES_FIXTURE:-$(read_inotify_value max_user_watches)}"
 
 (( detected_cpus >= MIN_DOCKER_CPUS )) \
   || capacity_failure cpu "requires ${MIN_DOCKER_CPUS}, detected ${detected_cpus}"
@@ -101,6 +103,12 @@ detected_storage="${KAMAJI_PREFLIGHT_STORAGE_BYTES_FIXTURE:-$(( $(df -Pk "${dock
   || capacity_failure memory "requires ${MIN_DOCKER_MEMORY_GIB} GiB, detected $((detected_memory / gib)) GiB"
 (( detected_storage >= MIN_DOCKER_STORAGE_GIB * gib )) \
   || capacity_failure storage "requires ${MIN_DOCKER_STORAGE_GIB} GiB, detected $((detected_storage / gib)) GiB"
+(( detected_inotify_instances >= MIN_INOTIFY_INSTANCES )) \
+  || capacity_failure inotify-instances \
+    "requires ${MIN_INOTIFY_INSTANCES}, detected ${detected_inotify_instances}; run just prepare-host"
+(( detected_inotify_watches >= MIN_INOTIFY_WATCHES )) \
+  || capacity_failure inotify-watches \
+    "requires ${MIN_INOTIFY_WATCHES}, detected ${detected_inotify_watches}; run just prepare-host"
 
 check_network_non_overlap
 
@@ -145,4 +153,4 @@ timeout "$(seconds_from_duration "${PREFLIGHT_PROBE_TIMEOUT}")" \
   || die "Docker cannot run the required privileged cgroup-v2 worker probe"
 trap - EXIT
 
-log "preflight passed: ${detected_cpus} CPUs, $((detected_memory / gib)) GiB Docker memory, $((detected_storage / gib)) GiB Docker storage"
+log "preflight passed: ${detected_cpus} CPUs, $((detected_memory / gib)) GiB Docker memory, $((detected_storage / gib)) GiB Docker storage, inotify instances=${detected_inotify_instances}, watches=${detected_inotify_watches}"

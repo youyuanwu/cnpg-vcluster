@@ -31,6 +31,17 @@ docker ps -a --filter "label=io.x-k8s.kind.cluster=${KIND_CLUSTER_NAME}" --forma
 docker ps -a --filter "$(owned_docker_filter)" --format '{{json .}}'
 docker volume ls --filter "$(owned_docker_filter)" --format '{{.Name}}'
 
+printf '\n== host inotify ==\n'
+printf 'max_user_instances=%s required=%s\n' \
+  "$(read_inotify_value max_user_instances)" "${MIN_INOTIFY_INSTANCES}"
+printf 'max_user_watches=%s required=%s\n' \
+  "$(read_inotify_value max_user_watches)" "${MIN_INOTIFY_WATCHES}"
+if [[ -f "${HOST_SYSCTL_STATE_FILE}" ]]; then
+  printf 'original_values_recorded=yes mode=%s\n' "$(stat -c '%a' "${HOST_SYSCTL_STATE_FILE}")"
+else
+  printf 'original_values_recorded=no\n'
+fi
+
 printf '\n== runtime state (names and modes only) ==\n'
 if [[ -d "${RUNTIME_DIR}" ]]; then
   find "${RUNTIME_DIR}" -printf '%M %P\n' | sort

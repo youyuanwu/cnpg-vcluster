@@ -6,6 +6,7 @@ WORKERS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "${WORKERS_LIB_DIR}/common.sh"
 
 FINAL_WORKER_FAILURE_EVIDENCE=""
+FINAL_WORKER_FAILURE_CODE=""
 
 worker_container_exists() {
   docker container inspect "${SPIKE_WORKER_NAME}" >/dev/null 2>&1
@@ -62,8 +63,14 @@ ensure_spike_volume() {
 
 spike_worker_systemd_ready() {
   local state
-  state="$(docker exec "${SPIKE_WORKER_NAME}" systemctl is-system-running --wait \
-    2>/dev/null || true)"
+  [[ "$(docker container inspect --format '{{.State.Running}}' \
+      "${SPIKE_WORKER_NAME}" 2>/dev/null || true)" == true ]] \
+    || return 1
+  state="$(
+    timeout "$(seconds_from_duration "${SYSTEMD_STATUS_TIMEOUT}")" \
+      docker exec "${SPIKE_WORKER_NAME}" systemctl is-system-running --wait \
+      2>/dev/null || true
+  )"
   grep -Eq 'running|degraded' <<<"${state}"
 }
 
@@ -499,7 +506,14 @@ record_final_worker_ownership() {
 final_worker_systemd_ready() {
   local name="$1"
   local state
-  state="$(docker exec "${name}" systemctl is-system-running --wait 2>/dev/null || true)"
+  [[ "$(docker container inspect --format '{{.State.Running}}' \
+      "${name}" 2>/dev/null || true)" == true ]] \
+    || return 1
+  state="$(
+    timeout "$(seconds_from_duration "${SYSTEMD_STATUS_TIMEOUT}")" \
+      docker exec "${name}" systemctl is-system-running --wait \
+      2>/dev/null || true
+  )"
   grep -Eq 'running|degraded' <<<"${state}"
 }
 
@@ -514,19 +528,63 @@ final_worker_substrate_ready() {
     && [[ -z "$(docker exec "${name}" swapon --show --noheadings 2>/dev/null)" ]]
 }
 
-final_worker_substrate_failure_summary() {
-  local name="$1"
-  local state
-  state="$(docker container inspect "${name}" \
-    --format 'running={{.State.Running}},exit={{.State.ExitCode}},oom={{.State.OOMKilled}},error={{.State.Error}}' \
-    2>/dev/null || printf inspect-unavailable)"
-  printf '%s,systemd=%s,containerd=%s,socket=%s,iptables=%s,swap=%s' \
-    "${state}" \
-    "$(docker exec "${name}" systemctl is-system-running 2>/dev/null || printf unavailable)" \
-    "$(docker exec "${name}" systemctl is-active containerd 2>/dev/null || printf inactive)" \
-    "$(docker exec "${name}" test -S /run/containerd/containerd.sock 2>/dev/null && printf present || printf absent)" \
-    "$(docker exec "${name}" iptables --version >/dev/null 2>&1 && printf present || printf absent)" \
-    "$(docker exec "${name}" swapon --show --noheadings 2>/dev/null | wc -l)"
+sanitize_worker_evidence() {
+  sed -E \
+    -e 's/([a-z0-9]{6})\.[a-z0-9]{16}/REDACTED/g' \
+    -e 's/([Pp]assword|[Tt]oken|[Ss]ecret|[Aa]uthorization)([=:][^[:space:]]+)/\1=REDACTED/g'
+}
+
+capture_final_worker_failure() {
+  local tenant="$1"
+  local ordinal="$2"
+  local attempt="$3"
+  local name state running evidence_file log_tail
+  name="$(worker_name "${tenant}" "${ordinal}")"
+  evidence_file="${RUNTIME_DIR}/logs/${name}-${attempt}.log"
+  state="$(
+    docker container inspect "${name}" \
+      --format 'running={{.State.Running}},exit={{.State.ExitCode}},oom={{.State.OOMKilled}},error={{json .State.Error}}' \
+      2>/dev/null || printf 'inspect-unavailable'
+  )"
+  running="$(docker container inspect "${name}" --format '{{.State.Running}}' 2>/dev/null || true)"
+  {
+    printf 'worker=%s\nattempt=%s\nstate=%s\n' "${name}" "${attempt}" "${state}"
+    printf 'inspect_state='
+    docker container inspect "${name}" --format '{{json .State}}' 2>/dev/null \
+      || printf 'unavailable'
+    printf '\nlogs:\n'
+    docker logs --tail 30 "${name}" 2>&1 || true
+    if [[ "${running}" == true ]]; then
+      printf '\nruntime:\n'
+      printf 'systemd=%s\n' "$(
+        timeout "$(seconds_from_duration "${SYSTEMD_STATUS_TIMEOUT}")" \
+          docker exec "${name}" systemctl is-system-running --wait 2>/dev/null \
+          || printf not-ready
+      )"
+      printf 'containerd=%s\n' "$(
+        docker exec "${name}" systemctl is-active containerd 2>/dev/null \
+          || printf inactive
+      )"
+      printf 'socket=%s\n' "$(
+        docker exec "${name}" test -S /run/containerd/containerd.sock 2>/dev/null \
+          && printf present || printf absent
+      )"
+      printf 'iptables=%s\n' "$(
+        docker exec "${name}" iptables --version >/dev/null 2>&1 \
+          && printf present || printf absent
+      )"
+      printf 'swap_entries=%s\n' "$(
+        docker exec "${name}" swapon --show --noheadings 2>/dev/null | wc -l
+      )"
+    else
+      printf '\nruntime=not-observed-container-not-running\n'
+    fi
+  } | sanitize_worker_evidence | write_secret_file "${evidence_file}"
+  log_tail="$(
+    sed -n '/^logs:$/,$p' "${evidence_file}" | tail -10 \
+      | tr '\n' ' ' | sed -E 's/[[:space:]]+/ /g'
+  )"
+  printf '%s,evidence=%s,log_tail=%s\n' "${state}" "${evidence_file}" "${log_tail:-none}"
 }
 
 start_final_worker_container() {
@@ -568,15 +626,22 @@ start_final_worker_container() {
 start_final_worker_with_retry() {
   local tenant="$1"
   local ordinal="$2"
+  local first_evidence second_evidence
+  FINAL_WORKER_FAILURE_CODE=""
+  FINAL_WORKER_FAILURE_EVIDENCE=""
   if start_final_worker_container "${tenant}" "${ordinal}"; then
     return 0
   fi
-  FINAL_WORKER_FAILURE_EVIDENCE="$(
-    final_worker_substrate_failure_summary "$(worker_name "${tenant}" "${ordinal}")"
-  )"
+  FINAL_WORKER_FAILURE_CODE=worker-substrate
+  first_evidence="$(capture_final_worker_failure "${tenant}" "${ordinal}" first-attempt)"
   remove_final_worker_container "${tenant}" "${ordinal}"
   sleep 2
-  start_final_worker_container "${tenant}" "${ordinal}"
+  if start_final_worker_container "${tenant}" "${ordinal}"; then
+    return 0
+  fi
+  second_evidence="$(capture_final_worker_failure "${tenant}" "${ordinal}" retry)"
+  FINAL_WORKER_FAILURE_EVIDENCE="first_attempt=${first_evidence}; retry=${second_evidence}"
+  return 1
 }
 
 final_worker_node_ready() {
@@ -702,6 +767,8 @@ reconcile_final_worker() {
   local ordinal="$2"
   local name state
   name="$(worker_name "${tenant}" "${ordinal}")"
+  FINAL_WORKER_FAILURE_CODE=""
+  FINAL_WORKER_FAILURE_EVIDENCE=""
   if docker container inspect "${name}" >/dev/null 2>&1; then
     final_worker_owned "${tenant}" "${name}" \
       || die "${tenant}.worker-ownership: refusing same-named unowned container ${name}"
@@ -712,7 +779,6 @@ reconcile_final_worker() {
         >/dev/null 2>&1 || true
       remove_final_worker_container "${tenant}" "${ordinal}"
       if ! start_final_worker_with_retry "${tenant}" "${ordinal}"; then
-        FINAL_WORKER_FAILURE_EVIDENCE="$(final_worker_substrate_failure_summary "${name}")"
         return 1
       fi
     else
@@ -722,7 +788,10 @@ reconcile_final_worker() {
       fi
       wait_for "${WORKER_START_TIMEOUT}" "systemd in ${name}" \
         final_worker_systemd_ready "${name}" || {
-          FINAL_WORKER_FAILURE_EVIDENCE="$(final_worker_substrate_failure_summary "${name}")"
+          FINAL_WORKER_FAILURE_CODE=worker-substrate
+          FINAL_WORKER_FAILURE_EVIDENCE="$(
+            capture_final_worker_failure "${tenant}" "${ordinal}" restart
+          )"
           return 1
         }
       record_final_worker_ownership "${tenant}" "${ordinal}"
@@ -732,26 +801,38 @@ reconcile_final_worker() {
       --ignore-not-found --wait=true --timeout="${WORKER_JOIN_TIMEOUT}" \
       >/dev/null 2>&1 || true
     if ! start_final_worker_with_retry "${tenant}" "${ordinal}"; then
-      FINAL_WORKER_FAILURE_EVIDENCE="$(final_worker_substrate_failure_summary "${name}")"
       return 1
     fi
   fi
 
   tenant_kube_proxy_conntrack_is_zero "${tenant}" || {
+    FINAL_WORKER_FAILURE_CODE=cni-konnectivity
     FINAL_WORKER_FAILURE_EVIDENCE="kube-proxy conntrack.maxPerCore is not 0"
     return 1
   }
   if ! final_worker_node_ready "${tenant}" "${name}"; then
+    FINAL_WORKER_FAILURE_CODE=kubeadm-bootstrap
     if docker exec "${name}" test -f /etc/kubernetes/kubelet.conf \
       || docker exec "${name}" test -f /var/lib/kubelet/config.yaml; then
-      reset_worker_state_for_rejoin "${name}" || return 1
+      if ! reset_worker_state_for_rejoin "${name}"; then
+        FINAL_WORKER_FAILURE_EVIDENCE="${name} kubeadm state reset failed"
+        return 1
+      fi
     fi
     tenant_kubectl "${tenant}" delete node "${name}" \
       --ignore-not-found --wait=true --timeout="${WORKER_JOIN_TIMEOUT}" \
       >/dev/null 2>&1 || true
-    join_final_worker "${tenant}" "${ordinal}" || return 1
+    if ! join_final_worker "${tenant}" "${ordinal}"; then
+      [[ -n "${FINAL_WORKER_FAILURE_EVIDENCE}" ]] \
+        || FINAL_WORKER_FAILURE_EVIDENCE="${name} kubeadm join failed without a parsed error summary"
+      return 1
+    fi
   fi
-  label_final_worker_node "${tenant}" "${name}"
+  if ! label_final_worker_node "${tenant}" "${name}"; then
+    FINAL_WORKER_FAILURE_CODE=kubeadm-bootstrap
+    FINAL_WORKER_FAILURE_EVIDENCE="${name} registered but ownership labels did not reconcile"
+    return 1
+  fi
 }
 
 reconcile_tenant_workers() {

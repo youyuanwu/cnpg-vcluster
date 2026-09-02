@@ -5,7 +5,7 @@
 The lab is a development experiment built from the public Kamaji
 26.8.6-edge source release. Phase 3 retains the healthy management plane and
 adds a fully ephemeral one-control-plane/one-worker compatibility gate for the
-unsupported container worker substrate.
+privileged container worker experiment.
 
 The intended completed topology is one Kubernetes 1.36.4 kind management
 cluster hosting cert-manager, MetalLB, Kamaji, a shared three-member datastore,
@@ -130,17 +130,38 @@ Preflight orders no-mutation checks before the short-lived privileged probe:
 1. exact `just` and lab-local tool versions;
 2. Linux Docker Engine, cgroup v2, and non-rootless operation;
 3. 12 logical CPUs, 24 GiB Docker memory, and 30 GiB Docker storage;
-4. pairwise CIDR and Docker-network non-overlap;
-5. local source, chart, lock, package, and manifest integrity;
-6. deterministic chart rendering and remote digest availability;
-7. a bounded, automatically removed privileged cgroup-v2 probe.
+4. host inotify floors of 1024 instances and 524288 watches;
+5. pairwise CIDR and Docker-network non-overlap;
+6. local source, chart, lock, package, and manifest integrity;
+7. deterministic chart rendering and remote digest availability;
+8. a bounded, automatically removed privileged cgroup-v2 probe.
 
-`MIN_DOCKER_CPUS`, `MIN_DOCKER_MEMORY_GIB`, and `MIN_DOCKER_STORAGE_GIB` are
+`MIN_DOCKER_CPUS`, `MIN_DOCKER_MEMORY_GIB`, `MIN_DOCKER_STORAGE_GIB`,
+`MIN_INOTIFY_INSTANCES`, and `MIN_INOTIFY_WATCHES` are
 intentional environment inputs. Operators may raise them for stricter host
 admission, and the static suite lowers observed fixture capacity to prove each
 threshold rejects before runtime state, a probe, a kind cluster, or any owned
 Docker object changes. Lowering the configured floors weakens the documented
 lab admission model.
+
+All management and nested worker containers run as host root and therefore
+share one initial-user-namespace inotify pool. The management plane alone used
+91 of the host's former 128-instance default; a joined worker adds systemd,
+containerd, kubelet, CNI, Konnectivity, and pod watches. The observed worker
+exit `255` was exactly reproduced by exhausting that pool, while six identical
+workers ran after setting 1024 instances. The 524288 watch floor follows the
+normal multi-node kind recommendation; watches were not the observed binding
+limit, but gating both avoids a predictable second bottleneck.
+
+`just prepare-host` securely records the original values once, raises only
+values below those floors with runtime non-interactive `sudo sysctl -w`, and
+verifies them. If sudo cannot authenticate in a non-interactive session but
+the operator already has Docker-daemon access, the recipe explicitly reports
+and uses a short-lived privileged pinned worker container for the equivalent
+host-global runtime write. It is idempotent, does not persist configuration
+under `/etc`, and is never called implicitly by creation. Phase 6 full
+teardown restores the originals only after every nested worker has been
+removed.
 
 The admission model counts six worker Docker caps (7.5 CPUs and 15 GiB),
 management requests (1.2 CPUs and 2 GiB), and a kind/system reserve (2 CPUs and
@@ -207,10 +228,11 @@ kube-proxy with `conntrack.maxPerCore: 0` before startup, as kind does for
 container nodes. Phase 4 implements that path without replacing kube-proxy or
 Calico. Kamaji's `spec.addons.kubeProxy` image repository/tag fields do not
 directly expose the setting, and an unpaused ConfigMap patch is reverted within
-two seconds. The lab uses Kamaji's pause annotation, patches the generated
+two seconds. The lab temporarily uses Kamaji's pause annotation, patches the generated
 ConfigMap through the explicit tenant kubeconfig, verifies the exact value
-immediately and after ten seconds, and only then joins workers. Teardown
-unpauses reconciliation before TCP deletion.
+immediately and after ten seconds, and only then joins workers. Successful
+creation removes the pause after worker, add-on, and storage validation and
+rechecks both TCPs and tenant health. Teardown also unpauses before deletion.
 
 The TCP explicitly selects digest-pinned `KONNECTIVITY_AGENT_IMAGE` and
 `KONNECTIVITY_SERVER_IMAGE` by splitting each valid `tag@digest` reference
@@ -235,7 +257,7 @@ certificate and performs exact prefix/user/role deletion before rechecking
 `DataStore/default` health. Only result/blocker evidence and the healthy
 management plane remain.
 
-## Fixed final topology and current result
+## Fixed final topology
 
 The final configuration declares exactly two one-replica TCPs:
 
@@ -262,15 +284,23 @@ worker recreation/rejoin. Node capacity still reflects the shared host, so
 the enforced capacity contract sums scheduled pod requests per node and
 compares them with each `1.25` CPU/`2560MiB` Docker cap.
 
-Repeated full-topology runs stop at `tenant-a-workers`. Both TCPs are Ready
-and worker 1 joins; worker 2 then exits before systemd becomes ready with
-Docker state `running=false,exit=255,oom=false`. Two unjoined workers, one TCP
-plus one joined/one unjoined worker, and two TCPs without joined workers were
-isolated successfully, making this the first observed final prerequisite.
-One recreate/retry repeats the exit. The recognized exit `2` path removes
-every final TCP, namespace, datastore prefix/user/role and credential,
-kubeconfig, worker, volume, smoke object, and tenant runtime subtree, retaining
-only healthy management and mode-0600 evidence.
+The former worker-2 Docker state
+`running=false,exit=255,oom=false,error=` was host inotify-instance exhaustion
+at systemd startup. It was not an OOM, CPU/memory/storage capacity failure, or
+proof of an unsupported substrate. Worker failures now record sanitized
+mode-`0600` Docker inspect state and log tails before removal; systemd and
+runtime probes are attempted only while the container is running. The one
+bounded retry deliberately retains the owned `/var/lib` volume.
+
+The prepared-host validation completed an initial create, an idempotent repeat
+with all six container IDs unchanged, and a missing-worker recovery where only
+`kamaji-tenant-b-worker-2` received a new container ID. Both TCPs were Ready
+and unpaused; both APIs exposed three Ready disjoint workers; CoreDNS,
+kube-proxy, Konnectivity, Calico, Local Path, and both smoke PVCs were healthy.
+Kamaji subsequently renders the kube-proxy ConfigMap field back to its default
+`null` value after unpausing, without restarting the healthy DaemonSet. A later
+create or recovery temporarily reapplies and verifies zero before starting or
+joining workers.
 
 ## Version summary
 

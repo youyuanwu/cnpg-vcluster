@@ -8,10 +8,11 @@ artifact. The edge channel is experimental; CLASTIX's stable artifact channel
 is not freely downloadable.
 
 The permanent compatibility gate uses one spike-only hosted control plane and
-worker. Phase 4 adds the fixed two-tenant/six-worker topology and the scoped
-kube-proxy remediation. The spike now passes every networking and persistence
-rung; this host blocks while scaling the final topology to its second worker,
-then removes all final tenant state.
+worker. Phase 4 adds the fixed two-tenant/six-worker topology, the scoped
+kube-proxy remediation, and explicit host inotify admission. The previously
+observed worker exit `255` was host `fs.inotify.max_user_instances=128`
+exhaustion during systemd startup, not evidence that the worker substrate or
+host capacity was unsupported.
 
 ## Prerequisites
 
@@ -19,6 +20,10 @@ then removes all final tenant state.
   containers.
 - At least 12 logical CPUs, 24 GiB of Docker memory, and 30 GiB free in
   Docker's storage filesystem.
+- Host inotify limits of at least `fs.inotify.max_user_instances=1024` and
+  `fs.inotify.max_user_watches=524288`. The instance floor is proven for the
+  management node plus six workers; the watch floor is the standard
+  multi-node kind recommendation and avoids the paired watch bottleneck.
 - `curl`, `git`, `python3`, `sha256sum`, `tar`, GNU `timeout`, and the Docker
   buildx plugin.
 - Host-installed `just` **1.58.0**. The lab never downloads, installs, or
@@ -44,6 +49,7 @@ extracted binary after installation.
 
 ```bash
 just tools
+just prepare-host
 just preflight
 just create-management
 just spike
@@ -52,6 +58,7 @@ just create
 just status
 just diagnose all
 just test-static
+just test-inotify-negative
 ```
 
 `just tools` installs checksum-verified kind 0.33.0, kubectl 1.36.4, and Helm
@@ -60,13 +67,26 @@ release tag/source/lock; places the exact kamaji-etcd 0.15.0 dependency beside
 the source chart; and renders a digest-only transitive image inventory. It
 does not install `just`.
 
-`just preflight` validates tools, Linux Docker, cgroup v2, capacity, network
+`just prepare-host` records the current two inotify values once in ignored,
+mode-`0600` runtime state, raises only values below the required floors with
+non-interactive `sudo sysctl -w`, and verifies the result. In a non-interactive
+lab session without cached sudo credentials, membership in the Docker group
+allows the same runtime-only write through a short-lived privileged pinned
+worker container; the recipe reports that fallback explicitly. It is
+idempotent and does not create persistent `/etc/sysctl.d` configuration.
+Phase 6 full teardown restores the recorded originals only after all nested
+workers are gone. Creation never changes host sysctls implicitly.
+
+`just preflight` validates tools, Linux Docker, cgroup v2, CPU/memory/storage
+capacity, both inotify floors, network
 overlap, prepared checksums, remote image digests, and a short-lived
 privileged-container probe. It creates no kind cluster, tenant, credential, or
 retained Docker resource. `MIN_DOCKER_CPUS`, `MIN_DOCKER_MEMORY_GIB`, and
-`MIN_DOCKER_STORAGE_GIB` are intentional environment inputs for operators who
+`MIN_DOCKER_STORAGE_GIB`, `MIN_INOTIFY_INSTANCES`, and
+`MIN_INOTIFY_WATCHES` are intentional environment inputs for operators who
 want stricter admission and for deterministic rejection tests; lowering them
-weakens the documented lab admission floor.
+weakens the documented lab admission floor. `just test-inotify-negative`
+proves both inotify failures occur before any retained mutation.
 
 `just create-management` creates or reconciles only the management plane. It
 records the exact kind node container identity before later adoption, derives
@@ -108,12 +128,13 @@ missing privilege are not the cause. The implemented remediation configures
 kube-proxy with `conntrack.maxPerCore: 0` before it starts, matching kind's
 container-node behavior. Kamaji's
 `spec.addons.kubeProxy` fields select the image repository and tag but do not
-directly expose this setting. The lab therefore pauses TCP reconciliation,
+directly expose this setting. The lab therefore temporarily pauses TCP reconciliation,
 patches only the generated kube-proxy ConfigMap through the explicit tenant
 kubeconfig, verifies the value immediately and after ten seconds, and performs
 all worker joins afterward. An unpaused probe reverted the value within two
-seconds; the paused value remained throughout the passing spike. kube-proxy
-stays enabled and Calico is unchanged.
+seconds, so the create path holds the pause through worker/add-on validation,
+then removes it before reporting success. kube-proxy stays enabled and Calico
+is unchanged.
 
 `just create` reuses only that current passing compatibility revision, removes
 and verifies every spike residual, checks that borrowed VIPs and datastore
@@ -124,13 +145,24 @@ Workers and volumes have exact ownership labels, persistent `/var/lib`,
 same-name refusal, stopped/stale handling, partial rejoin, and short-lived
 token cleanup.
 
-On the current host, repeated final runs reach the exact first failing
-prerequisite `tenant-a-workers`: with both TCPs present and worker 1 joined,
-worker 2 exits during systemd startup with
-`running=false,exit=255,oom=false`. One bounded recreate/retry produces the
-same result. Exit `2` cleanup removes both TCPs/namespaces/schemas/credentials,
-all kubeconfigs, workers, tenant volumes, and tenant runtime subtrees. Only the
-healthy management plane and blocker/result evidence remain.
+Validated Phase 4 runs leave exactly two Ready, unpaused TCPs, three disjoint
+Ready workers per tenant, healthy CoreDNS/kube-proxy/Konnectivity/Calico,
+one default Local Path class, and a Bound smoke PVC per tenant. Repeating
+`just create` replaces no healthy worker. Removing one owned worker and
+rerunning create restores only that worker while retaining its owned volume.
+
+The former `tenant-a-workers` exit `255` was reproduced by exhausting the
+host-root inotify instance pool and eliminated by raising
+`max_user_instances` to `1024`. Failed worker starts now preserve sanitized
+mode-`0600` Docker inspect state and log tails before cleanup; runtime/systemd
+probes run only for a live container. The bounded retry reuses the owned
+`/var/lib` volume rather than recreating it.
+
+Kamaji restores its generated kube-proxy ConfigMap default after the final
+unpause (reported as `null` by status). The already-running kube-proxy
+DaemonSets remain Ready. Every create/recovery run temporarily reapplies and
+verifies `maxPerCore: 0` before any worker start or join, then validates tenant
+health before unpausing.
 
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and
@@ -144,7 +176,7 @@ residual checks.
 Generated content is confined to ignored `.tools/` and `.runtime/`
 directories. Shell entry points use `umask 077`; state directories use mode
 `0700`; kubeconfigs and credentials use mode `0600`; and Kubernetes wrappers
-always select an explicit kubeconfig. Waits and network operations are finite
+always select an explicit kubeconfig. Waits, including `systemctl is-system-running --wait`, and network operations are finite
 and configurable through `config/settings.env`.
 
 Exit status `0` means success, `1` means an ordinary error or unhealthy state,

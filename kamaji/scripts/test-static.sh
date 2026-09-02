@@ -75,6 +75,12 @@ capacity_fixture_rejects() {
     && [[ "$("${BIN_DIR}/kind" get clusters 2>/dev/null | sort || true)" == "${before_clusters}" ]]
 }
 
+inotify_watch_fixture_rejects() {
+  KAMAJI_PREFLIGHT_INOTIFY_INSTANCES_FIXTURE="${MIN_INOTIFY_INSTANCES}" \
+    capacity_fixture_rejects INOTIFY_WATCHES_FIXTURE \
+      "$((MIN_INOTIFY_WATCHES - 1))" inotify-watches
+}
+
 command_returns_one() {
   set +e
   "$@" >/dev/null 2>&1
@@ -285,7 +291,7 @@ done
 
 check "complete just task surface" bash -c '
   tasks="$(just --justfile "$1" --list --unsorted)"
-  for task in tools preflight create-management spike destroy-spike create status diagnose verify destroy-tenant destroy test-static test-e2e; do
+  for task in tools preflight prepare-host create-management spike destroy-spike create status diagnose verify destroy-tenant destroy test-static test-inotify-negative test-e2e; do
     grep -Eq "^    ${task}([[:space:]]|$)" <<<"${tasks}" || exit 1
   done
 ' _ "${LAB_ROOT}/Justfile"
@@ -453,7 +459,9 @@ check "capacity thresholds are exact" bash -c '
   source "$1/config/settings.env"
   [[ "$MIN_DOCKER_CPUS" == 12 &&
      "$MIN_DOCKER_MEMORY_GIB" == 24 &&
-     "$MIN_DOCKER_STORAGE_GIB" == 30 ]]
+     "$MIN_DOCKER_STORAGE_GIB" == 30 &&
+     "$MIN_INOTIFY_INSTANCES" == 1024 &&
+     "$MIN_INOTIFY_WATCHES" == 524288 ]]
 ' _ "${LAB_ROOT}"
 check "spike control-plane resource split matches aggregate budget" bash -c '
   source "$1/config/settings.env"
@@ -476,6 +484,27 @@ check "memory threshold fixture rejects before mutation" \
   capacity_fixture_rejects MEMORY_BYTES_FIXTURE $((23 * 1024 * 1024 * 1024)) memory
 check "storage threshold fixture rejects before mutation" \
   capacity_fixture_rejects STORAGE_BYTES_FIXTURE $((29 * 1024 * 1024 * 1024)) storage
+check "inotify instance threshold fixture rejects before mutation" \
+  capacity_fixture_rejects INOTIFY_INSTANCES_FIXTURE 1023 inotify-instances
+check "inotify watch threshold fixture rejects before mutation" \
+  inotify_watch_fixture_rejects
+
+check "host preparation records applies verifies and exposes Phase 6 restore" bash -c '
+  file="$1/scripts/lib/host.sh"
+  grep -Fq "HOST_SYSCTL_STATE_FILE" "$file" &&
+  grep -Fq "record_original_inotify_values" "$file" &&
+  grep -Fq "sudo sysctl -q -w" "$file" &&
+  grep -Fq "require_host_inotify_capacity" "$file" &&
+  grep -Fq "restore_recorded_inotify_values" "$file" &&
+  grep -Fq "host inotify values cannot be restored while nested workers exist" "$file" &&
+  grep -Fq "rm -f \"\${HOST_SYSCTL_STATE_FILE}\"" "$file" &&
+  ! grep -R -F "sysctl -q -w" "$1/scripts/create.sh" "$1/scripts/create-spike.sh" "$1/scripts/preflight.sh"
+' _ "${LAB_ROOT}"
+check "negative inotify fixture recipe is static and non-mutating" bash -c '
+  grep -Fq "KAMAJI_PREFLIGHT_INOTIFY_INSTANCES_FIXTURE" "$1/scripts/test-inotify-negative.sh" &&
+  grep -Fq "KAMAJI_PREFLIGHT_INOTIFY_WATCHES_FIXTURE" "$1/scripts/test-inotify-negative.sh" &&
+  grep -Fq "KAMAJI_PREFLIGHT_FORBID_MUTATION_FIXTURE=1" "$1/scripts/test-inotify-negative.sh"
+' _ "${LAB_ROOT}"
 
 check "finite timeout declarations are environment-overridable" bash -c '
   export DOWNLOAD_TIMEOUT=37s
@@ -736,7 +765,24 @@ check "kube-proxy remediation is pre-join and proves non-reversion" bash -c '
   grep -Fq "immediate_reversion=not-observed" "$tenant_file" &&
   patch_line="$(grep -n "configure_tenant_kube_proxy_conntrack" "$create_file" | tail -1 | cut -d: -f1)" &&
   worker_line="$(grep -n "reconcile_tenant_workers" "$create_file" | tail -1 | cut -d: -f1)" &&
-  (( patch_line < worker_line ))
+  unpause_line="$(grep -n "unpause_tenant_reconciliation" "$create_file" | tail -1 | cut -d: -f1)" &&
+  (( patch_line < worker_line && worker_line < unpause_line )) &&
+  grep -Fq "tenant_reconciliation_is_unpaused" "$create_file"
+' _ "${LAB_ROOT}"
+check "worker failures preserve observed inspect and log evidence" bash -c '
+  file="$1/scripts/lib/workers.sh"
+  grep -Fq "docker container inspect" "$file" &&
+  grep -Fq "docker logs --tail 30" "$file" &&
+  grep -Fq "runtime=not-observed-container-not-running" "$file" &&
+  grep -Fq "write_secret_file \"\${evidence_file}\"" "$file" &&
+  grep -Fq "FINAL_WORKER_FAILURE_CODE=cni-konnectivity" "$file" &&
+  grep -Fq "FINAL_WORKER_FAILURE_CODE=kubeadm-bootstrap" "$file" &&
+  ! grep -Fq "FINAL_WORKER_FAILURE_EVIDENCE\" == *\"running=false\"" "$1/scripts/create.sh"
+' _ "${LAB_ROOT}"
+check "systemd wait probes consume a finite configured timeout" bash -c '
+  grep -Fq "SYSTEMD_STATUS_TIMEOUT" "$1/config/settings.env" &&
+  [[ "$(grep -c "seconds_from_duration.*SYSTEMD_STATUS_TIMEOUT" "$1/scripts/lib/workers.sh")" -ge 3 ]] &&
+  [[ "$(grep -c "State.Running" "$1/scripts/lib/workers.sh")" -ge 3 ]]
 ' _ "${LAB_ROOT}"
 check "final create reuses compatibility and rejects every spike residual" bash -c '
   file="$1/scripts/create.sh"

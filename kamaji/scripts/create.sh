@@ -209,6 +209,7 @@ assert actual == expected
 }
 
 require_exact_just
+require_host_inotify_capacity
 trap finish_final_create EXIT
 reconcile_management_plane
 load_management_network
@@ -241,13 +242,8 @@ final_tenant_b_ca_sha256="$(tenant_ca_fingerprint tenant-b)"
 for tenant in ${TENANT_NAMES}; do
   log "reconciling ${WORKERS_PER_TENANT} workers for ${tenant}"
   if ! reconcile_tenant_workers "${tenant}"; then
-    worker_blocker_code=kubeadm-bootstrap
-    if [[ "${FINAL_WORKER_FAILURE_EVIDENCE}" == *"running=false"* \
-      || "${FINAL_WORKER_FAILURE_EVIDENCE}" == *"systemd="* ]]; then
-      worker_blocker_code=worker-substrate
-    fi
-    blocked_final "${worker_blocker_code}" "${tenant}-workers" \
-      "${tenant} worker substrate or kubeadm join did not converge: ${FINAL_WORKER_FAILURE_EVIDENCE:-no kubeadm error summary}"
+    blocked_final "${FINAL_WORKER_FAILURE_CODE:-worker-substrate}" "${tenant}-workers" \
+      "${tenant} worker reconciliation did not converge: ${FINAL_WORKER_FAILURE_EVIDENCE:-no observed failure evidence}"
   fi
 done
 
@@ -265,4 +261,21 @@ if ! (validate_exact_final_topology); then
   blocked_final worker-substrate final-topology \
     "exact two-TCP, two-schema, six-worker isolation or storage topology did not validate"
 fi
+for tenant in ${TENANT_NAMES}; do
+  unpause_tenant_reconciliation "${tenant}"
+  wait_for "${TENANT_CONTROL_PLANE_TIMEOUT}" "${tenant} unpaused reconciliation" \
+    final_tenant_tcp_ready "${tenant}" \
+    || die "${tenant}.control-plane: did not remain Ready after unpausing reconciliation"
+  tenant_reconciliation_is_unpaused "${tenant}" \
+    || die "${tenant}.control-plane: reconciliation remains paused after successful create"
+  tenant_workers_ready "${tenant}" \
+    && final_tenant_deployment_ready "${tenant}" kube-system coredns \
+    && final_tenant_daemonset_ready "${tenant}" kube-system kube-proxy \
+    && final_tenant_daemonset_ready "${tenant}" kube-system konnectivity-agent \
+    && final_tenant_calico_ready "${tenant}" \
+    && final_tenant_local_path_ready "${tenant}" \
+    && [[ "$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
+      -o jsonpath='{.status.phase}')" == Bound ]] \
+    || die "${tenant}.health: workers, add-ons, or storage became unhealthy after unpausing"
+done
 log "two tenant control planes, six exclusive workers, and tenant add-ons are healthy"

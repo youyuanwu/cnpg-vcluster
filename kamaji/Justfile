@@ -11,6 +11,10 @@ tools:
 preflight:
     @scripts/preflight.sh
 
+# Record and raise only the runtime inotify limits required by this lab.
+prepare-host:
+    @scripts/prepare-host.sh
+
 # Create or reconcile only the management plane.
 create-management:
     @scripts/create-management.sh
@@ -50,6 +54,10 @@ destroy:
 # Run static invariants for implemented phases.
 test-static:
     @scripts/test-static.sh
+
+# Prove both inotify admission gates reject before mutation.
+test-inotify-negative:
+    @scripts/test-inotify-negative.sh
 
 # Run lifecycle coverage (implemented in Phase 6).
 test-e2e:

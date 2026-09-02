@@ -520,7 +520,7 @@ open(path, "w", encoding="utf-8").write(json.dumps(data))
   {
     printf 'compatibility_revision=%s\n' "${COMPATIBILITY_REVISION}"
     printf 'conntrack_max_per_core=%s\n' "${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}"
-    printf 'kamaji_reconciliation=paused\n'
+    printf 'kamaji_reconciliation=temporarily-paused\n'
     printf 'immediate_reversion=not-observed\n'
   } | write_secret_file "$(tenant_kube_proxy_evidence "${tenant}")"
 }
@@ -536,6 +536,15 @@ unpause_tenant_reconciliation() {
       kamaji.cnpg-vcluster.io/kube-proxy-remediation- \
       >/dev/null 2>&1 || true
   fi
+}
+
+tenant_reconciliation_is_unpaused() {
+  local tenant="$1"
+  local namespace paused
+  namespace="$(tenant_namespace "${tenant}")"
+  paused="$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
+    -o jsonpath='{.metadata.annotations.kamaji\.clastix\.io/paused}' 2>/dev/null || true)"
+  [[ -z "${paused}" || "${paused}" == false ]]
 }
 
 datastore_used_by_tenant() {

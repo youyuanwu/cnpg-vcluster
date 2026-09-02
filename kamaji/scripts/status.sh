@@ -55,6 +55,23 @@ else
   unhealthy "Docker Engine is unavailable"
 fi
 
+section "host inotify"
+inotify_instances="$(read_inotify_value max_user_instances)"
+inotify_watches="$(read_inotify_value max_user_watches)"
+printf 'max_user_instances: %s (required: %s)\n' \
+  "${inotify_instances}" "${MIN_INOTIFY_INSTANCES}"
+printf 'max_user_watches: %s (required: %s)\n' \
+  "${inotify_watches}" "${MIN_INOTIFY_WATCHES}"
+(( inotify_instances >= MIN_INOTIFY_INSTANCES )) \
+  || unhealthy "host inotify instance limit is below the required floor"
+(( inotify_watches >= MIN_INOTIFY_WATCHES )) \
+  || unhealthy "host inotify watch limit is below the required floor"
+if [[ -f "${HOST_SYSCTL_STATE_FILE}" ]]; then
+  printf 'original values: recorded in secure runtime state\n'
+else
+  printf 'original values: not recorded\n'
+fi
+
 section "management ownership and network"
 if [[ -f "${MANAGEMENT_OWNERSHIP_FILE}" ]]; then
   recorded_name="$(sed -n 's/^KIND_NODE_NAME=//p' "${MANAGEMENT_OWNERSHIP_FILE}")"
@@ -263,6 +280,10 @@ if [[ -f "${FINAL_RESULT_FILE}" ]] \
   [[ "${final_tcp_count}" -eq 2 ]] || unhealthy "passing final result lacks exactly two TCPs"
   [[ "${final_worker_count}" -eq 6 ]] || unhealthy "passing final result lacks exactly six workers"
   [[ "${final_volume_count}" -eq 6 ]] || unhealthy "passing final result lacks exactly six volumes"
+  for tenant in ${TENANT_NAMES}; do
+    tenant_reconciliation_is_unpaused "${tenant}" \
+      || unhealthy "${tenant} reconciliation is paused after successful create"
+  done
 elif [[ -f "${FINAL_RESULT_FILE}" ]] \
   && grep -Fxq 'result=blocked' "${FINAL_RESULT_FILE}"; then
   [[ "${final_tcp_count}" -eq 0 ]] || unhealthy "blocked final result retains TCPs"

@@ -18,6 +18,7 @@ MANAGEMENT_KUBECONFIG="${RUNTIME_DIR}/kubeconfigs/management.yaml"
 BLOCKER_FILE="${RUNTIME_DIR}/blocker"
 SPIKE_RESULT_FILE="${RUNTIME_DIR}/spike-result.env"
 FINAL_RESULT_FILE="${RUNTIME_DIR}/final-result.env"
+HOST_SYSCTL_STATE_FILE="${RUNTIME_DIR}/host/inotify-original.env"
 SPIKE_RUNTIME_DIR="${RUNTIME_DIR}/tenants/spike"
 SPIKE_RENDERED_MANIFEST="${SPIKE_RUNTIME_DIR}/tenantcontrolplane.yaml"
 SPIKE_WORKER_OWNERSHIP_FILE="${SPIKE_RUNTIME_DIR}/worker.env"
@@ -119,11 +120,34 @@ ensure_runtime_layout() {
     "${RUNTIME_DIR}" \
     "${RUNTIME_DIR}/kubeconfigs" \
     "${RUNTIME_DIR}/logs" \
+    "${RUNTIME_DIR}/host" \
     "${RUNTIME_DIR}/management" \
     "${RUNTIME_DIR}/network" \
     "${RUNTIME_DIR}/rendered" \
     "${RUNTIME_DIR}/tenants"
   find "${RUNTIME_DIR}" -type d -exec chmod 0700 {} +
+}
+
+read_inotify_value() {
+  local name="$1"
+  cat "/proc/sys/fs/inotify/${name}"
+}
+
+inotify_values_are_sufficient() {
+  local instances watches
+  instances="${KAMAJI_PREFLIGHT_INOTIFY_INSTANCES_FIXTURE:-$(read_inotify_value max_user_instances)}"
+  watches="${KAMAJI_PREFLIGHT_INOTIFY_WATCHES_FIXTURE:-$(read_inotify_value max_user_watches)}"
+  (( instances >= MIN_INOTIFY_INSTANCES && watches >= MIN_INOTIFY_WATCHES ))
+}
+
+require_host_inotify_capacity() {
+  local instances watches
+  instances="$(read_inotify_value max_user_instances)"
+  watches="$(read_inotify_value max_user_watches)"
+  (( instances >= MIN_INOTIFY_INSTANCES )) \
+    || die "capacity.inotify-instances: requires ${MIN_INOTIFY_INSTANCES}, detected ${instances}; run just prepare-host"
+  (( watches >= MIN_INOTIFY_WATCHES )) \
+    || die "capacity.inotify-watches: requires ${MIN_INOTIFY_WATCHES}, detected ${watches}; run just prepare-host"
 }
 
 write_secret_file() {
