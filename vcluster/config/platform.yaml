@@ -1,0 +1,12 @@
+# vCluster Platform's hosted Loft Router supplies the default HTTPS endpoint
+# used by private-node VPN. PLATFORM_HOST can select a separately managed
+# reachable endpoint.
+env:
+  DISABLE_LOFT_ROUTER: "false"
+resources:
+  requests:
+    cpu: 500m
+    memory: 512Mi
+  limits:
+    cpu: "2"
+    memory: 2Gi
