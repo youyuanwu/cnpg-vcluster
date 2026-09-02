@@ -55,6 +55,7 @@ just create-management
 just spike
 just destroy-spike
 just create
+just verify
 just status
 just diagnose all
 just test-static
@@ -145,7 +146,10 @@ and Calico is unchanged.
 and verifies every spike residual, checks that borrowed VIPs and datastore
 identities are free, then reconciles `tenant-a` and `tenant-b`, three exclusive
 workers each, independently rendered Calico and Local Path resources, DNS,
-Service routing, endpoint reachability, and one bound smoke PVC per tenant.
+Service routing, endpoint reachability, one bound smoke PVC per tenant, and
+independent CloudNativePG 1.30.0 operators with three PostgreSQL 18.4
+instances per tenant. Set `SKIP_CNPG=1` only when intentionally reconciling
+the worker/add-on layers without installing or changing database resources.
 Workers and volumes have exact ownership labels, persistent `/var/lib`,
 same-name refusal, stopped/stale handling, partial rejoin, and short-lived
 token cleanup.
@@ -171,6 +175,15 @@ waits for its replacement to become Ready, rejects the original
 `nf_conntrack_max` permission crash, and proves the ConfigMap remains
 `maxPerCore: 0` while the TCP stays paused.
 
+`just verify` checks exact management/TCP/schema/worker ownership, confirms no
+tenant CNPG or database storage resource appears through the management API,
+and validates one operator, one Cluster, three distinct PostgreSQL placements,
+three claims, and three volumes per tenant. It writes distinct SQL markers,
+proves both Kubernetes and PostgreSQL credentials are rejected by the opposite
+tenant without mistaking connectivity failure for authentication rejection,
+then exercises replica replacement with PVC/PV reuse and primary failover with
+retained data.
+
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and
 tenant-control-plane/spike layers without exporting credentials or reconciling
@@ -179,6 +192,9 @@ endpoints, kube-proxy configuration, worker counts, Ready replica counts for
 CoreDNS, kube-proxy, Konnectivity, Calico, and Local Path, storage classes,
 smoke PVCs, and blocked residual checks. They exit unhealthy when an expected
 replica, pause, patch, or storage gate is absent.
+Healthy tenant views also report CNPG CRDs, webhooks, RBAC, operator image and
+readiness, PostgreSQL services and primary, instance placements, PVCs, PVs,
+and recent database events.
 
 ## Security and state
 

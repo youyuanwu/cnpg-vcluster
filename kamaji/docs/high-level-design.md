@@ -121,7 +121,9 @@ Read-only status and diagnostics do not create `.runtime`, export credentials,
 start containers, or reconcile resources. They report only tool metadata,
 Docker metadata, owned resource names/status, runtime filenames/modes, blocker
 records, and API state reachable through an already existing explicit
-kubeconfig.
+kubeconfig. Tenant views include CNPG CRDs, webhooks, RBAC, controller image
+and readiness, PostgreSQL services and primary, instance placement, PVC/PV
+state, and recent operator/database events.
 
 ## Preflight and capacity
 
@@ -285,9 +287,26 @@ CIDR and `/var/lib/kamaji-local-path/<tenant>` root.
 
 The remediated one-worker ladder passes CNI, DNS/Service routing, endpoint
 reachability, a bound Local Path PVC, and marker persistence after an owned
-worker recreation/rejoin. Node capacity still reflects the shared host, so
+worker recreation/rejoin. Full creation then installs the checksum-verified
+CNPG 1.30.0 manifest independently through each tenant API, substitutes only
+the approved controller digest in memory, and creates one tenant-specific
+three-instance PostgreSQL 18.4 Cluster. Required hostname anti-affinity spreads
+each cluster across its three exclusive workers; each instance requests
+`100m/256Mi`, is limited to `1 CPU/1Gi`, and owns a tenant-local `1Gi` claim.
+Node capacity still reflects the shared host, so
 the enforced capacity contract sums scheduled pod requests per node and
 compares them with each `1.25` CPU/`2560MiB` Docker cap.
+
+The behavioral verifier proves that the management API owns only the hosted
+control planes and none of either tenant's CNPG or database resources. For
+Kubernetes identity checks it combines each source tenant's client credentials
+with the opposite tenant's already verified endpoint and CA, requiring an
+authentication rejection rather than accepting a network failure. PostgreSQL
+negative checks likewise use a reachable target-tenant client with the source
+tenant's transient password and require database authentication rejection.
+Distinct markers must survive replica replacement with the same PVC/PV and
+deletion of each current primary followed by promotion of a different
+instance.
 
 The former worker-2 Docker state
 `running=false,exit=255,oom=false,error=` was host inotify-instance exhaustion

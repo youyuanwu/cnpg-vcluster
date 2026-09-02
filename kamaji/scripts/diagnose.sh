@@ -10,6 +10,8 @@ source "${SCRIPT_DIR}/lib/tenants.sh"
 source "${SCRIPT_DIR}/lib/workers.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/addons.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/cnpg.sh"
 
 health="${EXIT_SUCCESS}"
 
@@ -203,6 +205,28 @@ for tenant in ${TENANT_NAMES}; do
       [[ "$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
         -o jsonpath='{.status.phase}' 2>/dev/null || true)" == Bound ]] \
         || unhealthy "${tenant} smoke PVC is not Bound"
+      printf '\n== %s CloudNativePG and PostgreSQL ==\n' "${tenant}"
+      tenant_kubectl "${tenant}" get crd \
+        -o name 2>/dev/null | grep 'postgresql.cnpg.io' || true
+      tenant_kubectl "${tenant}" get \
+        mutatingwebhookconfigurations,validatingwebhookconfigurations \
+        2>/dev/null | grep cnpg || true
+      tenant_kubectl "${tenant}" get clusterroles,clusterrolebindings \
+        2>/dev/null | grep cnpg || true
+      tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" get \
+        deployments,pods,services,endpoints,serviceaccounts -o wide 2>/dev/null || true
+      tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" get \
+        clusters.postgresql.cnpg.io,pods,services,endpoints,pvc -o wide \
+        2>/dev/null || true
+      tenant_kubectl "${tenant}" get pv -o wide 2>/dev/null || true
+      tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" get events \
+        --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -30 || true
+      tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" get events \
+        --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -50 || true
+      cnpg_operator_ready "${tenant}" \
+        || unhealthy "${tenant} CloudNativePG CRDs, webhooks, RBAC, or operator are not ready"
+      cnpg_tenant_ready "${tenant}" \
+        || unhealthy "${tenant} PostgreSQL cluster, instances, placements, or storage are not ready"
       tenant_kubectl "${tenant}" get events --all-namespaces \
         --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -30 || true
     else

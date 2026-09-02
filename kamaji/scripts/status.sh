@@ -10,6 +10,8 @@ source "${SCRIPT_DIR}/lib/tenants.sh"
 source "${SCRIPT_DIR}/lib/workers.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/addons.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/cnpg.sh"
 
 health="${EXIT_SUCCESS}"
 
@@ -31,6 +33,78 @@ deployment_ready() {
   ready="$(management_kubectl -n "${namespace}" get deployment "${name}" \
     -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
   [[ -n "${desired}" && "${ready:-0}" -eq "${desired}" ]]
+}
+
+report_cnpg_status() {
+  local tenant="$1"
+  local cluster desired ready image crd_ready cluster_count phase
+  local ready_instances current_primary pod_count placement_count pvc_count pv_count
+  cluster="$(cnpg_cluster_name "${tenant}")"
+  desired="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
+    get deployment cnpg-controller-manager -o jsonpath='{.spec.replicas}' \
+    2>/dev/null || true)"
+  ready="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
+    get deployment cnpg-controller-manager -o jsonpath='{.status.readyReplicas}' \
+    2>/dev/null || true)"
+  image="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
+    get deployment cnpg-controller-manager \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="manager")].image}' \
+    2>/dev/null || true)"
+  crd_ready=0
+  local crd
+  while IFS= read -r crd; do
+    [[ "$(tenant_kubectl "${tenant}" get "crd/${crd}" \
+      -o jsonpath='{.status.conditions[?(@.type=="Established")].status}' \
+      2>/dev/null || true)" == True ]] && crd_ready=$((crd_ready + 1))
+  done < <(cnpg_expected_crds)
+  printf 'CNPG operator: %s/%s Ready image=%s CRDs=%s/11\n' \
+    "${ready:-0}" "${desired:-0}" "${image:-absent}" "${crd_ready}"
+  cnpg_operator_ready "${tenant}" \
+    || unhealthy "${tenant} CloudNativePG CRDs, webhooks, RBAC, or operator are not ready"
+
+  cluster_count="$(
+    { tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" \
+        get clusters.postgresql.cnpg.io --no-headers 2>/dev/null || true; } | wc -l
+  )"
+  phase="$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" \
+    get "cluster/${cluster}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
+  ready_instances="$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" \
+    get "cluster/${cluster}" -o jsonpath='{.status.readyInstances}' \
+    2>/dev/null || true)"
+  current_primary="$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" \
+    get "cluster/${cluster}" -o jsonpath='{.status.currentPrimary}' \
+    2>/dev/null || true)"
+  pod_count="$(
+    { tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" get pods \
+        -l "cnpg.io/cluster=${cluster}" --no-headers 2>/dev/null || true; } | wc -l
+  )"
+  placement_count="$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" get pods \
+    -l "cnpg.io/cluster=${cluster}" -o json 2>/dev/null \
+    | python3 -c 'import json,sys; print(len({i.get("spec",{}).get("nodeName","") for i in json.load(sys.stdin).get("items",[]) if i.get("spec",{}).get("nodeName")}))' \
+    2>/dev/null || printf 0)"
+  pvc_count="$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" get pvc \
+    -l "cnpg.io/cluster=${cluster}" -o json 2>/dev/null \
+    | python3 -c 'import json,sys; print(sum(1 for i in json.load(sys.stdin).get("items",[]) if i.get("status",{}).get("phase")=="Bound"))' \
+    2>/dev/null || printf 0)"
+  pv_count="$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" get pvc \
+    -l "cnpg.io/cluster=${cluster}" -o json 2>/dev/null \
+    | python3 -c 'import json,sys; print(len({i.get("spec",{}).get("volumeName","") for i in json.load(sys.stdin).get("items",[]) if i.get("spec",{}).get("volumeName")}))' \
+    2>/dev/null || printf 0)"
+  printf 'PostgreSQL cluster: count=%s phase=%s ready=%s/%s primary=%s\n' \
+    "${cluster_count}" "${phase:-absent}" "${ready_instances:-0}" \
+    "${CNPG_INSTANCE_COUNT}" "${current_primary:-absent}"
+  printf 'PostgreSQL resources: pods=%s placements=%s PVCs=%s Bound PVs=%s\n' \
+    "${pod_count}" "${placement_count}" "${pvc_count}" "${pv_count}"
+  printf 'PostgreSQL services: %s\n' \
+    "$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" get services \
+      -l "cnpg.io/cluster=${cluster}" -o name 2>/dev/null | paste -sd, - || true)"
+  [[ "${cluster_count}" -eq 1 \
+    && "${pod_count}" -eq "${CNPG_INSTANCE_COUNT}" \
+    && "${placement_count}" -eq "${CNPG_INSTANCE_COUNT}" \
+    && "${pvc_count}" -eq "${CNPG_INSTANCE_COUNT}" \
+    && "${pv_count}" -eq "${CNPG_INSTANCE_COUNT}" ]] \
+    && cnpg_tenant_ready "${tenant}" \
+    || unhealthy "${tenant} PostgreSQL cluster, services, placements, claims, or volumes are not healthy"
 }
 
 section "tools"
@@ -315,6 +389,7 @@ for tenant in ${TENANT_NAMES}; do
       -o jsonpath='{.status.phase}' 2>/dev/null || printf absent)"
     printf 'smoke PVC: %s\n' "${smoke_pvc}"
     [[ "${smoke_pvc}" == Bound ]] || unhealthy "${tenant} smoke PVC is not Bound"
+    report_cnpg_status "${tenant}"
   else
     printf 'API: kubeconfig absent or unreachable\n'
     final_tenant_exists "${tenant}" \

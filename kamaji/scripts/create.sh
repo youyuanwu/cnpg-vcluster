@@ -13,6 +13,8 @@ source "${SCRIPT_DIR}/lib/workers.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/addons.sh"
 # shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/cnpg.sh"
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/destroy-spike.sh"
 
 final_result=error
@@ -299,6 +301,16 @@ for tenant in ${TENANT_NAMES}; do
       "${tenant} scheduled pod requests exceed the owned worker Docker caps"
 done
 
+if [[ "${SKIP_CNPG:-0}" != 1 ]]; then
+  install_all_cnpg
+  for tenant in ${TENANT_NAMES}; do
+    validate_final_worker_request_capacity "${tenant}" \
+      || die "${tenant}.capacity: scheduled add-on and PostgreSQL requests exceed the owned worker Docker caps"
+  done
+else
+  log "SKIP_CNPG=1: leaving tenant CloudNativePG resources unchanged"
+fi
+
 if ! (validate_exact_final_topology); then
   blocked_final worker-substrate final-topology \
     "exact two-TCP, two-schema, six-worker isolation or storage topology did not validate"
@@ -318,4 +330,8 @@ for tenant in ${TENANT_NAMES}; do
       -o jsonpath='{.status.phase}')" == Bound ]] \
     || die "${tenant}.health: workers, add-ons, or storage are unhealthy in the paused steady state"
 done
-log "two tenant control planes, six exclusive workers, and tenant add-ons are healthy; Kamaji reconciliation is intentionally paused to preserve kube-proxy conntrack.maxPerCore=0"
+if [[ "${SKIP_CNPG:-0}" != 1 ]]; then
+  log "two tenant control planes, six exclusive workers, tenant add-ons, and both three-instance PostgreSQL clusters are healthy; Kamaji reconciliation remains intentionally paused"
+else
+  log "two tenant control planes, six exclusive workers, and tenant add-ons are healthy; CNPG was skipped and Kamaji reconciliation remains intentionally paused"
+fi

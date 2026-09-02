@@ -361,6 +361,9 @@ check "Local Path 0.0.37 manifest checksum is exact" \
 check "CNPG 1.30.0 manifest checksum is exact" \
   has_text '^CNPG_MANIFEST_SHA256=f8bede43fe4ee0d478c2355b204a36876b2ae4faac60f2a9452280b293da3b88$' \
   "${LAB_ROOT}/config/versions.env"
+check "CNPG controller image digest is exact" \
+  has_text '^CNPG_CONTROLLER_IMAGE=ghcr.io/cloudnative-pg/cloudnative-pg:1\.30\.0@sha256:a2701eb97cdd2a34b1fdb2cb51987f544b706e40bec72ae7146cd8580efefebb$' \
+  "${LAB_ROOT}/config/versions.env"
 check "PostgreSQL 18.4 image digest is exact" \
   has_text '^POSTGRES_IMAGE=ghcr.io/cloudnative-pg/postgresql:18\.4-system-trixie@sha256:42708a75345b7a48fdd9257b071830783a97fd228529196b6313187a7198e185$' \
   "${LAB_ROOT}/config/versions.env"
@@ -406,6 +409,13 @@ check "direct manifest input checksums" bash -c '
     sha256sum -c - >/dev/null &&
   printf "%s  %s\n" "$CNPG_MANIFEST_SHA256" ".tools/inputs/cnpg-${CNPG_VERSION}.yaml" |
     sha256sum -c - >/dev/null
+' _ "${LAB_ROOT}"
+check "independent CNPG operator manifest matches verified provenance" bash -c '
+  source "$1/config/versions.env"
+  [[ "$CNPG_MANIFEST_URL" == "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/releases/cnpg-1.30.0.yaml" ]] &&
+  printf "%s  %s\n" "$CNPG_MANIFEST_SHA256" "$1/manifests/cnpg/operator.yaml" |
+    sha256sum -c - >/dev/null &&
+  [[ ! -L "$1/manifests/cnpg/operator.yaml" ]]
 ' _ "${LAB_ROOT}"
 check "rendered spike add-on checksums are exact" bash -c '
   source "$1/config/versions.env"
@@ -552,10 +562,12 @@ check "scripts do not print kubeconfigs, tokens, or passwords" bash -c '
 
 check "only compatibility paths can return blocked status" bash -c '
   refs="$(grep -R -l "EXIT_BLOCKED" "$1/scripts" --include="*.sh" --exclude=test-static.sh)"
-  [[ "$(printf "%s\n" "${refs}" | sort)" == "$(printf "%s\n" "$1/scripts/create-spike.sh" "$1/scripts/create.sh" | sort)" ]] &&
+  [[ "$(printf "%s\n" "${refs}" | sort)" == "$(printf "%s\n" "$1/scripts/create-spike.sh" "$1/scripts/create.sh" "$1/scripts/verify.sh" | sort)" ]] &&
   grep -Fq "return \"\${EXIT_BLOCKED}\"" "$1/scripts/create-spike.sh" &&
   grep -Fq "record_spike_blocker" "$1/scripts/create-spike.sh" &&
-  grep -Fq "record_final_blocker" "$1/scripts/create.sh"
+  grep -Fq "record_final_blocker" "$1/scripts/create.sh" &&
+  grep -Fq "blocked_result_is_current" "$1/scripts/verify.sh" &&
+  grep -Fq "exit \"\${EXIT_BLOCKED}\"" "$1/scripts/verify.sh"
 ' _ "${LAB_ROOT}"
 check "unimplemented normal path returns 1, never 2" \
   command_returns_one "${SCRIPT_DIR}/unavailable.sh" create "later phase"
@@ -835,6 +847,87 @@ check "capacity accounting uses Docker caps and scheduled pod requests" bash -c 
   grep -Fq "requested_cpu <= int(os.environ[\"CPU_CAP\"])" "$1/scripts/lib/workers.sh" &&
   grep -Fq "requested_memory <= int(os.environ[\"MEMORY_CAP\"])" "$1/scripts/lib/workers.sh"
 ' _ "${LAB_ROOT}"
+check "CNPG tenant manifests enforce exact independent database topology" bash -c '
+  source "$1/config/settings.env"
+  source "$1/config/versions.env"
+  for tenant in tenant-a tenant-b; do
+    file="$1/manifests/cnpg/cluster-${tenant}.yaml"
+    [[ -s "$file" ]] || exit 1
+    grep -Fq "name: ${tenant}-postgres" "$file" || exit 1
+    grep -Fq "namespace: ${DATABASE_NAMESPACE}" "$file" || exit 1
+    grep -Fq "instances: ${CNPG_INSTANCE_COUNT}" "$file" || exit 1
+    grep -Fq "imageName: ${POSTGRES_IMAGE}" "$file" || exit 1
+    grep -Fq "podAntiAffinityType: required" "$file" || exit 1
+    grep -Fq "topologyKey: kubernetes.io/hostname" "$file" || exit 1
+    grep -Fq "size: ${CNPG_STORAGE_SIZE}" "$file" || exit 1
+    grep -Fq "cpu: ${CNPG_REQUEST_CPU}" "$file" || exit 1
+    grep -Fq "memory: ${CNPG_REQUEST_MEMORY}" "$file" || exit 1
+    grep -Fq "cpu: \"${CNPG_LIMIT_CPU}\"" "$file" || exit 1
+    grep -Fq "memory: ${CNPG_LIMIT_MEMORY}" "$file" || exit 1
+  done
+  grep -Fq "database: ${TENANT_A_DATABASE}" "$1/manifests/cnpg/cluster-tenant-a.yaml" &&
+  grep -Fq "owner: ${TENANT_A_DATABASE_OWNER}" "$1/manifests/cnpg/cluster-tenant-a.yaml" &&
+  grep -Fq "database: ${TENANT_B_DATABASE}" "$1/manifests/cnpg/cluster-tenant-b.yaml" &&
+  grep -Fq "owner: ${TENANT_B_DATABASE_OWNER}" "$1/manifests/cnpg/cluster-tenant-b.yaml" &&
+  [[ "$TENANT_A_DATABASE" != "$TENANT_B_DATABASE" ]] &&
+  [[ "$TENANT_A_DATABASE_OWNER" != "$TENANT_B_DATABASE_OWNER" ]]
+' _ "${LAB_ROOT}"
+check "CNPG installation is per-tenant digest-pinned and readiness-gated" bash -c '
+  file="$1/scripts/lib/cnpg.sh"
+  grep -Fq "for tenant in \${TENANT_NAMES}" "$file" &&
+  grep -Fq "sha256_check \"\${CNPG_MANIFEST_SHA256}\"" "$file" &&
+  grep -Fq "CNPG_CONTROLLER_IMAGE" "$file" &&
+  grep -Fq "OPERATOR_IMAGE_NAME" "$file" &&
+  grep -Fq -- "--server-side --force-conflicts" "$file" &&
+  grep -Fq "cnpg_expected_crds" "$file" &&
+  grep -Fq "cnpg_operator_ready" "$file" &&
+  grep -Fq "cnpg_tenant_ready" "$file" &&
+  grep -Fq "automountServiceAccountToken: false" "$file" &&
+  ! grep -Fq "vcluster/" "$file"
+' _ "${LAB_ROOT}"
+check "create gates CNPG after add-ons and preserves skip and pause behavior" bash -c '
+  file="$1/scripts/create.sh"
+  addon_line="$(grep -n "install_final_tenant_addons" "$file" | tail -1 | cut -d: -f1)"
+  cnpg_line="$(grep -n "^  install_all_cnpg$" "$file" | cut -d: -f1)"
+  topology_line="$(grep -n "validate_exact_final_topology" "$file" | tail -1 | cut -d: -f1)"
+  [[ -n "$addon_line" && -n "$cnpg_line" && -n "$topology_line" ]] &&
+  (( addon_line < cnpg_line && cnpg_line < topology_line )) &&
+  grep -Fq '\''"${SKIP_CNPG:-0}" != 1'\'' "$file" &&
+  grep -Fq "validate_final_worker_request_capacity" "$file" &&
+  ! grep -Fq "unpause_tenant_reconciliation" "$file"
+' _ "${LAB_ROOT}"
+check "behavioral verifier covers both negative identities and recovery paths" bash -c '
+  file="$1/scripts/verify.sh"
+  test -x "$file" &&
+  grep -Fq "verify_management_absence" "$file" &&
+  grep -Fq "verify_management_topology" "$file" &&
+  grep -Fq "tenant_kube_proxy_steady_state_is_preserved" "$file" &&
+  grep -Fq "cross_kubernetes_identity_rejected tenant-a tenant-b" "$file" &&
+  grep -Fq "cross_kubernetes_identity_rejected tenant-b tenant-a" "$file" &&
+  grep -Fq "cross_database_identity_rejected tenant-a tenant-b" "$file" &&
+  grep -Fq "cross_database_identity_rejected tenant-b tenant-a" "$file" &&
+  grep -Fq "not an authentication failure" "$file" &&
+  grep -Fq "failed by connectivity, not authentication rejection" "$file" &&
+  grep -Fq "restart_replica_with_storage_reuse" "$file" &&
+  grep -Fq "failover_to_different_primary" "$file" &&
+  grep -Fq "replacement replica PVC" "$file" &&
+  grep -Fq "replacement replica PV" "$file" &&
+  grep -Fq "retained SQL marker" "$file"
+' _ "${LAB_ROOT}"
+check "CNPG Kubernetes calls always carry explicit kubeconfigs" bash -c '
+  ! grep -E "^[[:space:]]*kubectl[[:space:]]" \
+    "$1/scripts/lib/cnpg.sh" "$1/scripts/verify.sh" &&
+  grep -Fq '\''KUBECONFIG="${cross_config}" kubectl'\'' "$1/scripts/verify.sh" &&
+  grep -Fq "tenant_kubectl" "$1/scripts/lib/cnpg.sh"
+' _ "${LAB_ROOT}"
+check "CNPG clients never log credentials" bash -c '
+  ! grep -Eq "(echo|log|warn).*(password|PGPASSWORD|client-key-data|admin\\.conf)" \
+    "$1/scripts/lib/cnpg.sh" "$1/scripts/verify.sh" &&
+  ! grep -Eq "printf.*password.*(tee|>[^|])" "$1/scripts/verify.sh" &&
+  grep -Fq "valueFrom:" "$1/scripts/lib/cnpg.sh" &&
+  grep -Fq "secretKeyRef:" "$1/scripts/lib/cnpg.sh" &&
+  grep -Fq "unset password" "$1/scripts/verify.sh"
+' _ "${LAB_ROOT}"
 check "status and diagnostics cover both final tenants and exit shapes" bash -c '
   grep -Fq "final tenant topology" "$1/scripts/status.sh" &&
   grep -Fq "passing final result lacks exactly two TCPs" "$1/scripts/status.sh" &&
@@ -847,6 +940,16 @@ check "status and diagnostics cover both final tenants and exit shapes" bash -c 
   grep -Fq "final result evidence" "$1/scripts/diagnose.sh" &&
   grep -Fq "for tenant in \${TENANT_NAMES}" "$1/scripts/diagnose.sh" &&
   grep -Fq "exit \"\${health}\"" "$1/scripts/diagnose.sh"
+' _ "${LAB_ROOT}"
+check "status and diagnostics include tenant-owned CNPG and PostgreSQL layers" bash -c '
+  grep -Fq "report_cnpg_status" "$1/scripts/status.sh" &&
+  grep -Fq "CNPG operator:" "$1/scripts/status.sh" &&
+  grep -Fq "PostgreSQL cluster:" "$1/scripts/status.sh" &&
+  grep -Fq "PostgreSQL services:" "$1/scripts/status.sh" &&
+  grep -Fq "CloudNativePG and PostgreSQL" "$1/scripts/diagnose.sh" &&
+  grep -Fq "clusters.postgresql.cnpg.io,pods,services,endpoints,pvc" "$1/scripts/diagnose.sh" &&
+  grep -Fq "get pv -o wide" "$1/scripts/diagnose.sh" &&
+  grep -Fq "cnpg_tenant_ready" "$1/scripts/diagnose.sh"
 ' _ "${LAB_ROOT}"
 
 check "management values disable telemetry" \
@@ -942,4 +1045,4 @@ if (( failures > 0 )); then
   die "${failures} static check(s) failed"
 fi
 
-log "all ${checks} Phase 4 static checks passed"
+log "all ${checks} Phase 5 static checks passed"

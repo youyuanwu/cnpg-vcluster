@@ -27,7 +27,7 @@ spike:
 destroy-spike:
     @scripts/destroy-spike.sh
 
-# Reconcile both tenant control planes, six workers, networking, and storage.
+# Reconcile both tenant control planes, workers, add-ons, storage, and CNPG.
 create:
     @scripts/create.sh
 
@@ -39,9 +39,9 @@ status:
 diagnose scope="all":
     @scripts/diagnose.sh "{{scope}}"
 
-# Verify topology and behavior (implemented in Phase 5).
+# Verify topology, tenant identity, SQL separation, restart, and failover.
 verify:
-    @scripts/unavailable.sh verify "Phase 5"
+    @scripts/verify.sh
 
 # Destroy one tenant (implemented in Phase 6).
 destroy-tenant tenant:
