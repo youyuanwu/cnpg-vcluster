@@ -184,12 +184,13 @@ EOF
 
 run_network_smoke() {
   tenant_kubectl spike -n default delete pod spike-network-smoke \
-    --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    --ignore-not-found --wait=true --timeout="${TENANT_ADDON_TIMEOUT}" \
+    >/dev/null 2>&1 || true
   tenant_kubectl spike -n default run spike-network-smoke \
     --image="${VERIFY_IMAGE}" \
     --restart=Never \
     --command -- sh -ec \
-    'nslookup kubernetes.default.svc && wget --no-check-certificate -qO- https://kubernetes.default.svc/version >/dev/null' \
+    "nslookup kubernetes.default.svc.${SPIKE_CLUSTER_DOMAIN} && wget --no-check-certificate -qO- https://kubernetes.default.svc.${SPIKE_CLUSTER_DOMAIN}/version >/dev/null" \
     >/dev/null
   if ! tenant_kubectl spike -n default wait --for=jsonpath='{.status.phase}'=Succeeded \
     pod/spike-network-smoke --timeout="${TENANT_ADDON_TIMEOUT}" >/dev/null; then
@@ -197,7 +198,7 @@ run_network_smoke() {
     return 1
   fi
   tenant_kubectl spike -n default delete pod spike-network-smoke \
-    --wait=true >/dev/null
+    --wait=true --timeout="${TENANT_ADDON_TIMEOUT}" >/dev/null
 }
 
 install_spike_network_addons() {
@@ -219,9 +220,9 @@ install_spike_storage_addon() {
 
 create_spike_storage_writer() {
   tenant_kubectl spike -n default delete pod "${SPIKE_SMOKE_POD}" \
-    --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
   tenant_kubectl spike -n default delete pvc "${SPIKE_SMOKE_PVC}" \
-    --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
   cat <<EOF | tenant_kubectl spike apply -f - >/dev/null
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -242,7 +243,8 @@ metadata:
   namespace: default
 spec:
   restartPolicy: Never
-  nodeName: ${SPIKE_WORKER_NAME}
+  nodeSelector:
+    kubernetes.io/hostname: ${SPIKE_WORKER_NAME}
   containers:
     - name: writer
       image: ${VERIFY_IMAGE}
@@ -257,20 +259,27 @@ spec:
       persistentVolumeClaim:
         claimName: ${SPIKE_SMOKE_PVC}
 EOF
-  tenant_kubectl spike -n default wait --for=jsonpath='{.status.phase}'=Succeeded \
-    "pod/${SPIKE_SMOKE_POD}" --timeout="${TENANT_STORAGE_TIMEOUT}" >/dev/null \
-    && [[ "$(tenant_kubectl spike -n default get pvc "${SPIKE_SMOKE_PVC}" \
-      -o jsonpath='{.status.phase}')" == Bound ]]
+  if ! tenant_kubectl spike -n default wait \
+    --for=jsonpath='{.status.phase}'=Succeeded \
+    "pod/${SPIKE_SMOKE_POD}" --timeout="${TENANT_STORAGE_TIMEOUT}" >/dev/null; then
+    tenant_kubectl spike -n default describe "pod/${SPIKE_SMOKE_POD}" >&2 || true
+    tenant_kubectl spike -n local-path-storage logs \
+      deployment/local-path-provisioner --tail=50 >&2 || true
+    return 1
+  fi
+  [[ "$(tenant_kubectl spike -n default get pvc "${SPIKE_SMOKE_PVC}" \
+    -o jsonpath='{.status.phase}')" == Bound ]]
 }
 
 delete_spike_storage_writer_pod() {
   tenant_kubectl spike -n default delete pod "${SPIKE_SMOKE_POD}" \
-    --ignore-not-found --wait=true >/dev/null
+    --ignore-not-found --wait=true --timeout="${TENANT_STORAGE_TIMEOUT}" >/dev/null
 }
 
 verify_spike_storage_reader() {
   tenant_kubectl spike -n default delete pod "${SPIKE_SMOKE_POD}" \
-    --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    --ignore-not-found --wait=true --timeout="${TENANT_STORAGE_TIMEOUT}" \
+    >/dev/null 2>&1 || true
   cat <<EOF | tenant_kubectl spike apply -f - >/dev/null
 apiVersion: v1
 kind: Pod
@@ -279,7 +288,8 @@ metadata:
   namespace: default
 spec:
   restartPolicy: Never
-  nodeName: ${SPIKE_WORKER_NAME}
+  nodeSelector:
+    kubernetes.io/hostname: ${SPIKE_WORKER_NAME}
   containers:
     - name: reader
       image: ${VERIFY_IMAGE}
@@ -305,8 +315,291 @@ delete_spike_storage_smoke() {
   if [[ -f "$(tenant_kubeconfig spike)" ]] \
     && tenant_kubectl spike get --raw=/readyz >/dev/null 2>&1; then
     tenant_kubectl spike -n default delete pod "${SPIKE_SMOKE_POD}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
     tenant_kubectl spike -n default delete pvc "${SPIKE_SMOKE_PVC}" \
-      --ignore-not-found --wait=true >/dev/null 2>&1 || true
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
+}
+
+final_tenant_daemonset_ready() {
+  local tenant="$1"
+  local namespace="$2"
+  local name="$3"
+  local desired ready
+  desired="$(tenant_kubectl "${tenant}" -n "${namespace}" get daemonset "${name}" \
+    -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+  ready="$(tenant_kubectl "${tenant}" -n "${namespace}" get daemonset "${name}" \
+    -o jsonpath='{.status.numberReady}' 2>/dev/null || true)"
+  [[ "${desired:-0}" -eq "${WORKERS_PER_TENANT}" \
+    && "${ready:-0}" -eq "${desired}" ]]
+}
+
+final_tenant_deployment_ready() {
+  local tenant="$1"
+  local namespace="$2"
+  local name="$3"
+  local desired ready
+  desired="$(tenant_kubectl "${tenant}" -n "${namespace}" get deployment "${name}" \
+    -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+  ready="$(tenant_kubectl "${tenant}" -n "${namespace}" get deployment "${name}" \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+  [[ "${desired:-0}" -gt 0 && "${ready:-0}" -eq "${desired}" ]]
+}
+
+render_tenant_addons() {
+  local tenant="$1"
+  local addon_dir calico local_path pod_cidr storage_path
+  addon_dir="$(tenant_addon_dir "${tenant}")"
+  calico="${addon_dir}/calico.yaml"
+  local_path="${addon_dir}/local-path.yaml"
+  pod_cidr="$(tenant_pod_cidr "${tenant}")"
+  storage_path="$(tenant_storage_path "${tenant}")"
+  mkdir -p -m 0700 "${addon_dir}"
+  sha256_check "${CALICO_SPIKE_RENDER_SHA256}" \
+    "${LAB_ROOT}/manifests/addons/calico.yaml"
+  sha256_check "${LOCAL_PATH_SPIKE_RENDER_SHA256}" \
+    "${LAB_ROOT}/manifests/addons/local-path.yaml"
+  BASE_CALICO="${LAB_ROOT}/manifests/addons/calico.yaml" \
+  BASE_LOCAL_PATH="${LAB_ROOT}/manifests/addons/local-path.yaml" \
+  RENDERED_CALICO="${calico}" \
+  RENDERED_LOCAL_PATH="${local_path}" \
+  SPIKE_POD_CIDR="${SPIKE_POD_CIDR}" \
+  TENANT_POD_CIDR="${pod_cidr}" \
+  SPIKE_STORAGE_PATH="${SPIKE_STORAGE_PATH}" \
+  TENANT_STORAGE_PATH="${storage_path}" \
+  python3 -c '
+import os
+from pathlib import Path
+calico=Path(os.environ["BASE_CALICO"]).read_text(encoding="utf-8")
+if calico.count(os.environ["SPIKE_POD_CIDR"]) != 1:
+    raise SystemExit("Calico base has no unique spike CIDR")
+calico=calico.replace(os.environ["SPIKE_POD_CIDR"], os.environ["TENANT_POD_CIDR"], 1)
+local_path=Path(os.environ["BASE_LOCAL_PATH"]).read_text(encoding="utf-8")
+if local_path.count(os.environ["SPIKE_STORAGE_PATH"]) != 1:
+    raise SystemExit("Local Path base has no unique spike path")
+local_path=local_path.replace(
+    os.environ["SPIKE_STORAGE_PATH"], os.environ["TENANT_STORAGE_PATH"], 1)
+for destination, content in (
+    (os.environ["RENDERED_CALICO"], calico),
+    (os.environ["RENDERED_LOCAL_PATH"], local_path),
+):
+    path=Path(destination)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o600)
+'
+}
+
+configure_tenant_cni_bootstrap_endpoint() {
+  local tenant="$1"
+  cat <<EOF | tenant_kubectl "${tenant}" apply -f - >/dev/null
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kubernetes-services-endpoint
+  namespace: kube-system
+data:
+  KUBERNETES_SERVICE_HOST: "$(tenant_vip "${tenant}")"
+  KUBERNETES_SERVICE_PORT: "6443"
+  KUBERNETES_SERVICE_PORT_HTTPS: "6443"
+EOF
+}
+
+final_tenant_managed_addons_ready() {
+  local tenant="$1"
+  local namespace status
+  namespace="$(tenant_namespace "${tenant}")"
+  status="$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" -o json)"
+  STATUS_JSON="${status}" python3 -c '
+import json, os
+s=json.loads(os.environ["STATUS_JSON"]).get("status",{}).get("addons",{})
+assert s.get("coreDNS",{}).get("enabled") is True
+assert s.get("kubeProxy",{}).get("enabled") is True
+k=s.get("konnectivity",{})
+assert k.get("enabled") is True
+assert k.get("agent",{}).get("name")
+assert k.get("service",{}).get("name")
+' \
+    && tenant_kube_proxy_conntrack_is_zero "${tenant}" \
+    && final_tenant_deployment_ready "${tenant}" kube-system coredns \
+    && final_tenant_daemonset_ready "${tenant}" kube-system kube-proxy \
+    && final_tenant_daemonset_ready "${tenant}" kube-system konnectivity-agent
+}
+
+final_tenant_calico_ready() {
+  local tenant="$1"
+  final_tenant_daemonset_ready "${tenant}" kube-system calico-node \
+    && final_tenant_deployment_ready "${tenant}" kube-system calico-kube-controllers
+}
+
+final_tenant_network_ready() {
+  local tenant="$1"
+  tenant_workers_ready "${tenant}" \
+    && final_tenant_managed_addons_ready "${tenant}" \
+    && final_tenant_calico_ready "${tenant}"
+}
+
+wait_final_tenant_network() {
+  local tenant="$1"
+  wait_for "${TENANT_ADDON_TIMEOUT}" "${tenant} managed add-ons and Calico" \
+    final_tenant_network_ready "${tenant}"
+}
+
+worker_tenant_endpoints_accessible() {
+  local tenant="$1"
+  local ordinal name vip
+  vip="$(tenant_vip "${tenant}")"
+  for ordinal in $(seq 1 "${WORKERS_PER_TENANT}"); do
+    name="$(worker_name "${tenant}" "${ordinal}")"
+    docker exec "${name}" bash -ec \
+      "timeout 5 bash -c '</dev/tcp/${vip}/6443' && timeout 5 bash -c '</dev/tcp/${vip}/8132'" \
+      || return 1
+  done
+}
+
+run_final_tenant_network_smoke() {
+  local tenant="$1"
+  local domain pod
+  domain="$(tenant_cluster_domain "${tenant}")"
+  pod="phase4-network-smoke"
+  tenant_kubectl "${tenant}" -n default delete pod "${pod}" \
+    --ignore-not-found --wait=true --timeout="${TENANT_ADDON_TIMEOUT}" \
+    >/dev/null 2>&1 || true
+  tenant_kubectl "${tenant}" -n default run "${pod}" \
+    --image="${VERIFY_IMAGE}" \
+    --restart=Never \
+    --command -- sh -ec \
+    "nslookup kubernetes.default.svc.${domain} && wget --no-check-certificate -qO- https://kubernetes.default.svc.${domain}/version >/dev/null" \
+    >/dev/null
+  if ! tenant_kubectl "${tenant}" -n default wait \
+    --for=jsonpath='{.status.phase}'=Succeeded "pod/${pod}" \
+    --timeout="${TENANT_ADDON_TIMEOUT}" >/dev/null; then
+    tenant_kubectl "${tenant}" -n default logs "pod/${pod}" >&2 || true
+    return 1
+  fi
+  tenant_kubectl "${tenant}" -n default delete pod "${pod}" \
+    --wait=true --timeout="${TENANT_ADDON_TIMEOUT}" >/dev/null
+}
+
+verify_final_tenant_addon_images() {
+  local tenant="$1"
+  local namespace calico_images local_path_image agent_image server_image
+  namespace="$(tenant_namespace "${tenant}")"
+  calico_images="$(tenant_kubectl "${tenant}" -n kube-system get \
+    daemonset/calico-node deployment/calico-kube-controllers \
+    -o jsonpath='{range .items[*].spec.template.spec.initContainers[*]}{.image}{"\n"}{end}{range .items[*].spec.template.spec.containers[*]}{.image}{"\n"}{end}')"
+  grep -Fxq "${CALICO_CNI_IMAGE}" <<<"${calico_images}" \
+    && grep -Fxq "${CALICO_NODE_IMAGE}" <<<"${calico_images}" \
+    && grep -Fxq "${CALICO_KUBE_CONTROLLERS_IMAGE}" <<<"${calico_images}" \
+    || die "${tenant}.addons: Calico images are not digest pinned"
+  local_path_image="$(tenant_kubectl "${tenant}" -n local-path-storage \
+    get deployment/local-path-provisioner \
+    -o jsonpath='{.spec.template.spec.containers[0].image}')"
+  [[ "${local_path_image}" == "${LOCAL_PATH_PROVISIONER_IMAGE}" ]] \
+    || die "${tenant}.addons: Local Path image is not digest pinned"
+  agent_image="$(tenant_kubectl "${tenant}" -n kube-system \
+    get daemonset/konnectivity-agent \
+    -o jsonpath='{.spec.template.spec.containers[0].image}')"
+  server_image="$(management_kubectl -n "${namespace}" get deployment "${tenant}" \
+    -o jsonpath='{.spec.template.spec.containers[?(@.name=="konnectivity-server")].image}')"
+  [[ "${agent_image}" == "${KONNECTIVITY_AGENT_IMAGE}" \
+    && "${server_image}" == "${KONNECTIVITY_SERVER_IMAGE}" ]] \
+    || die "${tenant}.addons: Konnectivity images are not digest pinned"
+}
+
+final_tenant_local_path_ready() {
+  local tenant="$1"
+  local defaults
+  defaults="$(tenant_kubectl "${tenant}" get storageclass -o json \
+    | python3 -c 'import json,sys; print(sum(1 for i in json.load(sys.stdin).get("items",[]) if i.get("metadata",{}).get("annotations",{}).get("storageclass.kubernetes.io/is-default-class")=="true"))')"
+  final_tenant_deployment_ready "${tenant}" local-path-storage local-path-provisioner \
+    && [[ "${defaults}" -eq 1 ]] \
+    && [[ "$(tenant_kubectl "${tenant}" get storageclass "${TENANT_STORAGE_CLASS}" \
+      -o jsonpath='{.provisioner}')" == rancher.io/local-path ]]
+}
+
+create_final_tenant_storage_smoke() {
+  local tenant="$1"
+  tenant_kubectl "${tenant}" -n default delete pod "${TENANT_SMOKE_POD}" \
+    --ignore-not-found --wait=true --timeout="${TENANT_STORAGE_TIMEOUT}" \
+    >/dev/null 2>&1 || true
+  if tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
+    >/dev/null 2>&1; then
+    [[ "$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
+      -o jsonpath='{.status.phase}')" == Bound ]] && return 0
+    tenant_kubectl "${tenant}" -n default delete pvc "${TENANT_SMOKE_PVC}" \
+      --wait=true --timeout="${TENANT_STORAGE_TIMEOUT}" >/dev/null
+  fi
+  cat <<EOF | tenant_kubectl "${tenant}" apply -f - >/dev/null
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ${TENANT_SMOKE_PVC}
+  namespace: default
+  labels:
+    ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+    kamaji.cnpg-vcluster.io/tenant: ${tenant}
+spec:
+  accessModes: [ReadWriteOnce]
+  storageClassName: ${TENANT_STORAGE_CLASS}
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: ${TENANT_SMOKE_POD}
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+    - name: writer
+      image: ${VERIFY_IMAGE}
+      command: [sh, -ec]
+      args:
+        - printf '%s\n' '${TENANT_SMOKE_MARKER}-${tenant}' > /data/marker && sync
+      volumeMounts:
+        - name: data
+          mountPath: /data
+  volumes:
+    - name: data
+      persistentVolumeClaim:
+        claimName: ${TENANT_SMOKE_PVC}
+EOF
+  tenant_kubectl "${tenant}" -n default wait \
+    --for=jsonpath='{.status.phase}'=Succeeded "pod/${TENANT_SMOKE_POD}" \
+    --timeout="${TENANT_STORAGE_TIMEOUT}" >/dev/null \
+    && [[ "$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
+      -o jsonpath='{.status.phase}')" == Bound ]]
+}
+
+install_final_tenant_addons() {
+  local tenant="$1"
+  render_tenant_addons "${tenant}"
+  configure_tenant_cni_bootstrap_endpoint "${tenant}"
+  tenant_kubectl "${tenant}" apply \
+    -f "$(tenant_addon_dir "${tenant}")/calico.yaml" >/dev/null
+  wait_final_tenant_network "${tenant}" \
+    && wait_for "${TENANT_ADDON_TIMEOUT}" "${tenant} worker endpoint reachability" \
+      worker_tenant_endpoints_accessible "${tenant}" \
+    && run_final_tenant_network_smoke "${tenant}" \
+    || return 1
+  tenant_kubectl "${tenant}" apply \
+    -f "$(tenant_addon_dir "${tenant}")/local-path.yaml" >/dev/null
+  wait_for "${TENANT_STORAGE_TIMEOUT}" "${tenant} Local Path readiness" \
+    final_tenant_local_path_ready "${tenant}" \
+    && create_final_tenant_storage_smoke "${tenant}" \
+    || return 1
+  verify_final_tenant_addon_images "${tenant}"
+}
+
+delete_final_tenant_smoke() {
+  local tenant="$1"
+  if [[ -f "$(tenant_kubeconfig "${tenant}")" ]] \
+    && tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1; then
+    tenant_kubectl "${tenant}" -n default delete pod "${TENANT_SMOKE_POD}" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    tenant_kubectl "${tenant}" -n default delete pvc "${TENANT_SMOKE_PVC}" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
   fi
 }

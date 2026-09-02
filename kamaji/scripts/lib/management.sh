@@ -228,7 +228,8 @@ for variable, selected in (
 
 run_kamaji_post_install_hook() {
   management_kubectl -n "${MANAGEMENT_NAMESPACE}" delete job kamaji-etcd-setup-2 \
-    --ignore-not-found --wait=true >/dev/null 2>&1 || true
+    --ignore-not-found --wait=true --timeout="${DATASTORE_TIMEOUT}" \
+    >/dev/null 2>&1 || true
   management_kubectl apply -f "${KAMAJI_POST_HOOKS_MANIFEST}" >/dev/null \
     || return 1
   if ! management_kubectl -n "${MANAGEMENT_NAMESPACE}" wait \
@@ -247,7 +248,7 @@ run_kamaji_post_install_hook() {
     && grep -Fxq "${KAMAJI_ETCD_JOB_IMAGE}" <<<"${images}" \
     || return 1
   management_kubectl -n "${MANAGEMENT_NAMESPACE}" delete job kamaji-etcd-setup-2 \
-    --wait=true >/dev/null
+    --wait=true --timeout="${DATASTORE_TIMEOUT}" >/dev/null
 }
 
 datastore_ready() {

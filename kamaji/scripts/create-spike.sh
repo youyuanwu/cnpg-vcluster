@@ -32,6 +32,7 @@ write_spike_result() {
     printf 'blocker_code=%s\n' "${blocker_code:-none}"
     printf 'blocker_evidence=%s\n' "${blocker_message:-none}"
     printf 'kubernetes_version=%s\n' "${KUBERNETES_VERSION}"
+    printf 'compatibility_revision=%s\n' "${COMPATIBILITY_REVISION}"
     printf 'spike_vip=%s\n' "${SPIKE_VIP:-unallocated}"
     printf 'kubeadm_observed_preflight=%s\n' "${observed_preflight_snapshot}"
     printf 'kubeadm_failure_evidence=%s\n' "${join_failure_snapshot}"
@@ -111,6 +112,7 @@ if ! reconcile_spike_tenant; then
 fi
 export_spike_kubeconfig
 reconcile_spike_bootstrap_rbac
+configure_tenant_kube_proxy_conntrack spike
 datastore_used_by_spike \
   || die "spike.control-plane: DataStore/default did not record the spike consumer"
 
@@ -143,12 +145,12 @@ if ! install_spike_network_addons \
     "$(spike_network_failure_summary)"
 fi
 label_spike_node
-verify_spike_addon_images
 
 current_rung=persistent-worker-storage
 if ! install_spike_storage_addon \
   || ! create_spike_storage_writer \
-  || ! validate_spike_allocatable; then
+  || ! validate_spike_allocatable \
+  || ! verify_spike_addon_images; then
   blocked persistent-worker-storage "${current_rung}" \
     "default Local Path storage, bound PVC, or allocatable resource cap failed"
 fi

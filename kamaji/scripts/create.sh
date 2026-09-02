@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+
+set -Eeuo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/management.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/tenants.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/workers.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/addons.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/destroy-spike.sh"
+
+final_result=error
+final_blocker_code=""
+final_blocker_prerequisite=""
+final_blocker_message=""
+final_cleanup_proved=false
+final_tenant_a_endpoint=""
+final_tenant_b_endpoint=""
+final_tenant_a_ca_sha256=""
+final_tenant_b_ca_sha256=""
+
+clear_owned_compatibility_blocker() {
+  if [[ -f "${BLOCKER_FILE}" ]] \
+    && grep -Eq '^owner=(spike|final)$' "${BLOCKER_FILE}"; then
+    rm -f "${BLOCKER_FILE}"
+  fi
+}
+
+record_final_blocker() {
+  ensure_runtime_layout
+  {
+    printf 'owner=final\n'
+    printf 'code=%s\n' "${final_blocker_code}"
+    printf 'prerequisite=%s\n' "${final_blocker_prerequisite}"
+    printf 'message=%s\n' "${final_blocker_message}"
+  } | write_secret_file "${BLOCKER_FILE}"
+}
+
+write_final_result() {
+  ensure_runtime_layout
+  {
+    printf 'result=%s\n' "${final_result}"
+    printf 'compatibility_revision=%s\n' "${COMPATIBILITY_REVISION}"
+    printf 'first_failing_prerequisite=%s\n' \
+      "${final_blocker_prerequisite:-none}"
+    printf 'blocker_code=%s\n' "${final_blocker_code:-none}"
+    printf 'blocker_evidence=%s\n' "${final_blocker_message:-none}"
+    printf 'tenant_a_schema=%s\n' "${TENANT_A_SCHEMA}"
+    printf 'tenant_b_schema=%s\n' "${TENANT_B_SCHEMA}"
+    printf 'expected_workers=6\n'
+    printf 'tenant_a_endpoint=%s\n' "${final_tenant_a_endpoint:-not-observed}"
+    printf 'tenant_b_endpoint=%s\n' "${final_tenant_b_endpoint:-not-observed}"
+    printf 'tenant_a_ca_sha256=%s\n' "${final_tenant_a_ca_sha256:-not-observed}"
+    printf 'tenant_b_ca_sha256=%s\n' "${final_tenant_b_ca_sha256:-not-observed}"
+    if [[ "${final_cleanup_proved}" == true ]]; then
+      printf 'cleanup=proved\n'
+      printf 'final_tenants=absent\n'
+      printf 'final_workers=absent\n'
+      printf 'final_volumes=absent\n'
+      printf 'final_runtime=absent\n'
+    elif [[ "${final_result}" == pass ]]; then
+      printf 'cleanup=not-required\n'
+    else
+      printf 'cleanup=failed\n'
+    fi
+  } | write_secret_file "${FINAL_RESULT_FILE}"
+}
+
+cleanup_final_topology() {
+  local tenant
+  for tenant in ${TENANT_NAMES}; do
+    delete_final_tenant_smoke "${tenant}"
+    remove_tenant_workers "${tenant}"
+  done
+  for tenant in ${TENANT_NAMES}; do
+    delete_final_tenant_control_plane "${tenant}"
+  done
+}
+
+finish_final_create() {
+  local status=$?
+  trap - EXIT
+  if [[ "${status}" -eq "${EXIT_BLOCKED}" ]]; then
+    set +e
+    if (cleanup_final_topology); then
+      final_cleanup_proved=true
+      final_result=blocked
+      record_final_blocker
+    else
+      final_result=cleanup-failed
+      final_blocker_prerequisite=cleanup
+      final_blocker_message="final compatibility cleanup did not remove every owned tenant resource"
+      status="${EXIT_ERROR}"
+    fi
+    write_final_result
+    set -e
+  elif [[ "${status}" -eq "${EXIT_SUCCESS}" ]]; then
+    final_result=pass
+    clear_owned_compatibility_blocker
+    write_final_result
+  fi
+  exit "${status}"
+}
+
+blocked_final() {
+  final_blocker_code="$1"
+  final_blocker_prerequisite="$2"
+  shift 2
+  final_blocker_message="$*"
+  exit "${EXIT_BLOCKED}"
+}
+
+compatibility_result_is_current_pass() {
+  [[ -f "${SPIKE_RESULT_FILE}" ]] \
+    && grep -Fxq 'result=pass' "${SPIKE_RESULT_FILE}" \
+    && grep -Fxq "compatibility_revision=${COMPATIBILITY_REVISION}" \
+      "${SPIKE_RESULT_FILE}" \
+    && grep -Fxq 'cleanup=proved' "${SPIKE_RESULT_FILE}"
+}
+
+any_final_tenant_exists() {
+  local tenant
+  for tenant in ${TENANT_NAMES}; do
+    final_tenant_exists "${tenant}" && return 0
+  done
+  return 1
+}
+
+ensure_current_compatibility_decision() {
+  local status code evidence
+  if compatibility_result_is_current_pass; then
+    log "reusing compatibility decision ${COMPATIBILITY_REVISION}"
+    return
+  fi
+  if any_final_tenant_exists; then
+    die "final.compatibility: final tenants exist without a current passing compatibility decision"
+  fi
+  set +e
+  "${SCRIPT_DIR}/create-spike.sh"
+  status=$?
+  set -e
+  if [[ "${status}" -eq "${EXIT_BLOCKED}" ]]; then
+    code="$(sed -n 's/^code=//p' "${BLOCKER_FILE}" 2>/dev/null || true)"
+    evidence="$(sed -n 's/^message=//p' "${BLOCKER_FILE}" 2>/dev/null || true)"
+    blocked_final "${code:-worker-substrate}" compatibility-decision \
+      "${evidence:-worker compatibility decision remained blocked}"
+  fi
+  [[ "${status}" -eq "${EXIT_SUCCESS}" ]] \
+    || die "final.compatibility: compatibility decision failed with exit ${status}"
+  compatibility_result_is_current_pass \
+    || die "final.compatibility: passing decision lacks current cleanup evidence"
+}
+
+validate_exact_final_topology() {
+  local tcp_json worker_count volume_count tenant other name
+  tcp_json="$(management_kubectl get tenantcontrolplanes.kamaji.clastix.io \
+    --all-namespaces -o json)"
+  TCP_JSON="${tcp_json}" \
+  TENANT_A_NAMESPACE="${TENANT_A_NAMESPACE}" \
+  TENANT_B_NAMESPACE="${TENANT_B_NAMESPACE}" \
+  TENANT_A_SCHEMA="${TENANT_A_SCHEMA}" \
+  TENANT_B_SCHEMA="${TENANT_B_SCHEMA}" \
+  python3 -c '
+import json, os
+items=json.loads(os.environ["TCP_JSON"]).get("items",[])
+expected={
+ ("tenant-a",os.environ["TENANT_A_NAMESPACE"],os.environ["TENANT_A_SCHEMA"]),
+ ("tenant-b",os.environ["TENANT_B_NAMESPACE"],os.environ["TENANT_B_SCHEMA"]),
+}
+actual={(i["metadata"]["name"],i["metadata"]["namespace"],i["spec"]["dataStoreSchema"])
+        for i in items}
+assert actual == expected
+'
+  worker_count="$(docker ps -aq --filter "$(owned_docker_filter)" \
+    --filter 'label=kamaji.cnpg-vcluster.io/role=worker' | wc -l)"
+  volume_count="$(docker volume ls -q --filter "$(owned_docker_filter)" \
+    --filter 'label=kamaji.cnpg-vcluster.io/role=worker-var-lib' | wc -l)"
+  [[ "${worker_count}" -eq 6 && "${volume_count}" -eq 6 ]] \
+    || die "final.topology: expected six owned workers and six owned volumes"
+  validate_disjoint_worker_sets
+
+  [[ "$(management_kubectl get nodes --no-headers | wc -l)" -eq 1 ]] \
+    || die "final.isolation: management API contains tenant workers"
+  for tenant in ${TENANT_NAMES}; do
+    other=tenant-a
+    [[ "${tenant}" == tenant-a ]] && other=tenant-b
+    for name in $(tenant_kubectl "${tenant}" get nodes -o name | sed 's#node/##'); do
+      ! tenant_kubectl "${other}" get node "${name}" >/dev/null 2>&1 \
+        || die "final.isolation: ${name} appears in both tenants"
+    done
+    [[ "$(tenant_kubectl "${other}" get pvc --all-namespaces \
+      -l "kamaji.cnpg-vcluster.io/tenant=${tenant}" --no-headers \
+      2>/dev/null | wc -l)" -eq 0 ]] \
+      || die "final.isolation: ${tenant} storage appears in ${other}"
+    tenant_kube_proxy_conntrack_is_zero "${tenant}" \
+      || die "final.kube-proxy: ${tenant} conntrack remediation is absent"
+    [[ "$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
+      -o jsonpath='{.status.phase}')" == Bound ]] \
+      || die "final.storage: ${tenant} smoke PVC is not Bound"
+  done
+  verify_tenant_identity_separation
+  verify_no_spike_residuals
+}
+
+require_exact_just
+trap finish_final_create EXIT
+reconcile_management_plane
+load_management_network
+cleanup_spike_resources
+verify_no_spike_residuals
+ensure_current_compatibility_decision
+cleanup_spike_resources
+verify_no_spike_residuals
+verify_initial_final_identities_free
+
+for tenant in ${TENANT_NAMES}; do
+  log "reconciling ${tenant} control plane"
+  reconcile_final_tenant "${tenant}"
+  if ! (configure_tenant_kube_proxy_conntrack "${tenant}"); then
+    blocked_final cni-konnectivity "${tenant}-kube-proxy-remediation" \
+      "${tenant} conntrack.maxPerCore=0 was not retained before worker join"
+  fi
+done
+if ! (verify_tenant_identity_separation); then
+  blocked_final worker-substrate tenant-identity \
+    "tenant API endpoints or certificate authorities are not distinct"
+fi
+final_tenant_a_endpoint="$(tenant_kubectl tenant-a config view --raw \
+  -o jsonpath='{.clusters[0].cluster.server}')"
+final_tenant_b_endpoint="$(tenant_kubectl tenant-b config view --raw \
+  -o jsonpath='{.clusters[0].cluster.server}')"
+final_tenant_a_ca_sha256="$(tenant_ca_fingerprint tenant-a)"
+final_tenant_b_ca_sha256="$(tenant_ca_fingerprint tenant-b)"
+
+for tenant in ${TENANT_NAMES}; do
+  log "reconciling ${WORKERS_PER_TENANT} workers for ${tenant}"
+  if ! reconcile_tenant_workers "${tenant}"; then
+    worker_blocker_code=kubeadm-bootstrap
+    if [[ "${FINAL_WORKER_FAILURE_EVIDENCE}" == *"running=false"* \
+      || "${FINAL_WORKER_FAILURE_EVIDENCE}" == *"systemd="* ]]; then
+      worker_blocker_code=worker-substrate
+    fi
+    blocked_final "${worker_blocker_code}" "${tenant}-workers" \
+      "${tenant} worker substrate or kubeadm join did not converge: ${FINAL_WORKER_FAILURE_EVIDENCE:-no kubeadm error summary}"
+  fi
+done
+
+for tenant in ${TENANT_NAMES}; do
+  log "installing networking and storage for ${tenant}"
+  (install_final_tenant_addons "${tenant}") \
+    || blocked_final cni-konnectivity "${tenant}-addons" \
+      "${tenant} CoreDNS, kube-proxy, Konnectivity, Calico, DNS/service routing, endpoint reachability, or Local Path storage did not converge"
+  validate_final_worker_request_capacity "${tenant}" \
+    || blocked_final worker-substrate "${tenant}-capacity" \
+      "${tenant} scheduled pod requests exceed the owned worker Docker caps"
+done
+
+if ! (validate_exact_final_topology); then
+  blocked_final worker-substrate final-topology \
+    "exact two-TCP, two-schema, six-worker isolation or storage topology did not validate"
+fi
+log "two tenant control planes, six exclusive workers, and tenant add-ons are healthy"

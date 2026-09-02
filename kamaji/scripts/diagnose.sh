@@ -4,6 +4,10 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/tenants.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/workers.sh"
 
 scope="${1:-all}"
 case "${scope}" in
@@ -95,11 +99,41 @@ if [[ "${scope}" == spike || "${scope}" == all ]]; then
   fi
 fi
 
-if [[ "${scope}" == tenant-* ]]; then
-  printf '\n== %s API ==\n' "${scope}"
-  if [[ -f "$(tenant_kubeconfig "${scope}")" ]]; then
-    tenant_kubectl "${scope}" get nodes,pods,services,pvc --all-namespaces -o wide || true
-  else
-    printf '%s kubeconfig absent; no tenant API query attempted\n' "${scope}"
+for tenant in ${TENANT_NAMES}; do
+  if [[ "${scope}" == all || "${scope}" == "${tenant}" ]]; then
+    printf '\n== %s management identity ==\n' "${tenant}"
+    management_kubectl -n "$(tenant_namespace "${tenant}")" get \
+      tenantcontrolplanes,deployments,pods,services,secrets,pvc -o wide \
+      2>/dev/null || true
+    printf '\n== %s Docker resources ==\n' "${tenant}"
+    docker ps -a --filter "$(owned_docker_filter)" \
+      --filter "label=kamaji.cnpg-vcluster.io/tenant=${tenant}" \
+      --format '{{json .}}'
+    docker volume ls --filter "$(owned_docker_filter)" \
+      --filter "label=kamaji.cnpg-vcluster.io/tenant=${tenant}" \
+      --format '{{.Name}}'
+    printf '\n== %s API ==\n' "${tenant}"
+    if [[ -f "$(tenant_kubeconfig "${tenant}")" ]]; then
+      tenant_kubectl "${tenant}" get nodes -o wide 2>/dev/null || true
+      tenant_kubectl "${tenant}" get pods,services,pvc --all-namespaces \
+        -o wide 2>/dev/null || true
+      tenant_kubectl "${tenant}" get storageclass,pv -o wide 2>/dev/null || true
+      printf 'kube-proxy conntrack.maxPerCore='
+      tenant_kubectl "${tenant}" -n kube-system get configmap kube-proxy \
+        -o jsonpath='{.data.config\.conf}' 2>/dev/null \
+        | sed -n 's/^  maxPerCore: //p' || true
+      printf '\n'
+      tenant_kubectl "${tenant}" get events --all-namespaces \
+        --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -30 || true
+    else
+      printf '%s kubeconfig absent; no tenant API query attempted\n' "${tenant}"
+    fi
   fi
+done
+
+printf '\n== final result evidence ==\n'
+if [[ -f "${FINAL_RESULT_FILE}" ]]; then
+  sed 's/^/  /' "${FINAL_RESULT_FILE}"
+else
+  printf 'none\n'
 fi

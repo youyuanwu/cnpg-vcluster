@@ -18,6 +18,9 @@ verify_spike_vip_is_free() {
     load_management_network
     claims="$(services_claiming_vip "${TENANT_A_VIP}")" \
       || die "spike.cleanup: unable to inspect borrowed VIP allocation"
+    if final_tenant_exists tenant-a; then
+      claims="$(grep -Fvx "${TENANT_A_NAMESPACE}/tenant-a" <<<"${claims}" || true)"
+    fi
     [[ -z "${claims}" ]] \
       || die "spike.cleanup: borrowed VIP ${TENANT_A_VIP} remains claimed by ${claims//$'\n'/,}"
   elif [[ -x "${BIN_DIR}/kind" ]] \
@@ -33,6 +36,7 @@ cleanup_spike_resources() {
   remove_spike_worker_and_volume
   if [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
     && management_kubectl get --raw=/readyz >/dev/null 2>&1; then
+    unpause_tenant_reconciliation spike
     delete_spike_tenant
   else
     rm -f "$(tenant_kubeconfig spike)"

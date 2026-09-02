@@ -157,6 +157,63 @@ JSON
   [[ "$(services_claiming_vip "172.18.255.254")" == $'tenant-system/spec-ip\ntenant-system/external-ip\ntenant-system/annotation-ip\ndefault/status-ip' ]]
 )
 
+spike_refusal_is_no_mutation() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/tenants.sh"
+  local planted=0 before_runtime before_docker before_tcps output status
+  if ! final_tenant_state_reason >/dev/null 2>&1; then
+    mkdir -p -m 0700 "$(dirname "$(tenant_kubeconfig tenant-a)")"
+    printf 'final-state-fixture\n' | write_secret_file "$(tenant_kubeconfig tenant-a)"
+    planted=1
+  fi
+  before_runtime="$(runtime_fingerprint)"
+  before_docker="$(owned_docker_count)"
+  before_tcps="$(management_kubectl get tenantcontrolplanes.kamaji.clastix.io \
+    --all-namespaces -o json 2>/dev/null | sha256sum || true)"
+  set +e
+  output="$("${SCRIPT_DIR}/create-spike.sh" 2>&1)"
+  status=$?
+  set -e
+  [[ "${status}" -eq "${EXIT_ERROR}" ]] \
+    && grep -Fq 'spike.final-state-refusal' <<<"${output}" \
+    && [[ "$(runtime_fingerprint)" == "${before_runtime}" ]] \
+    && [[ "$(owned_docker_count)" == "${before_docker}" ]] \
+    && [[ "$(management_kubectl get tenantcontrolplanes.kamaji.clastix.io \
+      --all-namespaces -o json 2>/dev/null | sha256sum || true)" == "${before_tcps}" ]]
+  local result=$?
+  if (( planted == 1 )); then
+    rm -f "$(tenant_kubeconfig tenant-a)"
+    rmdir "$(dirname "$(tenant_kubeconfig tenant-a)")" 2>/dev/null || true
+  fi
+  return "${result}"
+)
+
+tenant_addon_render_fixture() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/tenants.sh"
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/addons.sh"
+  local fixture_dir="${TOOLS_TMP_DIR}/phase4-addon-fixture"
+  rm -rf "${fixture_dir}"
+  mkdir -p -m 0700 "${fixture_dir}"
+  trap 'rm -rf "${fixture_dir}"' EXIT
+  RUNTIME_DIR="${fixture_dir}"
+  render_tenant_addons tenant-a
+  render_tenant_addons tenant-b
+  grep -Fq "value: \"${TENANT_A_POD_CIDR}\"" \
+    "$(tenant_addon_dir tenant-a)/calico.yaml" \
+    && grep -Fq "value: \"${TENANT_B_POD_CIDR}\"" \
+      "$(tenant_addon_dir tenant-b)/calico.yaml" \
+    && grep -Fq "\"paths\":[\"${TENANT_A_STORAGE_PATH}\"]" \
+      "$(tenant_addon_dir tenant-a)/local-path.yaml" \
+    && grep -Fq "\"paths\":[\"${TENANT_B_STORAGE_PATH}\"]" \
+      "$(tenant_addon_dir tenant-b)/local-path.yaml" \
+    && ! cmp -s "$(tenant_addon_dir tenant-a)/calico.yaml" \
+      "$(tenant_addon_dir tenant-b)/calico.yaml" \
+    && ! cmp -s "$(tenant_addon_dir tenant-a)/local-path.yaml" \
+      "$(tenant_addon_dir tenant-b)/local-path.yaml"
+)
+
 cleanup_polarity_is_explicit() (
   local fixture_dir="${TOOLS_TMP_DIR}/cleanup-polarity-fixture"
   rm -rf "${fixture_dir}"
@@ -234,7 +291,7 @@ check "complete just task surface" bash -c '
 ' _ "${LAB_ROOT}/Justfile"
 check "Kamaji has no Makefile" test ! -e "${LAB_ROOT}/Makefile"
 check "root Makefile is byte-for-byte unchanged" files_identical_to_main Makefile
-check "root README remains unchanged through Phase 3" files_identical_to_main README.md
+check "root README remains unchanged through Phase 4" files_identical_to_main README.md
 check "vcluster tree is unchanged from main" \
   git -C "${LAB_ROOT}/.." diff --quiet main -- vcluster
 check "no PAW artifact is tracked" \
@@ -464,11 +521,12 @@ check "scripts do not print kubeconfigs, tokens, or passwords" bash -c '
     "$1/scripts/status.sh" "$1/scripts/diagnose.sh"
 ' _ "${LAB_ROOT}"
 
-check "only recognized spike paths can return blocked status" bash -c '
+check "only compatibility paths can return blocked status" bash -c '
   refs="$(grep -R -l "EXIT_BLOCKED" "$1/scripts" --include="*.sh" --exclude=test-static.sh)"
-  [[ "${refs}" == "$1/scripts/create-spike.sh" ]] &&
+  [[ "$(printf "%s\n" "${refs}" | sort)" == "$(printf "%s\n" "$1/scripts/create-spike.sh" "$1/scripts/create.sh" | sort)" ]] &&
   grep -Fq "return \"\${EXIT_BLOCKED}\"" "$1/scripts/create-spike.sh" &&
-  grep -Fq "record_spike_blocker" "$1/scripts/create-spike.sh"
+  grep -Fq "record_spike_blocker" "$1/scripts/create-spike.sh" &&
+  grep -Fq "record_final_blocker" "$1/scripts/create.sh"
 ' _ "${LAB_ROOT}"
 check "unimplemented normal path returns 1, never 2" \
   command_returns_one "${SCRIPT_DIR}/unavailable.sh" create "later phase"
@@ -540,6 +598,8 @@ check "spike always cleans exact ephemeral resources" bash -c '
 ' _ "${LAB_ROOT}"
 check "borrowed VIP claimant parser handles every claim shape" \
   services_claiming_vip_fixture
+check "just spike refuses final state with exit 1 and no mutation" \
+  spike_refusal_is_no_mutation
 check "cleanup proof attestations require successful cleanup" bash -c '
   result_block="$(sed -n "/^write_spike_result()/,/^}/p" "$1/scripts/create-spike.sh")"
   finish_block="$(sed -n "/^finish_spike()/,/^}/p" "$1/scripts/create-spike.sh")"
@@ -589,6 +649,143 @@ check "spike datastore cleanup is exact and health-gated" bash -c '
   grep -Fq '\''role delete "${SPIKE_SCHEMA}"'\'' "$1/scripts/lib/tenants.sh" &&
   grep -Fq "DataStore/default became unhealthy" "$1/scripts/lib/tenants.sh" &&
   grep -Fq "status.usedBy" "$1/scripts/lib/tenants.sh"
+' _ "${LAB_ROOT}"
+
+check "final tenant templates define exactly two isolated TCPs" bash -c '
+  source "$1/config/settings.env"
+  for tenant in tenant-a tenant-b; do
+    file="$1/config/tenants/${tenant}.yaml"
+    [[ -s "$file" ]] || exit 1
+    grep -Fq "name: ${tenant}" "$file" || exit 1
+    grep -Fq "namespace: kamaji-${tenant}" "$file" || exit 1
+    grep -Fq "dataStoreSchema: kamaji-${tenant}" "$file" || exit 1
+    grep -Fq "dataStoreUsername: kamaji-${tenant}" "$file" || exit 1
+    grep -Fq "replicas: 1" "$file" || exit 1
+    grep -Fq "version: \${KUBERNETES_VERSION}" "$file" || exit 1
+    grep -Fq "path: /cgroupDriver" "$file" || exit 1
+    grep -Fq "value: systemd" "$file" || exit 1
+    grep -Fq "coreDNS: {}" "$file" || exit 1
+    grep -Fq "kubeProxy: {}" "$file" || exit 1
+    grep -Fq "version: \${KONNECTIVITY_AGENT_VERSION_DIGEST}" "$file" || exit 1
+    grep -Fq "version: \${KONNECTIVITY_SERVER_VERSION_DIGEST}" "$file" || exit 1
+  done
+  grep -Fq "$TENANT_A_POD_CIDR" "$1/config/tenants/tenant-a.yaml" &&
+  grep -Fq "$TENANT_A_SERVICE_CIDR" "$1/config/tenants/tenant-a.yaml" &&
+  grep -Fq "$TENANT_A_DNS_SERVICE_IP" "$1/config/tenants/tenant-a.yaml" &&
+  grep -Fq "$TENANT_A_CLUSTER_DOMAIN" "$1/config/tenants/tenant-a.yaml" &&
+  grep -Fq "$TENANT_A_CERT_DNS" "$1/config/tenants/tenant-a.yaml" &&
+  grep -Fq "$TENANT_B_POD_CIDR" "$1/config/tenants/tenant-b.yaml" &&
+  grep -Fq "$TENANT_B_SERVICE_CIDR" "$1/config/tenants/tenant-b.yaml" &&
+  grep -Fq "$TENANT_B_DNS_SERVICE_IP" "$1/config/tenants/tenant-b.yaml" &&
+  grep -Fq "$TENANT_B_CLUSTER_DOMAIN" "$1/config/tenants/tenant-b.yaml" &&
+  grep -Fq "$TENANT_B_CERT_DNS" "$1/config/tenants/tenant-b.yaml"
+' _ "${LAB_ROOT}"
+check "final tenant identities are pairwise distinct" bash -c '
+  source "$1/config/settings.env"
+  values=(
+    "$TENANT_A_NAMESPACE" "$TENANT_B_NAMESPACE"
+    "$TENANT_A_SCHEMA" "$TENANT_B_SCHEMA"
+    "$TENANT_A_DATASTORE_USER" "$TENANT_B_DATASTORE_USER"
+    "$TENANT_A_POD_CIDR" "$TENANT_B_POD_CIDR"
+    "$TENANT_A_SERVICE_CIDR" "$TENANT_B_SERVICE_CIDR"
+    "$TENANT_A_DNS_SERVICE_IP" "$TENANT_B_DNS_SERVICE_IP"
+    "$TENANT_A_CLUSTER_DOMAIN" "$TENANT_B_CLUSTER_DOMAIN"
+    "$TENANT_A_CERT_DNS" "$TENANT_B_CERT_DNS"
+    "$TENANT_A_STORAGE_PATH" "$TENANT_B_STORAGE_PATH"
+  )
+  for ((i=0; i<${#values[@]}; i+=2)); do
+    [[ "${values[i]}" != "${values[i+1]}" ]] || exit 1
+  done
+' _ "${LAB_ROOT}"
+check "tenant add-ons render independently with exact CIDRs and paths" \
+  tenant_addon_render_fixture
+check "final worker names and volumes are exactly two by three" bash -c '
+  source "$1/scripts/lib/workers.sh"
+  expected=$'"'"'kamaji-tenant-a-worker-1\nkamaji-tenant-a-worker-2\nkamaji-tenant-a-worker-3\nkamaji-tenant-b-worker-1\nkamaji-tenant-b-worker-2\nkamaji-tenant-b-worker-3'"'"'
+  actual=""
+  for tenant in $TENANT_NAMES; do
+    for ordinal in $(seq 1 "$WORKERS_PER_TENANT"); do
+      actual+=$(worker_name "$tenant" "$ordinal")$'"'"'\n'"'"'
+      [[ "$(worker_volume_name "$tenant" "$ordinal")" == "$(worker_name "$tenant" "$ordinal")-var-lib" ]] || exit 1
+    done
+  done
+  [[ "${actual%$'\''\n'\''}" == "$expected" ]]
+' _ "${LAB_ROOT}"
+check "worker reconciliation covers current stopped stale and partial states" bash -c '
+  file="$1/scripts/lib/workers.sh"
+  grep -Fq "final_worker_current" "$file" &&
+  grep -Fq "docker start" "$file" &&
+  grep -Fq "remove_final_worker_container" "$file" &&
+  grep -Fq "final_worker_node_registered" "$file" &&
+  grep -Fq "reset_worker_state_for_rejoin" "$file" &&
+  grep -Fq "token create --ttl" "$file" &&
+  grep -Fq "token delete" "$file" &&
+  grep -Fq "validate_disjoint_worker_sets" "$file"
+' _ "${LAB_ROOT}"
+check "worker ownership rejects same-named unowned objects" bash -c '
+  grep -Fq "refusing same-named unowned container" "$1" &&
+  grep -Fq "refusing same-named unowned volume" "$1" &&
+  grep -Fq "worker-var-lib" "$1"
+' _ "${LAB_ROOT}/scripts/lib/workers.sh"
+check "kube-proxy remediation is pre-join and proves non-reversion" bash -c '
+  tenant_file="$1/scripts/lib/tenants.sh"
+  create_file="$1/scripts/create.sh"
+  grep -Fq "maxPerCore: " "$tenant_file" &&
+  grep -Fq "kamaji.clastix.io/paused=true" "$tenant_file" &&
+  grep -Fq "Kamaji reverted conntrack.maxPerCore" "$tenant_file" &&
+  grep -Fq "immediate_reversion=not-observed" "$tenant_file" &&
+  patch_line="$(grep -n "configure_tenant_kube_proxy_conntrack" "$create_file" | tail -1 | cut -d: -f1)" &&
+  worker_line="$(grep -n "reconcile_tenant_workers" "$create_file" | tail -1 | cut -d: -f1)" &&
+  (( patch_line < worker_line ))
+' _ "${LAB_ROOT}"
+check "final create reuses compatibility and rejects every spike residual" bash -c '
+  file="$1/scripts/create.sh"
+  grep -Fq "compatibility_result_is_current_pass" "$file" &&
+  grep -Fq "cleanup_spike_resources" "$file" &&
+  grep -Fq "verify_no_spike_residuals" "$file" &&
+  grep -Fq "verify_initial_final_identities_free" "$file" &&
+  grep -Fq "first_failing_prerequisite" "$file"
+' _ "${LAB_ROOT}"
+check "blocked final path removes every tenant-owned runtime layer" bash -c '
+  grep -Fq "cleanup_final_topology" "$1/scripts/create.sh" &&
+  grep -Fq "delete_final_tenant_smoke" "$1/scripts/create.sh" &&
+  grep -Fq "remove_tenant_workers" "$1/scripts/create.sh" &&
+  grep -Fq "delete_final_tenant_control_plane" "$1/scripts/create.sh" &&
+  grep -Fq "exact etcd prefix remains" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "exact etcd user remains" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "exact etcd role remains" "$1/scripts/lib/tenants.sh"
+' _ "${LAB_ROOT}"
+check "final topology gates exact TCP schema worker storage and isolation counts" bash -c '
+  file="$1/scripts/create.sh"
+  grep -Fq "assert actual == expected" "$file" &&
+  grep -Fq "expected six owned workers and six owned volumes" "$file" &&
+  grep -Fq "management API contains tenant workers" "$file" &&
+  grep -Fq "appears in both tenants" "$file" &&
+  grep -Fq "storage appears in" "$file" &&
+  grep -Fq "smoke PVC is not Bound" "$file"
+' _ "${LAB_ROOT}"
+check "runtime result captures endpoint and CA identity separation" bash -c '
+  grep -Fq "verify_tenant_identity_separation" "$1" &&
+  grep -Fq "tenant_a_endpoint=%s" "$1" &&
+  grep -Fq "tenant_b_endpoint=%s" "$1" &&
+  grep -Fq "tenant_a_ca_sha256=%s" "$1" &&
+  grep -Fq "tenant_b_ca_sha256=%s" "$1"
+' _ "${LAB_ROOT}/scripts/create.sh"
+check "capacity accounting uses Docker caps and scheduled pod requests" bash -c '
+  source "$1/config/settings.env"
+  [[ "$WORKER_TOTAL_CPUS" == 7.5 && "$WORKER_TOTAL_MEMORY_GIB" == 15 &&
+     "$MANAGEMENT_REQUEST_CPUS" == 1.2 && "$KIND_RESERVE_CPUS" == 2 ]] &&
+  grep -Fq "validate_final_worker_request_capacity" "$1/scripts/lib/workers.sh" &&
+  grep -Fq "requested_cpu <= int(os.environ[\"CPU_CAP\"])" "$1/scripts/lib/workers.sh" &&
+  grep -Fq "requested_memory <= int(os.environ[\"MEMORY_CAP\"])" "$1/scripts/lib/workers.sh"
+' _ "${LAB_ROOT}"
+check "status and diagnostics cover both final tenants and exit shapes" bash -c '
+  grep -Fq "final tenant topology" "$1/scripts/status.sh" &&
+  grep -Fq "passing final result lacks exactly two TCPs" "$1/scripts/status.sh" &&
+  grep -Fq "blocked final result retains workers" "$1/scripts/status.sh" &&
+  grep -Fq "kube-proxy conntrack.maxPerCore" "$1/scripts/status.sh" &&
+  grep -Fq "final result evidence" "$1/scripts/diagnose.sh" &&
+  grep -Fq "for tenant in \${TENANT_NAMES}" "$1/scripts/diagnose.sh"
 ' _ "${LAB_ROOT}"
 
 check "management values disable telemetry" \
@@ -684,4 +881,4 @@ if (( failures > 0 )); then
   die "${failures} static check(s) failed"
 fi
 
-log "all ${checks} Phase 3 static checks passed"
+log "all ${checks} Phase 4 static checks passed"

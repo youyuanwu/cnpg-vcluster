@@ -7,11 +7,11 @@ CloudNativePG databases. It uses the public Apache-2.0 Kamaji
 artifact. The edge channel is experimental; CLASTIX's stable artifact channel
 is not freely downloadable.
 
-Phase 3 adds an ephemeral compatibility gate for one spike-only hosted control
-plane and worker. The gate borrows Tenant A's reserved VIP only while no final
-tenant state exists, exercises kubeadm, Calico, Konnectivity, DNS, service
-routing, and persistent local storage, then removes every spike resource on
-both pass and blocked exit.
+The permanent compatibility gate uses one spike-only hosted control plane and
+worker. Phase 4 adds the fixed two-tenant/six-worker topology and the scoped
+kube-proxy remediation. The spike now passes every networking and persistence
+rung; this host blocks while scaling the final topology to its second worker,
+then removes all final tenant state.
 
 ## Prerequisites
 
@@ -48,8 +48,9 @@ just preflight
 just create-management
 just spike
 just destroy-spike
+just create
 just status
-just diagnose spike
+just diagnose all
 just test-static
 ```
 
@@ -80,8 +81,9 @@ neither adopted nor deleted.
 1. upstream-equivalent privileged `kindest/node` kubeadm join;
 2. Kubernetes 1.36.4, systemd kubelet, and the fixed LoadBalancer VIP;
 3. Calico, CoreDNS, kube-proxy, Konnectivity, DNS, and service routing;
-4. persistent `/var/lib`, default Local Path storage, a bound PVC, Docker-cap
-   allocatable resources, and marker survival across worker recreation.
+4. persistent `/var/lib`, default Local Path storage, a bound PVC, scheduled
+   request accounting against Docker caps, and marker survival across worker
+   recreation and rejoin.
 
 The spike refuses with exit `1` before mutation if a final tenant TCP, schema
 credential, kubeconfig, worker, or volume exists. Otherwise it always removes
@@ -98,21 +100,44 @@ general ConfigMap reads.
 Additional container-only bootstrap adjustments are exact:
 Konnectivity tolerates the worker's temporary `not-ready:NoSchedule` taint,
 Calico's installer receives only the fixed API VIP/port before Service routing
-exists. The live target currently blocks when kube-proxy tries to write
+exists. The original live target blocked when kube-proxy tried to write
 `/proc/sys/net/netfilter/nf_conntrack_max`. On this host, the Linux kernel
 exposes `net.netfilter.nf_conntrack_max` read-only in a separate network
 namespace even to a privileged container; nesting, Docker/runc masking, and
-missing privilege are not the cause. The realistic remediation is to configure
+missing privilege are not the cause. The implemented remediation configures
 kube-proxy with `conntrack.maxPerCore: 0` before it starts, matching kind's
-container-node behavior, or use a kube-proxy-free dataplane. Kamaji's
+container-node behavior. Kamaji's
 `spec.addons.kubeProxy` fields select the image repository and tag but do not
-directly expose this kube-proxy configuration, so Phase 4 must first test a
-pre-start ConfigMap/configuration path rather than assume an addon-field knob.
+directly expose this setting. The lab therefore pauses TCP reconciliation,
+patches only the generated kube-proxy ConfigMap through the explicit tenant
+kubeconfig, verifies the value immediately and after ten seconds, and performs
+all worker joins afterward. An unpaused probe reverted the value within two
+seconds; the paused value remained throughout the passing spike. kube-proxy
+stays enabled and Calico is unchanged.
+
+`just create` reuses only that current passing compatibility revision, removes
+and verifies every spike residual, checks that borrowed VIPs and datastore
+identities are free, then reconciles `tenant-a` and `tenant-b`, three exclusive
+workers each, independently rendered Calico and Local Path resources, DNS,
+Service routing, endpoint reachability, and one bound smoke PVC per tenant.
+Workers and volumes have exact ownership labels, persistent `/var/lib`,
+same-name refusal, stopped/stale handling, partial rejoin, and short-lived
+token cleanup.
+
+On the current host, repeated final runs reach the exact first failing
+prerequisite `tenant-a-workers`: with both TCPs present and worker 1 joined,
+worker 2 exits during systemd startup with
+`running=false,exit=255,oom=false`. One bounded recreate/retry produces the
+same result. Exit `2` cleanup removes both TCPs/namespaces/schemas/credentials,
+all kubeconfigs, workers, tenant volumes, and tenant runtime subtrees. Only the
+healthy management plane and blocker/result evidence remain.
 
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and
 tenant-control-plane/spike layers without exporting credentials or reconciling
-resources.
+resources. Final views include both TCP identities, endpoints, kube-proxy
+remediation, worker counts, add-ons, storage classes, smoke PVCs, and blocked
+residual checks.
 
 ## Security and state
 
@@ -125,7 +150,7 @@ and configurable through `config/settings.env`.
 Exit status `0` means success, `1` means an ordinary error or unhealthy state,
 and exit status `2` is reserved for a recognized compatibility blocker with a
 machine-readable blocker record. Management creation never returns `2`;
-Phase 3 and later compatibility gates may do so only through the dedicated
+Compatibility gates may do so only through the dedicated
 blocker path.
 
 `KUBEADM_IGNORE_PREFLIGHT_ERRORS` in `config/settings.env` is the single

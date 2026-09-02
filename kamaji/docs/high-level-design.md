@@ -177,8 +177,9 @@ The compatibility ladder is deliberately ordered:
    CPU/memory caps, and persistent `/var/lib`;
 3. Calico plus Kamaji-managed CoreDNS, kube-proxy, and Konnectivity, including
    worker access to ports 6443/8132 and pod DNS/service routing;
-4. one default Local Path class, a bound PVC, allocatable resource validation,
-   and a marker read after recreating the worker with its owned volume.
+4. one default Local Path class, a bound PVC, scheduled request validation
+   against the Docker cap, and a marker read after recreating and rejoining the
+   worker with its owned volume.
 
 The first 1.36.4 attempt proved an edge-release RBAC gap before kubeadm
 preflight: the bootstrap identity could not read `kubelet-config`. The narrow
@@ -203,11 +204,13 @@ tries to update `nf_conntrack_max`. On this host, the Linux kernel exposes
 including a single-level privileged container; nesting, Docker/runc masking,
 and missing privilege are not the cause. The viable paths are to configure
 kube-proxy with `conntrack.maxPerCore: 0` before startup, as kind does for
-container nodes, or to use a kube-proxy-free dataplane. Kamaji's
-`spec.addons.kubeProxy` image repository/tag fields do not directly expose that
-configuration. Phase 4 must therefore test a pre-start ConfigMap/configuration
-path (or explicitly replace the managed dataplane) before accepting the
-full-topology blocked state.
+container nodes. Phase 4 implements that path without replacing kube-proxy or
+Calico. Kamaji's `spec.addons.kubeProxy` image repository/tag fields do not
+directly expose the setting, and an unpaused ConfigMap patch is reverted within
+two seconds. The lab uses Kamaji's pause annotation, patches the generated
+ConfigMap through the explicit tenant kubeconfig, verifies the exact value
+immediately and after ten seconds, and only then joins workers. Teardown
+unpauses reconciliation before TCP deletion.
 
 The TCP explicitly selects digest-pinned `KONNECTIVITY_AGENT_IMAGE` and
 `KONNECTIVITY_SERVER_IMAGE` by splitting each valid `tag@digest` reference
@@ -231,6 +234,43 @@ a digest-pinned etcd maintenance Pod mounts only the datastore client
 certificate and performs exact prefix/user/role deletion before rechecking
 `DataStore/default` health. Only result/blocker evidence and the healthy
 management plane remain.
+
+## Fixed final topology and current result
+
+The final configuration declares exactly two one-replica TCPs:
+
+- `tenant-a` in `kamaji-tenant-a`, schema/user `kamaji-tenant-a`, VIP
+  `172.18.255.254`, Pod CIDR `10.64.0.0/16`, Service CIDR
+  `10.128.0.0/16`, DNS `10.128.0.10`, domain
+  `tenant-a.cluster.local`, certificate DNS SAN
+  `api.tenant-a.kamaji.local`;
+- `tenant-b` in `kamaji-tenant-b`, schema/user `kamaji-tenant-b`, VIP
+  `172.18.255.253`, Pod CIDR `10.65.0.0/16`, Service CIDR
+  `10.129.0.0/16`, DNS `10.129.0.10`, domain
+  `tenant-b.cluster.local`, certificate DNS SAN
+  `api.tenant-b.kamaji.local`.
+
+Both select Kubernetes 1.36.4, the systemd kubelet patch, CoreDNS,
+kube-proxy, and digest-pinned Konnectivity images. Workers are named
+`kamaji-<tenant>-worker-{1,2,3}` with matching persistent `-var-lib` volumes.
+Calico and Local Path render separately for each tenant with its exact Pod
+CIDR and `/var/lib/kamaji-local-path/<tenant>` root.
+
+The remediated one-worker ladder passes CNI, DNS/Service routing, endpoint
+reachability, a bound Local Path PVC, and marker persistence after an owned
+worker recreation/rejoin. Node capacity still reflects the shared host, so
+the enforced capacity contract sums scheduled pod requests per node and
+compares them with each `1.25` CPU/`2560MiB` Docker cap.
+
+Repeated full-topology runs stop at `tenant-a-workers`. Both TCPs are Ready
+and worker 1 joins; worker 2 then exits before systemd becomes ready with
+Docker state `running=false,exit=255,oom=false`. Two unjoined workers, one TCP
+plus one joined/one unjoined worker, and two TCPs without joined workers were
+isolated successfully, making this the first observed final prerequisite.
+One recreate/retry repeats the exit. The recognized exit `2` path removes
+every final TCP, namespace, datastore prefix/user/role and credential,
+kubeconfig, worker, volume, smoke object, and tenant runtime subtree, retaining
+only healthy management and mode-0600 evidence.
 
 ## Version summary
 

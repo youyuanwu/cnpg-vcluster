@@ -6,6 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "${SCRIPT_DIR}/lib/common.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/tenants.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/workers.sh"
 
 health="${EXIT_SUCCESS}"
 
@@ -172,8 +174,16 @@ spike_worker_count="$(docker ps -aq --filter "$(owned_docker_filter)" \
   --filter 'label=kamaji.cnpg-vcluster.io/tenant=spike' | wc -l)"
 spike_volume_count="$(docker volume ls -q --filter "$(owned_docker_filter)" \
   --filter 'label=kamaji.cnpg-vcluster.io/tenant=spike' | wc -l)"
-load_management_network
-if spike_vip_claims="$(services_claiming_vip "${TENANT_A_VIP}" 2>/dev/null)"; then
+if [[ -f "${MANAGEMENT_NETWORK_FILE}" ]]; then
+  load_management_network
+fi
+if [[ -n "${TENANT_A_VIP:-}" ]] \
+  && spike_vip_claims="$(services_claiming_vip "${TENANT_A_VIP}" 2>/dev/null)"; then
+  if final_tenant_exists tenant-a; then
+    spike_vip_claims="$(
+      grep -Fvx "${TENANT_A_NAMESPACE}/tenant-a" <<<"${spike_vip_claims}" || true
+    )"
+  fi
   if [[ -n "${spike_vip_claims}" ]]; then
     spike_vip_claim_count="$(grep -c '^' <<<"${spike_vip_claims}")"
   else
@@ -192,5 +202,72 @@ printf '  residual VIP claims: %s\n' "${spike_vip_claim_count}"
 [[ "${spike_vip_claim_count}" == 0 ]] || unhealthy "spike borrowed VIP remains claimed or could not be inspected"
 [[ ! -e "$(tenant_kubeconfig spike)" ]] || unhealthy "spike kubeconfig remains"
 [[ ! -e "${SPIKE_RUNTIME_DIR}" ]] || unhealthy "spike runtime subtree remains"
+
+section "final tenant topology"
+if [[ -f "${FINAL_RESULT_FILE}" ]]; then
+  sed 's/^/  /' "${FINAL_RESULT_FILE}"
+else
+  printf '  result evidence: absent\n'
+fi
+final_tcp_count="$(management_kubectl get tenantcontrolplanes.kamaji.clastix.io \
+  --all-namespaces --no-headers 2>/dev/null | wc -l)"
+final_worker_count="$(docker ps -aq --filter "$(owned_docker_filter)" \
+  --filter 'label=kamaji.cnpg-vcluster.io/role=worker' | wc -l)"
+final_volume_count="$(docker volume ls -q --filter "$(owned_docker_filter)" \
+  --filter 'label=kamaji.cnpg-vcluster.io/role=worker-var-lib' | wc -l)"
+printf '  final TCPs: %s\n' "${final_tcp_count}"
+printf '  final workers: %s\n' "${final_worker_count}"
+printf '  final worker volumes: %s\n' "${final_volume_count}"
+
+for tenant in ${TENANT_NAMES}; do
+  namespace="$(tenant_namespace "${tenant}")"
+  printf '\n-- %s --\n' "${tenant}"
+  if final_tenant_exists "${tenant}"; then
+    printf 'TCP: %s endpoint=%s schema=%s paused=%s\n' \
+      "$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
+        -o jsonpath='{.status.kubernetesResources.version.status}' 2>/dev/null || printf unknown)" \
+      "$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
+        -o jsonpath='{.status.controlPlaneEndpoint}' 2>/dev/null || printf unknown)" \
+      "$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
+        -o jsonpath='{.spec.dataStoreSchema}' 2>/dev/null || printf unknown)" \
+      "$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
+        -o jsonpath='{.metadata.annotations.kamaji\.clastix\.io/paused}' 2>/dev/null || printf false)"
+  else
+    printf 'TCP: absent\n'
+  fi
+  if [[ -f "$(tenant_kubeconfig "${tenant}")" ]] \
+    && tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1; then
+    printf 'API: ready\n'
+    printf 'Ready workers: %s/%s\n' \
+      "$(tenant_kubectl "${tenant}" get nodes --no-headers 2>/dev/null \
+        | awk '$2 == "Ready" {count++} END {print count+0}')" \
+      "${WORKERS_PER_TENANT}"
+    printf 'kube-proxy conntrack.maxPerCore: %s\n' \
+      "$(tenant_kubectl "${tenant}" -n kube-system get configmap kube-proxy \
+        -o jsonpath='{.data.config\.conf}' 2>/dev/null \
+        | sed -n 's/^  maxPerCore: //p' || printf unknown)"
+    printf 'default storage classes: %s\n' \
+      "$(tenant_kubectl "${tenant}" get storageclass -o json 2>/dev/null \
+        | python3 -c 'import json,sys; print(sum(1 for i in json.load(sys.stdin).get("items",[]) if i.get("metadata",{}).get("annotations",{}).get("storageclass.kubernetes.io/is-default-class")=="true"))' \
+        || printf unknown)"
+    printf 'smoke PVC: %s\n' \
+      "$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || printf absent)"
+  else
+    printf 'API: kubeconfig absent or unreachable\n'
+  fi
+done
+
+if [[ -f "${FINAL_RESULT_FILE}" ]] \
+  && grep -Fxq 'result=pass' "${FINAL_RESULT_FILE}"; then
+  [[ "${final_tcp_count}" -eq 2 ]] || unhealthy "passing final result lacks exactly two TCPs"
+  [[ "${final_worker_count}" -eq 6 ]] || unhealthy "passing final result lacks exactly six workers"
+  [[ "${final_volume_count}" -eq 6 ]] || unhealthy "passing final result lacks exactly six volumes"
+elif [[ -f "${FINAL_RESULT_FILE}" ]] \
+  && grep -Fxq 'result=blocked' "${FINAL_RESULT_FILE}"; then
+  [[ "${final_tcp_count}" -eq 0 ]] || unhealthy "blocked final result retains TCPs"
+  [[ "${final_worker_count}" -eq 0 ]] || unhealthy "blocked final result retains workers"
+  [[ "${final_volume_count}" -eq 0 ]] || unhealthy "blocked final result retains volumes"
+fi
 
 exit "${health}"

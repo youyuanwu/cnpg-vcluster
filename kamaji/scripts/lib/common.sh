@@ -17,6 +17,7 @@ RUNTIME_DIR="${LAB_ROOT}/.runtime"
 MANAGEMENT_KUBECONFIG="${RUNTIME_DIR}/kubeconfigs/management.yaml"
 BLOCKER_FILE="${RUNTIME_DIR}/blocker"
 SPIKE_RESULT_FILE="${RUNTIME_DIR}/spike-result.env"
+FINAL_RESULT_FILE="${RUNTIME_DIR}/final-result.env"
 SPIKE_RUNTIME_DIR="${RUNTIME_DIR}/tenants/spike"
 SPIKE_RENDERED_MANIFEST="${SPIKE_RUNTIME_DIR}/tenantcontrolplane.yaml"
 SPIKE_WORKER_OWNERSHIP_FILE="${SPIKE_RUNTIME_DIR}/worker.env"
@@ -146,6 +147,22 @@ management_context() {
 
 tenant_kubeconfig() {
   printf '%s/tenants/%s/admin.conf\n' "${RUNTIME_DIR}" "$1"
+}
+
+tenant_runtime_dir() {
+  printf '%s/tenants/%s\n' "${RUNTIME_DIR}" "$1"
+}
+
+tenant_rendered_manifest() {
+  printf '%s/tenantcontrolplane.yaml\n' "$(tenant_runtime_dir "$1")"
+}
+
+tenant_kube_proxy_evidence() {
+  printf '%s/kube-proxy.env\n' "$(tenant_runtime_dir "$1")"
+}
+
+tenant_addon_dir() {
+  printf '%s/addons\n' "$(tenant_runtime_dir "$1")"
 }
 
 management_kubectl() {

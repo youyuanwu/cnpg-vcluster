@@ -23,9 +23,9 @@ spike:
 destroy-spike:
     @scripts/destroy-spike.sh
 
-# Reconcile the complete lab (implemented in later phases).
+# Reconcile both tenant control planes, six workers, networking, and storage.
 create:
-    @scripts/unavailable.sh create "Phase 4"
+    @scripts/create.sh
 
 # Report read-only summarized state.
 status:
