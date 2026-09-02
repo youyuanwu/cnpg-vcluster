@@ -35,7 +35,7 @@ for item in json.load(sys.stdin).get("items", []):
         *(entry.get("ip", "") for entry in status.get("ingress", [])),
     ]))
     if vip in claims:
-        print(f"{metadata.get('namespace', 'default')}/{metadata.get('name', '')}")
+        print(metadata.get("namespace", "default") + "/" + metadata.get("name", ""))
 '
 }
 

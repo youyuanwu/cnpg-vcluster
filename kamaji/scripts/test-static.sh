@@ -138,6 +138,25 @@ hostile_observer_is_rejected() (
     && ! observer_is_read_only hostile_mutation_observer
 )
 
+services_claiming_vip_fixture() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/tenants.sh"
+
+  management_kubectl() {
+    cat <<'JSON'
+{"items":[
+  {"metadata":{"namespace":"tenant-system","name":"spec-ip"},"spec":{"loadBalancerIP":"172.18.255.254"}},
+  {"metadata":{"namespace":"tenant-system","name":"external-ip"},"spec":{"externalIPs":["172.18.255.254"]}},
+  {"metadata":{"namespace":"tenant-system","name":"annotation-ip","annotations":{"metallb.io/loadBalancerIPs":"172.18.255.253,172.18.255.254"}},"spec":{}},
+  {"metadata":{"name":"status-ip"},"spec":{},"status":{"loadBalancer":{"ingress":[{"ip":"172.18.255.254"}]}}},
+  {"metadata":{"namespace":"tenant-system","name":"other-ip"},"spec":{"loadBalancerIP":"172.18.255.252"}}
+]}
+JSON
+  }
+
+  [[ "$(services_claiming_vip "172.18.255.254")" == $'tenant-system/spec-ip\ntenant-system/external-ip\ntenant-system/annotation-ip\ndefault/status-ip' ]]
+)
+
 cleanup_polarity_is_explicit() (
   local fixture_dir="${TOOLS_TMP_DIR}/cleanup-polarity-fixture"
   rm -rf "${fixture_dir}"
@@ -519,6 +538,8 @@ check "spike always cleans exact ephemeral resources" bash -c '
   grep -Fq "services_claiming_vip" "$1/scripts/status.sh" &&
   grep -Fq "rm -rf \"\${SPIKE_RUNTIME_DIR}\"" "$1/scripts/destroy-spike.sh"
 ' _ "${LAB_ROOT}"
+check "borrowed VIP claimant parser handles every claim shape" \
+  services_claiming_vip_fixture
 check "cleanup proof attestations require successful cleanup" bash -c '
   result_block="$(sed -n "/^write_spike_result()/,/^}/p" "$1/scripts/create-spike.sh")"
   finish_block="$(sed -n "/^finish_spike()/,/^}/p" "$1/scripts/create-spike.sh")"
