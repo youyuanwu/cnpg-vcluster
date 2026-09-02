@@ -1,27 +1,7 @@
-SHELL := /usr/bin/env bash
+VCLUSTER_DIR := vcluster
+VCLUSTER_TARGETS := tools create verify status diagnose destroy test-static test-e2e
 
-.PHONY: tools create verify status diagnose destroy test-static test-e2e
+.PHONY: $(VCLUSTER_TARGETS)
 
-tools:
-	@./scripts/tools.sh
-
-create: tools
-	@./scripts/create.sh
-
-verify: tools
-	@./scripts/verify.sh
-
-status: tools
-	@./scripts/status.sh
-
-diagnose: tools
-	@./scripts/diagnose.sh $(TENANT)
-
-destroy: tools
-	@./scripts/destroy.sh
-
-test-static:
-	@./scripts/test-static.sh
-
-test-e2e: tools
-	@./scripts/test-e2e.sh
+$(VCLUSTER_TARGETS):
+	@$(MAKE) -C $(VCLUSTER_DIR) $@
