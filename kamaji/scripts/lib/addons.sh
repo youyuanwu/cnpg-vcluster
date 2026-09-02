@@ -105,6 +105,18 @@ print(value.split("://",1)[-1] if value else "")
       | grep -Fq 'open /proc/sys/net/netfilter/nf_conntrack_max: permission denied'
 }
 
+spike_network_failure_summary() {
+  local evidence
+  evidence="$(spike_addon_failure_summary 2>/dev/null || printf unavailable)"
+  if spike_kube_proxy_procfs_blocked; then
+    printf '%s\n' \
+      "the host Linux kernel exposes net.netfilter.nf_conntrack_max read-only in the worker network namespace even to privileged kube-proxy; configure conntrack.maxPerCore: 0 before kube-proxy starts or use a kube-proxy-free dataplane; other pending add-on states are consequential, not independent failures: ${evidence}"
+  else
+    printf '%s\n' \
+      "Calico, CoreDNS, kube-proxy, Konnectivity, DNS, or service routing failed: ${evidence}"
+  fi
+}
+
 wait_spike_network_addons() {
   local deadline=$((SECONDS + $(seconds_from_duration "${TENANT_ADDON_TIMEOUT}")))
   until spike_managed_addons_ready && spike_calico_ready; do

@@ -98,9 +98,16 @@ general ConfigMap reads.
 Additional container-only bootstrap adjustments are exact:
 Konnectivity tolerates the worker's temporary `not-ready:NoSchedule` taint,
 Calico's installer receives only the fixed API VIP/port before Service routing
-exists. The live target currently blocks when nested kube-proxy tries to write
-`/proc/sys/net/netfilter/nf_conntrack_max`: Docker exposes that path read-only
-inside the pod even though both the worker and pod are privileged.
+exists. The live target currently blocks when kube-proxy tries to write
+`/proc/sys/net/netfilter/nf_conntrack_max`. On this host, the Linux kernel
+exposes `net.netfilter.nf_conntrack_max` read-only in a separate network
+namespace even to a privileged container; nesting, Docker/runc masking, and
+missing privilege are not the cause. The realistic remediation is to configure
+kube-proxy with `conntrack.maxPerCore: 0` before it starts, matching kind's
+container-node behavior, or use a kube-proxy-free dataplane. Kamaji's
+`spec.addons.kubeProxy` fields select the image repository and tag but do not
+directly expose this kube-proxy configuration, so Phase 4 must first test a
+pre-start ConfigMap/configuration path rather than assume an addon-field knob.
 
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and

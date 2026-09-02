@@ -197,11 +197,17 @@ The CNI rung also records three container-only bootstrap facts. Konnectivity
 needs an explicit `not-ready:NoSchedule` toleration before CNI makes the node
 Ready. Calico's installer cannot use the Service VIP before kube-proxy works,
 so its documented `kubernetes-services-endpoint` ConfigMap points only to the
-fixed control-plane VIP and port. Finally, kube-proxy must update
-`nf_conntrack_max`, but Docker exposes that exact path read-only even in the
-privileged nested pod. The generated kube-proxy ConfigMap and DaemonSet remain
-entirely Kamaji-owned, so the gate records this exact substrate prerequisite
-instead of broadly disabling conntrack setup.
+fixed control-plane VIP and port. Finally, kube-proxy's default conntrack setup
+tries to update `nf_conntrack_max`. On this host, the Linux kernel exposes
+`net.netfilter.nf_conntrack_max` read-only in every separate network namespace,
+including a single-level privileged container; nesting, Docker/runc masking,
+and missing privilege are not the cause. The viable paths are to configure
+kube-proxy with `conntrack.maxPerCore: 0` before startup, as kind does for
+container nodes, or to use a kube-proxy-free dataplane. Kamaji's
+`spec.addons.kubeProxy` image repository/tag fields do not directly expose that
+configuration. Phase 4 must therefore test a pre-start ConfigMap/configuration
+path (or explicitly replace the managed dataplane) before accepting the
+full-topology blocked state.
 
 The TCP explicitly selects digest-pinned `KONNECTIVITY_AGENT_IMAGE` and
 `KONNECTIVITY_SERVER_IMAGE` by splitting each valid `tag@digest` reference

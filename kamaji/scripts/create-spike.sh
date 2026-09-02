@@ -22,6 +22,7 @@ blocker_message=""
 observed_preflight_snapshot=none
 join_failure_snapshot=none
 persistence_snapshot=""
+cleanup_proved=false
 
 write_spike_result() {
   ensure_runtime_layout
@@ -34,14 +35,19 @@ write_spike_result() {
     printf 'spike_vip=%s\n' "${SPIKE_VIP:-unallocated}"
     printf 'kubeadm_observed_preflight=%s\n' "${observed_preflight_snapshot}"
     printf 'kubeadm_failure_evidence=%s\n' "${join_failure_snapshot}"
-    printf 'kubeadm_ignore_allowlist=%s\n' "${KUBEADM_IGNORE_PREFLIGHT_ERRORS:-none}"
+    printf 'kubeadm_ignore_allowlist="%s"\n' "${KUBEADM_IGNORE_PREFLIGHT_ERRORS}"
     if [[ -n "${persistence_snapshot}" ]]; then
       printf '%s\n' "${persistence_snapshot}"
     fi
-    printf 'schema_cleanup=proved\n'
-    printf 'credential_cleanup=proved\n'
-    printf 'datastore_used_by_cleanup=proved\n'
-    printf 'shared_datastore_healthy=proved\n'
+    if [[ "${cleanup_proved}" == true ]]; then
+      printf 'cleanup=proved\n'
+      printf 'schema_cleanup=proved\n'
+      printf 'credential_cleanup=proved\n'
+      printf 'datastore_used_by_cleanup=proved\n'
+      printf 'shared_datastore_healthy=proved\n'
+    else
+      printf 'cleanup=failed\n'
+    fi
   } | write_secret_file "${SPIKE_RESULT_FILE}"
 }
 
@@ -58,14 +64,19 @@ finish_spike() {
   if [[ -f "${SPIKE_PERSISTENCE_EVIDENCE}" ]]; then
     persistence_snapshot="$(cat "${SPIKE_PERSISTENCE_EVIDENCE}")"
   fi
-  if ! (cleanup_spike_resources); then
+  if (cleanup_spike_resources); then
+    cleanup_proved=true
+  else
     warn "spike cleanup failed"
     status="${EXIT_ERROR}"
     result=cleanup-failed
+    current_rung=cleanup
   fi
-  if [[ "${status}" -eq "${EXIT_SUCCESS}" ]]; then
+  if [[ "${cleanup_proved}" != true ]]; then
+    :
+  elif [[ "${status}" -eq "${EXIT_SUCCESS}" ]]; then
     result=pass
-    rm -f "${BLOCKER_FILE}"
+    clear_owned_spike_blocker
   elif [[ "${status}" -eq "${EXIT_BLOCKED}" ]]; then
     result=blocked
     record_spike_blocker "${blocker_code}" "${blocker_message}"
@@ -129,7 +140,7 @@ current_rung=cni-konnectivity
 if ! install_spike_network_addons \
   || ! wait_for "${TENANT_ADDON_TIMEOUT}" "spike Ready node" spike_node_ready; then
   blocked cni-konnectivity "${current_rung}" \
-    "Calico, CoreDNS, kube-proxy, Konnectivity, DNS, or service routing failed: $(spike_addon_failure_summary 2>/dev/null || printf unavailable)"
+    "$(spike_network_failure_summary)"
 fi
 label_spike_node
 verify_spike_addon_images

@@ -5,7 +5,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/common.sh"
 # shellcheck disable=SC1091
-source "${SCRIPT_DIR}/lib/network.sh"
+source "${SCRIPT_DIR}/lib/tenants.sh"
 
 health="${EXIT_SUCCESS}"
 
@@ -172,12 +172,24 @@ spike_worker_count="$(docker ps -aq --filter "$(owned_docker_filter)" \
   --filter 'label=kamaji.cnpg-vcluster.io/tenant=spike' | wc -l)"
 spike_volume_count="$(docker volume ls -q --filter "$(owned_docker_filter)" \
   --filter 'label=kamaji.cnpg-vcluster.io/tenant=spike' | wc -l)"
+load_management_network
+if spike_vip_claims="$(services_claiming_vip "${TENANT_A_VIP}" 2>/dev/null)"; then
+  if [[ -n "${spike_vip_claims}" ]]; then
+    spike_vip_claim_count="$(grep -c '^' <<<"${spike_vip_claims}")"
+  else
+    spike_vip_claim_count=0
+  fi
+else
+  spike_vip_claim_count=unknown
+fi
 printf '  residual TCPs: %s\n' "${spike_tcp_count}"
 printf '  residual workers: %s\n' "${spike_worker_count}"
 printf '  residual volumes: %s\n' "${spike_volume_count}"
+printf '  residual VIP claims: %s\n' "${spike_vip_claim_count}"
 [[ "${spike_tcp_count}" -eq 0 ]] || unhealthy "spike TenantControlPlane remains"
 [[ "${spike_worker_count}" -eq 0 ]] || unhealthy "spike worker remains"
 [[ "${spike_volume_count}" -eq 0 ]] || unhealthy "spike worker volume remains"
+[[ "${spike_vip_claim_count}" == 0 ]] || unhealthy "spike borrowed VIP remains claimed or could not be inspected"
 [[ ! -e "$(tenant_kubeconfig spike)" ]] || unhealthy "spike kubeconfig remains"
 [[ ! -e "${SPIKE_RUNTIME_DIR}" ]] || unhealthy "spike runtime subtree remains"
 

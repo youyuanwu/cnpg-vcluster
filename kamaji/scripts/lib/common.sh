@@ -121,7 +121,6 @@ ensure_runtime_layout() {
     "${RUNTIME_DIR}/management" \
     "${RUNTIME_DIR}/network" \
     "${RUNTIME_DIR}/rendered" \
-    "${RUNTIME_DIR}/results" \
     "${RUNTIME_DIR}/tenants"
   find "${RUNTIME_DIR}" -type d -exec chmod 0700 {} +
 }
@@ -177,18 +176,6 @@ record_blocker() {
   } | write_secret_file "${BLOCKER_FILE}"
 }
 
-compatibility_blocker() {
-  local code="$1"
-  shift
-  case " ${COMPATIBILITY_BLOCKER_CODES} " in
-    *" ${code} "*) ;;
-    *) die "unrecognized compatibility blocker code: ${code}" ;;
-  esac
-  record_blocker "${code}" "$*"
-  warn "compatibility blocker ${code}: $*"
-  return "${EXIT_BLOCKED}"
-}
-
 record_spike_blocker() {
   local code="$1"
   shift
@@ -205,11 +192,15 @@ record_spike_blocker() {
   warn "compatibility blocker ${code}: $*"
 }
 
-clear_owned_spike_evidence() {
+clear_owned_spike_blocker() {
   if [[ -f "${BLOCKER_FILE}" ]] \
     && grep -Fxq 'owner=spike' "${BLOCKER_FILE}"; then
     rm -f "${BLOCKER_FILE}"
   fi
+}
+
+clear_owned_spike_evidence() {
+  clear_owned_spike_blocker
   rm -f "${SPIKE_RESULT_FILE}"
 }
 

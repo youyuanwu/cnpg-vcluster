@@ -201,6 +201,10 @@ raise SystemExit(0 if observed == allowed else 1)
 '
 }
 
+kubeadm_ignore_preflight_arg() {
+  printf -- '--ignore-preflight-errors=%s\n' "${KUBEADM_IGNORE_PREFLIGHT_ERRORS}"
+}
+
 spike_node_registered() {
   tenant_kubectl spike get node "${SPIKE_WORKER_NAME}" >/dev/null 2>&1
 }
@@ -257,7 +261,7 @@ join_spike_worker() {
       chmod 0600 "${SPIKE_PREFLIGHT_EVIDENCE}.summary"
       return 1
     fi
-    ignore_arg=("--ignore-preflight-errors=${KUBEADM_IGNORE_PREFLIGHT_ERRORS}")
+    ignore_arg=("$(kubeadm_ignore_preflight_arg)")
     docker exec "${SPIKE_WORKER_NAME}" kubeadm reset --force \
       --cri-socket unix:///run/containerd/containerd.sock >/dev/null 2>&1 || true
     if ! timeout "$(seconds_from_duration "${WORKER_JOIN_TIMEOUT}")" \

@@ -11,6 +11,34 @@ spike_tcp_ref() {
   printf 'tenantcontrolplane.kamaji.clastix.io/%s\n' "${SPIKE_NAME}"
 }
 
+services_claiming_vip() {
+  local vip="$1"
+  management_kubectl get services --all-namespaces -o json \
+    | CLAIMED_VIP="${vip}" python3 -c '
+import json
+import os
+import sys
+
+vip = os.environ["CLAIMED_VIP"]
+for item in json.load(sys.stdin).get("items", []):
+    metadata = item.get("metadata", {})
+    spec = item.get("spec", {})
+    status = item.get("status", {}).get("loadBalancer", {})
+    annotations = metadata.get("annotations", {})
+    claims = set(filter(None, [
+        spec.get("loadBalancerIP", ""),
+        *spec.get("externalIPs", []),
+        *(value.strip() for key in (
+            "metallb.io/loadBalancerIPs",
+            "metallb.universe.tf/loadBalancerIPs",
+        ) for value in annotations.get(key, "").split(",")),
+        *(entry.get("ip", "") for entry in status.get("ingress", [])),
+    ]))
+    if vip in claims:
+        print(f"{metadata.get('namespace', 'default')}/{metadata.get('name', '')}")
+'
+}
+
 final_tenant_state_reason() {
   local tenant
   if [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \

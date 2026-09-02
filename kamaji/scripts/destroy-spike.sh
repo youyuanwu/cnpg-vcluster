@@ -11,6 +11,21 @@ source "${SCRIPT_DIR}/lib/workers.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/addons.sh"
 
+verify_spike_vip_is_free() {
+  local claims
+  if [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
+    && management_kubectl get --raw=/readyz >/dev/null 2>&1; then
+    load_management_network
+    claims="$(services_claiming_vip "${TENANT_A_VIP}")" \
+      || die "spike.cleanup: unable to inspect borrowed VIP allocation"
+    [[ -z "${claims}" ]] \
+      || die "spike.cleanup: borrowed VIP ${TENANT_A_VIP} remains claimed by ${claims//$'\n'/,}"
+  elif [[ -x "${BIN_DIR}/kind" ]] \
+    && "${BIN_DIR}/kind" get clusters 2>/dev/null | grep -Fxq "${KIND_CLUSTER_NAME}"; then
+    die "spike.cleanup: management cluster exists but borrowed VIP release cannot be verified"
+  fi
+}
+
 cleanup_spike_resources() {
   delete_spike_storage_smoke
   delete_spike_node
@@ -22,6 +37,7 @@ cleanup_spike_resources() {
   else
     rm -f "$(tenant_kubeconfig spike)"
   fi
+  verify_spike_vip_is_free
   rm -rf "${SPIKE_RUNTIME_DIR}"
 }
 

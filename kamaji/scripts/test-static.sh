@@ -341,9 +341,10 @@ check "Calico render uses exact spike CIDR and image pins" bash -c '
   ! grep -Eq "image: quay.io/calico/.+:v3.32.2$" "$1/manifests/addons/calico.yaml"
 ' _ "${LAB_ROOT}"
 check "Local Path render is default, persistent, and pinned" bash -c '
+  source "$1/config/settings.env"
   source "$1/config/versions.env"
   grep -Fq "storageclass.kubernetes.io/is-default-class: \"true\"" "$1/manifests/addons/local-path.yaml" &&
-  grep -Fq "\"paths\":[\"/var/lib/kamaji-local-path\"]" "$1/manifests/addons/local-path.yaml" &&
+  grep -Fq "\"paths\":[\"${SPIKE_STORAGE_PATH}\"]" "$1/manifests/addons/local-path.yaml" &&
   grep -Fq "$LOCAL_PATH_PROVISIONER_IMAGE" "$1/manifests/addons/local-path.yaml" &&
   grep -Fq "$VERIFY_IMAGE" "$1/manifests/addons/local-path.yaml"
 ' _ "${LAB_ROOT}"
@@ -446,9 +447,7 @@ check "scripts do not print kubeconfigs, tokens, or passwords" bash -c '
 
 check "only recognized spike paths can return blocked status" bash -c '
   refs="$(grep -R -l "EXIT_BLOCKED" "$1/scripts" --include="*.sh" --exclude=test-static.sh)"
-  [[ "$(printf "%s\n" "$refs" | sort)" == "$(printf "%s\n" "$1/scripts/create-spike.sh" "$1/scripts/lib/common.sh" | sort)" ]] &&
-  grep -A12 "^compatibility_blocker()" "$1/scripts/lib/common.sh" |
-    grep -Fq "return \"\${EXIT_BLOCKED}\"" &&
+  [[ "${refs}" == "$1/scripts/create-spike.sh" ]] &&
   grep -Fq "return \"\${EXIT_BLOCKED}\"" "$1/scripts/create-spike.sh" &&
   grep -Fq "record_spike_blocker" "$1/scripts/create-spike.sh"
 ' _ "${LAB_ROOT}"
@@ -492,10 +491,15 @@ assert all(not a.overlaps(b) for i,a in enumerate(nets) for b in nets[i+1:])
 PY
 ' _ "${LAB_ROOT}"
 check "kubeadm allowlist has one settings source and exact consumers" bash -c '
+  unset KUBEADM_IGNORE_PREFLIGHT_ERRORS
   [[ "$(grep -R -h "^: .*KUBEADM_IGNORE_PREFLIGHT_ERRORS" "$1/config" | wc -l)" -eq 1 ]] &&
-  grep -Fq -- '\''--ignore-preflight-errors=${KUBEADM_IGNORE_PREFLIGHT_ERRORS}'\'' "$1/scripts/lib/workers.sh" &&
-  grep -Fq "KUBEADM_IGNORE_PREFLIGHT_ERRORS" "$1/README.md" &&
-  grep -Fq "KUBEADM_IGNORE_PREFLIGHT_ERRORS" "$1/docs/high-level-design.md"
+  source "$1/config/settings.env" &&
+  source "$1/scripts/lib/workers.sh" &&
+  expected_arg="--ignore-preflight-errors=${KUBEADM_IGNORE_PREFLIGHT_ERRORS}" &&
+  [[ "$(kubeadm_ignore_preflight_arg)" == "${expected_arg}" ]] &&
+  rendered="KUBEADM_IGNORE_PREFLIGHT_ERRORS=\"${KUBEADM_IGNORE_PREFLIGHT_ERRORS}\"" &&
+  grep -Fq "${rendered}" "$1/README.md" &&
+  grep -Fq "${rendered}" "$1/docs/high-level-design.md"
 ' _ "${LAB_ROOT}"
 check "spike entrypoint implements ordered compatibility ladder" bash -c '
   mapfile -t lines < <(grep -n "^current_rung=" "$1/scripts/create-spike.sh" | cut -d: -f1)
@@ -511,7 +515,24 @@ check "spike always cleans exact ephemeral resources" bash -c '
   for action in delete_spike_storage_smoke delete_spike_node remove_spike_worker_and_volume delete_spike_tenant; do
     grep -Fq "$action" "$1/scripts/destroy-spike.sh" || exit 1
   done &&
+  grep -Fq "verify_spike_vip_is_free" "$1/scripts/destroy-spike.sh" &&
+  grep -Fq "services_claiming_vip" "$1/scripts/status.sh" &&
   grep -Fq "rm -rf \"\${SPIKE_RUNTIME_DIR}\"" "$1/scripts/destroy-spike.sh"
+' _ "${LAB_ROOT}"
+check "cleanup proof attestations require successful cleanup" bash -c '
+  result_block="$(sed -n "/^write_spike_result()/,/^}/p" "$1/scripts/create-spike.sh")"
+  finish_block="$(sed -n "/^finish_spike()/,/^}/p" "$1/scripts/create-spike.sh")"
+  grep -Fq '\''[[ "${cleanup_proved}" == true ]]'\'' <<<"${result_block}" &&
+  grep -Fq "cleanup=failed" <<<"${result_block}" &&
+  grep -Fq "result=cleanup-failed" <<<"${finish_block}" &&
+  grep -Fq "current_rung=cleanup" <<<"${finish_block}"
+' _ "${LAB_ROOT}"
+check "spike result records the exact configured allowlist value" \
+  has_text 'kubeadm_ignore_allowlist="%s".*KUBEADM_IGNORE_PREFLIGHT_ERRORS' \
+  "${LAB_ROOT}/scripts/create-spike.sh"
+check "successful spike clears only spike-owned blocker evidence" bash -c '
+  grep -Fq "clear_owned_spike_blocker" "$1/scripts/create-spike.sh" &&
+  ! grep -Eq '\''rm -f .*BLOCKER_FILE'\'' "$1/scripts/create-spike.sh"
 ' _ "${LAB_ROOT}"
 check "final-state refusal precedes spike evidence clearing and mutation" bash -c '
   refusal="$(grep -n "^refuse_spike_with_final_state$" "$1/scripts/create-spike.sh" | cut -d: -f1)"
