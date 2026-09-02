@@ -3,9 +3,10 @@
 ## Status and purpose
 
 The lab is a development experiment built from the public Kamaji
-26.8.6-edge source release. Phase 1 implements only its independent task
-surface, immutable input preparation, secure state foundation, no-mutation
-preflight, initial read-only status/diagnostics, and static invariants.
+26.8.6-edge source release. Phase 2 implements its management plane: one
+explicitly owned kind cluster, deterministic Docker-subnet VIP allocation,
+cert-manager, MetalLB, Kamaji, and a three-member shared datastore. Tenant
+control planes and workers remain absent until later phases.
 
 The intended completed topology is one Kubernetes 1.36.4 kind management
 cluster hosting cert-manager, MetalLB, Kamaji, a shared three-member datastore,
@@ -54,6 +55,53 @@ datastore, datastore bootstrap kubectl, and datastore bootstrap etcd images
 with approved OCI digest references. The renderer emits a deterministic
 transitive image inventory and fails unless every rendered image is
 digest-pinned and no `latest` reference remains.
+
+The directly selected etcd server image comes from
+`kamaji-etcd` 0.15.0 `values.image`; the shell-capable etcd setup image comes
+from `values.jobs.etcd`; and the kubectl setup image is the lab's explicit
+`values.jobs.kubectl` override. Their resolved digests and provenance fields
+are recorded together in `config/versions.env`.
+
+The renderer is also Helm's argument-less post-renderer during installation.
+This is the same transformation used by the checked render, so the installed
+controller and StatefulSet receive the validated digest references. Helm 3
+does not pass hook manifests through post-renderers, so installation disables
+native hook execution and applies the locked chart's rendered hook
+prerequisites and post-install Job separately from the same digest-validated
+manifest. No dependency update or repository lookup occurs: the checked-in
+lock and exact local `kamaji-etcd-0.15.0.tgz` package must re-verify before
+render or install.
+
+## Management reconciliation and networking
+
+The kind cluster is always addressed by its exact name and explicit
+`.runtime/kubeconfigs/management.yaml`. On first creation the lab records the
+full control-plane container ID, expected container name, and kind cluster
+label. A later run may reuse the cluster only when the live identity and label
+match that mode-0600 record. Same-named unrecorded, replaced, or partial state
+is refused before adoption or deletion.
+
+After kind is ready, the network library inspects the actual `kind` Docker
+network, selects the highest two unassigned IPv4 host addresses
+deterministically, rejects overlap with every management and tenant Pod or
+Service CIDR, persists the subnet and addresses, and renders a two-`/32`
+MetalLB pool with `autoAssign: false` plus one explicit L2 advertisement.
+Every repeated management create revalidates the recorded addresses against
+current Docker endpoint allocation before applying the pool.
+
+Management dependencies reconcile in strict order:
+
+1. Kubernetes 1.36.4 API and owned kind identity;
+2. cert-manager 1.21.1 controller, cainjector, webhook, and CRDs;
+3. MetalLB 0.16.1 controller, speaker, webhook, pool, and advertisement;
+4. the locked Kamaji chart, controller/webhooks/CRDs, three-member etcd
+   StatefulSet, three retained `1Gi` PVCs, and ready `DataStore/default`.
+
+Helm installs use atomic bounded waits. A newly introduced component is
+target-cleaned when its readiness gate fails and cleanup is safe; an existing
+owned component is preserved for diagnosis. Errors identify `kubernetes`,
+`cert-manager`, `metallb`, `kamaji`, or `datastore`, return `1`, and never
+select a different, moving, or paid artifact.
 
 ## Security model
 
@@ -113,6 +161,11 @@ exception is selected in Phase 1. If that ladder fails because the container
 substrate cannot meet a recognized prerequisite, the lab records a blocker,
 returns `2`, cleans tenant resources, and makes no readiness or isolation
 claim.
+
+Phase 3 must set both `KONNECTIVITY_AGENT_IMAGE` and
+`KONNECTIVITY_SERVER_IMAGE` explicitly on every rendered
+`TenantControlPlane`; the CRD's untagged schema defaults are not acceptable
+runtime image selections.
 
 ## Version summary
 

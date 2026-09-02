@@ -53,12 +53,13 @@ install_binary kubectl "${KUBECTL_VERSION}" "${KUBECTL_URL}" "${KUBECTL_SHA256}"
 helm_archive="${CACHE_DIR}/helm-${HELM_VERSION}-linux-amd64.tar.gz"
 download_file "Helm ${HELM_VERSION}" "${HELM_URL}" "${HELM_SHA256}" "${helm_archive}"
 if [[ ! -x "${BIN_DIR}/helm" ]] \
-  || ! "${BIN_DIR}/helm" version --short 2>/dev/null | grep -Fq "${HELM_VERSION}"; then
+  || ! sha256_matches "${HELM_BINARY_SHA256}" "${BIN_DIR}/helm"; then
   helm_extract="${TOOLS_TMP_DIR}/helm-extract"
   rm -rf "${helm_extract}"
   mkdir -p -m 0700 "${helm_extract}"
   tar -xzf "${helm_archive}" -C "${helm_extract}"
   install -m 0755 "${helm_extract}/linux-amd64/helm" "${BIN_DIR}/helm"
+  sha256_check "${HELM_BINARY_SHA256}" "${BIN_DIR}/helm"
   rm -rf "${helm_extract}"
 fi
 

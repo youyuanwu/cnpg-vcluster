@@ -11,9 +11,9 @@ tools:
 preflight:
     @scripts/preflight.sh
 
-# Create only the management plane (implemented in Phase 2).
+# Create or reconcile only the management plane.
 create-management:
-    @scripts/unavailable.sh create-management "Phase 2"
+    @scripts/create-management.sh
 
 # Run the ephemeral worker compatibility gate (implemented in Phase 3).
 spike:
@@ -43,7 +43,7 @@ destroy-tenant tenant:
 destroy:
     @scripts/unavailable.sh destroy "Phase 6"
 
-# Run Phase 1 static invariants.
+# Run static invariants for implemented phases.
 test-static:
     @scripts/test-static.sh
 

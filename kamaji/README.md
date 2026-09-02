@@ -7,8 +7,10 @@ CloudNativePG databases. It uses the public Apache-2.0 Kamaji
 artifact. The edge channel is experimental; CLASTIX's stable artifact channel
 is not freely downloadable.
 
-Phase 1 establishes deterministic inputs, secure local state, host preflight,
-read-only inspection, and static tests. It does not create clusters.
+Phase 2 adds the idempotent management-only path: one owned Kubernetes 1.36.4
+kind cluster with cert-manager 1.21.1, MetalLB 0.16.1, Kamaji 26.8.6-edge, and
+the locked three-member datastore. It creates no tenant control plane or
+worker.
 
 ## Prerequisites
 
@@ -16,7 +18,8 @@ read-only inspection, and static tests. It does not create clusters.
   containers.
 - At least 12 logical CPUs, 24 GiB of Docker memory, and 30 GiB free in
   Docker's storage filesystem.
-- `curl`, `git`, `python3`, `sha256sum`, `tar`, and GNU `timeout`.
+- `curl`, `git`, `python3`, `sha256sum`, `tar`, GNU `timeout`, and the Docker
+  buildx plugin.
 - Host-installed `just` **1.58.0**. The lab never downloads, installs, or
   replaces `just`.
 
@@ -36,11 +39,12 @@ just --version
 The final command must print `just 1.58.0`. Remove the downloaded archive and
 extracted binary after installation.
 
-## Phase 1 commands
+## Implemented commands
 
 ```bash
 just tools
 just preflight
+just create-management
 just status
 just diagnose
 just test-static
@@ -57,9 +61,18 @@ overlap, prepared checksums, remote image digests, and a short-lived
 privileged-container probe. It creates no kind cluster, tenant, credential, or
 retained Docker resource.
 
-`status` and `diagnose` are read-only. Before management creation, they still
-report tools, Docker, owned objects, runtime state, blocker state, and the
-absence of management resources.
+`just create-management` creates or reconciles only the management plane. It
+records the exact kind node container identity before later adoption, derives
+two free addresses from the actual kind Docker IPv4 subnet, installs the
+pinned dependencies in order, and gates their CRDs, webhooks, controller
+workloads, three `1Gi` datastore PVCs, and `DataStore/default`. A same-named
+kind cluster without matching local ownership evidence is refused and is
+neither adopted nor deleted.
+
+`status` and `diagnose` are read-only. They report tools, Docker, ownership
+evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and
+tenant-control-plane counts without exporting credentials or reconciling
+resources.
 
 ## Security and state
 
@@ -75,9 +88,9 @@ machine-readable blocker record. Phase 1 has no normal path that returns `2`.
 
 ## Licensing, telemetry, and support boundary
 
-Kamaji telemetry is enabled by upstream defaults. The management phase will
-install it with `telemetry.disabled: true`; no account or license credential is
-used.
+Kamaji telemetry is enabled by upstream defaults. This lab installs it with
+`telemetry.disabled: true`, rendered as `--disable-telemetry`; no account or
+license credential is used.
 
 Kamaji documents regular Linux virtual machines and bare metal as workers. The
 planned privileged `kindest/node` workers are an unsupported

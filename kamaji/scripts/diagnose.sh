@@ -23,16 +23,27 @@ if ! docker info >/dev/null 2>&1; then
   die "Docker Engine is unavailable"
 fi
 docker info --format 'server={{.ServerVersion}} root={{.DockerRootDir}} cgroup={{.CgroupVersion}} cpus={{.NCPU}} memory_bytes={{.MemTotal}}'
-docker ps -a --filter "$(owned_docker_filter)" \
-  --format '{{json .}}'
+docker ps -a --filter "label=io.x-k8s.kind.cluster=${KIND_CLUSTER_NAME}" --format '{{json .}}'
+docker ps -a --filter "$(owned_docker_filter)" --format '{{json .}}'
 docker volume ls --filter "$(owned_docker_filter)" --format '{{.Name}}'
-docker network ls --format '{{.Name}}\t{{.Driver}}\t{{.Scope}}'
 
 printf '\n== runtime state (names and modes only) ==\n'
 if [[ -d "${RUNTIME_DIR}" ]]; then
   find "${RUNTIME_DIR}" -printf '%M %P\n' | sort
 else
   printf 'runtime directory absent\n'
+fi
+
+printf '\n== management ownership and network ==\n'
+if [[ -f "${MANAGEMENT_OWNERSHIP_FILE}" ]]; then
+  sed 's/^/  /' "${MANAGEMENT_OWNERSHIP_FILE}"
+else
+  printf 'ownership evidence absent\n'
+fi
+if [[ -f "${MANAGEMENT_NETWORK_FILE}" ]]; then
+  sed 's/^/  /' "${MANAGEMENT_NETWORK_FILE}"
+else
+  printf 'network assignment absent\n'
 fi
 
 printf '\n== blocker state ==\n'
@@ -42,16 +53,21 @@ else
   printf 'none\n'
 fi
 
-printf '\n== owned management resources ==\n'
-if [[ -f "${MANAGEMENT_KUBECONFIG}" ]]; then
-  management_kubectl get nodes,pods,services,pvc --all-namespaces -o wide || true
-  management_kubectl get \
-    tenantcontrolplanes.kamaji.clastix.io,datastores.kamaji.clastix.io \
-    --all-namespaces -o wide 2>/dev/null || true
+printf '\n== management Kubernetes ==\n'
+if [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
+  && management_kubectl get --raw=/readyz >/dev/null 2>&1; then
+  management_kubectl get nodes -o wide
+  management_kubectl -n cert-manager get deployments,pods,endpoints -o wide 2>/dev/null || true
+  management_kubectl -n metallb-system get deployments,daemonsets,pods,endpoints,ipaddresspools,l2advertisements -o wide 2>/dev/null || true
+  management_kubectl -n "${MANAGEMENT_NAMESPACE}" get deployments,statefulsets,pods,services,endpoints,pvc,certificates,issuers -o wide 2>/dev/null || true
+  management_kubectl get datastores.kamaji.clastix.io -o wide 2>/dev/null || true
+  management_kubectl get tenantcontrolplanes.kamaji.clastix.io --all-namespaces -o wide 2>/dev/null || true
+  management_kubectl get mutatingwebhookconfigurations,validatingwebhookconfigurations \
+    -l app.kubernetes.io/name=kamaji -o wide 2>/dev/null || true
   management_kubectl get events --all-namespaces \
     --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -50 || true
 else
-  printf 'management kubeconfig absent; no management API query attempted\n'
+  printf 'management kubeconfig absent or API unreachable; no management API query attempted\n'
 fi
 
 if [[ "${scope}" == tenant-* ]]; then

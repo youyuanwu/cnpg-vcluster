@@ -69,13 +69,16 @@ require_command python3
 require_command sha256sum
 require_command timeout
 require_exact_just
+docker buildx version >/dev/null 2>&1 \
+  || die "required Docker buildx plugin is unavailable; install buildx before running preflight"
 
 [[ -x "${BIN_DIR}/kind" && -x "${BIN_DIR}/kubectl" && -x "${BIN_DIR}/helm" ]] \
   || die "lab-local tools are incomplete; run just tools"
 sha256_check "${KIND_SHA256}" "${BIN_DIR}/kind"
 sha256_check "${KUBECTL_SHA256}" "${BIN_DIR}/kubectl"
+sha256_check "${HELM_BINARY_SHA256}" "${BIN_DIR}/helm"
 "${BIN_DIR}/helm" version --short | grep -Fq "${HELM_VERSION}" \
-  || die "lab-local Helm version does not match ${HELM_VERSION}"
+  || die "checksum-verified lab-local Helm does not report ${HELM_VERSION}"
 
 [[ "$(docker info --format '{{.OSType}}')" == "linux" ]] \
   || die "Docker Engine must run Linux containers"

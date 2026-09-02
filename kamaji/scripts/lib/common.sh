@@ -16,6 +16,11 @@ TOOLS_TMP_DIR="${TOOLS_DIR}/tmp"
 RUNTIME_DIR="${LAB_ROOT}/.runtime"
 MANAGEMENT_KUBECONFIG="${RUNTIME_DIR}/kubeconfigs/management.yaml"
 BLOCKER_FILE="${RUNTIME_DIR}/blocker"
+MANAGEMENT_OWNERSHIP_FILE="${RUNTIME_DIR}/management/ownership.env"
+MANAGEMENT_NETWORK_FILE="${RUNTIME_DIR}/network/management.env"
+METALLB_RENDERED_MANIFEST="${RUNTIME_DIR}/rendered/metallb-pool.yaml"
+KAMAJI_PRE_HOOKS_MANIFEST="${RUNTIME_DIR}/rendered/kamaji-hooks-pre.yaml"
+KAMAJI_POST_HOOKS_MANIFEST="${RUNTIME_DIR}/rendered/kamaji-hooks-post.yaml"
 KAMAJI_CHART_DIR="${CHARTS_DIR}/kamaji"
 KAMAJI_IMAGE_INVENTORY="${RENDERED_DIR}/kamaji-images.txt"
 KAMAJI_RENDERED_MANIFEST="${RENDERED_DIR}/kamaji.yaml"
@@ -104,9 +109,9 @@ ensure_tools_layout() {
 ensure_runtime_layout() {
   mkdir -p -m 0700 \
     "${RUNTIME_DIR}" \
-    "${RUNTIME_DIR}/blockers" \
     "${RUNTIME_DIR}/kubeconfigs" \
     "${RUNTIME_DIR}/logs" \
+    "${RUNTIME_DIR}/management" \
     "${RUNTIME_DIR}/network" \
     "${RUNTIME_DIR}/rendered" \
     "${RUNTIME_DIR}/tenants"
@@ -140,6 +145,11 @@ management_kubectl() {
   KUBECONFIG="${MANAGEMENT_KUBECONFIG}" kubectl \
     --context "$(management_context)" \
     --request-timeout="${KUBECTL_REQUEST_TIMEOUT}" "$@"
+}
+
+management_helm() {
+  KUBECONFIG="${MANAGEMENT_KUBECONFIG}" helm \
+    --kube-context "$(management_context)" "$@"
 }
 
 tenant_kubectl() {

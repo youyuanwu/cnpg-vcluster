@@ -6,12 +6,14 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 source "${SCRIPT_DIR}/lib/common.sh"
 
 failures=0
+checks=0
 
 check() {
   local description="$1"
   shift
+  checks=$((checks + 1))
   if "$@"; then
-    printf 'ok - %s\n' "${description}"
+    :
   else
     printf 'not ok - %s\n' "${description}" >&2
     failures=$((failures + 1))
@@ -79,6 +81,34 @@ command_returns_one() {
   [[ "${status}" -eq "${EXIT_ERROR}" ]]
 }
 
+observer_is_read_only() {
+  local before_runtime before_resources output status
+  before_runtime="$(runtime_fingerprint)"
+  if [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
+    && management_kubectl get --raw=/readyz >/dev/null 2>&1; then
+    before_resources="$(
+      management_kubectl get namespaces,deployments,statefulsets,daemonsets,pvc \
+        --all-namespaces -o name 2>/dev/null | sort
+    )"
+  else
+    before_resources="unavailable"
+  fi
+  set +e
+  output="$("$@" 2>&1)"
+  status=$?
+  set -e
+  [[ "${status}" -eq "${EXIT_SUCCESS}" || "${status}" -eq "${EXIT_ERROR}" ]] \
+    && [[ "${status}" -ne "${EXIT_BLOCKED}" ]] \
+    && [[ "$(runtime_fingerprint)" == "${before_runtime}" ]]
+  if [[ "${before_resources}" != unavailable ]]; then
+    [[ "$(
+      management_kubectl get namespaces,deployments,statefulsets,daemonsets,pvc \
+        --all-namespaces -o name 2>/dev/null | sort
+    )" == "${before_resources}" ]]
+  fi
+  [[ -n "${output}" ]]
+}
+
 require_exact_just
 
 for script in "${LAB_ROOT}"/scripts/*.sh "${LAB_ROOT}"/scripts/lib/*.sh; do
@@ -93,7 +123,7 @@ check "complete just task surface" bash -c '
 ' _ "${LAB_ROOT}/Justfile"
 check "Kamaji has no Makefile" test ! -e "${LAB_ROOT}/Makefile"
 check "root Makefile is byte-for-byte unchanged" files_identical_to_main Makefile
-check "root README is unchanged in Phase 1" files_identical_to_main README.md
+check "root README remains unchanged through Phase 2" files_identical_to_main README.md
 check "vcluster tree is unchanged from main" \
   git -C "${LAB_ROOT}/.." diff --quiet main -- vcluster
 check "no PAW artifact is tracked" \
@@ -128,6 +158,9 @@ check "kubectl 1.36.4 checksum is exact" \
   "${LAB_ROOT}/config/versions.env"
 check "Helm 3.21.4 checksum is exact" \
   has_text '^HELM_SHA256=61f88ab166748cb19604d7884cb100ae9ccb13804ddeb98e08af167eacbb6a14$' \
+  "${LAB_ROOT}/config/versions.env"
+check "extracted Helm binary checksum is exact" \
+  has_text '^HELM_BINARY_SHA256=cd27ec335b9c961a0a098cce870fded88429210edc898fd213da0b16e67333bd$' \
   "${LAB_ROOT}/config/versions.env"
 check "Kamaji release source commit and checksum are exact" bash -c '
   grep -Fqx "KAMAJI_TAG_COMMIT=80f32baafe34cba9d739c41208c21090dbe1827d" "$1" &&
@@ -169,6 +202,12 @@ check "every directly selected image uses a digest" bash -c '
 check "kind config uses the approved management image" \
   has_text 'image: kindest/node:v1\.36\.4@sha256:099e049362a1526b2db71494e1947aae99bd16290d7c895f2b7ea312e3cbfaed' \
   "${LAB_ROOT}/config/kind.yaml"
+check "kind CIDRs match settings" bash -c '
+  source "$1/config/settings.env"
+  pod="$(awk "/podSubnet:/ {print \$2}" "$1/config/kind.yaml")"
+  service="$(awk "/serviceSubnet:/ {print \$2}" "$1/config/kind.yaml")"
+  [[ "$pod" == "$MANAGEMENT_POD_CIDR" && "$service" == "$MANAGEMENT_SERVICE_CIDR" ]]
+' _ "${LAB_ROOT}"
 
 check "prepared Kamaji source archive checksum" \
   sha256_check "${KAMAJI_SOURCE_SHA256}" "${CACHE_DIR}/kamaji-${KAMAJI_VERSION}.tar.gz"
@@ -180,6 +219,8 @@ check "prepared dependency package checksum" \
 check "cert-manager package checksum" \
   sha256_check "${CERT_MANAGER_CHART_SHA256}" \
   "${INPUTS_DIR}/cert-manager-${CERT_MANAGER_VERSION}.tgz"
+check "installed Helm binary integrity" \
+  sha256_check "${HELM_BINARY_SHA256}" "${BIN_DIR}/helm"
 check "direct manifest input checksums" bash -c '
   source "$1/config/versions.env"
   cd "$1"
@@ -195,6 +236,10 @@ check "direct manifest input checksums" bash -c '
 
 check "deterministic Kamaji render validates" \
   "${SCRIPT_DIR}/render-kamaji.sh" validate
+check "Kamaji renderer has one non-recursive post-render path" bash -c '
+  grep -Fq '\''case "${1:-post-render}" in'\'' "$1" &&
+  ! grep -Fq '\''render-kamaji.sh post-render'\'' "$1"
+' _ "${LAB_ROOT}/scripts/render-kamaji.sh"
 check "rendered direct images are digest pinned" bash -c '
   source "$1/config/versions.env"
   for image in "$KAMAJI_IMAGE" "$KAMAJI_ETCD_IMAGE" "$KAMAJI_ETCD_JOB_IMAGE" "$KAMAJI_KUBECTL_JOB_IMAGE"; do
@@ -207,6 +252,11 @@ check "transitive image inventory is complete and digest-only" bash -c '
 ' _ "${KAMAJI_IMAGE_INVENTORY}"
 check "render contains no moving latest reference" \
   not_has_text '(^|[:/@])latest($|@|:)' "${KAMAJI_IMAGE_INVENTORY}"
+check "direct datastore image provenance is recorded" bash -c '
+  grep -Fq "KAMAJI_ETCD_IMAGE_PROVENANCE=kamaji-etcd-0.15.0:values.image" "$1" &&
+  grep -Fq "KAMAJI_ETCD_JOB_IMAGE_PROVENANCE=kamaji-etcd-0.15.0:values.jobs.etcd" "$1" &&
+  grep -Fq "KAMAJI_KUBECTL_JOB_IMAGE_PROVENANCE=kamaji-etcd-0.15.0:values.jobs.kubectl" "$1"
+' _ "${LAB_ROOT}/config/versions.env"
 
 check "capacity thresholds are exact" bash -c '
   source "$1/config/settings.env"
@@ -244,6 +294,12 @@ check "common shell enforces umask 077" \
   has_text '^umask 077$' "${LAB_ROOT}/scripts/lib/common.sh"
 check "common shell creates mode-0600 secret files" \
   has_text 'chmod 0600.*destination' "${LAB_ROOT}/scripts/lib/common.sh"
+check "preflight names missing Docker buildx" \
+  has_text 'required Docker buildx plugin is unavailable' "${LAB_ROOT}/scripts/preflight.sh"
+check "tools and preflight verify Helm binary checksum" bash -c '
+  grep -Fq "HELM_BINARY_SHA256" "$1/scripts/tools.sh" &&
+  grep -Fq "HELM_BINARY_SHA256" "$1/scripts/preflight.sh"
+' _ "${LAB_ROOT}"
 check "all Kubernetes operations use explicit wrappers" bash -c '
   ! grep -R -E "^[[:space:]]*kubectl[[:space:]]" "$1/scripts" \
     --include="*.sh" --exclude=common.sh --exclude=test-static.sh
@@ -267,10 +323,82 @@ check "only compatibility_blocker can return blocked status" bash -c '
 ' _ "${LAB_ROOT}"
 check "unimplemented normal path returns 1, never 2" \
   command_returns_one "${SCRIPT_DIR}/unavailable.sh" create "later phase"
-check "clean status is unhealthy status 1, never blocker 2" \
-  command_returns_one "${SCRIPT_DIR}/status.sh"
-check "diagnostics completes without blocker status" \
-  "${SCRIPT_DIR}/diagnose.sh" all
+check "status is read-only and never returns blocker status" \
+  observer_is_read_only "${SCRIPT_DIR}/status.sh"
+check "diagnostics is read-only and never returns blocker status" \
+  observer_is_read_only "${SCRIPT_DIR}/diagnose.sh" all
+
+check "management values disable telemetry" \
+  has_text '^  disabled: true$' "${LAB_ROOT}/config/kamaji-values.yaml"
+check "management values pin controller input" bash -c '
+  grep -Fq "repository: clastix/kamaji" "$1" &&
+  grep -Fq "tag: 26.8.6-edge" "$1"
+' _ "${LAB_ROOT}/config/kamaji-values.yaml"
+check "management values enforce datastore capacity" bash -c '
+  grep -Fq "replicas: 3" "$1" &&
+  grep -Fq "size: 1Gi" "$1" &&
+  grep -Fq "retentionPolicyWhenDeleted: Retain" "$1" &&
+  grep -Fq "cpu: 100m" "$1" &&
+  grep -Fq "memory: 256Mi" "$1" &&
+  grep -Fq "cpu: 500m" "$1" &&
+  grep -Fq "memory: 512Mi" "$1"
+' _ "${LAB_ROOT}/config/kamaji-values.yaml"
+check "management values use locked datastore image inputs" bash -c '
+  grep -Fq "tag: v3.5.17" "$1" &&
+  grep -Fq "tag: v3.5.6" "$1" &&
+  grep -Fq "tag: v1.36" "$1" &&
+  ! grep -Eq "dependency.*(update|build)" "$1"
+' _ "${LAB_ROOT}/config/kamaji-values.yaml"
+check "MetalLB template defines exactly two explicit non-auto VIPs" bash -c '
+  [[ "$(grep -c "/32" "$1")" -eq 2 ]] &&
+  grep -Fq "autoAssign: false" "$1" &&
+  grep -Fq "kind: L2Advertisement" "$1" &&
+  grep -Fq "kamaji-tenant-vips" "$1"
+' _ "${LAB_ROOT}/manifests/metallb/pool.yaml.tpl"
+check "network library derives and revalidates Docker VIPs" bash -c '
+  grep -Fq "docker network inspect" "$1" &&
+  grep -Fq "broadcast_address" "$1" &&
+  grep -Fq "recorded VIP is assigned to a Docker endpoint" "$1" &&
+  grep -Fq "EXCLUDED_CIDRS" "$1"
+' _ "${LAB_ROOT}/scripts/lib/network.sh"
+check "management ownership fails closed" bash -c '
+  set +e
+  output="$(
+    {
+      source "$1/scripts/lib/management.sh"
+      MANAGEMENT_OWNERSHIP_FILE="$1/.runtime/nonexistent-ownership-fixture"
+      validate_management_ownership
+    } 2>&1
+  )"
+  status=$?
+  set -e
+  [[ "$status" -eq 1 ]] && grep -Fq "management.ownership-refusal" <<<"$output"
+' _ "${LAB_ROOT}"
+check "management gates name every dependency" bash -c '
+  for component in kubernetes cert-manager metallb kamaji datastore; do
+    grep -Fq "management.${component}:" "$1" || exit 1
+  done
+' _ "${LAB_ROOT}/scripts/lib/management.sh"
+check "new dependency failures have targeted cleanup" bash -c '
+  for cleanup in cleanup_new_kind_cluster cleanup_cert_manager cleanup_metallb cleanup_kamaji; do
+    grep -Fq "${cleanup}" "$1" || exit 1
+  done
+' _ "${LAB_ROOT}/scripts/lib/management.sh"
+check "management scripts contain no fallback artifact path" bash -c '
+  ! grep -Eiq "(fallback|stable\\.clastix|license|activation|vcluster)" \
+    "$1/scripts/create-management.sh" "$1/scripts/lib/management.sh"
+' _ "${LAB_ROOT}"
+check "create-management stops at zero TCPs and workers" bash -c '
+  grep -Fq "expected zero TenantControlPlanes" "$1" &&
+  grep -Fq "expected zero owned worker containers" "$1"
+' _ "${LAB_ROOT}/scripts/create-management.sh"
+check "management Helm uses the locked local chart and deterministic renderer" bash -c '
+  grep -Fq '\''"${KAMAJI_CHART_DIR}"'\'' "$1" &&
+  grep -Fq -- "--post-renderer" "$1" &&
+  grep -Fq -- "--no-hooks" "$1" &&
+  grep -Fq "KAMAJI_POST_HOOKS_MANIFEST" "$1" &&
+  ! grep -Fq "helm dependency" "$1"
+' _ "${LAB_ROOT}/scripts/lib/management.sh"
 
 check "lab-local state is ignored narrowly" bash -c '
   [[ "$(cat "$1/.gitignore")" == $'"'"'.tools/\n.runtime/'"'"' ]]
@@ -288,9 +416,13 @@ check "design documents privileged shared-kernel boundary" \
   has_text 'share the Docker host kernel' "${LAB_ROOT}/docs/high-level-design.md"
 check "design records deterministic transitive image inventory" \
   has_text 'transitive image inventory' "${LAB_ROOT}/docs/high-level-design.md"
+check "Phase 3 retains explicit Konnectivity digest action" bash -c '
+  grep -Fq "KONNECTIVITY_AGENT_IMAGE" "$1" &&
+  grep -Fq "KONNECTIVITY_SERVER_IMAGE" "$1"
+' _ "${LAB_ROOT}/docs/high-level-design.md"
 
 if (( failures > 0 )); then
   die "${failures} static check(s) failed"
 fi
 
-log "all Phase 1 static checks passed"
+log "all ${checks} Phase 2 static checks passed"
