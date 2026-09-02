@@ -1,0 +1,52 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+default:
+    @just --list
+
+# Install and verify lab-local tools and immutable upstream inputs.
+tools:
+    @scripts/tools.sh
+
+# Validate the host and prepared inputs without creating lab infrastructure.
+preflight:
+    @scripts/preflight.sh
+
+# Create only the management plane (implemented in Phase 2).
+create-management:
+    @scripts/unavailable.sh create-management "Phase 2"
+
+# Run the ephemeral worker compatibility gate (implemented in Phase 3).
+spike:
+    @scripts/unavailable.sh spike "Phase 3"
+
+# Reconcile the complete lab (implemented in later phases).
+create:
+    @scripts/unavailable.sh create "Phase 4"
+
+# Report read-only summarized state.
+status:
+    @scripts/status.sh
+
+# Report read-only detailed state for all, management, spike, or a tenant.
+diagnose scope="all":
+    @scripts/diagnose.sh "{{scope}}"
+
+# Verify topology and behavior (implemented in Phase 5).
+verify:
+    @scripts/unavailable.sh verify "Phase 5"
+
+# Destroy one tenant (implemented in Phase 6).
+destroy-tenant tenant:
+    @scripts/unavailable.sh "destroy-tenant {{tenant}}" "Phase 6"
+
+# Destroy the complete lab (implemented in Phase 6).
+destroy:
+    @scripts/unavailable.sh destroy "Phase 6"
+
+# Run Phase 1 static invariants.
+test-static:
+    @scripts/test-static.sh
+
+# Run lifecycle coverage (implemented in Phase 6).
+test-e2e:
+    @scripts/unavailable.sh test-e2e "Phase 6"
