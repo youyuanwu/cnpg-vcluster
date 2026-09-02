@@ -59,6 +59,7 @@ just status
 just diagnose all
 just test-static
 just test-inotify-negative
+just test-kube-proxy-restart tenant-a
 ```
 
 `just tools` installs checksum-verified kind 0.33.0, kubectl 1.36.4, and Helm
@@ -128,13 +129,17 @@ missing privilege are not the cause. The implemented remediation configures
 kube-proxy with `conntrack.maxPerCore: 0` before it starts, matching kind's
 container-node behavior. Kamaji's
 `spec.addons.kubeProxy` fields select the image repository and tag but do not
-directly expose this setting. The lab therefore temporarily pauses TCP reconciliation,
-patches only the generated kube-proxy ConfigMap through the explicit tenant
-kubeconfig, verifies the value immediately and after ten seconds, and performs
-all worker joins afterward. An unpaused probe reverted the value within two
-seconds, so the create path holds the pause through worker/add-on validation,
-then removes it before reporting success. kube-proxy stays enabled and Calico
-is unchanged.
+directly expose this setting. The lab therefore lets Kamaji initially
+reconcile each control plane and its managed add-on objects, then pauses that
+TCP, patches only the generated kube-proxy ConfigMap through the explicit
+tenant kubeconfig, verifies the value immediately and after ten seconds, and
+performs all worker joins afterward. An unpaused probe reverted the value
+within two seconds, so the successful steady state intentionally retains the
+pause. This pauses only future Kamaji reconciliation: the hosted API,
+control-plane pods, tenant workers, kube-proxy, CoreDNS, Konnectivity, Calico,
+and tenant workloads keep running. This is an experimental container-worker
+workaround, not normal full Kamaji reconciliation. kube-proxy stays enabled
+and Calico is unchanged.
 
 `just create` reuses only that current passing compatibility revision, removes
 and verifies every spike residual, checks that borrowed VIPs and datastore
@@ -145,10 +150,13 @@ Workers and volumes have exact ownership labels, persistent `/var/lib`,
 same-name refusal, stopped/stale handling, partial rejoin, and short-lived
 token cleanup.
 
-Validated Phase 4 runs leave exactly two Ready, unpaused TCPs, three disjoint
-Ready workers per tenant, healthy CoreDNS/kube-proxy/Konnectivity/Calico,
-one default Local Path class, and a Bound smoke PVC per tenant. Repeating
-`just create` replaces no healthy worker. Removing one owned worker and
+Validated Phase 4 runs leave exactly two Ready, intentionally paused TCPs,
+three disjoint Ready workers per tenant, healthy
+CoreDNS/kube-proxy/Konnectivity/Calico, one default Local Path class, and a
+Bound smoke PVC per tenant. Repeating
+`just create` first requires the pause annotation, remediation revision, and
+`maxPerCore: 0` to remain intact and fails instead of silently repairing a
+drifted TCP. It replaces no healthy worker. Removing one owned worker and
 rerunning create restores only that worker while retaining its owned volume.
 
 The former `tenant-a-workers` exit `255` was reproduced by exhausting the
@@ -158,18 +166,19 @@ mode-`0600` Docker inspect state and log tails before cleanup; runtime/systemd
 probes run only for a live container. The bounded retry reuses the owned
 `/var/lib` volume rather than recreating it.
 
-Kamaji restores its generated kube-proxy ConfigMap default after the final
-unpause (reported as `null` by status). The already-running kube-proxy
-DaemonSets remain Ready. Every create/recovery run temporarily reapplies and
-verifies `maxPerCore: 0` before any worker start or join, then validates tenant
-health before unpausing.
+`just test-kube-proxy-restart tenant-a` deletes one tenant kube-proxy pod,
+waits for its replacement to become Ready, rejects the original
+`nf_conntrack_max` permission crash, and proves the ConfigMap remains
+`maxPerCore: 0` while the TCP stays paused.
 
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and
 tenant-control-plane/spike layers without exporting credentials or reconciling
-resources. Final views include both TCP identities, endpoints, kube-proxy
-remediation, worker counts, add-ons, storage classes, smoke PVCs, and blocked
-residual checks.
+resources. Final views include both TCP identities, pause/remediation state,
+endpoints, kube-proxy configuration, worker counts, Ready replica counts for
+CoreDNS, kube-proxy, Konnectivity, Calico, and Local Path, storage classes,
+smoke PVCs, and blocked residual checks. They exit unhealthy when an expected
+replica, pause, patch, or storage gate is absent.
 
 ## Security and state
 

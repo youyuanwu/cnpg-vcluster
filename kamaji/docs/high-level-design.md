@@ -231,8 +231,13 @@ directly expose the setting, and an unpaused ConfigMap patch is reverted within
 two seconds. The lab temporarily uses Kamaji's pause annotation, patches the generated
 ConfigMap through the explicit tenant kubeconfig, verifies the exact value
 immediately and after ten seconds, and only then joins workers. Successful
-creation removes the pause after worker, add-on, and storage validation and
-rechecks both TCPs and tenant health. Teardown also unpauses before deletion.
+creation retains the pause after worker, add-on, and storage validation because
+an unpaused controller restores the incompatible generated value. The pause
+stops future Kamaji reconciliation, not the hosted control-plane APIs or tenant
+workloads: control-plane pods, workers, networking, DNS, Konnectivity, and
+storage continue running. This is an experimental container-worker workaround
+and a deliberate limitation, not normal fully reconciled Kamaji operation.
+Teardown unpauses before deletion.
 
 The TCP explicitly selects digest-pinned `KONNECTIVITY_AGENT_IMAGE` and
 `KONNECTIVITY_SERVER_IMAGE` by splitting each valid `tag@digest` reference
@@ -295,12 +300,14 @@ bounded retry deliberately retains the owned `/var/lib` volume.
 The prepared-host validation completed an initial create, an idempotent repeat
 with all six container IDs unchanged, and a missing-worker recovery where only
 `kamaji-tenant-b-worker-2` received a new container ID. Both TCPs were Ready
-and unpaused; both APIs exposed three Ready disjoint workers; CoreDNS,
+and intentionally paused after initial reconciliation and patching; both APIs
+exposed three Ready disjoint workers; CoreDNS,
 kube-proxy, Konnectivity, Calico, Local Path, and both smoke PVCs were healthy.
-Kamaji subsequently renders the kube-proxy ConfigMap field back to its default
-`null` value after unpausing, without restarting the healthy DaemonSet. A later
-create or recovery temporarily reapplies and verifies zero before starting or
-joining workers.
+Repeated create fails closed if either pause/remediation annotation or
+`maxPerCore: 0` has drifted. A behavioral regression deletes one kube-proxy
+pod, waits for its replacement to become Ready without the
+`nf_conntrack_max` permission crash, and proves the retained configuration is
+still zero.
 
 ## Version summary
 

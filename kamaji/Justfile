@@ -59,6 +59,10 @@ test-static:
 test-inotify-negative:
     @scripts/test-inotify-negative.sh
 
+# Restart one tenant kube-proxy pod and prove the paused remediation survives.
+test-kube-proxy-restart tenant="tenant-a":
+    @scripts/test-kube-proxy-restart.sh "{{tenant}}"
+
 # Run lifecycle coverage (implemented in Phase 6).
 test-e2e:
     @scripts/unavailable.sh test-e2e "Phase 6"

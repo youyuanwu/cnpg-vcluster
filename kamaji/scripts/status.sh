@@ -8,6 +8,8 @@ source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/tenants.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/workers.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/addons.sh"
 
 health="${EXIT_SUCCESS}"
 
@@ -240,38 +242,83 @@ for tenant in ${TENANT_NAMES}; do
   namespace="$(tenant_namespace "${tenant}")"
   printf '\n-- %s --\n' "${tenant}"
   if final_tenant_exists "${tenant}"; then
-    printf 'TCP: %s endpoint=%s schema=%s paused=%s\n' \
+    pause_value="$(tenant_reconciliation_pause_value "${tenant}")"
+    remediation_revision="$(tenant_reconciliation_remediation_revision "${tenant}")"
+    printf 'TCP: %s endpoint=%s schema=%s paused=%s remediation=%s\n' \
       "$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
         -o jsonpath='{.status.kubernetesResources.version.status}' 2>/dev/null || printf unknown)" \
       "$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
         -o jsonpath='{.status.controlPlaneEndpoint}' 2>/dev/null || printf unknown)" \
       "$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
         -o jsonpath='{.spec.dataStoreSchema}' 2>/dev/null || printf unknown)" \
-      "$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
-        -o jsonpath='{.metadata.annotations.kamaji\.clastix\.io/paused}' 2>/dev/null || printf false)"
+      "${pause_value:-false}" \
+      "${remediation_revision:-absent}"
+    tenant_reconciliation_is_paused "${tenant}" \
+      || unhealthy "${tenant} Kamaji reconciliation is not intentionally paused"
+    [[ "${remediation_revision}" == "${COMPATIBILITY_REVISION}" ]] \
+      || unhealthy "${tenant} kube-proxy remediation revision is absent or stale"
+    final_tenant_tcp_ready "${tenant}" \
+      || unhealthy "${tenant} TenantControlPlane is not Ready"
   else
     printf 'TCP: absent\n'
   fi
   if [[ -f "$(tenant_kubeconfig "${tenant}")" ]] \
     && tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1; then
     printf 'API: ready\n'
-    printf 'Ready workers: %s/%s\n' \
-      "$(tenant_kubectl "${tenant}" get nodes --no-headers 2>/dev/null \
-        | awk '$2 == "Ready" {count++} END {print count+0}')" \
-      "${WORKERS_PER_TENANT}"
-    printf 'kube-proxy conntrack.maxPerCore: %s\n' \
-      "$(tenant_kubectl "${tenant}" -n kube-system get configmap kube-proxy \
+    ready_workers="$(tenant_kubectl "${tenant}" get nodes --no-headers 2>/dev/null \
+      | awk '$2 == "Ready" {count++} END {print count+0}')"
+    printf 'Ready workers: %s/%s\n' "${ready_workers}" "${WORKERS_PER_TENANT}"
+    [[ "${ready_workers}" -eq "${WORKERS_PER_TENANT}" ]] \
+      || unhealthy "${tenant} does not have ${WORKERS_PER_TENANT} Ready workers"
+    conntrack_value="$(tenant_kubectl "${tenant}" -n kube-system get configmap kube-proxy \
         -o jsonpath='{.data.config\.conf}' 2>/dev/null \
-        | sed -n 's/^  maxPerCore: //p' || printf unknown)"
-    printf 'default storage classes: %s\n' \
-      "$(tenant_kubectl "${tenant}" get storageclass -o json 2>/dev/null \
-        | python3 -c 'import json,sys; print(sum(1 for i in json.load(sys.stdin).get("items",[]) if i.get("metadata",{}).get("annotations",{}).get("storageclass.kubernetes.io/is-default-class")=="true"))' \
-        || printf unknown)"
-    printf 'smoke PVC: %s\n' \
-      "$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
-        -o jsonpath='{.status.phase}' 2>/dev/null || printf absent)"
+        | sed -n 's/^  maxPerCore: //p' || true)"
+    printf 'kube-proxy conntrack.maxPerCore: %s\n' "${conntrack_value:-absent}"
+    [[ "${conntrack_value}" == "${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}" ]] \
+      || unhealthy "${tenant} kube-proxy conntrack.maxPerCore is not ${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}"
+    for component in \
+      "deployment kube-system coredns CoreDNS" \
+      "daemonset kube-system kube-proxy kube-proxy" \
+      "daemonset kube-system konnectivity-agent Konnectivity" \
+      "daemonset kube-system calico-node Calico-node" \
+      "deployment kube-system calico-kube-controllers Calico-controllers" \
+      "deployment local-path-storage local-path-provisioner local-path"; do
+      read -r kind component_namespace component_name component_label <<<"${component}"
+      if [[ "${kind}" == deployment ]]; then
+        desired="$(tenant_kubectl "${tenant}" -n "${component_namespace}" \
+          get deployment "${component_name}" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+        ready="$(tenant_kubectl "${tenant}" -n "${component_namespace}" \
+          get deployment "${component_name}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+        component_ok=false
+        final_tenant_deployment_ready "${tenant}" "${component_namespace}" "${component_name}" \
+          && component_ok=true
+      else
+        desired="$(tenant_kubectl "${tenant}" -n "${component_namespace}" \
+          get daemonset "${component_name}" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+        ready="$(tenant_kubectl "${tenant}" -n "${component_namespace}" \
+          get daemonset "${component_name}" -o jsonpath='{.status.numberReady}' 2>/dev/null || true)"
+        component_ok=false
+        final_tenant_daemonset_ready "${tenant}" "${component_namespace}" "${component_name}" \
+          && component_ok=true
+      fi
+      printf '%s: %s/%s Ready\n' "${component_label}" "${ready:-0}" "${desired:-0}"
+      [[ "${component_ok}" == true ]] \
+        || unhealthy "${tenant} ${component_label} replicas are not Ready"
+    done
+    default_classes="$(tenant_kubectl "${tenant}" get storageclass -o json 2>/dev/null \
+      | python3 -c 'import json,sys; print(sum(1 for i in json.load(sys.stdin).get("items",[]) if i.get("metadata",{}).get("annotations",{}).get("storageclass.kubernetes.io/is-default-class")=="true"))' \
+      || printf 0)"
+    printf 'default storage classes: %s\n' "${default_classes}"
+    final_tenant_local_path_ready "${tenant}" \
+      || unhealthy "${tenant} local-path storage is not ready or uniquely default"
+    smoke_pvc="$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
+      -o jsonpath='{.status.phase}' 2>/dev/null || printf absent)"
+    printf 'smoke PVC: %s\n' "${smoke_pvc}"
+    [[ "${smoke_pvc}" == Bound ]] || unhealthy "${tenant} smoke PVC is not Bound"
   else
     printf 'API: kubeconfig absent or unreachable\n'
+    final_tenant_exists "${tenant}" \
+      && unhealthy "${tenant} API is unreachable"
   fi
 done
 
@@ -281,8 +328,8 @@ if [[ -f "${FINAL_RESULT_FILE}" ]] \
   [[ "${final_worker_count}" -eq 6 ]] || unhealthy "passing final result lacks exactly six workers"
   [[ "${final_volume_count}" -eq 6 ]] || unhealthy "passing final result lacks exactly six volumes"
   for tenant in ${TENANT_NAMES}; do
-    tenant_reconciliation_is_unpaused "${tenant}" \
-      || unhealthy "${tenant} reconciliation is paused after successful create"
+    tenant_kube_proxy_steady_state_is_preserved "${tenant}" \
+      || unhealthy "${tenant} passing result lacks the paused kube-proxy steady state"
   done
 elif [[ -f "${FINAL_RESULT_FILE}" ]] \
   && grep -Fxq 'result=blocked' "${FINAL_RESULT_FILE}"; then

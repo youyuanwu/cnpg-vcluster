@@ -24,6 +24,7 @@ final_tenant_a_endpoint=""
 final_tenant_b_endpoint=""
 final_tenant_a_ca_sha256=""
 final_tenant_b_ca_sha256=""
+existing_final_tenants=""
 
 clear_owned_compatibility_blocker() {
   if [[ -f "${BLOCKER_FILE}" ]] \
@@ -104,6 +105,11 @@ finish_final_create() {
     final_result=pass
     clear_owned_compatibility_blocker
     write_final_result
+  else
+    final_result=error
+    final_blocker_prerequisite="${final_blocker_prerequisite:-create}"
+    final_blocker_message="${final_blocker_message:-final reconciliation failed; inspect diagnostics}"
+    write_final_result
   fi
   exit "${status}"
 }
@@ -130,6 +136,36 @@ any_final_tenant_exists() {
     final_tenant_exists "${tenant}" && return 0
   done
   return 1
+}
+
+capture_existing_final_tenant_state() {
+  local tenant
+  if [[ ! -f "${MANAGEMENT_KUBECONFIG}" ]] \
+    || ! management_kubectl get --raw=/readyz >/dev/null 2>&1; then
+    return
+  fi
+  if ! any_final_tenant_exists; then
+    return
+  fi
+  [[ -f "${MANAGEMENT_NETWORK_FILE}" ]] \
+    || die "final.repeat-create: management network state is absent"
+  load_management_network
+  for tenant in ${TENANT_NAMES}; do
+    if final_tenant_exists "${tenant}"; then
+      [[ -f "$(tenant_kubeconfig "${tenant}")" ]] \
+        && tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1 \
+        || die "final.repeat-create: ${tenant} API identity is absent or unreachable"
+      final_tenant_tcp_ready "${tenant}" \
+        || die "final.repeat-create: ${tenant} control plane is not Ready"
+      tenant_kube_proxy_steady_state_is_preserved "${tenant}" \
+        || die "final.repeat-create: ${tenant} must already be paused with remediation ${COMPATIBILITY_REVISION} and conntrack.maxPerCore=${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}"
+      existing_final_tenants+=" ${tenant} "
+    fi
+  done
+}
+
+final_tenant_existed_at_start() {
+  [[ "${existing_final_tenants}" == *" $1 "* ]]
 }
 
 ensure_current_compatibility_decision() {
@@ -211,6 +247,7 @@ assert actual == expected
 require_exact_just
 require_host_inotify_capacity
 trap finish_final_create EXIT
+capture_existing_final_tenant_state
 reconcile_management_plane
 load_management_network
 cleanup_spike_resources
@@ -223,9 +260,14 @@ verify_initial_final_identities_free
 for tenant in ${TENANT_NAMES}; do
   log "reconciling ${tenant} control plane"
   reconcile_final_tenant "${tenant}"
-  if ! (configure_tenant_kube_proxy_conntrack "${tenant}"); then
-    blocked_final cni-konnectivity "${tenant}-kube-proxy-remediation" \
-      "${tenant} conntrack.maxPerCore=0 was not retained before worker join"
+  if final_tenant_existed_at_start "${tenant}"; then
+    tenant_kube_proxy_steady_state_is_preserved "${tenant}" \
+      || die "final.repeat-create: ${tenant} pause or kube-proxy remediation changed during reconciliation"
+  else
+    if ! (configure_tenant_kube_proxy_conntrack "${tenant}"); then
+      blocked_final cni-konnectivity "${tenant}-kube-proxy-remediation" \
+        "${tenant} conntrack.maxPerCore=0 was not retained before worker join"
+    fi
   fi
 done
 if ! (verify_tenant_identity_separation); then
@@ -262,12 +304,10 @@ if ! (validate_exact_final_topology); then
     "exact two-TCP, two-schema, six-worker isolation or storage topology did not validate"
 fi
 for tenant in ${TENANT_NAMES}; do
-  unpause_tenant_reconciliation "${tenant}"
-  wait_for "${TENANT_CONTROL_PLANE_TIMEOUT}" "${tenant} unpaused reconciliation" \
-    final_tenant_tcp_ready "${tenant}" \
-    || die "${tenant}.control-plane: did not remain Ready after unpausing reconciliation"
-  tenant_reconciliation_is_unpaused "${tenant}" \
-    || die "${tenant}.control-plane: reconciliation remains paused after successful create"
+  final_tenant_tcp_ready "${tenant}" \
+    || die "${tenant}.control-plane: did not remain Ready while reconciliation was paused"
+  tenant_kube_proxy_steady_state_is_preserved "${tenant}" \
+    || die "${tenant}.kube-proxy: expected paused steady state or conntrack remediation is absent"
   tenant_workers_ready "${tenant}" \
     && final_tenant_deployment_ready "${tenant}" kube-system coredns \
     && final_tenant_daemonset_ready "${tenant}" kube-system kube-proxy \
@@ -276,6 +316,6 @@ for tenant in ${TENANT_NAMES}; do
     && final_tenant_local_path_ready "${tenant}" \
     && [[ "$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
       -o jsonpath='{.status.phase}')" == Bound ]] \
-    || die "${tenant}.health: workers, add-ons, or storage became unhealthy after unpausing"
+    || die "${tenant}.health: workers, add-ons, or storage are unhealthy in the paused steady state"
 done
-log "two tenant control planes, six exclusive workers, and tenant add-ons are healthy"
+log "two tenant control planes, six exclusive workers, and tenant add-ons are healthy; Kamaji reconciliation is intentionally paused to preserve kube-proxy conntrack.maxPerCore=0"

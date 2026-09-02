@@ -8,6 +8,15 @@ source "${SCRIPT_DIR}/lib/common.sh"
 source "${SCRIPT_DIR}/lib/tenants.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/workers.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/addons.sh"
+
+health="${EXIT_SUCCESS}"
+
+unhealthy() {
+  printf 'unhealthy: %s\n' "$*" >&2
+  health="${EXIT_ERROR}"
+}
 
 scope="${1:-all}"
 case "${scope}" in
@@ -57,6 +66,7 @@ else
 fi
 if [[ -f "${MANAGEMENT_NETWORK_FILE}" ]]; then
   sed 's/^/  /' "${MANAGEMENT_NETWORK_FILE}"
+  load_management_network
 else
   printf 'network assignment absent\n'
 fi
@@ -112,10 +122,30 @@ fi
 
 for tenant in ${TENANT_NAMES}; do
   if [[ "${scope}" == all || "${scope}" == "${tenant}" ]]; then
+    tenant_exists=false
+    final_tenant_exists "${tenant}" && tenant_exists=true
     printf '\n== %s management identity ==\n' "${tenant}"
     management_kubectl -n "$(tenant_namespace "${tenant}")" get \
       tenantcontrolplanes,deployments,pods,services,secrets,pvc -o wide \
       2>/dev/null || true
+    if [[ "${tenant_exists}" == true ]]; then
+      printf 'TCP paused=%s remediation=%s\n' \
+        "$(tenant_reconciliation_pause_value "${tenant}")" \
+        "$(tenant_reconciliation_remediation_revision "${tenant}")"
+      tenant_reconciliation_is_paused "${tenant}" \
+        || unhealthy "${tenant} Kamaji reconciliation is not intentionally paused"
+      [[ "$(tenant_reconciliation_remediation_revision "${tenant}")" \
+        == "${COMPATIBILITY_REVISION}" ]] \
+        || unhealthy "${tenant} kube-proxy remediation revision is absent or stale"
+      final_tenant_tcp_ready "${tenant}" \
+        || unhealthy "${tenant} TenantControlPlane is not Ready"
+    else
+      printf 'TCP absent\n'
+      if [[ -f "${FINAL_RESULT_FILE}" ]] \
+        && grep -Fxq 'result=pass' "${FINAL_RESULT_FILE}"; then
+        unhealthy "${tenant} TenantControlPlane is absent despite passing final result"
+      fi
+    fi
     printf '\n== %s Docker resources ==\n' "${tenant}"
     docker ps -a --filter "$(owned_docker_filter)" \
       --filter "label=kamaji.cnpg-vcluster.io/tenant=${tenant}" \
@@ -124,7 +154,8 @@ for tenant in ${TENANT_NAMES}; do
       --filter "label=kamaji.cnpg-vcluster.io/tenant=${tenant}" \
       --format '{{.Name}}'
     printf '\n== %s API ==\n' "${tenant}"
-    if [[ -f "$(tenant_kubeconfig "${tenant}")" ]]; then
+    if [[ -f "$(tenant_kubeconfig "${tenant}")" ]] \
+      && tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1; then
       tenant_kubectl "${tenant}" get nodes -o wide 2>/dev/null || true
       tenant_kubectl "${tenant}" get pods,services,pvc --all-namespaces \
         -o wide 2>/dev/null || true
@@ -134,10 +165,50 @@ for tenant in ${TENANT_NAMES}; do
         -o jsonpath='{.data.config\.conf}' 2>/dev/null \
         | sed -n 's/^  maxPerCore: //p' || true
       printf '\n'
+      for component in \
+        "deployment kube-system coredns CoreDNS" \
+        "daemonset kube-system kube-proxy kube-proxy" \
+        "daemonset kube-system konnectivity-agent Konnectivity" \
+        "daemonset kube-system calico-node Calico-node" \
+        "deployment kube-system calico-kube-controllers Calico-controllers" \
+        "deployment local-path-storage local-path-provisioner local-path"; do
+        read -r kind component_namespace component_name component_label <<<"${component}"
+        if [[ "${kind}" == deployment ]]; then
+          desired="$(tenant_kubectl "${tenant}" -n "${component_namespace}" \
+            get deployment "${component_name}" -o jsonpath='{.spec.replicas}' 2>/dev/null || true)"
+          ready="$(tenant_kubectl "${tenant}" -n "${component_namespace}" \
+            get deployment "${component_name}" -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)"
+          component_ok=false
+          final_tenant_deployment_ready "${tenant}" "${component_namespace}" "${component_name}" \
+            && component_ok=true
+        else
+          desired="$(tenant_kubectl "${tenant}" -n "${component_namespace}" \
+            get daemonset "${component_name}" -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null || true)"
+          ready="$(tenant_kubectl "${tenant}" -n "${component_namespace}" \
+            get daemonset "${component_name}" -o jsonpath='{.status.numberReady}' 2>/dev/null || true)"
+          component_ok=false
+          final_tenant_daemonset_ready "${tenant}" "${component_namespace}" "${component_name}" \
+            && component_ok=true
+        fi
+        printf '%s=%s/%s Ready\n' "${component_label}" "${ready:-0}" "${desired:-0}"
+        [[ "${component_ok}" == true ]] \
+          || unhealthy "${tenant} ${component_label} replicas are not Ready"
+      done
+      tenant_workers_ready "${tenant}" \
+        || unhealthy "${tenant} workers are not all Ready"
+      tenant_kube_proxy_conntrack_is_zero "${tenant}" \
+        || unhealthy "${tenant} kube-proxy conntrack.maxPerCore is not ${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}"
+      final_tenant_local_path_ready "${tenant}" \
+        || unhealthy "${tenant} local-path storage is not ready or uniquely default"
+      [[ "$(tenant_kubectl "${tenant}" -n default get pvc "${TENANT_SMOKE_PVC}" \
+        -o jsonpath='{.status.phase}' 2>/dev/null || true)" == Bound ]] \
+        || unhealthy "${tenant} smoke PVC is not Bound"
       tenant_kubectl "${tenant}" get events --all-namespaces \
         --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -30 || true
     else
       printf '%s kubeconfig absent; no tenant API query attempted\n' "${tenant}"
+      [[ "${tenant_exists}" == false ]] \
+        || unhealthy "${tenant} API is unreachable"
     fi
   fi
 done
@@ -148,3 +219,5 @@ if [[ -f "${FINAL_RESULT_FILE}" ]]; then
 else
   printf 'none\n'
 fi
+
+exit "${health}"

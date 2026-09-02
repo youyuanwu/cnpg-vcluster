@@ -471,6 +471,34 @@ tenant_kube_proxy_conntrack_is_zero() {
     | grep -Eq "^  maxPerCore: ${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}$"
 }
 
+tenant_reconciliation_pause_value() {
+  local tenant="$1"
+  management_kubectl -n "$(tenant_namespace "${tenant}")" \
+    get "$(tenant_tcp_ref "${tenant}")" \
+    -o jsonpath='{.metadata.annotations.kamaji\.clastix\.io/paused}' \
+    2>/dev/null || true
+}
+
+tenant_reconciliation_remediation_revision() {
+  local tenant="$1"
+  management_kubectl -n "$(tenant_namespace "${tenant}")" \
+    get "$(tenant_tcp_ref "${tenant}")" \
+    -o jsonpath='{.metadata.annotations.kamaji\.cnpg-vcluster\.io/kube-proxy-remediation}' \
+    2>/dev/null || true
+}
+
+tenant_reconciliation_is_paused() {
+  [[ "$(tenant_reconciliation_pause_value "$1")" == true ]]
+}
+
+tenant_kube_proxy_steady_state_is_preserved() {
+  local tenant="$1"
+  tenant_reconciliation_is_paused "${tenant}" \
+    && [[ "$(tenant_reconciliation_remediation_revision "${tenant}")" \
+      == "${COMPATIBILITY_REVISION}" ]] \
+    && tenant_kube_proxy_conntrack_is_zero "${tenant}"
+}
+
 configure_tenant_kube_proxy_conntrack() {
   local tenant="$1"
   local namespace manifest
@@ -520,7 +548,7 @@ open(path, "w", encoding="utf-8").write(json.dumps(data))
   {
     printf 'compatibility_revision=%s\n' "${COMPATIBILITY_REVISION}"
     printf 'conntrack_max_per_core=%s\n' "${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}"
-    printf 'kamaji_reconciliation=temporarily-paused\n'
+    printf 'kamaji_reconciliation=intentionally-paused-steady-state\n'
     printf 'immediate_reversion=not-observed\n'
   } | write_secret_file "$(tenant_kube_proxy_evidence "${tenant}")"
 }
@@ -540,10 +568,8 @@ unpause_tenant_reconciliation() {
 
 tenant_reconciliation_is_unpaused() {
   local tenant="$1"
-  local namespace paused
-  namespace="$(tenant_namespace "${tenant}")"
-  paused="$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
-    -o jsonpath='{.metadata.annotations.kamaji\.clastix\.io/paused}' 2>/dev/null || true)"
+  local paused
+  paused="$(tenant_reconciliation_pause_value "${tenant}")"
   [[ -z "${paused}" || "${paused}" == false ]]
 }
 

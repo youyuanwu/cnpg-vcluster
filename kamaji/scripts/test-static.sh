@@ -291,7 +291,7 @@ done
 
 check "complete just task surface" bash -c '
   tasks="$(just --justfile "$1" --list --unsorted)"
-  for task in tools preflight prepare-host create-management spike destroy-spike create status diagnose verify destroy-tenant destroy test-static test-inotify-negative test-e2e; do
+  for task in tools preflight prepare-host create-management spike destroy-spike create status diagnose verify destroy-tenant destroy test-static test-inotify-negative test-kube-proxy-restart test-e2e; do
     grep -Eq "^    ${task}([[:space:]]|$)" <<<"${tasks}" || exit 1
   done
 ' _ "${LAB_ROOT}/Justfile"
@@ -756,7 +756,7 @@ check "worker ownership rejects same-named unowned objects" bash -c '
   grep -Fq "refusing same-named unowned volume" "$1" &&
   grep -Fq "worker-var-lib" "$1"
 ' _ "${LAB_ROOT}/scripts/lib/workers.sh"
-check "kube-proxy remediation is pre-join and proves non-reversion" bash -c '
+check "kube-proxy remediation is pre-join and retained as steady state" bash -c '
   tenant_file="$1/scripts/lib/tenants.sh"
   create_file="$1/scripts/create.sh"
   grep -Fq "maxPerCore: " "$tenant_file" &&
@@ -765,9 +765,19 @@ check "kube-proxy remediation is pre-join and proves non-reversion" bash -c '
   grep -Fq "immediate_reversion=not-observed" "$tenant_file" &&
   patch_line="$(grep -n "configure_tenant_kube_proxy_conntrack" "$create_file" | tail -1 | cut -d: -f1)" &&
   worker_line="$(grep -n "reconcile_tenant_workers" "$create_file" | tail -1 | cut -d: -f1)" &&
-  unpause_line="$(grep -n "unpause_tenant_reconciliation" "$create_file" | tail -1 | cut -d: -f1)" &&
-  (( patch_line < worker_line && worker_line < unpause_line )) &&
-  grep -Fq "tenant_reconciliation_is_unpaused" "$create_file"
+  (( patch_line < worker_line )) &&
+  ! grep -Fq "unpause_tenant_reconciliation" "$create_file" &&
+  grep -Fq "tenant_kube_proxy_steady_state_is_preserved" "$create_file" &&
+  grep -Fq "final.repeat-create" "$create_file"
+' _ "${LAB_ROOT}"
+check "kube-proxy restart regression is credential-safe lifecycle coverage" bash -c '
+  file="$1/scripts/test-kube-proxy-restart.sh"
+  test -x "$file" &&
+  grep -Fq "delete pod" "$file" &&
+  grep -Fq "replacement kube-proxy readiness" "$file" &&
+  grep -Fq "permission denied" "$file" &&
+  grep -Fq "tenant_kube_proxy_steady_state_is_preserved" "$file" &&
+  ! grep -Eq "(cat|echo|printf).*(admin\\.conf|kubeconfig|token|password)" "$file"
 ' _ "${LAB_ROOT}"
 check "worker failures preserve observed inspect and log evidence" bash -c '
   file="$1/scripts/lib/workers.sh"
@@ -830,8 +840,13 @@ check "status and diagnostics cover both final tenants and exit shapes" bash -c 
   grep -Fq "passing final result lacks exactly two TCPs" "$1/scripts/status.sh" &&
   grep -Fq "blocked final result retains workers" "$1/scripts/status.sh" &&
   grep -Fq "kube-proxy conntrack.maxPerCore" "$1/scripts/status.sh" &&
+  grep -Fq "CoreDNS" "$1/scripts/status.sh" &&
+  grep -Fq "Konnectivity" "$1/scripts/status.sh" &&
+  grep -Fq "local-path" "$1/scripts/status.sh" &&
+  grep -Fq "Kamaji reconciliation is not intentionally paused" "$1/scripts/status.sh" &&
   grep -Fq "final result evidence" "$1/scripts/diagnose.sh" &&
-  grep -Fq "for tenant in \${TENANT_NAMES}" "$1/scripts/diagnose.sh"
+  grep -Fq "for tenant in \${TENANT_NAMES}" "$1/scripts/diagnose.sh" &&
+  grep -Fq "exit \"\${health}\"" "$1/scripts/diagnose.sh"
 ' _ "${LAB_ROOT}"
 
 check "management values disable telemetry" \
