@@ -59,7 +59,10 @@ does not install `just`.
 `just preflight` validates tools, Linux Docker, cgroup v2, capacity, network
 overlap, prepared checksums, remote image digests, and a short-lived
 privileged-container probe. It creates no kind cluster, tenant, credential, or
-retained Docker resource.
+retained Docker resource. `MIN_DOCKER_CPUS`, `MIN_DOCKER_MEMORY_GIB`, and
+`MIN_DOCKER_STORAGE_GIB` are intentional environment inputs for operators who
+want stricter admission and for deterministic rejection tests; lowering them
+weakens the documented lab admission floor.
 
 `just create-management` creates or reconciles only the management plane. It
 records the exact kind node container identity before later adoption, derives
@@ -83,8 +86,10 @@ always select an explicit kubeconfig. Waits and network operations are finite
 and configurable through `config/settings.env`.
 
 Exit status `0` means success, `1` means an ordinary error or unhealthy state,
-and Exit status `2` is reserved for a recognized compatibility blocker with a
-machine-readable blocker record. Phase 1 has no normal path that returns `2`.
+and exit status `2` is reserved for a recognized compatibility blocker with a
+machine-readable blocker record. Management creation never returns `2`;
+Phase 3 and later compatibility gates may do so only through the dedicated
+blocker path.
 
 ## Licensing, telemetry, and support boundary
 

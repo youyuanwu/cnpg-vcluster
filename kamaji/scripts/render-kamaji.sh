@@ -83,14 +83,88 @@ validate_render() {
       || grep -Fq "image: \"${expected}\"" "${manifest}" \
       || die "rendered chart is missing approved image ${expected}"
   done
-  grep -Fq 'replicas: 3' "${manifest}" \
-    || die "rendered chart is missing the three-member datastore"
-  [[ "$(grep -c 'storage: 1Gi' "${manifest}")" -eq 1 ]] \
-    || die "rendered chart does not request 1Gi datastore claims"
-  for resource in 100m 128Mi 500m 512Mi 256Mi; do
-    grep -Fq "${resource}" "${manifest}" \
-      || die "rendered chart is missing capacity value ${resource}"
-  done
+  MANIFEST="${manifest}" \
+  CONTROLLER_REQUEST_CPU="${KAMAJI_CONTROLLER_REQUEST_CPU}" \
+  CONTROLLER_REQUEST_MEMORY="${KAMAJI_CONTROLLER_REQUEST_MEMORY}" \
+  CONTROLLER_LIMIT_CPU="${KAMAJI_CONTROLLER_LIMIT_CPU}" \
+  CONTROLLER_LIMIT_MEMORY="${KAMAJI_CONTROLLER_LIMIT_MEMORY}" \
+  ETCD_REPLICAS="${KAMAJI_ETCD_REPLICAS}" \
+  ETCD_REQUEST_CPU="${KAMAJI_ETCD_REQUEST_CPU}" \
+  ETCD_REQUEST_MEMORY="${KAMAJI_ETCD_REQUEST_MEMORY}" \
+  ETCD_LIMIT_CPU="${KAMAJI_ETCD_LIMIT_CPU}" \
+  ETCD_LIMIT_MEMORY="${KAMAJI_ETCD_LIMIT_MEMORY}" \
+  ETCD_PVC_SIZE="${KAMAJI_ETCD_PVC_SIZE}" \
+  python3 -c '
+import os
+import re
+from pathlib import Path
+
+documents = re.split(r"(?m)^---\s*$", Path(os.environ["MANIFEST"]).read_text(encoding="utf-8"))
+
+def identity(document):
+    kind = re.search(r"(?m)^kind:\s*[\"\x27]?([^\"\x27\s]+)", document)
+    name = re.search(r"(?m)^metadata:\s*\n(?:^[ \t].*\n)*?^  name:\s*[\"\x27]?([^\"\x27\s]+)", document)
+    return (kind.group(1) if kind else None, name.group(1) if name else None)
+
+def select(kind, name):
+    matches = [document for document in documents if identity(document) == (kind, name)]
+    if len(matches) != 1:
+        raise SystemExit(f"expected one {kind}/{name}, found {len(matches)}")
+    return matches[0]
+
+def resource_maps(document):
+    lines = document.splitlines()
+    found = []
+    for index, line in enumerate(lines):
+        if line.strip() != "resources:":
+            continue
+        base = len(line) - len(line.lstrip())
+        current = None
+        values = {}
+        for nested in lines[index + 1:]:
+            if not nested.strip():
+                continue
+            indent = len(nested) - len(nested.lstrip())
+            if indent <= base:
+                break
+            stripped = nested.strip()
+            if stripped in ("requests:", "limits:"):
+                current = stripped[:-1]
+                continue
+            match = re.fullmatch(r"(cpu|memory):\s*[\"\x27]?([^\"\x27\s]+)", stripped)
+            if current and match:
+                values[(current, match.group(1))] = match.group(2)
+        found.append(values)
+    return found
+
+def require_resources(document, expected, workload):
+    if expected not in resource_maps(document):
+        raise SystemExit(f"{workload} resources do not match the configured capacity budget")
+
+controller = select("Deployment", "kamaji")
+require_resources(controller, {
+    ("requests", "cpu"): os.environ["CONTROLLER_REQUEST_CPU"],
+    ("requests", "memory"): os.environ["CONTROLLER_REQUEST_MEMORY"],
+    ("limits", "cpu"): os.environ["CONTROLLER_LIMIT_CPU"],
+    ("limits", "memory"): os.environ["CONTROLLER_LIMIT_MEMORY"],
+}, "Deployment/kamaji")
+
+datastore = select("StatefulSet", "kamaji-etcd")
+etcd_replicas = re.escape(os.environ["ETCD_REPLICAS"])
+etcd_pvc_size = re.escape(os.environ["ETCD_PVC_SIZE"])
+if not re.search(rf"(?m)^  replicas:\s*{etcd_replicas}\s*$", datastore):
+    raise SystemExit("StatefulSet/kamaji-etcd replica count does not match the capacity budget")
+if not re.search(r"(?m)^    whenDeleted:\s*Retain\s*$", datastore):
+    raise SystemExit("StatefulSet/kamaji-etcd does not retain deleted claims")
+if not re.search(rf"(?m)^\s+storage:\s*{etcd_pvc_size}\s*$", datastore):
+    raise SystemExit("StatefulSet/kamaji-etcd claim size does not match the capacity budget")
+require_resources(datastore, {
+    ("requests", "cpu"): os.environ["ETCD_REQUEST_CPU"],
+    ("requests", "memory"): os.environ["ETCD_REQUEST_MEMORY"],
+    ("limits", "cpu"): os.environ["ETCD_LIMIT_CPU"],
+    ("limits", "memory"): os.environ["ETCD_LIMIT_MEMORY"],
+}, "StatefulSet/kamaji-etcd")
+'
   [[ "$(wc -l <"${KAMAJI_IMAGE_INVENTORY}")" -eq 4 ]] \
     || die "expected four transitive chart images"
   if grep -Ev '@sha256:[0-9a-f]{64}$' "${KAMAJI_IMAGE_INVENTORY}" | grep -q .; then

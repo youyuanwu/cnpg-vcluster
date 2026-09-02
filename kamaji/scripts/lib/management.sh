@@ -19,6 +19,12 @@ management_container_exists() {
   docker container inspect "$(management_node_name)" >/dev/null 2>&1
 }
 
+cleanup_if_introduced() {
+  local introduced="$1"
+  shift
+  (( introduced == 0 )) || "$@"
+}
+
 record_management_ownership() {
   local node id label
   node="$(management_node_name)"
@@ -88,13 +94,13 @@ reconcile_kind_cluster() {
   fi
 
   if ! management_kubectl get --raw=/readyz >/dev/null 2>&1; then
-    (( created == 0 )) || cleanup_new_kind_cluster
+    cleanup_if_introduced "${created}" cleanup_new_kind_cluster
     die "management.kubernetes: API readiness failed for the owned kind cluster"
   fi
   local server_version
   server_version="$(management_kubectl version -o json | python3 -c 'import json,sys; print(json.load(sys.stdin)["serverVersion"]["gitVersion"])')"
   if [[ "${server_version}" != "${KUBERNETES_VERSION}" ]]; then
-    (( created == 0 )) || cleanup_new_kind_cluster
+    cleanup_if_introduced "${created}" cleanup_new_kind_cluster
     die "management.kubernetes: expected ${KUBERNETES_VERSION}, found ${server_version}"
   fi
 }
@@ -105,8 +111,8 @@ cleanup_cert_manager() {
 }
 
 reconcile_cert_manager() {
-  local existed=0
-  management_helm status cert-manager --namespace cert-manager >/dev/null 2>&1 && existed=1
+  local introduced=1
+  management_helm status cert-manager --namespace cert-manager >/dev/null 2>&1 && introduced=0
   if ! management_helm upgrade --install cert-manager \
     "${INPUTS_DIR}/cert-manager-${CERT_MANAGER_VERSION}.tgz" \
     --namespace cert-manager \
@@ -121,25 +127,25 @@ reconcile_cert_manager() {
     --set webhook.resources.requests.memory=128Mi \
     --set cainjector.resources.requests.cpu=100m \
     --set cainjector.resources.requests.memory=128Mi; then
-    (( existed == 1 )) || cleanup_cert_manager
+    cleanup_if_introduced "${introduced}" cleanup_cert_manager
     die "management.cert-manager: ${CERT_MANAGER_VERSION} installation or readiness failed"
   fi
   local deployment
   for deployment in cert-manager cert-manager-cainjector cert-manager-webhook; do
     if ! management_kubectl -n cert-manager rollout status "deployment/${deployment}" \
       --timeout="${CERT_MANAGER_TIMEOUT}" >/dev/null; then
-      (( existed == 1 )) || cleanup_cert_manager
+      cleanup_if_introduced "${introduced}" cleanup_cert_manager
       die "management.cert-manager: deployment ${deployment} did not become ready"
     fi
   done
   if ! management_kubectl wait --for=condition=Established \
     crd/certificates.cert-manager.io crd/issuers.cert-manager.io \
     --timeout="${CERT_MANAGER_TIMEOUT}" >/dev/null; then
-    (( existed == 1 )) || cleanup_cert_manager
+    cleanup_if_introduced "${introduced}" cleanup_cert_manager
     die "management.cert-manager: required CRDs did not become established"
   fi
   if [[ -z "$(management_kubectl -n cert-manager get endpoints cert-manager-webhook -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)" ]]; then
-    (( existed == 1 )) || cleanup_cert_manager
+    cleanup_if_introduced "${introduced}" cleanup_cert_manager
     die "management.cert-manager: webhook has no ready endpoint"
   fi
 }
@@ -150,11 +156,11 @@ cleanup_metallb() {
 }
 
 reconcile_metallb() {
-  local existed=0
-  management_kubectl get namespace metallb-system >/dev/null 2>&1 && existed=1
+  local introduced=1
+  management_kubectl get namespace metallb-system >/dev/null 2>&1 && introduced=0
   if ! management_kubectl apply \
     -f "${INPUTS_DIR}/metallb-native-${METALLB_VERSION}.yaml" >/dev/null; then
-    (( existed == 1 )) || cleanup_metallb
+    cleanup_if_introduced "${introduced}" cleanup_metallb
     die "management.metallb: ${METALLB_VERSION} manifest application failed"
   fi
   if ! management_kubectl wait --for=condition=Established \
@@ -164,16 +170,16 @@ reconcile_metallb() {
       --timeout="${METALLB_TIMEOUT}" >/dev/null \
     || ! management_kubectl -n metallb-system rollout status daemonset/speaker \
       --timeout="${METALLB_TIMEOUT}" >/dev/null; then
-    (( existed == 1 )) || cleanup_metallb
+    cleanup_if_introduced "${introduced}" cleanup_metallb
     die "management.metallb: ${METALLB_VERSION} controller, speaker, or CRD readiness failed"
   fi
   if [[ -z "$(management_kubectl -n metallb-system get endpoints metallb-webhook-service -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)" ]]; then
-    (( existed == 1 )) || cleanup_metallb
+    cleanup_if_introduced "${introduced}" cleanup_metallb
     die "management.metallb: webhook has no ready endpoint"
   fi
   if ! management_kubectl apply -f "${METALLB_RENDERED_MANIFEST}" >/dev/null; then
-    if (( existed == 0 )); then
-      cleanup_metallb
+    if (( introduced == 1 )); then
+      cleanup_if_introduced "${introduced}" cleanup_metallb
     else
       management_kubectl delete -f "${METALLB_RENDERED_MANIFEST}" --ignore-not-found >/dev/null 2>&1 || true
     fi
@@ -250,8 +256,8 @@ datastore_ready() {
 }
 
 reconcile_kamaji() {
-  local existed=0
-  management_helm status kamaji --namespace "${MANAGEMENT_NAMESPACE}" >/dev/null 2>&1 && existed=1
+  local introduced=1
+  management_helm status kamaji --namespace "${MANAGEMENT_NAMESPACE}" >/dev/null 2>&1 && introduced=0
   "${LAB_ROOT}/scripts/render-kamaji.sh" render
   render_kamaji_hook_manifests
   if ! management_kubectl get namespace "${MANAGEMENT_NAMESPACE}" >/dev/null 2>&1; then
@@ -261,7 +267,7 @@ reconcile_kamaji() {
     "${OWNERSHIP_LABEL}=${LAB_PREFIX}" --overwrite >/dev/null
   if ! management_kubectl -n "${MANAGEMENT_NAMESPACE}" apply \
     -f "${KAMAJI_PRE_HOOKS_MANIFEST}" >/dev/null; then
-    (( existed == 1 )) || cleanup_kamaji
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.kamaji: digest-pinned hook prerequisites failed"
   fi
   if ! management_helm upgrade --install kamaji "${KAMAJI_CHART_DIR}" \
@@ -272,13 +278,13 @@ reconcile_kamaji() {
     --timeout "${KAMAJI_TIMEOUT}" \
     --values "${LAB_ROOT}/config/kamaji-values.yaml" \
     --post-renderer "${LAB_ROOT}/scripts/render-kamaji.sh"; then
-    (( existed == 1 )) || cleanup_kamaji
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.kamaji: ${KAMAJI_VERSION} locked chart installation failed"
   fi
   "${LAB_ROOT}/scripts/render-kamaji.sh" validate
   if ! management_kubectl -n "${MANAGEMENT_NAMESPACE}" apply \
     -f "${KAMAJI_PRE_HOOKS_MANIFEST}" >/dev/null; then
-    (( existed == 1 )) || cleanup_kamaji
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.kamaji: digest-pinned hook prerequisites were not retained"
   fi
 
@@ -289,29 +295,29 @@ reconcile_kamaji() {
     --timeout="${KAMAJI_TIMEOUT}" >/dev/null \
     || ! management_kubectl -n "${MANAGEMENT_NAMESPACE}" rollout status deployment/kamaji \
       --timeout="${KAMAJI_TIMEOUT}" >/dev/null; then
-    (( existed == 1 )) || cleanup_kamaji
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.kamaji: controller or CRD readiness failed"
   fi
   if [[ -z "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get endpoints kamaji-webhook-service -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)" ]]; then
-    (( existed == 1 )) || cleanup_kamaji
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.kamaji: webhook has no ready endpoint"
   fi
   if ! management_kubectl -n "${MANAGEMENT_NAMESPACE}" rollout status statefulset/kamaji-etcd \
     --timeout="${DATASTORE_TIMEOUT}" >/dev/null; then
-    (( existed == 1 )) || cleanup_kamaji
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.datastore: three-member etcd StatefulSet did not become ready"
   fi
   if ! run_kamaji_post_install_hook; then
-    (( existed == 1 )) || cleanup_kamaji
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.datastore: digest-pinned datastore setup hook failed"
   fi
   if ! wait_for "${DATASTORE_TIMEOUT}" "DataStore/default readiness" datastore_ready; then
-    (( existed == 1 )) || cleanup_kamaji
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.datastore: DataStore/default did not become ready"
   fi
   if [[ "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get pvc -o json \
       | python3 -c 'import json,sys; print(sum(1 for item in json.load(sys.stdin)["items"] if item["metadata"]["name"].startswith("data-kamaji-etcd-") and item.get("status", {}).get("phase") == "Bound"))')" -ne "${KAMAJI_ETCD_REPLICAS}" ]]; then
-    (( existed == 1 )) || cleanup_kamaji
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.datastore: expected ${KAMAJI_ETCD_REPLICAS} bound datastore PVCs"
   fi
 }

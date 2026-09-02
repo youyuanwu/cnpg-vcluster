@@ -19,5 +19,4 @@ worker_count="$(docker ps -aq --filter "$(owned_docker_filter)" | wc -l)"
 [[ "${worker_count}" -eq 0 ]] \
   || die "management.topology: expected zero owned worker containers, found ${worker_count}"
 
-rm -f "${BLOCKER_FILE}"
 log "management plane ready with zero tenant control planes and zero workers"

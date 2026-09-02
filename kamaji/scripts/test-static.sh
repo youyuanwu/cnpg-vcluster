@@ -4,6 +4,8 @@ set -Eeuo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/common.sh"
+# shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/management.sh"
 
 failures=0
 checks=0
@@ -82,14 +84,14 @@ command_returns_one() {
 }
 
 observer_is_read_only() {
-  local before_runtime before_resources output status
+  local before_runtime before_resources after_resources output status resources_ok=1
   before_runtime="$(runtime_fingerprint)"
   if [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
     && management_kubectl get --raw=/readyz >/dev/null 2>&1; then
     before_resources="$(
       management_kubectl get namespaces,deployments,statefulsets,daemonsets,pvc \
         --all-namespaces -o name 2>/dev/null | sort
-    )"
+    )" || resources_ok=0
   else
     before_resources="unavailable"
   fi
@@ -97,17 +99,99 @@ observer_is_read_only() {
   output="$("$@" 2>&1)"
   status=$?
   set -e
-  [[ "${status}" -eq "${EXIT_SUCCESS}" || "${status}" -eq "${EXIT_ERROR}" ]] \
-    && [[ "${status}" -ne "${EXIT_BLOCKED}" ]] \
-    && [[ "$(runtime_fingerprint)" == "${before_runtime}" ]]
+  after_resources="${before_resources}"
   if [[ "${before_resources}" != unavailable ]]; then
-    [[ "$(
+    after_resources="$(
       management_kubectl get namespaces,deployments,statefulsets,daemonsets,pvc \
         --all-namespaces -o name 2>/dev/null | sort
-    )" == "${before_resources}" ]]
+    )" || resources_ok=0
   fi
-  [[ -n "${output}" ]]
+  [[ "${status}" -eq "${EXIT_SUCCESS}" || "${status}" -eq "${EXIT_ERROR}" ]] \
+    && [[ "$(runtime_fingerprint)" == "${before_runtime}" ]] \
+    && (( resources_ok == 1 )) \
+    && [[ "${after_resources}" == "${before_resources}" ]] \
+    && [[ -n "${output}" ]]
 }
+
+hostile_observer_is_rejected() (
+  local fixture_dir="${TOOLS_TMP_DIR}/observer-hostile-fixture"
+  rm -rf "${fixture_dir}"
+  mkdir -p -m 0700 "${fixture_dir}"
+  trap 'rm -rf "${fixture_dir}"' EXIT
+  RUNTIME_DIR="${fixture_dir}"
+  MANAGEMENT_KUBECONFIG="${fixture_dir}/missing-kubeconfig"
+
+  hostile_observer() {
+    printf 'hostile observer output\n'
+    touch "${RUNTIME_DIR}/mutated"
+    return "${EXIT_BLOCKED}"
+  }
+
+  ! observer_is_read_only hostile_observer
+)
+
+cleanup_polarity_is_explicit() (
+  local fixture_dir="${TOOLS_TMP_DIR}/cleanup-polarity-fixture"
+  rm -rf "${fixture_dir}"
+  mkdir -p -m 0700 "${fixture_dir}"
+  trap 'rm -rf "${fixture_dir}"' EXIT
+  touch "${fixture_dir}/component"
+
+  cleanup_fixture_component() {
+    rm -f "${fixture_dir}/component"
+  }
+
+  cleanup_if_introduced 0 cleanup_fixture_component
+  [[ -f "${fixture_dir}/component" ]] \
+    && cleanup_if_introduced 1 cleanup_fixture_component \
+    && [[ ! -e "${fixture_dir}/component" ]]
+)
+
+fresh_cert_manager_failure_is_targeted() (
+  local fixture_dir="${TOOLS_TMP_DIR}/cert-manager-failure-fixture"
+  local output status component
+  rm -rf "${fixture_dir}"
+  mkdir -p -m 0700 "${fixture_dir}"
+  trap 'rm -rf "${fixture_dir}"' EXIT
+  for component in kubernetes metallb kamaji datastore; do
+    touch "${fixture_dir}/${component}"
+  done
+
+  management_helm() {
+    case "$1" in
+      status)
+        return 1
+        ;;
+      upgrade)
+        touch "${fixture_dir}/cert-manager"
+        return 1
+        ;;
+      uninstall)
+        rm -f "${fixture_dir}/cert-manager"
+        ;;
+      *)
+        return 1
+        ;;
+    esac
+  }
+
+  management_kubectl() {
+    if [[ " $* " == *" delete namespace cert-manager "* ]]; then
+      rm -f "${fixture_dir}/cert-manager"
+    fi
+    return 0
+  }
+
+  set +e
+  output="$(reconcile_cert_manager 2>&1)"
+  status=$?
+  set -e
+
+  [[ "${status}" -eq "${EXIT_ERROR}" ]] \
+    && [[ "${output}" == "[kamaji-lab] ERROR: management.cert-manager: ${CERT_MANAGER_VERSION} installation or readiness failed" ]] \
+    && [[ ! -e "${fixture_dir}/cert-manager" ]] \
+    && [[ "$(find "${fixture_dir}" -maxdepth 1 -type f -printf '%f\n' | sort)" == $'datastore\nkamaji\nkubernetes\nmetallb' ]]
+)
 
 require_exact_just
 
@@ -327,6 +411,8 @@ check "status is read-only and never returns blocker status" \
   observer_is_read_only "${SCRIPT_DIR}/status.sh"
 check "diagnostics is read-only and never returns blocker status" \
   observer_is_read_only "${SCRIPT_DIR}/diagnose.sh" all
+check "hostile exit-2 mutating observer is rejected" \
+  hostile_observer_is_rejected
 
 check "management values disable telemetry" \
   has_text '^  disabled: true$' "${LAB_ROOT}/config/kamaji-values.yaml"
@@ -374,16 +460,10 @@ check "management ownership fails closed" bash -c '
   set -e
   [[ "$status" -eq 1 ]] && grep -Fq "management.ownership-refusal" <<<"$output"
 ' _ "${LAB_ROOT}"
-check "management gates name every dependency" bash -c '
-  for component in kubernetes cert-manager metallb kamaji datastore; do
-    grep -Fq "management.${component}:" "$1" || exit 1
-  done
-' _ "${LAB_ROOT}/scripts/lib/management.sh"
-check "new dependency failures have targeted cleanup" bash -c '
-  for cleanup in cleanup_new_kind_cluster cleanup_cert_manager cleanup_metallb cleanup_kamaji; do
-    grep -Fq "${cleanup}" "$1" || exit 1
-  done
-' _ "${LAB_ROOT}/scripts/lib/management.sh"
+check "introduced-component cleanup polarity is explicit" \
+  cleanup_polarity_is_explicit
+check "fresh cert-manager failure is targeted and preserves dependencies" \
+  fresh_cert_manager_failure_is_targeted
 check "management scripts contain no fallback artifact path" bash -c '
   ! grep -Eiq "(fallback|stable\\.clastix|license|activation|vcluster)" \
     "$1/scripts/create-management.sh" "$1/scripts/lib/management.sh"
@@ -392,6 +472,8 @@ check "create-management stops at zero TCPs and workers" bash -c '
   grep -Fq "expected zero TenantControlPlanes" "$1" &&
   grep -Fq "expected zero owned worker containers" "$1"
 ' _ "${LAB_ROOT}/scripts/create-management.sh"
+check "management reconcile preserves compatibility blocker evidence" \
+  not_has_text 'rm -f .*BLOCKER_FILE' "${LAB_ROOT}/scripts/create-management.sh"
 check "management Helm uses the locked local chart and deterministic renderer" bash -c '
   grep -Fq '\''"${KAMAJI_CHART_DIR}"'\'' "$1" &&
   grep -Fq -- "--post-renderer" "$1" &&
@@ -411,7 +493,7 @@ check "README documents edge and no-activation status" \
 check "README documents telemetry opt-out" \
   has_text 'telemetry\.disabled: true' "${LAB_ROOT}/README.md"
 check "README documents exit meanings" \
-  has_text 'Exit status `2`.*compatibility blocker' "${LAB_ROOT}/README.md"
+  has_text '[Ee]xit status `2`.*compatibility blocker' "${LAB_ROOT}/README.md"
 check "design documents privileged shared-kernel boundary" \
   has_text 'share the Docker host kernel' "${LAB_ROOT}/docs/high-level-design.md"
 check "design records deterministic transitive image inventory" \

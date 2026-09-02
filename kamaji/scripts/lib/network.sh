@@ -141,7 +141,7 @@ reconcile_management_network() {
   inspect_json="$(docker network inspect "${network}")"
   if [[ -f "${MANAGEMENT_NETWORK_FILE}" ]]; then
     validate_management_network "${inspect_json}" \
-      || die "network.vip-conflict: recorded management VIP assignment is no longer safe"
+      || die "network.vip-conflict: recorded management VIP assignment in ${MANAGEMENT_NETWORK_FILE} is no longer safe; remove that record after resolving the conflict to regenerate it"
   else
     write_management_network "${inspect_json}"
     validate_management_network "${inspect_json}" \

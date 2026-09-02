@@ -129,9 +129,12 @@ Preflight orders no-mutation checks before the short-lived privileged probe:
 6. deterministic chart rendering and remote digest availability;
 7. a bounded, automatically removed privileged cgroup-v2 probe.
 
-CPU, memory-byte, and storage-byte fixture overrides allow the static suite to
-prove each threshold rejects before runtime state, a probe, a kind cluster, or
-any owned Docker object changes.
+`MIN_DOCKER_CPUS`, `MIN_DOCKER_MEMORY_GIB`, and `MIN_DOCKER_STORAGE_GIB` are
+intentional environment inputs. Operators may raise them for stricter host
+admission, and the static suite lowers observed fixture capacity to prove each
+threshold rejects before runtime state, a probe, a kind cluster, or any owned
+Docker object changes. Lowering the configured floors weakens the documented
+lab admission model.
 
 The admission model counts six worker Docker caps (7.5 CPUs and 15 GiB),
 management requests (1.2 CPUs and 2 GiB), and a kind/system reserve (2 CPUs and
