@@ -1,0 +1,97 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: ${SPIKE_NAMESPACE}
+  labels:
+    ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+    kamaji.cnpg-vcluster.io/role: compatibility-spike
+---
+apiVersion: kamaji.clastix.io/v1alpha1
+kind: TenantControlPlane
+metadata:
+  name: ${SPIKE_NAME}
+  namespace: ${SPIKE_NAMESPACE}
+  labels:
+    ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+    kamaji.cnpg-vcluster.io/role: compatibility-spike
+spec:
+  controlPlane:
+    deployment:
+      replicas: 1
+      resources:
+        apiServer:
+          requests:
+            cpu: ${TENANT_API_SERVER_REQUEST_CPU}
+            memory: ${TENANT_API_SERVER_REQUEST_MEMORY}
+          limits:
+            cpu: ${TENANT_API_SERVER_LIMIT_CPU}
+            memory: ${TENANT_API_SERVER_LIMIT_MEMORY}
+        controllerManager:
+          requests:
+            cpu: ${TENANT_CONTROLLER_MANAGER_REQUEST_CPU}
+            memory: ${TENANT_CONTROLLER_MANAGER_REQUEST_MEMORY}
+          limits:
+            cpu: ${TENANT_CONTROLLER_MANAGER_LIMIT_CPU}
+            memory: ${TENANT_CONTROLLER_MANAGER_LIMIT_MEMORY}
+        scheduler:
+          requests:
+            cpu: ${TENANT_SCHEDULER_REQUEST_CPU}
+            memory: ${TENANT_SCHEDULER_REQUEST_MEMORY}
+          limits:
+            cpu: ${TENANT_SCHEDULER_LIMIT_CPU}
+            memory: ${TENANT_SCHEDULER_LIMIT_MEMORY}
+    service:
+      serviceType: LoadBalancer
+      allocateLoadBalancerNodePorts: false
+      additionalMetadata:
+        annotations:
+          metallb.io/loadBalancerIPs: ${SPIKE_VIP}
+  kubernetes:
+    version: ${KUBERNETES_VERSION}
+    kubelet:
+      preferredAddressTypes:
+        - InternalIP
+        - ExternalIP
+      configurationJSONPatches:
+        - op: add
+          path: /cgroupDriver
+          value: systemd
+  networkProfile:
+    address: ${SPIKE_VIP}
+    advertiseAddress: ${SPIKE_VIP}
+    port: 6443
+    certSANs:
+      - ${SPIKE_VIP}
+      - ${SPIKE_NAME}
+    clusterDomain: ${SPIKE_CLUSTER_DOMAIN}
+    serviceCidrs:
+      - ${SPIKE_SERVICE_CIDR}
+    podCidrs:
+      - ${SPIKE_POD_CIDR}
+    dnsServiceIPs:
+      - ${SPIKE_DNS_SERVICE_IP}
+  addons:
+    coreDNS: {}
+    kubeProxy: {}
+    konnectivity:
+      server:
+        image: ${KONNECTIVITY_SERVER_REPOSITORY}
+        version: ${KONNECTIVITY_SERVER_VERSION_DIGEST}
+        port: 8132
+      agent:
+        image: ${KONNECTIVITY_AGENT_REPOSITORY}
+        version: ${KONNECTIVITY_AGENT_VERSION_DIGEST}
+        mode: DaemonSet
+        hostNetwork: true
+        tolerations:
+          - key: CriticalAddonsOnly
+            operator: Exists
+          - key: node.kubernetes.io/not-ready
+            operator: Exists
+            effect: NoSchedule
+          - key: node.kubernetes.io/not-ready
+            operator: Exists
+            effect: NoExecute
+  dataStore: default
+  dataStoreSchema: ${SPIKE_SCHEMA}
+  dataStoreUsername: ${SPIKE_DATASTORE_USER}

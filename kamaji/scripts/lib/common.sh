@@ -16,6 +16,13 @@ TOOLS_TMP_DIR="${TOOLS_DIR}/tmp"
 RUNTIME_DIR="${LAB_ROOT}/.runtime"
 MANAGEMENT_KUBECONFIG="${RUNTIME_DIR}/kubeconfigs/management.yaml"
 BLOCKER_FILE="${RUNTIME_DIR}/blocker"
+SPIKE_RESULT_FILE="${RUNTIME_DIR}/spike-result.env"
+SPIKE_RUNTIME_DIR="${RUNTIME_DIR}/tenants/spike"
+SPIKE_RENDERED_MANIFEST="${SPIKE_RUNTIME_DIR}/tenantcontrolplane.yaml"
+SPIKE_WORKER_OWNERSHIP_FILE="${SPIKE_RUNTIME_DIR}/worker.env"
+SPIKE_JOIN_FILE="${SPIKE_RUNTIME_DIR}/join.sh"
+SPIKE_PREFLIGHT_EVIDENCE="${SPIKE_RUNTIME_DIR}/kubeadm-preflight.log"
+SPIKE_PERSISTENCE_EVIDENCE="${SPIKE_RUNTIME_DIR}/persistence.env"
 MANAGEMENT_OWNERSHIP_FILE="${RUNTIME_DIR}/management/ownership.env"
 MANAGEMENT_NETWORK_FILE="${RUNTIME_DIR}/network/management.env"
 METALLB_RENDERED_MANIFEST="${RUNTIME_DIR}/rendered/metallb-pool.yaml"
@@ -114,6 +121,7 @@ ensure_runtime_layout() {
     "${RUNTIME_DIR}/management" \
     "${RUNTIME_DIR}/network" \
     "${RUNTIME_DIR}/rendered" \
+    "${RUNTIME_DIR}/results" \
     "${RUNTIME_DIR}/tenants"
   find "${RUNTIME_DIR}" -type d -exec chmod 0700 {} +
 }
@@ -179,6 +187,30 @@ compatibility_blocker() {
   record_blocker "${code}" "$*"
   warn "compatibility blocker ${code}: $*"
   return "${EXIT_BLOCKED}"
+}
+
+record_spike_blocker() {
+  local code="$1"
+  shift
+  case " ${COMPATIBILITY_BLOCKER_CODES} " in
+    *" ${code} "*) ;;
+    *) die "unrecognized compatibility blocker code: ${code}" ;;
+  esac
+  ensure_runtime_layout
+  {
+    printf 'owner=spike\n'
+    printf 'code=%s\n' "${code}"
+    printf 'message=%s\n' "$*"
+  } | write_secret_file "${BLOCKER_FILE}"
+  warn "compatibility blocker ${code}: $*"
+}
+
+clear_owned_spike_evidence() {
+  if [[ -f "${BLOCKER_FILE}" ]] \
+    && grep -Fxq 'owner=spike' "${BLOCKER_FILE}"; then
+    rm -f "${BLOCKER_FILE}"
+  fi
+  rm -f "${SPIKE_RESULT_FILE}"
 }
 
 owned_docker_filter() {

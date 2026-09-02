@@ -70,6 +70,31 @@ else
   printf 'management kubeconfig absent or API unreachable; no management API query attempted\n'
 fi
 
+if [[ "${scope}" == spike || "${scope}" == all ]]; then
+  printf '\n== spike management resources ==\n'
+  management_kubectl -n "${SPIKE_NAMESPACE}" get \
+    tenantcontrolplanes,deployments,pods,services,secrets,pvc -o wide 2>/dev/null || true
+  printf '\n== spike Docker resources ==\n'
+  docker ps -a --filter "$(owned_docker_filter)" \
+    --filter 'label=kamaji.cnpg-vcluster.io/tenant=spike' --format '{{json .}}'
+  docker volume ls --filter "$(owned_docker_filter)" \
+    --filter 'label=kamaji.cnpg-vcluster.io/tenant=spike' --format '{{.Name}}'
+  printf '\n== spike result evidence ==\n'
+  if [[ -f "${SPIKE_RESULT_FILE}" ]]; then
+    sed 's/^/  /' "${SPIKE_RESULT_FILE}"
+  else
+    printf 'none\n'
+  fi
+  printf '\n== spike tenant API ==\n'
+  if [[ -f "$(tenant_kubeconfig spike)" ]]; then
+    tenant_kubectl spike get nodes -o wide 2>/dev/null || true
+    tenant_kubectl spike get pods,services,pvc --all-namespaces -o wide 2>/dev/null || true
+    tenant_kubectl spike get storageclass,pv -o wide 2>/dev/null || true
+  else
+    printf 'spike kubeconfig absent; no tenant API query attempted\n'
+  fi
+fi
+
 if [[ "${scope}" == tenant-* ]]; then
   printf '\n== %s API ==\n' "${scope}"
   if [[ -f "$(tenant_kubeconfig "${scope}")" ]]; then

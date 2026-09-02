@@ -7,10 +7,11 @@ CloudNativePG databases. It uses the public Apache-2.0 Kamaji
 artifact. The edge channel is experimental; CLASTIX's stable artifact channel
 is not freely downloadable.
 
-Phase 2 adds the idempotent management-only path: one owned Kubernetes 1.36.4
-kind cluster with cert-manager 1.21.1, MetalLB 0.16.1, Kamaji 26.8.6-edge, and
-the locked three-member datastore. It creates no tenant control plane or
-worker.
+Phase 3 adds an ephemeral compatibility gate for one spike-only hosted control
+plane and worker. The gate borrows Tenant A's reserved VIP only while no final
+tenant state exists, exercises kubeadm, Calico, Konnectivity, DNS, service
+routing, and persistent local storage, then removes every spike resource on
+both pass and blocked exit.
 
 ## Prerequisites
 
@@ -45,8 +46,10 @@ extracted binary after installation.
 just tools
 just preflight
 just create-management
+just spike
+just destroy-spike
 just status
-just diagnose
+just diagnose spike
 just test-static
 ```
 
@@ -72,9 +75,36 @@ workloads, three `1Gi` datastore PVCs, and `DataStore/default`. A same-named
 kind cluster without matching local ownership evidence is refused and is
 neither adopted nor deleted.
 
+`just spike` runs this ordered ladder:
+
+1. upstream-equivalent privileged `kindest/node` kubeadm join;
+2. Kubernetes 1.36.4, systemd kubelet, and the fixed LoadBalancer VIP;
+3. Calico, CoreDNS, kube-proxy, Konnectivity, DNS, and service routing;
+4. persistent `/var/lib`, default Local Path storage, a bound PVC, Docker-cap
+   allocatable resources, and marker survival across worker recreation.
+
+The spike refuses with exit `1` before mutation if a final tenant TCP, schema
+credential, kubeconfig, worker, or volume exists. Otherwise it always removes
+its TCP, namespace, worker, volume, schema, etcd user/role, datastore Secret,
+kubeconfig, borrowed-VIP consumer, and runtime subtree. Only the healthy
+management plane and mode-`0600` result/blocker evidence remain.
+
+Kamaji 26.8.6-edge does not create the Kubernetes 1.36.4 bootstrap permission
+needed to read the named `kubeadm-config` and `kubelet-config` ConfigMaps. The
+spike adds one namespaced Role with only `get` on those two resource names and
+binds only `system:bootstrappers:kubeadm:default-node-token`; it does not grant
+general ConfigMap reads.
+
+Additional container-only bootstrap adjustments are exact:
+Konnectivity tolerates the worker's temporary `not-ready:NoSchedule` taint,
+Calico's installer receives only the fixed API VIP/port before Service routing
+exists. The live target currently blocks when nested kube-proxy tries to write
+`/proc/sys/net/netfilter/nf_conntrack_max`: Docker exposes that path read-only
+inside the pod even though both the worker and pod are privileged.
+
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and
-tenant-control-plane counts without exporting credentials or reconciling
+tenant-control-plane/spike layers without exporting credentials or reconciling
 resources.
 
 ## Security and state
@@ -91,6 +121,14 @@ machine-readable blocker record. Management creation never returns `2`;
 Phase 3 and later compatibility gates may do so only through the dedicated
 blocker path.
 
+`KUBEADM_IGNORE_PREFLIGHT_ERRORS` in `config/settings.env` is the single
+allowlist source used by the initial no-ignore attempt and any retry. Its current
+exact value is empty (`KUBEADM_IGNORE_PREFLIGHT_ERRORS=""`): no preflight
+exception is ignored unless the target 1.36.4 join first reports the exact
+container-specific error set. The join token TTL is `10m`; tokens and mode
+`0600` join files are deleted after every attempt and are never printed by
+normal commands.
+
 ## Licensing, telemetry, and support boundary
 
 Kamaji telemetry is enabled by upstream defaults. This lab installs it with
@@ -98,12 +136,13 @@ Kamaji telemetry is enabled by upstream defaults. This lab installs it with
 license credential is used.
 
 Kamaji documents regular Linux virtual machines and bare metal as workers. The
-planned privileged `kindest/node` workers are an unsupported
+privileged `kindest/node` workers are an unsupported
 container-as-machine compatibility experiment. They share one host kernel,
 Docker daemon, storage, networking, power, and failure domain. They do not
 provide hostile-tenant, kernel, hardware, or production isolation. If standard
-bootstrap cannot converge, later phases return the recognized blocked result
-instead of claiming tenant or database verification succeeded.
+bootstrap cannot converge, `just spike` returns the recognized blocked result
+with its first failing rung instead of claiming tenant or database verification
+succeeded.
 
 See [docs/high-level-design.md](docs/high-level-design.md) for the design and
 complete deterministic input chain.

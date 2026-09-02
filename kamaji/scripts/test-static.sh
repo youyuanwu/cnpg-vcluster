@@ -121,13 +121,21 @@ hostile_observer_is_rejected() (
   RUNTIME_DIR="${fixture_dir}"
   MANAGEMENT_KUBECONFIG="${fixture_dir}/missing-kubeconfig"
 
-  hostile_observer() {
+  hostile_exit_observer() {
     printf 'hostile observer output\n'
     touch "${RUNTIME_DIR}/mutated"
     return "${EXIT_BLOCKED}"
   }
 
-  ! observer_is_read_only hostile_observer
+  hostile_mutation_observer() {
+    printf 'hostile observer output\n'
+    touch "${RUNTIME_DIR}/mutated"
+    return "${EXIT_SUCCESS}"
+  }
+
+  ! observer_is_read_only hostile_exit_observer \
+    && rm -f "${RUNTIME_DIR}/mutated" \
+    && ! observer_is_read_only hostile_mutation_observer
 )
 
 cleanup_polarity_is_explicit() (
@@ -201,13 +209,13 @@ done
 
 check "complete just task surface" bash -c '
   tasks="$(just --justfile "$1" --list --unsorted)"
-  for task in tools preflight create-management spike create status diagnose verify destroy-tenant destroy test-static test-e2e; do
+  for task in tools preflight create-management spike destroy-spike create status diagnose verify destroy-tenant destroy test-static test-e2e; do
     grep -Eq "^    ${task}([[:space:]]|$)" <<<"${tasks}" || exit 1
   done
 ' _ "${LAB_ROOT}/Justfile"
 check "Kamaji has no Makefile" test ! -e "${LAB_ROOT}/Makefile"
 check "root Makefile is byte-for-byte unchanged" files_identical_to_main Makefile
-check "root README remains unchanged through Phase 2" files_identical_to_main README.md
+check "root README remains unchanged through Phase 3" files_identical_to_main README.md
 check "vcluster tree is unchanged from main" \
   git -C "${LAB_ROOT}/.." diff --quiet main -- vcluster
 check "no PAW artifact is tracked" \
@@ -317,6 +325,28 @@ check "direct manifest input checksums" bash -c '
   printf "%s  %s\n" "$CNPG_MANIFEST_SHA256" ".tools/inputs/cnpg-${CNPG_VERSION}.yaml" |
     sha256sum -c - >/dev/null
 ' _ "${LAB_ROOT}"
+check "rendered spike add-on checksums are exact" bash -c '
+  source "$1/config/versions.env"
+  printf "%s  %s\n" "$CALICO_SPIKE_RENDER_SHA256" "$1/manifests/addons/calico.yaml" |
+    sha256sum -c - >/dev/null &&
+  printf "%s  %s\n" "$LOCAL_PATH_SPIKE_RENDER_SHA256" "$1/manifests/addons/local-path.yaml" |
+    sha256sum -c - >/dev/null
+' _ "${LAB_ROOT}"
+check "Calico render uses exact spike CIDR and image pins" bash -c '
+  source "$1/config/versions.env"
+  grep -Fq "value: \"10.66.0.0/16\"" "$1/manifests/addons/calico.yaml" &&
+  grep -Fq "$CALICO_CNI_IMAGE" "$1/manifests/addons/calico.yaml" &&
+  grep -Fq "$CALICO_NODE_IMAGE" "$1/manifests/addons/calico.yaml" &&
+  grep -Fq "$CALICO_KUBE_CONTROLLERS_IMAGE" "$1/manifests/addons/calico.yaml" &&
+  ! grep -Eq "image: quay.io/calico/.+:v3.32.2$" "$1/manifests/addons/calico.yaml"
+' _ "${LAB_ROOT}"
+check "Local Path render is default, persistent, and pinned" bash -c '
+  source "$1/config/versions.env"
+  grep -Fq "storageclass.kubernetes.io/is-default-class: \"true\"" "$1/manifests/addons/local-path.yaml" &&
+  grep -Fq "\"paths\":[\"/var/lib/kamaji-local-path\"]" "$1/manifests/addons/local-path.yaml" &&
+  grep -Fq "$LOCAL_PATH_PROVISIONER_IMAGE" "$1/manifests/addons/local-path.yaml" &&
+  grep -Fq "$VERIFY_IMAGE" "$1/manifests/addons/local-path.yaml"
+' _ "${LAB_ROOT}"
 
 check "deterministic Kamaji render validates" \
   "${SCRIPT_DIR}/render-kamaji.sh" validate
@@ -347,6 +377,21 @@ check "capacity thresholds are exact" bash -c '
   [[ "$MIN_DOCKER_CPUS" == 12 &&
      "$MIN_DOCKER_MEMORY_GIB" == 24 &&
      "$MIN_DOCKER_STORAGE_GIB" == 30 ]]
+' _ "${LAB_ROOT}"
+check "spike control-plane resource split matches aggregate budget" bash -c '
+  source "$1/config/settings.env"
+  [[ "$TENANT_API_SERVER_REQUEST_CPU" == 125m &&
+     "$TENANT_CONTROLLER_MANAGER_REQUEST_CPU" == 75m &&
+     "$TENANT_SCHEDULER_REQUEST_CPU" == 50m &&
+     "$TENANT_API_SERVER_REQUEST_MEMORY" == 256Mi &&
+     "$TENANT_CONTROLLER_MANAGER_REQUEST_MEMORY" == 128Mi &&
+     "$TENANT_SCHEDULER_REQUEST_MEMORY" == 128Mi &&
+     "$TENANT_API_SERVER_LIMIT_CPU" == 500m &&
+     "$TENANT_CONTROLLER_MANAGER_LIMIT_CPU" == 300m &&
+     "$TENANT_SCHEDULER_LIMIT_CPU" == 200m &&
+     "$TENANT_API_SERVER_LIMIT_MEMORY" == 512Mi &&
+     "$TENANT_CONTROLLER_MANAGER_LIMIT_MEMORY" == 256Mi &&
+     "$TENANT_SCHEDULER_LIMIT_MEMORY" == 256Mi ]]
 ' _ "${LAB_ROOT}"
 check "CPU threshold fixture rejects before mutation" \
   capacity_fixture_rejects CPU_FIXTURE 11 cpu
@@ -399,11 +444,13 @@ check "scripts do not print kubeconfigs, tokens, or passwords" bash -c '
     "$1/scripts/status.sh" "$1/scripts/diagnose.sh"
 ' _ "${LAB_ROOT}"
 
-check "only compatibility_blocker can return blocked status" bash -c '
+check "only recognized spike paths can return blocked status" bash -c '
   refs="$(grep -R -l "EXIT_BLOCKED" "$1/scripts" --include="*.sh" --exclude=test-static.sh)"
-  [[ "$refs" == "$1/scripts/lib/common.sh" ]] &&
+  [[ "$(printf "%s\n" "$refs" | sort)" == "$(printf "%s\n" "$1/scripts/create-spike.sh" "$1/scripts/lib/common.sh" | sort)" ]] &&
   grep -A12 "^compatibility_blocker()" "$1/scripts/lib/common.sh" |
-    grep -Fq "return \"\${EXIT_BLOCKED}\""
+    grep -Fq "return \"\${EXIT_BLOCKED}\"" &&
+  grep -Fq "return \"\${EXIT_BLOCKED}\"" "$1/scripts/create-spike.sh" &&
+  grep -Fq "record_spike_blocker" "$1/scripts/create-spike.sh"
 ' _ "${LAB_ROOT}"
 check "unimplemented normal path returns 1, never 2" \
   command_returns_one "${SCRIPT_DIR}/unavailable.sh" create "later phase"
@@ -413,6 +460,94 @@ check "diagnostics is read-only and never returns blocker status" \
   observer_is_read_only "${SCRIPT_DIR}/diagnose.sh" all
 check "hostile exit-2 mutating observer is rejected" \
   hostile_observer_is_rejected
+
+check "spike TCP is isolated, explicit, and target-versioned" bash -c '
+  source "$1/config/settings.env"
+  source "$1/config/versions.env"
+  tcp="$1/config/tenants/spike.yaml"
+  grep -Fq "name: \${SPIKE_NAME}" "$tcp" &&
+  grep -Fq "namespace: \${SPIKE_NAMESPACE}" "$tcp" &&
+  grep -Fq "replicas: 1" "$tcp" &&
+  grep -Fq "version: \${KUBERNETES_VERSION}" "$tcp" &&
+  grep -Fq "dataStoreSchema: \${SPIKE_SCHEMA}" "$tcp" &&
+  grep -Fq "op: add" "$tcp" &&
+  grep -Fq "path: /cgroupDriver" "$tcp" &&
+  grep -Fq "value: systemd" "$tcp" &&
+  grep -Fq "coreDNS: {}" "$tcp" &&
+  grep -Fq "kubeProxy: {}" "$tcp" &&
+  grep -Fq "hostNetwork: true" "$tcp" &&
+  grep -A3 -F "effect: NoSchedule" "$tcp" | grep -Fq "NoSchedule" &&
+  grep -Fq "version: \${KONNECTIVITY_AGENT_VERSION_DIGEST}" "$tcp" &&
+  grep -Fq "version: \${KONNECTIVITY_SERVER_VERSION_DIGEST}" "$tcp"
+' _ "${LAB_ROOT}"
+check "spike CIDRs are explicit and non-overlapping" bash -c '
+  source "$1/config/settings.env"
+  python3 - "$MANAGEMENT_POD_CIDR" "$MANAGEMENT_SERVICE_CIDR" \
+    "$TENANT_A_POD_CIDR" "$TENANT_A_SERVICE_CIDR" \
+    "$TENANT_B_POD_CIDR" "$TENANT_B_SERVICE_CIDR" \
+    "$SPIKE_POD_CIDR" "$SPIKE_SERVICE_CIDR" <<'"'"'PY'"'"'
+import ipaddress,sys
+nets=[ipaddress.ip_network(v) for v in sys.argv[1:]]
+assert all(not a.overlaps(b) for i,a in enumerate(nets) for b in nets[i+1:])
+PY
+' _ "${LAB_ROOT}"
+check "kubeadm allowlist has one settings source and exact consumers" bash -c '
+  [[ "$(grep -R -h "^: .*KUBEADM_IGNORE_PREFLIGHT_ERRORS" "$1/config" | wc -l)" -eq 1 ]] &&
+  grep -Fq -- '\''--ignore-preflight-errors=${KUBEADM_IGNORE_PREFLIGHT_ERRORS}'\'' "$1/scripts/lib/workers.sh" &&
+  grep -Fq "KUBEADM_IGNORE_PREFLIGHT_ERRORS" "$1/README.md" &&
+  grep -Fq "KUBEADM_IGNORE_PREFLIGHT_ERRORS" "$1/docs/high-level-design.md"
+' _ "${LAB_ROOT}"
+check "spike entrypoint implements ordered compatibility ladder" bash -c '
+  mapfile -t lines < <(grep -n "^current_rung=" "$1/scripts/create-spike.sh" | cut -d: -f1)
+  [[ "${#lines[@]}" -eq 7 ]] &&
+  (( lines[0] < lines[1] && lines[1] < lines[2] && lines[2] < lines[3] && lines[3] < lines[4] && lines[4] < lines[5] && lines[5] < lines[6] )) &&
+  grep -Fq "upstream-equivalent-join" "$1/scripts/create-spike.sh" &&
+  grep -Fq "target-systemd-fixed-vip" "$1/scripts/create-spike.sh" &&
+  grep -Fq "cni-konnectivity" "$1/scripts/create-spike.sh" &&
+  grep -Fq "persistent-worker-storage" "$1/scripts/create-spike.sh"
+' _ "${LAB_ROOT}"
+check "spike always cleans exact ephemeral resources" bash -c '
+  grep -Fq "trap finish_spike EXIT" "$1/scripts/create-spike.sh" &&
+  for action in delete_spike_storage_smoke delete_spike_node remove_spike_worker_and_volume delete_spike_tenant; do
+    grep -Fq "$action" "$1/scripts/destroy-spike.sh" || exit 1
+  done &&
+  grep -Fq "rm -rf \"\${SPIKE_RUNTIME_DIR}\"" "$1/scripts/destroy-spike.sh"
+' _ "${LAB_ROOT}"
+check "final-state refusal precedes spike evidence clearing and mutation" bash -c '
+  refusal="$(grep -n "^refuse_spike_with_final_state$" "$1/scripts/create-spike.sh" | cut -d: -f1)"
+  clear="$(grep -n "^clear_owned_spike_evidence$" "$1/scripts/create-spike.sh" | cut -d: -f1)"
+  trap_line="$(grep -n "^trap finish_spike EXIT$" "$1/scripts/create-spike.sh" | cut -d: -f1)"
+  management="$(grep -n "^reconcile_management_plane$" "$1/scripts/create-spike.sh" | cut -d: -f1)"
+  [[ -n "$refusal" && -n "$clear" && -n "$trap_line" && -n "$management" ]] &&
+  (( refusal < clear && clear < trap_line && trap_line < management ))
+' _ "${LAB_ROOT}"
+check "spike token and join material are short-lived and secret" bash -c '
+  grep -Fq "token create --ttl \"\${KUBEADM_TOKEN_TTL}\"" "$1/scripts/lib/workers.sh" &&
+  grep -Fq "token delete" "$1/scripts/lib/workers.sh" &&
+  grep -Fq "chmod 0600" "$1/scripts/lib/workers.sh" &&
+  grep -Fq "remove_worker_join_material" "$1/scripts/lib/workers.sh" &&
+  ! grep -Eq "(log|echo).*(join_command|token_id)" "$1/scripts/lib/workers.sh"
+' _ "${LAB_ROOT}"
+check "target bootstrap RBAC patch is resource-name scoped" bash -c '
+  grep -Fq "resourceNames: [kubeadm-config, kubelet-config]" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "verbs: [get]" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "system:bootstrappers:kubeadm:default-node-token" "$1/scripts/lib/tenants.sh" &&
+  ! grep -A8 "name: kubeadm:bootstrap-config-reader" "$1/scripts/lib/tenants.sh" |
+    grep -Eq "verbs:.*(list|watch|\\*)"
+' _ "${LAB_ROOT}"
+check "container network bootstrap patches are narrow" bash -c '
+  grep -Fq "name: kubernetes-services-endpoint" "$1/scripts/lib/addons.sh" &&
+  grep -Fq "KUBERNETES_SERVICE_HOST" "$1/scripts/lib/addons.sh" &&
+  grep -Fq "open /proc/sys/net/netfilter/nf_conntrack_max: permission denied" "$1/scripts/lib/addons.sh" &&
+  grep -Fq "effect: NoSchedule" "$1/config/tenants/spike.yaml"
+' _ "${LAB_ROOT}"
+check "spike datastore cleanup is exact and health-gated" bash -c '
+  grep -Fq '\''del "/${SPIKE_SCHEMA}/" --prefix'\'' "$1/scripts/lib/tenants.sh" &&
+  grep -Fq '\''user delete "${SPIKE_DATASTORE_USER}"'\'' "$1/scripts/lib/tenants.sh" &&
+  grep -Fq '\''role delete "${SPIKE_SCHEMA}"'\'' "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "DataStore/default became unhealthy" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "status.usedBy" "$1/scripts/lib/tenants.sh"
+' _ "${LAB_ROOT}"
 
 check "management values disable telemetry" \
   has_text '^  disabled: true$' "${LAB_ROOT}/config/kamaji-values.yaml"
@@ -507,4 +642,4 @@ if (( failures > 0 )); then
   die "${failures} static check(s) failed"
 fi
 
-log "all ${checks} Phase 2 static checks passed"
+log "all ${checks} Phase 3 static checks passed"

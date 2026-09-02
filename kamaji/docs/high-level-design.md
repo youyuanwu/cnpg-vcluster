@@ -3,10 +3,9 @@
 ## Status and purpose
 
 The lab is a development experiment built from the public Kamaji
-26.8.6-edge source release. Phase 2 implements its management plane: one
-explicitly owned kind cluster, deterministic Docker-subnet VIP allocation,
-cert-manager, MetalLB, Kamaji, and a three-member shared datastore. Tenant
-control planes and workers remain absent until later phases.
+26.8.6-edge source release. Phase 3 retains the healthy management plane and
+adds a fully ephemeral one-control-plane/one-worker compatibility gate for the
+unsupported container worker substrate.
 
 The intended completed topology is one Kubernetes 1.36.4 kind management
 cluster hosting cert-manager, MetalLB, Kamaji, a shared three-member datastore,
@@ -55,6 +54,13 @@ datastore, datastore bootstrap kubectl, and datastore bootstrap etcd images
 with approved OCI digest references. The renderer emits a deterministic
 transitive image inventory and fails unless every rendered image is
 digest-pinned and no `latest` reference remains.
+
+The tracked spike add-on manifests are deterministic transforms of the
+checksum-verified Calico 3.32.2 and Local Path Provisioner 0.0.37 inputs.
+Calico selects `10.66.0.0/16` and digest-pins its CNI, node, and controller
+images. Local Path is the sole default StorageClass, stores data below
+`/var/lib/kamaji-local-path`, and digest-pins both provisioner and helper
+images. Their rendered checksums are recorded in `config/versions.env`.
 
 The directly selected etcd server image comes from
 `kamaji-etcd` 0.15.0 `values.image`; the shell-capable etcd setup image comes
@@ -158,17 +164,67 @@ They also share its daemon, physical storage, networking, power, and failure
 domain. A privileged worker can affect the host and other workers, so this
 topology is not a hostile-tenant or production security boundary.
 
-Later work must first prove one ephemeral worker with standard kubeadm,
-Konnectivity, Calico, and persistent local storage. No kubeadm preflight
-exception is selected in Phase 1. If that ladder fails because the container
-substrate cannot meet a recognized prerequisite, the lab records a blocker,
-returns `2`, cleans tenant resources, and makes no readiness or isolation
-claim.
+The spike has distinct namespace, TCP, schema/user, worker, volume, kubeconfig,
+and runtime identities. It borrows the persisted Tenant A VIP only after
+proving that no final tenant TCP, schema credential, kubeconfig, worker, or
+volume exists. Refusal occurs before blocker clearing or management
+reconciliation, so controlled or real final state is preserved.
 
-Phase 3 must set both `KONNECTIVITY_AGENT_IMAGE` and
-`KONNECTIVITY_SERVER_IMAGE` explicitly on every rendered
-`TenantControlPlane`; the CRD's untagged schema defaults are not acceptable
-runtime image selections.
+The compatibility ladder is deliberately ordered:
+
+1. the upstream-equivalent privileged `kindest/node` join shape;
+2. target Kubernetes 1.36.4, systemd kubelet configuration, fixed VIP, Docker
+   CPU/memory caps, and persistent `/var/lib`;
+3. Calico plus Kamaji-managed CoreDNS, kube-proxy, and Konnectivity, including
+   worker access to ports 6443/8132 and pod DNS/service routing;
+4. one default Local Path class, a bound PVC, allocatable resource validation,
+   and a marker read after recreating the worker with its owned volume.
+
+The first 1.36.4 attempt proved an edge-release RBAC gap before kubeadm
+preflight: the bootstrap identity could not read `kubelet-config`. The narrow
+compatibility patch is a namespaced Role limited to `get` on the named
+`kubeadm-config` and `kubelet-config` ConfigMaps, bound only to
+`system:bootstrappers:kubeadm:default-node-token`. It does not use an ignored
+preflight error or grant list/watch access.
+
+The same investigation proved that Kubernetes 1.36.4's generated
+`KubeletConfiguration` omits `cgroupDriver` before customization. The explicit
+RFC 6902 operation is therefore the narrow `add /cgroupDriver = systemd`
+rather than the upstream sample's `replace`, which fails when the key is
+absent.
+
+The CNI rung also records three container-only bootstrap facts. Konnectivity
+needs an explicit `not-ready:NoSchedule` toleration before CNI makes the node
+Ready. Calico's installer cannot use the Service VIP before kube-proxy works,
+so its documented `kubernetes-services-endpoint` ConfigMap points only to the
+fixed control-plane VIP and port. Finally, kube-proxy must update
+`nf_conntrack_max`, but Docker exposes that exact path read-only even in the
+privileged nested pod. The generated kube-proxy ConfigMap and DaemonSet remain
+entirely Kamaji-owned, so the gate records this exact substrate prerequisite
+instead of broadly disabling conntrack setup.
+
+The TCP explicitly selects digest-pinned `KONNECTIVITY_AGENT_IMAGE` and
+`KONNECTIVITY_SERVER_IMAGE` by splitting each valid `tag@digest` reference
+between the CRD's image and version fields. `hostNetwork: true` gives the agent
+an out-of-band bootstrap path before Calico converges.
+
+`KUBEADM_IGNORE_PREFLIGHT_ERRORS` in `config/settings.env` is the only
+preflight exception source. Its current exact value is empty
+(`KUBEADM_IGNORE_PREFLIGHT_ERRORS=""`). Every join first executes a target
+attempt without ignores, extracts the exact `[ERROR ...]` identifiers, and
+continues only when that set exactly equals the configured allowlist. Unknown,
+broader, or invented ignores block the kubeadm rung; an allowed retry first
+runs a scoped `kubeadm reset`. The short-lived token TTL
+is `10m`; token and join files are removed after each attempt.
+
+The exit trap always deletes smoke storage, node, worker, owned volume, TCP,
+namespace, kubeconfig, and spike runtime subtree. TCP finalization is verified
+against the exact `/${SPIKE_SCHEMA}/` etcd prefix, exact user and role,
+credential Secret, and `DataStore.status.usedBy`. If Kamaji leaves any identity,
+a digest-pinned etcd maintenance Pod mounts only the datastore client
+certificate and performs exact prefix/user/role deletion before rechecking
+`DataStore/default` health. Only result/blocker evidence and the healthy
+management plane remain.
 
 ## Version summary
 

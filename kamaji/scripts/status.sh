@@ -158,4 +158,27 @@ datastore_ready="$(management_kubectl get datastore default -o jsonpath='{.statu
 printf 'TenantControlPlanes: %s\n' \
   "$(management_kubectl get tenantcontrolplanes.kamaji.clastix.io --all-namespaces --no-headers 2>/dev/null | wc -l)"
 
+section "worker compatibility spike"
+if [[ -f "${SPIKE_RESULT_FILE}" ]]; then
+  sed 's/^/  /' "${SPIKE_RESULT_FILE}"
+else
+  printf '  result evidence: absent\n'
+fi
+spike_tcp_count="$(
+  { management_kubectl -n "${SPIKE_NAMESPACE}" get \
+      tenantcontrolplane "${SPIKE_NAME}" --no-headers 2>/dev/null || true; } | wc -l
+)"
+spike_worker_count="$(docker ps -aq --filter "$(owned_docker_filter)" \
+  --filter 'label=kamaji.cnpg-vcluster.io/tenant=spike' | wc -l)"
+spike_volume_count="$(docker volume ls -q --filter "$(owned_docker_filter)" \
+  --filter 'label=kamaji.cnpg-vcluster.io/tenant=spike' | wc -l)"
+printf '  residual TCPs: %s\n' "${spike_tcp_count}"
+printf '  residual workers: %s\n' "${spike_worker_count}"
+printf '  residual volumes: %s\n' "${spike_volume_count}"
+[[ "${spike_tcp_count}" -eq 0 ]] || unhealthy "spike TenantControlPlane remains"
+[[ "${spike_worker_count}" -eq 0 ]] || unhealthy "spike worker remains"
+[[ "${spike_volume_count}" -eq 0 ]] || unhealthy "spike worker volume remains"
+[[ ! -e "$(tenant_kubeconfig spike)" ]] || unhealthy "spike kubeconfig remains"
+[[ ! -e "${SPIKE_RUNTIME_DIR}" ]] || unhealthy "spike runtime subtree remains"
+
 exit "${health}"

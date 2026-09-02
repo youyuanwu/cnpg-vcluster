@@ -15,9 +15,13 @@ preflight:
 create-management:
     @scripts/create-management.sh
 
-# Run the ephemeral worker compatibility gate (implemented in Phase 3).
+# Run the ephemeral worker compatibility gate and always remove spike state.
 spike:
-    @scripts/unavailable.sh spike "Phase 3"
+    @scripts/create-spike.sh
+
+# Remove only residual compatibility-spike resources.
+destroy-spike:
+    @scripts/destroy-spike.sh
 
 # Reconcile the complete lab (implemented in later phases).
 create:
