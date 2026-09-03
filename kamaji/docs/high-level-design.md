@@ -171,8 +171,7 @@ Preflight orders no-mutation checks before the short-lived privileged probe:
 8. a bounded, automatically removed privileged cgroup-v2 probe.
 
 Every mutating create or repair entry point runs this full preflight.
-`KAMAJI_TEST_SKIP_PREFLIGHT=1` is a narrowly test-only seam for a fixture that
-already completed the same checks.
+No environment variable bypasses the admission gate.
 
 `MIN_DOCKER_CPUS`, `MIN_DOCKER_MEMORY_GIB`, `MIN_DOCKER_STORAGE_GIB`,
 `MIN_INOTIFY_INSTANCES`, and `MIN_INOTIFY_WATCHES` are
@@ -357,10 +356,13 @@ each cluster across its three exclusive workers; each instance requests
 `100m/256Mi`, is limited to `1 CPU/1Gi`, and owns a tenant-local `1Gi` claim.
 Node capacity still reflects the shared host, so
 the enforced capacity contract computes each non-terminal Pod's effective
-request as `max(sum(app containers), max(init containers)) + pod overhead`
-for CPU and memory, then compares the node total with each
-`1.25` CPU/`2560MiB` Docker cap. Verification clients have explicit
-`25m/32Mi` requests and `100m/128Mi` limits.
+request using Kubernetes 1.36 native-sidecar semantics. It compares the
+steady-state sum of application containers plus restartable init containers
+(`restartPolicy: Always`) with each regular init container plus the
+restartable init containers that precede it, selects the maximum, and adds Pod
+overhead. The node total is then compared with each `1.25` CPU/`2560MiB`
+Docker cap. Verification clients have explicit `25m/32Mi` requests and
+`100m/128Mi` limits.
 
 The behavioral verifier proves that the management API owns only the hosted
 control planes and none of either tenant's CNPG or database resources. For
@@ -451,7 +453,10 @@ objects carrying the lab label fail closed rather than being swept.
 owned TCP. It refuses absent or unowned state, restores reconciliation,
 reapplies the pause/kube-proxy workaround, reconciles that tenant's workers,
 add-ons, and CNPG resources, and requires any existing database marker to
-survive.
+survive. The lifecycle suite removes the remediation revision and changes the
+owned kube-proxy configuration, then proves repair restores the Ready paused
+state without replacing worker, CNPG Cluster, PVC, or PV identities or either
+tenant's marker.
 
 If `.runtime` ownership or network evidence is lost while resources remain,
 teardown refuses to adopt or delete them. Recovery is deliberately manual:
@@ -472,7 +477,11 @@ healthy states without reconciliation: tools, Docker, management Kubernetes,
 Kamaji/datastore, TCPs and endpoints, workers, add-ons, storage, CNPG
 operators, and PostgreSQL clusters. Ordinary failures and unhealthy observers
 return `1`; `2` is exclusive to a recognized compatibility blocker with
-persisted evidence and successful cleanup.
+persisted evidence and successful cleanup. `verify` accepts a blocked outcome
+only when the compatibility revision is current, code and nonempty evidence
+match the final blocker record, cleanup is proved, and live state contains a
+healthy management plane with no final TCPs, workers, worker volumes, tenant
+namespaces, or tenant runtime trees.
 
 ## Upstream references
 

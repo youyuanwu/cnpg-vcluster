@@ -94,6 +94,27 @@ cluster_identities() {
   done
 }
 
+storage_identities() {
+  local tenant
+  for tenant in ${TENANT_NAMES}; do
+    tenant_kubectl "${tenant}" get pvc,pv --all-namespaces -o json \
+      | TENANT="${tenant}" python3 -c '
+import json, os, sys
+for item in json.load(sys.stdin).get("items", []):
+    metadata=item.get("metadata", {})
+    spec=item.get("spec", {})
+    print(
+        os.environ["TENANT"],
+        item.get("kind", ""),
+        metadata.get("namespace", ""),
+        metadata.get("name", ""),
+        metadata.get("uid", ""),
+        spec.get("volumeName", ""),
+    )
+'
+  done | sort
+}
+
 marker_value() {
   local tenant="$1"
   cnpg_run_sql "${tenant}" \
@@ -140,7 +161,7 @@ print("\n".join(sorted(
 }
 
 assert_effective_request_fixtures() {
-  local fixture
+  local fixture sidecar_fixture
   fixture='{"items":[{"spec":{"containers":[{"resources":{"requests":{"cpu":"50m","memory":"32Mi"}}}],"initContainers":[{"resources":{"requests":{"cpu":"900m","memory":"700Mi"}}}],"overhead":{"cpu":"50m","memory":"100Mi"}},"status":{"phase":"Running"}}]}'
   printf '%s\n' "${fixture}" \
     | CPU_CAP=1000000000 MEMORY_CAP=838860800 \
@@ -150,6 +171,16 @@ assert_effective_request_fixtures() {
       python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1
   ! printf '%s\n' "${fixture}" \
     | CPU_CAP=1000000000 MEMORY_CAP=838860799 \
+      python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1
+  sidecar_fixture='{"items":[{"spec":{"containers":[{"resources":{"requests":{"cpu":"100m","memory":"64Mi"}}}],"initContainers":[{"name":"sidecar","restartPolicy":"Always","resources":{"requests":{"cpu":"200m","memory":"128Mi"}}},{"name":"setup","resources":{"requests":{"cpu":"500m","memory":"512Mi"}}}],"overhead":{"cpu":"50m","memory":"64Mi"}},"status":{"phase":"Running"}}]}'
+  printf '%s\n' "${sidecar_fixture}" \
+    | CPU_CAP=750000000 MEMORY_CAP=738197504 \
+      python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null
+  ! printf '%s\n' "${sidecar_fixture}" \
+    | CPU_CAP=749999999 MEMORY_CAP=738197504 \
+      python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1
+  ! printf '%s\n' "${sidecar_fixture}" \
+    | CPU_CAP=750000000 MEMORY_CAP=738197503 \
       python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1
 }
 
@@ -216,6 +247,117 @@ cleanup_sentinels() {
     kind delete cluster --name "${SENTINEL_CLUSTER}" \
     --kubeconfig "${SENTINEL_KUBECONFIG}" >/dev/null 2>&1 || true
   rm -f "${SENTINEL_KUBECONFIG}"
+}
+
+finish_e2e() {
+  local status=$?
+  trap - EXIT
+  set +e
+  printf 'E2E_EXIT=%s\n' "${status}" >>"${RESULT_LOG}"
+  if (( status != 0 )); then
+    "${SCRIPT_DIR}/destroy.sh" >>"${RESULT_LOG}" 2>&1 || true
+    "${SCRIPT_DIR}/destroy.sh" >>"${RESULT_LOG}" 2>&1 || true
+  fi
+  cleanup_sentinels
+  exit "${status}"
+}
+
+write_blocked_result_fixture() {
+  local revision="$1"
+  local code="$2"
+  local evidence="$3"
+  local cleanup="${4:-proved}"
+  {
+    printf 'result=blocked\n'
+    printf 'compatibility_revision=%s\n' "${revision}"
+    printf 'first_failing_prerequisite=tenant-a-workers\n'
+    printf 'blocker_code=%s\n' "${code}"
+    printf 'blocker_evidence=%s\n' "${evidence}"
+    printf 'cleanup=%s\n' "${cleanup}"
+    printf 'final_tenants=absent\n'
+    printf 'final_workers=absent\n'
+    printf 'final_volumes=absent\n'
+    printf 'final_runtime=absent\n'
+  } | write_secret_file "${FINAL_RESULT_FILE}"
+  {
+    printf 'owner=final\n'
+    printf 'code=%s\n' "${code}"
+    printf 'prerequisite=tenant-a-workers\n'
+    printf 'message=%s\n' "${evidence}"
+  } | write_secret_file "${BLOCKER_FILE}"
+}
+
+assert_verify_rejects_blocked_record() {
+  local description="$1"
+  local output status
+  set +e
+  output="$("${SCRIPT_DIR}/verify.sh" 2>&1)"
+  status=$?
+  set -e
+  printf '%s\n' "${output}" >>"${RESULT_LOG}"
+  [[ "${status}" -eq "${EXIT_ERROR}" ]] \
+    || die "${description} blocker record returned ${status}, expected exit 1"
+}
+
+assert_blocker_record_validation() {
+  local saved_result="${CACHE_DIR}/e2e-saved-final-result.env"
+  cp "${FINAL_RESULT_FILE}" "${saved_result}"
+
+  write_blocked_result_fixture stale-revision worker-substrate \
+    "recognized fixture evidence"
+  assert_verify_rejects_blocked_record stale-revision
+
+  write_blocked_result_fixture "${COMPATIBILITY_REVISION}" worker-substrate \
+    "recognized fixture evidence"
+  sed -i '/^blocker_evidence=/d' "${FINAL_RESULT_FILE}"
+  assert_verify_rejects_blocked_record truncated
+
+  write_blocked_result_fixture "${COMPATIBILITY_REVISION}" worker-substrate \
+    "recognized fixture evidence"
+  sed -i 's/^code=.*/code=kubeadm-bootstrap/' "${BLOCKER_FILE}"
+  assert_verify_rejects_blocked_record mismatched
+
+  write_blocked_result_fixture "${COMPATIBILITY_REVISION}" worker-substrate none
+  assert_verify_rejects_blocked_record missing-evidence
+
+  write_blocked_result_fixture "${COMPATIBILITY_REVISION}" worker-substrate \
+    "recognized fixture evidence" failed
+  assert_verify_rejects_blocked_record missing-cleanup
+
+  write_blocked_result_fixture "${COMPATIBILITY_REVISION}" worker-substrate \
+    "recognized fixture evidence"
+  assert_verify_rejects_blocked_record residual-resource
+
+  cp "${saved_result}" "${FINAL_RESULT_FILE}"
+  rm -f "${saved_result}" "${BLOCKER_FILE}"
+}
+
+inject_tenant_remediation_drift() {
+  local tenant="$1"
+  local manifest="${CACHE_DIR}/${tenant}-kube-proxy-drift.json"
+  management_kubectl -n "$(tenant_namespace "${tenant}")" \
+    annotate "$(tenant_tcp_ref "${tenant}")" \
+    kamaji.cnpg-vcluster.io/kube-proxy-remediation- >/dev/null
+  tenant_kubectl "${tenant}" -n kube-system get configmap kube-proxy -o json \
+    >"${manifest}"
+  KUBE_PROXY_MANIFEST="${manifest}" python3 -c '
+import json, os, re
+path=os.environ["KUBE_PROXY_MANIFEST"]
+data=json.load(open(path, encoding="utf-8"))
+config, count=re.subn(r"(?m)^  maxPerCore:.*$", "  maxPerCore: 1",
+                      data["data"]["config.conf"])
+assert count == 1
+data["data"]["config.conf"]=config
+metadata=data["metadata"]
+for key in ("managedFields", "resourceVersion", "uid", "creationTimestamp"):
+    metadata.pop(key, None)
+data.pop("status", None)
+open(path, "w", encoding="utf-8").write(json.dumps(data))
+'
+  tenant_kubectl "${tenant}" replace -f "${manifest}" >/dev/null
+  rm -f "${manifest}"
+  ! tenant_kube_proxy_steady_state_is_preserved "${tenant}" \
+    || die "${tenant} remediation drift fixture did not create drift"
 }
 
 recognized_blocker_cleanup() {
@@ -295,6 +437,7 @@ test_unowned_refusals() {
   output="$("${SCRIPT_DIR}/destroy.sh" 2>&1)"
   status=$?
   set -e
+  printf '%s\n' "${output}" >>"${RESULT_LOG}"
   [[ "${status}" -eq "${EXIT_ERROR}" \
     && -n "$(docker container inspect "${name}" 2>/dev/null)" ]] \
     || die "owned worker without a record was not refused and preserved"
@@ -310,6 +453,7 @@ test_unowned_refusals() {
   output="$("${SCRIPT_DIR}/destroy.sh" 2>&1)"
   status=$?
   set -e
+  printf '%s\n' "${output}" >>"${RESULT_LOG}"
   [[ "${status}" -eq "${EXIT_ERROR}" \
     && -n "$(docker container inspect "${name}" 2>/dev/null)" ]] \
     || die "mismatched worker record was not refused and preserved"
@@ -325,6 +469,7 @@ test_unowned_refusals() {
   output="$("${SCRIPT_DIR}/destroy.sh" 2>&1)"
   status=$?
   set -e
+  printf '%s\n' "${output}" >>"${RESULT_LOG}"
   [[ "${status}" -eq "${EXIT_ERROR}" ]] \
     && docker container inspect "${LAB_PREFIX}-unexpected-owned-sentinel" >/dev/null \
     || die "unexpected ownership-labelled sentinel was swept"
@@ -335,6 +480,7 @@ require_exact_just
 ensure_tools_layout
 : >"${RESULT_LOG}"
 chmod 0600 "${RESULT_LOG}"
+trap finish_e2e EXIT
 run_logged "${SCRIPT_DIR}/tools.sh"
 run_logged "${SCRIPT_DIR}/destroy.sh"
 run_logged "${SCRIPT_DIR}/destroy.sh"
@@ -342,7 +488,6 @@ run_logged "${SCRIPT_DIR}/destroy.sh"
 mkdir -p -m 0700 "${CACHE_DIR}"
 : >"${RESULT_LOG}"
 chmod 0600 "${RESULT_LOG}"
-trap cleanup_sentinels EXIT
 
 docker run -d --name "${SENTINEL_CONTAINER}" "${VERIFY_IMAGE}" sleep 3600 >/dev/null
 docker volume create "${SENTINEL_VOLUME}" >/dev/null
@@ -403,6 +548,7 @@ done
 seed_markers
 worker_before="$(worker_identities)"
 clusters_before="$(cluster_identities)"
+storage_before="$(storage_identities)"
 marker_a_before="$(marker_value tenant-a)"
 marker_b_before="$(marker_value tenant-b)"
 run_logged "${SCRIPT_DIR}/create.sh"
@@ -410,9 +556,74 @@ run_logged "${SCRIPT_DIR}/create.sh"
   || die "repeat create replaced a healthy worker"
 [[ "$(cluster_identities)" == "${clusters_before}" ]] \
   || die "repeat create replaced a CNPG Cluster"
+[[ "$(storage_identities)" == "${storage_before}" ]] \
+  || die "repeat create replaced a PVC or PV"
 [[ "$(marker_value tenant-a)" == "${marker_a_before}" \
   && "$(marker_value tenant-b)" == "${marker_b_before}" ]] \
   || die "repeat create changed a database marker"
+
+rm -f "${MANAGEMENT_KUBECONFIG}" "${BLOCKER_FILE}"
+set +e
+env KAMAJI_TEST_INJECT_RECOGNIZED_WORKER_FAILURE=tenant-a \
+  "${SCRIPT_DIR}/create.sh" >>"${RESULT_LOG}" 2>&1
+captured_blocker_status=$?
+set -e
+[[ "${captured_blocker_status}" -eq "${EXIT_ERROR}" ]] \
+  || die "recognized blocker after management kubeconfig loss returned ${captured_blocker_status}, expected exit 1"
+[[ -f "${MANAGEMENT_KUBECONFIG}" \
+  && "$(stat -c '%a' "${MANAGEMENT_KUBECONFIG}")" == 600 ]] \
+  || die "management kubeconfig was not securely re-exported before tenant capture"
+[[ ! -e "${BLOCKER_FILE}" \
+  && "$(worker_identities)" == "${worker_before}" \
+  && "$(cluster_identities)" == "${clusters_before}" \
+  && "$(storage_identities)" == "${storage_before}" \
+  && "$(marker_value tenant-a)" == "${marker_a_before}" \
+  && "$(marker_value tenant-b)" == "${marker_b_before}" \
+  && "$(docker ps -aq --filter "$(owned_docker_filter)" \
+    --filter 'label=kamaji.cnpg-vcluster.io/role=worker' | wc -l)" -eq 6 ]] \
+  || die "fail-closed tenant capture did not preserve both tenants, PVCs, markers, and six workers"
+grep -Fxq 'result=error' "${FINAL_RESULT_FILE}" \
+  && grep -Fxq 'cleanup=not-attempted' "${FINAL_RESULT_FILE}" \
+  && grep -Fq 'retained_tenants=tenant-a tenant-b' "${FINAL_RESULT_FILE}" \
+  || die "captured recognized blocker did not record truthful retained state"
+run_logged "${SCRIPT_DIR}/create.sh"
+
+repair_workers_before="$(worker_identities)"
+repair_clusters_before="$(cluster_identities)"
+repair_storage_before="$(storage_identities)"
+repair_marker_a_before="$(marker_value tenant-a)"
+repair_marker_b_before="$(marker_value tenant-b)"
+management_kubectl -n "$(tenant_namespace tenant-a)" \
+  label "$(tenant_tcp_ref tenant-a)" "${OWNERSHIP_LABEL}-" >/dev/null
+set +e
+"${SCRIPT_DIR}/repair-tenant.sh" tenant-a >>"${RESULT_LOG}" 2>&1
+repair_refusal_status=$?
+set -e
+[[ "${repair_refusal_status}" -eq "${EXIT_ERROR}" ]] \
+  || die "repair did not refuse a TCP without exact ownership"
+[[ "$(worker_identities)" == "${repair_workers_before}" \
+  && "$(cluster_identities)" == "${repair_clusters_before}" \
+  && "$(storage_identities)" == "${repair_storage_before}" \
+  && "$(marker_value tenant-a)" == "${repair_marker_a_before}" \
+  && "$(marker_value tenant-b)" == "${repair_marker_b_before}" ]] \
+  || die "ownership-gated repair refusal changed healthy identities or data"
+management_kubectl -n "$(tenant_namespace tenant-a)" \
+  label "$(tenant_tcp_ref tenant-a)" \
+  "${OWNERSHIP_LABEL}=${LAB_PREFIX}" --overwrite >/dev/null
+inject_tenant_remediation_drift tenant-a
+run_logged "${SCRIPT_DIR}/repair-tenant.sh" tenant-a
+load_management_network
+tenant_kube_proxy_steady_state_is_preserved tenant-a \
+  && final_tenant_tcp_ready tenant-a \
+  && tenant_workers_ready tenant-a \
+  && cnpg_tenant_ready tenant-a \
+  || die "repair did not restore the Ready paused remediation state"
+[[ "$(worker_identities)" == "${repair_workers_before}" \
+  && "$(cluster_identities)" == "${repair_clusters_before}" \
+  && "$(storage_identities)" == "${repair_storage_before}" \
+  && "$(marker_value tenant-a)" == "${repair_marker_a_before}" \
+  && "$(marker_value tenant-b)" == "${repair_marker_b_before}" ]] \
+  || die "repair replaced a worker, CNPG Cluster, PVC/PV, or marker"
 
 rm -f "${BLOCKER_FILE}"
 set +e
@@ -573,6 +784,7 @@ for tenant in ${TENANT_NAMES}; do
     cnpg_tenant_ready "${tenant}" \
     || die "${tenant} did not settle before verification"
 done
+assert_blocker_record_validation
 set +e
 env KAMAJI_TEST_FAIL_AFTER_CROSS_AUTH_SECRET=tenant-a \
   "${SCRIPT_DIR}/verify.sh" >>"${RESULT_LOG}" 2>&1
@@ -600,6 +812,19 @@ assert_observer_read_only "${CACHE_DIR}/e2e-one-tenant-status.log" \
 assert_observer_read_only "${CACHE_DIR}/e2e-one-tenant-diagnose.log" \
   "${EXIT_ERROR}" "${SCRIPT_DIR}/diagnose.sh" all
 
+run_logged "${SCRIPT_DIR}/destroy-tenant.sh" tenant-b
+write_blocked_result_fixture "${COMPATIBILITY_REVISION}" worker-substrate \
+  "recognized final compatibility fixture"
+set +e
+"${SCRIPT_DIR}/verify.sh" >>"${RESULT_LOG}" 2>&1
+blocked_verify_status=$?
+"${SCRIPT_DIR}/status.sh" >>"${RESULT_LOG}" 2>&1
+blocked_status_status=$?
+set -e
+[[ "${blocked_verify_status}" -eq "${EXIT_BLOCKED}" \
+  && "${blocked_status_status}" -eq "${EXIT_SUCCESS}" ]] \
+  || die "current consistent blocker with allowed residual state was not accepted"
+
 run_logged "${SCRIPT_DIR}/destroy.sh"
 run_logged "${SCRIPT_DIR}/destroy.sh"
 assert_sentinels_present
@@ -626,6 +851,4 @@ if grep -Ehiv 'webhookconfiguration' \
   die "captured lifecycle output contains credential material"
 fi
 
-trap - EXIT
-cleanup_sentinels
 log "complete Kamaji lifecycle, recovery, teardown, restoration, and sentinel coverage passed"

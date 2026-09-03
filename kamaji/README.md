@@ -96,9 +96,8 @@ weakens the documented lab admission floor. `just test-inotify-negative`
 proves both inotify failures occur before any retained mutation.
 
 `just create`, `just spike`, and `just repair` run this complete non-mutating
-preflight before infrastructure changes. `KAMAJI_TEST_SKIP_PREFLIGHT=1` exists
-only for controlled test fixtures that have already run the same preflight; it
-is not an operator bypass.
+preflight unconditionally before infrastructure changes. There is no
+environment bypass for mutating entry points.
 
 The 24 GiB memory floor counts 15 GiB of six worker-container caps, 2.25 GiB
 of management-cluster pod requests, and a 3 GiB kind/system reserve: 20.25 GiB
@@ -255,11 +254,14 @@ cleanup.
 
 `just test-e2e` starts from full cleanup, exercises capacity rejection,
 host preparation, create/repeat/recovery, clean/partial/healthy observers,
-kubeconfig re-export, partial join recovery, persistent worker-volume reuse,
-full verification, one-tenant teardown, repeated full teardown, ownership
-refusal, credential scanning, sentinel preservation, and host-sysctl
-restoration. Exit `2` is used only if a classifier finds recognized compatibility evidence
-and cleanup of newly created tenant state succeeds. Ordinary add-on, topology,
+kubeconfig re-export before fail-closed tenant capture, recognized-blocker
+preservation, explicit TCP repair, blocker-record validation, partial join
+recovery, persistent worker-volume reuse, full verification, one-tenant
+teardown, repeated full teardown, ownership refusal, credential scanning,
+sentinel preservation, and host-sysctl restoration. Exit `2` is used only if
+a classifier finds recognized compatibility evidence, no final tenant existed
+at entry, exact cleanup succeeds, and the current blocker/result records match
+the healthy-management-only residual state. Ordinary add-on, topology,
 capacity, API, timeout, and validation failures return `1`, retain every
 pre-existing healthy tenant and database, and create no blocker record.
 
@@ -285,7 +287,9 @@ directories. Shell entry points use `umask 077`; state directories use mode
 always select an explicit kubeconfig. Waits, including `systemctl is-system-running --wait`, and network operations are finite
 and configurable through `config/settings.env`.
 The host `just` lookup is captured before `.tools/bin` is added to `PATH`;
-`${BIN_DIR}/just` is explicitly rejected as the prerequisite.
+the resolved executable and `${BIN_DIR}` are canonicalized, and any relative,
+absolute, or symlink spelling that resolves at or below `${BIN_DIR}` is
+rejected as the prerequisite.
 
 Exit status `0` means success, `1` means an ordinary error or unhealthy state,
 and exit status `2` is reserved for a recognized compatibility blocker with a
@@ -302,9 +306,11 @@ container-specific error set. The join token TTL is `10m`; tokens and mode
 normal commands.
 
 Capacity checks use Kubernetes effective requests per non-terminal Pod:
-the larger of summed application containers or the largest init container,
-plus Pod overhead. Ephemeral SQL and cross-auth clients request `25m/32Mi`
-and are limited to `100m/128Mi`.
+the larger of (a) application containers plus all restartable init containers
+(`restartPolicy: Always`) or (b) each regular init container plus the
+restartable init containers already running before it, then Pod overhead.
+Ephemeral SQL and cross-auth clients request `25m/32Mi` and are limited to
+`100m/128Mi`.
 
 ## Licensing, telemetry, and support boundary
 

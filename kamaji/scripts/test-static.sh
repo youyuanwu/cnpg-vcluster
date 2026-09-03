@@ -227,7 +227,10 @@ JSON
 spike_refusal_is_no_mutation() (
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/lib/tenants.sh"
-  local planted=0 before_runtime before_docker before_tcps output status
+  local planted=0 runtime_existed=0 tenants_existed=0
+  local before_runtime before_docker before_tcps output status
+  [[ -d "${RUNTIME_DIR}" ]] && runtime_existed=1
+  [[ -d "${RUNTIME_DIR}/tenants" ]] && tenants_existed=1
   if ! final_tenant_state_reason >/dev/null 2>&1; then
     mkdir -p -m 0700 "$(dirname "$(tenant_kubeconfig tenant-a)")"
     printf 'final-state-fixture\n' | write_secret_file "$(tenant_kubeconfig tenant-a)"
@@ -251,6 +254,10 @@ spike_refusal_is_no_mutation() (
   if (( planted == 1 )); then
     rm -f "$(tenant_kubeconfig tenant-a)"
     rmdir "$(dirname "$(tenant_kubeconfig tenant-a)")" 2>/dev/null || true
+    (( tenants_existed == 1 )) \
+      || rmdir "${RUNTIME_DIR}/tenants" 2>/dev/null || true
+    (( runtime_existed == 1 )) \
+      || rmdir "${RUNTIME_DIR}" 2>/dev/null || true
   fi
   return "${result}"
 )
@@ -260,7 +267,7 @@ tenant_addon_render_fixture() (
   source "${SCRIPT_DIR}/lib/tenants.sh"
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/lib/addons.sh"
-  local fixture_dir="${TOOLS_TMP_DIR}/phase4-addon-fixture"
+  local fixture_dir="${TOOLS_TMP_DIR}/tenant-addon-render-fixture"
   rm -rf "${fixture_dir}"
   mkdir -p -m 0700 "${fixture_dir}"
   trap 'rm -rf "${fixture_dir}"' EXIT
@@ -396,7 +403,7 @@ datastore_unavailable_is_not_absence() (
 )
 
 effective_request_fixtures() (
-  local fixture
+  local fixture sidecar_fixture
   fixture='{"items":[{"spec":{"containers":[{"resources":{"requests":{"cpu":"100m","memory":"64Mi"}}}],"initContainers":[{"resources":{"requests":{"cpu":"800m","memory":"700Mi"}}}],"overhead":{"cpu":"50m","memory":"100Mi"}},"status":{"phase":"Running"}}]}'
   printf '%s\n' "${fixture}" \
     | CPU_CAP=850000000 MEMORY_CAP=838860800 \
@@ -407,6 +414,104 @@ effective_request_fixtures() (
     && ! printf '%s\n' "${fixture}" \
       | CPU_CAP=850000000 MEMORY_CAP=838860799 \
         python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1
+  sidecar_fixture='{"items":[{"spec":{"containers":[{"resources":{"requests":{"cpu":"100m","memory":"64Mi"}}}],"initContainers":[{"name":"sidecar","restartPolicy":"Always","resources":{"requests":{"cpu":"200m","memory":"128Mi"}}},{"name":"setup","resources":{"requests":{"cpu":"500m","memory":"512Mi"}}}],"overhead":{"cpu":"50m","memory":"64Mi"}},"status":{"phase":"Running"}}]}'
+  printf '%s\n' "${sidecar_fixture}" \
+    | CPU_CAP=750000000 MEMORY_CAP=738197504 \
+      python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null \
+    && ! printf '%s\n' "${sidecar_fixture}" \
+      | CPU_CAP=749999999 MEMORY_CAP=738197504 \
+        python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1 \
+    && ! printf '%s\n' "${sidecar_fixture}" \
+      | CPU_CAP=750000000 MEMORY_CAP=738197503 \
+        python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1
+)
+
+host_just_resolution_fixtures() (
+  local fixture_root="${TOOLS_TMP_DIR}/host-just-resolution-fixture"
+  local nested_bin="${BIN_DIR}/host-just-fixture"
+  local external_bin="${fixture_root}/external"
+  local symlink_bin="${fixture_root}/symlink"
+  rm -rf "${fixture_root}" "${nested_bin}"
+  mkdir -p -m 0700 "${nested_bin}" "${external_bin}" "${symlink_bin}"
+  trap 'rm -rf "${fixture_root}" "${nested_bin}"' EXIT
+  printf '#!/usr/bin/env bash\nprintf "just %s\\n"\n' "${JUST_VERSION}" \
+    >"${nested_bin}/just"
+  printf '#!/usr/bin/env bash\nprintf "just %s\\n"\n' "${JUST_VERSION}" \
+    >"${external_bin}/just"
+  chmod 0700 "${nested_bin}/just" "${external_bin}/just"
+  ln -s "${nested_bin}/just" "${symlink_bin}/just"
+
+  cd "${LAB_ROOT}"
+  HOST_PATH=".tools/bin/host-just-fixture:/usr/bin:/bin"
+  ! resolve_host_just >/dev/null || return 1
+  HOST_PATH=".tools/tmp/host-just-resolution-fixture/symlink:/usr/bin:/bin"
+  ! resolve_host_just >/dev/null || return 1
+  HOST_PATH=".tools/tmp/host-just-resolution-fixture/external:/usr/bin:/bin"
+  [[ "$(resolve_host_just)" == "$(readlink -f "${external_bin}/just")" ]] \
+    && require_exact_just
+)
+
+blocked_result_validation_fixtures() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/verify.sh"
+  local fixture_dir="${TOOLS_TMP_DIR}/blocked-result-validation-fixture"
+  local residual=clean
+  rm -rf "${fixture_dir}"
+  mkdir -p -m 0700 "${fixture_dir}"
+  trap 'rm -rf "${fixture_dir}"' EXIT
+  FINAL_RESULT_FILE="${fixture_dir}/final-result.env"
+  BLOCKER_FILE="${fixture_dir}/blocker"
+
+  blocked_residual_state_is_allowed() {
+    [[ "${residual}" == clean ]]
+  }
+
+  write_valid_blocked_records() {
+    {
+      printf 'result=blocked\n'
+      printf 'compatibility_revision=%s\n' "${COMPATIBILITY_REVISION}"
+      printf 'first_failing_prerequisite=tenant-a-workers\n'
+      printf 'blocker_code=worker-substrate\n'
+      printf 'blocker_evidence=recognized fixture evidence\n'
+      printf 'cleanup=proved\n'
+      printf 'final_tenants=absent\n'
+      printf 'final_workers=absent\n'
+      printf 'final_volumes=absent\n'
+      printf 'final_runtime=absent\n'
+    } | write_secret_file "${FINAL_RESULT_FILE}"
+    {
+      printf 'owner=final\n'
+      printf 'code=worker-substrate\n'
+      printf 'prerequisite=tenant-a-workers\n'
+      printf 'message=recognized fixture evidence\n'
+    } | write_secret_file "${BLOCKER_FILE}"
+  }
+
+  write_valid_blocked_records
+  blocked_result_is_current || return 1
+
+  sed -i "s/${COMPATIBILITY_REVISION}/stale-revision/" "${FINAL_RESULT_FILE}"
+  ! blocked_result_is_current || return 1
+
+  write_valid_blocked_records
+  sed -i '/^blocker_evidence=/d' "${FINAL_RESULT_FILE}"
+  ! blocked_result_is_current || return 1
+
+  write_valid_blocked_records
+  sed -i 's/^code=.*/code=kubeadm-bootstrap/' "${BLOCKER_FILE}"
+  ! blocked_result_is_current || return 1
+
+  write_valid_blocked_records
+  sed -i 's/^blocker_evidence=.*/blocker_evidence=none/' "${FINAL_RESULT_FILE}"
+  ! blocked_result_is_current || return 1
+
+  write_valid_blocked_records
+  sed -i '/^cleanup=/d' "${FINAL_RESULT_FILE}"
+  ! blocked_result_is_current || return 1
+
+  write_valid_blocked_records
+  residual=present
+  ! blocked_result_is_current
 )
 
 exact_node_set_rejects_extra_node() (
@@ -468,9 +573,12 @@ check "tools verifies the host just prerequisite" \
   has_text 'require_exact_just' "${LAB_ROOT}/scripts/tools.sh"
 check "host just lookup rejects the lab binary directory" bash -c '
   grep -Fq "HOST_PATH" "$1/scripts/lib/common.sh" &&
-  grep -Fq '\''"${executable}" != "${BIN_DIR}/just"'\'' "$1/scripts/lib/common.sh" &&
-  grep -Fq '\''${BIN_DIR}/just cannot satisfy the prerequisite'\'' "$1/scripts/lib/common.sh"
+  grep -Fq "canonical_executable" "$1/scripts/lib/common.sh" &&
+  grep -Fq '\''"${canonical_bin}/"*) return 1'\'' "$1/scripts/lib/common.sh" &&
+  grep -Fq "resolve_host_just" "$1/scripts/status.sh"
 ' _ "${LAB_ROOT}"
+check "host just resolution rejects relative and symlink lab paths" \
+  host_just_resolution_fixtures
 check "tools never downloads or installs just" bash -c '
   ! grep -E "(curl|wget|install|cp|mv).*(JUST_|just-)" "$1/scripts/tools.sh"
 ' _ "${LAB_ROOT}"
@@ -737,9 +845,10 @@ check "all Kubernetes operations use explicit wrappers" bash -c '
 check "mutating create and repair entrypoints run full preflight" bash -c '
   for file in create.sh create-spike.sh repair-tenant.sh; do
     grep -Fq '\''"${SCRIPT_DIR}/preflight.sh"'\'' "$1/scripts/$file" || exit 1
-    grep -Fq "KAMAJI_TEST_SKIP_PREFLIGHT" "$1/scripts/$file" || exit 1
+    ! grep -Fq "KAMAJI_TEST_SKIP_PREFLIGHT" "$1/scripts/$file" || exit 1
   done
-  grep -Fq "KAMAJI_TEST_SKIP_PREFLIGHT=1" "$1/README.md"
+  ! grep -Fq "KAMAJI_TEST_SKIP_PREFLIGHT" \
+    "$1/README.md" "$1/docs/high-level-design.md"
 ' _ "${LAB_ROOT}"
 check "kind deletion always selects an explicit kubeconfig" bash -c '
   python3 - "$1/scripts" <<'"'"'PY'"'"'
@@ -781,6 +890,8 @@ check "only compatibility paths can return blocked status" bash -c '
   grep -Fq "exit \"\${EXIT_BLOCKED}\"" "$1/scripts/verify.sh" &&
   grep -Fq "recognized_blocker_cleanup" "$1/scripts/test-e2e.sh"
 ' _ "${LAB_ROOT}"
+check "blocked verification requires current consistent records and clean residuals" \
+  blocked_result_validation_fixtures
 check "ordinary final failures have explicit non-blocker classifiers" bash -c '
   file="$1/scripts/create.sh"
   for classifier in classify_kube_proxy_failure classify_addon_failure \
@@ -1100,9 +1211,10 @@ check "capacity accounting uses Docker caps and scheduled pod requests" bash -c 
      "$KIND_RESERVE_CPUS" == 2 && "$KIND_RESERVE_MEMORY_GIB" == 3 ]] &&
   grep -Fq "validate_final_worker_request_capacity" "$1/scripts/lib/workers.sh" &&
   grep -Fq "initContainers" "$1/scripts/lib/effective_requests.py" &&
+  grep -Fq "restartPolicy" "$1/scripts/lib/effective_requests.py" &&
   grep -Fq "overhead" "$1/scripts/lib/effective_requests.py"
 ' _ "${LAB_ROOT}"
-check "effective request fixtures cover init containers and pod overhead" \
+check "effective request fixtures cover init containers native sidecars and pod overhead" \
   effective_request_fixtures
 check "ephemeral SQL and cross-auth clients have explicit resources" bash -c '
   source "$1/config/settings.env"
@@ -1191,6 +1303,8 @@ check "cross-auth ownership and exact cleanup are interruption safe" bash -c '
   grep -Fq -- "--local -f -" <<<"$block" &&
   grep -Fq "kamaji.cnpg-vcluster.io/role=cross-auth" <<<"$block" &&
   grep -Fq "trap - RETURN" <<<"$block" &&
+  grep -Fq "trap - RETURN INT TERM HUP" <<<"$block" &&
+  grep -Fq "trap '\''return 130'\'' INT TERM HUP" <<<"$block" &&
   grep -Fq "KAMAJI_TEST_FAIL_AFTER_CROSS_AUTH_SECRET" <<<"$block" &&
   ! grep -Fq "label secret" <<<"$block"
 ' _ "${LAB_ROOT}"
@@ -1211,7 +1325,8 @@ check "CNPG clients never log credentials" bash -c '
 check "status and diagnostics cover both final tenants and exit shapes" bash -c '
   grep -Fq "final tenant topology" "$1/scripts/status.sh" &&
   grep -Fq "passing final result lacks exactly two TCPs" "$1/scripts/status.sh" &&
-  grep -Fq "blocked final result lacks cleanup proof" "$1/scripts/status.sh" &&
+  grep -Fq "blocked final result and blocker records are stale, incomplete, or inconsistent" "$1/scripts/status.sh" &&
+  grep -Fq "blocked final result retains a worker volume" "$1/scripts/status.sh" &&
   grep -Fq "kube-proxy conntrack.maxPerCore" "$1/scripts/status.sh" &&
   grep -Fq "CoreDNS" "$1/scripts/status.sh" &&
   grep -Fq "Konnectivity" "$1/scripts/status.sh" &&
