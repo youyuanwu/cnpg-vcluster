@@ -304,6 +304,7 @@ fresh_cert_manager_failure_is_targeted() (
   rm -rf "${fixture_dir}"
   mkdir -p -m 0700 "${fixture_dir}"
   trap 'rm -rf "${fixture_dir}"' EXIT
+  CERT_MANAGER_RENDERED_MANIFEST="${fixture_dir}/cert-manager.yaml"
   for component in kubernetes metallb kamaji datastore; do
     touch "${fixture_dir}/${component}"
   done
@@ -353,7 +354,8 @@ fresh_cert_manager_failure_is_targeted() (
   [[ "${status}" -eq "${EXIT_ERROR}" ]] \
     && [[ "${output}" == "[kamaji-lab] ERROR: management.cert-manager: ${CERT_MANAGER_VERSION} installation or readiness failed" ]] \
     && [[ ! -e "${fixture_dir}/cert-manager" ]] \
-    && [[ "$(find "${fixture_dir}" -maxdepth 1 -type f -printf '%f\n' | sort)" == $'datastore\nkamaji\nkubernetes\nmetallb' ]]
+    && [[ "$(find "${fixture_dir}" -maxdepth 1 -type f ! -name cert-manager.yaml \
+      -printf '%f\n' | sort)" == $'datastore\nkamaji\nkubernetes\nmetallb' ]]
 )
 
 etcd_probe_states_are_distinct() (
