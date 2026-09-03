@@ -55,6 +55,7 @@ just create-management
 just spike
 just destroy-spike
 just create
+just repair tenant-a
 just verify
 just status
 just diagnose all
@@ -94,6 +95,11 @@ want stricter admission and for deterministic rejection tests; lowering them
 weakens the documented lab admission floor. `just test-inotify-negative`
 proves both inotify failures occur before any retained mutation.
 
+`just create`, `just spike`, and `just repair` run this complete non-mutating
+preflight before infrastructure changes. `KAMAJI_TEST_SKIP_PREFLIGHT=1` exists
+only for controlled test fixtures that have already run the same preflight; it
+is not an operator bypass.
+
 The 24 GiB memory floor counts 15 GiB of six worker-container caps, 2.25 GiB
 of management-cluster pod requests, and a 3 GiB kind/system reserve: 20.25 GiB
 admitted, leaving 3.75 GiB. Each tenant control plane keeps a 512 MiB aggregate
@@ -112,6 +118,13 @@ pinned dependencies in order, and gates their CRDs, webhooks, controller
 workloads, three `1Gi` datastore PVCs, and `DataStore/default`. A same-named
 kind cluster without matching local ownership evidence is refused and is
 neither adopted nor deleted.
+
+The cert-manager chart and MetalLB manifest are checksum-verified again
+immediately before each use. cert-manager's controller, webhook, cainjector,
+and startup API check use the chart's supported digest values. The MetalLB
+controller and speaker tags are replaced by one deterministic verified
+transform. Rendered inputs and live workloads must match all six recorded
+digests and their provenance in `config/versions.env`.
 
 `just spike` runs this ordered ladder:
 
@@ -167,7 +180,10 @@ instances per tenant. Set `SKIP_CNPG=1` only when intentionally reconciling
 the worker/add-on layers without installing or changing database resources.
 Workers and volumes have exact ownership labels, persistent `/var/lib`,
 same-name refusal, stopped/stale handling, partial rejoin, and short-lived
-token cleanup.
+token cleanup. An existing credentialed worker receives a bounded Ready grace
+after restart before any reset/rejoin. Join material is protected by scoped
+return and signal cleanup; stale material on an already-Ready worker is
+deleted, including a best-effort token revocation.
 
 Validated runs leave exactly two Ready, intentionally paused TCPs, three
 disjoint Ready workers per tenant, healthy
@@ -177,6 +193,11 @@ Bound smoke PVC per tenant. Repeating
 `maxPerCore: 0` to remain intact and fails instead of silently repairing a
 drifted TCP. It replaces no healthy worker. Removing one owned worker and
 rerunning create restores only that worker while retaining its owned volume.
+Use `just repair tenant-a` (or `tenant-b`) for an explicitly owned incomplete
+or drifted TCP. The bounded repair refuses missing/unlabelled ownership,
+unpauses and reconciles the exact TCP, reapplies the kube-proxy workaround,
+and reconciles only that tenant's workers, add-ons, and database while
+requiring any existing marker to survive.
 
 The former `tenant-a-workers` exit `255` was reproduced by exhausting the
 host-root inotify instance pool and eliminated by raising
@@ -208,12 +229,19 @@ datastore identity, and PostgreSQL cluster remain healthy. A create-only lab
 has no `kamaji_verification` table, so teardown first proves SQL connectivity
 and does not require a marker. If the table exists, teardown requires the
 survivor's exact marker and rejects a missing or different value.
+Targeted teardown first proves the shared datastore is Ready and that its
+prefix, user, role, and `usedBy` state can all be inspected. API, TLS, or
+maintenance-Pod failures return exit `1` and retain the namespace/runtime
+ownership evidence for retry; they are never treated as absence.
 
 `just destroy` removes spike residuals, both tenants, the kubectl-applied
 Kamaji datastore hook RBAC, Kamaji/datastore, MetalLB, cert-manager, the exact
 owned kind cluster, and `.runtime/`. It refuses unowned same-name objects,
 uses the lab-local kubeconfig so unrelated contexts are untouched, and
 restores the values recorded by `just prepare-host`. Repeating it is safe.
+Only the enumerated management, spike, worker, and volume names with matching
+records are eligible for deletion. Any unexpected ownership-labelled Docker
+object fails closed instead of being swept.
 
 Teardown intentionally fails closed if `.runtime` ownership or network
 evidence is lost while resources are live. There is no force-adopt or
@@ -230,8 +258,10 @@ host preparation, create/repeat/recovery, clean/partial/healthy observers,
 kubeconfig re-export, partial join recovery, persistent worker-volume reuse,
 full verification, one-tenant teardown, repeated full teardown, ownership
 refusal, credential scanning, sentinel preservation, and host-sysctl
-restoration. Exit `2` is used only if a fresh recognized compatibility blocker
-is recorded and cleanup succeeds.
+restoration. Exit `2` is used only if a classifier finds recognized compatibility evidence
+and cleanup of newly created tenant state succeeds. Ordinary add-on, topology,
+capacity, API, timeout, and validation failures return `1`, retain every
+pre-existing healthy tenant and database, and create no blocker record.
 
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and
@@ -254,6 +284,8 @@ directories. Shell entry points use `umask 077`; state directories use mode
 `0700`; kubeconfigs and credentials use mode `0600`; and Kubernetes wrappers
 always select an explicit kubeconfig. Waits, including `systemctl is-system-running --wait`, and network operations are finite
 and configurable through `config/settings.env`.
+The host `just` lookup is captured before `.tools/bin` is added to `PATH`;
+`${BIN_DIR}/just` is explicitly rejected as the prerequisite.
 
 Exit status `0` means success, `1` means an ordinary error or unhealthy state,
 and exit status `2` is reserved for a recognized compatibility blocker with a
@@ -268,6 +300,11 @@ exception is ignored unless the target 1.36.4 join first reports the exact
 container-specific error set. The join token TTL is `10m`; tokens and mode
 `0600` join files are deleted after every attempt and are never printed by
 normal commands.
+
+Capacity checks use Kubernetes effective requests per non-terminal Pod:
+the larger of summed application containers or the largest init container,
+plus Pod overhead. Ephemeral SQL and cross-auth clients request `25m/32Mi`
+and are limited to `100m/128Mi`.
 
 ## Licensing, telemetry, and support boundary
 
@@ -285,7 +322,17 @@ with its first failing rung instead of claiming tenant or database verification
 succeeded.
 
 See [docs/high-level-design.md](docs/high-level-design.md) for the design and
-complete deterministic input chain.
+complete deterministic input chain, and
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md) for upstream licenses,
+modification notices, and Apache-2.0 text.
+
+Two limitations remain explicit. Docker IPAM does not reserve the borrowed
+VIPs, so a later collision fails closed; recovery is to stop the conflicting
+endpoint and rerun, not to change a live tenant address. CoreDNS and
+kube-proxy images generated by Kamaji remain upstream-selected because the
+current TCP image API cannot directly express the required digest-only
+references without replacing the managed add-ons; all directly selected lab
+images remain pinned.
 
 ## Versions and upstream documentation
 

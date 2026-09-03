@@ -32,6 +32,7 @@ CloudNativePG clusters:
 cd kamaji
 just tools
 just prepare-host
+just preflight
 just create
 just verify
 just destroy

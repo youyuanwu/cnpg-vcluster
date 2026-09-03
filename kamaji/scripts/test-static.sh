@@ -313,6 +313,13 @@ fresh_cert_manager_failure_is_targeted() (
       status)
         return 1
         ;;
+      template)
+        printf 'image: %s\nimage: %s\nimage: %s\nimage: %s\n' \
+          "${CERT_MANAGER_CONTROLLER_IMAGE}" \
+          "${CERT_MANAGER_WEBHOOK_IMAGE}" \
+          "${CERT_MANAGER_CAINJECTOR_IMAGE}" \
+          "${CERT_MANAGER_STARTUPAPICHECK_IMAGE}"
+        ;;
       upgrade)
         touch "${fixture_dir}/cert-manager"
         return 1
@@ -330,6 +337,11 @@ fresh_cert_manager_failure_is_targeted() (
     if [[ " $* " == *" delete namespace cert-manager "* ]]; then
       rm -f "${fixture_dir}/cert-manager"
     fi
+    if [[ " $* " == *" get namespace cert-manager "* ]]; then
+      [[ ! -f "${fixture_dir}/cert-manager" ]] \
+        || printf 'namespace/cert-manager\n'
+      return 0
+    fi
     return 0
   }
 
@@ -344,6 +356,78 @@ fresh_cert_manager_failure_is_targeted() (
     && [[ "$(find "${fixture_dir}" -maxdepth 1 -type f -printf '%f\n' | sort)" == $'datastore\nkamaji\nkubernetes\nmetallb' ]]
 )
 
+etcd_probe_states_are_distinct() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/tenants.sh"
+  local mode=present
+
+  etcd_maintenance() {
+    case "${mode}:$1:$2" in
+      present:get:/*) printf '/schema/key\n' ;;
+      absent:get:/*) return 0 ;;
+      present:user:*|present:role:*) printf 'present\n' ;;
+      absent:user:*) printf 'User %s does not exist\n' "$3" >&2; return 1 ;;
+      absent:role:*) printf 'Role %s does not exist\n' "$3" >&2; return 1 ;;
+      failed:*) printf 'maintenance pod failed\n' >&2; return 1 ;;
+      *) return 1 ;;
+    esac
+  }
+
+  [[ "$(etcd_prefix_state schema)" == present \
+    && "$(etcd_user_state schema)" == present \
+    && "$(etcd_role_state schema)" == present ]] || return 1
+  mode=absent
+  [[ "$(etcd_prefix_state schema)" == absent \
+    && "$(etcd_user_state schema)" == absent \
+    && "$(etcd_role_state schema)" == absent ]] || return 1
+  mode=failed
+  ! etcd_prefix_state schema >/dev/null \
+    && ! etcd_user_state schema >/dev/null \
+    && ! etcd_role_state schema >/dev/null
+)
+
+datastore_unavailable_is_not_absence() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/tenants.sh"
+  KAMAJI_TEST_DATASTORE_UNAVAILABLE=1
+  ! management_datastore_available
+)
+
+effective_request_fixtures() (
+  local fixture
+  fixture='{"items":[{"spec":{"containers":[{"resources":{"requests":{"cpu":"100m","memory":"64Mi"}}}],"initContainers":[{"resources":{"requests":{"cpu":"800m","memory":"700Mi"}}}],"overhead":{"cpu":"50m","memory":"100Mi"}},"status":{"phase":"Running"}}]}'
+  printf '%s\n' "${fixture}" \
+    | CPU_CAP=850000000 MEMORY_CAP=838860800 \
+      python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null \
+    && ! printf '%s\n' "${fixture}" \
+      | CPU_CAP=849999999 MEMORY_CAP=838860800 \
+        python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1 \
+    && ! printf '%s\n' "${fixture}" \
+      | CPU_CAP=850000000 MEMORY_CAP=838860799 \
+        python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1
+)
+
+exact_node_set_rejects_extra_node() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/workers.sh"
+  tenant_kubectl() {
+    if [[ " $* " == *" get nodes "* ]]; then
+      printf '%s\n' \
+        kamaji-tenant-a-worker-1 \
+        kamaji-tenant-a-worker-2 \
+        kamaji-tenant-a-worker-3 \
+        unexpected-notready-node
+      return
+    fi
+    return 1
+  }
+  set +e
+  (validate_exact_tenant_node_set tenant-a >/dev/null 2>&1)
+  local status=$?
+  set -e
+  [[ "${status}" -eq "${EXIT_ERROR}" ]]
+)
+
 require_exact_just
 
 for script in "${LAB_ROOT}"/scripts/*.sh "${LAB_ROOT}"/scripts/lib/*.sh; do
@@ -352,7 +436,7 @@ done
 
 check "complete just task surface" bash -c '
   tasks="$(just --justfile "$1" --list --unsorted)"
-  for task in tools preflight prepare-host create-management spike destroy-spike create status diagnose verify destroy-tenant destroy test-static test-inotify-negative test-kube-proxy-restart test-e2e; do
+  for task in tools preflight prepare-host create-management spike destroy-spike create repair status diagnose verify destroy-tenant destroy test-static test-inotify-negative test-kube-proxy-restart test-e2e; do
     grep -Eq "^    ${task}([[:space:]]|$)" <<<"${tasks}" || exit 1
   done
 ' _ "${LAB_ROOT}/Justfile"
@@ -380,6 +464,11 @@ check "scripts/config/task runner do not couple to vcluster paths" bash -c '
 
 check "tools verifies the host just prerequisite" \
   has_text 'require_exact_just' "${LAB_ROOT}/scripts/tools.sh"
+check "host just lookup rejects the lab binary directory" bash -c '
+  grep -Fq "HOST_PATH" "$1/scripts/lib/common.sh" &&
+  grep -Fq '\''"${executable}" != "${BIN_DIR}/just"'\'' "$1/scripts/lib/common.sh" &&
+  grep -Fq '\''${BIN_DIR}/just cannot satisfy the prerequisite'\'' "$1/scripts/lib/common.sh"
+' _ "${LAB_ROOT}"
 check "tools never downloads or installs just" bash -c '
   ! grep -E "(curl|wget|install|cp|mv).*(JUST_|just-)" "$1/scripts/tools.sh"
 ' _ "${LAB_ROOT}"
@@ -417,9 +506,24 @@ check "locked kamaji-etcd package checksum is exact" \
 check "cert-manager OCI descriptor digest is exact" \
   has_text '^CERT_MANAGER_OCI_DIGEST=sha256:15c0b46d9006ce8eb9ff14d1bf54d1bbfcc587bb9e24cd9fe186fb8fec56af1f$' \
   "${LAB_ROOT}/config/versions.env"
+check "cert-manager workload image digests are exact" bash -c '
+  source "$1"
+  for image in \
+    "$CERT_MANAGER_CONTROLLER_IMAGE" "$CERT_MANAGER_WEBHOOK_IMAGE" \
+    "$CERT_MANAGER_CAINJECTOR_IMAGE" "$CERT_MANAGER_STARTUPAPICHECK_IMAGE"; do
+    [[ "$image" =~ :v1\.21\.1@sha256:[0-9a-f]{64}$ ]] || exit 1
+  done
+  [[ "$CERT_MANAGER_IMAGE_PROVENANCE" == cert-manager-v1.21.1:* ]]
+' _ "${LAB_ROOT}/config/versions.env"
 check "MetalLB v0.16.1 manifest checksum is exact" \
   has_text '^METALLB_MANIFEST_SHA256=bf25feebb7582ca7df845efd52ffbc2960d6cbf4cfc972f47fded9f788b67f0b$' \
   "${LAB_ROOT}/config/versions.env"
+check "MetalLB workload image digests are exact" bash -c '
+  source "$1"
+  [[ "$METALLB_CONTROLLER_IMAGE" =~ :v0\.16\.1@sha256:[0-9a-f]{64}$ ]] &&
+  [[ "$METALLB_SPEAKER_IMAGE" =~ :v0\.16\.1@sha256:[0-9a-f]{64}$ ]] &&
+  [[ "$METALLB_IMAGE_PROVENANCE" == metallb-v0.16.1:* ]]
+' _ "${LAB_ROOT}/config/versions.env"
 check "Calico 3.32.2 manifest checksum is exact" \
   has_text '^CALICO_MANIFEST_SHA256=a8c828a06a87c629a282ebbc424895b77f3a030251993e41ea400a743675bb02$' \
   "${LAB_ROOT}/config/versions.env"
@@ -477,6 +581,15 @@ check "direct manifest input checksums" bash -c '
     sha256sum -c - >/dev/null &&
   printf "%s  %s\n" "$CNPG_MANIFEST_SHA256" ".tools/inputs/cnpg-${CNPG_VERSION}.yaml" |
     sha256sum -c - >/dev/null
+' _ "${LAB_ROOT}"
+check "cert-manager and MetalLB reverify and pin inputs before use" bash -c '
+  file="$1/scripts/lib/management.sh"
+  grep -Fq '\''sha256_check "${CERT_MANAGER_CHART_SHA256}"'\'' "$file" &&
+  grep -Fq '\''image.digest=${CERT_MANAGER_CONTROLLER_IMAGE##*@}'\'' "$file" &&
+  grep -Fq '\''startupapicheck.image.digest=${CERT_MANAGER_STARTUPAPICHECK_IMAGE##*@}'\'' "$file" &&
+  grep -Fq '\''sha256_check "${METALLB_MANIFEST_SHA256}"'\'' "$file" &&
+  grep -Fq "render_metallb_manifest" "$file" &&
+  grep -Fq "live workloads do not use the approved image digests" "$file"
 ' _ "${LAB_ROOT}"
 check "independent CNPG operator manifest matches verified provenance" bash -c '
   source "$1/config/versions.env"
@@ -619,6 +732,32 @@ check "all Kubernetes operations use explicit wrappers" bash -c '
   ! grep -R -E "^[[:space:]]*kubectl[[:space:]]" "$1/scripts" \
     --include="*.sh" --exclude=common.sh --exclude=test-static.sh
 ' _ "${LAB_ROOT}"
+check "mutating create and repair entrypoints run full preflight" bash -c '
+  for file in create.sh create-spike.sh repair-tenant.sh; do
+    grep -Fq '\''"${SCRIPT_DIR}/preflight.sh"'\'' "$1/scripts/$file" || exit 1
+    grep -Fq "KAMAJI_TEST_SKIP_PREFLIGHT" "$1/scripts/$file" || exit 1
+  done
+  grep -Fq "KAMAJI_TEST_SKIP_PREFLIGHT=1" "$1/README.md"
+' _ "${LAB_ROOT}"
+check "kind deletion always selects an explicit kubeconfig" bash -c '
+  python3 - "$1/scripts" <<'"'"'PY'"'"'
+from pathlib import Path
+import sys
+for path in Path(sys.argv[1]).rglob("*.sh"):
+    if path.name == "test-static.sh":
+        continue
+    lines=path.read_text(encoding="utf-8").splitlines()
+    for index,line in enumerate(lines):
+        if "kind delete cluster" not in line:
+            continue
+        command=line
+        cursor=index
+        while command.rstrip().endswith("\\"):
+            cursor += 1
+            command += " " + lines[cursor]
+        assert "--kubeconfig" in command, f"{path}:{index+1}"
+PY
+' _ "${LAB_ROOT}"
 check "management wrapper sets kubeconfig and context" bash -c '
   grep -Fq "KUBECONFIG=\"\${MANAGEMENT_KUBECONFIG}\"" "$1" &&
   grep -Fq -- "--context \"\$(management_context)\"" "$1"
@@ -639,6 +778,17 @@ check "only compatibility paths can return blocked status" bash -c '
   grep -Fq "blocked_result_is_current" "$1/scripts/verify.sh" &&
   grep -Fq "exit \"\${EXIT_BLOCKED}\"" "$1/scripts/verify.sh" &&
   grep -Fq "recognized_blocker_cleanup" "$1/scripts/test-e2e.sh"
+' _ "${LAB_ROOT}"
+check "ordinary final failures have explicit non-blocker classifiers" bash -c '
+  file="$1/scripts/create.sh"
+  for classifier in classify_kube_proxy_failure classify_addon_failure \
+    classify_topology_failure classify_capacity_failure classify_worker_failure; do
+    grep -Fq "${classifier}()" "$file" || exit 1
+  done
+  grep -Fq "KAMAJI_TEST_INJECT_ADDON_FAILURE" "$1/scripts/lib/addons.sh" &&
+  grep -Fq "ordinary add-on failure" "$1/scripts/test-e2e.sh" &&
+  grep -Fq "ordinary add-on failure created a compatibility blocker record" \
+    "$1/scripts/test-e2e.sh"
 ' _ "${LAB_ROOT}"
 check "status is read-only and never returns blocker status" \
   observer_is_read_only "${SCRIPT_DIR}/status.sh"
@@ -676,6 +826,12 @@ import ipaddress,sys
 nets=[ipaddress.ip_network(v) for v in sys.argv[1:]]
 assert all(not a.overlaps(b) for i,a in enumerate(nets) for b in nets[i+1:])
 PY
+' _ "${LAB_ROOT}"
+check "spike CIDRs participate in Docker overlap checks" bash -c '
+  grep -F "CONFIGURED_CIDRS=" "$1/scripts/preflight.sh" \
+    | grep -Fq '\''${SPIKE_POD_CIDR} ${SPIKE_SERVICE_CIDR}'\'' &&
+  [[ "$(grep -F "EXCLUDED_CIDRS=" "$1/scripts/lib/network.sh" \
+    | grep -Fc '\''${SPIKE_POD_CIDR} ${SPIKE_SERVICE_CIDR}'\'')" -eq 2 ]]
 ' _ "${LAB_ROOT}"
 check "kubeadm allowlist has one settings source and exact consumers" bash -c '
   unset KUBEADM_IGNORE_PREFLIGHT_ERRORS
@@ -740,6 +896,18 @@ check "spike token and join material are short-lived and secret" bash -c '
   grep -Fq "remove_worker_join_material" "$1/scripts/lib/workers.sh" &&
   ! grep -Eq "(log|echo).*(join_command|token_id)" "$1/scripts/lib/workers.sh"
 ' _ "${LAB_ROOT}"
+check "final worker join cleanup is return signal and stale safe" bash -c '
+  file="$1/scripts/lib/workers.sh"
+  grep -Fq "cleanup_final_worker_join_material" "$file" &&
+  grep -Fq "trap - RETURN INT TERM HUP" "$file" &&
+  grep -Fq "cleanup_stale_final_worker_join_material" "$file" &&
+  grep -Fq "KAMAJI_TEST_FAIL_AFTER_FINAL_JOIN" "$file" &&
+  grep -Fq "interrupted final-worker join retained" "$1/scripts/test-e2e.sh"
+' _ "${LAB_ROOT}"
+check "datastore probes distinguish present absent and inspection failure" \
+  etcd_probe_states_are_distinct
+check "unavailable datastore is not treated as absence" \
+  datastore_unavailable_is_not_absence
 check "target bootstrap RBAC patch is resource-name scoped" bash -c '
   grep -Fq "resourceNames: [kubeadm-config, kubelet-config]" "$1/scripts/lib/tenants.sh" &&
   grep -Fq "verbs: [get]" "$1/scripts/lib/tenants.sh" &&
@@ -830,12 +998,21 @@ check "worker reconciliation covers current stopped stale and partial states" ba
   grep -Fq "reset_worker_state_for_rejoin" "$file" &&
   grep -Fq "token create --ttl" "$file" &&
   grep -Fq "token delete" "$file" &&
-  grep -Fq "validate_disjoint_worker_sets" "$file"
+  grep -Fq "validate_disjoint_worker_sets" "$file" &&
+  grep -Fq "WORKER_READY_GRACE_TIMEOUT" "$file" &&
+  grep -Fq "stopped-worker readiness grace" "$1/scripts/test-e2e.sh"
+' _ "${LAB_ROOT}"
+check "semantic runtime names contain no workflow phase number" bash -c '
+  ! grep -E "phase[0-9]" "$1/config/settings.env" "$1/README.md" \
+    "$1/docs/high-level-design.md"
 ' _ "${LAB_ROOT}"
 check "worker ownership rejects same-named unowned objects" bash -c '
   grep -Fq "refusing same-named unowned container" "$1" &&
   grep -Fq "refusing same-named unowned volume" "$1" &&
-  grep -Fq "worker-var-lib" "$1"
+  grep -Fq "worker-var-lib" "$1" &&
+  grep -Fq "WORKER_VOLUME_ID" "$1" &&
+  grep -Fq "validate_final_worker_ownership_record" "$1" &&
+  grep -Fq "validate_final_worker_volume_ownership_record" "$1"
 ' _ "${LAB_ROOT}/scripts/lib/workers.sh"
 check "kube-proxy remediation is pre-join and retained as steady state" bash -c '
   tenant_file="$1/scripts/lib/tenants.sh"
@@ -888,9 +1065,10 @@ check "blocked final path removes every tenant-owned runtime layer" bash -c '
   grep -Fq "delete_final_tenant_smoke" "$1/scripts/create.sh" &&
   grep -Fq "remove_tenant_workers" "$1/scripts/create.sh" &&
   grep -Fq "delete_final_tenant_control_plane" "$1/scripts/create.sh" &&
-  grep -Fq "exact etcd prefix remains" "$1/scripts/lib/tenants.sh" &&
-  grep -Fq "exact etcd user remains" "$1/scripts/lib/tenants.sh" &&
-  grep -Fq "exact etcd role remains" "$1/scripts/lib/tenants.sh"
+  grep -Fq "exact etcd prefix" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "exact etcd user" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "exact etcd role" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "final_tenant_existed_at_start" "$1/scripts/create.sh"
 ' _ "${LAB_ROOT}"
 check "final topology gates exact TCP schema worker storage and isolation counts" bash -c '
   file="$1/scripts/create.sh"
@@ -899,8 +1077,12 @@ check "final topology gates exact TCP schema worker storage and isolation counts
   grep -Fq "management API contains tenant workers" "$file" &&
   grep -Fq "appears in both tenants" "$file" &&
   grep -Fq "storage appears in" "$file" &&
-  grep -Fq "smoke PVC is not Bound" "$file"
+  grep -Fq "smoke PVC is not Bound" "$file" &&
+  grep -Fq "complete Node set differs from the exact expected workers" \
+    "$1/scripts/lib/workers.sh"
 ' _ "${LAB_ROOT}"
+check "complete Node set rejects an extra unlabeled NotReady node" \
+  exact_node_set_rejects_extra_node
 check "runtime result captures endpoint and CA identity separation" bash -c '
   grep -Fq "verify_tenant_identity_separation" "$1" &&
   grep -Fq "tenant_a_endpoint=%s" "$1" &&
@@ -915,8 +1097,19 @@ check "capacity accounting uses Docker caps and scheduled pod requests" bash -c 
      "$MANAGEMENT_REQUEST_MEMORY_GIB" == 2.25 &&
      "$KIND_RESERVE_CPUS" == 2 && "$KIND_RESERVE_MEMORY_GIB" == 3 ]] &&
   grep -Fq "validate_final_worker_request_capacity" "$1/scripts/lib/workers.sh" &&
-  grep -Fq "requested_cpu <= int(os.environ[\"CPU_CAP\"])" "$1/scripts/lib/workers.sh" &&
-  grep -Fq "requested_memory <= int(os.environ[\"MEMORY_CAP\"])" "$1/scripts/lib/workers.sh"
+  grep -Fq "initContainers" "$1/scripts/lib/effective_requests.py" &&
+  grep -Fq "overhead" "$1/scripts/lib/effective_requests.py"
+' _ "${LAB_ROOT}"
+check "effective request fixtures cover init containers and pod overhead" \
+  effective_request_fixtures
+check "ephemeral SQL and cross-auth clients have explicit resources" bash -c '
+  source "$1/config/settings.env"
+  [[ "$SQL_CLIENT_REQUEST_CPU" == 25m && "$SQL_CLIENT_REQUEST_MEMORY" == 32Mi &&
+     "$SQL_CLIENT_LIMIT_CPU" == 100m && "$SQL_CLIENT_LIMIT_MEMORY" == 128Mi ]] &&
+  block="$(sed -n "/^create_cnpg_sql_client()/,/^}/p" "$1/scripts/lib/cnpg.sh")" &&
+  grep -Fq "requests:" <<<"$block" &&
+  grep -Fq '\''cpu: ${SQL_CLIENT_REQUEST_CPU}'\'' <<<"$block" &&
+  grep -Fq '\''memory: ${SQL_CLIENT_LIMIT_MEMORY}'\'' <<<"$block"
 ' _ "${LAB_ROOT}"
 check "CNPG tenant manifests enforce exact independent database topology" bash -c '
   source "$1/config/settings.env"
@@ -991,6 +1184,14 @@ check "behavioral verifier covers both negative identities and recovery paths" b
   grep -Fq -- "--all-namespaces --no-headers" "$file" &&
   grep -Fq "storageClassName" "$file"
 ' _ "${LAB_ROOT}"
+check "cross-auth ownership and exact cleanup are interruption safe" bash -c '
+  block="$(sed -n "/^cross_database_identity_rejected()/,/^}/p" "$1/scripts/verify.sh")"
+  grep -Fq -- "--local -f -" <<<"$block" &&
+  grep -Fq "kamaji.cnpg-vcluster.io/role=cross-auth" <<<"$block" &&
+  grep -Fq "trap - RETURN" <<<"$block" &&
+  grep -Fq "KAMAJI_TEST_FAIL_AFTER_CROSS_AUTH_SECRET" <<<"$block" &&
+  ! grep -Fq "label secret" <<<"$block"
+' _ "${LAB_ROOT}"
 check "CNPG Kubernetes calls always carry explicit kubeconfigs" bash -c '
   ! grep -E "^[[:space:]]*kubectl[[:space:]]" \
     "$1/scripts/lib/cnpg.sh" "$1/scripts/verify.sh" &&
@@ -1008,7 +1209,7 @@ check "CNPG clients never log credentials" bash -c '
 check "status and diagnostics cover both final tenants and exit shapes" bash -c '
   grep -Fq "final tenant topology" "$1/scripts/status.sh" &&
   grep -Fq "passing final result lacks exactly two TCPs" "$1/scripts/status.sh" &&
-  grep -Fq "blocked final result retains workers" "$1/scripts/status.sh" &&
+  grep -Fq "blocked final result lacks cleanup proof" "$1/scripts/status.sh" &&
   grep -Fq "kube-proxy conntrack.maxPerCore" "$1/scripts/status.sh" &&
   grep -Fq "CoreDNS" "$1/scripts/status.sh" &&
   grep -Fq "Konnectivity" "$1/scripts/status.sh" &&
@@ -1037,11 +1238,21 @@ check "tenant teardown is exact and verifies the survivor" bash -c '
   grep -Fq "remove_tenant_workers" "$file" &&
   grep -Fq "delete_final_tenant_control_plane" "$file" &&
   grep -Fq "tenant_management_secrets" "$file" &&
-  grep -Fq "DataStore/default still reports status.usedBy" "$file" &&
-  grep -Fq "exact datastore schema remains" "$file" &&
+  grep -Fq "DataStore/default status.usedBy" "$file" &&
+  grep -Fq "exact datastore schema" "$file" &&
+  grep -Fq "shared datastore is unavailable during cleanup proof" "$file" &&
   grep -Fq "verify_surviving_tenant_health" "$file" &&
   grep -Fq "cnpg_verify_marker_if_present" "$file" &&
   grep -Fq "container identity drifted" "$file"
+' _ "${LAB_ROOT}"
+check "targeted teardown requires datastore inspection before mutation" bash -c '
+  file="$1/scripts/destroy-tenant.sh"
+  require_line="$(grep -n "require_management_datastore_inspection" "$file" | head -1 | cut -d: -f1)"
+  cnpg_line="$(grep -n "delete_cnpg_for_tenant" "$file" | tail -1 | cut -d: -f1)"
+  [[ -n "$require_line" && -n "$cnpg_line" && "$require_line" -lt "$cnpg_line" ]] &&
+  grep -Fq "KAMAJI_TEST_DATASTORE_UNAVAILABLE" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "datastore-unavailable targeted teardown removed retry evidence" \
+    "$1/scripts/test-e2e.sh"
 ' _ "${LAB_ROOT}"
 check "survivor marker policy accepts unseeded and requires seeded identity" \
   optional_marker_policy_fixture unseeded
@@ -1074,6 +1285,42 @@ check "full teardown removes shared resources then restores host state" bash -c 
   kind_line="$(grep -n "delete_owned_kind_cluster" "$file" | tail -1 | cut -d: -f1)" &&
   restore_line="$(grep -n "restore_recorded_inotify_values" "$file" | tail -1 | cut -d: -f1)" &&
   (( kind_line < restore_line ))
+' _ "${LAB_ROOT}"
+check "full teardown refuses unexpected ownership-labelled objects" bash -c '
+  grep -Fq "validate_owned_docker_inventory" "$1/scripts/destroy.sh" &&
+  ! grep -Fq "remove_owned_residual_docker_resources" "$1/scripts/destroy.sh" &&
+  grep -Fq "unexpected ownership-labelled sentinel was swept" \
+    "$1/scripts/test-e2e.sh"
+' _ "${LAB_ROOT}"
+check "all delete waits are finite or explicitly non-waiting" bash -c '
+  python3 - "$1/scripts" <<'"'"'PY'"'"'
+from pathlib import Path
+import sys
+for path in Path(sys.argv[1]).rglob("*.sh"):
+    if path.name == "test-static.sh":
+        continue
+    lines=path.read_text(encoding="utf-8").splitlines()
+    for index,line in enumerate(lines):
+        if not any(token in line for token in (
+            "management_kubectl", "tenant_kubectl", "management_helm",
+            "kind delete cluster",
+        )):
+            continue
+        command=line
+        cursor=index
+        while command.rstrip().endswith("\\"):
+            cursor += 1
+            command += " " + lines[cursor]
+        if " delete " in f" {command} ":
+            bounded = "--wait=false" in command or "--timeout" in command
+            if "kind delete cluster" in command and index > 0:
+                bounded = bounded or "timeout " in lines[index - 1]
+            assert bounded, (
+                f"{path}:{index+1}: {command}"
+            )
+        if "management_helm uninstall" in command:
+            assert "--timeout" in command, f"{path}:{index+1}: {command}"
+PY
 ' _ "${LAB_ROOT}"
 check "Kamaji teardown names kubectl-applied hook RBAC and exact CRDs" bash -c '
   file="$1/scripts/lib/management.sh"
@@ -1206,6 +1453,23 @@ check "documentation covers lifecycle and support boundaries" bash -c '
   grep -Fq "inotify" "$1/docs/high-level-design.md" &&
   grep -Fq "Teardown" "$1/docs/high-level-design.md" &&
   grep -Fq "public edge" "$1/docs/high-level-design.md"
+' _ "${LAB_ROOT}"
+check "repair recipe and dataplane alternatives are documented" bash -c '
+  test -x "$1/scripts/repair-tenant.sh" &&
+  grep -Fq "repair tenant:" "$1/Justfile" &&
+  grep -Fq "validate_final_tenant_ownership" "$1/scripts/repair-tenant.sh" &&
+  grep -Fq "Alternatives considered" "$1/docs/high-level-design.md" &&
+  grep -Fq "Self-managed kube-proxy" "$1/docs/high-level-design.md" &&
+  grep -Fq "Kube-proxy-free Calico/eBPF" "$1/docs/high-level-design.md"
+' _ "${LAB_ROOT}"
+check "third-party notices and Apache license are tracked and linked" bash -c '
+  test -s "$1/THIRD_PARTY_NOTICES.md" &&
+  test -s "$1/licenses/Apache-2.0.txt" &&
+  grep -Fq "Kamaji NOTICE" "$1/THIRD_PARTY_NOTICES.md" &&
+  for project in Kamaji cert-manager MetalLB Calico "Local Path" CloudNativePG; do
+    grep -Fq "$project" "$1/THIRD_PARTY_NOTICES.md" || exit 1
+  done &&
+  grep -Fq "THIRD_PARTY_NOTICES.md" "$1/README.md"
 ' _ "${LAB_ROOT}"
 
 if (( failures > 0 )); then

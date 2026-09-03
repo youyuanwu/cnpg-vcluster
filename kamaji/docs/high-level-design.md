@@ -65,6 +65,13 @@ direct input:
   CloudNativePG 1.30.0 manifests;
 - PostgreSQL 18.4, Konnectivity 0.36.0, worker, and verification images.
 
+The cert-manager controller, webhook, cainjector, and startup API check plus
+the MetalLB controller and speaker are independently resolved and recorded by
+digest. The cert-manager chart consumes its supported digest values. MetalLB
+uses a deterministic transform of the immediately checksum-verified native
+manifest. Both rendered inputs and the live controller workloads are checked
+against the recorded references and provenance.
+
 The upstream Kamaji chart identifies itself with moving chart/app versions and
 renders `repository:tag` image fields. The lab therefore prepares the chart
 from the verified release source instead of a moving chart repository. It
@@ -163,6 +170,10 @@ Preflight orders no-mutation checks before the short-lived privileged probe:
 7. deterministic chart rendering and remote digest availability;
 8. a bounded, automatically removed privileged cgroup-v2 probe.
 
+Every mutating create or repair entry point runs this full preflight.
+`KAMAJI_TEST_SKIP_PREFLIGHT=1` is a narrowly test-only seam for a fixture that
+already completed the same checks.
+
 `MIN_DOCKER_CPUS`, `MIN_DOCKER_MEMORY_GIB`, `MIN_DOCKER_STORAGE_GIB`,
 `MIN_INOTIFY_INSTANCES`, and `MIN_INOTIFY_WATCHES` are
 intentional environment inputs. Operators may raise them for stricter host
@@ -212,7 +223,11 @@ Downloads, remote descriptor/image checks, Kubernetes requests, probes, and
 future readiness checks consume finite environment-overridable durations.
 Status uses `1` for an unhealthy or not-yet-created lab. Ordinary failures also
 use `1`. Status `2` is reserved solely for a recognized compatibility blocker
-recorded by the dedicated blocker function; normal recipes cannot produce it.
+recorded by an evidence classifier and the dedicated blocker function.
+Ordinary add-on timeouts, API errors, topology differences, capacity
+overcommit, and validation failures return `1`, preserve all pre-existing
+healthy tenants and data, and do not write a blocker. Blocker cleanup is
+limited to tenant state introduced by the failing create.
 
 ## Experimental worker boundary
 
@@ -276,6 +291,18 @@ storage continue running. This is an experimental container-worker workaround
 and a deliberate limitation, not normal fully reconciled Kamaji operation.
 Teardown unpauses before deletion.
 
+### Alternatives considered
+
+- **Self-managed kube-proxy:** omitting Kamaji's managed kube-proxy and
+  applying a lab-owned DaemonSet would expose the needed configuration, but
+  would replace a core Kamaji-managed add-on and require the lab to own
+  versioning, RBAC, ConfigMaps, upgrades, and migration. It is not a surgical
+  workaround for this experiment.
+- **Kube-proxy-free Calico/eBPF:** this would avoid the conntrack write but
+  changes the dataplane, kernel requirements, service-routing verification,
+  and compatibility scope. It is a viable future architecture, not an
+  equivalent repair of the reviewed iptables-mode topology.
+
 The TCP explicitly selects digest-pinned `KONNECTIVITY_AGENT_IMAGE` and
 `KONNECTIVITY_SERVER_IMAGE` by splitting each valid `tag@digest` reference
 between the CRD's image and version fields. `hostNetwork: true` gives the agent
@@ -329,8 +356,11 @@ three-instance PostgreSQL 18.4 Cluster. Required hostname anti-affinity spreads
 each cluster across its three exclusive workers; each instance requests
 `100m/256Mi`, is limited to `1 CPU/1Gi`, and owns a tenant-local `1Gi` claim.
 Node capacity still reflects the shared host, so
-the enforced capacity contract sums scheduled pod requests per node and
-compares them with each `1.25` CPU/`2560MiB` Docker cap.
+the enforced capacity contract computes each non-terminal Pod's effective
+request as `max(sum(app containers), max(init containers)) + pod overhead`
+for CPU and memory, then compares the node total with each
+`1.25` CPU/`2560MiB` Docker cap. Verification clients have explicit
+`25m/32Mi` requests and `100m/128Mi` limits.
 
 The behavioral verifier proves that the management API owns only the hosted
 control planes and none of either tenant's CNPG or database resources. For
@@ -363,6 +393,12 @@ pod, waits for its replacement to become Ready without the
 `nf_conntrack_max` permission crash, and proves the retained configuration is
 still zero.
 
+Existing stopped or transiently NotReady credentialed workers receive a
+bounded Ready grace before destructive reset/rejoin. Final joins install
+scoped return and signal cleanup immediately after creating material, revoke
+the token best-effort, and remove both container and host join directories on
+every path. Already-Ready workers clean or refuse stale exact join material.
+
 ## Version summary
 
 | Component | Pin |
@@ -393,6 +429,10 @@ have a reachable API, both credential Secrets, three current workers, and a
 healthy three-instance PostgreSQL cluster. Teardown always proves PostgreSQL
 connectivity. If `kamaji_verification` exists it also requires the survivor's
 exact marker; a create-only lab has no such table, and its absence is valid.
+The operation begins by proving `DataStore/default` and all tri-state
+prefix/user/role probes are inspectable. Maintenance Pod, API, or TLS failure
+is `inspection-failed`, never `absent`; targeted teardown returns `1` and
+retains namespace/runtime evidence until a retry can prove cleanup.
 
 Full teardown performs spike cleanup and both tenant cleanups before removing
 the kubectl-applied Kamaji hook ServiceAccount, Role, and RoleBinding, the
@@ -403,6 +443,15 @@ nested workers and the management node are absent; the secure original-value
 record is removed only after the restored values re-read exactly. Exact
 ownership records and Docker labels prevent adoption or deletion of
 same-named foreign objects. Repeated teardown tolerates absence.
+Deletion enumerates the exact management, spike, six worker, and six volume
+identities and checks recorded container and volume identities. Unexpected
+objects carrying the lab label fail closed rather than being swept.
+
+`just repair tenant-a|tenant-b` is the bounded explicit path for an incomplete
+owned TCP. It refuses absent or unowned state, restores reconciliation,
+reapplies the pause/kube-proxy workaround, reconciles that tenant's workers,
+add-ons, and CNPG resources, and requires any existing database marker to
+survive.
 
 If `.runtime` ownership or network evidence is lost while resources remain,
 teardown refuses to adopt or delete them. Recovery is deliberately manual:
@@ -410,6 +459,13 @@ independently verify the exact kind node identity and labels on every object,
 remove only proven lab-owned resources, and restore inotify values from a
 separately maintained host baseline. Operators must not reconstruct evidence,
 guess prior sysctl values, or use broad prune commands.
+
+Docker IPAM does not reserve the selected VIPs. A collision is therefore a
+fail-closed exception: stop the conflicting Docker endpoint, verify the
+recorded VIP is free, and retry without changing a healthy tenant. Kamaji's
+generated CoreDNS and kube-proxy images also remain an explicit upstream
+exception because its current managed-add-on fields cannot express the
+required digest references without a new self-managed dataplane architecture.
 
 Status and diagnostics enumerate the FR-014 layers in clean, partial, and
 healthy states without reconciliation: tools, Docker, management Kubernetes,

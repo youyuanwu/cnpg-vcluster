@@ -126,6 +126,33 @@ assert_marker_table_absent() {
     || die "${tenant} unexpectedly has a verification marker table"
 }
 
+bootstrap_token_inventory() {
+  local tenant="$1"
+  tenant_kubectl "${tenant}" -n kube-system get secrets -o json \
+    | python3 -c '
+import json,sys
+print("\n".join(sorted(
+    item["metadata"]["name"]
+    for item in json.load(sys.stdin).get("items",[])
+    if item.get("type") == "bootstrap.kubernetes.io/token"
+)))
+'
+}
+
+assert_effective_request_fixtures() {
+  local fixture
+  fixture='{"items":[{"spec":{"containers":[{"resources":{"requests":{"cpu":"50m","memory":"32Mi"}}}],"initContainers":[{"resources":{"requests":{"cpu":"900m","memory":"700Mi"}}}],"overhead":{"cpu":"50m","memory":"100Mi"}},"status":{"phase":"Running"}}]}'
+  printf '%s\n' "${fixture}" \
+    | CPU_CAP=1000000000 MEMORY_CAP=838860800 \
+      python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null
+  ! printf '%s\n' "${fixture}" \
+    | CPU_CAP=949999999 MEMORY_CAP=838860800 \
+      python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1
+  ! printf '%s\n' "${fixture}" \
+    | CPU_CAP=1000000000 MEMORY_CAP=838860799 \
+      python3 "${SCRIPT_DIR}/lib/effective_requests.py" >/dev/null 2>&1
+}
+
 assert_observer_read_only() {
   local output="$1"
   local expected_status="$2"
@@ -185,7 +212,8 @@ assert_sentinels_present() {
 cleanup_sentinels() {
   docker rm -f "${SENTINEL_CONTAINER}" >/dev/null 2>&1 || true
   docker volume rm "${SENTINEL_VOLUME}" >/dev/null 2>&1 || true
-  kind delete cluster --name "${SENTINEL_CLUSTER}" \
+  timeout "$(seconds_from_duration "${KIND_CREATE_TIMEOUT}")" \
+    kind delete cluster --name "${SENTINEL_CLUSTER}" \
     --kubeconfig "${SENTINEL_KUBECONFIG}" >/dev/null 2>&1 || true
   rm -f "${SENTINEL_KUBECONFIG}"
 }
@@ -249,6 +277,58 @@ test_unowned_refusals() {
     && docker container inspect "$(management_node_name)" >/dev/null \
     || die "unowned same-name management object was not refused and preserved"
   docker rm -f "$(management_node_name)" >/dev/null
+
+  name="$(worker_name tenant-a 1)"
+  volume="$(worker_volume_name tenant-a 1)"
+  docker volume create \
+    --label "${OWNERSHIP_LABEL}=${LAB_PREFIX}" \
+    --label kamaji.cnpg-vcluster.io/tenant=tenant-a \
+    --label kamaji.cnpg-vcluster.io/role=worker-var-lib \
+    "${volume}" >/dev/null
+  docker run -d --name "${name}" \
+    --label "${OWNERSHIP_LABEL}=${LAB_PREFIX}" \
+    --label kamaji.cnpg-vcluster.io/tenant=tenant-a \
+    --label kamaji.cnpg-vcluster.io/role=worker \
+    --mount "type=volume,src=${volume},dst=/var/lib" \
+    "${VERIFY_IMAGE}" sleep 3600 >/dev/null
+  set +e
+  output="$("${SCRIPT_DIR}/destroy.sh" 2>&1)"
+  status=$?
+  set -e
+  [[ "${status}" -eq "${EXIT_ERROR}" \
+    && -n "$(docker container inspect "${name}" 2>/dev/null)" ]] \
+    || die "owned worker without a record was not refused and preserved"
+  mkdir -p -m 0700 "$(dirname "$(worker_ownership_file tenant-a 1)")"
+  {
+    printf 'WORKER_NAME=%s\n' "${name}"
+    printf 'WORKER_ID=wrong-id\n'
+    printf 'WORKER_VOLUME=%s\n' "${volume}"
+    printf 'WORKER_VOLUME_ID=%s\n' \
+      "$(docker volume inspect --format '{{.Name}}:{{.CreatedAt}}' "${volume}")"
+  } | write_secret_file "$(worker_ownership_file tenant-a 1)"
+  set +e
+  output="$("${SCRIPT_DIR}/destroy.sh" 2>&1)"
+  status=$?
+  set -e
+  [[ "${status}" -eq "${EXIT_ERROR}" \
+    && -n "$(docker container inspect "${name}" 2>/dev/null)" ]] \
+    || die "mismatched worker record was not refused and preserved"
+  docker rm -f "${name}" >/dev/null
+  docker volume rm "${volume}" >/dev/null
+  rm -rf "${RUNTIME_DIR}"
+
+  docker run -d --name "${LAB_PREFIX}-unexpected-owned-sentinel" \
+    --label "${OWNERSHIP_LABEL}=${LAB_PREFIX}" \
+    --label kamaji.cnpg-vcluster.io/role=unexpected \
+    "${VERIFY_IMAGE}" sleep 3600 >/dev/null
+  set +e
+  output="$("${SCRIPT_DIR}/destroy.sh" 2>&1)"
+  status=$?
+  set -e
+  [[ "${status}" -eq "${EXIT_ERROR}" ]] \
+    && docker container inspect "${LAB_PREFIX}-unexpected-owned-sentinel" >/dev/null \
+    || die "unexpected ownership-labelled sentinel was swept"
+  docker rm -f "${LAB_PREFIX}-unexpected-owned-sentinel" >/dev/null
 }
 
 require_exact_just
@@ -272,6 +352,7 @@ kind create cluster --name "${SENTINEL_CLUSTER}" \
   --wait "${KIND_CREATE_TIMEOUT}" >>"${RESULT_LOG}" 2>&1
 chmod 0600 "${SENTINEL_KUBECONFIG}"
 assert_sentinels_present
+assert_effective_request_fixtures
 
 assert_observer_read_only "${CACHE_DIR}/e2e-clean-status.log" \
   "${EXIT_ERROR}" "${SCRIPT_DIR}/status.sh"
@@ -332,6 +413,95 @@ run_logged "${SCRIPT_DIR}/create.sh"
 [[ "$(marker_value tenant-a)" == "${marker_a_before}" \
   && "$(marker_value tenant-b)" == "${marker_b_before}" ]] \
   || die "repeat create changed a database marker"
+
+rm -f "${BLOCKER_FILE}"
+set +e
+env KAMAJI_TEST_INJECT_ADDON_FAILURE=tenant-a \
+  "${SCRIPT_DIR}/create.sh" >>"${RESULT_LOG}" 2>&1
+ordinary_status=$?
+set -e
+[[ "${ordinary_status}" -eq "${EXIT_ERROR}" ]] \
+  || die "ordinary add-on failure returned ${ordinary_status}, expected exit 1"
+[[ ! -e "${BLOCKER_FILE}" ]] \
+  || die "ordinary add-on failure created a compatibility blocker record"
+grep -Fxq 'result=error' "${FINAL_RESULT_FILE}" \
+  && grep -Fxq 'cleanup=not-attempted' "${FINAL_RESULT_FILE}" \
+  || die "ordinary add-on failure did not record an error result"
+[[ "$(worker_identities)" == "${worker_before}" \
+  && "$(cluster_identities)" == "${clusters_before}" \
+  && "$(marker_value tenant-a)" == "${marker_a_before}" \
+  && "$(marker_value tenant-b)" == "${marker_b_before}" ]] \
+  || die "ordinary add-on failure damaged a healthy tenant or database"
+
+set +e
+env KAMAJI_TEST_DATASTORE_UNAVAILABLE=1 \
+  "${SCRIPT_DIR}/destroy-tenant.sh" tenant-a >>"${RESULT_LOG}" 2>&1
+datastore_status=$?
+set -e
+[[ "${datastore_status}" -eq "${EXIT_ERROR}" ]] \
+  || die "datastore-unavailable targeted teardown did not return exit 1"
+[[ "$(worker_identities)" == "${worker_before}" \
+  && "$(cluster_identities)" == "${clusters_before}" \
+  && "$(marker_value tenant-a)" == "${marker_a_before}" \
+  && "$(marker_value tenant-b)" == "${marker_b_before}" \
+  && -d "$(tenant_runtime_dir tenant-a)" ]] \
+  || die "datastore-unavailable targeted teardown removed retry evidence or tenant data"
+
+stopped_worker="$(worker_name tenant-a 1)"
+stopped_id="$(docker container inspect --format '{{.Id}}' "${stopped_worker}")"
+stopped_uid="$(tenant_kubectl tenant-a get node "${stopped_worker}" -o jsonpath='{.metadata.uid}')"
+docker exec "${stopped_worker}" mkdir -p /var/lib/kamaji-e2e /var/lib/containerd/kamaji-e2e
+docker exec "${stopped_worker}" sh -c \
+  'printf stopped-data > /var/lib/kamaji-e2e/stopped; printf stopped-cache > /var/lib/containerd/kamaji-e2e/cache'
+docker stop "${stopped_worker}" >/dev/null
+run_logged env SKIP_CNPG=1 "${SCRIPT_DIR}/create.sh"
+[[ "$(docker container inspect --format '{{.Id}}' "${stopped_worker}")" == "${stopped_id}" \
+  && "$(tenant_kubectl tenant-a get node "${stopped_worker}" -o jsonpath='{.metadata.uid}')" == "${stopped_uid}" \
+  && "$(docker exec "${stopped_worker}" cat /var/lib/kamaji-e2e/stopped)" == stopped-data \
+  && "$(docker exec "${stopped_worker}" cat /var/lib/containerd/kamaji-e2e/cache)" == stopped-cache ]] \
+  || die "stopped-worker readiness grace replaced node, container, data, or cache identity"
+
+interrupted_worker="$(worker_name tenant-a 3)"
+tokens_before="$(bootstrap_token_inventory tenant-a)"
+tenant_kubectl tenant-a delete node "${interrupted_worker}" \
+  --ignore-not-found --wait=true --timeout="${WORKER_JOIN_TIMEOUT}" >/dev/null
+docker exec "${interrupted_worker}" kubeadm reset --force \
+  --cri-socket unix:///run/containerd/containerd.sock >/dev/null 2>&1 || true
+set +e
+env SKIP_CNPG=1 KAMAJI_TEST_FAIL_AFTER_FINAL_JOIN="${interrupted_worker}" \
+  "${SCRIPT_DIR}/create.sh" >>"${RESULT_LOG}" 2>&1
+join_status=$?
+set -e
+[[ "${join_status}" -eq "${EXIT_ERROR}" ]] \
+  || die "injected post-join failure did not remain an ordinary exit 1"
+[[ ! -e "$(tenant_runtime_dir tenant-a)/join/${interrupted_worker}" ]] \
+  && ! docker exec "${interrupted_worker}" test -e /var/lib/kamaji-final-join \
+  && [[ "$(bootstrap_token_inventory tenant-a)" == "${tokens_before}" ]] \
+  || die "interrupted final-worker join retained admin.conf, join script, token, or host material"
+run_logged env SKIP_CNPG=1 "${SCRIPT_DIR}/create.sh"
+tenant_workers_ready tenant-a \
+  || die "worker did not recover after interruption-safe join cleanup"
+
+cat <<EOF | tenant_kubectl tenant-b apply -f - >/dev/null
+apiVersion: v1
+kind: Node
+metadata:
+  name: unexpected-notready-node
+spec:
+  unschedulable: true
+EOF
+set +e
+env SKIP_CNPG=1 "${SCRIPT_DIR}/create.sh" >>"${RESULT_LOG}" 2>&1
+topology_status=$?
+"${SCRIPT_DIR}/status.sh" >>"${RESULT_LOG}" 2>&1
+status_topology=$?
+set -e
+[[ "${topology_status}" -eq "${EXIT_ERROR}" \
+  && "${status_topology}" -eq "${EXIT_ERROR}" ]] \
+  || die "extra unlabeled NotReady Node was not rejected by create and status"
+tenant_kubectl tenant-b delete node unexpected-notready-node \
+  --wait=true --timeout="${WORKER_JOIN_TIMEOUT}" >/dev/null
+run_logged env SKIP_CNPG=1 "${SCRIPT_DIR}/create.sh"
 for tenant in ${TENANT_NAMES}; do
   wait_for "${CNPG_TIMEOUT}" "${tenant} stable CNPG health after repeat create" \
     cnpg_tenant_ready "${tenant}" \
@@ -403,6 +573,18 @@ for tenant in ${TENANT_NAMES}; do
     cnpg_tenant_ready "${tenant}" \
     || die "${tenant} did not settle before verification"
 done
+set +e
+env KAMAJI_TEST_FAIL_AFTER_CROSS_AUTH_SECRET=tenant-a \
+  "${SCRIPT_DIR}/verify.sh" >>"${RESULT_LOG}" 2>&1
+cross_auth_status=$?
+set -e
+[[ "${cross_auth_status}" -eq "${EXIT_ERROR}" ]] \
+  || die "cross-auth interruption fixture did not fail with exit 1"
+! tenant_kubectl tenant-b -n "${DATABASE_NAMESPACE}" \
+  get secret cnpg-cross-auth-tenant-a >/dev/null 2>&1 \
+  || die "cross-auth interruption retained the exact credential Secret"
+cnpg_tenant_ready tenant-a && cnpg_tenant_ready tenant-b \
+  || die "cross-auth interruption damaged a tenant database"
 run_logged "${SCRIPT_DIR}/verify.sh"
 run_logged "${SCRIPT_DIR}/destroy-tenant.sh" tenant-a
 load_management_network
