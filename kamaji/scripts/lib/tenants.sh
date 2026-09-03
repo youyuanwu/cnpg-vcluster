@@ -406,6 +406,62 @@ final_tenant_tcp_ready() {
     && "${datastore}" == default ]]
 }
 
+tenant_control_plane_container_statuses() {
+  local tenant="$1"
+  local namespace
+  namespace="$(tenant_namespace "${tenant}")"
+  management_kubectl -n "${namespace}" get pods -o json 2>/dev/null \
+    | TENANT="${tenant}" python3 -c '
+import json, os, sys
+names = {
+    "kube-apiserver",
+    "kube-controller-manager",
+    "kube-scheduler",
+    "konnectivity-server",
+}
+for pod in json.load(sys.stdin).get("items", []):
+    pod_name = pod.get("metadata", {}).get("name", "")
+    for status in pod.get("status", {}).get("containerStatuses", []):
+        name = status.get("name", "")
+        if name not in names:
+            continue
+        state = status.get("state", {})
+        if state.get("running") is not None:
+            current = "running"
+        elif state.get("waiting") is not None:
+            current = "waiting:" + state["waiting"].get("reason", "unknown")
+        elif state.get("terminated") is not None:
+            current = "terminated:" + state["terminated"].get("reason", "unknown")
+        else:
+            current = "unknown"
+        terminated = status.get("lastState", {}).get("terminated", {})
+        print(
+            "tenant={tenant} pod={pod} container={container} restarts={restarts} "
+            "state={state} last_reason={reason} last_exit={exit_code}".format(
+                tenant=os.environ["TENANT"],
+                pod=pod_name,
+                container=name,
+                restarts=status.get("restartCount", 0),
+                state=current,
+                reason=terminated.get("reason", "none"),
+                exit_code=terminated.get("exitCode", "none"),
+            )
+        )
+'
+}
+
+tenant_control_plane_oom_evidence() {
+  tenant_control_plane_container_statuses "$1" \
+    | grep -E 'state=terminated:OOMKilled|last_reason=OOMKilled'
+}
+
+all_tenant_control_plane_oom_evidence() {
+  local tenant
+  for tenant in ${TENANT_NAMES}; do
+    tenant_control_plane_oom_evidence "${tenant}" || true
+  done
+}
+
 export_tenant_kubeconfig() {
   local tenant="$1"
   local namespace secret_name server

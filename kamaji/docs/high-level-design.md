@@ -51,7 +51,7 @@ network assignments, logs, and generated credentials.
 ## Deterministic supply chain
 
 `config/versions.env` records the source URL and SHA-256 or OCI digest for every
-direct Phase 1 input:
+direct input:
 
 - kind 0.33.0 and `kindest/node:v1.36.4`;
 - kubectl 1.36.4 and Helm 3.21.4;
@@ -146,7 +146,9 @@ Docker metadata, owned resource names/status, runtime filenames/modes, blocker
 records, and API state reachable through an already existing explicit
 kubeconfig. Tenant views include CNPG CRDs, webhooks, RBAC, controller image
 and readiness, PostgreSQL services and primary, instance placement, PVC/PV
-state, and recent operator/database events.
+state, and recent operator/database events. They also expose each tenant
+control-plane container's restart count, current state, and last terminated
+reason/exit code. A retained `OOMKilled` last state is reported as unhealthy.
 
 ## Preflight and capacity
 
@@ -188,9 +190,21 @@ under `/etc`, and is never called implicitly by creation. Full teardown restores
 owned management cluster have been removed.
 
 The admission model counts six worker Docker caps (7.5 CPUs and 15 GiB),
-management requests (1.2 CPUs and 2 GiB), and a kind/system reserve (2 CPUs and
-3 GiB). Tenant pod limits run inside worker caps and are not added to the host
-admission total a second time.
+management requests (1.2 CPUs and 2.25 GiB), and a kind/system reserve (2 CPUs
+and 3 GiB). The resulting 10.7 CPU and 20.25 GiB admission leaves 1.3 CPU and
+3.75 GiB at the 12-CPU/24-GiB floor. The management memory request arithmetic
+is 128 MiB for Kamaji, 768 MiB for three datastore replicas, 1024 MiB for two
+tenant control planes, and 384 MiB for cert-manager and MetalLB.
+
+Each tenant control plane requests 512 MiB in aggregate. Its component limits
+sum to 1536 MiB: 1 GiB for kube-apiserver and 256 MiB each for controller
+manager and scheduler. The API server request remains 256 MiB. Clean lifecycle
+evidence showed both tenant API servers terminated with exit 137 and
+`OOMKilled` at the former 512 MiB limit while the host still had about 22 GiB
+available, so the 1 GiB ceiling addresses a measured per-cgroup constraint
+without inflating requests or weakening the 24 GiB host gate. Tenant pod
+limits run inside worker caps and are not added to host admission a second
+time; management limits are burst ceilings rather than admission quantities.
 
 ## Finite failure semantics
 
@@ -198,8 +212,7 @@ Downloads, remote descriptor/image checks, Kubernetes requests, probes, and
 future readiness checks consume finite environment-overridable durations.
 Status uses `1` for an unhealthy or not-yet-created lab. Ordinary failures also
 use `1`. Status `2` is reserved solely for a recognized compatibility blocker
-recorded by the dedicated blocker function; Phase 1 cannot produce it through
-a normal recipe.
+recorded by the dedicated blocker function; normal recipes cannot produce it.
 
 ## Experimental worker boundary
 
@@ -249,7 +262,7 @@ tries to update `nf_conntrack_max`. On this host, the Linux kernel exposes
 including a single-level privileged container; nesting, Docker/runc masking,
 and missing privilege are not the cause. The viable paths are to configure
 kube-proxy with `conntrack.maxPerCore: 0` before startup, as kind does for
-container nodes. Phase 4 implements that path without replacing kube-proxy or
+container nodes. The lab implements that path without replacing kube-proxy or
 Calico. Kamaji's `spec.addons.kubeProxy` image repository/tag fields do not
 directly expose the setting, and an unpaused ConfigMap patch is reverted within
 two seconds. The lab temporarily uses Kamaji's pause annotation, patches the generated
@@ -376,8 +389,10 @@ TCP is deliberately unpaused only for finalization. Deletion is not complete
 until its management namespace, kubeconfig/PKI and datastore credential
 Secrets, exact etcd prefix/user/role, API VIP claim, and
 `DataStore.status.usedBy` reference are absent. The opposite tenant must still
-have a reachable API, both credential Secrets, three current workers, its SQL
-marker, and a healthy three-instance PostgreSQL cluster.
+have a reachable API, both credential Secrets, three current workers, and a
+healthy three-instance PostgreSQL cluster. Teardown always proves PostgreSQL
+connectivity. If `kamaji_verification` exists it also requires the survivor's
+exact marker; a create-only lab has no such table, and its absence is valid.
 
 Full teardown performs spike cleanup and both tenant cleanups before removing
 the kubectl-applied Kamaji hook ServiceAccount, Role, and RoleBinding, the
@@ -388,6 +403,13 @@ nested workers and the management node are absent; the secure original-value
 record is removed only after the restored values re-read exactly. Exact
 ownership records and Docker labels prevent adoption or deletion of
 same-named foreign objects. Repeated teardown tolerates absence.
+
+If `.runtime` ownership or network evidence is lost while resources remain,
+teardown refuses to adopt or delete them. Recovery is deliberately manual:
+independently verify the exact kind node identity and labels on every object,
+remove only proven lab-owned resources, and restore inotify values from a
+separately maintained host baseline. Operators must not reconstruct evidence,
+guess prior sysctl values, or use broad prune commands.
 
 Status and diagnostics enumerate the FR-014 layers in clean, partial, and
 healthy states without reconciliation: tools, Docker, management Kubernetes,

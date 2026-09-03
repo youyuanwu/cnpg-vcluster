@@ -34,17 +34,40 @@ runtime_fingerprint() {
 }
 
 management_fingerprint() {
+  local tenant
   if [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
     && management_kubectl get --raw=/readyz >/dev/null 2>&1; then
-    management_kubectl get namespaces,deployments,statefulsets,daemonsets,pvc,services \
+    {
+      management_kubectl get namespaces,deployments,statefulsets,daemonsets,pvc,services \
       --all-namespaces -o json \
-      | python3 -c '
+        | RESOURCE_SCOPE=management python3 -c '
 import json, sys
+import os
 for item in json.load(sys.stdin).get("items", []):
     metadata=item["metadata"]
-    print(item["kind"], metadata.get("namespace", ""), metadata["name"],
+    print(os.environ["RESOURCE_SCOPE"], item["kind"],
+          metadata.get("namespace", ""), metadata["name"],
           metadata.get("uid", ""))
-' | sort | sha256sum
+'
+      for tenant in ${TENANT_NAMES}; do
+        if [[ -f "$(tenant_kubeconfig "${tenant}")" ]] \
+          && tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1; then
+          tenant_kubectl "${tenant}" get \
+            namespaces,deployments,statefulsets,daemonsets,pvc,services,clusters.postgresql.cnpg.io \
+            --all-namespaces -o json 2>/dev/null \
+            | RESOURCE_SCOPE="${tenant}" python3 -c '
+import json, os, sys
+for item in json.load(sys.stdin).get("items", []):
+    metadata=item["metadata"]
+    print(os.environ["RESOURCE_SCOPE"], item["kind"],
+          metadata.get("namespace", ""), metadata["name"],
+          metadata.get("uid", ""))
+'
+        else
+          printf '%s unavailable\n' "${tenant}"
+        fi
+      done
+    } | sort | sha256sum
   else
     printf 'unavailable\n'
   fi
@@ -93,6 +116,14 @@ seed_markers() {
     [[ "$(marker_value "${tenant}")" == "${marker}" ]] \
       || die "${tenant} marker seed failed"
   done
+}
+
+assert_marker_table_absent() {
+  local tenant="$1"
+  [[ "$(cnpg_run_sql "${tenant}" \
+    "SELECT COALESCE(to_regclass('public.kamaji_verification')::text, 'absent');" \
+    | tail -1)" == absent ]] \
+    || die "${tenant} unexpectedly has a verification marker table"
 }
 
 assert_observer_read_only() {
@@ -275,6 +306,19 @@ if (( create_status != EXIT_SUCCESS )); then
   recognized_blocker_cleanup "${create_status}"
 fi
 
+for tenant in ${TENANT_NAMES}; do
+  assert_marker_table_absent "${tenant}"
+done
+run_logged "${SCRIPT_DIR}/destroy-tenant.sh" tenant-a
+assert_marker_table_absent tenant-b
+run_logged "${SCRIPT_DIR}/create.sh"
+for tenant in ${TENANT_NAMES}; do
+  wait_for "${CNPG_TIMEOUT}" "${tenant} stable CNPG health after unseeded teardown recovery" \
+    cnpg_tenant_ready "${tenant}" \
+    || die "${tenant} did not settle after unseeded teardown recovery"
+  assert_marker_table_absent "${tenant}"
+done
+
 seed_markers
 worker_before="$(worker_identities)"
 clusters_before="$(cluster_identities)"
@@ -367,7 +411,7 @@ final_tenant_exists tenant-b \
   && tenant_kube_proxy_steady_state_is_preserved tenant-b \
   && tenant_workers_ready tenant-b \
   && cnpg_tenant_ready tenant-b \
-  && cnpg_verify_marker tenant-b \
+  && cnpg_verify_marker_if_present tenant-b \
   || die "tenant-b did not survive tenant-a teardown"
 assert_observer_read_only "${CACHE_DIR}/e2e-one-tenant-status.log" \
   "${EXIT_ERROR}" "${SCRIPT_DIR}/status.sh"

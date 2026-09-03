@@ -53,8 +53,9 @@ delete_tenant_test_resources() {
   [[ -f "$(tenant_kubeconfig "${tenant}")" ]] \
     && tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1 \
     || return 0
-  tenant_kubectl "${tenant}" -n default delete pod phase4-network-smoke \
-    "${TENANT_SMOKE_POD}" --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  tenant_kubectl "${tenant}" -n default delete pod \
+    "${TENANT_NETWORK_SMOKE_POD}" "${TENANT_SMOKE_POD}" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
   tenant_kubectl "${tenant}" -n default delete pvc "${TENANT_SMOKE_PVC}" \
     --ignore-not-found --wait=true --timeout="${TENANT_STORAGE_TIMEOUT}" \
     >/dev/null 2>&1 || true
@@ -130,7 +131,7 @@ verify_surviving_tenant_health() {
     || die "${tenant}.survivor: datastore identity is incomplete"
   tenant_workers_ready "${tenant}" \
     && cnpg_tenant_ready "${tenant}" \
-    && cnpg_verify_marker "${tenant}" \
+    && cnpg_verify_marker_if_present "${tenant}" \
     || die "${tenant}.survivor: workers, PostgreSQL, or marker are unhealthy"
   for ordinal in $(seq 1 "${WORKERS_PER_TENANT}"); do
     final_worker_current "${tenant}" "${ordinal}" \

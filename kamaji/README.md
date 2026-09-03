@@ -8,8 +8,8 @@ artifact. The edge channel is experimental; CLASTIX's stable artifact channel
 is not freely downloadable.
 
 The permanent compatibility gate uses one spike-only hosted control plane and
-worker. Phase 4 adds the fixed two-tenant/six-worker topology, the scoped
-kube-proxy remediation, and explicit host inotify admission. The previously
+worker. The fixed two-tenant/six-worker topology adds scoped kube-proxy
+remediation and explicit host inotify admission. The previously
 observed worker exit `255` was host `fs.inotify.max_user_instances=128`
 exhaustion during systemd startup, not evidence that the worker substrate or
 host capacity was unsupported.
@@ -94,6 +94,17 @@ want stricter admission and for deterministic rejection tests; lowering them
 weakens the documented lab admission floor. `just test-inotify-negative`
 proves both inotify failures occur before any retained mutation.
 
+The 24 GiB memory floor counts 15 GiB of six worker-container caps, 2.25 GiB
+of management-cluster pod requests, and a 3 GiB kind/system reserve: 20.25 GiB
+admitted, leaving 3.75 GiB. Each tenant control plane keeps a 512 MiB aggregate
+request inside the management request budget. Its component limits total
+1536 MiB: the kube-apiserver requests 256 MiB and is limited to 1 GiB, while
+the controller manager and scheduler each request 128 MiB and are limited to
+256 MiB. The API limit was raised after clean lifecycle runs measured
+repeatable cgroup OOMKills at 512 MiB despite ample host memory. Limits are
+burst ceilings, not extra admission quantities; requests remain unchanged so
+the lab does not disguise host pressure.
+
 `just create-management` creates or reconciles only the management plane. It
 records the exact kind node container identity before later adoption, derives
 two free addresses from the actual kind Docker IPv4 subnet, installs the
@@ -158,8 +169,8 @@ Workers and volumes have exact ownership labels, persistent `/var/lib`,
 same-name refusal, stopped/stale handling, partial rejoin, and short-lived
 token cleanup.
 
-Validated Phase 4 runs leave exactly two Ready, intentionally paused TCPs,
-three disjoint Ready workers per tenant, healthy
+Validated runs leave exactly two Ready, intentionally paused TCPs, three
+disjoint Ready workers per tenant, healthy
 CoreDNS/kube-proxy/Konnectivity/Calico, one default Local Path class, and a
 Bound smoke PVC per tenant. Repeating
 `just create` first requires the pause annotation, remediation revision, and
@@ -193,13 +204,26 @@ CNPG operator, smoke resources, nodes, workers, owned volumes, TCP namespace,
 kubeconfig/PKI and datastore credentials, runtime state, datastore schema,
 user/role, and `DataStore.status.usedBy` entry. It first accounts for the
 intentional TCP pause, then proves Tenant B's API, credentials, three workers,
-marker, datastore identity, and PostgreSQL cluster remain healthy.
+datastore identity, and PostgreSQL cluster remain healthy. A create-only lab
+has no `kamaji_verification` table, so teardown first proves SQL connectivity
+and does not require a marker. If the table exists, teardown requires the
+survivor's exact marker and rejects a missing or different value.
 
 `just destroy` removes spike residuals, both tenants, the kubectl-applied
 Kamaji datastore hook RBAC, Kamaji/datastore, MetalLB, cert-manager, the exact
 owned kind cluster, and `.runtime/`. It refuses unowned same-name objects,
 uses the lab-local kubeconfig so unrelated contexts are untouched, and
 restores the values recorded by `just prepare-host`. Repeating it is safe.
+
+Teardown intentionally fails closed if `.runtime` ownership or network
+evidence is lost while resources are live. There is no force-adopt or
+force-delete switch. Stop automated operations, independently inspect the
+exact kind container label and ID plus every Kamaji ownership label, and
+manually remove only resources whose ownership can be proven. Do not recreate
+evidence files, use broad Docker prune commands, or guess the original
+inotify values. Restore inotify settings to the host's separately documented
+baseline; if no baseline exists, obtain one from the host administrator before
+cleanup.
 
 `just test-e2e` starts from full cleanup, exercises capacity rejection,
 host preparation, create/repeat/recovery, clean/partial/healthy observers,
@@ -219,7 +243,9 @@ smoke PVCs, and blocked residual checks. They exit unhealthy when an expected
 replica, pause, patch, or storage gate is absent.
 Healthy tenant views also report CNPG CRDs, webhooks, RBAC, operator image and
 readiness, PostgreSQL services and primary, instance placements, PVCs, PVs,
-and recent database events.
+and recent database events. Both observers also print tenant control-plane
+container restart counts, current state, and last termination reason/exit
+code; retained `OOMKilled` evidence makes the observed state unhealthy.
 
 ## Security and state
 

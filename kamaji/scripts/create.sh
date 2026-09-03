@@ -90,6 +90,7 @@ cleanup_final_topology() {
 
 finish_final_create() {
   local status=$?
+  local oom_evidence=""
   trap - EXIT
   if [[ "${status}" -eq "${EXIT_BLOCKED}" ]]; then
     set +e
@@ -116,7 +117,13 @@ finish_final_create() {
   else
     final_result=error
     final_blocker_prerequisite="${final_blocker_prerequisite:-create}"
-    final_blocker_message="${final_blocker_message:-final reconciliation failed; inspect diagnostics}"
+    oom_evidence="$(all_tenant_control_plane_oom_evidence || true)"
+    if [[ -n "${oom_evidence}" ]]; then
+      final_blocker_message="tenant control-plane OOMKilled: ${oom_evidence//$'\n'/; }"
+      warn "${final_blocker_message}"
+    else
+      final_blocker_message="${final_blocker_message:-final reconciliation failed; inspect diagnostics}"
+    fi
     write_final_result
   fi
   exit "${status}"

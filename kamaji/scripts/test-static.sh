@@ -81,14 +81,6 @@ inotify_watch_fixture_rejects() {
       "$((MIN_INOTIFY_WATCHES - 1))" inotify-watches
 }
 
-command_returns_one() {
-  set +e
-  "$@" >/dev/null 2>&1
-  local status=$?
-  set -e
-  [[ "${status}" -eq "${EXIT_ERROR}" ]]
-}
-
 observer_is_read_only() {
   local before_runtime before_resources after_resources output status resources_ok=1
   before_runtime="$(runtime_fingerprint)"
@@ -142,6 +134,59 @@ hostile_observer_is_rejected() (
   ! observer_is_read_only hostile_exit_observer \
     && rm -f "${RUNTIME_DIR}/mutated" \
     && ! observer_is_read_only hostile_mutation_observer
+)
+
+optional_marker_policy_fixture() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/cnpg.sh"
+  local state="$1"
+
+  cnpg_run_sql() {
+    local tenant="$1"
+    local sql="$2"
+    if [[ "${sql}" == *"to_regclass"* ]]; then
+      if [[ "${state}" == unseeded ]]; then
+        printf 'absent\n'
+      else
+        printf 'kamaji_verification\n'
+      fi
+    elif [[ "${state}" == seeded-correct ]]; then
+      cnpg_database_marker "${tenant}"
+    else
+      printf 'wrong-marker\n'
+    fi
+  }
+
+  case "${state}" in
+    unseeded|seeded-correct)
+      cnpg_verify_marker_if_present tenant-b
+      ;;
+    seeded-wrong)
+      ! cnpg_verify_marker_if_present tenant-b
+      ;;
+  esac
+)
+
+control_plane_oom_fixture() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/tenants.sh"
+
+  management_kubectl() {
+    cat <<'JSON'
+{"items":[{"metadata":{"name":"tenant-a-abc"},"status":{"containerStatuses":[
+  {"name":"kube-apiserver","restartCount":2,"state":{"running":{"startedAt":"now"}},"lastState":{"terminated":{"reason":"OOMKilled","exitCode":137}}},
+  {"name":"kube-scheduler","restartCount":0,"state":{"running":{"startedAt":"now"}},"lastState":{}}
+]}}]}
+JSON
+  }
+
+  output="$(tenant_control_plane_container_statuses tenant-a)"
+  grep -Fq 'container=kube-apiserver restarts=2 state=running last_reason=OOMKilled last_exit=137' \
+    <<<"${output}" \
+    && grep -Fq 'container=kube-scheduler restarts=0 state=running last_reason=none last_exit=none' \
+      <<<"${output}" \
+    && tenant_control_plane_oom_evidence tenant-a \
+      | grep -Fq 'last_reason=OOMKilled'
 )
 
 services_claiming_vip_fixture() (
@@ -491,9 +536,11 @@ check "spike control-plane resource split matches aggregate budget" bash -c '
      "$TENANT_API_SERVER_LIMIT_CPU" == 500m &&
      "$TENANT_CONTROLLER_MANAGER_LIMIT_CPU" == 300m &&
      "$TENANT_SCHEDULER_LIMIT_CPU" == 200m &&
-     "$TENANT_API_SERVER_LIMIT_MEMORY" == 512Mi &&
+     "$TENANT_API_SERVER_LIMIT_MEMORY" == 1Gi &&
      "$TENANT_CONTROLLER_MANAGER_LIMIT_MEMORY" == 256Mi &&
-     "$TENANT_SCHEDULER_LIMIT_MEMORY" == 256Mi ]]
+     "$TENANT_SCHEDULER_LIMIT_MEMORY" == 256Mi &&
+     "$TENANT_CONTROL_PLANE_REQUEST_MEMORY" == 512Mi &&
+     "$TENANT_CONTROL_PLANE_LIMIT_MEMORY" == 1536Mi ]]
 ' _ "${LAB_ROOT}"
 check "CPU threshold fixture rejects before mutation" \
   capacity_fixture_rejects CPU_FIXTURE 11 cpu
@@ -506,7 +553,7 @@ check "inotify instance threshold fixture rejects before mutation" \
 check "inotify watch threshold fixture rejects before mutation" \
   inotify_watch_fixture_rejects
 
-check "host preparation records applies verifies and exposes Phase 6 restore" bash -c '
+check "host preparation records applies verifies and exposes full restore" bash -c '
   file="$1/scripts/lib/host.sh"
   grep -Fq "HOST_SYSCTL_STATE_FILE" "$file" &&
   grep -Fq "record_original_inotify_values" "$file" &&
@@ -577,8 +624,6 @@ check "only compatibility paths can return blocked status" bash -c '
   grep -Fq "exit \"\${EXIT_BLOCKED}\"" "$1/scripts/verify.sh" &&
   grep -Fq "recognized_blocker_cleanup" "$1/scripts/test-e2e.sh"
 ' _ "${LAB_ROOT}"
-check "unimplemented normal path returns 1, never 2" \
-  command_returns_one "${SCRIPT_DIR}/unavailable.sh" create "later phase"
 check "status is read-only and never returns blocker status" \
   observer_is_read_only "${SCRIPT_DIR}/status.sh"
 check "diagnostics is read-only and never returns blocker status" \
@@ -850,7 +895,9 @@ check "runtime result captures endpoint and CA identity separation" bash -c '
 check "capacity accounting uses Docker caps and scheduled pod requests" bash -c '
   source "$1/config/settings.env"
   [[ "$WORKER_TOTAL_CPUS" == 7.5 && "$WORKER_TOTAL_MEMORY_GIB" == 15 &&
-     "$MANAGEMENT_REQUEST_CPUS" == 1.2 && "$KIND_RESERVE_CPUS" == 2 ]] &&
+     "$MANAGEMENT_REQUEST_CPUS" == 1.2 &&
+     "$MANAGEMENT_REQUEST_MEMORY_GIB" == 2.25 &&
+     "$KIND_RESERVE_CPUS" == 2 && "$KIND_RESERVE_MEMORY_GIB" == 3 ]] &&
   grep -Fq "validate_final_worker_request_capacity" "$1/scripts/lib/workers.sh" &&
   grep -Fq "requested_cpu <= int(os.environ[\"CPU_CAP\"])" "$1/scripts/lib/workers.sh" &&
   grep -Fq "requested_memory <= int(os.environ[\"MEMORY_CAP\"])" "$1/scripts/lib/workers.sh"
@@ -977,8 +1024,22 @@ check "tenant teardown is exact and verifies the survivor" bash -c '
   grep -Fq "DataStore/default still reports status.usedBy" "$file" &&
   grep -Fq "exact datastore schema remains" "$file" &&
   grep -Fq "verify_surviving_tenant_health" "$file" &&
-  grep -Fq "cnpg_verify_marker" "$file" &&
+  grep -Fq "cnpg_verify_marker_if_present" "$file" &&
   grep -Fq "container identity drifted" "$file"
+' _ "${LAB_ROOT}"
+check "survivor marker policy accepts unseeded and requires seeded identity" \
+  optional_marker_policy_fixture unseeded
+check "survivor marker policy accepts the correct seeded marker" \
+  optional_marker_policy_fixture seeded-correct
+check "survivor marker policy rejects an incorrect seeded marker" \
+  optional_marker_policy_fixture seeded-wrong
+check "control-plane diagnostics expose restart and OOMKilled evidence" \
+  control_plane_oom_fixture
+check "create failure records tenant control-plane OOMKilled cause" bash -c '
+  grep -Fq "all_tenant_control_plane_oom_evidence" "$1/scripts/create.sh" &&
+  grep -Fq "tenant control-plane OOMKilled" "$1/scripts/create.sh" &&
+  grep -Fq "control plane has OOMKilled container evidence" "$1/scripts/status.sh" &&
+  grep -Fq "control plane has OOMKilled container evidence" "$1/scripts/diagnose.sh"
 ' _ "${LAB_ROOT}"
 check "full teardown removes shared resources then restores host state" bash -c '
   file="$1/scripts/destroy.sh"
@@ -1012,6 +1073,8 @@ check "lifecycle E2E covers clean partial healthy recovery refusal and teardown"
   grep -Fq "e2e-clean-status.log" "$file" &&
   grep -Fq "e2e-partial-status.log" "$file" &&
   grep -Fq "e2e-healthy-status.log" "$file" &&
+  grep -Fq "assert_marker_table_absent" "$file" &&
+  grep -Fq "stable CNPG health after unseeded teardown recovery" "$file" &&
   grep -Fq "seed_markers" "$file" &&
   grep -Fq "repeat create replaced a healthy worker" "$file" &&
   grep -Fq "deleted tenant kubeconfig was not securely re-exported" "$file" &&
@@ -1022,6 +1085,11 @@ check "lifecycle E2E covers clean partial healthy recovery refusal and teardown"
   grep -Fq "assert_sentinels_present" "$file" &&
   grep -Fq "did not restore the recorded host inotify values" "$file" &&
   grep -Fq "captured lifecycle output contains credential material" "$file"
+' _ "${LAB_ROOT}"
+check "observer fingerprint covers tenant CNPG resources" bash -c '
+  block="$(sed -n "/^management_fingerprint()/,/^}/p" "$1/scripts/test-e2e.sh")"
+  grep -Fq "clusters.postgresql.cnpg.io" <<<"${block}" &&
+  grep -Fq "RESOURCE_SCOPE=\"\${tenant}\"" <<<"${block}"
 ' _ "${LAB_ROOT}"
 
 check "management values disable telemetry" \
@@ -1108,11 +1176,11 @@ check "design documents privileged shared-kernel boundary" \
   has_text 'share the Docker host kernel' "${LAB_ROOT}/docs/high-level-design.md"
 check "design records deterministic transitive image inventory" \
   has_text 'transitive image inventory' "${LAB_ROOT}/docs/high-level-design.md"
-check "Phase 3 retains explicit Konnectivity digest action" bash -c '
+check "design retains explicit Konnectivity digest action" bash -c '
   grep -Fq "KONNECTIVITY_AGENT_IMAGE" "$1" &&
   grep -Fq "KONNECTIVITY_SERVER_IMAGE" "$1"
 ' _ "${LAB_ROOT}/docs/high-level-design.md"
-check "documentation covers Phase 6 lifecycle and support boundaries" bash -c '
+check "documentation covers lifecycle and support boundaries" bash -c '
   grep -Fq "just destroy-tenant tenant-a" "$1/README.md" &&
   grep -Fq "just destroy" "$1/README.md" &&
   grep -Fq "just test-e2e" "$1/README.md" &&
@@ -1126,4 +1194,4 @@ if (( failures > 0 )); then
   die "${failures} static check(s) failed"
 fi
 
-log "all ${checks} Phase 6 static checks passed"
+log "all ${checks} Kamaji static checks passed"

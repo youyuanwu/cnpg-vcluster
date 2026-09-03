@@ -415,3 +415,15 @@ cnpg_verify_marker() {
     "SELECT marker FROM kamaji_verification WHERE marker='${marker}';")"
   [[ "$(tail -1 <<<"${result}")" == "${marker}" ]]
 }
+
+cnpg_verify_marker_if_present() {
+  local tenant="$1"
+  local relation
+  relation="$(cnpg_run_sql "${tenant}" \
+    "SELECT COALESCE(to_regclass('public.kamaji_verification')::text, 'absent');")" \
+    || return 1
+  if [[ "$(tail -1 <<<"${relation}")" == absent ]]; then
+    return 0
+  fi
+  cnpg_verify_marker "${tenant}"
+}

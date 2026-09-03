@@ -357,6 +357,15 @@ for tenant in ${TENANT_NAMES}; do
       || unhealthy "${tenant} kube-proxy remediation revision is absent or stale"
     final_tenant_tcp_ready "${tenant}" \
       || unhealthy "${tenant} TenantControlPlane is not Ready"
+    control_plane_status="$(
+      tenant_control_plane_container_statuses "${tenant}" || true
+    )"
+    printf 'control-plane containers:\n%s\n' \
+      "${control_plane_status:-  status unavailable}"
+    if grep -Eq 'state=terminated:OOMKilled|last_reason=OOMKilled' \
+      <<<"${control_plane_status}"; then
+      unhealthy "${tenant} control plane has OOMKilled container evidence"
+    fi
   else
     printf 'TCP: absent\n'
   fi

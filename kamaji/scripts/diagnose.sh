@@ -131,6 +131,15 @@ for tenant in ${TENANT_NAMES}; do
     management_kubectl -n "$(tenant_namespace "${tenant}")" get \
       tenantcontrolplanes,deployments,pods,services,secrets,pvc -o wide \
       2>/dev/null || true
+    printf '\n== %s control-plane container status ==\n' "${tenant}"
+    control_plane_status="$(
+      tenant_control_plane_container_statuses "${tenant}" || true
+    )"
+    printf '%s\n' "${control_plane_status:-status unavailable}"
+    if grep -Eq 'state=terminated:OOMKilled|last_reason=OOMKilled' \
+      <<<"${control_plane_status}"; then
+      unhealthy "${tenant} control plane has OOMKilled container evidence"
+    fi
     if [[ "${tenant_exists}" == true ]]; then
       printf 'TCP paused=%s remediation=%s\n' \
         "$(tenant_reconciliation_pause_value "${tenant}")" \

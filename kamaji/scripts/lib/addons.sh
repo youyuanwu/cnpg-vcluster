@@ -460,7 +460,7 @@ run_final_tenant_network_smoke() {
   local tenant="$1"
   local domain pod
   domain="$(tenant_cluster_domain "${tenant}")"
-  pod="phase4-network-smoke"
+  pod="${TENANT_NETWORK_SMOKE_POD}"
   tenant_kubectl "${tenant}" -n default delete pod "${pod}" \
     --ignore-not-found --wait=true --timeout="${TENANT_ADDON_TIMEOUT}" \
     >/dev/null 2>&1 || true
