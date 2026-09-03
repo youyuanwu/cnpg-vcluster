@@ -189,6 +189,22 @@ JSON
       | grep -Fq 'last_reason=OOMKilled'
 )
 
+control_plane_status_absent_fixture() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/tenants.sh"
+
+  management_kubectl() {
+    return 1
+  }
+
+  local output status
+  set +e
+  output="$(tenant_control_plane_container_statuses tenant-a 2>&1)"
+  status=$?
+  set -e
+  [[ "${status}" -eq "${EXIT_SUCCESS}" && -z "${output}" ]]
+)
+
 services_claiming_vip_fixture() (
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/lib/tenants.sh"
@@ -1035,6 +1051,8 @@ check "survivor marker policy rejects an incorrect seeded marker" \
   optional_marker_policy_fixture seeded-wrong
 check "control-plane diagnostics expose restart and OOMKilled evidence" \
   control_plane_oom_fixture
+check "control-plane diagnostics tolerate absent pod JSON" \
+  control_plane_status_absent_fixture
 check "create failure records tenant control-plane OOMKilled cause" bash -c '
   grep -Fq "all_tenant_control_plane_oom_evidence" "$1/scripts/create.sh" &&
   grep -Fq "tenant control-plane OOMKilled" "$1/scripts/create.sh" &&

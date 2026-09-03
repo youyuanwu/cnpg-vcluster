@@ -408,10 +408,13 @@ final_tenant_tcp_ready() {
 
 tenant_control_plane_container_statuses() {
   local tenant="$1"
-  local namespace
+  local namespace payload
   namespace="$(tenant_namespace "${tenant}")"
-  management_kubectl -n "${namespace}" get pods -o json 2>/dev/null \
-    | TENANT="${tenant}" python3 -c '
+  payload="$(
+    management_kubectl -n "${namespace}" get pods -o json 2>/dev/null || true
+  )"
+  [[ -n "${payload}" ]] || return 0
+  TENANT="${tenant}" python3 -c '
 import json, os, sys
 names = {
     "kube-apiserver",
@@ -447,7 +450,7 @@ for pod in json.load(sys.stdin).get("items", []):
                 exit_code=terminated.get("exitCode", "none"),
             )
         )
-'
+' <<<"${payload}"
 }
 
 tenant_control_plane_oom_evidence() {
