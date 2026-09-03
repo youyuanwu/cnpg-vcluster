@@ -24,6 +24,7 @@ spec:
       owner: tenant_b_owner
   storage:
     size: 1Gi
+    storageClass: local-path
   resources:
     requests:
       cpu: 100m

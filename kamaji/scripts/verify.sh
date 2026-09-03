@@ -196,8 +196,8 @@ verify_cnpg_objects() {
   cnpg_tenant_ready "${tenant}" \
     || die "${tenant} CNPG operator or PostgreSQL cluster is not ready"
 
-  cluster_count="$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" \
-    get clusters.postgresql.cnpg.io --no-headers | wc -l)"
+  cluster_count="$(tenant_kubectl "${tenant}" get clusters.postgresql.cnpg.io \
+    --all-namespaces --no-headers | wc -l)"
   assert_equals 1 "${cluster_count}" "${tenant} CNPG Cluster count"
   ! tenant_kubectl "${other}" -n "${DATABASE_NAMESPACE}" get \
     "cluster.postgresql.cnpg.io/${cluster}" >/dev/null 2>&1 \
@@ -246,13 +246,16 @@ for pod in items:
   pvc_json="$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" get pvc \
     -l "cnpg.io/cluster=${cluster}" -o json)"
   PVC_JSON="${pvc_json}" CNPG_INSTANCE_COUNT="${CNPG_INSTANCE_COUNT}" \
-    CNPG_STORAGE_SIZE="${CNPG_STORAGE_SIZE}" python3 -c '
+    CNPG_STORAGE_SIZE="${CNPG_STORAGE_SIZE}" \
+    TENANT_STORAGE_CLASS="${TENANT_STORAGE_CLASS}" python3 -c '
 import json, os
 items=json.loads(os.environ["PVC_JSON"]).get("items", [])
 assert len(items) == int(os.environ["CNPG_INSTANCE_COUNT"])
 assert len({i["spec"]["volumeName"] for i in items}) == len(items)
 assert all(i["status"]["phase"] == "Bound" for i in items)
 assert all(i["spec"]["resources"]["requests"]["storage"] == os.environ["CNPG_STORAGE_SIZE"]
+           for i in items)
+assert all(i["spec"]["storageClassName"] == os.environ["TENANT_STORAGE_CLASS"]
            for i in items)
 '
   pv_count="$(PVC_JSON="${pvc_json}" python3 -c \
@@ -467,6 +470,7 @@ main() {
   fi
   [[ -f "${FINAL_RESULT_FILE}" ]] \
     && grep -Fxq 'result=pass' "${FINAL_RESULT_FILE}" \
+    && grep -Fxq 'cnpg=installed' "${FINAL_RESULT_FILE}" \
     || die "a passing full create result is required before verification"
   ensure_runtime_layout
   mkdir -p -m 0700 "${VERIFY_RUNTIME_DIR}"

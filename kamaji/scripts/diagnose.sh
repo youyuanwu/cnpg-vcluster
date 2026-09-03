@@ -26,7 +26,7 @@ case "${scope}" in
   *) die "diagnostic scope must be all, management, spike, tenant-a, or tenant-b" ;;
 esac
 
-printf '== tool files ==\n'
+printf '== tools ==\n'
 if [[ -d "${TOOLS_DIR}" ]]; then
   find "${TOOLS_DIR}" -maxdepth 2 -printf '%M %P\n' | sort
 else
@@ -95,6 +95,7 @@ if [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
     --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -50 || true
 else
   printf 'management kubeconfig absent or API unreachable; no management API query attempted\n'
+  printf 'Kamaji controller and datastore unavailable\n'
 fi
 
 if [[ "${scope}" == spike || "${scope}" == all ]]; then
@@ -162,6 +163,7 @@ for tenant in ${TENANT_NAMES}; do
       tenant_kubectl "${tenant}" get pods,services,pvc --all-namespaces \
         -o wide 2>/dev/null || true
       tenant_kubectl "${tenant}" get storageclass,pv -o wide 2>/dev/null || true
+      printf '\n== %s workers, add-ons, and storage ==\n' "${tenant}"
       printf 'kube-proxy conntrack.maxPerCore='
       tenant_kubectl "${tenant}" -n kube-system get configmap kube-proxy \
         -o jsonpath='{.data.config\.conf}' 2>/dev/null \
@@ -231,6 +233,7 @@ for tenant in ${TENANT_NAMES}; do
         --sort-by=.metadata.creationTimestamp 2>/dev/null | tail -30 || true
     else
       printf '%s kubeconfig absent; no tenant API query attempted\n' "${tenant}"
+      printf 'TenantControlPlane endpoint, workers, add-ons, storage, CloudNativePG operator, and PostgreSQL cluster are absent or unavailable\n'
       [[ "${tenant_exists}" == false ]] \
         || unhealthy "${tenant} API is unreachable"
     fi

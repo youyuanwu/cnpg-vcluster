@@ -45,7 +45,7 @@ just --version
 The final command must print `just 1.58.0`. Remove the downloaded archive and
 extracted binary after installation.
 
-## Implemented commands
+## Commands
 
 ```bash
 just tools
@@ -61,6 +61,9 @@ just diagnose all
 just test-static
 just test-inotify-negative
 just test-kube-proxy-restart tenant-a
+just destroy-tenant tenant-a
+just destroy
+just test-e2e
 ```
 
 `just tools` installs checksum-verified kind 0.33.0, kubectl 1.36.4, and Helm
@@ -76,8 +79,9 @@ lab session without cached sudo credentials, membership in the Docker group
 allows the same runtime-only write through a short-lived privileged pinned
 worker container; the recipe reports that fallback explicitly. It is
 idempotent and does not create persistent `/etc/sysctl.d` configuration.
-Phase 6 full teardown restores the recorded originals only after all nested
-workers are gone. Creation never changes host sysctls implicitly.
+Full teardown restores the recorded originals only after all nested workers
+and the owned management cluster are gone. Creation never changes host
+sysctls implicitly.
 
 `just preflight` validates tools, Linux Docker, cgroup v2, CPU/memory/storage
 capacity, both inotify floors, network
@@ -184,6 +188,27 @@ tenant without mistaking connectivity failure for authentication rejection,
 then exercises replica replacement with PVC/PV reuse and primary failover with
 retained data.
 
+`just destroy-tenant tenant-a` removes only Tenant A's PostgreSQL cluster,
+CNPG operator, smoke resources, nodes, workers, owned volumes, TCP namespace,
+kubeconfig/PKI and datastore credentials, runtime state, datastore schema,
+user/role, and `DataStore.status.usedBy` entry. It first accounts for the
+intentional TCP pause, then proves Tenant B's API, credentials, three workers,
+marker, datastore identity, and PostgreSQL cluster remain healthy.
+
+`just destroy` removes spike residuals, both tenants, the kubectl-applied
+Kamaji datastore hook RBAC, Kamaji/datastore, MetalLB, cert-manager, the exact
+owned kind cluster, and `.runtime/`. It refuses unowned same-name objects,
+uses the lab-local kubeconfig so unrelated contexts are untouched, and
+restores the values recorded by `just prepare-host`. Repeating it is safe.
+
+`just test-e2e` starts from full cleanup, exercises capacity rejection,
+host preparation, create/repeat/recovery, clean/partial/healthy observers,
+kubeconfig re-export, partial join recovery, persistent worker-volume reuse,
+full verification, one-tenant teardown, repeated full teardown, ownership
+refusal, credential scanning, sentinel preservation, and host-sysctl
+restoration. Exit `2` is used only if a fresh recognized compatibility blocker
+is recorded and cleanup succeeds.
+
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and
 tenant-control-plane/spike layers without exporting credentials or reconciling
@@ -235,3 +260,23 @@ succeeded.
 
 See [docs/high-level-design.md](docs/high-level-design.md) for the design and
 complete deterministic input chain.
+
+## Versions and upstream documentation
+
+| Component | Version |
+|---|---|
+| Kubernetes / kubectl | 1.36.4 |
+| kind | 0.33.0 |
+| Kamaji | 26.8.6-edge |
+| cert-manager | 1.21.1 |
+| MetalLB | 0.16.1 |
+| Calico | 3.32.2 |
+| Local Path Provisioner | 0.0.37 |
+| CloudNativePG | 1.30.0 |
+| PostgreSQL | 18.4 |
+
+- [Kamaji edge release](https://github.com/clastix/kamaji/releases/tag/26.8.6-edge)
+- [Kamaji on kind](https://kamaji.clastix.io/getting-started/kamaji-kind/)
+- [Kamaji worker nodes](https://kamaji.clastix.io/concepts/tenant-worker-nodes/)
+- [Kamaji datastore](https://kamaji.clastix.io/concepts/datastore/)
+- [CloudNativePG 1.30](https://cloudnative-pg.io/docs/1.30/)

@@ -582,6 +582,12 @@ datastore_used_by_tenant() {
     | tr ' ' '\n' | grep -Fxq "${reference}"
 }
 
+management_datastore_available() {
+  management_kubectl get datastore default >/dev/null 2>&1 \
+    && management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
+      get statefulset kamaji-etcd >/dev/null 2>&1
+}
+
 final_tenant_tcp_absent() {
   local tenant="$1"
   ! management_kubectl -n "$(tenant_namespace "${tenant}")" \
@@ -625,25 +631,27 @@ delete_final_tenant_control_plane() {
       || die "${tenant}.cleanup: TenantControlPlane finalizers did not complete"
   fi
 
-  if etcd_prefix_exists "${schema}" \
-    || etcd_user_exists "${user}" \
-    || etcd_role_exists "${schema}"; then
-    force_delete_tenant_datastore_identity "${tenant}"
+  if management_datastore_available; then
+    if etcd_prefix_exists "${schema}" \
+      || etcd_user_exists "${user}" \
+      || etcd_role_exists "${schema}"; then
+      force_delete_tenant_datastore_identity "${tenant}"
+    fi
+    [[ -z "${credential_secret}" ]] \
+      || ! management_kubectl -n "${namespace}" get secret "${credential_secret}" \
+        >/dev/null 2>&1 \
+      || die "${tenant}.cleanup: datastore credential Secret remains"
+    ! datastore_used_by_tenant "${tenant}" \
+      || die "${tenant}.cleanup: DataStore/default still reports tenant in status.usedBy"
+    ! etcd_prefix_exists "${schema}" \
+      || die "${tenant}.cleanup: exact etcd prefix remains"
+    ! etcd_user_exists "${user}" \
+      || die "${tenant}.cleanup: exact etcd user remains"
+    ! etcd_role_exists "${schema}" \
+      || die "${tenant}.cleanup: exact etcd role remains"
+    [[ "$(management_kubectl get datastore default -o jsonpath='{.status.ready}')" == true ]] \
+      || die "${tenant}.cleanup: shared DataStore/default became unhealthy"
   fi
-  [[ -z "${credential_secret}" ]] \
-    || ! management_kubectl -n "${namespace}" get secret "${credential_secret}" \
-      >/dev/null 2>&1 \
-    || die "${tenant}.cleanup: datastore credential Secret remains"
-  ! datastore_used_by_tenant "${tenant}" \
-    || die "${tenant}.cleanup: DataStore/default still reports tenant in status.usedBy"
-  ! etcd_prefix_exists "${schema}" \
-    || die "${tenant}.cleanup: exact etcd prefix remains"
-  ! etcd_user_exists "${user}" \
-    || die "${tenant}.cleanup: exact etcd user remains"
-  ! etcd_role_exists "${schema}" \
-    || die "${tenant}.cleanup: exact etcd role remains"
-  [[ "$(management_kubectl get datastore default -o jsonpath='{.status.ready}')" == true ]] \
-    || die "${tenant}.cleanup: shared DataStore/default became unhealthy"
 
   management_kubectl delete namespace "${namespace}" \
     --ignore-not-found --wait=true --timeout="${TENANT_DELETE_TIMEOUT}" >/dev/null
@@ -859,25 +867,27 @@ delete_spike_tenant() {
     fi
   fi
 
-  if etcd_prefix_exists "${SPIKE_SCHEMA}" \
-    || etcd_user_exists "${SPIKE_DATASTORE_USER}" \
-    || etcd_role_exists "${SPIKE_SCHEMA}"; then
-    force_delete_spike_datastore_identity
-  fi
+  if management_datastore_available; then
+    if etcd_prefix_exists "${SPIKE_SCHEMA}" \
+      || etcd_user_exists "${SPIKE_DATASTORE_USER}" \
+      || etcd_role_exists "${SPIKE_SCHEMA}"; then
+      force_delete_spike_datastore_identity
+    fi
 
-  [[ -z "${credential_secret}" ]] \
-    || ! management_kubectl -n "${SPIKE_NAMESPACE}" get secret "${credential_secret}" >/dev/null 2>&1 \
-    || die "spike.cleanup: datastore credential Secret remains"
-  ! datastore_used_by_spike \
-    || die "spike.cleanup: DataStore/default still reports spike in status.usedBy"
-  ! etcd_prefix_exists "${SPIKE_SCHEMA}" \
-    || die "spike.cleanup: exact etcd prefix remains"
-  ! etcd_user_exists "${SPIKE_DATASTORE_USER}" \
-    || die "spike.cleanup: exact etcd user remains"
-  ! etcd_role_exists "${SPIKE_SCHEMA}" \
-    || die "spike.cleanup: exact etcd role remains"
-  [[ "$(management_kubectl get datastore default -o jsonpath='{.status.ready}')" == true ]] \
-    || die "spike.cleanup: shared DataStore/default became unhealthy"
+    [[ -z "${credential_secret}" ]] \
+      || ! management_kubectl -n "${SPIKE_NAMESPACE}" get secret "${credential_secret}" >/dev/null 2>&1 \
+      || die "spike.cleanup: datastore credential Secret remains"
+    ! datastore_used_by_spike \
+      || die "spike.cleanup: DataStore/default still reports spike in status.usedBy"
+    ! etcd_prefix_exists "${SPIKE_SCHEMA}" \
+      || die "spike.cleanup: exact etcd prefix remains"
+    ! etcd_user_exists "${SPIKE_DATASTORE_USER}" \
+      || die "spike.cleanup: exact etcd user remains"
+    ! etcd_role_exists "${SPIKE_SCHEMA}" \
+      || die "spike.cleanup: exact etcd role remains"
+    [[ "$(management_kubectl get datastore default -o jsonpath='{.status.ready}')" == true ]] \
+      || die "spike.cleanup: shared DataStore/default became unhealthy"
+  fi
 
   management_kubectl delete namespace "${SPIKE_NAMESPACE}" \
     --ignore-not-found --wait=true --timeout="${SPIKE_DELETE_TIMEOUT}" >/dev/null

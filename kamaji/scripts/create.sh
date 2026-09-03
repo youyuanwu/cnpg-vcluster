@@ -27,6 +27,7 @@ final_tenant_b_endpoint=""
 final_tenant_a_ca_sha256=""
 final_tenant_b_ca_sha256=""
 existing_final_tenants=""
+final_cnpg_state=installed
 
 clear_owned_compatibility_blocker() {
   if [[ -f "${BLOCKER_FILE}" ]] \
@@ -54,6 +55,7 @@ write_final_result() {
       "${final_blocker_prerequisite:-none}"
     printf 'blocker_code=%s\n' "${final_blocker_code:-none}"
     printf 'blocker_evidence=%s\n' "${final_blocker_message:-none}"
+    printf 'cnpg=%s\n' "${final_cnpg_state}"
     printf 'tenant_a_schema=%s\n' "${TENANT_A_SCHEMA}"
     printf 'tenant_b_schema=%s\n' "${TENANT_B_SCHEMA}"
     printf 'expected_workers=6\n'
@@ -67,7 +69,7 @@ write_final_result() {
       printf 'final_workers=absent\n'
       printf 'final_volumes=absent\n'
       printf 'final_runtime=absent\n'
-    elif [[ "${final_result}" == pass ]]; then
+    elif [[ "${final_result}" == pass || "${final_result}" == partial ]]; then
       printf 'cleanup=not-required\n'
     else
       printf 'cleanup=failed\n'
@@ -104,7 +106,11 @@ finish_final_create() {
     write_final_result
     set -e
   elif [[ "${status}" -eq "${EXIT_SUCCESS}" ]]; then
-    final_result=pass
+    if [[ "${final_cnpg_state}" == installed ]]; then
+      final_result=pass
+    else
+      final_result=partial
+    fi
     clear_owned_compatibility_blocker
     write_final_result
   else
@@ -154,9 +160,12 @@ capture_existing_final_tenant_state() {
   load_management_network
   for tenant in ${TENANT_NAMES}; do
     if final_tenant_exists "${tenant}"; then
-      [[ -f "$(tenant_kubeconfig "${tenant}")" ]] \
-        && tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1 \
-        || die "final.repeat-create: ${tenant} API identity is absent or unreachable"
+      if [[ ! -f "$(tenant_kubeconfig "${tenant}")" ]] \
+        || ! tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1; then
+        export_tenant_kubeconfig "${tenant}"
+      fi
+      [[ "$(stat -c '%a' "$(tenant_kubeconfig "${tenant}")")" == 600 ]] \
+        || die "final.repeat-create: ${tenant} kubeconfig is not mode 0600"
       final_tenant_tcp_ready "${tenant}" \
         || die "final.repeat-create: ${tenant} control plane is not Ready"
       tenant_kube_proxy_steady_state_is_preserved "${tenant}" \
@@ -308,6 +317,7 @@ if [[ "${SKIP_CNPG:-0}" != 1 ]]; then
       || die "${tenant}.capacity: scheduled add-on and PostgreSQL requests exceed the owned worker Docker caps"
   done
 else
+  final_cnpg_state=skipped
   log "SKIP_CNPG=1: leaving tenant CloudNativePG resources unchanged"
 fi
 

@@ -57,14 +57,15 @@ report_cnpg_status() {
       -o jsonpath='{.status.conditions[?(@.type=="Established")].status}' \
       2>/dev/null || true)" == True ]] && crd_ready=$((crd_ready + 1))
   done < <(cnpg_expected_crds)
+  printf 'CloudNativePG layer:\n'
   printf 'CNPG operator: %s/%s Ready image=%s CRDs=%s/11\n' \
     "${ready:-0}" "${desired:-0}" "${image:-absent}" "${crd_ready}"
   cnpg_operator_ready "${tenant}" \
     || unhealthy "${tenant} CloudNativePG CRDs, webhooks, RBAC, or operator are not ready"
 
   cluster_count="$(
-    { tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" \
-        get clusters.postgresql.cnpg.io --no-headers 2>/dev/null || true; } | wc -l
+    { tenant_kubectl "${tenant}" get clusters.postgresql.cnpg.io \
+        --all-namespaces --no-headers 2>/dev/null || true; } | wc -l
   )"
   phase="$(tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" \
     get "cluster/${cluster}" -o jsonpath='{.status.phase}' 2>/dev/null || true)"
@@ -105,6 +106,27 @@ report_cnpg_status() {
     && "${pv_count}" -eq "${CNPG_INSTANCE_COUNT}" ]] \
     && cnpg_tenant_ready "${tenant}" \
     || unhealthy "${tenant} PostgreSQL cluster, services, placements, claims, or volumes are not healthy"
+}
+
+report_unavailable_cluster_layers() {
+  section "cert-manager"
+  printf 'unavailable: management API is not ready\n'
+  section "MetalLB"
+  printf 'unavailable: management API is not ready\n'
+  section "Kamaji controller and datastore"
+  printf 'unavailable: management API is not ready\n'
+  section "worker compatibility spike"
+  printf 'control plane, endpoint, worker, add-ons, and storage: absent or unavailable\n'
+  section "final tenant topology"
+  local tenant
+  for tenant in ${TENANT_NAMES}; do
+    printf '\n-- %s --\n' "${tenant}"
+    printf 'TenantControlPlane and API endpoint: absent or unavailable\n'
+    printf 'workers: absent or unavailable\n'
+    printf 'add-ons and storage: absent or unavailable\n'
+    printf 'CloudNativePG operator: absent or unavailable\n'
+    printf 'PostgreSQL cluster: absent or unavailable\n'
+  done
 }
 
 section "tools"
@@ -181,10 +203,12 @@ fi
 section "management Kubernetes"
 if [[ ! -f "${MANAGEMENT_KUBECONFIG}" ]]; then
   unhealthy "management kubeconfig is absent"
+  report_unavailable_cluster_layers
   exit "${health}"
 fi
 if ! management_kubectl get --raw=/readyz >/dev/null 2>&1; then
   unhealthy "management API is unreachable"
+  report_unavailable_cluster_layers
   exit "${health}"
 fi
 printf 'API: ready\n'
@@ -350,6 +374,7 @@ for tenant in ${TENANT_NAMES}; do
     printf 'kube-proxy conntrack.maxPerCore: %s\n' "${conntrack_value:-absent}"
     [[ "${conntrack_value}" == "${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}" ]] \
       || unhealthy "${tenant} kube-proxy conntrack.maxPerCore is not ${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}"
+    printf 'add-ons and storage:\n'
     for component in \
       "deployment kube-system coredns CoreDNS" \
       "daemonset kube-system kube-proxy kube-proxy" \
@@ -399,6 +424,8 @@ done
 
 if [[ -f "${FINAL_RESULT_FILE}" ]] \
   && grep -Fxq 'result=pass' "${FINAL_RESULT_FILE}"; then
+  grep -Fxq 'cnpg=installed' "${FINAL_RESULT_FILE}" \
+    || unhealthy "passing final result does not record CNPG as installed"
   [[ "${final_tcp_count}" -eq 2 ]] || unhealthy "passing final result lacks exactly two TCPs"
   [[ "${final_worker_count}" -eq 6 ]] || unhealthy "passing final result lacks exactly six workers"
   [[ "${final_volume_count}" -eq 6 ]] || unhealthy "passing final result lacks exactly six volumes"

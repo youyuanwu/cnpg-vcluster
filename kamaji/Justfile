@@ -43,13 +43,13 @@ diagnose scope="all":
 verify:
     @scripts/verify.sh
 
-# Destroy one tenant (implemented in Phase 6).
+# Destroy one tenant and verify the survivor.
 destroy-tenant tenant:
-    @scripts/unavailable.sh "destroy-tenant {{tenant}}" "Phase 6"
+    @scripts/destroy-tenant.sh "{{tenant}}"
 
-# Destroy the complete lab (implemented in Phase 6).
+# Destroy all owned lab resources and restore recorded host inotify values.
 destroy:
-    @scripts/unavailable.sh destroy "Phase 6"
+    @scripts/destroy.sh
 
 # Run static invariants for implemented phases.
 test-static:
@@ -63,6 +63,6 @@ test-inotify-negative:
 test-kube-proxy-restart tenant="tenant-a":
     @scripts/test-kube-proxy-restart.sh "{{tenant}}"
 
-# Run lifecycle coverage (implemented in Phase 6).
+# Run the complete lifecycle and ownership test.
 test-e2e:
-    @scripts/unavailable.sh test-e2e "Phase 6"
+    @scripts/test-e2e.sh

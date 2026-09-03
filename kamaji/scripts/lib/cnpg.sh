@@ -69,12 +69,24 @@ cnpg_crds_ready() {
 
 cnpg_operator_ready() {
   local tenant="$1"
-  local desired ready image related_image endpoints
+  local desired ready updated available generation observed image related_image endpoints
   desired="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
     get deployment cnpg-controller-manager -o jsonpath='{.spec.replicas}' \
     2>/dev/null || true)"
   ready="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
     get deployment cnpg-controller-manager -o jsonpath='{.status.readyReplicas}' \
+    2>/dev/null || true)"
+  updated="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
+    get deployment cnpg-controller-manager -o jsonpath='{.status.updatedReplicas}' \
+    2>/dev/null || true)"
+  available="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
+    get deployment cnpg-controller-manager -o jsonpath='{.status.availableReplicas}' \
+    2>/dev/null || true)"
+  generation="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
+    get deployment cnpg-controller-manager -o jsonpath='{.metadata.generation}' \
+    2>/dev/null || true)"
+  observed="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
+    get deployment cnpg-controller-manager -o jsonpath='{.status.observedGeneration}' \
     2>/dev/null || true)"
   image="$(tenant_kubectl "${tenant}" -n "${CNPG_NAMESPACE}" \
     get deployment cnpg-controller-manager \
@@ -89,6 +101,9 @@ cnpg_operator_ready() {
     -o jsonpath='{.subsets[*].addresses[*].ip}' 2>/dev/null || true)"
   [[ "${desired:-0}" -gt 0 \
     && "${ready:-0}" -eq "${desired}" \
+    && "${updated:-0}" -eq "${desired}" \
+    && "${available:-0}" -eq "${desired}" \
+    && "${observed:-0}" -ge "${generation:-1}" \
     && "${image}" == "${CNPG_CONTROLLER_IMAGE}" \
     && "${related_image}" == "${CNPG_CONTROLLER_IMAGE}" \
     && -n "${endpoints}" ]] \
@@ -149,13 +164,17 @@ cnpg_storage_ready() {
   cluster="$(cnpg_cluster_name "${tenant}")"
   tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" get pvc \
     -l "cnpg.io/cluster=${cluster}" -o json 2>/dev/null \
-    | CNPG_INSTANCE_COUNT="${CNPG_INSTANCE_COUNT}" python3 -c '
+    | CNPG_INSTANCE_COUNT="${CNPG_INSTANCE_COUNT}" \
+      TENANT_STORAGE_CLASS="${TENANT_STORAGE_CLASS}" python3 -c '
 import json, os, sys
 items=json.load(sys.stdin).get("items", [])
 expected=int(os.environ["CNPG_INSTANCE_COUNT"])
 raise SystemExit(0 if len(items) == expected
                  and all(i.get("status", {}).get("phase") == "Bound"
-                         and i.get("spec", {}).get("volumeName") for i in items)
+                         and i.get("spec", {}).get("volumeName")
+                         and i.get("spec", {}).get("storageClassName")
+                             == os.environ["TENANT_STORAGE_CLASS"]
+                         for i in items)
                  else 1)
 '
 }
@@ -185,8 +204,7 @@ cnpg_tenant_ready() {
     && cnpg_placements_ready "${tenant}"
 }
 
-apply_cnpg_operator() {
-  local tenant="$1"
+render_cnpg_operator() {
   local manifest="${LAB_ROOT}/manifests/cnpg/operator.yaml"
   sha256_check "${CNPG_MANIFEST_SHA256}" "${manifest}"
   CNPG_OPERATOR_MANIFEST="${manifest}" \
@@ -205,8 +223,89 @@ for old, new in replacements.items():
         raise SystemExit("CNPG operator manifest does not contain one expected " + old)
     source=source.replace(old, new, 1)
 sys.stdout.write(source)
-' | tenant_kubectl "${tenant}" apply --server-side --force-conflicts \
+'
+}
+
+apply_cnpg_operator() {
+  local tenant="$1"
+  render_cnpg_operator \
+    | tenant_kubectl "${tenant}" apply --server-side --force-conflicts \
       --field-manager=kamaji-cnpg-lab -f - >/dev/null
+}
+
+tenant_namespace_absent() {
+  local tenant="$1"
+  local namespace="$2"
+  ! tenant_kubectl "${tenant}" get namespace "${namespace}" >/dev/null 2>&1
+}
+
+cnpg_operator_absent() {
+  local tenant="$1"
+  local crd
+  while IFS= read -r crd; do
+    ! tenant_kubectl "${tenant}" get "crd/${crd}" >/dev/null 2>&1 \
+      || return 1
+  done < <(cnpg_expected_crds)
+}
+
+delete_cnpg_for_tenant() {
+  local tenant="$1"
+  local cluster crd
+  cluster="$(cnpg_cluster_name "${tenant}")"
+  [[ -f "$(tenant_kubeconfig "${tenant}")" ]] \
+    && tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1 \
+    || return 0
+
+  tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" delete pod,secret \
+    -l "kamaji.cnpg-vcluster.io/role in (sql-client,cross-auth)" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" delete \
+    "cluster.postgresql.cnpg.io/${cluster}" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  tenant_kubectl "${tenant}" delete namespace "${DATABASE_NAMESPACE}" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  tenant_kubectl "${tenant}" delete \
+    mutatingwebhookconfiguration/cnpg-mutating-webhook-configuration \
+    validatingwebhookconfiguration/cnpg-validating-webhook-configuration \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  while IFS= read -r crd; do
+    tenant_kubectl "${tenant}" delete "crd/${crd}" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  done < <(cnpg_expected_crds)
+  tenant_kubectl "${tenant}" delete clusterrole \
+    cnpg-database-editor-role cnpg-database-viewer-role cnpg-manager \
+    cnpg-publication-editor-role cnpg-publication-viewer-role \
+    cnpg-subscription-editor-role cnpg-subscription-viewer-role \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  tenant_kubectl "${tenant}" delete clusterrolebinding cnpg-manager-rolebinding \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  tenant_kubectl "${tenant}" delete namespace "${CNPG_NAMESPACE}" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  local deadline=$((SECONDS + $(seconds_from_duration "${CNPG_TIMEOUT}")))
+  until cnpg_operator_absent "${tenant}" \
+    && tenant_namespace_absent "${tenant}" "${DATABASE_NAMESPACE}" \
+    && tenant_namespace_absent "${tenant}" "${CNPG_NAMESPACE}"; do
+    while IFS= read -r crd; do
+      tenant_kubectl "${tenant}" delete "crd/${crd}" \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    done < <(cnpg_expected_crds)
+    tenant_kubectl "${tenant}" delete namespace \
+      "${DATABASE_NAMESPACE}" "${CNPG_NAMESPACE}" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+    if (( SECONDS >= deadline )); then
+      die "${tenant}.cleanup: CNPG resources or namespaces did not finish deleting"
+    fi
+    sleep "${WAIT_POLL_INTERVAL}"
+  done
+
+  while IFS= read -r crd; do
+    ! tenant_kubectl "${tenant}" get "crd/${crd}" >/dev/null 2>&1 \
+      || die "${tenant}.cleanup: CNPG CRD ${crd} remains"
+  done < <(cnpg_expected_crds)
+  ! tenant_kubectl "${tenant}" get namespace "${DATABASE_NAMESPACE}" >/dev/null 2>&1 \
+    || die "${tenant}.cleanup: database namespace remains"
+  ! tenant_kubectl "${tenant}" get namespace "${CNPG_NAMESPACE}" >/dev/null 2>&1 \
+    || die "${tenant}.cleanup: CNPG operator namespace remains"
 }
 
 install_cnpg_for_tenant() {
@@ -306,4 +405,13 @@ cnpg_run_sql() {
   delete_cnpg_sql_client "${tenant}" "${client}"
   (( status == 0 )) || return "${status}"
   printf '%s\n' "${result}"
+}
+
+cnpg_verify_marker() {
+  local tenant="$1"
+  local marker result
+  marker="$(cnpg_database_marker "${tenant}")"
+  result="$(cnpg_run_sql "${tenant}" \
+    "SELECT marker FROM kamaji_verification WHERE marker='${marker}';")"
+  [[ "$(tail -1 <<<"${result}")" == "${marker}" ]]
 }

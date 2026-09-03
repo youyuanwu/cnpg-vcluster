@@ -2,16 +2,39 @@
 
 ## Status and purpose
 
-The lab is a development experiment built from the public Kamaji
-26.8.6-edge source release. Phase 3 retains the healthy management plane and
-adds a fully ephemeral one-control-plane/one-worker compatibility gate for the
-privileged container worker experiment.
+The lab is a development experiment built from the public edge Kamaji
+26.8.6-edge source release. It requires no account, activation, product key,
+or paid artifact; the freely downloadable edge channel is experimental.
 
-The intended completed topology is one Kubernetes 1.36.4 kind management
+The as-built topology is one Kubernetes 1.36.4 kind management
 cluster hosting cert-manager, MetalLB, Kamaji, a shared three-member datastore,
-and two hosted tenant control planes. Each tenant will own three exclusive
+and two hosted tenant control planes. Each tenant owns three exclusive
 worker containers, networking, dynamic storage, one CloudNativePG 1.30.0
 operator, and one three-instance PostgreSQL 18.4 cluster.
+
+```mermaid
+flowchart TB
+  Host[Linux Docker host]
+  Mgmt[kind management cluster]
+  Kamaji[Kamaji controller]
+  Etcd[(shared 3-member etcd)]
+  TCPA[Tenant A control plane]
+  TCPB[Tenant B control plane]
+  WA[3 Tenant A workers]
+  WB[3 Tenant B workers]
+  PGA[(Tenant A CNPG 3 instances)]
+  PGB[(Tenant B CNPG 3 instances)]
+
+  Host --> Mgmt
+  Mgmt --> Kamaji
+  Mgmt --> Etcd
+  Kamaji --> TCPA
+  Kamaji --> TCPB
+  TCPA -->|unique schema| Etcd
+  TCPB -->|unique schema| Etcd
+  TCPA --> WA --> PGA
+  TCPB --> WB --> PGB
+```
 
 ## Independence and ownership
 
@@ -161,9 +184,8 @@ verifies them. If sudo cannot authenticate in a non-interactive session but
 the operator already has Docker-daemon access, the recipe explicitly reports
 and uses a short-lived privileged pinned worker container for the equivalent
 host-global runtime write. It is idempotent, does not persist configuration
-under `/etc`, and is never called implicitly by creation. Phase 6 full
-teardown restores the originals only after every nested worker has been
-removed.
+under `/etc`, and is never called implicitly by creation. Full teardown restores the originals only after every nested worker and the
+owned management cluster have been removed.
 
 The admission model counts six worker Docker caps (7.5 CPUs and 15 GiB),
 management requests (1.2 CPUs and 2 GiB), and a kind/system reserve (2 CPUs and
@@ -344,6 +366,35 @@ still zero.
 | Local Path Provisioner | 0.0.37 |
 | CloudNativePG | 1.30.0 |
 | PostgreSQL | 18.4 |
+
+## Teardown and recovery
+
+Tenant teardown deletes the tenant's CNPG Cluster before its operator, removes
+test resources and Node identities through the tenant API, then removes only
+exactly named, correctly labelled worker containers and volumes. The paused
+TCP is deliberately unpaused only for finalization. Deletion is not complete
+until its management namespace, kubeconfig/PKI and datastore credential
+Secrets, exact etcd prefix/user/role, API VIP claim, and
+`DataStore.status.usedBy` reference are absent. The opposite tenant must still
+have a reachable API, both credential Secrets, three current workers, its SQL
+marker, and a healthy three-instance PostgreSQL cluster.
+
+Full teardown performs spike cleanup and both tenant cleanups before removing
+the kubectl-applied Kamaji hook ServiceAccount, Role, and RoleBinding, the
+shared DataStore and Kamaji release/CRDs, MetalLB, cert-manager, and the exact
+owned kind cluster. The kind deletion uses the lab-local kubeconfig and never
+rewrites unrelated contexts. Original inotify values are restored only after
+nested workers and the management node are absent; the secure original-value
+record is removed only after the restored values re-read exactly. Exact
+ownership records and Docker labels prevent adoption or deletion of
+same-named foreign objects. Repeated teardown tolerates absence.
+
+Status and diagnostics enumerate the FR-014 layers in clean, partial, and
+healthy states without reconciliation: tools, Docker, management Kubernetes,
+Kamaji/datastore, TCPs and endpoints, workers, add-ons, storage, CNPG
+operators, and PostgreSQL clusters. Ordinary failures and unhealthy observers
+return `1`; `2` is exclusive to a recognized compatibility blocker with
+persisted evidence and successful cleanup.
 
 ## Upstream references
 

@@ -19,6 +19,10 @@ management_container_exists() {
   docker container inspect "$(management_node_name)" >/dev/null 2>&1
 }
 
+management_state_present() {
+  kind_cluster_reported || management_container_exists
+}
+
 cleanup_if_introduced() {
   local introduced="$1"
   shift
@@ -52,6 +56,41 @@ validate_management_ownership() {
   actual_label="$(docker container inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "${recorded_name}" 2>/dev/null || true)"
   [[ -n "${actual_id}" && "${actual_id}" == "${recorded_id}" && "${actual_label}" == "${KIND_CLUSTER_NAME}" ]] \
     || die "management.ownership-refusal: live kind node identity does not match the ownership record"
+}
+
+ensure_owned_management_access() {
+  local reported=0 container=0
+  kind_cluster_reported && reported=1
+  management_container_exists && container=1
+  if (( reported == 0 && container == 0 )); then
+    return 1
+  fi
+  (( reported == 1 && container == 1 )) \
+    || die "management.ownership-refusal: partial same-named kind state is not safe to adopt or delete"
+  validate_management_ownership
+  if [[ ! -f "${MANAGEMENT_KUBECONFIG}" ]]; then
+    kind export kubeconfig --name "${KIND_CLUSTER_NAME}" \
+      --kubeconfig "${MANAGEMENT_KUBECONFIG}" >/dev/null
+    chmod 0600 "${MANAGEMENT_KUBECONFIG}"
+  fi
+  management_kubectl get --raw=/readyz >/dev/null 2>&1 \
+    || die "management.kubernetes: owned management API is unreachable"
+}
+
+delete_owned_kind_cluster() {
+  local reported=0 container=0
+  kind_cluster_reported && reported=1
+  management_container_exists && container=1
+  if (( reported == 0 && container == 0 )); then
+    return 0
+  fi
+  (( reported == 1 && container == 1 )) \
+    || die "management.ownership-refusal: partial same-named kind state is not safe to delete"
+  validate_management_ownership
+  kind delete cluster --name "${KIND_CLUSTER_NAME}" \
+    --kubeconfig "${MANAGEMENT_KUBECONFIG}" >/dev/null
+  ! kind_cluster_reported && ! management_container_exists \
+    || die "management.cleanup: exact owned kind cluster remains"
 }
 
 cleanup_new_kind_cluster() {
@@ -155,6 +194,10 @@ cleanup_metallb() {
     --ignore-not-found >/dev/null 2>&1 || true
 }
 
+apply_metallb_pool() {
+  management_kubectl apply -f "${METALLB_RENDERED_MANIFEST}" >/dev/null 2>&1
+}
+
 reconcile_metallb() {
   local introduced=1
   management_kubectl get namespace metallb-system >/dev/null 2>&1 && introduced=0
@@ -177,7 +220,8 @@ reconcile_metallb() {
     cleanup_if_introduced "${introduced}" cleanup_metallb
     die "management.metallb: webhook has no ready endpoint"
   fi
-  if ! management_kubectl apply -f "${METALLB_RENDERED_MANIFEST}" >/dev/null; then
+  if ! wait_for "${METALLB_TIMEOUT}" "MetalLB admission webhook and VIP pool" \
+    apply_metallb_pool; then
     if (( introduced == 1 )); then
       cleanup_if_introduced "${introduced}" cleanup_metallb
     else
@@ -199,6 +243,52 @@ cleanup_kamaji() {
       | grep '^persistentvolumeclaim/data-kamaji-etcd-' || true
   )
   management_kubectl delete namespace "${MANAGEMENT_NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
+}
+
+destroy_kamaji_shared_resources() {
+  management_kubectl -n "${MANAGEMENT_NAMESPACE}" delete job kamaji-etcd-setup-2 \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  management_kubectl delete datastore default \
+    --ignore-not-found --wait=true --timeout="${DATASTORE_TIMEOUT}" >/dev/null 2>&1 || true
+  management_kubectl -n "${MANAGEMENT_NAMESPACE}" delete \
+    serviceaccount/kamaji-etcd \
+    role.rbac.authorization.k8s.io/kamaji-etcd-gen-certs-role \
+    rolebinding.rbac.authorization.k8s.io/kamaji-etcd-gen-certs-rolebinding \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  management_helm uninstall kamaji --namespace "${MANAGEMENT_NAMESPACE}" \
+    >/dev/null 2>&1 || true
+  if [[ -f "${KAMAJI_RENDERED_MANIFEST}" ]]; then
+    management_kubectl delete -f "${KAMAJI_RENDERED_MANIFEST}" \
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  fi
+  management_kubectl delete \
+    crd/datastores.kamaji.clastix.io \
+    crd/kubeconfiggenerators.kamaji.clastix.io \
+    crd/tenantcontrolplanes.kamaji.clastix.io \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  management_kubectl delete namespace "${MANAGEMENT_NAMESPACE}" \
+    --ignore-not-found --wait=true --timeout="${DATASTORE_TIMEOUT}" >/dev/null 2>&1 || true
+}
+
+destroy_metallb_shared_resources() {
+  management_kubectl delete -f "${METALLB_RENDERED_MANIFEST}" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  cleanup_metallb
+  management_kubectl delete namespace metallb-system \
+    --ignore-not-found --wait=true --timeout="${METALLB_TIMEOUT}" >/dev/null 2>&1 || true
+}
+
+destroy_cert_manager_shared_resources() {
+  cleanup_cert_manager
+  local crd
+  while IFS= read -r crd; do
+    [[ -n "${crd}" ]] || continue
+    management_kubectl delete "${crd}" --ignore-not-found --wait=false \
+      >/dev/null 2>&1 || true
+  done < <(
+    management_kubectl get crd -o name 2>/dev/null \
+      | grep -E '\.(cert-manager\.io|acme\.cert-manager\.io)$' || true
+  )
 }
 
 render_kamaji_hook_manifests() {

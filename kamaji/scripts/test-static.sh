@@ -297,7 +297,14 @@ check "complete just task surface" bash -c '
 ' _ "${LAB_ROOT}/Justfile"
 check "Kamaji has no Makefile" test ! -e "${LAB_ROOT}/Makefile"
 check "root Makefile is byte-for-byte unchanged" files_identical_to_main Makefile
-check "root README remains unchanged through Phase 4" files_identical_to_main README.md
+check "root README is a two-lab index with preserved vCluster Make commands" bash -c '
+  file="$1/../README.md"
+  grep -Fq "vCluster lab" "$file" &&
+  grep -Fq "Kamaji lab" "$file" &&
+  grep -Fq "make create" "$file" &&
+  grep -Fq "cd kamaji" "$file" &&
+  grep -Fq "just create" "$file"
+' _ "${LAB_ROOT}"
 check "vcluster tree is unchanged from main" \
   git -C "${LAB_ROOT}/.." diff --quiet main -- vcluster
 check "no PAW artifact is tracked" \
@@ -562,12 +569,13 @@ check "scripts do not print kubeconfigs, tokens, or passwords" bash -c '
 
 check "only compatibility paths can return blocked status" bash -c '
   refs="$(grep -R -l "EXIT_BLOCKED" "$1/scripts" --include="*.sh" --exclude=test-static.sh)"
-  [[ "$(printf "%s\n" "${refs}" | sort)" == "$(printf "%s\n" "$1/scripts/create-spike.sh" "$1/scripts/create.sh" "$1/scripts/verify.sh" | sort)" ]] &&
+  [[ "$(printf "%s\n" "${refs}" | sort)" == "$(printf "%s\n" "$1/scripts/create-spike.sh" "$1/scripts/create.sh" "$1/scripts/verify.sh" "$1/scripts/test-e2e.sh" | sort)" ]] &&
   grep -Fq "return \"\${EXIT_BLOCKED}\"" "$1/scripts/create-spike.sh" &&
   grep -Fq "record_spike_blocker" "$1/scripts/create-spike.sh" &&
   grep -Fq "record_final_blocker" "$1/scripts/create.sh" &&
   grep -Fq "blocked_result_is_current" "$1/scripts/verify.sh" &&
-  grep -Fq "exit \"\${EXIT_BLOCKED}\"" "$1/scripts/verify.sh"
+  grep -Fq "exit \"\${EXIT_BLOCKED}\"" "$1/scripts/verify.sh" &&
+  grep -Fq "recognized_blocker_cleanup" "$1/scripts/test-e2e.sh"
 ' _ "${LAB_ROOT}"
 check "unimplemented normal path returns 1, never 2" \
   command_returns_one "${SCRIPT_DIR}/unavailable.sh" create "later phase"
@@ -860,6 +868,7 @@ check "CNPG tenant manifests enforce exact independent database topology" bash -
     grep -Fq "podAntiAffinityType: required" "$file" || exit 1
     grep -Fq "topologyKey: kubernetes.io/hostname" "$file" || exit 1
     grep -Fq "size: ${CNPG_STORAGE_SIZE}" "$file" || exit 1
+    grep -Fq "storageClass: ${TENANT_STORAGE_CLASS}" "$file" || exit 1
     grep -Fq "cpu: ${CNPG_REQUEST_CPU}" "$file" || exit 1
     grep -Fq "memory: ${CNPG_REQUEST_MEMORY}" "$file" || exit 1
     grep -Fq "cpu: \"${CNPG_LIMIT_CPU}\"" "$file" || exit 1
@@ -893,6 +902,9 @@ check "create gates CNPG after add-ons and preserves skip and pause behavior" ba
   [[ -n "$addon_line" && -n "$cnpg_line" && -n "$topology_line" ]] &&
   (( addon_line < cnpg_line && cnpg_line < topology_line )) &&
   grep -Fq '\''"${SKIP_CNPG:-0}" != 1'\'' "$file" &&
+  grep -Fq "final_cnpg_state=skipped" "$file" &&
+  grep -Fq "final_result=partial" "$file" &&
+  grep -Fq "cnpg=%s" "$file" &&
   grep -Fq "validate_final_worker_request_capacity" "$file" &&
   ! grep -Fq "unpause_tenant_reconciliation" "$file"
 ' _ "${LAB_ROOT}"
@@ -912,7 +924,9 @@ check "behavioral verifier covers both negative identities and recovery paths" b
   grep -Fq "failover_to_different_primary" "$file" &&
   grep -Fq "replacement replica PVC" "$file" &&
   grep -Fq "replacement replica PV" "$file" &&
-  grep -Fq "retained SQL marker" "$file"
+  grep -Fq "retained SQL marker" "$file" &&
+  grep -Fq -- "--all-namespaces --no-headers" "$file" &&
+  grep -Fq "storageClassName" "$file"
 ' _ "${LAB_ROOT}"
 check "CNPG Kubernetes calls always carry explicit kubeconfigs" bash -c '
   ! grep -E "^[[:space:]]*kubectl[[:space:]]" \
@@ -950,6 +964,64 @@ check "status and diagnostics include tenant-owned CNPG and PostgreSQL layers" b
   grep -Fq "clusters.postgresql.cnpg.io,pods,services,endpoints,pvc" "$1/scripts/diagnose.sh" &&
   grep -Fq "get pv -o wide" "$1/scripts/diagnose.sh" &&
   grep -Fq "cnpg_tenant_ready" "$1/scripts/diagnose.sh"
+' _ "${LAB_ROOT}"
+
+check "tenant teardown is exact and verifies the survivor" bash -c '
+  file="$1/scripts/destroy-tenant.sh"
+  test -x "$file" &&
+  grep -Fq "delete_cnpg_for_tenant" "$file" &&
+  grep -Fq "delete_tenant_test_resources" "$file" &&
+  grep -Fq "remove_tenant_workers" "$file" &&
+  grep -Fq "delete_final_tenant_control_plane" "$file" &&
+  grep -Fq "tenant_management_secrets" "$file" &&
+  grep -Fq "DataStore/default still reports status.usedBy" "$file" &&
+  grep -Fq "exact datastore schema remains" "$file" &&
+  grep -Fq "verify_surviving_tenant_health" "$file" &&
+  grep -Fq "cnpg_verify_marker" "$file" &&
+  grep -Fq "container identity drifted" "$file"
+' _ "${LAB_ROOT}"
+check "full teardown removes shared resources then restores host state" bash -c '
+  file="$1/scripts/destroy.sh"
+  test -x "$file" &&
+  grep -Fq "cleanup_spike_resources" "$file" &&
+  grep -Fq "destroy_one_tenant tenant-a false" "$file" &&
+  grep -Fq "destroy_kamaji_shared_resources" "$file" &&
+  grep -Fq "destroy_metallb_shared_resources" "$file" &&
+  grep -Fq "destroy_cert_manager_shared_resources" "$file" &&
+  grep -Fq "restore_recorded_inotify_values" "$file" &&
+  grep -Fq "delete_owned_kind_cluster" "$file" &&
+  grep -Fq "verify_no_owned_lab_resources" "$file" &&
+  grep -Fq "rm -rf \"\${RUNTIME_DIR}\"" "$file" &&
+  kind_line="$(grep -n "delete_owned_kind_cluster" "$file" | tail -1 | cut -d: -f1)" &&
+  restore_line="$(grep -n "restore_recorded_inotify_values" "$file" | tail -1 | cut -d: -f1)" &&
+  (( kind_line < restore_line ))
+' _ "${LAB_ROOT}"
+check "Kamaji teardown names kubectl-applied hook RBAC and exact CRDs" bash -c '
+  file="$1/scripts/lib/management.sh"
+  grep -Fq "serviceaccount/kamaji-etcd" "$file" &&
+  grep -Fq "role.rbac.authorization.k8s.io/kamaji-etcd-gen-certs-role" "$file" &&
+  grep -Fq "rolebinding.rbac.authorization.k8s.io/kamaji-etcd-gen-certs-rolebinding" "$file" &&
+  grep -Fq "crd/datastores.kamaji.clastix.io" "$file" &&
+  grep -Fq "crd/kubeconfiggenerators.kamaji.clastix.io" "$file" &&
+  grep -Fq "crd/tenantcontrolplanes.kamaji.clastix.io" "$file" &&
+  grep -Fq -- "--kubeconfig \"\${MANAGEMENT_KUBECONFIG}\"" "$file"
+' _ "${LAB_ROOT}"
+check "lifecycle E2E covers clean partial healthy recovery refusal and teardown" bash -c '
+  file="$1/scripts/test-e2e.sh"
+  test -x "$file" &&
+  grep -Fq "e2e-clean-status.log" "$file" &&
+  grep -Fq "e2e-partial-status.log" "$file" &&
+  grep -Fq "e2e-healthy-status.log" "$file" &&
+  grep -Fq "seed_markers" "$file" &&
+  grep -Fq "repeat create replaced a healthy worker" "$file" &&
+  grep -Fq "deleted tenant kubeconfig was not securely re-exported" "$file" &&
+  grep -Fq "stale-expired-join" "$file" &&
+  grep -Fq "retained-worker-value" "$file" &&
+  grep -Fq "destroy-tenant.sh" "$file" &&
+  grep -Fq "test_unowned_refusals" "$file" &&
+  grep -Fq "assert_sentinels_present" "$file" &&
+  grep -Fq "did not restore the recorded host inotify values" "$file" &&
+  grep -Fq "captured lifecycle output contains credential material" "$file"
 ' _ "${LAB_ROOT}"
 
 check "management values disable telemetry" \
@@ -1040,9 +1112,18 @@ check "Phase 3 retains explicit Konnectivity digest action" bash -c '
   grep -Fq "KONNECTIVITY_AGENT_IMAGE" "$1" &&
   grep -Fq "KONNECTIVITY_SERVER_IMAGE" "$1"
 ' _ "${LAB_ROOT}/docs/high-level-design.md"
+check "documentation covers Phase 6 lifecycle and support boundaries" bash -c '
+  grep -Fq "just destroy-tenant tenant-a" "$1/README.md" &&
+  grep -Fq "just destroy" "$1/README.md" &&
+  grep -Fq "just test-e2e" "$1/README.md" &&
+  grep -Fq "intentional" "$1/README.md" &&
+  grep -Fq "inotify" "$1/docs/high-level-design.md" &&
+  grep -Fq "Teardown" "$1/docs/high-level-design.md" &&
+  grep -Fq "public edge" "$1/docs/high-level-design.md"
+' _ "${LAB_ROOT}"
 
 if (( failures > 0 )); then
   die "${failures} static check(s) failed"
 fi
 
-log "all ${checks} Phase 5 static checks passed"
+log "all ${checks} Phase 6 static checks passed"
