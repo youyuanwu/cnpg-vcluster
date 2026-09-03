@@ -7,6 +7,7 @@ source "${WORKERS_LIB_DIR}/common.sh"
 
 FINAL_WORKER_FAILURE_EVIDENCE=""
 FINAL_WORKER_FAILURE_CODE=""
+FINAL_WORKER_FAILURE_RECOGNIZED=false
 
 worker_container_exists() {
   docker container inspect "${SPIKE_WORKER_NAME}" >/dev/null 2>&1
@@ -29,10 +30,15 @@ spike_volume_owned() {
 }
 
 record_spike_worker_ownership() {
+  local volume="$1"
   {
     printf 'WORKER_NAME=%s\n' "${SPIKE_WORKER_NAME}"
     printf 'WORKER_ID=%s\n' "$(docker container inspect --format '{{.Id}}' "${SPIKE_WORKER_NAME}")"
-    printf 'WORKER_VOLUME=%s\n' "$1"
+    printf 'WORKER_VOLUME=%s\n' "${volume}"
+    if [[ -n "${volume}" ]]; then
+      printf 'WORKER_VOLUME_ID=%s\n' \
+        "$(docker volume inspect --format '{{.Name}}:{{.CreatedAt}}' "${volume}")"
+    fi
   } | write_secret_file "${SPIKE_WORKER_OWNERSHIP_FILE}"
 }
 
@@ -136,7 +142,6 @@ remove_spike_worker_container() {
     validate_spike_worker_ownership
     docker rm -f "${SPIKE_WORKER_NAME}" >/dev/null
   fi
-  rm -f "${SPIKE_WORKER_OWNERSHIP_FILE}"
 }
 
 remove_spike_worker_and_volume() {
@@ -144,8 +149,18 @@ remove_spike_worker_and_volume() {
   if docker volume inspect "${SPIKE_VOLUME_NAME}" >/dev/null 2>&1; then
     spike_volume_owned \
       || die "spike.worker-ownership: refusing deletion of unowned volume ${SPIKE_VOLUME_NAME}"
+    [[ -f "${SPIKE_WORKER_OWNERSHIP_FILE}" ]] \
+      || die "spike.worker-ownership: live volume lacks runtime ownership evidence"
+    local recorded_volume recorded_volume_id live_volume_id
+    recorded_volume="$(sed -n 's/^WORKER_VOLUME=//p' "${SPIKE_WORKER_OWNERSHIP_FILE}")"
+    recorded_volume_id="$(sed -n 's/^WORKER_VOLUME_ID=//p' "${SPIKE_WORKER_OWNERSHIP_FILE}")"
+    live_volume_id="$(docker volume inspect --format '{{.Name}}:{{.CreatedAt}}' "${SPIKE_VOLUME_NAME}")"
+    [[ "${recorded_volume}" == "${SPIKE_VOLUME_NAME}" \
+      && -n "${recorded_volume_id}" && "${recorded_volume_id}" == "${live_volume_id}" ]] \
+      || die "spike.worker-ownership: live volume identity differs from its record"
     docker volume rm "${SPIKE_VOLUME_NAME}" >/dev/null
   fi
+  rm -f "${SPIKE_WORKER_OWNERSHIP_FILE}"
 }
 
 delete_spike_node() {
@@ -315,35 +330,18 @@ validate_spike_allocatable() {
     "${SPIKE_WORKER_NAME}")"
   tenant_kubectl spike get pods --all-namespaces \
     --field-selector "spec.nodeName=${SPIKE_WORKER_NAME}" -o json \
-  | ALLOCATABLE="${allocatable}" CPU_CAP="${cpu_cap}" MEMORY_CAP="${memory_cap}" \
-    python3 -c '
-import json, os, re
-a=json.loads(os.environ["ALLOCATABLE"])["status"]["allocatable"]
-pods=json.load(__import__("sys").stdin).get("items",[])
-def cpu(v):
-    if not v: return 0
-    if v.endswith("n"): return int(v[:-1])
-    if v.endswith("u"): return int(v[:-1])*1000
-    if v.endswith("m"): return int(v[:-1])*1000000
-    return int(v)*1000000000
-def memory(v):
-    if not v: return 0
-    units={"Ki":1024,"Mi":1024**2,"Gi":1024**3,"K":1000,"M":1000**2,"G":1000**3}
-    m=re.fullmatch(r"([0-9]+)([A-Za-z]+)?",v)
-    return int(m.group(1))*units.get(m.group(2),1)
-cpu_requested=sum(cpu(c.get("resources",{}).get("requests",{}).get("cpu","0"))
-                  for p in pods for c in p.get("spec",{}).get("containers",[]))
-memory_requested=sum(memory(c.get("resources",{}).get("requests",{}).get("memory","0"))
-                     for p in pods for c in p.get("spec",{}).get("containers",[]))
-assert cpu_requested <= int(os.environ["CPU_CAP"])
-assert memory_requested <= int(os.environ["MEMORY_CAP"])
-print("ALLOCATABLE_CPU="+a["cpu"])
-print("ALLOCATABLE_MEMORY="+a["memory"])
-print("REQUESTED_CPU_NANO="+str(cpu_requested))
-print("REQUESTED_MEMORY_BYTES="+str(memory_requested))
-print("DOCKER_CPU_NANO="+os.environ["CPU_CAP"])
-print("DOCKER_MEMORY_BYTES="+os.environ["MEMORY_CAP"])
-' | write_secret_file "${SPIKE_PERSISTENCE_EVIDENCE}"
+  | CPU_CAP="${cpu_cap}" MEMORY_CAP="${memory_cap}" \
+    python3 "${WORKERS_LIB_DIR}/effective_requests.py" \
+    >"${SPIKE_PERSISTENCE_EVIDENCE}"
+  {
+    printf 'ALLOCATABLE_CPU=%s\n' \
+      "$(ALLOCATABLE="${allocatable}" python3 -c 'import json,os; print(json.loads(os.environ["ALLOCATABLE"])["status"]["allocatable"]["cpu"])')"
+    printf 'ALLOCATABLE_MEMORY=%s\n' \
+      "$(ALLOCATABLE="${allocatable}" python3 -c 'import json,os; print(json.loads(os.environ["ALLOCATABLE"])["status"]["allocatable"]["memory"])')"
+    printf 'DOCKER_CPU_NANO=%s\n' "${cpu_cap}"
+    printf 'DOCKER_MEMORY_BYTES=%s\n' "${memory_cap}"
+  } >>"${SPIKE_PERSISTENCE_EVIDENCE}"
+  chmod 0600 "${SPIKE_PERSISTENCE_EVIDENCE}"
 }
 
 recreate_persistent_spike_worker() {
@@ -478,15 +476,43 @@ final_worker_current() {
 validate_final_worker_ownership_record() {
   local tenant="$1"
   local ordinal="$2"
-  local name record recorded_id live_id
+  local name volume record recorded_name recorded_id recorded_volume
+  local recorded_volume_id live_id live_volume_id
   name="$(worker_name "${tenant}" "${ordinal}")"
+  volume="$(worker_volume_name "${tenant}" "${ordinal}")"
   record="$(worker_ownership_file "${tenant}" "${ordinal}")"
   [[ -f "${record}" ]] \
     || die "${tenant}.worker-ownership: ${name} lacks runtime ownership evidence"
+  recorded_name="$(sed -n 's/^WORKER_NAME=//p' "${record}")"
   recorded_id="$(sed -n 's/^WORKER_ID=//p' "${record}")"
+  recorded_volume="$(sed -n 's/^WORKER_VOLUME=//p' "${record}")"
+  recorded_volume_id="$(sed -n 's/^WORKER_VOLUME_ID=//p' "${record}")"
   live_id="$(docker container inspect --format '{{.Id}}' "${name}")"
-  [[ -n "${recorded_id}" && "${recorded_id}" == "${live_id}" ]] \
+  live_volume_id="$(docker volume inspect --format '{{.Name}}:{{.CreatedAt}}' "${volume}")"
+  [[ "${recorded_name}" == "${name}" \
+    && -n "${recorded_id}" && "${recorded_id}" == "${live_id}" \
+    && "${recorded_volume}" == "${volume}" \
+    && -n "${recorded_volume_id}" && "${recorded_volume_id}" == "${live_volume_id}" ]] \
     || die "${tenant}.worker-ownership: ${name} identity differs from its record"
+}
+
+validate_final_worker_volume_ownership_record() {
+  local tenant="$1"
+  local ordinal="$2"
+  local name volume record recorded_name recorded_volume recorded_volume_id live_volume_id
+  name="$(worker_name "${tenant}" "${ordinal}")"
+  volume="$(worker_volume_name "${tenant}" "${ordinal}")"
+  record="$(worker_ownership_file "${tenant}" "${ordinal}")"
+  [[ -f "${record}" ]] \
+    || die "${tenant}.worker-ownership: ${volume} lacks runtime ownership evidence"
+  recorded_name="$(sed -n 's/^WORKER_NAME=//p' "${record}")"
+  recorded_volume="$(sed -n 's/^WORKER_VOLUME=//p' "${record}")"
+  recorded_volume_id="$(sed -n 's/^WORKER_VOLUME_ID=//p' "${record}")"
+  live_volume_id="$(docker volume inspect --format '{{.Name}}:{{.CreatedAt}}' "${volume}")"
+  [[ "${recorded_name}" == "${name}" \
+    && "${recorded_volume}" == "${volume}" \
+    && -n "${recorded_volume_id}" && "${recorded_volume_id}" == "${live_volume_id}" ]] \
+    || die "${tenant}.worker-ownership: ${volume} identity differs from its record"
 }
 
 record_final_worker_ownership() {
@@ -500,6 +526,8 @@ record_final_worker_ownership() {
     printf 'WORKER_NAME=%s\n' "${name}"
     printf 'WORKER_ID=%s\n' "$(docker container inspect --format '{{.Id}}' "${name}")"
     printf 'WORKER_VOLUME=%s\n' "${volume}"
+    printf 'WORKER_VOLUME_ID=%s\n' \
+      "$(docker volume inspect --format '{{.Name}}:{{.CreatedAt}}' "${volume}")"
   } | write_secret_file "${record}"
 }
 
@@ -629,6 +657,7 @@ start_final_worker_with_retry() {
   local first_evidence second_evidence
   FINAL_WORKER_FAILURE_CODE=""
   FINAL_WORKER_FAILURE_EVIDENCE=""
+  FINAL_WORKER_FAILURE_RECOGNIZED=false
   if start_final_worker_container "${tenant}" "${ordinal}"; then
     return 0
   fi
@@ -641,6 +670,10 @@ start_final_worker_with_retry() {
   fi
   second_evidence="$(capture_final_worker_failure "${tenant}" "${ordinal}" retry)"
   FINAL_WORKER_FAILURE_EVIDENCE="first_attempt=${first_evidence}; retry=${second_evidence}"
+  if [[ "${first_evidence}" != *"inspect-unavailable"* \
+    && "${second_evidence}" != *"inspect-unavailable"* ]]; then
+    FINAL_WORKER_FAILURE_RECOGNIZED=true
+  fi
   return 1
 }
 
@@ -671,7 +704,7 @@ label_final_worker_node() {
 join_final_worker() {
   local tenant="$1"
   local ordinal="$2"
-  local name runtime join_file evidence join_command token_id status
+  local name runtime join_file evidence join_command token_id="" status
   name="$(worker_name "${tenant}" "${ordinal}")"
   runtime="$(tenant_runtime_dir "${tenant}")/join/${name}"
   join_file="${runtime}/join.sh"
@@ -679,6 +712,8 @@ join_final_worker() {
   mkdir -p -m 0700 "${runtime}"
 
   docker exec "${name}" mkdir -p -m 0700 /var/lib/kamaji-final-join
+  trap 'trap - RETURN INT TERM HUP; cleanup_final_worker_join_material "${tenant}" "${name}" "${runtime}" "${token_id}"' RETURN
+  trap 'return 130' INT TERM HUP
   docker cp "$(tenant_kubeconfig "${tenant}")" \
     "${name}:/var/lib/kamaji-final-join/admin.conf" >/dev/null
   docker exec "${name}" chmod 0600 /var/lib/kamaji-final-join/admin.conf
@@ -686,14 +721,10 @@ join_final_worker() {
   if ! join_command="$(docker exec "${name}" kubeadm \
     --kubeconfig=/var/lib/kamaji-final-join/admin.conf \
     token create --ttl "${KUBEADM_TOKEN_TTL}" --print-join-command 2>/dev/null)"; then
-    docker exec "${name}" rm -rf /var/lib/kamaji-final-join >/dev/null 2>&1 || true
-    rm -rf "${runtime}"
     return 1
   fi
   token_id="$(sed -E 's/.*--token ([^. ]+)\..*/\1/' <<<"${join_command}")"
   if [[ ! "${token_id}" =~ ^[a-z0-9]{6}$ ]]; then
-    docker exec "${name}" rm -rf /var/lib/kamaji-final-join >/dev/null 2>&1 || true
-    rm -rf "${runtime}"
     return 1
   fi
 
@@ -716,10 +747,11 @@ join_final_worker() {
   set -e
   chmod 0600 "${evidence}"
 
-  docker exec "${name}" kubeadm \
-    --kubeconfig=/var/lib/kamaji-final-join/admin.conf \
-    token delete "${token_id}" >/dev/null 2>&1 || true
-  docker exec "${name}" rm -rf /var/lib/kamaji-final-join >/dev/null 2>&1 || true
+  if [[ "${KAMAJI_TEST_FAIL_AFTER_FINAL_JOIN:-}" == "${name}" \
+    && "${status}" -eq 0 ]]; then
+    FINAL_WORKER_FAILURE_EVIDENCE="${name} injected ordinary failure after successful join"
+    return 1
+  fi
   if (( status != 0 )); then
     FINAL_WORKER_FAILURE_EVIDENCE="$(
       grep -E '^\s*\[ERROR |^error:|^To see the stack trace' "${evidence}" \
@@ -730,10 +762,43 @@ join_final_worker() {
         | paste -sd '|' - || true
     )"
   fi
-  rm -rf "${runtime}"
   (( status == 0 )) || return 1
   wait_for "${WORKER_JOIN_TIMEOUT}" "${name} registration" \
     final_worker_node_registered "${tenant}" "${name}"
+}
+
+cleanup_final_worker_join_material() {
+  local tenant="$1"
+  local name="$2"
+  local runtime="$3"
+  local token_id="${4:-}"
+  if docker container inspect "${name}" >/dev/null 2>&1 \
+    && final_worker_owned "${tenant}" "${name}"; then
+    if [[ -n "${token_id}" ]] \
+      && docker exec "${name}" test -f /var/lib/kamaji-final-join/admin.conf; then
+      docker exec "${name}" kubeadm \
+        --kubeconfig=/var/lib/kamaji-final-join/admin.conf \
+        token delete "${token_id}" >/dev/null 2>&1 || true
+    fi
+    docker exec "${name}" rm -rf /var/lib/kamaji-final-join \
+      >/dev/null 2>&1 || true
+  fi
+  rm -rf "${runtime}"
+}
+
+cleanup_stale_final_worker_join_material() {
+  local tenant="$1"
+  local ordinal="$2"
+  local name runtime token_id=""
+  name="$(worker_name "${tenant}" "${ordinal}")"
+  runtime="$(tenant_runtime_dir "${tenant}")/join/${name}"
+  if docker exec "${name}" test -f /var/lib/kamaji-final-join/join.sh \
+    >/dev/null 2>&1; then
+    token_id="$(docker exec "${name}" sed -n -E \
+      's/.*--token ([a-z0-9]{6})\.[a-z0-9]{16}.*/\1/p' \
+      /var/lib/kamaji-final-join/join.sh 2>/dev/null || true)"
+  fi
+  cleanup_final_worker_join_material "${tenant}" "${name}" "${runtime}" "${token_id}"
 }
 
 remove_final_worker_container() {
@@ -744,9 +809,9 @@ remove_final_worker_container() {
   if docker container inspect "${name}" >/dev/null 2>&1; then
     final_worker_owned "${tenant}" "${name}" \
       || die "${tenant}.worker-ownership: refusing deletion of unowned container ${name}"
+    validate_final_worker_ownership_record "${tenant}" "${ordinal}"
     docker rm -f "${name}" >/dev/null
   fi
-  rm -f "$(worker_ownership_file "${tenant}" "${ordinal}")"
 }
 
 remove_final_worker_and_volume() {
@@ -758,17 +823,20 @@ remove_final_worker_and_volume() {
   if docker volume inspect "${volume}" >/dev/null 2>&1; then
     final_volume_owned "${tenant}" "${volume}" \
       || die "${tenant}.worker-ownership: refusing deletion of unowned volume ${volume}"
+    validate_final_worker_volume_ownership_record "${tenant}" "${ordinal}"
     docker volume rm "${volume}" >/dev/null
   fi
+  rm -f "$(worker_ownership_file "${tenant}" "${ordinal}")"
 }
 
 reconcile_final_worker() {
   local tenant="$1"
   local ordinal="$2"
-  local name state
+  local name state had_credentials=false
   name="$(worker_name "${tenant}" "${ordinal}")"
   FINAL_WORKER_FAILURE_CODE=""
   FINAL_WORKER_FAILURE_EVIDENCE=""
+  FINAL_WORKER_FAILURE_RECOGNIZED=false
   if docker container inspect "${name}" >/dev/null 2>&1; then
     final_worker_owned "${tenant}" "${name}" \
       || die "${tenant}.worker-ownership: refusing same-named unowned container ${name}"
@@ -795,6 +863,9 @@ reconcile_final_worker() {
           return 1
         }
       record_final_worker_ownership "${tenant}" "${ordinal}"
+      if docker exec "${name}" test -f /etc/kubernetes/kubelet.conf; then
+        had_credentials=true
+      fi
     fi
   else
     tenant_kubectl "${tenant}" delete node "${name}" \
@@ -810,7 +881,14 @@ reconcile_final_worker() {
     FINAL_WORKER_FAILURE_EVIDENCE="kube-proxy conntrack.maxPerCore is not 0"
     return 1
   }
+  cleanup_stale_final_worker_join_material "${tenant}" "${ordinal}"
   if ! final_worker_node_ready "${tenant}" "${name}"; then
+    if [[ "${had_credentials}" == true ]] \
+      && wait_for "${WORKER_READY_GRACE_TIMEOUT}" "${name} Ready grace" \
+        final_worker_node_ready "${tenant}" "${name}"; then
+      label_final_worker_node "${tenant}" "${name}"
+      return
+    fi
     FINAL_WORKER_FAILURE_CODE=kubeadm-bootstrap
     if docker exec "${name}" test -f /etc/kubernetes/kubelet.conf \
       || docker exec "${name}" test -f /var/lib/kubelet/config.yaml; then
@@ -825,6 +903,9 @@ reconcile_final_worker() {
     if ! join_final_worker "${tenant}" "${ordinal}"; then
       [[ -n "${FINAL_WORKER_FAILURE_EVIDENCE}" ]] \
         || FINAL_WORKER_FAILURE_EVIDENCE="${name} kubeadm join failed without a parsed error summary"
+      if [[ "${FINAL_WORKER_FAILURE_EVIDENCE}" == *"[ERROR "* ]]; then
+        FINAL_WORKER_FAILURE_RECOGNIZED=true
+      fi
       return 1
     fi
   fi
@@ -859,17 +940,44 @@ remove_tenant_workers() {
   done
 }
 
-validate_disjoint_worker_sets() {
-  local tenant expected actual names all_names
+validate_exact_tenant_node_set() {
+  local tenant="$1"
+  local expected actual names expected_names ordinal name
   expected="${WORKERS_PER_TENANT}"
+  expected_names=""
+  for ordinal in $(seq 1 "${WORKERS_PER_TENANT}"); do
+    name="$(worker_name "${tenant}" "${ordinal}")"
+    expected_names+="${name}"$'\n'
+  done
+  expected_names="$(grep . <<<"${expected_names}" | sort)"
+  names="$(tenant_kubectl "${tenant}" get nodes \
+    -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)"
+  actual="$(grep -c . <<<"${names}" || true)"
+  [[ "${actual}" -eq "${expected}" && "${names}" == "${expected_names}" ]] \
+    || die "${tenant}.workers: complete Node set differs from the exact expected workers"
+  for name in ${expected_names}; do
+    tenant_kubectl "${tenant}" get node "${name}" -o json \
+      | OWNERSHIP_LABEL="${OWNERSHIP_LABEL}" \
+        LAB_PREFIX="${LAB_PREFIX}" \
+        EXPECTED_TENANT="${tenant}" \
+        python3 -c '
+import json,os,sys
+labels=json.load(sys.stdin).get("metadata",{}).get("labels",{})
+assert labels.get(os.environ["OWNERSHIP_LABEL"]) == os.environ["LAB_PREFIX"]
+assert labels.get("kamaji.cnpg-vcluster.io/tenant") == os.environ["EXPECTED_TENANT"]
+assert labels.get("kamaji.cnpg-vcluster.io/role") == "worker"
+' || die "${tenant}.workers: ${name} lacks exact ownership labels"
+    final_worker_node_ready "${tenant}" "${name}" \
+      || die "${tenant}.workers: ${name} is not Ready"
+  done
+  printf '%s\n' "${names}"
+}
+
+validate_disjoint_worker_sets() {
+  local tenant names all_names
   all_names=""
   for tenant in ${TENANT_NAMES}; do
-    names="$(tenant_kubectl "${tenant}" get nodes \
-      -l "${OWNERSHIP_LABEL}=${LAB_PREFIX},kamaji.cnpg-vcluster.io/tenant=${tenant}" \
-      -o jsonpath='{range .items[*]}{.metadata.name}{"\n"}{end}' | sort)"
-    actual="$(grep -c . <<<"${names}" || true)"
-    [[ "${actual}" -eq "${expected}" ]] \
-      || die "${tenant}.workers: expected ${expected} owned nodes, found ${actual}"
+    names="$(validate_exact_tenant_node_set "${tenant}")"
     all_names+="${names}"$'\n'
   done
   [[ "$(grep -c . <<<"${all_names}")" -eq "$((WORKERS_PER_TENANT * 2))" \
@@ -894,27 +1002,8 @@ validate_final_worker_request_capacity() {
     cpu_cap="$(docker container inspect --format '{{.HostConfig.NanoCpus}}' "${name}")"
     memory_cap="$(docker container inspect --format '{{.HostConfig.Memory}}' "${name}")"
     tenant_kubectl "${tenant}" get pods --all-namespaces \
-      --field-selector "spec.nodeName=${name}" -o json \
-    | CPU_CAP="${cpu_cap}" MEMORY_CAP="${memory_cap}" python3 -c '
-import json, os, re
-pods=json.load(__import__("sys").stdin).get("items",[])
-def cpu(value):
-    if not value: return 0
-    if value.endswith("n"): return int(value[:-1])
-    if value.endswith("u"): return int(value[:-1])*1000
-    if value.endswith("m"): return int(value[:-1])*1000000
-    return int(value)*1000000000
-def memory(value):
-    if not value: return 0
-    units={"Ki":1024,"Mi":1024**2,"Gi":1024**3,"K":1000,"M":1000**2,"G":1000**3}
-    match=re.fullmatch(r"([0-9]+)([A-Za-z]+)?", value)
-    return int(match.group(1))*units.get(match.group(2),1)
-requested_cpu=sum(cpu(c.get("resources",{}).get("requests",{}).get("cpu","0"))
-                  for p in pods for c in p.get("spec",{}).get("containers",[]))
-requested_memory=sum(memory(c.get("resources",{}).get("requests",{}).get("memory","0"))
-                     for p in pods for c in p.get("spec",{}).get("containers",[]))
-assert requested_cpu <= int(os.environ["CPU_CAP"])
-assert requested_memory <= int(os.environ["MEMORY_CAP"])
-'
-  done
+        --field-selector "spec.nodeName=${name}" -o json \
+      | CPU_CAP="${cpu_cap}" MEMORY_CAP="${memory_cap}" \
+        python3 "${WORKERS_LIB_DIR}/effective_requests.py" >/dev/null
+    done
 }

@@ -575,6 +575,10 @@ EOF
 
 install_final_tenant_addons() {
   local tenant="$1"
+  if [[ "${KAMAJI_TEST_INJECT_ADDON_FAILURE:-}" == "${tenant}" ]]; then
+    warn "${tenant}.addons: injected ordinary add-on failure"
+    return 1
+  fi
   render_tenant_addons "${tenant}"
   configure_tenant_cni_bootstrap_endpoint "${tenant}"
   tenant_kubectl "${tenant}" apply \
@@ -591,6 +595,30 @@ install_final_tenant_addons() {
     && create_final_tenant_storage_smoke "${tenant}" \
     || return 1
   verify_final_tenant_addon_images "${tenant}"
+}
+
+final_tenant_kube_proxy_procfs_blocked() {
+  local tenant="$1"
+  local pod_json entry node container_id
+  pod_json="$(tenant_kubectl "${tenant}" -n kube-system get pods \
+    -l k8s-app=kube-proxy -o json 2>/dev/null || printf '{"items":[]}')"
+  while IFS=$'\t' read -r node container_id; do
+    [[ -n "${node}" && -n "${container_id}" ]] || continue
+    docker exec "${node}" crictl logs "${container_id}" 2>&1 \
+      | grep -Fq 'open /proc/sys/net/netfilter/nf_conntrack_max: permission denied' \
+      && return 0
+  done < <(
+    POD_JSON="${pod_json}" python3 -c '
+import json,os
+for pod in json.loads(os.environ["POD_JSON"]).get("items",[]):
+    node=pod.get("spec",{}).get("nodeName","")
+    for status in pod.get("status",{}).get("containerStatuses",[]):
+        value=status.get("containerID","")
+        if value:
+            print(node + "\t" + value.split("://",1)[-1])
+'
+  )
+  return 1
 }
 
 delete_final_tenant_smoke() {

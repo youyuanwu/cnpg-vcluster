@@ -351,6 +351,7 @@ cross_database_identity_rejected() {
   secret="cnpg-cross-auth-${source}"
   client="cnpg-cross-auth-${source}-to-${target}"
   cluster="$(cnpg_cluster_name "${target}")"
+  trap 'trap - RETURN; delete_cnpg_sql_client "${target}" "${client}"; tenant_kubectl "${target}" -n "${DATABASE_NAMESPACE}" delete secret "${secret}" --ignore-not-found --wait=false >/dev/null 2>&1 || true' RETURN
   tenant_kubectl "${target}" -n "${DATABASE_NAMESPACE}" delete pod "${client}" \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
   tenant_kubectl "${target}" -n "${DATABASE_NAMESPACE}" delete secret "${secret}" \
@@ -366,15 +367,18 @@ cross_database_identity_rejected() {
       create secret generic "${secret}" \
       --from-file=password=/dev/stdin \
       --dry-run=client -o yaml \
+    | tenant_kubectl "${target}" -n "${DATABASE_NAMESPACE}" label \
+      --local -f - \
+      "${OWNERSHIP_LABEL}=${LAB_PREFIX}" \
+      "kamaji.cnpg-vcluster.io/tenant=${target}" \
+      kamaji.cnpg-vcluster.io/role=cross-auth \
+      --overwrite -o yaml \
     | tenant_kubectl "${target}" apply -f - >/dev/null
   unset password
-  tenant_kubectl "${target}" -n "${DATABASE_NAMESPACE}" label secret "${secret}" \
-    "${OWNERSHIP_LABEL}=${LAB_PREFIX}" \
-    "kamaji.cnpg-vcluster.io/tenant=${target}" \
-    kamaji.cnpg-vcluster.io/role=cross-auth --overwrite >/dev/null
-  create_cnpg_sql_client "${target}" "${client}" "${secret}"
-  tenant_kubectl "${target}" -n "${DATABASE_NAMESPACE}" label pod "${client}" \
-    kamaji.cnpg-vcluster.io/role=cross-auth --overwrite >/dev/null
+  if [[ "${KAMAJI_TEST_FAIL_AFTER_CROSS_AUTH_SECRET:-}" == "${source}" ]]; then
+    return 1
+  fi
+  create_cnpg_sql_client "${target}" "${client}" "${secret}" cross-auth
   cnpg_run_sql "${target}" "SELECT 1;" >/dev/null \
     || die "${target} database connectivity failed before cross-authentication test"
   set +e

@@ -67,23 +67,26 @@ delete_tenant_test_resources() {
 
 verify_removed_tenant_absent() {
   local tenant="$1"
+  local require_datastore_proof="${2:-true}"
   local namespace schema user secret claims
   namespace="$(tenant_namespace "${tenant}")"
   schema="$(tenant_schema "${tenant}")"
   user="$(tenant_datastore_user "${tenant}")"
   ! final_tenant_exists "${tenant}" \
     || die "${tenant}.cleanup: TenantControlPlane remains"
-  ! management_kubectl get namespace "${namespace}" >/dev/null 2>&1 \
-    || die "${tenant}.cleanup: management namespace remains"
-  if management_datastore_available; then
-    ! datastore_used_by_tenant "${tenant}" \
-      || die "${tenant}.cleanup: DataStore/default still reports status.usedBy"
-    ! etcd_prefix_exists "${schema}" \
-      || die "${tenant}.cleanup: exact datastore schema remains"
-    ! etcd_user_exists "${user}" \
-      || die "${tenant}.cleanup: exact datastore user remains"
-    ! etcd_role_exists "${schema}" \
-      || die "${tenant}.cleanup: exact datastore role remains"
+  management_namespace_absent "${namespace}" \
+    || die "${tenant}.cleanup: management namespace remains or could not be inspected"
+  if [[ "${require_datastore_proof}" == true ]]; then
+    management_datastore_available \
+      || die "${tenant}.cleanup: shared datastore is unavailable during cleanup proof"
+    require_probe_state absent "${tenant}.cleanup: DataStore/default status.usedBy" \
+      datastore_used_by_tenant_state "${tenant}"
+    require_probe_state absent "${tenant}.cleanup: exact datastore schema" \
+      etcd_prefix_state "${schema}"
+    require_probe_state absent "${tenant}.cleanup: exact datastore user" \
+      etcd_user_state "${user}"
+    require_probe_state absent "${tenant}.cleanup: exact datastore role" \
+      etcd_role_state "${schema}"
   fi
   while IFS= read -r secret; do
     [[ -z "${secret}" ]] \
@@ -142,6 +145,7 @@ verify_surviving_tenant_health() {
 destroy_one_tenant() {
   local tenant="$1"
   local verify_survivor="${2:-true}"
+  local cleanup_mode="${3:-targeted}"
   local survivor survivor_present=false
   survivor="$(other_final_tenant "${tenant}")"
 
@@ -153,6 +157,9 @@ destroy_one_tenant() {
   [[ -f "${MANAGEMENT_NETWORK_FILE}" ]] \
     || die "management network assignment is absent"
   load_management_network
+  if [[ "${cleanup_mode}" == targeted ]]; then
+    require_management_datastore_inspection "${tenant}"
+  fi
   ensure_tenant_kubeconfig_if_possible "${tenant}"
   if final_tenant_exists "${survivor}"; then
     survivor_present=true
@@ -162,8 +169,10 @@ destroy_one_tenant() {
   delete_cnpg_for_tenant "${tenant}"
   delete_tenant_test_resources "${tenant}"
   remove_tenant_workers "${tenant}"
-  delete_final_tenant_control_plane "${tenant}"
-  verify_removed_tenant_absent "${tenant}"
+  delete_final_tenant_control_plane "${tenant}" \
+    "$([[ "${cleanup_mode}" == targeted ]] && printf true || printf false)"
+  verify_removed_tenant_absent "${tenant}" \
+    "$([[ "${cleanup_mode}" == targeted ]] && printf true || printf false)"
   if [[ "${verify_survivor}" == true && "${survivor_present}" == true ]]; then
     verify_surviving_tenant_health "${survivor}"
   fi

@@ -71,6 +71,8 @@ write_final_result() {
       printf 'final_runtime=absent\n'
     elif [[ "${final_result}" == pass || "${final_result}" == partial ]]; then
       printf 'cleanup=not-required\n'
+    elif [[ "${final_result}" == error ]]; then
+      printf 'cleanup=not-attempted\n'
     else
       printf 'cleanup=failed\n'
     fi
@@ -80,11 +82,17 @@ write_final_result() {
 cleanup_final_topology() {
   local tenant
   for tenant in ${TENANT_NAMES}; do
+    final_tenant_existed_at_start "${tenant}" && continue
     delete_final_tenant_smoke "${tenant}"
     remove_tenant_workers "${tenant}"
   done
   for tenant in ${TENANT_NAMES}; do
-    delete_final_tenant_control_plane "${tenant}"
+    final_tenant_existed_at_start "${tenant}" && continue
+    delete_final_tenant_control_plane "${tenant}" true
+  done
+  for tenant in ${TENANT_NAMES}; do
+    final_tenant_existed_at_start "${tenant}" && continue
+    verify_final_tenant_cleanup_absent "${tenant}"
   done
 }
 
@@ -134,7 +142,56 @@ blocked_final() {
   final_blocker_prerequisite="$2"
   shift 2
   final_blocker_message="$*"
+  [[ " ${COMPATIBILITY_BLOCKER_CODES} " == *" ${final_blocker_code} "* \
+    && -n "${final_blocker_message}" ]] \
+    || die "final.compatibility: refusing unclassified exit 2"
   exit "${EXIT_BLOCKED}"
+}
+
+classify_kube_proxy_failure() {
+  local tenant="$1"
+  if final_tenant_kube_proxy_procfs_blocked "${tenant}"; then
+    final_blocker_code=cni-konnectivity
+    final_blocker_message="${tenant} kube-proxy has the recognized read-only nf_conntrack_max compatibility failure"
+    return 0
+  fi
+  return 1
+}
+
+classify_addon_failure() {
+  classify_kube_proxy_failure "$1"
+}
+
+classify_worker_failure() {
+  [[ "${FINAL_WORKER_FAILURE_RECOGNIZED}" == true \
+    && " ${COMPATIBILITY_BLOCKER_CODES} " == *" ${FINAL_WORKER_FAILURE_CODE} "* \
+    && -n "${FINAL_WORKER_FAILURE_EVIDENCE}" ]] \
+    || return 1
+  final_blocker_code="${FINAL_WORKER_FAILURE_CODE}"
+  final_blocker_message="${FINAL_WORKER_FAILURE_EVIDENCE}"
+}
+
+classify_topology_failure() {
+  return 1
+}
+
+classify_capacity_failure() {
+  return 1
+}
+
+handle_classified_failure() {
+  local classifier="$1"
+  local tenant="$2"
+  local prerequisite="$3"
+  local ordinary_message="$4"
+  if "${classifier}" "${tenant}"; then
+    if [[ "${tenant}" != all ]] && final_tenant_existed_at_start "${tenant}"; then
+      die "${ordinary_message}; recognized evidence was retained but exit 2 cleanup is forbidden for a pre-existing tenant"
+    fi
+    blocked_final "${final_blocker_code}" "${prerequisite}" \
+      "${final_blocker_message}"
+  fi
+  die "${ordinary_message}"
 }
 
 compatibility_result_is_current_pass() {
@@ -263,7 +320,11 @@ assert actual == expected
 }
 
 require_exact_just
+if [[ "${KAMAJI_TEST_SKIP_PREFLIGHT:-0}" != 1 ]]; then
+  "${SCRIPT_DIR}/preflight.sh"
+fi
 require_host_inotify_capacity
+clear_owned_compatibility_blocker
 trap finish_final_create EXIT
 capture_existing_final_tenant_state
 reconcile_management_plane
@@ -283,15 +344,14 @@ for tenant in ${TENANT_NAMES}; do
       || die "final.repeat-create: ${tenant} pause or kube-proxy remediation changed during reconciliation"
   else
     if ! (configure_tenant_kube_proxy_conntrack "${tenant}"); then
-      blocked_final cni-konnectivity "${tenant}-kube-proxy-remediation" \
-        "${tenant} conntrack.maxPerCore=0 was not retained before worker join"
+      handle_classified_failure classify_kube_proxy_failure "${tenant}" \
+        "${tenant}-kube-proxy-remediation" \
+        "${tenant}.kube-proxy: remediation failed without recognized compatibility evidence"
     fi
   fi
 done
-if ! (verify_tenant_identity_separation); then
-  blocked_final worker-substrate tenant-identity \
-    "tenant API endpoints or certificate authorities are not distinct"
-fi
+verify_tenant_identity_separation \
+  || die "tenant.identity: endpoint or certificate separation validation failed"
 final_tenant_a_endpoint="$(tenant_kubectl tenant-a config view --raw \
   -o jsonpath='{.clusters[0].cluster.server}')"
 final_tenant_b_endpoint="$(tenant_kubectl tenant-b config view --raw \
@@ -302,19 +362,24 @@ final_tenant_b_ca_sha256="$(tenant_ca_fingerprint tenant-b)"
 for tenant in ${TENANT_NAMES}; do
   log "reconciling ${WORKERS_PER_TENANT} workers for ${tenant}"
   if ! reconcile_tenant_workers "${tenant}"; then
-    blocked_final "${FINAL_WORKER_FAILURE_CODE:-worker-substrate}" "${tenant}-workers" \
-      "${tenant} worker reconciliation did not converge: ${FINAL_WORKER_FAILURE_EVIDENCE:-no observed failure evidence}"
+    handle_classified_failure classify_worker_failure "${tenant}" \
+      "${tenant}-workers" \
+      "${tenant}.workers: reconciliation failed without recognized compatibility evidence: ${FINAL_WORKER_FAILURE_EVIDENCE:-no observed failure evidence}"
   fi
 done
 
 for tenant in ${TENANT_NAMES}; do
   log "installing networking and storage for ${tenant}"
-  (install_final_tenant_addons "${tenant}") \
-    || blocked_final cni-konnectivity "${tenant}-addons" \
-      "${tenant} CoreDNS, kube-proxy, Konnectivity, Calico, DNS/service routing, endpoint reachability, or Local Path storage did not converge"
-  validate_final_worker_request_capacity "${tenant}" \
-    || blocked_final worker-substrate "${tenant}-capacity" \
-      "${tenant} scheduled pod requests exceed the owned worker Docker caps"
+  if ! (install_final_tenant_addons "${tenant}"); then
+    handle_classified_failure classify_addon_failure "${tenant}" \
+      "${tenant}-addons" \
+      "${tenant}.addons: ordinary readiness, API, or storage failure; retained all tenant resources for diagnosis"
+  fi
+  if ! validate_final_worker_request_capacity "${tenant}"; then
+    handle_classified_failure classify_capacity_failure "${tenant}" \
+      "${tenant}-capacity" \
+      "${tenant}.capacity: effective scheduled pod requests exceed an owned worker Docker cap"
+  fi
 done
 
 if [[ "${SKIP_CNPG:-0}" != 1 ]]; then
@@ -329,8 +394,8 @@ else
 fi
 
 if ! (validate_exact_final_topology); then
-  blocked_final worker-substrate final-topology \
-    "exact two-TCP, two-schema, six-worker isolation or storage topology did not validate"
+  handle_classified_failure classify_topology_failure all final-topology \
+    "final.topology: exact two-TCP, two-schema, six-worker isolation or storage topology did not validate"
 fi
 for tenant in ${TENANT_NAMES}; do
   final_tenant_tcp_ready "${tenant}" \

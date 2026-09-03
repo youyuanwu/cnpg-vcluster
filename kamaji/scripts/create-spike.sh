@@ -99,6 +99,9 @@ blocked() {
 
 require_exact_just
 refuse_spike_with_final_state
+if [[ "${KAMAJI_TEST_SKIP_PREFLIGHT:-0}" != 1 ]]; then
+  "${SCRIPT_DIR}/preflight.sh"
+fi
 require_host_inotify_capacity
 clear_owned_spike_evidence
 trap finish_spike EXIT

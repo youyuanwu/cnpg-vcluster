@@ -5,6 +5,10 @@ umask 077
 
 COMMON_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 LAB_ROOT="$(cd "${COMMON_DIR}/../.." && pwd -P)"
+if [[ -z "${HOST_PATH+x}" ]]; then
+  HOST_PATH="${PATH}"
+fi
+export HOST_PATH
 TOOLS_DIR="${LAB_ROOT}/.tools"
 BIN_DIR="${TOOLS_DIR}/bin"
 CACHE_DIR="${TOOLS_DIR}/cache"
@@ -28,6 +32,8 @@ SPIKE_PERSISTENCE_EVIDENCE="${SPIKE_RUNTIME_DIR}/persistence.env"
 MANAGEMENT_OWNERSHIP_FILE="${RUNTIME_DIR}/management/ownership.env"
 MANAGEMENT_NETWORK_FILE="${RUNTIME_DIR}/network/management.env"
 METALLB_RENDERED_MANIFEST="${RUNTIME_DIR}/rendered/metallb-pool.yaml"
+METALLB_PINNED_MANIFEST="${RUNTIME_DIR}/rendered/metallb-native-pinned.yaml"
+CERT_MANAGER_RENDERED_MANIFEST="${RUNTIME_DIR}/rendered/cert-manager.yaml"
 KAMAJI_PRE_HOOKS_MANIFEST="${RUNTIME_DIR}/rendered/kamaji-hooks-pre.yaml"
 KAMAJI_POST_HOOKS_MANIFEST="${RUNTIME_DIR}/rendered/kamaji-hooks-post.yaml"
 KAMAJI_CHART_DIR="${CHARTS_DIR}/kamaji"
@@ -158,11 +164,15 @@ write_secret_file() {
 }
 
 require_exact_just() {
-  require_command just
-  local actual
-  actual="$(just --version 2>/dev/null || true)"
+  local executable actual
+  executable="$(
+    PATH="${HOST_PATH}" command -v just 2>/dev/null || true
+  )"
+  [[ -n "${executable}" && "${executable}" != "${BIN_DIR}/just" ]] \
+    || die "host-installed just ${JUST_VERSION} is required; ${BIN_DIR}/just cannot satisfy the prerequisite"
+  actual="$("${executable}" --version 2>/dev/null || true)"
   [[ "${actual}" == "just ${JUST_VERSION}" ]] \
-    || die "just ${JUST_VERSION} is required; found ${actual:-unavailable}"
+    || die "host-installed just ${JUST_VERSION} is required; found ${actual:-unavailable} at ${executable}"
 }
 
 management_context() {

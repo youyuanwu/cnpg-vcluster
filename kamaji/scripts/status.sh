@@ -377,6 +377,9 @@ for tenant in ${TENANT_NAMES}; do
     printf 'Ready workers: %s/%s\n' "${ready_workers}" "${WORKERS_PER_TENANT}"
     [[ "${ready_workers}" -eq "${WORKERS_PER_TENANT}" ]] \
       || unhealthy "${tenant} does not have ${WORKERS_PER_TENANT} Ready workers"
+    if ! (validate_exact_tenant_node_set "${tenant}" >/dev/null); then
+      unhealthy "${tenant} complete Node-name set or ownership labels differ from the exact expected three"
+    fi
     conntrack_value="$(tenant_kubectl "${tenant}" -n kube-system get configmap kube-proxy \
         -o jsonpath='{.data.config\.conf}' 2>/dev/null \
         | sed -n 's/^  maxPerCore: //p' || true)"
@@ -444,9 +447,8 @@ if [[ -f "${FINAL_RESULT_FILE}" ]] \
   done
 elif [[ -f "${FINAL_RESULT_FILE}" ]] \
   && grep -Fxq 'result=blocked' "${FINAL_RESULT_FILE}"; then
-  [[ "${final_tcp_count}" -eq 0 ]] || unhealthy "blocked final result retains TCPs"
-  [[ "${final_worker_count}" -eq 0 ]] || unhealthy "blocked final result retains workers"
-  [[ "${final_volume_count}" -eq 0 ]] || unhealthy "blocked final result retains volumes"
+  grep -Fxq 'cleanup=proved' "${FINAL_RESULT_FILE}" \
+    || unhealthy "blocked final result lacks cleanup proof"
 fi
 
 exit "${health}"

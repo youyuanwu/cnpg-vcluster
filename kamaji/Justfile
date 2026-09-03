@@ -31,6 +31,10 @@ destroy-spike:
 create:
     @scripts/create.sh
 
+# Explicitly repair one owned incomplete or drifted tenant without auto-adoption.
+repair tenant:
+    @scripts/repair-tenant.sh "{{tenant}}"
+
 # Report read-only summarized state.
 status:
     @scripts/status.sh

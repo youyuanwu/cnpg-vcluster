@@ -357,6 +357,7 @@ create_cnpg_sql_client() {
   local tenant="$1"
   local client="$2"
   local password_secret="$3"
+  local role="${4:-sql-client}"
   cat <<EOF | tenant_kubectl "${tenant}" apply -f - >/dev/null
 apiVersion: v1
 kind: Pod
@@ -366,7 +367,7 @@ metadata:
   labels:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
     kamaji.cnpg-vcluster.io/tenant: ${tenant}
-    kamaji.cnpg-vcluster.io/role: sql-client
+    kamaji.cnpg-vcluster.io/role: ${role}
 spec:
   automountServiceAccountToken: false
   restartPolicy: Never
@@ -380,6 +381,13 @@ spec:
             secretKeyRef:
               name: ${password_secret}
               key: password
+      resources:
+        requests:
+          cpu: ${SQL_CLIENT_REQUEST_CPU}
+          memory: ${SQL_CLIENT_REQUEST_MEMORY}
+        limits:
+          cpu: ${SQL_CLIENT_LIMIT_CPU}
+          memory: ${SQL_CLIENT_LIMIT_MEMORY}
 EOF
   tenant_kubectl "${tenant}" -n "${DATABASE_NAMESPACE}" wait \
     --for=condition=Ready "pod/${client}" --timeout="${SQL_CLIENT_TIMEOUT}" \

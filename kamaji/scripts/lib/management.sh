@@ -23,6 +23,16 @@ management_state_present() {
   kind_cluster_reported || management_container_exists
 }
 
+management_namespace_absent() {
+  local output status
+  set +e
+  output="$(management_kubectl get namespace "$1" \
+    --ignore-not-found -o name 2>&1)"
+  status=$?
+  set -e
+  (( status == 0 )) && [[ -z "${output}" ]]
+}
+
 cleanup_if_introduced() {
   local introduced="$1"
   shift
@@ -87,14 +97,17 @@ delete_owned_kind_cluster() {
   (( reported == 1 && container == 1 )) \
     || die "management.ownership-refusal: partial same-named kind state is not safe to delete"
   validate_management_ownership
-  kind delete cluster --name "${KIND_CLUSTER_NAME}" \
+  timeout "$(seconds_from_duration "${KIND_CREATE_TIMEOUT}")" \
+    kind delete cluster --name "${KIND_CLUSTER_NAME}" \
     --kubeconfig "${MANAGEMENT_KUBECONFIG}" >/dev/null
   ! kind_cluster_reported && ! management_container_exists \
     || die "management.cleanup: exact owned kind cluster remains"
 }
 
 cleanup_new_kind_cluster() {
-  kind delete cluster --name "${KIND_CLUSTER_NAME}" >/dev/null 2>&1 || true
+  timeout "$(seconds_from_duration "${KIND_CREATE_TIMEOUT}")" \
+    kind delete cluster --name "${KIND_CLUSTER_NAME}" \
+    --kubeconfig "${MANAGEMENT_KUBECONFIG}" >/dev/null 2>&1 || true
   rm -f "${MANAGEMENT_KUBECONFIG}" "${MANAGEMENT_OWNERSHIP_FILE}" \
     "${MANAGEMENT_NETWORK_FILE}" "${METALLB_RENDERED_MANIFEST}"
 }
@@ -145,12 +158,56 @@ reconcile_kind_cluster() {
 }
 
 cleanup_cert_manager() {
-  management_helm uninstall cert-manager --namespace cert-manager >/dev/null 2>&1 || true
-  management_kubectl delete namespace cert-manager --ignore-not-found >/dev/null 2>&1 || true
+  management_helm uninstall cert-manager --namespace cert-manager \
+    --timeout "${CERT_MANAGER_TIMEOUT}" >/dev/null 2>&1 || true
+  management_kubectl delete namespace cert-manager --ignore-not-found \
+    --wait=false >/dev/null 2>&1 || true
+  wait_for "${CERT_MANAGER_TIMEOUT}" "cert-manager namespace deletion" \
+    management_namespace_absent cert-manager
+}
+
+render_cert_manager_manifest() {
+  local chart="${INPUTS_DIR}/cert-manager-${CERT_MANAGER_VERSION}.tgz"
+  mkdir -p -m 0700 "$(dirname "${CERT_MANAGER_RENDERED_MANIFEST}")"
+  sha256_check "${CERT_MANAGER_CHART_SHA256}" "${chart}"
+  management_helm template cert-manager "${chart}" \
+    --namespace cert-manager \
+    --include-crds \
+    --set crds.enabled=true \
+    --set "image.tag=${CERT_MANAGER_VERSION}" \
+    --set "image.digest=${CERT_MANAGER_CONTROLLER_IMAGE##*@}" \
+    --set "webhook.image.tag=${CERT_MANAGER_VERSION}" \
+    --set "webhook.image.digest=${CERT_MANAGER_WEBHOOK_IMAGE##*@}" \
+    --set "cainjector.image.tag=${CERT_MANAGER_VERSION}" \
+    --set "cainjector.image.digest=${CERT_MANAGER_CAINJECTOR_IMAGE##*@}" \
+    --set "startupapicheck.image.tag=${CERT_MANAGER_VERSION}" \
+    --set "startupapicheck.image.digest=${CERT_MANAGER_STARTUPAPICHECK_IMAGE##*@}" \
+    >"${CERT_MANAGER_RENDERED_MANIFEST}"
+  chmod 0600 "${CERT_MANAGER_RENDERED_MANIFEST}"
+  local image
+  for image in \
+    "${CERT_MANAGER_CONTROLLER_IMAGE}" \
+    "${CERT_MANAGER_WEBHOOK_IMAGE}" \
+    "${CERT_MANAGER_CAINJECTOR_IMAGE}" \
+    "${CERT_MANAGER_STARTUPAPICHECK_IMAGE}"; do
+    grep -Fq "${image}" "${CERT_MANAGER_RENDERED_MANIFEST}" \
+      || die "management.cert-manager: rendered image ${image} is absent"
+  done
+}
+
+verify_cert_manager_live_images() {
+  local images
+  images="$(management_kubectl -n cert-manager get deployments \
+    cert-manager cert-manager-webhook cert-manager-cainjector \
+    -o jsonpath='{range .items[*].spec.template.spec.containers[*]}{.image}{"\n"}{end}')"
+  grep -Fxq "${CERT_MANAGER_CONTROLLER_IMAGE}" <<<"${images}" \
+    && grep -Fxq "${CERT_MANAGER_WEBHOOK_IMAGE}" <<<"${images}" \
+    && grep -Fxq "${CERT_MANAGER_CAINJECTOR_IMAGE}" <<<"${images}"
 }
 
 reconcile_cert_manager() {
   local introduced=1
+  render_cert_manager_manifest
   management_helm status cert-manager --namespace cert-manager >/dev/null 2>&1 && introduced=0
   if ! management_helm upgrade --install cert-manager \
     "${INPUTS_DIR}/cert-manager-${CERT_MANAGER_VERSION}.tgz" \
@@ -160,6 +217,14 @@ reconcile_cert_manager() {
     --wait \
     --timeout "${CERT_MANAGER_TIMEOUT}" \
     --set crds.enabled=true \
+    --set "image.tag=${CERT_MANAGER_VERSION}" \
+    --set "image.digest=${CERT_MANAGER_CONTROLLER_IMAGE##*@}" \
+    --set "webhook.image.tag=${CERT_MANAGER_VERSION}" \
+    --set "webhook.image.digest=${CERT_MANAGER_WEBHOOK_IMAGE##*@}" \
+    --set "cainjector.image.tag=${CERT_MANAGER_VERSION}" \
+    --set "cainjector.image.digest=${CERT_MANAGER_CAINJECTOR_IMAGE##*@}" \
+    --set "startupapicheck.image.tag=${CERT_MANAGER_VERSION}" \
+    --set "startupapicheck.image.digest=${CERT_MANAGER_STARTUPAPICHECK_IMAGE##*@}" \
     --set resources.requests.cpu=100m \
     --set resources.requests.memory=128Mi \
     --set webhook.resources.requests.cpu=100m \
@@ -187,11 +252,43 @@ reconcile_cert_manager() {
     cleanup_if_introduced "${introduced}" cleanup_cert_manager
     die "management.cert-manager: webhook has no ready endpoint"
   fi
+  verify_cert_manager_live_images \
+    || die "management.cert-manager: live workloads do not use the approved image digests"
+}
+
+render_metallb_manifest() {
+  local source="${INPUTS_DIR}/metallb-native-${METALLB_VERSION}.yaml"
+  mkdir -p -m 0700 "$(dirname "${METALLB_PINNED_MANIFEST}")"
+  sha256_check "${METALLB_MANIFEST_SHA256}" "${source}"
+  METALLB_SOURCE="${source}" \
+  METALLB_OUTPUT="${METALLB_PINNED_MANIFEST}" \
+  METALLB_CONTROLLER_TAGGED="quay.io/metallb/controller:${METALLB_VERSION}" \
+  METALLB_CONTROLLER_IMAGE="${METALLB_CONTROLLER_IMAGE}" \
+  METALLB_SPEAKER_TAGGED="quay.io/metallb/speaker:${METALLB_VERSION}" \
+  METALLB_SPEAKER_IMAGE="${METALLB_SPEAKER_IMAGE}" \
+  python3 -c '
+import os
+from pathlib import Path
+source=Path(os.environ["METALLB_SOURCE"]).read_text(encoding="utf-8")
+for tagged, pinned in (
+    (os.environ["METALLB_CONTROLLER_TAGGED"], os.environ["METALLB_CONTROLLER_IMAGE"]),
+    (os.environ["METALLB_SPEAKER_TAGGED"], os.environ["METALLB_SPEAKER_IMAGE"]),
+):
+    if source.count(tagged) != 1:
+        raise SystemExit(f"unexpected MetalLB image occurrence count for {tagged}")
+    source=source.replace(tagged, pinned)
+output=Path(os.environ["METALLB_OUTPUT"])
+output.write_text(source, encoding="utf-8")
+output.chmod(0o600)
+'
 }
 
 cleanup_metallb() {
-  management_kubectl delete -f "${INPUTS_DIR}/metallb-native-${METALLB_VERSION}.yaml" \
-    --ignore-not-found >/dev/null 2>&1 || true
+  render_metallb_manifest
+  management_kubectl delete -f "${METALLB_PINNED_MANIFEST}" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  wait_for "${METALLB_TIMEOUT}" "MetalLB namespace deletion" \
+    management_namespace_absent metallb-system
 }
 
 apply_metallb_pool() {
@@ -200,9 +297,10 @@ apply_metallb_pool() {
 
 reconcile_metallb() {
   local introduced=1
+  render_metallb_manifest
   management_kubectl get namespace metallb-system >/dev/null 2>&1 && introduced=0
   if ! management_kubectl apply \
-    -f "${INPUTS_DIR}/metallb-native-${METALLB_VERSION}.yaml" >/dev/null; then
+    -f "${METALLB_PINNED_MANIFEST}" >/dev/null; then
     cleanup_if_introduced "${introduced}" cleanup_metallb
     die "management.metallb: ${METALLB_VERSION} manifest application failed"
   fi
@@ -220,12 +318,19 @@ reconcile_metallb() {
     cleanup_if_introduced "${introduced}" cleanup_metallb
     die "management.metallb: webhook has no ready endpoint"
   fi
+  local images
+  images="$(management_kubectl -n metallb-system get deployment/controller daemonset/speaker \
+    -o jsonpath='{range .items[*].spec.template.spec.containers[*]}{.image}{"\n"}{end}')"
+  grep -Fxq "${METALLB_CONTROLLER_IMAGE}" <<<"${images}" \
+    && grep -Fxq "${METALLB_SPEAKER_IMAGE}" <<<"${images}" \
+    || die "management.metallb: live workloads do not use the approved image digests"
   if ! wait_for "${METALLB_TIMEOUT}" "MetalLB admission webhook and VIP pool" \
     apply_metallb_pool; then
     if (( introduced == 1 )); then
       cleanup_if_introduced "${introduced}" cleanup_metallb
     else
-      management_kubectl delete -f "${METALLB_RENDERED_MANIFEST}" --ignore-not-found >/dev/null 2>&1 || true
+      management_kubectl delete -f "${METALLB_RENDERED_MANIFEST}" \
+        --ignore-not-found --wait=false >/dev/null 2>&1 || true
     fi
     die "management.metallb: deterministic VIP pool application failed"
   fi
@@ -233,16 +338,20 @@ reconcile_metallb() {
 
 cleanup_kamaji() {
   local claim
-  management_helm uninstall kamaji --namespace "${MANAGEMENT_NAMESPACE}" >/dev/null 2>&1 || true
+  management_helm uninstall kamaji --namespace "${MANAGEMENT_NAMESPACE}" \
+    --timeout "${KAMAJI_TIMEOUT}" >/dev/null 2>&1 || true
   while IFS= read -r claim; do
     [[ -n "${claim}" ]] || continue
     management_kubectl -n "${MANAGEMENT_NAMESPACE}" delete "${claim}" \
-      --ignore-not-found >/dev/null 2>&1 || true
+      --ignore-not-found --wait=false >/dev/null 2>&1 || true
   done < <(
     management_kubectl -n "${MANAGEMENT_NAMESPACE}" get pvc -o name 2>/dev/null \
       | grep '^persistentvolumeclaim/data-kamaji-etcd-' || true
   )
-  management_kubectl delete namespace "${MANAGEMENT_NAMESPACE}" --ignore-not-found >/dev/null 2>&1 || true
+  management_kubectl delete namespace "${MANAGEMENT_NAMESPACE}" \
+    --ignore-not-found --wait=false >/dev/null 2>&1 || true
+  wait_for "${KAMAJI_TIMEOUT}" "Kamaji namespace deletion" \
+    management_namespace_absent "${MANAGEMENT_NAMESPACE}"
 }
 
 destroy_kamaji_shared_resources() {
@@ -256,7 +365,7 @@ destroy_kamaji_shared_resources() {
     rolebinding.rbac.authorization.k8s.io/kamaji-etcd-gen-certs-rolebinding \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
   management_helm uninstall kamaji --namespace "${MANAGEMENT_NAMESPACE}" \
-    >/dev/null 2>&1 || true
+    --timeout "${KAMAJI_TIMEOUT}" >/dev/null 2>&1 || true
   if [[ -f "${KAMAJI_RENDERED_MANIFEST}" ]]; then
     management_kubectl delete -f "${KAMAJI_RENDERED_MANIFEST}" \
       --ignore-not-found --wait=false >/dev/null 2>&1 || true

@@ -632,25 +632,96 @@ tenant_reconciliation_is_unpaused() {
   [[ -z "${paused}" || "${paused}" == false ]]
 }
 
-datastore_used_by_tenant() {
+datastore_used_by_tenant_state() {
   local tenant="$1"
-  local reference
+  local reference output status
   reference="$(tenant_namespace "${tenant}")/${tenant}"
-  management_kubectl get datastore default \
-    -o jsonpath='{.status.usedBy[*]}' 2>/dev/null \
-    | tr ' ' '\n' | grep -Fxq "${reference}"
+  set +e
+  output="$(management_kubectl get datastore default \
+    -o jsonpath='{.status.usedBy[*]}' 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  if tr ' ' '\n' <<<"${output}" | grep -Fxq "${reference}"; then
+    printf 'present\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
+datastore_used_by_tenant() {
+  [[ "$(datastore_used_by_tenant_state "$1")" == present ]]
 }
 
 management_datastore_available() {
-  management_kubectl get datastore default >/dev/null 2>&1 \
-    && management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
-      get statefulset kamaji-etcd >/dev/null 2>&1
+  [[ "${KAMAJI_TEST_DATASTORE_UNAVAILABLE:-0}" != 1 ]] \
+    && [[ "$(management_kubectl get datastore default \
+      -o jsonpath='{.status.ready}' 2>/dev/null || true)" == true ]] \
+    && [[ "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
+      get statefulset kamaji-etcd \
+      -o jsonpath='{.status.readyReplicas}' 2>/dev/null || true)" \
+      == "${KAMAJI_ETCD_REPLICAS}" ]]
+}
+
+require_probe_state() {
+  local expected="$1"
+  local description="$2"
+  shift 2
+  local state
+  state="$("$@")" \
+    || die "${description}: datastore inspection failed"
+  [[ "${state}" == "${expected}" ]] \
+    || die "${description}: expected ${expected}, found ${state}"
+}
+
+wait_for_probe_state() {
+  local duration="$1"
+  local expected="$2"
+  local description="$3"
+  shift 3
+  local deadline=$((SECONDS + $(seconds_from_duration "${duration}")))
+  local state
+  while true; do
+    state="$("$@")" \
+      || return 1
+    [[ "${state}" == "${expected}" ]] && return 0
+    if (( SECONDS >= deadline )); then
+      warn "timed out waiting for ${description}=${expected} after ${duration}"
+      return 1
+    fi
+    sleep "${WAIT_POLL_INTERVAL}"
+  done
+}
+
+require_management_datastore_inspection() {
+  local tenant="$1"
+  local schema user state
+  schema="$(tenant_schema "${tenant}")"
+  user="$(tenant_datastore_user "${tenant}")"
+  management_datastore_available \
+    || die "${tenant}.datastore-cleanup: shared datastore is unavailable; no tenant resources were removed, restore it and retry"
+  state="$(datastore_used_by_tenant_state "${tenant}")" \
+    || die "${tenant}.datastore-cleanup: DataStore/default inspection failed"
+  state="$(etcd_prefix_state "${schema}")" \
+    || die "${tenant}.datastore-cleanup: exact etcd prefix inspection failed"
+  state="$(etcd_user_state "${user}")" \
+    || die "${tenant}.datastore-cleanup: exact etcd user inspection failed"
+  state="$(etcd_role_state "${schema}")" \
+    || die "${tenant}.datastore-cleanup: exact etcd role inspection failed"
 }
 
 final_tenant_tcp_absent() {
   local tenant="$1"
-  ! management_kubectl -n "$(tenant_namespace "${tenant}")" \
-    get "$(tenant_tcp_ref "${tenant}")" >/dev/null 2>&1
+  local output status
+  set +e
+  output="$(management_kubectl -n "$(tenant_namespace "${tenant}")" \
+    get "$(tenant_tcp_ref "${tenant}")" --ignore-not-found -o name 2>&1)"
+  status=$?
+  set -e
+  (( status == 0 )) && [[ -z "${output}" ]]
 }
 
 force_delete_tenant_datastore_identity() {
@@ -660,11 +731,16 @@ force_delete_tenant_datastore_identity() {
   user="$(tenant_datastore_user "${tenant}")"
   etcd_maintenance del "/${schema}/" --prefix >/dev/null \
     || die "${tenant}.datastore-cleanup: exact prefix deletion failed"
-  if etcd_user_exists "${user}"; then
+  local state
+  state="$(etcd_user_state "${user}")" \
+    || die "${tenant}.datastore-cleanup: exact user inspection failed"
+  if [[ "${state}" == present ]]; then
     etcd_maintenance user delete "${user}" >/dev/null \
       || die "${tenant}.datastore-cleanup: exact user deletion failed"
   fi
-  if etcd_role_exists "${schema}"; then
+  state="$(etcd_role_state "${schema}")" \
+    || die "${tenant}.datastore-cleanup: exact role inspection failed"
+  if [[ "${state}" == present ]]; then
     etcd_maintenance role delete "${schema}" >/dev/null \
       || die "${tenant}.datastore-cleanup: exact role deletion failed"
   fi
@@ -672,17 +748,22 @@ force_delete_tenant_datastore_identity() {
 
 delete_final_tenant_control_plane() {
   local tenant="$1"
+  local require_datastore_proof="${2:-true}"
   local namespace schema user credential_secret=""
   namespace="$(tenant_namespace "${tenant}")"
   schema="$(tenant_schema "${tenant}")"
   user="$(tenant_datastore_user "${tenant}")"
+  if [[ "${require_datastore_proof}" == true ]]; then
+    require_management_datastore_inspection "${tenant}"
+  fi
   unpause_tenant_reconciliation "${tenant}"
 
   if management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
     >/dev/null 2>&1; then
     credential_secret="$(management_kubectl -n "${namespace}" \
       get "$(tenant_tcp_ref "${tenant}")" \
-      -o jsonpath='{.status.storage.config.secretName}' 2>/dev/null || true)"
+      -o jsonpath='{.status.storage.config.secretName}')" \
+      || die "${tenant}.cleanup: unable to inspect datastore credential Secret name"
     management_kubectl -n "${namespace}" delete "$(tenant_tcp_ref "${tenant}")" \
       --wait=false >/dev/null
     wait_for "${TENANT_DELETE_TIMEOUT}" "${tenant} TenantControlPlane deletion" \
@@ -691,37 +772,106 @@ delete_final_tenant_control_plane() {
   fi
 
   if management_datastore_available; then
-    if etcd_prefix_exists "${schema}" \
-      || etcd_user_exists "${user}" \
-      || etcd_role_exists "${schema}"; then
-      force_delete_tenant_datastore_identity "${tenant}"
+    force_delete_tenant_datastore_identity "${tenant}"
+    if [[ -n "${credential_secret}" ]]; then
+      local credential_state
+      credential_state="$(management_namespaced_resource_state \
+        "${namespace}" "secret/${credential_secret}")" \
+        || die "${tenant}.cleanup: datastore credential Secret inspection failed"
+      [[ "${credential_state}" == absent ]] \
+        || die "${tenant}.cleanup: datastore credential Secret remains"
     fi
-    [[ -z "${credential_secret}" ]] \
-      || ! management_kubectl -n "${namespace}" get secret "${credential_secret}" \
-        >/dev/null 2>&1 \
-      || die "${tenant}.cleanup: datastore credential Secret remains"
-    ! datastore_used_by_tenant "${tenant}" \
-      || die "${tenant}.cleanup: DataStore/default still reports tenant in status.usedBy"
-    ! etcd_prefix_exists "${schema}" \
-      || die "${tenant}.cleanup: exact etcd prefix remains"
-    ! etcd_user_exists "${user}" \
-      || die "${tenant}.cleanup: exact etcd user remains"
-    ! etcd_role_exists "${schema}" \
-      || die "${tenant}.cleanup: exact etcd role remains"
+    wait_for_probe_state "${TENANT_DELETE_TIMEOUT}" absent \
+      "${tenant}.cleanup: DataStore/default status.usedBy" \
+      datastore_used_by_tenant_state "${tenant}" \
+      || die "${tenant}.cleanup: DataStore/default status.usedBy cleanup proof failed"
+    wait_for_probe_state "${TENANT_DELETE_TIMEOUT}" absent \
+      "${tenant}.cleanup: exact etcd prefix" \
+      etcd_prefix_state "${schema}" \
+      || die "${tenant}.cleanup: exact etcd prefix cleanup proof failed"
+    wait_for_probe_state "${TENANT_DELETE_TIMEOUT}" absent \
+      "${tenant}.cleanup: exact etcd user" \
+      etcd_user_state "${user}" \
+      || die "${tenant}.cleanup: exact etcd user cleanup proof failed"
+    wait_for_probe_state "${TENANT_DELETE_TIMEOUT}" absent \
+      "${tenant}.cleanup: exact etcd role" \
+      etcd_role_state "${schema}" \
+      || die "${tenant}.cleanup: exact etcd role cleanup proof failed"
     [[ "$(management_kubectl get datastore default -o jsonpath='{.status.ready}')" == true ]] \
       || die "${tenant}.cleanup: shared DataStore/default became unhealthy"
+  elif [[ "${require_datastore_proof}" == true ]]; then
+    die "${tenant}.cleanup: shared datastore became unavailable; retaining namespace and runtime evidence for retry"
   fi
 
   management_kubectl delete namespace "${namespace}" \
-    --ignore-not-found --wait=true --timeout="${TENANT_DELETE_TIMEOUT}" >/dev/null
+    --ignore-not-found --wait=false >/dev/null
+  wait_for "${TENANT_DELETE_TIMEOUT}" "${tenant} namespace deletion" \
+    management_namespace_absent "${namespace}" \
+    || die "${tenant}.cleanup: management namespace deletion did not finish"
   rm -f "$(tenant_kubeconfig "${tenant}")"
   rm -rf "$(tenant_runtime_dir "${tenant}")"
+}
+
+verify_final_tenant_cleanup_absent() {
+  local tenant="$1"
+  local namespace schema user claims
+  namespace="$(tenant_namespace "${tenant}")"
+  schema="$(tenant_schema "${tenant}")"
+  user="$(tenant_datastore_user "${tenant}")"
+  final_tenant_tcp_absent "${tenant}" \
+    || die "${tenant}.cleanup-proof: TenantControlPlane is present or uninspectable"
+  management_namespace_absent "${namespace}" \
+    || die "${tenant}.cleanup-proof: namespace is present or uninspectable"
+  require_probe_state absent "${tenant}.cleanup-proof: DataStore/default status.usedBy" \
+    datastore_used_by_tenant_state "${tenant}"
+  require_probe_state absent "${tenant}.cleanup-proof: exact etcd prefix" \
+    etcd_prefix_state "${schema}"
+  require_probe_state absent "${tenant}.cleanup-proof: exact etcd user" \
+    etcd_user_state "${user}"
+  require_probe_state absent "${tenant}.cleanup-proof: exact etcd role" \
+    etcd_role_state "${schema}"
+  [[ -z "$(docker ps -aq --filter "$(owned_docker_filter)" \
+    --filter "label=kamaji.cnpg-vcluster.io/tenant=${tenant}")" ]] \
+    || die "${tenant}.cleanup-proof: worker container remains"
+  [[ -z "$(docker volume ls -q --filter "$(owned_docker_filter)" \
+    --filter "label=kamaji.cnpg-vcluster.io/tenant=${tenant}")" ]] \
+    || die "${tenant}.cleanup-proof: worker volume remains"
+  [[ ! -e "$(tenant_runtime_dir "${tenant}")" ]] \
+    || die "${tenant}.cleanup-proof: runtime evidence remains"
+  claims="$(services_claiming_vip "$(tenant_vip "${tenant}")")" \
+    || die "${tenant}.cleanup-proof: VIP could not be inspected"
+  [[ -z "${claims}" ]] \
+    || die "${tenant}.cleanup-proof: VIP remains claimed by ${claims//$'\n'/,}"
 }
 
 final_tenant_exists() {
   local tenant="$1"
   management_kubectl -n "$(tenant_namespace "${tenant}")" \
     get "$(tenant_tcp_ref "${tenant}")" >/dev/null 2>&1
+}
+
+validate_final_tenant_ownership() {
+  local tenant="$1"
+  local namespace payload
+  namespace="$(tenant_namespace "${tenant}")"
+  payload="$(management_kubectl -n "${namespace}" get "$(tenant_tcp_ref "${tenant}")" \
+    -o json)" \
+    || die "${tenant}.repair: TenantControlPlane is absent"
+  TCP_JSON="${payload}" \
+  EXPECTED_NAME="${tenant}" \
+  EXPECTED_NAMESPACE="${namespace}" \
+  EXPECTED_SCHEMA="$(tenant_schema "${tenant}")" \
+  OWNERSHIP_LABEL="${OWNERSHIP_LABEL}" \
+  LAB_PREFIX="${LAB_PREFIX}" \
+  python3 -c '
+import json,os
+tcp=json.loads(os.environ["TCP_JSON"])
+metadata=tcp.get("metadata",{})
+assert metadata.get("name") == os.environ["EXPECTED_NAME"]
+assert metadata.get("namespace") == os.environ["EXPECTED_NAMESPACE"]
+assert metadata.get("labels",{}).get(os.environ["OWNERSHIP_LABEL"]) == os.environ["LAB_PREFIX"]
+assert tcp.get("spec",{}).get("dataStoreSchema") == os.environ["EXPECTED_SCHEMA"]
+' || die "${tenant}.repair: refusing to adopt a TCP without exact ownership and schema"
 }
 
 verify_initial_final_identities_free() {
@@ -736,12 +886,12 @@ verify_initial_final_identities_free() {
       || die "final.pre-create: ${tenant} VIP is claimed by ${claims//$'\n'/,}"
     schema="$(tenant_schema "${tenant}")"
     user="$(tenant_datastore_user "${tenant}")"
-    ! etcd_prefix_exists "${schema}" \
-      || die "final.pre-create: ${tenant} datastore prefix already exists"
-    ! etcd_user_exists "${user}" \
-      || die "final.pre-create: ${tenant} datastore user already exists"
-    ! etcd_role_exists "${schema}" \
-      || die "final.pre-create: ${tenant} datastore role already exists"
+    require_probe_state absent "final.pre-create: ${tenant} datastore prefix" \
+      etcd_prefix_state "${schema}"
+    require_probe_state absent "final.pre-create: ${tenant} datastore user" \
+      etcd_user_state "${user}"
+    require_probe_state absent "final.pre-create: ${tenant} datastore role" \
+      etcd_role_state "${schema}"
   done
 }
 
@@ -750,12 +900,12 @@ verify_no_spike_residuals() {
   ! management_kubectl -n "${SPIKE_NAMESPACE}" get "$(spike_tcp_ref)" \
     >/dev/null 2>&1 \
     || die "final.pre-create: spike TenantControlPlane remains"
-  ! etcd_prefix_exists "${SPIKE_SCHEMA}" \
-    || die "final.pre-create: spike datastore prefix remains"
-  ! etcd_user_exists "${SPIKE_DATASTORE_USER}" \
-    || die "final.pre-create: spike datastore user remains"
-  ! etcd_role_exists "${SPIKE_SCHEMA}" \
-    || die "final.pre-create: spike datastore role remains"
+  require_probe_state absent "final.pre-create: spike datastore prefix" \
+    etcd_prefix_state "${SPIKE_SCHEMA}"
+  require_probe_state absent "final.pre-create: spike datastore user" \
+    etcd_user_state "${SPIKE_DATASTORE_USER}"
+  require_probe_state absent "final.pre-create: spike datastore role" \
+    etcd_role_state "${SPIKE_SCHEMA}"
   [[ ! -e "$(tenant_kubeconfig spike)" && ! -e "${SPIKE_RUNTIME_DIR}" ]] \
     || die "final.pre-create: spike runtime state remains"
   [[ -z "$(docker ps -aq --filter "$(owned_docker_filter)" \
@@ -774,10 +924,47 @@ verify_no_spike_residuals() {
   fi
 }
 
+datastore_used_by_spike_state() {
+  local output status
+  set +e
+  output="$(management_kubectl get datastore default \
+    -o jsonpath='{.status.usedBy[*]}' 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  if tr ' ' '\n' <<<"${output}" \
+    | grep -Fxq "${SPIKE_NAMESPACE}/${SPIKE_NAME}"; then
+    printf 'present\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
+management_namespaced_resource_state() {
+  local namespace="$1"
+  local resource="$2"
+  local output status
+  set +e
+  output="$(management_kubectl -n "${namespace}" get "${resource}" \
+    --ignore-not-found -o name 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  if [[ -n "${output}" ]]; then
+    printf 'present\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
 datastore_used_by_spike() {
-  management_kubectl get datastore default \
-    -o jsonpath='{.status.usedBy[*]}' 2>/dev/null \
-    | tr ' ' '\n' | grep -Fxq "${SPIKE_NAMESPACE}/${SPIKE_NAME}"
+  [[ "$(datastore_used_by_spike_state)" == present ]]
 }
 
 etcd_maintenance_finished() {
@@ -788,12 +975,27 @@ etcd_maintenance_finished() {
   [[ "${phase}" == Succeeded || "${phase}" == Failed ]]
 }
 
+etcd_maintenance_pod_absent() {
+  local pod="$1"
+  local output status
+  set +e
+  output="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get pod "${pod}" \
+    --ignore-not-found -o name 2>&1)"
+  status=$?
+  set -e
+  (( status == 0 )) && [[ -z "${output}" ]]
+}
+
 etcd_maintenance() {
   local operation="$1"
   shift
   local pod="${LAB_PREFIX}-etcd-maintenance"
   local manifest="${RUNTIME_DIR}/management/etcd-maintenance.yaml"
   local existing_label phase exit_code
+  if [[ "${KAMAJI_TEST_ETCD_MAINTENANCE_FAILURE:-0}" == 1 ]]; then
+    printf 'injected etcd maintenance failure\n' >&2
+    return 1
+  fi
 
   if management_kubectl -n "${MANAGEMENT_NAMESPACE}" get pod "${pod}" >/dev/null 2>&1; then
     existing_label="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get pod "${pod}" -o json \
@@ -801,7 +1003,10 @@ etcd_maintenance() {
     [[ "${existing_label}" == "${LAB_PREFIX}" ]] \
       || die "spike.datastore-cleanup: refusing unowned maintenance pod ${pod}"
     management_kubectl -n "${MANAGEMENT_NAMESPACE}" delete pod "${pod}" \
-      --wait=true --timeout="${SPIKE_DELETE_TIMEOUT}" >/dev/null
+      --wait=false >/dev/null
+    wait_for "${SPIKE_DELETE_TIMEOUT}" "old etcd maintenance pod deletion" \
+      etcd_maintenance_pod_absent "${pod}" \
+      || return 1
   fi
 
   ETCD_OPERATION="${operation}" \
@@ -879,31 +1084,85 @@ path.chmod(0o600)
     -o jsonpath='{.status.containerStatuses[0].state.terminated.exitCode}')"
   management_kubectl -n "${MANAGEMENT_NAMESPACE}" logs "${pod}" 2>/dev/null || true
   management_kubectl -n "${MANAGEMENT_NAMESPACE}" delete pod "${pod}" \
-    --wait=true --timeout="${SPIKE_DELETE_TIMEOUT}" >/dev/null 2>&1 || true
+    --wait=false >/dev/null 2>&1 || true
   rm -f "${manifest}"
   [[ "${phase}" == Succeeded && "${exit_code}" == 0 ]]
 }
 
+etcd_prefix_state() {
+  local output status
+  set +e
+  output="$(etcd_maintenance get "/${1}/" --prefix --keys-only 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  if [[ -n "${output}" ]]; then
+    printf 'present\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
+etcd_user_state() {
+  local output status
+  set +e
+  output="$(etcd_maintenance user get "$1" 2>&1)"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    printf 'present\n'
+  elif grep -Eqi 'user .* does not exist|user name not found' <<<"${output}"; then
+    printf 'absent\n'
+  else
+    printf 'inspection-failed\n'
+    return 1
+  fi
+}
+
+etcd_role_state() {
+  local output status
+  set +e
+  output="$(etcd_maintenance role get "$1" 2>&1)"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    printf 'present\n'
+  elif grep -Eqi 'role .* does not exist|role name not found' <<<"${output}"; then
+    printf 'absent\n'
+  else
+    printf 'inspection-failed\n'
+    return 1
+  fi
+}
+
 etcd_prefix_exists() {
-  [[ -n "$(etcd_maintenance get "/${1}/" --prefix --keys-only 2>/dev/null)" ]]
+  [[ "$(etcd_prefix_state "$1")" == present ]]
 }
 
 etcd_user_exists() {
-  etcd_maintenance user get "$1" >/dev/null 2>&1
+  [[ "$(etcd_user_state "$1")" == present ]]
 }
 
 etcd_role_exists() {
-  etcd_maintenance role get "$1" >/dev/null 2>&1
+  [[ "$(etcd_role_state "$1")" == present ]]
 }
 
 force_delete_spike_datastore_identity() {
+  local state
   etcd_maintenance del "/${SPIKE_SCHEMA}/" --prefix >/dev/null \
     || die "spike.datastore-cleanup: exact prefix deletion failed"
-  if etcd_user_exists "${SPIKE_DATASTORE_USER}"; then
+  state="$(etcd_user_state "${SPIKE_DATASTORE_USER}")" \
+    || die "spike.datastore-cleanup: exact user inspection failed"
+  if [[ "${state}" == present ]]; then
     etcd_maintenance user delete "${SPIKE_DATASTORE_USER}" >/dev/null \
       || die "spike.datastore-cleanup: exact user deletion failed"
   fi
-  if etcd_role_exists "${SPIKE_SCHEMA}"; then
+  state="$(etcd_role_state "${SPIKE_SCHEMA}")" \
+    || die "spike.datastore-cleanup: exact role inspection failed"
+  if [[ "${state}" == present ]]; then
     etcd_maintenance role delete "${SPIKE_SCHEMA}" >/dev/null \
       || die "spike.datastore-cleanup: exact role deletion failed"
   fi
@@ -917,7 +1176,8 @@ delete_spike_tenant() {
   local credential_secret=""
   if management_kubectl -n "${SPIKE_NAMESPACE}" get "$(spike_tcp_ref)" >/dev/null 2>&1; then
     credential_secret="$(management_kubectl -n "${SPIKE_NAMESPACE}" get "$(spike_tcp_ref)" \
-      -o jsonpath='{.status.storage.config.secretName}' 2>/dev/null || true)"
+      -o jsonpath='{.status.storage.config.secretName}')" \
+      || die "spike.cleanup: unable to inspect datastore credential Secret name"
     management_kubectl -n "${SPIKE_NAMESPACE}" delete "$(spike_tcp_ref)" \
       --wait=false >/dev/null
     if ! wait_for "${SPIKE_DELETE_TIMEOUT}" "spike TenantControlPlane deletion" \
@@ -927,28 +1187,37 @@ delete_spike_tenant() {
   fi
 
   if management_datastore_available; then
-    if etcd_prefix_exists "${SPIKE_SCHEMA}" \
-      || etcd_user_exists "${SPIKE_DATASTORE_USER}" \
-      || etcd_role_exists "${SPIKE_SCHEMA}"; then
-      force_delete_spike_datastore_identity
-    fi
+    force_delete_spike_datastore_identity
 
-    [[ -z "${credential_secret}" ]] \
-      || ! management_kubectl -n "${SPIKE_NAMESPACE}" get secret "${credential_secret}" >/dev/null 2>&1 \
-      || die "spike.cleanup: datastore credential Secret remains"
-    ! datastore_used_by_spike \
-      || die "spike.cleanup: DataStore/default still reports spike in status.usedBy"
-    ! etcd_prefix_exists "${SPIKE_SCHEMA}" \
-      || die "spike.cleanup: exact etcd prefix remains"
-    ! etcd_user_exists "${SPIKE_DATASTORE_USER}" \
-      || die "spike.cleanup: exact etcd user remains"
-    ! etcd_role_exists "${SPIKE_SCHEMA}" \
-      || die "spike.cleanup: exact etcd role remains"
+    if [[ -n "${credential_secret}" ]]; then
+      local credential_state
+      credential_state="$(management_namespaced_resource_state \
+        "${SPIKE_NAMESPACE}" "secret/${credential_secret}")" \
+        || die "spike.cleanup: datastore credential Secret inspection failed"
+      [[ "${credential_state}" == absent ]] \
+        || die "spike.cleanup: datastore credential Secret remains"
+    fi
+    wait_for_probe_state "${SPIKE_DELETE_TIMEOUT}" absent \
+      "spike.cleanup: DataStore/default status.usedBy" \
+      datastore_used_by_spike_state \
+      || die "spike.cleanup: DataStore/default status.usedBy cleanup proof failed"
+    wait_for_probe_state "${SPIKE_DELETE_TIMEOUT}" absent \
+      "spike.cleanup: exact etcd prefix" \
+      etcd_prefix_state "${SPIKE_SCHEMA}" \
+      || die "spike.cleanup: exact etcd prefix cleanup proof failed"
+    wait_for_probe_state "${SPIKE_DELETE_TIMEOUT}" absent \
+      "spike.cleanup: exact etcd user" \
+      etcd_user_state "${SPIKE_DATASTORE_USER}" \
+      || die "spike.cleanup: exact etcd user cleanup proof failed"
+    wait_for_probe_state "${SPIKE_DELETE_TIMEOUT}" absent \
+      "spike.cleanup: exact etcd role" \
+      etcd_role_state "${SPIKE_SCHEMA}" \
+      || die "spike.cleanup: exact etcd role cleanup proof failed"
     [[ "$(management_kubectl get datastore default -o jsonpath='{.status.ready}')" == true ]] \
       || die "spike.cleanup: shared DataStore/default became unhealthy"
   fi
 
   management_kubectl delete namespace "${SPIKE_NAMESPACE}" \
-    --ignore-not-found --wait=true --timeout="${SPIKE_DELETE_TIMEOUT}" >/dev/null
+    --ignore-not-found --wait=false >/dev/null
   rm -f "$(tenant_kubeconfig spike)"
 }
