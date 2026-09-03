@@ -5,6 +5,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/common.sh"
 # shellcheck disable=SC1091
+source "${SCRIPT_DIR}/lib/management.sh"
+# shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/tenants.sh"
 # shellcheck disable=SC1091
 source "${SCRIPT_DIR}/lib/workers.sh"
@@ -130,12 +132,14 @@ report_unavailable_cluster_layers() {
 }
 
 section "tools"
-if command -v just >/dev/null 2>&1; then
-  printf 'just: %s (required: %s)\n' "$(just --version 2>/dev/null || printf unknown)" "${JUST_VERSION}"
-  [[ "$(just --version 2>/dev/null || true)" == "just ${JUST_VERSION}" ]] \
+if host_just="$(resolve_host_just)"; then
+  printf 'just: %s at %s (required: %s)\n' \
+    "$("${host_just}" --version 2>/dev/null || printf unknown)" \
+    "${host_just}" "${JUST_VERSION}"
+  [[ "$("${host_just}" --version 2>/dev/null || true)" == "just ${JUST_VERSION}" ]] \
     || unhealthy "just version mismatch"
 else
-  unhealthy "just not found"
+  unhealthy "allowed host just not found outside ${BIN_DIR}"
 fi
 for tool in kind kubectl helm; do
   if [[ -x "${BIN_DIR}/${tool}" ]]; then
@@ -447,8 +451,20 @@ if [[ -f "${FINAL_RESULT_FILE}" ]] \
   done
 elif [[ -f "${FINAL_RESULT_FILE}" ]] \
   && grep -Fxq 'result=blocked' "${FINAL_RESULT_FILE}"; then
-  grep -Fxq 'cleanup=proved' "${FINAL_RESULT_FILE}" \
-    || unhealthy "blocked final result lacks cleanup proof"
+  blocked_result_records_are_current_consistent \
+    || unhealthy "blocked final result and blocker records are stale, incomplete, or inconsistent"
+  [[ "${final_tcp_count}" -eq 0 ]] \
+    || unhealthy "blocked final result retains a TenantControlPlane"
+  [[ "${final_worker_count}" -eq 0 ]] \
+    || unhealthy "blocked final result retains a worker"
+  [[ "${final_volume_count}" -eq 0 ]] \
+    || unhealthy "blocked final result retains a worker volume"
+  for tenant in ${TENANT_NAMES}; do
+    [[ ! -e "$(tenant_runtime_dir "${tenant}")" ]] \
+      || unhealthy "blocked final result retains ${tenant} runtime state"
+    management_namespace_absent "$(tenant_namespace "${tenant}")" \
+      || unhealthy "blocked final result retains ${tenant} management namespace"
+  done
 fi
 
 exit "${health}"

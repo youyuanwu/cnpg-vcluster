@@ -698,22 +698,22 @@ wait_for_probe_state() {
 
 require_management_datastore_inspection() {
   local tenant="$1"
-  local schema user state
+  local schema user
   schema="$(tenant_schema "${tenant}")"
   user="$(tenant_datastore_user "${tenant}")"
   management_datastore_available \
     || die "${tenant}.datastore-cleanup: shared datastore is unavailable; no tenant resources were removed, restore it and retry"
-  state="$(datastore_used_by_tenant_state "${tenant}")" \
+  datastore_used_by_tenant_state "${tenant}" >/dev/null \
     || die "${tenant}.datastore-cleanup: DataStore/default inspection failed"
-  state="$(etcd_prefix_state "${schema}")" \
+  etcd_prefix_state "${schema}" >/dev/null \
     || die "${tenant}.datastore-cleanup: exact etcd prefix inspection failed"
-  state="$(etcd_user_state "${user}")" \
+  etcd_user_state "${user}" >/dev/null \
     || die "${tenant}.datastore-cleanup: exact etcd user inspection failed"
-  state="$(etcd_role_state "${schema}")" \
+  etcd_role_state "${schema}" >/dev/null \
     || die "${tenant}.datastore-cleanup: exact etcd role inspection failed"
 }
 
-final_tenant_tcp_absent() {
+final_tenant_tcp_state() {
   local tenant="$1"
   local output status
   set +e
@@ -721,7 +721,19 @@ final_tenant_tcp_absent() {
     get "$(tenant_tcp_ref "${tenant}")" --ignore-not-found -o name 2>&1)"
   status=$?
   set -e
-  (( status == 0 )) && [[ -z "${output}" ]]
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  if [[ -n "${output}" ]]; then
+    printf 'present\n'
+  else
+    printf 'absent\n'
+  fi
+}
+
+final_tenant_tcp_absent() {
+  [[ "$(final_tenant_tcp_state "$1")" == absent ]]
 }
 
 force_delete_tenant_datastore_identity() {

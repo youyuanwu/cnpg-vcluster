@@ -284,11 +284,11 @@ output.chmod(0o600)
 }
 
 cleanup_metallb() {
-  render_metallb_manifest
+  (render_metallb_manifest) || return 0
   management_kubectl delete -f "${METALLB_PINNED_MANIFEST}" \
     --ignore-not-found --wait=false >/dev/null 2>&1 || true
   wait_for "${METALLB_TIMEOUT}" "MetalLB namespace deletion" \
-    management_namespace_absent metallb-system
+    management_namespace_absent metallb-system || return 0
 }
 
 apply_metallb_pool() {

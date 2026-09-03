@@ -919,6 +919,12 @@ reconcile_final_worker() {
 reconcile_tenant_workers() {
   local tenant="$1"
   local ordinal
+  if [[ "${KAMAJI_TEST_INJECT_RECOGNIZED_WORKER_FAILURE:-}" == "${tenant}" ]]; then
+    FINAL_WORKER_FAILURE_CODE=worker-substrate
+    FINAL_WORKER_FAILURE_EVIDENCE="${tenant} injected recognized worker blocker"
+    FINAL_WORKER_FAILURE_RECOGNIZED=true
+    return 1
+  fi
   for ordinal in $(seq 1 "${WORKERS_PER_TENANT}"); do
     log "reconciling $(worker_name "${tenant}" "${ordinal}")"
     reconcile_final_worker "${tenant}" "${ordinal}" || return 1

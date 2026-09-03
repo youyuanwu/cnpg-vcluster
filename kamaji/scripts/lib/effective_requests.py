@@ -47,15 +47,17 @@ def effective(pod, resource, parser):
         request(container, resource, parser)
         for container in spec.get("containers", [])
     )
-    init = max(
-        (
-            request(container, resource, parser)
-            for container in spec.get("initContainers", [])
-        ),
-        default=0,
-    )
+    running_sidecars = 0
+    init_peak = 0
+    for container in spec.get("initContainers", []):
+        container_request = request(container, resource, parser)
+        if container.get("restartPolicy") == "Always":
+            running_sidecars += container_request
+        else:
+            init_peak = max(init_peak, running_sidecars + container_request)
+    steady_state = application + running_sidecars
     overhead = parser(spec.get("overhead", {}).get(resource, "0"))
-    return max(application, init) + overhead
+    return max(steady_state, init_peak) + overhead
 
 
 pods = [

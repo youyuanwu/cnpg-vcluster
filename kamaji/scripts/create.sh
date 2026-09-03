@@ -63,12 +63,17 @@ write_final_result() {
     printf 'tenant_b_endpoint=%s\n' "${final_tenant_b_endpoint:-not-observed}"
     printf 'tenant_a_ca_sha256=%s\n' "${final_tenant_a_ca_sha256:-not-observed}"
     printf 'tenant_b_ca_sha256=%s\n' "${final_tenant_b_ca_sha256:-not-observed}"
-    if [[ "${final_cleanup_proved}" == true ]]; then
+    printf 'retained_tenants=%s\n' \
+      "$(xargs <<<"${existing_final_tenants}" 2>/dev/null || true)"
+    if [[ "${final_cleanup_proved}" == true \
+      && -z "${existing_final_tenants}" ]]; then
       printf 'cleanup=proved\n'
       printf 'final_tenants=absent\n'
       printf 'final_workers=absent\n'
       printf 'final_volumes=absent\n'
       printf 'final_runtime=absent\n'
+    elif [[ "${final_cleanup_proved}" == true ]]; then
+      printf 'cleanup=failed\n'
     elif [[ "${final_result}" == pass || "${final_result}" == partial ]]; then
       printf 'cleanup=not-required\n'
     elif [[ "${final_result}" == error ]]; then
@@ -81,17 +86,16 @@ write_final_result() {
 
 cleanup_final_topology() {
   local tenant
+  [[ -z "${existing_final_tenants}" ]] \
+    || die "final.compatibility: refusing cleanup because a final tenant existed at entry"
   for tenant in ${TENANT_NAMES}; do
-    final_tenant_existed_at_start "${tenant}" && continue
     delete_final_tenant_smoke "${tenant}"
     remove_tenant_workers "${tenant}"
   done
   for tenant in ${TENANT_NAMES}; do
-    final_tenant_existed_at_start "${tenant}" && continue
     delete_final_tenant_control_plane "${tenant}" true
   done
   for tenant in ${TENANT_NAMES}; do
-    final_tenant_existed_at_start "${tenant}" && continue
     verify_final_tenant_cleanup_absent "${tenant}"
   done
 }
@@ -100,6 +104,12 @@ finish_final_create() {
   local status=$?
   local oom_evidence=""
   trap - EXIT
+  if [[ "${status}" -eq "${EXIT_BLOCKED}" \
+    && -n "${existing_final_tenants}" ]]; then
+    status="${EXIT_ERROR}"
+    final_blocker_prerequisite="${final_blocker_prerequisite:-create}"
+    final_blocker_message="${final_blocker_message:-recognized compatibility evidence was retained}; exit 2 cleanup is forbidden because a final tenant existed at entry"
+  fi
   if [[ "${status}" -eq "${EXIT_BLOCKED}" ]]; then
     set +e
     if (cleanup_final_topology); then
@@ -145,6 +155,8 @@ blocked_final() {
   [[ " ${COMPATIBILITY_BLOCKER_CODES} " == *" ${final_blocker_code} "* \
     && -n "${final_blocker_message}" ]] \
     || die "final.compatibility: refusing unclassified exit 2"
+  [[ -z "${existing_final_tenants}" ]] \
+    || die "final.compatibility: refusing exit 2 because a final tenant existed at entry"
   exit "${EXIT_BLOCKED}"
 }
 
@@ -185,8 +197,8 @@ handle_classified_failure() {
   local prerequisite="$3"
   local ordinary_message="$4"
   if "${classifier}" "${tenant}"; then
-    if [[ "${tenant}" != all ]] && final_tenant_existed_at_start "${tenant}"; then
-      die "${ordinary_message}; recognized evidence was retained but exit 2 cleanup is forbidden for a pre-existing tenant"
+    if [[ -n "${existing_final_tenants}" ]]; then
+      die "${ordinary_message}; recognized evidence was retained but exit 2 cleanup is forbidden because a final tenant existed at entry"
     fi
     blocked_final "${final_blocker_code}" "${prerequisite}" \
       "${final_blocker_message}"
@@ -211,32 +223,42 @@ any_final_tenant_exists() {
 }
 
 capture_existing_final_tenant_state() {
-  local tenant
-  if [[ ! -f "${MANAGEMENT_KUBECONFIG}" ]] \
-    || ! management_kubectl get --raw=/readyz >/dev/null 2>&1; then
-    return
-  fi
-  if ! any_final_tenant_exists; then
-    return
-  fi
-  [[ -f "${MANAGEMENT_NETWORK_FILE}" ]] \
-    || die "final.repeat-create: management network state is absent"
-  load_management_network
+  local tenant state
+  [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
+    && management_kubectl get --raw=/readyz >/dev/null 2>&1 \
+    || die "final.repeat-create: reconciled management API is not inspectable"
   for tenant in ${TENANT_NAMES}; do
-    if final_tenant_exists "${tenant}"; then
-      if [[ ! -f "$(tenant_kubeconfig "${tenant}")" ]] \
-        || ! tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1; then
-        export_tenant_kubeconfig "${tenant}"
-      fi
-      [[ "$(stat -c '%a' "$(tenant_kubeconfig "${tenant}")")" == 600 ]] \
-        || die "final.repeat-create: ${tenant} kubeconfig is not mode 0600"
-      final_tenant_tcp_ready "${tenant}" \
-        || die "final.repeat-create: ${tenant} control plane is not Ready"
-      tenant_kube_proxy_steady_state_is_preserved "${tenant}" \
-        || die "final.repeat-create: ${tenant} must already be paused with remediation ${COMPATIBILITY_REVISION} and conntrack.maxPerCore=${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}"
-      existing_final_tenants+=" ${tenant} "
+    state="$(final_tenant_tcp_state "${tenant}")" \
+      || die "final.repeat-create: ${tenant} existence could not be inspected"
+    [[ "${state}" == absent ]] && continue
+    if [[ ! -f "$(tenant_kubeconfig "${tenant}")" ]] \
+      || ! tenant_kubectl "${tenant}" get --raw=/readyz >/dev/null 2>&1; then
+      export_tenant_kubeconfig "${tenant}"
     fi
+    [[ "$(stat -c '%a' "$(tenant_kubeconfig "${tenant}")")" == 600 ]] \
+      || die "final.repeat-create: ${tenant} kubeconfig is not mode 0600"
+    final_tenant_tcp_ready "${tenant}" \
+      || die "final.repeat-create: ${tenant} control plane is not Ready"
+    tenant_kube_proxy_steady_state_is_preserved "${tenant}" \
+      || die "final.repeat-create: ${tenant} must already be paused with remediation ${COMPATIBILITY_REVISION} and conntrack.maxPerCore=${KUBE_PROXY_CONNTRACK_MAX_PER_CORE}"
+    existing_final_tenants+=" ${tenant} "
   done
+}
+
+prepare_management_for_existing_tenant_capture() {
+  local reported=0 container=0 ownership=0
+  kind_cluster_reported && reported=1
+  management_container_exists && container=1
+  [[ -f "${MANAGEMENT_OWNERSHIP_FILE}" ]] && ownership=1
+  if (( reported == 0 && container == 0 && ownership == 0 )); then
+    reconcile_management_plane
+    return
+  fi
+  (( reported == 1 && container == 1 && ownership == 1 )) \
+    || die "final.repeat-create: management state exists but cannot be safely inspected"
+  ensure_owned_management_access \
+    || die "final.repeat-create: owned management state became unavailable"
+  reconcile_management_plane
 }
 
 final_tenant_existed_at_start() {
@@ -320,15 +342,13 @@ assert actual == expected
 }
 
 require_exact_just
-if [[ "${KAMAJI_TEST_SKIP_PREFLIGHT:-0}" != 1 ]]; then
-  "${SCRIPT_DIR}/preflight.sh"
-fi
+"${SCRIPT_DIR}/preflight.sh"
 require_host_inotify_capacity
-clear_owned_compatibility_blocker
 trap finish_final_create EXIT
-capture_existing_final_tenant_state
-reconcile_management_plane
+prepare_management_for_existing_tenant_capture
 load_management_network
+capture_existing_final_tenant_state
+clear_owned_compatibility_blocker
 cleanup_spike_resources
 verify_no_spike_residuals
 ensure_current_compatibility_decision

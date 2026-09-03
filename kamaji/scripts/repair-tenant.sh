@@ -22,9 +22,7 @@ case "${tenant}" in
 esac
 
 require_exact_just
-if [[ "${KAMAJI_TEST_SKIP_PREFLIGHT:-0}" != 1 ]]; then
-  "${SCRIPT_DIR}/preflight.sh"
-fi
+"${SCRIPT_DIR}/preflight.sh"
 require_host_inotify_capacity
 ensure_owned_management_access
 load_management_network

@@ -165,14 +165,80 @@ write_secret_file() {
 
 require_exact_just() {
   local executable actual
-  executable="$(
-    PATH="${HOST_PATH}" command -v just 2>/dev/null || true
-  )"
-  [[ -n "${executable}" && "${executable}" != "${BIN_DIR}/just" ]] \
-    || die "host-installed just ${JUST_VERSION} is required; ${BIN_DIR}/just cannot satisfy the prerequisite"
+  executable="$(resolve_host_just)"
+  [[ -n "${executable}" ]] \
+    || die "host-installed just ${JUST_VERSION} is required; executables below ${BIN_DIR} cannot satisfy the prerequisite"
   actual="$("${executable}" --version 2>/dev/null || true)"
   [[ "${actual}" == "just ${JUST_VERSION}" ]] \
     || die "host-installed just ${JUST_VERSION} is required; found ${actual:-unavailable} at ${executable}"
+}
+
+canonical_path() {
+  readlink -f -- "$1" 2>/dev/null
+}
+
+resolve_host_just() {
+  local executable canonical_executable canonical_bin
+  executable="$(PATH="${HOST_PATH}" command -v just 2>/dev/null || true)"
+  [[ -n "${executable}" ]] || return 1
+  canonical_executable="$(canonical_path "${executable}")" || return 1
+  canonical_bin="$(canonical_path "${BIN_DIR}")" || return 1
+  case "${canonical_executable}" in
+    "${canonical_bin}"|"${canonical_bin}/"*) return 1 ;;
+  esac
+  printf '%s\n' "${canonical_executable}"
+}
+
+record_value() {
+  local file="$1"
+  local key="$2"
+  awk -v key="${key}" '
+    index($0, key "=") == 1 {
+      count++
+      value=substr($0, length(key) + 2)
+    }
+    END {
+      if (count != 1 || value == "") exit 1
+      print value
+    }
+  ' "${file}" 2>/dev/null
+}
+
+compatibility_blocker_code_is_allowed() {
+  [[ " ${COMPATIBILITY_BLOCKER_CODES} " == *" $1 "* ]]
+}
+
+blocked_result_records_are_current_consistent() {
+  local result revision prerequisite code evidence cleanup
+  local blocker_owner blocker_code blocker_prerequisite blocker_message
+  [[ -f "${FINAL_RESULT_FILE}" && -f "${BLOCKER_FILE}" ]] || return 1
+  result="$(record_value "${FINAL_RESULT_FILE}" result)" || return 1
+  revision="$(record_value "${FINAL_RESULT_FILE}" compatibility_revision)" \
+    || return 1
+  prerequisite="$(record_value "${FINAL_RESULT_FILE}" first_failing_prerequisite)" \
+    || return 1
+  code="$(record_value "${FINAL_RESULT_FILE}" blocker_code)" || return 1
+  evidence="$(record_value "${FINAL_RESULT_FILE}" blocker_evidence)" || return 1
+  cleanup="$(record_value "${FINAL_RESULT_FILE}" cleanup)" || return 1
+  blocker_owner="$(record_value "${BLOCKER_FILE}" owner)" || return 1
+  blocker_code="$(record_value "${BLOCKER_FILE}" code)" || return 1
+  blocker_prerequisite="$(record_value "${BLOCKER_FILE}" prerequisite)" \
+    || return 1
+  blocker_message="$(record_value "${BLOCKER_FILE}" message)" || return 1
+  [[ "${result}" == blocked \
+    && "${revision}" == "${COMPATIBILITY_REVISION}" \
+    && "${prerequisite}" != none \
+    && "${evidence}" != none \
+    && "${cleanup}" == proved \
+    && "${blocker_owner}" == final \
+    && "${blocker_code}" == "${code}" \
+    && "${blocker_prerequisite}" == "${prerequisite}" \
+    && "${blocker_message}" == "${evidence}" ]] \
+    && compatibility_blocker_code_is_allowed "${code}" \
+    && grep -Fxq 'final_tenants=absent' "${FINAL_RESULT_FILE}" \
+    && grep -Fxq 'final_workers=absent' "${FINAL_RESULT_FILE}" \
+    && grep -Fxq 'final_volumes=absent' "${FINAL_RESULT_FILE}" \
+    && grep -Fxq 'final_runtime=absent' "${FINAL_RESULT_FILE}"
 }
 
 management_context() {
