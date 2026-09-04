@@ -678,6 +678,46 @@ blocked_management_daemonset_is_ready() {
   [[ -n "${desired}" && "${desired}" -gt 0 && "${ready:-0}" -eq "${desired}" ]]
 }
 
+blocked_management_network_is_healthy() {
+  local network_json pool_json advertisement_json
+  [[ -f "${MANAGEMENT_NETWORK_FILE}" ]] || return 1
+  network_json="$(docker network inspect "$(kind_network_name)" 2>/dev/null)" \
+    || return 1
+  validate_management_network "${network_json}" >/dev/null 2>&1 || return 1
+  pool_json="$(management_kubectl -n metallb-system get \
+    ipaddresspool kamaji-tenant-vips -o json 2>/dev/null)" || return 1
+  advertisement_json="$(management_kubectl -n metallb-system get \
+    l2advertisement kamaji-tenant-vips -o json 2>/dev/null)" || return 1
+  POOL_JSON="${pool_json}" \
+  ADVERTISEMENT_JSON="${advertisement_json}" \
+  OWNERSHIP_LABEL="${OWNERSHIP_LABEL}" \
+  LAB_PREFIX="${LAB_PREFIX}" \
+  TENANT_A_VIP="${TENANT_A_VIP}" \
+  TENANT_B_VIP="${TENANT_B_VIP}" \
+    python3 -c '
+import json
+import os
+
+pool = json.loads(os.environ["POOL_JSON"])
+advertisement = json.loads(os.environ["ADVERTISEMENT_JSON"])
+expected = {
+    os.environ["TENANT_A_VIP"] + "/32",
+    os.environ["TENANT_B_VIP"] + "/32",
+}
+owner = os.environ["OWNERSHIP_LABEL"]
+prefix = os.environ["LAB_PREFIX"]
+valid = (
+    set(pool.get("spec", {}).get("addresses", [])) == expected
+    and pool.get("spec", {}).get("autoAssign") is False
+    and pool.get("metadata", {}).get("labels", {}).get(owner) == prefix
+    and advertisement.get("spec", {}).get("ipAddressPools", [])
+        == ["kamaji-tenant-vips"]
+    and advertisement.get("metadata", {}).get("labels", {}).get(owner) == prefix
+)
+raise SystemExit(0 if valid else 1)
+'
+}
+
 blocked_management_plane_is_healthy() {
   kind_cluster_reported \
     && management_container_exists \
@@ -689,6 +729,7 @@ blocked_management_plane_is_healthy() {
     && blocked_management_deployment_is_ready cert-manager cert-manager-webhook \
     && blocked_management_deployment_is_ready metallb-system controller \
     && blocked_management_daemonset_is_ready metallb-system speaker \
+    && blocked_management_network_is_healthy \
     && blocked_management_deployment_is_ready "${MANAGEMENT_NAMESPACE}" kamaji \
     && [[ -n "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
       get endpoints kamaji-webhook-service \
@@ -813,6 +854,10 @@ blocked_datastore_used_by_state() {
   esac
 }
 
+blocked_path_is_present() {
+  [[ -e "$1" || -L "$1" ]]
+}
+
 blocked_residual_state_is_allowed() {
   local tenant schema user vip
   BLOCKED_RESIDUAL_REASON=""
@@ -831,17 +876,17 @@ blocked_residual_state_is_allowed() {
     || return 1
 
   for tenant in ${TENANT_NAMES} spike; do
-    if [[ -e "$(tenant_kubeconfig "${tenant}")" ]]; then
+    if blocked_path_is_present "$(tenant_kubeconfig "${tenant}")"; then
       blocked_residual_failure "${tenant} kubeconfig remains"
       return 1
     fi
     if [[ "${tenant}" == spike ]]; then
-      if [[ -e "${SPIKE_RUNTIME_DIR}" ]]; then
+      if blocked_path_is_present "${SPIKE_RUNTIME_DIR}"; then
         blocked_residual_failure "spike runtime subtree remains"
         return 1
       fi
     else
-      if [[ -e "$(tenant_runtime_dir "${tenant}")" ]]; then
+      if blocked_path_is_present "$(tenant_runtime_dir "${tenant}")"; then
         blocked_residual_failure "${tenant} runtime subtree remains"
         return 1
       fi

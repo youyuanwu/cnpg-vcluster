@@ -630,8 +630,21 @@ blocked_result_validation_fixtures() (
     || return 1
   rm -rf "${SPIKE_RUNTIME_DIR}"
 
+  ln -s "${fixture_dir}/missing-runtime-target" "${SPIKE_RUNTIME_DIR}"
+  ! blocked_result_is_current \
+    && [[ "${BLOCKED_RESIDUAL_REASON}" == "spike runtime subtree remains" ]] \
+    || return 1
+  rm -f "${SPIKE_RUNTIME_DIR}"
+
   mkdir -p -m 0700 "$(dirname "$(tenant_kubeconfig spike)")"
   : >"$(tenant_kubeconfig spike)"
+  ! blocked_result_is_current \
+    && [[ "${BLOCKED_RESIDUAL_REASON}" == "spike kubeconfig remains" ]] \
+    || return 1
+  rm -rf "${SPIKE_RUNTIME_DIR}"
+
+  mkdir -p -m 0700 "$(dirname "$(tenant_kubeconfig spike)")"
+  ln -s "${fixture_dir}/missing-kubeconfig-target" "$(tenant_kubeconfig spike)"
   ! blocked_result_is_current \
     && [[ "${BLOCKED_RESIDUAL_REASON}" == "spike kubeconfig remains" ]] \
     || return 1
@@ -1462,7 +1475,8 @@ check "status and diagnostics cover both final tenants and exit shapes" bash -c 
   grep -Fq "final tenant topology" "$1/scripts/status.sh" &&
   grep -Fq "passing final result lacks exactly two TCPs" "$1/scripts/status.sh" &&
   grep -Fq "blocked final result and blocker records are stale, incomplete, or inconsistent" "$1/scripts/status.sh" &&
-  grep -Fq "blocked final result retains a worker volume" "$1/scripts/status.sh" &&
+  grep -Fq "blocked final result residual proof failed" "$1/scripts/status.sh" &&
+  grep -Fq "healthy owned management infrastructure only" "$1/scripts/status.sh" &&
   grep -Fq "kube-proxy conntrack.maxPerCore" "$1/scripts/status.sh" &&
   grep -Fq "CoreDNS" "$1/scripts/status.sh" &&
   grep -Fq "Konnectivity" "$1/scripts/status.sh" &&
