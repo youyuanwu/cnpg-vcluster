@@ -44,9 +44,10 @@ delegate to the repository Makefile. Docker objects will use the distinct
 `io.cnpg-vcluster.kamaji-lab` ownership label and exact Kamaji-specific names.
 
 The ignored `.tools/` tree contains downloaded binaries, source archives,
-charts, manifests, rendered output, and local temporary files. The ignored
-`.runtime/` tree is reserved for management and tenant kubeconfigs, blockers,
-network assignments, logs, and generated credentials.
+charts, checksum-verified upstream manifests, rendered chart output, and local
+temporary files. The ignored `.runtime/` tree contains management and tenant
+kubeconfigs, blockers, network assignments, logs, generated credentials, and
+tenant-specific rendered manifests.
 
 ## Deterministic supply chain
 
@@ -85,12 +86,16 @@ with approved OCI digest references. The renderer emits a deterministic
 transitive image inventory and fails unless every rendered image is
 digest-pinned and no `latest` reference remains.
 
-The tracked spike add-on manifests are deterministic transforms of the
-checksum-verified Calico 3.32.2 and Local Path Provisioner 0.0.37 inputs.
-Calico selects `10.66.0.0/16` and digest-pins its CNI, node, and controller
-images. Local Path is the sole default StorageClass, stores data below
-`/var/lib/kamaji-local-path`, and digest-pins both provisioner and helper
-images. Their rendered checksums are recorded in `config/versions.env`.
+Calico 3.32.2, Local Path Provisioner 0.0.37, and CloudNativePG 1.30.0 release
+manifests are fetched into ignored `.tools/inputs/` and verified against the
+SHA-256 values in `config/versions.env`; their large upstream YAML is not
+tracked. Runtime renderers write mode-0600 copies below `.runtime/`. Calico
+selects each tenant's Pod CIDR and digest-pins its CNI, node, and controller
+images. Local Path becomes the sole default StorageClass, uses the tenant's
+path below `/var/lib`, and digest-pins both provisioner and helper images.
+CloudNativePG replaces only the selected operator tag with the approved
+controller digest. The spike add-on render checksums remain recorded as
+determinism fixtures.
 
 The directly selected etcd server image comes from
 `kamaji-etcd` 0.15.0 `values.image`; the shell-capable etcd setup image comes
@@ -349,9 +354,9 @@ CIDR and `/var/lib/kamaji-local-path/<tenant>` root.
 
 The remediated one-worker ladder passes CNI, DNS/Service routing, endpoint
 reachability, a bound Local Path PVC, and marker persistence after an owned
-worker recreation/rejoin. Full creation then installs the checksum-verified
-CNPG 1.30.0 manifest independently through each tenant API, substitutes only
-the approved controller digest in memory, and creates one tenant-specific
+worker recreation/rejoin. Full creation then renders the downloaded, checksum-verified CNPG 1.30.0
+manifest independently for each tenant API, substitutes only the approved
+controller digest, and creates one tenant-specific
 three-instance PostgreSQL 18.4 Cluster. Required hostname anti-affinity spreads
 each cluster across its three exclusive workers; each instance requests
 `100m/256Mi`, is limited to `1 CPU/1Gi`, and owns a tenant-local `1Gi` claim.

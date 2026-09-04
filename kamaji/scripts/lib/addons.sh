@@ -5,6 +5,109 @@ ADDONS_LIB_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 # shellcheck disable=SC1091
 source "${ADDONS_LIB_DIR}/common.sh"
 
+render_calico_manifest() {
+  local pod_cidr="$1"
+  local destination="$2"
+  local source="${INPUTS_DIR}/calico-${CALICO_VERSION}.yaml"
+  sha256_check "${CALICO_MANIFEST_SHA256}" "${source}"
+  mkdir -p -m 0700 "$(dirname "${destination}")"
+  CALICO_SOURCE="${source}" \
+  CALICO_DESTINATION="${destination}" \
+  CALICO_POD_CIDR="${pod_cidr}" \
+  CALICO_VERSION="${CALICO_VERSION}" \
+  CALICO_CNI_IMAGE="${CALICO_CNI_IMAGE}" \
+  CALICO_NODE_IMAGE="${CALICO_NODE_IMAGE}" \
+  CALICO_KUBE_CONTROLLERS_IMAGE="${CALICO_KUBE_CONTROLLERS_IMAGE}" \
+  python3 -c '
+import os
+from pathlib import Path
+
+source = Path(os.environ["CALICO_SOURCE"]).read_text(encoding="utf-8")
+tag = os.environ["CALICO_VERSION"]
+replacements = {
+    f"quay.io/calico/cni:{tag}": os.environ["CALICO_CNI_IMAGE"],
+    f"quay.io/calico/node:{tag}": os.environ["CALICO_NODE_IMAGE"],
+    f"quay.io/calico/kube-controllers:{tag}":
+        os.environ["CALICO_KUBE_CONTROLLERS_IMAGE"],
+}
+expected = {
+    f"quay.io/calico/cni:{tag}": 2,
+    f"quay.io/calico/node:{tag}": 2,
+    f"quay.io/calico/kube-controllers:{tag}": 1,
+}
+for old, new in replacements.items():
+    if source.count(old) != expected[old]:
+        raise SystemExit(f"Calico input contains {source.count(old)} copies of {old}, expected {expected[old]}")
+    source = source.replace(old, new)
+pool = """            # - name: CALICO_IPV4POOL_CIDR
+            #   value: "192.168.0.0/16\""""
+rendered_pool = """            - name: CALICO_IPV4POOL_CIDR
+              value: \"""" + os.environ["CALICO_POD_CIDR"] + "\""
+if source.count(pool) != 1:
+    raise SystemExit("Calico input does not contain the expected IPv4 pool placeholder")
+source = source.replace(pool, rendered_pool, 1)
+destination = Path(os.environ["CALICO_DESTINATION"])
+destination.write_text(source, encoding="utf-8")
+destination.chmod(0o600)
+'
+}
+
+render_local_path_manifest() {
+  local storage_path="$1"
+  local destination="$2"
+  local source="${INPUTS_DIR}/local-path-${LOCAL_PATH_VERSION}.yaml"
+  sha256_check "${LOCAL_PATH_MANIFEST_SHA256}" "${source}"
+  mkdir -p -m 0700 "$(dirname "${destination}")"
+  LOCAL_PATH_SOURCE="${source}" \
+  LOCAL_PATH_DESTINATION="${destination}" \
+  LOCAL_PATH_NODE_PATH="${storage_path}" \
+  LOCAL_PATH_VERSION="${LOCAL_PATH_VERSION}" \
+  LOCAL_PATH_PROVISIONER_IMAGE="${LOCAL_PATH_PROVISIONER_IMAGE}" \
+  LOCAL_PATH_HELPER_IMAGE="${VERIFY_IMAGE}" \
+  python3 -c '
+import os
+from pathlib import Path
+
+source = Path(os.environ["LOCAL_PATH_SOURCE"]).read_text(encoding="utf-8")
+provisioner = f"docker.io/rancher/local-path-provisioner:{os.environ['"'"'LOCAL_PATH_VERSION'"'"']}"
+if source.count(provisioner) != 1:
+    raise SystemExit("Local Path input does not contain one expected provisioner image")
+source = source.replace(provisioner, os.environ["LOCAL_PATH_PROVISIONER_IMAGE"], 1)
+storage_class = """metadata:
+  name: local-path
+provisioner: rancher.io/local-path"""
+rendered_storage_class = """metadata:
+  name: local-path
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: rancher.io/local-path"""
+if source.count(storage_class) != 1:
+    raise SystemExit("Local Path input does not contain the expected StorageClass")
+source = source.replace(storage_class, rendered_storage_class, 1)
+default_path = "\"paths\":[\"/opt/local-path-provisioner\"]"
+rendered_path = "\"paths\":[\"" + os.environ["LOCAL_PATH_NODE_PATH"] + "\"]"
+if source.count(default_path) != 1:
+    raise SystemExit("Local Path input does not contain the expected node path")
+source = source.replace(default_path, rendered_path, 1)
+helper = "image: docker.io/library/busybox"
+if source.count(helper) != 1:
+    raise SystemExit("Local Path input does not contain one expected helper image")
+source = source.replace(helper, "image: " + os.environ["LOCAL_PATH_HELPER_IMAGE"], 1)
+destination = Path(os.environ["LOCAL_PATH_DESTINATION"])
+destination.write_text(source, encoding="utf-8")
+destination.chmod(0o600)
+'
+}
+
+render_spike_addons() {
+  local addon_dir
+  addon_dir="$(spike_addon_dir)"
+  render_calico_manifest "${SPIKE_POD_CIDR}" "${addon_dir}/calico.yaml"
+  render_local_path_manifest "${SPIKE_STORAGE_PATH}" "${addon_dir}/local-path.yaml"
+  sha256_check "${CALICO_SPIKE_RENDER_SHA256}" "${addon_dir}/calico.yaml"
+  sha256_check "${LOCAL_PATH_SPIKE_RENDER_SHA256}" "${addon_dir}/local-path.yaml"
+}
+
 tenant_daemonset_ready() {
   local namespace="$1"
   local name="$2"
@@ -202,9 +305,9 @@ run_network_smoke() {
 }
 
 install_spike_network_addons() {
-  sha256_check "${CALICO_SPIKE_RENDER_SHA256}" "${LAB_ROOT}/manifests/addons/calico.yaml"
+  render_spike_addons
   configure_spike_cni_bootstrap_endpoint
-  tenant_kubectl spike apply -f "${LAB_ROOT}/manifests/addons/calico.yaml" >/dev/null
+  tenant_kubectl spike apply -f "$(spike_addon_dir)/calico.yaml" >/dev/null
   wait_spike_network_addons \
     && wait_for "${TENANT_ADDON_TIMEOUT}" "worker control-plane endpoint access" \
       worker_endpoint_accessible \
@@ -212,9 +315,8 @@ install_spike_network_addons() {
 }
 
 install_spike_storage_addon() {
-  sha256_check "${LOCAL_PATH_SPIKE_RENDER_SHA256}" \
-    "${LAB_ROOT}/manifests/addons/local-path.yaml"
-  tenant_kubectl spike apply -f "${LAB_ROOT}/manifests/addons/local-path.yaml" >/dev/null
+  render_spike_addons
+  tenant_kubectl spike apply -f "$(spike_addon_dir)/local-path.yaml" >/dev/null
   wait_for "${TENANT_STORAGE_TIMEOUT}" "Local Path readiness" spike_local_path_ready
 }
 
@@ -354,39 +456,8 @@ render_tenant_addons() {
   local_path="${addon_dir}/local-path.yaml"
   pod_cidr="$(tenant_pod_cidr "${tenant}")"
   storage_path="$(tenant_storage_path "${tenant}")"
-  mkdir -p -m 0700 "${addon_dir}"
-  sha256_check "${CALICO_SPIKE_RENDER_SHA256}" \
-    "${LAB_ROOT}/manifests/addons/calico.yaml"
-  sha256_check "${LOCAL_PATH_SPIKE_RENDER_SHA256}" \
-    "${LAB_ROOT}/manifests/addons/local-path.yaml"
-  BASE_CALICO="${LAB_ROOT}/manifests/addons/calico.yaml" \
-  BASE_LOCAL_PATH="${LAB_ROOT}/manifests/addons/local-path.yaml" \
-  RENDERED_CALICO="${calico}" \
-  RENDERED_LOCAL_PATH="${local_path}" \
-  SPIKE_POD_CIDR="${SPIKE_POD_CIDR}" \
-  TENANT_POD_CIDR="${pod_cidr}" \
-  SPIKE_STORAGE_PATH="${SPIKE_STORAGE_PATH}" \
-  TENANT_STORAGE_PATH="${storage_path}" \
-  python3 -c '
-import os
-from pathlib import Path
-calico=Path(os.environ["BASE_CALICO"]).read_text(encoding="utf-8")
-if calico.count(os.environ["SPIKE_POD_CIDR"]) != 1:
-    raise SystemExit("Calico base has no unique spike CIDR")
-calico=calico.replace(os.environ["SPIKE_POD_CIDR"], os.environ["TENANT_POD_CIDR"], 1)
-local_path=Path(os.environ["BASE_LOCAL_PATH"]).read_text(encoding="utf-8")
-if local_path.count(os.environ["SPIKE_STORAGE_PATH"]) != 1:
-    raise SystemExit("Local Path base has no unique spike path")
-local_path=local_path.replace(
-    os.environ["SPIKE_STORAGE_PATH"], os.environ["TENANT_STORAGE_PATH"], 1)
-for destination, content in (
-    (os.environ["RENDERED_CALICO"], calico),
-    (os.environ["RENDERED_LOCAL_PATH"], local_path),
-):
-    path=Path(destination)
-    path.write_text(content, encoding="utf-8")
-    path.chmod(0o600)
-'
+  render_calico_manifest "${pod_cidr}" "${calico}"
+  render_local_path_manifest "${storage_path}" "${local_path}"
 }
 
 configure_tenant_cni_bootstrap_endpoint() {

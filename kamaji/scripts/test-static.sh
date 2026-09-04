@@ -272,9 +272,18 @@ tenant_addon_render_fixture() (
   mkdir -p -m 0700 "${fixture_dir}"
   trap 'rm -rf "${fixture_dir}"' EXIT
   RUNTIME_DIR="${fixture_dir}"
+  SPIKE_RUNTIME_DIR="${RUNTIME_DIR}/tenants/spike"
+  render_spike_addons
   render_tenant_addons tenant-a
   render_tenant_addons tenant-b
-  grep -Fq "value: \"${TENANT_A_POD_CIDR}\"" \
+  sha256_check "${CALICO_SPIKE_RENDER_SHA256}" \
+    "$(spike_addon_dir)/calico.yaml" \
+    && sha256_check "${LOCAL_PATH_SPIKE_RENDER_SHA256}" \
+      "$(spike_addon_dir)/local-path.yaml" \
+    && grep -Fq "${CALICO_CNI_IMAGE}" "$(spike_addon_dir)/calico.yaml" \
+    && grep -Fq "${LOCAL_PATH_PROVISIONER_IMAGE}" \
+      "$(spike_addon_dir)/local-path.yaml" \
+    && grep -Fq "value: \"${TENANT_A_POD_CIDR}\"" \
     "$(tenant_addon_dir tenant-a)/calico.yaml" \
     && grep -Fq "value: \"${TENANT_B_POD_CIDR}\"" \
       "$(tenant_addon_dir tenant-b)/calico.yaml" \
@@ -286,6 +295,24 @@ tenant_addon_render_fixture() (
       "$(tenant_addon_dir tenant-b)/calico.yaml" \
     && ! cmp -s "$(tenant_addon_dir tenant-a)/local-path.yaml" \
       "$(tenant_addon_dir tenant-b)/local-path.yaml"
+)
+
+cnpg_operator_render_fixture() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/cnpg.sh"
+  local fixture_dir="${TOOLS_TMP_DIR}/cnpg-operator-render-fixture"
+  rm -rf "${fixture_dir}"
+  mkdir -p -m 0700 "${fixture_dir}"
+  trap 'rm -rf "${fixture_dir}"' EXIT
+  RUNTIME_DIR="${fixture_dir}"
+  CNPG_RENDERED_MANIFEST="${fixture_dir}/rendered/cnpg-operator.yaml"
+  render_cnpg_operator >/dev/null
+  [[ -s "${CNPG_RENDERED_MANIFEST}" ]] \
+    && [[ "$(stat -c '%a' "${CNPG_RENDERED_MANIFEST}")" == 600 ]] \
+    && grep -Fq "image: ${CNPG_CONTROLLER_IMAGE}" "${CNPG_RENDERED_MANIFEST}" \
+    && grep -Fq "value: ${CNPG_CONTROLLER_IMAGE}" "${CNPG_RENDERED_MANIFEST}" \
+    && ! grep -Eq "ghcr\\.io/cloudnative-pg/cloudnative-pg:1\\.30\\.0$" \
+      "${CNPG_RENDERED_MANIFEST}"
 )
 
 cleanup_polarity_is_explicit() (
@@ -852,36 +879,27 @@ check "cert-manager and MetalLB reverify and pin inputs before use" bash -c '
   grep -Fq "render_metallb_manifest" "$file" &&
   grep -Fq "live workloads do not use the approved image digests" "$file"
 ' _ "${LAB_ROOT}"
-check "independent CNPG operator manifest matches verified provenance" bash -c '
+check "CNPG operator is fetched, verified, and rendered at runtime" bash -c '
   source "$1/config/versions.env"
   [[ "$CNPG_MANIFEST_URL" == "https://raw.githubusercontent.com/cloudnative-pg/cloudnative-pg/v1.30.0/releases/cnpg-1.30.0.yaml" ]] &&
-  printf "%s  %s\n" "$CNPG_MANIFEST_SHA256" "$1/manifests/cnpg/operator.yaml" |
+  printf "%s  %s\n" "$CNPG_MANIFEST_SHA256" "$1/.tools/inputs/cnpg-${CNPG_VERSION}.yaml" |
     sha256sum -c - >/dev/null &&
-  [[ ! -L "$1/manifests/cnpg/operator.yaml" ]]
+  [[ ! -e "$1/manifests/cnpg/operator.yaml" ]] &&
+  grep -Fq '\''local manifest="${INPUTS_DIR}/cnpg-${CNPG_VERSION}.yaml"'\'' \
+    "$1/scripts/lib/cnpg.sh"
 ' _ "${LAB_ROOT}"
-check "rendered spike add-on checksums are exact" bash -c '
-  source "$1/config/versions.env"
-  printf "%s  %s\n" "$CALICO_SPIKE_RENDER_SHA256" "$1/manifests/addons/calico.yaml" |
-    sha256sum -c - >/dev/null &&
-  printf "%s  %s\n" "$LOCAL_PATH_SPIKE_RENDER_SHA256" "$1/manifests/addons/local-path.yaml" |
-    sha256sum -c - >/dev/null
+check "Calico and Local Path are fetched instead of tracked" bash -c '
+  [[ ! -e "$1/manifests/addons/calico.yaml" ]] &&
+  [[ ! -e "$1/manifests/addons/local-path.yaml" ]] &&
+  grep -Fq '\''local source="${INPUTS_DIR}/calico-${CALICO_VERSION}.yaml"'\'' \
+    "$1/scripts/lib/addons.sh" &&
+  grep -Fq '\''local source="${INPUTS_DIR}/local-path-${LOCAL_PATH_VERSION}.yaml"'\'' \
+    "$1/scripts/lib/addons.sh"
 ' _ "${LAB_ROOT}"
-check "Calico render uses exact spike CIDR and image pins" bash -c '
-  source "$1/config/versions.env"
-  grep -Fq "value: \"10.66.0.0/16\"" "$1/manifests/addons/calico.yaml" &&
-  grep -Fq "$CALICO_CNI_IMAGE" "$1/manifests/addons/calico.yaml" &&
-  grep -Fq "$CALICO_NODE_IMAGE" "$1/manifests/addons/calico.yaml" &&
-  grep -Fq "$CALICO_KUBE_CONTROLLERS_IMAGE" "$1/manifests/addons/calico.yaml" &&
-  ! grep -Eq "image: quay.io/calico/.+:v3.32.2$" "$1/manifests/addons/calico.yaml"
-' _ "${LAB_ROOT}"
-check "Local Path render is default, persistent, and pinned" bash -c '
-  source "$1/config/settings.env"
-  source "$1/config/versions.env"
-  grep -Fq "storageclass.kubernetes.io/is-default-class: \"true\"" "$1/manifests/addons/local-path.yaml" &&
-  grep -Fq "\"paths\":[\"${SPIKE_STORAGE_PATH}\"]" "$1/manifests/addons/local-path.yaml" &&
-  grep -Fq "$LOCAL_PATH_PROVISIONER_IMAGE" "$1/manifests/addons/local-path.yaml" &&
-  grep -Fq "$VERIFY_IMAGE" "$1/manifests/addons/local-path.yaml"
-' _ "${LAB_ROOT}"
+check "runtime add-on rendering is deterministic and tenant-specific" \
+  tenant_addon_render_fixture
+check "runtime CNPG operator rendering is pinned" \
+  cnpg_operator_render_fixture
 
 check "deterministic Kamaji render validates" \
   "${SCRIPT_DIR}/render-kamaji.sh" validate

@@ -73,6 +73,14 @@ release tag/source/lock; places the exact kamaji-etcd 0.15.0 dependency beside
 the source chart; and renders a digest-only transitive image inventory. It
 does not install `just`.
 
+Large upstream manifests are not committed. `just tools` downloads the pinned
+Calico, Local Path Provisioner, and CloudNativePG release YAML into ignored
+`.tools/inputs/` and verifies each SHA-256. Creation then deterministically
+renders tenant-specific, digest-pinned copies under ignored `.runtime/`.
+Re-running the renderer from the same pinned inputs produces the recorded
+checksums. Cached inputs avoid repeated manifest downloads, while the current
+tooling still performs remote tag and digest provenance checks.
+
 `just prepare-host` records the current two inotify values once in ignored,
 mode-`0600` runtime state, raises only values below the required floors with
 non-interactive `sudo sysctl -w`, and verifies the result. In a non-interactive

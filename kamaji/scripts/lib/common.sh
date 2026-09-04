@@ -36,6 +36,7 @@ METALLB_PINNED_MANIFEST="${RUNTIME_DIR}/rendered/metallb-native-pinned.yaml"
 CERT_MANAGER_RENDERED_MANIFEST="${RUNTIME_DIR}/rendered/cert-manager.yaml"
 KAMAJI_PRE_HOOKS_MANIFEST="${RUNTIME_DIR}/rendered/kamaji-hooks-pre.yaml"
 KAMAJI_POST_HOOKS_MANIFEST="${RUNTIME_DIR}/rendered/kamaji-hooks-post.yaml"
+CNPG_RENDERED_MANIFEST="${RUNTIME_DIR}/rendered/cnpg-operator.yaml"
 KAMAJI_CHART_DIR="${CHARTS_DIR}/kamaji"
 KAMAJI_IMAGE_INVENTORY="${RENDERED_DIR}/kamaji-images.txt"
 KAMAJI_RENDERED_MANIFEST="${RENDERED_DIR}/kamaji.yaml"
@@ -270,6 +271,10 @@ tenant_kube_proxy_evidence() {
 
 tenant_addon_dir() {
   printf '%s/addons\n' "$(tenant_runtime_dir "$1")"
+}
+
+spike_addon_dir() {
+  printf '%s/addons\n' "${SPIKE_RUNTIME_DIR}"
 }
 
 management_kubectl() {

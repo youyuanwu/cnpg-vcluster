@@ -205,9 +205,11 @@ cnpg_tenant_ready() {
 }
 
 render_cnpg_operator() {
-  local manifest="${LAB_ROOT}/manifests/cnpg/operator.yaml"
+  local manifest="${INPUTS_DIR}/cnpg-${CNPG_VERSION}.yaml"
   sha256_check "${CNPG_MANIFEST_SHA256}" "${manifest}"
+  ensure_runtime_layout
   CNPG_OPERATOR_MANIFEST="${manifest}" \
+  CNPG_RENDERED_MANIFEST="${CNPG_RENDERED_MANIFEST}" \
   CNPG_CONTROLLER_IMAGE="${CNPG_CONTROLLER_IMAGE}" \
   python3 -c '
 import os, sys
@@ -222,15 +224,19 @@ for old, new in replacements.items():
     if source.count(old) != 1:
         raise SystemExit("CNPG operator manifest does not contain one expected " + old)
     source=source.replace(old, new, 1)
-sys.stdout.write(source)
+destination=Path(os.environ["CNPG_RENDERED_MANIFEST"])
+destination.write_text(source, encoding="utf-8")
+destination.chmod(0o600)
 '
+  printf '%s\n' "${CNPG_RENDERED_MANIFEST}"
 }
 
 apply_cnpg_operator() {
   local tenant="$1"
-  render_cnpg_operator \
-    | tenant_kubectl "${tenant}" apply --server-side --force-conflicts \
-      --field-manager=kamaji-cnpg-lab -f - >/dev/null
+  local manifest
+  manifest="$(render_cnpg_operator)"
+  tenant_kubectl "${tenant}" apply --server-side --force-conflicts \
+    --field-manager=kamaji-cnpg-lab -f "${manifest}" >/dev/null
 }
 
 tenant_namespace_absent() {
