@@ -656,6 +656,238 @@ datastore_used_by_tenant() {
   [[ "$(datastore_used_by_tenant_state "$1")" == present ]]
 }
 
+blocked_management_deployment_is_ready() {
+  local namespace="$1"
+  local name="$2"
+  local desired ready
+  desired="$(management_kubectl -n "${namespace}" get "deployment/${name}" \
+    -o jsonpath='{.spec.replicas}' 2>/dev/null)" || return 1
+  ready="$(management_kubectl -n "${namespace}" get "deployment/${name}" \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || return 1
+  [[ -n "${desired}" && "${ready:-0}" -eq "${desired}" ]]
+}
+
+blocked_management_daemonset_is_ready() {
+  local namespace="$1"
+  local name="$2"
+  local desired ready
+  desired="$(management_kubectl -n "${namespace}" get "daemonset/${name}" \
+    -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null)" || return 1
+  ready="$(management_kubectl -n "${namespace}" get "daemonset/${name}" \
+    -o jsonpath='{.status.numberReady}' 2>/dev/null)" || return 1
+  [[ -n "${desired}" && "${desired}" -gt 0 && "${ready:-0}" -eq "${desired}" ]]
+}
+
+blocked_management_plane_is_healthy() {
+  kind_cluster_reported \
+    && management_container_exists \
+    && management_ownership_is_valid \
+    && [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
+    && management_kubectl get --raw=/readyz >/dev/null 2>&1 \
+    && blocked_management_deployment_is_ready cert-manager cert-manager \
+    && blocked_management_deployment_is_ready cert-manager cert-manager-cainjector \
+    && blocked_management_deployment_is_ready cert-manager cert-manager-webhook \
+    && blocked_management_deployment_is_ready metallb-system controller \
+    && blocked_management_daemonset_is_ready metallb-system speaker \
+    && blocked_management_deployment_is_ready "${MANAGEMENT_NAMESPACE}" kamaji \
+    && [[ -n "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
+      get endpoints kamaji-webhook-service \
+      -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)" ]] \
+    && [[ "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
+      get statefulset kamaji-etcd \
+      -o jsonpath='{.spec.replicas}' 2>/dev/null)" \
+      == "${KAMAJI_ETCD_REPLICAS}" ]] \
+    && [[ "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
+      get statefulset kamaji-etcd \
+      -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" \
+      == "${KAMAJI_ETCD_REPLICAS}" ]] \
+    && [[ "$(management_kubectl get datastore default \
+      -o jsonpath='{.status.ready}' 2>/dev/null)" == true ]]
+}
+
+blocked_residual_failure() {
+  BLOCKED_RESIDUAL_REASON="$*"
+  return 1
+}
+
+blocked_residual_probe_state() {
+  local key="$1"
+  shift
+  case "${KAMAJI_TEST_BLOCKED_RESIDUAL:-}" in
+    "${key}:present")
+      printf 'present\n'
+      return 0
+      ;;
+    "${key}:inspection-failed")
+      printf 'inspection-failed\n'
+      return 1
+      ;;
+  esac
+  "$@"
+}
+
+blocked_require_absent_probe() {
+  local key="$1"
+  local description="$2"
+  shift 2
+  local state
+  state="$(blocked_residual_probe_state "${key}" "$@")" || {
+    blocked_residual_failure "${description} inspection failed"
+    return 1
+  }
+  [[ "${state}" == absent ]] \
+    || blocked_residual_failure "${description} is ${state}"
+}
+
+blocked_all_tcp_state() {
+  local output status
+  set +e
+  output="$(management_kubectl get tenantcontrolplanes.kamaji.clastix.io \
+    --all-namespaces -o name 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  [[ -z "${output}" ]] && printf 'absent\n' || printf 'present\n'
+}
+
+blocked_owned_worker_state() {
+  local output status
+  set +e
+  output="$(docker ps -aq --filter "$(owned_docker_filter)" \
+    --filter 'label=kamaji.cnpg-vcluster.io/role=worker' 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  [[ -z "${output}" ]] && printf 'absent\n' || printf 'present\n'
+}
+
+blocked_owned_worker_volume_state() {
+  local output status
+  set +e
+  output="$(docker volume ls -q --filter "$(owned_docker_filter)" \
+    --filter 'label=kamaji.cnpg-vcluster.io/role=worker-var-lib' 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  [[ -z "${output}" ]] && printf 'absent\n' || printf 'present\n'
+}
+
+blocked_management_namespace_state() {
+  local namespace="$1"
+  local output status
+  set +e
+  output="$(management_kubectl get namespace "${namespace}" \
+    --ignore-not-found -o name 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  [[ -z "${output}" ]] && printf 'absent\n' || printf 'present\n'
+}
+
+blocked_vip_claim_state() {
+  local vip="$1"
+  local claims
+  claims="$(services_claiming_vip "${vip}" 2>/dev/null)" || {
+    printf 'inspection-failed\n'
+    return 1
+  }
+  [[ -z "${claims}" ]] && printf 'absent\n' || printf 'present\n'
+}
+
+blocked_datastore_used_by_state() {
+  case "$1" in
+    spike) datastore_used_by_spike_state ;;
+    *) datastore_used_by_tenant_state "$1" ;;
+  esac
+}
+
+blocked_residual_state_is_allowed() {
+  local tenant schema user vip
+  BLOCKED_RESIDUAL_REASON=""
+  blocked_management_plane_is_healthy || {
+    blocked_residual_failure "owned management infrastructure is unhealthy or could not be inspected"
+    return 1
+  }
+  blocked_require_absent_probe tcp \
+    "final or spike TenantControlPlane residual" blocked_all_tcp_state \
+    || return 1
+  blocked_require_absent_probe workers \
+    "final or spike worker residual" blocked_owned_worker_state \
+    || return 1
+  blocked_require_absent_probe worker-volumes \
+    "final or spike worker volume residual" blocked_owned_worker_volume_state \
+    || return 1
+
+  for tenant in ${TENANT_NAMES} spike; do
+    if [[ -e "$(tenant_kubeconfig "${tenant}")" ]]; then
+      blocked_residual_failure "${tenant} kubeconfig remains"
+      return 1
+    fi
+    if [[ "${tenant}" == spike ]]; then
+      if [[ -e "${SPIKE_RUNTIME_DIR}" ]]; then
+        blocked_residual_failure "spike runtime subtree remains"
+        return 1
+      fi
+    else
+      if [[ -e "$(tenant_runtime_dir "${tenant}")" ]]; then
+        blocked_residual_failure "${tenant} runtime subtree remains"
+        return 1
+      fi
+    fi
+    blocked_require_absent_probe "${tenant}.namespace" \
+      "${tenant} management namespace" blocked_management_namespace_state \
+      "$(tenant_namespace "${tenant}")" || return 1
+  done
+
+  if [[ ! -f "${MANAGEMENT_NETWORK_FILE}" ]]; then
+    blocked_residual_failure "management network assignment is absent"
+    return 1
+  fi
+  # shellcheck disable=SC1090
+  source "${MANAGEMENT_NETWORK_FILE}" || {
+    blocked_residual_failure "management network assignment could not be read"
+    return 1
+  }
+  for vip in "${TENANT_A_VIP:-}" "${TENANT_B_VIP:-}"; do
+    if [[ -z "${vip}" ]]; then
+      blocked_residual_failure "management VIP assignment is incomplete"
+      return 1
+    fi
+    blocked_require_absent_probe "vip.${vip}" \
+      "borrowed tenant VIP ${vip} claim" blocked_vip_claim_state "${vip}" \
+      || return 1
+  done
+
+  for tenant in ${TENANT_NAMES} spike; do
+    schema="$(tenant_schema "${tenant}")"
+    user="$(tenant_datastore_user "${tenant}")"
+    blocked_require_absent_probe "${tenant}.datastore-used-by" \
+      "${tenant} DataStore/default status.usedBy residual" \
+      blocked_datastore_used_by_state "${tenant}" || return 1
+    blocked_require_absent_probe "${tenant}.datastore-prefix" \
+      "${tenant} datastore prefix residual" etcd_readonly_prefix_state "${schema}" \
+      || return 1
+    blocked_require_absent_probe "${tenant}.datastore-user" \
+      "${tenant} datastore user residual" etcd_readonly_user_state "${user}" \
+      || return 1
+    blocked_require_absent_probe "${tenant}.datastore-role" \
+      "${tenant} datastore role residual" etcd_readonly_role_state "${schema}" \
+      || return 1
+  done
+}
+
 management_datastore_available() {
   [[ "${KAMAJI_TEST_DATASTORE_UNAVAILABLE:-0}" != 1 ]] \
     && [[ "$(management_kubectl get datastore default \
@@ -996,6 +1228,95 @@ etcd_maintenance_pod_absent() {
   status=$?
   set -e
   (( status == 0 )) && [[ -z "${output}" ]]
+}
+
+etcd_readonly() {
+  local operation="$1"
+  shift
+  case "${operation}:$*" in
+    get:*|user:get\ *|role:get\ *) ;;
+    *) return 1 ;;
+  esac
+  local ca_certificate client_certificate client_key
+  ca_certificate="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
+    get secret kamaji-etcd-ca -o jsonpath='{.data.tls\.crt}' 2>/dev/null)" \
+    || return 1
+  client_certificate="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
+    get secret kamaji-etcd-client-certs -o jsonpath='{.data.tls\.crt}' \
+    2>/dev/null)" || return 1
+  client_key="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
+    get secret kamaji-etcd-client-certs -o jsonpath='{.data.tls\.key}' \
+    2>/dev/null)" || return 1
+  [[ -n "${ca_certificate}" && -n "${client_certificate}" \
+    && -n "${client_key}" ]] || return 1
+
+  {
+    printf '%s\n' "${ca_certificate}"
+    printf '%s\n' "${client_certificate}"
+    printf '%s\n' "${client_key}"
+  } | management_kubectl -n "${MANAGEMENT_NAMESPACE}" exec -i kamaji-etcd-0 \
+    -- sh -c '
+      set -eu
+      cert_dir="$(mktemp -d)"
+      trap '\''rm -rf "${cert_dir}"'\'' EXIT HUP INT TERM
+      IFS= read -r ca_certificate
+      IFS= read -r client_certificate
+      IFS= read -r client_key
+      printf "%s" "${ca_certificate}" | base64 -d >"${cert_dir}/ca.crt"
+      printf "%s" "${client_certificate}" | base64 -d >"${cert_dir}/tls.crt"
+      printf "%s" "${client_key}" | base64 -d >"${cert_dir}/tls.key"
+      ETCDCTL_API=3 etcdctl \
+        --endpoints=https://127.0.0.1:2379 \
+        --cacert="${cert_dir}/ca.crt" \
+        --cert="${cert_dir}/tls.crt" \
+        --key="${cert_dir}/tls.key" \
+        "$@"
+    ' -- "${operation}" "$@"
+}
+
+etcd_readonly_prefix_state() {
+  local output status
+  set +e
+  output="$(etcd_readonly get "/${1}/" --prefix --keys-only 2>&1)"
+  status=$?
+  set -e
+  if (( status != 0 )); then
+    printf 'inspection-failed\n'
+    return 1
+  fi
+  [[ -z "${output}" ]] && printf 'absent\n' || printf 'present\n'
+}
+
+etcd_readonly_user_state() {
+  local output status
+  set +e
+  output="$(etcd_readonly user get "$1" 2>&1)"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    printf 'present\n'
+  elif grep -Eqi 'user .* does not exist|user name not found' <<<"${output}"; then
+    printf 'absent\n'
+  else
+    printf 'inspection-failed\n'
+    return 1
+  fi
+}
+
+etcd_readonly_role_state() {
+  local output status
+  set +e
+  output="$(etcd_readonly role get "$1" 2>&1)"
+  status=$?
+  set -e
+  if (( status == 0 )); then
+    printf 'present\n'
+  elif grep -Eqi 'role .* does not exist|role name not found' <<<"${output}"; then
+    printf 'absent\n'
+  else
+    printf 'inspection-failed\n'
+    return 1
+  fi
 }
 
 etcd_maintenance() {

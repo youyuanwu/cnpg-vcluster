@@ -299,6 +299,72 @@ assert_verify_rejects_blocked_record() {
     || die "${description} blocker record returned ${status}, expected exit 1"
 }
 
+assert_blocked_residual_rejected() {
+  local description="$1"
+  local expected="$2"
+  local injected="${3:-}"
+  local verify_output verify_status status_output status_status
+  set +e
+  verify_output="$(
+    KAMAJI_TEST_BLOCKED_RESIDUAL="${injected}" \
+      "${SCRIPT_DIR}/verify.sh" 2>&1
+  )"
+  verify_status=$?
+  status_output="$(
+    KAMAJI_TEST_BLOCKED_RESIDUAL="${injected}" \
+      "${SCRIPT_DIR}/status.sh" 2>&1
+  )"
+  status_status=$?
+  set -e
+  printf '%s\n%s\n' "${verify_output}" "${status_output}" >>"${RESULT_LOG}"
+  [[ "${verify_status}" -eq "${EXIT_ERROR}" \
+    && "${status_status}" -eq "${EXIT_ERROR}" \
+    && "${verify_output}" == *"${expected}"* \
+    && "${status_output}" == *"${expected}"* ]] \
+    || die "${description} residual was not rejected with the exact diagnostic"
+}
+
+assert_exact_blocked_residual_validation() {
+  local vip_service="${LAB_PREFIX}-blocked-vip-fixture"
+
+  assert_blocked_residual_rejected datastore-used-by \
+    "tenant-a DataStore/default status.usedBy residual is present" \
+    "tenant-a.datastore-used-by:present"
+  assert_blocked_residual_rejected datastore-prefix \
+    "tenant-a datastore prefix residual is present" \
+    "tenant-a.datastore-prefix:present"
+  assert_blocked_residual_rejected datastore-user \
+    "tenant-a datastore user residual is present" \
+    "tenant-a.datastore-user:present"
+  assert_blocked_residual_rejected datastore-role \
+    "tenant-a datastore role residual is present" \
+    "tenant-a.datastore-role:present"
+  assert_blocked_residual_rejected datastore-inspection \
+    "tenant-a datastore prefix residual inspection failed" \
+    "tenant-a.datastore-prefix:inspection-failed"
+
+  mkdir -p -m 0700 "${SPIKE_RUNTIME_DIR}"
+  assert_blocked_residual_rejected spike-runtime \
+    "spike runtime subtree remains"
+  rm -rf "${SPIKE_RUNTIME_DIR}"
+
+  mkdir -p -m 0700 "$(dirname "$(tenant_kubeconfig spike)")"
+  : >"$(tenant_kubeconfig spike)"
+  assert_blocked_residual_rejected spike-kubeconfig \
+    "spike kubeconfig remains"
+  rm -rf "${SPIKE_RUNTIME_DIR}"
+
+  load_management_network
+  management_kubectl -n default create service clusterip "${vip_service}" \
+    --tcp=443:443 >/dev/null
+  management_kubectl -n default patch service "${vip_service}" --type=merge \
+    -p "{\"spec\":{\"externalIPs\":[\"${TENANT_A_VIP}\"]}}" >/dev/null
+  assert_blocked_residual_rejected vip-claim \
+    "borrowed tenant VIP ${TENANT_A_VIP} claim is present"
+  management_kubectl -n default delete service "${vip_service}" \
+    --wait=true --timeout="${KUBERNETES_DELETE_TIMEOUT}" >/dev/null
+}
+
 assert_blocker_record_validation() {
   local saved_result="${CACHE_DIR}/e2e-saved-final-result.env"
   cp "${FINAL_RESULT_FILE}" "${saved_result}"
@@ -815,6 +881,7 @@ assert_observer_read_only "${CACHE_DIR}/e2e-one-tenant-diagnose.log" \
 run_logged "${SCRIPT_DIR}/destroy-tenant.sh" tenant-b
 write_blocked_result_fixture "${COMPATIBILITY_REVISION}" worker-substrate \
   "recognized final compatibility fixture"
+assert_exact_blocked_residual_validation
 set +e
 "${SCRIPT_DIR}/verify.sh" >>"${RESULT_LOG}" 2>&1
 blocked_verify_status=$?

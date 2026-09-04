@@ -480,8 +480,11 @@ return `1`; `2` is exclusive to a recognized compatibility blocker with
 persisted evidence and successful cleanup. `verify` accepts a blocked outcome
 only when the compatibility revision is current, code and nonempty evidence
 match the final blocker record, cleanup is proved, and live state contains a
-healthy management plane with no final TCPs, workers, worker volumes, tenant
-namespaces, or tenant runtime trees.
+healthy owned management plane with no final or spike TCPs, workers, worker
+volumes, namespaces, kubeconfigs, runtime subtrees, borrowed-VIP claims,
+datastore prefixes, users, roles, or `DataStore.status.usedBy` entries. The
+shared status/verify predicate treats any inspection failure as unhealthy
+rather than absence.
 
 ## Upstream references
 

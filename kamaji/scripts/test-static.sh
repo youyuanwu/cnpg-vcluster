@@ -430,41 +430,126 @@ host_just_resolution_fixtures() (
   local fixture_root="${TOOLS_TMP_DIR}/host-just-resolution-fixture"
   local nested_bin="${BIN_DIR}/host-just-fixture"
   local external_bin="${fixture_root}/external"
+  local wrong_bin="${fixture_root}/wrong"
   local symlink_bin="${fixture_root}/symlink"
+  local missing_bin="${fixture_root}/missing-parent/bin"
+  local output status
   rm -rf "${fixture_root}" "${nested_bin}"
-  mkdir -p -m 0700 "${nested_bin}" "${external_bin}" "${symlink_bin}"
+  mkdir -p -m 0700 \
+    "${nested_bin}" "${external_bin}" "${wrong_bin}" "${symlink_bin}"
   trap 'rm -rf "${fixture_root}" "${nested_bin}"' EXIT
   printf '#!/usr/bin/env bash\nprintf "just %s\\n"\n' "${JUST_VERSION}" \
     >"${nested_bin}/just"
   printf '#!/usr/bin/env bash\nprintf "just %s\\n"\n' "${JUST_VERSION}" \
     >"${external_bin}/just"
-  chmod 0700 "${nested_bin}/just" "${external_bin}/just"
-  ln -s "${nested_bin}/just" "${symlink_bin}/just"
+  printf '#!/usr/bin/env bash\nprintf "just 0.0.0\\n"\n' \
+    >"${wrong_bin}/just"
+  chmod 0700 "${nested_bin}/just" "${external_bin}/just" "${wrong_bin}/just"
+  ln -s "${BIN_DIR}" "${symlink_bin}/lab-bin"
+  ln -s "${nested_bin}" "${symlink_bin}/nested-bin"
 
   cd "${LAB_ROOT}"
+  HOST_PATH=".tools/bin:/usr/bin:/bin"
+  ! resolve_host_just >/dev/null || return 1
   HOST_PATH=".tools/bin/host-just-fixture:/usr/bin:/bin"
   ! resolve_host_just >/dev/null || return 1
-  HOST_PATH=".tools/tmp/host-just-resolution-fixture/symlink:/usr/bin:/bin"
+  HOST_PATH=".tools/tmp/host-just-resolution-fixture/symlink/lab-bin:/usr/bin:/bin"
+  ! resolve_host_just >/dev/null || return 1
+  HOST_PATH=".tools/tmp/host-just-resolution-fixture/symlink/nested-bin:/usr/bin:/bin"
   ! resolve_host_just >/dev/null || return 1
   HOST_PATH=".tools/tmp/host-just-resolution-fixture/external:/usr/bin:/bin"
   [[ "$(resolve_host_just)" == "$(readlink -f "${external_bin}/just")" ]] \
-    && require_exact_just
+    && require_exact_just || return 1
+
+  BIN_DIR="${missing_bin}"
+  HOST_PATH="${external_bin}:/usr/bin:/bin"
+  [[ ! -e "${missing_bin}" ]] \
+    && [[ "$(resolve_host_just)" == "$(readlink -f "${external_bin}/just")" ]] \
+    && require_exact_just || return 1
+
+  set +e
+  output="$(
+    HOST_PATH="${fixture_root}/absent" \
+      bash -c 'set -Eeuo pipefail; source "$1"; require_exact_just' \
+      _ "${SCRIPT_DIR}/lib/common.sh" 2>&1
+  )"
+  status=$?
+  set -e
+  [[ "${status}" -eq "${EXIT_ERROR}" \
+    && -n "${output}" \
+    && "${output}" == *"host-installed just ${JUST_VERSION} is required"* ]] \
+    || return 1
+
+  set +e
+  output="$(
+    HOST_PATH="${wrong_bin}" \
+      bash -c 'set -Eeuo pipefail; source "$1"; require_exact_just' \
+      _ "${SCRIPT_DIR}/lib/common.sh" 2>&1
+  )"
+  status=$?
+  set -e
+  [[ "${status}" -eq "${EXIT_ERROR}" \
+    && "${output}" == *"found just 0.0.0"* ]]
+)
+
+fresh_checkout_tools_bootstrap_fixture() (
+  local fixture_root output status
+  fixture_root="$(mktemp -d "${TOOLS_TMP_DIR}/fresh-checkout-tools.XXXXXX")"
+  trap 'rm -rf "${fixture_root}"' EXIT
+  git -C "${LAB_ROOT}/.." archive HEAD kamaji | tar -x -C "${fixture_root}"
+  mkdir -p -m 0700 "${fixture_root}/external"
+  printf '#!/usr/bin/env bash\nprintf "just %s\\n"\n' "${JUST_VERSION}" \
+    >"${fixture_root}/external/just"
+  printf '%s\n' \
+    '#!/usr/bin/env bash' \
+    "printf 'fresh bootstrap reached download\\n' >&2" \
+    'exit 42' \
+    >"${fixture_root}/external/curl"
+  chmod 0700 "${fixture_root}/external/just" "${fixture_root}/external/curl"
+
+  set +e
+  output="$(
+    cd "${fixture_root}/kamaji"
+    PATH="${fixture_root}/external:/usr/bin:/bin" ./scripts/tools.sh 2>&1
+  )"
+  status=$?
+  set -e
+  [[ "${status}" -eq 42 \
+    && "${output}" == *"fresh bootstrap reached download"* \
+    && "${output}" != *"host-installed just"* \
+    && -d "${fixture_root}/kamaji/.tools/bin" ]]
 )
 
 blocked_result_validation_fixtures() (
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/verify.sh"
   local fixture_dir="${TOOLS_TMP_DIR}/blocked-result-validation-fixture"
-  local residual=clean
+  local tenant residual_class key
   rm -rf "${fixture_dir}"
   mkdir -p -m 0700 "${fixture_dir}"
   trap 'rm -rf "${fixture_dir}"' EXIT
+  RUNTIME_DIR="${fixture_dir}/runtime"
+  SPIKE_RUNTIME_DIR="${RUNTIME_DIR}/tenants/spike"
+  MANAGEMENT_NETWORK_FILE="${RUNTIME_DIR}/network/management.env"
   FINAL_RESULT_FILE="${fixture_dir}/final-result.env"
   BLOCKER_FILE="${fixture_dir}/blocker"
+  mkdir -p -m 0700 "$(dirname "${MANAGEMENT_NETWORK_FILE}")"
+  {
+    printf 'TENANT_A_VIP=172.18.0.240\n'
+    printf 'TENANT_B_VIP=172.18.0.241\n'
+  } >"${MANAGEMENT_NETWORK_FILE}"
 
-  blocked_residual_state_is_allowed() {
-    [[ "${residual}" == clean ]]
-  }
+  blocked_management_plane_is_healthy() { return 0; }
+  blocked_all_tcp_state() { printf 'absent\n'; }
+  blocked_owned_worker_state() { printf 'absent\n'; }
+  blocked_owned_worker_volume_state() { printf 'absent\n'; }
+  blocked_management_namespace_state() { printf 'absent\n'; }
+  blocked_vip_claim_state() { printf 'absent\n'; }
+  datastore_used_by_tenant_state() { printf 'absent\n'; }
+  datastore_used_by_spike_state() { printf 'absent\n'; }
+  etcd_readonly_prefix_state() { printf 'absent\n'; }
+  etcd_readonly_user_state() { printf 'absent\n'; }
+  etcd_readonly_role_state() { printf 'absent\n'; }
 
   write_valid_blocked_records() {
     {
@@ -510,8 +595,49 @@ blocked_result_validation_fixtures() (
   ! blocked_result_is_current || return 1
 
   write_valid_blocked_records
-  residual=present
-  ! blocked_result_is_current
+  for key in tcp workers worker-volumes \
+    tenant-a.namespace tenant-b.namespace spike.namespace \
+    vip.172.18.0.240 vip.172.18.0.241; do
+    if KAMAJI_TEST_BLOCKED_RESIDUAL="${key}:present" \
+      blocked_result_is_current; then
+      return 1
+    fi
+    [[ -n "${BLOCKED_RESIDUAL_REASON}" ]] || return 1
+  done
+
+  for tenant in ${TENANT_NAMES} spike; do
+    for residual_class in datastore-used-by datastore-prefix \
+      datastore-user datastore-role; do
+      key="${tenant}.${residual_class}"
+      if KAMAJI_TEST_BLOCKED_RESIDUAL="${key}:present" \
+        blocked_result_is_current; then
+        return 1
+      fi
+      [[ "${BLOCKED_RESIDUAL_REASON}" == *"${tenant}"*"is present"* ]] \
+        || return 1
+      if KAMAJI_TEST_BLOCKED_RESIDUAL="${key}:inspection-failed" \
+        blocked_result_is_current; then
+        return 1
+      fi
+      [[ "${BLOCKED_RESIDUAL_REASON}" == *"${tenant}"*"inspection failed"* ]] \
+        || return 1
+    done
+  done
+
+  mkdir -p -m 0700 "${SPIKE_RUNTIME_DIR}"
+  ! blocked_result_is_current \
+    && [[ "${BLOCKED_RESIDUAL_REASON}" == "spike runtime subtree remains" ]] \
+    || return 1
+  rm -rf "${SPIKE_RUNTIME_DIR}"
+
+  mkdir -p -m 0700 "$(dirname "$(tenant_kubeconfig spike)")"
+  : >"$(tenant_kubeconfig spike)"
+  ! blocked_result_is_current \
+    && [[ "${BLOCKED_RESIDUAL_REASON}" == "spike kubeconfig remains" ]] \
+    || return 1
+  rm -rf "${SPIKE_RUNTIME_DIR}"
+
+  blocked_result_is_current
 )
 
 exact_node_set_rejects_extra_node() (
@@ -574,11 +700,14 @@ check "tools verifies the host just prerequisite" \
 check "host just lookup rejects the lab binary directory" bash -c '
   grep -Fq "HOST_PATH" "$1/scripts/lib/common.sh" &&
   grep -Fq "canonical_executable" "$1/scripts/lib/common.sh" &&
+  grep -Fq "canonical_missing_path" "$1/scripts/lib/common.sh" &&
   grep -Fq '\''"${canonical_bin}/"*) return 1'\'' "$1/scripts/lib/common.sh" &&
   grep -Fq "resolve_host_just" "$1/scripts/status.sh"
 ' _ "${LAB_ROOT}"
-check "host just resolution rejects relative and symlink lab paths" \
+check "host just resolution handles missing bins and rejects lab paths" \
   host_just_resolution_fixtures
+check "fresh checkout tools reaches bootstrap after host just resolution" \
+  fresh_checkout_tools_bootstrap_fixture
 check "tools never downloads or installs just" bash -c '
   ! grep -E "(curl|wget|install|cp|mv).*(JUST_|just-)" "$1/scripts/tools.sh"
 ' _ "${LAB_ROOT}"
@@ -892,6 +1021,13 @@ check "only compatibility paths can return blocked status" bash -c '
 ' _ "${LAB_ROOT}"
 check "blocked verification requires current consistent records and clean residuals" \
   blocked_result_validation_fixtures
+check "blocked residual inspection uses read-only datastore probes" bash -c '
+  predicate="$(sed -n "/^blocked_residual_state_is_allowed()/,/^}/p" "$1/scripts/lib/tenants.sh")"
+  grep -Fq "etcd_readonly_prefix_state" <<<"${predicate}" &&
+  grep -Fq "etcd_readonly_user_state" <<<"${predicate}" &&
+  grep -Fq "etcd_readonly_role_state" <<<"${predicate}" &&
+  ! grep -Fq "etcd_maintenance" <<<"${predicate}"
+' _ "${LAB_ROOT}"
 check "ordinary final failures have explicit non-blocker classifiers" bash -c '
   file="$1/scripts/create.sh"
   for classifier in classify_kube_proxy_failure classify_addon_failure \

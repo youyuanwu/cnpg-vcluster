@@ -451,20 +451,13 @@ if [[ -f "${FINAL_RESULT_FILE}" ]] \
   done
 elif [[ -f "${FINAL_RESULT_FILE}" ]] \
   && grep -Fxq 'result=blocked' "${FINAL_RESULT_FILE}"; then
-  blocked_result_records_are_current_consistent \
-    || unhealthy "blocked final result and blocker records are stale, incomplete, or inconsistent"
-  [[ "${final_tcp_count}" -eq 0 ]] \
-    || unhealthy "blocked final result retains a TenantControlPlane"
-  [[ "${final_worker_count}" -eq 0 ]] \
-    || unhealthy "blocked final result retains a worker"
-  [[ "${final_volume_count}" -eq 0 ]] \
-    || unhealthy "blocked final result retains a worker volume"
-  for tenant in ${TENANT_NAMES}; do
-    [[ ! -e "$(tenant_runtime_dir "${tenant}")" ]] \
-      || unhealthy "blocked final result retains ${tenant} runtime state"
-    management_namespace_absent "$(tenant_namespace "${tenant}")" \
-      || unhealthy "blocked final result retains ${tenant} management namespace"
-  done
+  if ! blocked_result_records_are_current_consistent; then
+    unhealthy "blocked final result and blocker records are stale, incomplete, or inconsistent"
+  elif blocked_residual_state_is_allowed; then
+    printf '  blocked residual class: healthy owned management infrastructure only\n'
+  else
+    unhealthy "blocked final result residual proof failed: ${BLOCKED_RESIDUAL_REASON:-unknown residual inspection failure}"
+  fi
 fi
 
 exit "${health}"

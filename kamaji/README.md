@@ -261,9 +261,13 @@ teardown, repeated full teardown, ownership refusal, credential scanning,
 sentinel preservation, and host-sysctl restoration. Exit `2` is used only if
 a classifier finds recognized compatibility evidence, no final tenant existed
 at entry, exact cleanup succeeds, and the current blocker/result records match
-the healthy-management-only residual state. Ordinary add-on, topology,
-capacity, API, timeout, and validation failures return `1`, retain every
-pre-existing healthy tenant and database, and create no blocker record.
+the healthy-management-only residual state. That exact state requires owned
+management readiness plus absence of every final/spike TCP, worker, worker
+volume, namespace, kubeconfig, runtime subtree, VIP claim, datastore prefix,
+user, role, and `DataStore.status.usedBy` entry; an inspection failure returns
+`1`, never `2`. Ordinary add-on, topology, capacity, API, timeout, and
+validation failures return `1`, retain every pre-existing healthy tenant and
+database, and create no blocker record.
 
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and
@@ -287,9 +291,11 @@ directories. Shell entry points use `umask 077`; state directories use mode
 always select an explicit kubeconfig. Waits, including `systemctl is-system-running --wait`, and network operations are finite
 and configurable through `config/settings.env`.
 The host `just` lookup is captured before `.tools/bin` is added to `PATH`;
-the resolved executable and `${BIN_DIR}` are canonicalized, and any relative,
-absolute, or symlink spelling that resolves at or below `${BIN_DIR}` is
-rejected as the prerequisite.
+the resolved executable and `${BIN_DIR}` are canonicalized without requiring
+the lab tool directory to exist, and any relative, absolute, or symlink
+spelling that resolves at or below `${BIN_DIR}` is rejected as the
+prerequisite. Missing, wrong-version, and lab-local candidates retain an
+actionable error under strict shell errexit.
 
 Exit status `0` means success, `1` means an ordinary error or unhealthy state,
 and exit status `2` is reserved for a recognized compatibility blocker with a

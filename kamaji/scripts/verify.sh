@@ -71,60 +71,6 @@ blocked_result_is_current() {
     && blocked_residual_state_is_allowed
 }
 
-management_deployment_is_ready() {
-  local namespace="$1"
-  local name="$2"
-  local desired ready
-  desired="$(management_kubectl -n "${namespace}" get "deployment/${name}" \
-    -o jsonpath='{.spec.replicas}' 2>/dev/null)" || return 1
-  ready="$(management_kubectl -n "${namespace}" get "deployment/${name}" \
-    -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || return 1
-  [[ -n "${desired}" && "${ready:-0}" -eq "${desired}" ]]
-}
-
-management_daemonset_is_ready() {
-  local namespace="$1"
-  local name="$2"
-  local desired ready
-  desired="$(management_kubectl -n "${namespace}" get "daemonset/${name}" \
-    -o jsonpath='{.status.desiredNumberScheduled}' 2>/dev/null)" || return 1
-  ready="$(management_kubectl -n "${namespace}" get "daemonset/${name}" \
-    -o jsonpath='{.status.numberReady}' 2>/dev/null)" || return 1
-  [[ -n "${desired}" && "${desired}" -gt 0 && "${ready:-0}" -eq "${desired}" ]]
-}
-
-blocked_management_plane_is_healthy() {
-  [[ -f "${MANAGEMENT_KUBECONFIG}" ]] \
-    && management_kubectl get --raw=/readyz >/dev/null 2>&1 \
-    && management_deployment_is_ready cert-manager cert-manager \
-    && management_deployment_is_ready cert-manager cert-manager-cainjector \
-    && management_deployment_is_ready cert-manager cert-manager-webhook \
-    && management_deployment_is_ready metallb-system controller \
-    && management_daemonset_is_ready metallb-system speaker \
-    && management_deployment_is_ready "${MANAGEMENT_NAMESPACE}" kamaji \
-    && [[ "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
-      get statefulset kamaji-etcd \
-      -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" \
-      == "${KAMAJI_ETCD_REPLICAS}" ]] \
-    && [[ "$(management_kubectl get datastore default \
-      -o jsonpath='{.status.ready}' 2>/dev/null)" == true ]]
-}
-
-blocked_residual_state_is_allowed() {
-  local tenant
-  blocked_management_plane_is_healthy || return 1
-  [[ -z "$(management_kubectl get tenantcontrolplanes.kamaji.clastix.io \
-    --all-namespaces -o name 2>/dev/null)" ]] || return 1
-  [[ -z "$(docker ps -aq --filter "$(owned_docker_filter)" \
-    --filter 'label=kamaji.cnpg-vcluster.io/role=worker')" ]] || return 1
-  [[ -z "$(docker volume ls -q --filter "$(owned_docker_filter)" \
-    --filter 'label=kamaji.cnpg-vcluster.io/role=worker-var-lib')" ]] || return 1
-  for tenant in ${TENANT_NAMES}; do
-    [[ ! -e "$(tenant_runtime_dir "${tenant}")" ]] || return 1
-    management_namespace_absent "$(tenant_namespace "${tenant}")" || return 1
-  done
-}
-
 verify_management_topology() {
   management_kubectl get --raw=/readyz >/dev/null
   [[ "$(management_kubectl get datastore default -o jsonpath='{.status.ready}')" == true ]] \
@@ -522,9 +468,12 @@ failover_to_different_primary() {
 
 main() {
   require_exact_just
-  if blocked_result_is_current; then
-    log "verification blocked by the recorded worker compatibility result"
-    exit "${EXIT_BLOCKED}"
+  if blocked_result_records_are_current_consistent; then
+    if blocked_residual_state_is_allowed; then
+      log "verification blocked by the recorded worker compatibility result"
+      exit "${EXIT_BLOCKED}"
+    fi
+    die "blocked final result residual proof failed: ${BLOCKED_RESIDUAL_REASON:-unknown residual inspection failure}"
   fi
   [[ -f "${FINAL_RESULT_FILE}" ]] \
     && grep -Fxq 'result=pass' "${FINAL_RESULT_FILE}" \

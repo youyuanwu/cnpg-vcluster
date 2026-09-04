@@ -54,18 +54,32 @@ record_management_ownership() {
 }
 
 validate_management_ownership() {
-  [[ -f "${MANAGEMENT_OWNERSHIP_FILE}" ]] \
-    || die "management.ownership-refusal: same-named cluster is not recorded as owned"
+  management_ownership_is_valid \
+    || die "${MANAGEMENT_OWNERSHIP_ERROR}"
+}
+
+management_ownership_is_valid() {
+  MANAGEMENT_OWNERSHIP_ERROR=""
+  if [[ ! -f "${MANAGEMENT_OWNERSHIP_FILE}" ]]; then
+    MANAGEMENT_OWNERSHIP_ERROR="management.ownership-refusal: same-named cluster is not recorded as owned"
+    return 1
+  fi
   local recorded_cluster recorded_name recorded_id actual_id actual_label
   recorded_cluster="$(sed -n 's/^KIND_CLUSTER_NAME=//p' "${MANAGEMENT_OWNERSHIP_FILE}")"
   recorded_name="$(sed -n 's/^KIND_NODE_NAME=//p' "${MANAGEMENT_OWNERSHIP_FILE}")"
   recorded_id="$(sed -n 's/^KIND_NODE_ID=//p' "${MANAGEMENT_OWNERSHIP_FILE}")"
-  [[ "${recorded_cluster}" == "${KIND_CLUSTER_NAME}" && "${recorded_name}" == "$(management_node_name)" ]] \
-    || die "management.ownership-refusal: runtime ownership record does not match ${KIND_CLUSTER_NAME}"
+  if [[ "${recorded_cluster}" != "${KIND_CLUSTER_NAME}" \
+    || "${recorded_name}" != "$(management_node_name)" ]]; then
+    MANAGEMENT_OWNERSHIP_ERROR="management.ownership-refusal: runtime ownership record does not match ${KIND_CLUSTER_NAME}"
+    return 1
+  fi
   actual_id="$(docker container inspect --format '{{.Id}}' "${recorded_name}" 2>/dev/null || true)"
   actual_label="$(docker container inspect --format '{{index .Config.Labels "io.x-k8s.kind.cluster"}}' "${recorded_name}" 2>/dev/null || true)"
-  [[ -n "${actual_id}" && "${actual_id}" == "${recorded_id}" && "${actual_label}" == "${KIND_CLUSTER_NAME}" ]] \
-    || die "management.ownership-refusal: live kind node identity does not match the ownership record"
+  if [[ -z "${actual_id}" || "${actual_id}" != "${recorded_id}" \
+    || "${actual_label}" != "${KIND_CLUSTER_NAME}" ]]; then
+    MANAGEMENT_OWNERSHIP_ERROR="management.ownership-refusal: live kind node identity does not match the ownership record"
+    return 1
+  fi
 }
 
 ensure_owned_management_access() {

@@ -165,7 +165,7 @@ write_secret_file() {
 
 require_exact_just() {
   local executable actual
-  executable="$(resolve_host_just)"
+  executable="$(resolve_host_just || true)"
   [[ -n "${executable}" ]] \
     || die "host-installed just ${JUST_VERSION} is required; executables below ${BIN_DIR} cannot satisfy the prerequisite"
   actual="$("${executable}" --version 2>/dev/null || true)"
@@ -173,16 +173,20 @@ require_exact_just() {
     || die "host-installed just ${JUST_VERSION} is required; found ${actual:-unavailable} at ${executable}"
 }
 
-canonical_path() {
+canonical_existing_path() {
   readlink -f -- "$1" 2>/dev/null
+}
+
+canonical_missing_path() {
+  readlink -m -- "$1" 2>/dev/null
 }
 
 resolve_host_just() {
   local executable canonical_executable canonical_bin
   executable="$(PATH="${HOST_PATH}" command -v just 2>/dev/null || true)"
   [[ -n "${executable}" ]] || return 1
-  canonical_executable="$(canonical_path "${executable}")" || return 1
-  canonical_bin="$(canonical_path "${BIN_DIR}")" || return 1
+  canonical_executable="$(canonical_existing_path "${executable}")" || return 1
+  canonical_bin="$(canonical_missing_path "${BIN_DIR}")" || return 1
   case "${canonical_executable}" in
     "${canonical_bin}"|"${canonical_bin}/"*) return 1 ;;
   esac
