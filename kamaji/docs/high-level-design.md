@@ -200,11 +200,12 @@ under `/etc`, and is never called implicitly by creation. Full teardown restores
 owned management cluster have been removed.
 
 The admission model counts six worker Docker caps (7.5 CPUs and 15 GiB),
-management requests (1.2 CPUs and 2.25 GiB), and a kind/system reserve (2 CPUs
-and 3 GiB). The resulting 10.7 CPU and 20.25 GiB admission leaves 1.3 CPU and
-3.75 GiB at the 12-CPU/24-GiB floor. The management memory request arithmetic
-is 128 MiB for Kamaji, 768 MiB for three datastore replicas, 1024 MiB for two
-tenant control planes, and 384 MiB for cert-manager and MetalLB.
+management requests (1.21 CPUs and 2.28125 GiB), and a kind/system reserve
+(2 CPUs and 3 GiB). The resulting 10.71 CPU and 20.28125 GiB admission leaves
+1.29 CPU and 3.71875 GiB at the 12-CPU/24-GiB floor. The management memory
+request arithmetic is 128 MiB for Kamaji, 768 MiB for three datastore
+replicas, 1024 MiB for two tenant control planes, 384 MiB for cert-manager and
+MetalLB, and 32 MiB for the read-only etcd inspector.
 
 Each tenant control plane requests 512 MiB in aggregate. Its component limits
 sum to 1536 MiB: 1 GiB for kube-apiserver and 256 MiB each for controller

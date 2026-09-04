@@ -1377,9 +1377,14 @@ check "runtime result captures endpoint and CA identity separation" bash -c '
 check "capacity accounting uses Docker caps and scheduled pod requests" bash -c '
   source "$1/config/settings.env"
   [[ "$WORKER_TOTAL_CPUS" == 7.5 && "$WORKER_TOTAL_MEMORY_GIB" == 15 &&
-     "$MANAGEMENT_REQUEST_CPUS" == 1.2 &&
-     "$MANAGEMENT_REQUEST_MEMORY_GIB" == 2.25 &&
+     "$MANAGEMENT_REQUEST_CPUS" == 1.21 &&
+     "$MANAGEMENT_REQUEST_MEMORY_GIB" == 2.28125 &&
+     "$ETCD_INSPECTOR_REQUEST_CPU" == 10m &&
+     "$ETCD_INSPECTOR_REQUEST_MEMORY" == 32Mi &&
      "$KIND_RESERVE_CPUS" == 2 && "$KIND_RESERVE_MEMORY_GIB" == 3 ]] &&
+  inspector="$(sed -n "/^render_etcd_inspector_manifest()/,/^}/p" "$1/scripts/lib/management.sh")" &&
+  grep -Fq "ETCD_INSPECTOR_REQUEST_CPU" <<<"$inspector" &&
+  grep -Fq "ETCD_INSPECTOR_REQUEST_MEMORY" <<<"$inspector" &&
   grep -Fq "validate_final_worker_request_capacity" "$1/scripts/lib/workers.sh" &&
   grep -Fq "initContainers" "$1/scripts/lib/effective_requests.py" &&
   grep -Fq "restartPolicy" "$1/scripts/lib/effective_requests.py" &&

@@ -99,10 +99,12 @@ proves both inotify failures occur before any retained mutation.
 preflight unconditionally before infrastructure changes. There is no
 environment bypass for mutating entry points.
 
-The 24 GiB memory floor counts 15 GiB of six worker-container caps, 2.25 GiB
-of management-cluster pod requests, and a 3 GiB kind/system reserve: 20.25 GiB
-admitted, leaving 3.75 GiB. Each tenant control plane keeps a 512 MiB aggregate
-request inside the management request budget. Its component limits total
+The 24 GiB memory floor counts 15 GiB of six worker-container caps,
+2.28125 GiB of management-cluster pod requests (including the read-only etcd
+inspector), and a 3 GiB kind/system reserve: 20.28125 GiB admitted, leaving
+3.71875 GiB. CPU admission is 10.71 of 12 logical CPUs, leaving 1.29 CPUs.
+Each tenant control plane keeps a 512 MiB aggregate request inside the
+management request budget. Its component limits total
 1536 MiB: the kube-apiserver requests 256 MiB and is limited to 1 GiB, while
 the controller manager and scheduler each request 128 MiB and are limited to
 256 MiB. The API limit was raised after clean lifecycle runs measured

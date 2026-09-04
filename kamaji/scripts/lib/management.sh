@@ -474,6 +474,10 @@ render_etcd_inspector_manifest() {
   ETCD_INSPECTOR_NAME="${ETCD_INSPECTOR_NAME}" \
   ETCD_IMAGE="${KAMAJI_ETCD_IMAGE}" \
   ETCD_NAMESPACE="${MANAGEMENT_NAMESPACE}" \
+  ETCD_INSPECTOR_REQUEST_CPU="${ETCD_INSPECTOR_REQUEST_CPU}" \
+  ETCD_INSPECTOR_REQUEST_MEMORY="${ETCD_INSPECTOR_REQUEST_MEMORY}" \
+  ETCD_INSPECTOR_LIMIT_CPU="${ETCD_INSPECTOR_LIMIT_CPU}" \
+  ETCD_INSPECTOR_LIMIT_MEMORY="${ETCD_INSPECTOR_LIMIT_MEMORY}" \
   OWNERSHIP_LABEL="${OWNERSHIP_LABEL}" \
   LAB_PREFIX="${LAB_PREFIX}" \
     python3 -c '
@@ -523,8 +527,14 @@ payload = {
                     "command": ["etcdctl"],
                     "args": connection + ["watch", "/__kamaji_readonly_inspector__"],
                     "resources": {
-                        "requests": {"cpu": "10m", "memory": "32Mi"},
-                        "limits": {"cpu": "100m", "memory": "64Mi"},
+                        "requests": {
+                            "cpu": os.environ["ETCD_INSPECTOR_REQUEST_CPU"],
+                            "memory": os.environ["ETCD_INSPECTOR_REQUEST_MEMORY"],
+                        },
+                        "limits": {
+                            "cpu": os.environ["ETCD_INSPECTOR_LIMIT_CPU"],
+                            "memory": os.environ["ETCD_INSPECTOR_LIMIT_MEMORY"],
+                        },
                     },
                     "readinessProbe": {
                         "exec": {
