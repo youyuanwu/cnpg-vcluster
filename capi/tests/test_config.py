@@ -3,8 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
-from scripts.lib.config import ConfigError, load_env_file, parse_duration
+from scripts.lib.config import ConfigError, load_configuration, load_env_file, parse_duration
 
 
 class ConfigTests(unittest.TestCase):
@@ -34,3 +35,21 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(parse_duration("2h"), 7200)
         with self.assertRaises(ConfigError):
             parse_duration("1.5m")
+
+    def test_immutable_versions_ignore_environment(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        with patch.dict(
+            "os.environ",
+            {
+                "KIND_URL": "https://attacker.invalid/kind",
+                "KIND_SHA256": "0" * 64,
+                "MIN_DOCKER_CPUS": "99",
+                "LAB_PREFIX": "attacker",
+            },
+            clear=False,
+        ):
+            values = load_configuration(root)
+        self.assertNotEqual(values["KIND_URL"], "https://attacker.invalid/kind")
+        self.assertNotEqual(values["KIND_SHA256"], "0" * 64)
+        self.assertEqual(values["MIN_DOCKER_CPUS"], "99")
+        self.assertEqual(values["LAB_PREFIX"], "capi-kamaji-tenants")

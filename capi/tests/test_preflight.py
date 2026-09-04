@@ -7,6 +7,8 @@ from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
 from scripts.preflight import PreflightError, configured_networks, verify_management_name
+from scripts.preflight import verify_privileged_probe
+from scripts.lib.process import CommandError
 
 
 BASE = {
@@ -43,3 +45,25 @@ class PreflightTests(unittest.TestCase):
             ):
                 with self.assertRaises(PreflightError):
                     verify_management_name(Path(temporary), config, 30)
+
+    def test_timed_out_probe_cleans_owned_container(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(command: list[str], **_: object) -> CompletedProcess[str]:
+            commands.append(command)
+            if len(command) > 1 and command[1] == "run":
+                cid_path = Path(command[command.index("--cidfile") + 1])
+                cid_path.write_text("owned-probe-id\n", encoding="utf-8")
+                raise CommandError(tuple(command), 124, "timeout")
+            return CompletedProcess(command, 0, stdout="", stderr="")
+
+        config = {
+            "PREFLIGHT_PROBE_TIMEOUT": "1s",
+            "LAB_PREFIX": "test",
+            "OWNERSHIP_LABEL": "test.owner",
+            "VERIFY_IMAGE": "busybox:1.37.0@sha256:" + "0" * 64,
+        }
+        with patch("scripts.preflight.run", side_effect=fake_run):
+            with self.assertRaises(PreflightError):
+                verify_privileged_probe(config)
+        self.assertIn(["docker", "rm", "-f", "owned-probe-id"], commands)

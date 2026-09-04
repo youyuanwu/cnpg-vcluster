@@ -3,66 +3,87 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
+# [implemented] Download and verify pinned tools and immutable inputs.
 tools:
     @python3 scripts/lab.py tools
 
+# [implemented] Record and raise the local host inotify floors.
 prepare-host:
     @python3 scripts/lab.py prepare-host
 
+# [implemented] Validate prepared inputs and the local Docker host.
 preflight:
     @python3 scripts/lab.py preflight
 
+# [phase 2] Reconcile the management cluster and lifecycle controllers.
 create-management:
     @python3 scripts/lab.py unavailable create-management
 
+# [phase 3] Prove authoritative endpoint and worker registration.
 test-endpoint:
     @python3 scripts/lab.py unavailable test-endpoint
 
+# [phase 4] Prove networking and one Ready worker.
 test-spike:
     @python3 scripts/lab.py unavailable test-spike
 
+# [phase 5] Prove the three-worker Machine lifecycle.
 test-machines:
     @python3 scripts/lab.py unavailable test-machines
 
+# [phase 6] Prove Machine-independent local storage.
 test-storage:
     @python3 scripts/lab.py unavailable test-storage
 
+# [phase 7] Prove CNPG continuity through Machine replacement.
 test-persistence:
     @python3 scripts/lab.py unavailable test-persistence
 
+# [phase 8] Reconcile both tenant clusters.
 create:
     @python3 scripts/lab.py unavailable create
 
+# [phase 9] Repair one exactly identified tenant.
 repair tenant:
     @python3 scripts/lab.py unavailable repair "{{tenant}}"
 
+# [phase 2] Report read-only summarized state.
 status:
     @python3 scripts/lab.py unavailable status
 
+# [phase 2] Report read-only scoped diagnostics.
 diagnose scope="all":
     @python3 scripts/lab.py unavailable diagnose "{{scope}}"
 
+# [phase 8] Verify tenant isolation and database behavior.
 verify:
     @python3 scripts/lab.py unavailable verify
 
+# [phase 9] Delete one tenant and verify the survivor.
 destroy-tenant tenant:
     @python3 scripts/lab.py unavailable destroy-tenant "{{tenant}}"
 
+# [phase 10] Delete all exactly owned experiment resources.
 destroy:
     @python3 scripts/lab.py unavailable destroy
 
+# [phase 10] Remove one exact stuck finalizer after UID confirmation.
 break-glass kind namespace name uid:
     @python3 scripts/lab.py unavailable break-glass "{{kind}}" "{{namespace}}" "{{name}}" "{{uid}}"
 
+# [implemented] Run standard-library unit tests.
 test-unit:
     @python3 -m unittest discover -s tests -p "test_*.py"
 
+# [implemented] Run source and repository-boundary checks.
 test-static:
     @python3 scripts/test_static.py
 
+# [phase 9] Exercise tenant repair and targeted deletion.
 test-tenant-lifecycle:
     @python3 scripts/lab.py unavailable test-tenant-lifecycle
 
+# [phase 10] Run the full clean-to-clean lifecycle.
 test-e2e:
     @python3 scripts/lab.py unavailable test-e2e
 

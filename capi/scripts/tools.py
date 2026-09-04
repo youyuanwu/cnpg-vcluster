@@ -10,7 +10,13 @@ import urllib.request
 from pathlib import Path
 
 from scripts.lib.config import parse_duration, require
-from scripts.lib.files import IntegrityError, ensure_private_dir, verify_sha256
+from scripts.lib.files import (
+    IntegrityError,
+    ensure_private_dir,
+    has_owner_only_permissions,
+    verify_sha256,
+    write_private_file,
+)
 from scripts.lib.process import run
 
 
@@ -148,6 +154,93 @@ def _verify_metadata(path: Path, minor: str, contract: str) -> None:
         raise IntegrityError(f"{path} does not advertise minor {minor} contract {contract}")
 
 
+def _yaml_document(path: Path, resource_name: str) -> str:
+    documents = re.split(r"(?m)^---\s*$", path.read_text(encoding="utf-8"))
+    matches = [
+        document
+        for document in documents
+        if re.search(rf"(?m)^\s*name:\s*{re.escape(resource_name)}\s*$", document)
+    ]
+    if len(matches) != 1:
+        raise IntegrityError(
+            f"{path} contains {len(matches)} documents named {resource_name}, expected one"
+        )
+    return matches[0]
+
+
+def _verify_crd(
+    path: Path,
+    resource_name: str,
+    storage_version: str,
+    *,
+    conversion: str | None,
+) -> str:
+    document = _yaml_document(path, resource_name)
+    required = (
+        "kind: CustomResourceDefinition",
+        f"name: {storage_version}",
+        "served: true",
+        "storage: true",
+    )
+    for marker in required:
+        if marker not in document:
+            raise IntegrityError(f"{resource_name} is missing required marker {marker!r}")
+    conversion_marker = f"strategy: {conversion}" if conversion else None
+    if conversion_marker and conversion_marker not in document:
+        raise IntegrityError(
+            f"{resource_name} does not declare conversion strategy {conversion}"
+        )
+    return document
+
+
+def _verify_provider_schemas(inputs_dir: Path) -> None:
+    _verify_crd(
+        inputs_dir / "capi-core-components.yaml",
+        "clusters.cluster.x-k8s.io",
+        "v1beta2",
+        conversion="Webhook",
+    )
+    _verify_crd(
+        inputs_dir / "capi-bootstrap-components.yaml",
+        "kubeadmconfigs.bootstrap.cluster.x-k8s.io",
+        "v1beta2",
+        conversion="Webhook",
+    )
+    for resource_name in (
+        "devclusters.infrastructure.cluster.x-k8s.io",
+        "devmachines.infrastructure.cluster.x-k8s.io",
+    ):
+        _verify_crd(
+            inputs_dir / "capd-components.yaml",
+            resource_name,
+            "v1beta2",
+            conversion="Webhook",
+        )
+    kamaji = _verify_crd(
+        inputs_dir / "kamaji-capi-components.yaml",
+        "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
+        "v1alpha2",
+        conversion=None,
+    )
+    for marker in (
+        "cluster.x-k8s.io/v1beta2: v1alpha2",
+        "conditions:",
+        "observedGeneration:",
+        "reason:",
+        "status:",
+        "type:",
+        "dataStoreName:",
+        "network:",
+        "addons:",
+    ):
+        if marker not in kamaji:
+            raise IntegrityError(f"KamajiControlPlane CRD is missing {marker!r}")
+    components = (inputs_dir / "kamaji-capi-components.yaml").read_text(encoding="utf-8")
+    for marker in ("kamaji.clastix.io", "tenantcontrolplanes"):
+        if marker not in components:
+            raise IntegrityError(f"Kamaji provider components are missing {marker!r}")
+
+
 def _ensure_cert_manager_chart(
     config: dict[str, str],
     inputs_dir: Path,
@@ -155,15 +248,8 @@ def _ensure_cert_manager_chart(
     timeout: int,
 ) -> Path:
     destination = inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.tgz"
-    if destination.exists():
-        try:
-            verify_sha256(destination, config["CERT_MANAGER_CHART_SHA256"])
-            return destination
-        except IntegrityError:
-            destination.unlink()
-
     with tempfile.TemporaryDirectory(dir=inputs_dir) as temporary_dir:
-        run(
+        result = run(
             [
                 str(bin_dir / "helm"),
                 "pull",
@@ -175,12 +261,22 @@ def _ensure_cert_manager_chart(
             ],
             timeout=timeout,
         )
+        output = result.stdout + result.stderr
+        expected_digest = f"Digest: {config['CERT_MANAGER_OCI_DIGEST']}"
+        if expected_digest not in output:
+            raise IntegrityError(
+                f"cert-manager OCI descriptor did not report {config['CERT_MANAGER_OCI_DIGEST']}"
+            )
         candidates = list(Path(temporary_dir).glob("cert-manager-*.tgz"))
         if len(candidates) != 1:
             raise IntegrityError("Helm did not produce exactly one cert-manager chart")
         shutil.move(candidates[0], destination)
         destination.chmod(0o600)
     verify_sha256(destination, config["CERT_MANAGER_CHART_SHA256"])
+    write_private_file(
+        inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.digest",
+        config["CERT_MANAGER_OCI_DIGEST"] + "\n",
+    )
     return destination
 
 
@@ -192,6 +288,13 @@ def verify_all_inputs(root: Path, config: dict[str, str]) -> None:
         inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.tgz",
         config["CERT_MANAGER_CHART_SHA256"],
     )
+    digest_path = inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.digest"
+    if not digest_path.is_file():
+        raise IntegrityError("cert-manager OCI descriptor record is missing")
+    if digest_path.read_text(encoding="utf-8").strip() != config["CERT_MANAGER_OCI_DIGEST"]:
+        raise IntegrityError("cert-manager OCI descriptor record does not match")
+    if not has_owner_only_permissions(digest_path):
+        raise IntegrityError("cert-manager OCI descriptor record is not owner-only")
 
     _verify_metadata(
         inputs_dir / "capi-metadata.yaml",
@@ -209,6 +312,7 @@ def verify_all_inputs(root: Path, config: dict[str, str]) -> None:
             raise IntegrityError(
                 f"{filename} does not contain exactly one {config[image_key]} image"
             )
+    _verify_provider_schemas(inputs_dir)
 
 
 def prepare_tools(root: Path, config: dict[str, str]) -> None:

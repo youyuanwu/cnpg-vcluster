@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
+import os
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.lib.host import HostError, resolve_host_just
+from scripts.lib.host import HostError, _validate_state_record, resolve_host_just
 
 
 class HostTests(unittest.TestCase):
@@ -31,3 +33,55 @@ class HostTests(unittest.TestCase):
             with patch("scripts.lib.host.shutil.which", return_value=str(link)):
                 with self.assertRaises(HostError):
                     resolve_host_just(root, {"JUST_VERSION": "1.58.0"})
+
+    def test_rejects_foreign_inotify_record(self) -> None:
+        config = {
+            "LAB_PREFIX": "expected",
+            "OWNERSHIP_LABEL": "expected.owner",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            host_dir = Path(temporary) / "host"
+            host_dir.mkdir(mode=0o700)
+            path = host_dir / "inotify.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "lab_prefix": "foreign",
+                        "ownership_label": "expected.owner",
+                        "owner_uid": os.getuid(),
+                        "max_user_instances": 128,
+                        "max_user_watches": 524288,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            path.chmod(0o600)
+            with self.assertRaises(HostError):
+                _validate_state_record(path, config)
+
+    def test_rejects_broad_inotify_record_permissions(self) -> None:
+        config = {
+            "LAB_PREFIX": "expected",
+            "OWNERSHIP_LABEL": "expected.owner",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            host_dir = Path(temporary) / "host"
+            host_dir.mkdir(mode=0o700)
+            path = host_dir / "inotify.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "lab_prefix": "expected",
+                        "ownership_label": "expected.owner",
+                        "owner_uid": os.getuid(),
+                        "max_user_instances": 128,
+                        "max_user_watches": 524288,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            path.chmod(0o644)
+            with self.assertRaises(HostError):
+                _validate_state_record(path, config)

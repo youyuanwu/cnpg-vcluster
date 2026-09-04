@@ -8,6 +8,19 @@ from pathlib import Path
 
 KEY_RE = re.compile(r"^[A-Z][A-Z0-9_]*$")
 DURATION_RE = re.compile(r"^([0-9]+)(s|m|h)$")
+OPERATOR_OVERRIDE_KEYS = {
+    "MIN_DOCKER_CPUS",
+    "MIN_DOCKER_MEMORY_GIB",
+    "MIN_DOCKER_STORAGE_GIB",
+    "MIN_INOTIFY_INSTANCES",
+    "MIN_INOTIFY_WATCHES",
+    "DOWNLOAD_TIMEOUT",
+    "COMMAND_TIMEOUT",
+    "PREFLIGHT_PROBE_TIMEOUT",
+    "KUBECTL_REQUEST_TIMEOUT",
+    "CONDITION_TIMEOUT",
+    "WAIT_POLL_INTERVAL",
+}
 
 
 class ConfigError(ValueError):
@@ -44,7 +57,7 @@ def load_env_file(path: Path, *, overrides: dict[str, str] | None = None) -> dic
             raise ConfigError(f"{path}:{line_number}: duplicate key {key}")
         values[key] = _parse_value(raw.strip(), line_number)
 
-    source = os.environ if overrides is None else overrides
+    source = {} if overrides is None else overrides
     for key in values:
         if key in source:
             values[key] = source[key]
@@ -53,7 +66,10 @@ def load_env_file(path: Path, *, overrides: dict[str, str] | None = None) -> dic
 
 def load_configuration(root: Path) -> dict[str, str]:
     versions = load_env_file(root / "config" / "versions.env")
-    settings = load_env_file(root / "config" / "settings.env")
+    settings = load_env_file(
+        root / "config" / "settings.env",
+        overrides={key: os.environ[key] for key in OPERATOR_OVERRIDE_KEYS if key in os.environ},
+    )
     duplicates = versions.keys() & settings.keys()
     if duplicates:
         raise ConfigError(f"duplicate keys across configuration files: {sorted(duplicates)}")

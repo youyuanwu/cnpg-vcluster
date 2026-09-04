@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 import json
+import fcntl
 import os
 import shutil
+import stat
+from contextlib import contextmanager
 from pathlib import Path
+from typing import Iterator
 
 from .config import parse_duration
-from .files import write_private_file
+from .files import ensure_private_dir, has_owner_only_permissions, write_private_file
 from .process import run
 
 
 class HostError(RuntimeError):
     pass
+
+
+HOST_STATE_SCHEMA = 1
 
 
 def read_inotify(name: str) -> int:
@@ -41,6 +48,78 @@ def _state_path(root: Path) -> Path:
     return root / ".runtime" / "host" / "inotify.json"
 
 
+@contextmanager
+def _host_lock(root: Path) -> Iterator[None]:
+    host_dir = root / ".runtime" / "host"
+    ensure_private_dir(host_dir)
+    lock_path = host_dir / ".lock"
+    try:
+        descriptor = os.open(
+            lock_path,
+            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+            0o600,
+        )
+    except OSError as exc:
+        raise HostError(f"unable to open host lock {lock_path}: {exc}") from exc
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise HostError(f"host lock is not a regular file: {lock_path}")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+        if not _state_path(root).exists():
+            lock_path.unlink(missing_ok=True)
+            try:
+                host_dir.rmdir()
+                host_dir.parent.rmdir()
+            except OSError:
+                pass
+
+
+def _validate_state_record(path: Path, config: dict[str, str]) -> dict[str, int]:
+    if path.is_symlink() or not path.is_file():
+        raise HostError(f"host state record is not a regular file: {path}")
+    if not has_owner_only_permissions(path) or not has_owner_only_permissions(path.parent):
+        raise HostError(f"host state path is not owner-only: {path}")
+    if path.stat().st_uid != os.getuid() or path.parent.stat().st_uid != os.getuid():
+        raise HostError(f"host state path belongs to another user: {path}")
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HostError(f"malformed host state record: {path}") from exc
+    expected_keys = {
+        "schema",
+        "lab_prefix",
+        "ownership_label",
+        "owner_uid",
+        "max_user_instances",
+        "max_user_watches",
+    }
+    if set(payload) != expected_keys:
+        raise HostError(f"host state record has unexpected fields: {path}")
+    if payload["schema"] != HOST_STATE_SCHEMA:
+        raise HostError(f"unsupported host state schema in {path}")
+    if payload["lab_prefix"] != config["LAB_PREFIX"]:
+        raise HostError(f"host state record belongs to another lab: {path}")
+    if payload["ownership_label"] != config["OWNERSHIP_LABEL"]:
+        raise HostError(f"host state record ownership label mismatch: {path}")
+    if payload["owner_uid"] != os.getuid():
+        raise HostError(f"host state record belongs to another user: {path}")
+    try:
+        values = {
+            "max_user_instances": int(payload["max_user_instances"]),
+            "max_user_watches": int(payload["max_user_watches"]),
+        }
+    except (TypeError, ValueError) as exc:
+        raise HostError(f"host state record values are invalid: {path}") from exc
+    if any(value < 0 for value in values.values()):
+        raise HostError(f"host state record values are invalid: {path}")
+    return values
+
+
 def _apply_sysctl(root: Path, config: dict[str, str], name: str, value: int) -> None:
     timeout = parse_duration(config["COMMAND_TIMEOUT"])
     sudo = shutil.which("sudo")
@@ -68,67 +147,59 @@ def _apply_sysctl(root: Path, config: dict[str, str], name: str, value: int) -> 
 
 
 def prepare_inotify(root: Path, config: dict[str, str]) -> None:
-    state_path = _state_path(root)
-    if state_path.exists():
-        try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise HostError(f"malformed host state record: {state_path}") from exc
-    else:
-        state = {
-            "max_user_instances": read_inotify("max_user_instances"),
-            "max_user_watches": read_inotify("max_user_watches"),
-        }
-        write_private_file(state_path, json.dumps(state, sort_keys=True) + "\n")
+    with _host_lock(root):
+        state_path = _state_path(root)
+        if state_path.exists() or state_path.is_symlink():
+            _validate_state_record(state_path, config)
+        else:
+            state = {
+                "schema": HOST_STATE_SCHEMA,
+                "lab_prefix": config["LAB_PREFIX"],
+                "ownership_label": config["OWNERSHIP_LABEL"],
+                "owner_uid": os.getuid(),
+                "max_user_instances": read_inotify("max_user_instances"),
+                "max_user_watches": read_inotify("max_user_watches"),
+            }
+            write_private_file(state_path, json.dumps(state, sort_keys=True) + "\n")
+            _validate_state_record(state_path, config)
 
-    floors = {
-        "max_user_instances": int(config["MIN_INOTIFY_INSTANCES"]),
-        "max_user_watches": int(config["MIN_INOTIFY_WATCHES"]),
-    }
-    for name, floor in floors.items():
-        if read_inotify(name) < floor:
-            _apply_sysctl(root, config, name, floor)
-        if read_inotify(name) < floor:
-            raise HostError(f"fs.inotify.{name} remains below required floor {floor}")
-    print(f"host inotify values prepared; originals recorded in {state_path}")
+        floors = {
+            "max_user_instances": int(config["MIN_INOTIFY_INSTANCES"]),
+            "max_user_watches": int(config["MIN_INOTIFY_WATCHES"]),
+        }
+        for name, floor in floors.items():
+            if read_inotify(name) < floor:
+                _apply_sysctl(root, config, name, floor)
+            if read_inotify(name) < floor:
+                raise HostError(f"fs.inotify.{name} remains below required floor {floor}")
+        print(f"host inotify values prepared; originals recorded in {state_path}")
 
 
 def restore_inotify(root: Path, config: dict[str, str]) -> None:
-    state_path = _state_path(root)
-    if not state_path.exists():
-        return
-    try:
-        state = json.loads(state_path.read_text(encoding="utf-8"))
-        originals = {
-            "max_user_instances": int(state["max_user_instances"]),
-            "max_user_watches": int(state["max_user_watches"]),
-        }
-    except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
-        raise HostError(f"malformed host state record: {state_path}") from exc
+    with _host_lock(root):
+        state_path = _state_path(root)
+        if not state_path.exists() and not state_path.is_symlink():
+            return
+        originals = _validate_state_record(state_path, config)
 
-    owned_workers = run(
-        [
-            "docker",
-            "ps",
-            "-aq",
-            "--filter",
-            f"label={config['OWNERSHIP_LABEL']}=true",
-            "--filter",
-            "label=cnpg-vcluster.capi/role=worker",
-        ],
-        timeout=30,
-    ).stdout.split()
-    if owned_workers:
-        raise HostError("cannot restore host inotify values while owned workers exist")
+        owned_workers = run(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                f"label={config['OWNERSHIP_LABEL']}=true",
+                "--filter",
+                "label=cnpg-vcluster.capi/role=worker",
+            ],
+            timeout=30,
+        ).stdout.split()
+        if owned_workers:
+            raise HostError("cannot restore host inotify values while owned workers exist")
 
-    for name, value in originals.items():
-        _apply_sysctl(root, config, name, value)
-        if read_inotify(name) != value:
-            raise HostError(f"failed to restore fs.inotify.{name}")
-    state_path.unlink()
-    try:
-        state_path.parent.rmdir()
-        state_path.parent.parent.rmdir()
-    except OSError:
-        pass
-    print("restored recorded host inotify values")
+        for name, value in originals.items():
+            _apply_sysctl(root, config, name, value)
+            if read_inotify(name) != value:
+                raise HostError(f"failed to restore fs.inotify.{name}")
+        state_path.unlink()
+        print("restored recorded host inotify values")

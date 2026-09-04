@@ -68,6 +68,8 @@ def check_recipes() -> None:
         if (match := re.match(r"\s{4}([a-zA-Z0-9_-]+)", line))
     }
     check(EXPECTED_RECIPES <= recipes, f"missing recipes: {sorted(EXPECTED_RECIPES - recipes)}")
+    check("[implemented]" in result.stdout, "task list does not mark implemented recipes")
+    check("[phase 2]" in result.stdout, "task list does not mark future blocked recipes")
     unavailable = output(
         "python3",
         "scripts/lab.py",

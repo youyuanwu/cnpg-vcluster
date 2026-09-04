@@ -9,9 +9,10 @@ import uuid
 from pathlib import Path
 
 from scripts.lib.config import parse_duration
+from scripts.lib.files import verify_sha256
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.ownership import IdentityRecord, OwnershipError
-from scripts.lib.process import run
+from scripts.lib.process import CommandError, run
 from scripts.tools import verify_all_inputs
 
 
@@ -82,6 +83,10 @@ def _tool_version(path: Path, command: list[str], expected: str, timeout: int) -
 def verify_tools(root: Path, config: dict[str, str], timeout: int) -> None:
     resolve_host_just(root, config)
     bin_dir = root / ".tools" / "bin"
+    verify_sha256(bin_dir / "kind", config["KIND_SHA256"])
+    verify_sha256(bin_dir / "kubectl", config["KUBECTL_SHA256"])
+    verify_sha256(bin_dir / "clusterctl", config["CLUSTERCTL_SHA256"])
+    verify_sha256(bin_dir / "helm", config["HELM_BINARY_SHA256"])
     _tool_version(bin_dir / "kind", ["version"], config["KIND_VERSION"], timeout)
     kubectl = json.loads(
         run(
@@ -200,27 +205,61 @@ def verify_images(config: dict[str, str], timeout: int) -> None:
 def verify_privileged_probe(config: dict[str, str]) -> None:
     timeout = parse_duration(config["PREFLIGHT_PROBE_TIMEOUT"])
     name = f"{config['LAB_PREFIX']}-preflight-{uuid.uuid4().hex[:12]}"
-    result = run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "--name",
-            name,
-            "--privileged",
-            "--cgroupns=private",
-            "--network=none",
-            "--entrypoint",
-            "sh",
-            config["VERIFY_IMAGE"],
-            "-ec",
-            "test -r /proc/1/status && test -d /sys/fs/cgroup",
-        ],
-        timeout=timeout,
-        check=False,
-    )
-    if result.returncode != 0:
-        run(["docker", "rm", "-f", name], timeout=30, check=False)
+    cid_file = Path("/tmp") / f"{name}.cid"
+    result = None
+    try:
+        result = run(
+            [
+                "docker",
+                "run",
+                "--rm",
+                "--cidfile",
+                str(cid_file),
+                "--name",
+                name,
+                "--label",
+                f"{config['OWNERSHIP_LABEL']}=true",
+                "--label",
+                "cnpg-vcluster.capi/role=probe",
+                "--privileged",
+                "--cgroupns=private",
+                "--network=none",
+                "--entrypoint",
+                "sh",
+                config["VERIFY_IMAGE"],
+                "-ec",
+                "test -r /proc/1/status && test -d /sys/fs/cgroup",
+            ],
+            timeout=timeout,
+            check=False,
+        )
+    except CommandError as exc:
+        raise PreflightError(f"privileged container probe failed: {exc}") from exc
+    finally:
+        identifier = cid_file.read_text(encoding="utf-8").strip() if cid_file.exists() else ""
+        cid_file.unlink(missing_ok=True)
+        if identifier:
+            run(["docker", "rm", "-f", identifier], timeout=30, check=False)
+        else:
+            inspect = run(
+                ["docker", "inspect", name, "--format", "{{json .Config.Labels}}"],
+                timeout=30,
+                check=False,
+            )
+            if inspect.returncode == 0:
+                labels = json.loads(inspect.stdout)
+                if (
+                    labels.get(config["OWNERSHIP_LABEL"]) == "true"
+                    and labels.get("cnpg-vcluster.capi/role") == "probe"
+                ):
+                    run(["docker", "rm", "-f", name], timeout=30, check=False)
+        remaining = run(
+            ["docker", "ps", "-aq", "--filter", f"name=^/{name}$"],
+            timeout=30,
+        ).stdout.strip()
+        if remaining:
+            raise PreflightError(f"privileged probe cleanup failed for {name}")
+    if result is None or result.returncode != 0:
         raise PreflightError("privileged container probe failed")
 
 
