@@ -265,9 +265,11 @@ the healthy-management-only residual state. That exact state requires owned
 management readiness plus absence of every final/spike TCP, worker, worker
 volume, namespace, kubeconfig, runtime subtree, VIP claim, datastore prefix,
 user, role, and `DataStore.status.usedBy` entry; an inspection failure returns
-`1`, never `2`. Ordinary add-on, topology, capacity, API, timeout, and
-validation failures return `1`, retain every pre-existing healthy tenant and
-database, and create no blocker record.
+`1`, never `2`. Datastore checks execute through an owned digest-pinned
+read-only inspector in the management namespace rather than creating
+maintenance resources from `status` or `verify`. Ordinary add-on, topology,
+capacity, API, timeout, and validation failures return `1`, retain every
+pre-existing healthy tenant and database, and create no blocker record.
 
 `status` and `diagnose` are read-only. They report tools, Docker, ownership
 evidence, selected VIPs, cert-manager, MetalLB, Kamaji, datastore state, and

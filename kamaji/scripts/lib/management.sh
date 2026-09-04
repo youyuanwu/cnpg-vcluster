@@ -469,6 +469,155 @@ datastore_ready() {
     -o jsonpath='{.status.ready}' 2>/dev/null)" == "true" ]]
 }
 
+render_etcd_inspector_manifest() {
+  ETCD_INSPECTOR_MANIFEST="${ETCD_INSPECTOR_MANIFEST}" \
+  ETCD_INSPECTOR_NAME="${ETCD_INSPECTOR_NAME}" \
+  ETCD_IMAGE="${KAMAJI_ETCD_IMAGE}" \
+  ETCD_NAMESPACE="${MANAGEMENT_NAMESPACE}" \
+  OWNERSHIP_LABEL="${OWNERSHIP_LABEL}" \
+  LAB_PREFIX="${LAB_PREFIX}" \
+    python3 -c '
+import json
+import os
+from pathlib import Path
+
+name = os.environ["ETCD_INSPECTOR_NAME"]
+namespace = os.environ["ETCD_NAMESPACE"]
+owner = os.environ["OWNERSHIP_LABEL"]
+prefix = os.environ["LAB_PREFIX"]
+connection = [
+    "--endpoints=https://kamaji-etcd-0.kamaji-etcd."
+        + namespace + ".svc.cluster.local:2379",
+    "--cacert=/etc/etcd/client/ca.crt",
+    "--cert=/etc/etcd/client/tls.crt",
+    "--key=/etc/etcd/client/tls.key",
+]
+payload = {
+    "apiVersion": "apps/v1",
+    "kind": "Deployment",
+    "metadata": {
+        "name": name,
+        "namespace": namespace,
+        "labels": {
+            owner: prefix,
+            "kamaji.cnpg-vcluster.io/role": "datastore-inspector",
+        },
+    },
+    "spec": {
+        "replicas": 1,
+        "selector": {"matchLabels": {"app": name}},
+        "template": {
+            "metadata": {
+                "labels": {
+                    "app": name,
+                    owner: prefix,
+                    "kamaji.cnpg-vcluster.io/role": "datastore-inspector",
+                },
+            },
+            "spec": {
+                "automountServiceAccountToken": False,
+                "terminationGracePeriodSeconds": 1,
+                "containers": [{
+                    "name": "etcdctl",
+                    "image": os.environ["ETCD_IMAGE"],
+                    "command": ["etcdctl"],
+                    "args": connection + ["watch", "/__kamaji_readonly_inspector__"],
+                    "resources": {
+                        "requests": {"cpu": "10m", "memory": "32Mi"},
+                        "limits": {"cpu": "100m", "memory": "64Mi"},
+                    },
+                    "readinessProbe": {
+                        "exec": {
+                            "command": ["etcdctl"] + connection + ["endpoint", "health"],
+                        },
+                        "periodSeconds": 5,
+                        "timeoutSeconds": 3,
+                        "failureThreshold": 6,
+                    },
+                    "securityContext": {
+                        "allowPrivilegeEscalation": False,
+                        "readOnlyRootFilesystem": True,
+                    },
+                    "volumeMounts": [{
+                        "name": "client",
+                        "mountPath": "/etc/etcd/client",
+                        "readOnly": True,
+                    }],
+                }],
+                "volumes": [{
+                    "name": "client",
+                    "projected": {
+                        "defaultMode": 256,
+                        "sources": [
+                            {"secret": {
+                                "name": "kamaji-etcd-ca",
+                                "items": [{"key": "tls.crt", "path": "ca.crt"}],
+                            }},
+                            {"secret": {
+                                "name": "kamaji-etcd-client-certs",
+                                "items": [
+                                    {"key": "tls.crt", "path": "tls.crt"},
+                                    {"key": "tls.key", "path": "tls.key"},
+                                ],
+                            }},
+                        ],
+                    },
+                }],
+            },
+        },
+    },
+}
+path = Path(os.environ["ETCD_INSPECTOR_MANIFEST"])
+path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+path.chmod(0o600)
+'
+}
+
+etcd_inspector_pod() {
+  local pod
+  pod="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get pods \
+    -l "app=${ETCD_INSPECTOR_NAME}" \
+    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null)" || return 1
+  [[ -n "${pod}" ]] || return 1
+  printf '%s\n' "${pod}"
+}
+
+etcd_inspector_is_ready() {
+  local desired ready image owner pod
+  desired="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get \
+    "deployment/${ETCD_INSPECTOR_NAME}" \
+    -o jsonpath='{.spec.replicas}' 2>/dev/null)" || return 1
+  ready="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get \
+    "deployment/${ETCD_INSPECTOR_NAME}" \
+    -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || return 1
+  image="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get \
+    "deployment/${ETCD_INSPECTOR_NAME}" \
+    -o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null)" \
+    || return 1
+  owner="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get \
+    "deployment/${ETCD_INSPECTOR_NAME}" -o json 2>/dev/null \
+    | OWNERSHIP_LABEL="${OWNERSHIP_LABEL}" python3 -c \
+      'import json,os,sys; print(json.load(sys.stdin).get("metadata",{}).get("labels",{}).get(os.environ["OWNERSHIP_LABEL"],""))')" \
+    || return 1
+  pod="$(etcd_inspector_pod)" || return 1
+  [[ "${desired}" == 1 && "${ready:-0}" == 1 \
+    && "${image}" == "${KAMAJI_ETCD_IMAGE}" \
+    && "${owner}" == "${LAB_PREFIX}" \
+    && "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get "pod/${pod}" \
+      -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' \
+      2>/dev/null)" == True ]]
+}
+
+reconcile_etcd_inspector() {
+  render_etcd_inspector_manifest
+  management_kubectl apply -f "${ETCD_INSPECTOR_MANIFEST}" >/dev/null \
+    || return 1
+  management_kubectl -n "${MANAGEMENT_NAMESPACE}" rollout status \
+    "deployment/${ETCD_INSPECTOR_NAME}" \
+    --timeout="${DATASTORE_TIMEOUT}" >/dev/null \
+    && etcd_inspector_is_ready
+}
+
 reconcile_kamaji() {
   local introduced=1
   management_helm status kamaji --namespace "${MANAGEMENT_NAMESPACE}" >/dev/null 2>&1 && introduced=0
@@ -533,6 +682,10 @@ reconcile_kamaji() {
       | python3 -c 'import json,sys; print(sum(1 for item in json.load(sys.stdin)["items"] if item["metadata"]["name"].startswith("data-kamaji-etcd-") and item.get("status", {}).get("phase") == "Bound"))')" -ne "${KAMAJI_ETCD_REPLICAS}" ]]; then
     cleanup_if_introduced "${introduced}" cleanup_kamaji
     die "management.datastore: expected ${KAMAJI_ETCD_REPLICAS} bound datastore PVCs"
+  fi
+  if ! reconcile_etcd_inspector; then
+    cleanup_if_introduced "${introduced}" cleanup_kamaji
+    die "management.datastore: read-only residual inspector did not become ready"
   fi
 }
 

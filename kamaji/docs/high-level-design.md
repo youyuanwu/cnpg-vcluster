@@ -484,7 +484,10 @@ healthy owned management plane with no final or spike TCPs, workers, worker
 volumes, namespaces, kubeconfigs, runtime subtrees, borrowed-VIP claims,
 datastore prefixes, users, roles, or `DataStore.status.usedBy` entries. The
 shared status/verify predicate treats any inspection failure as unhealthy
-rather than absence.
+rather than absence. A digest-pinned owned inspector Deployment keeps the
+client certificate mounted and services read-only `etcdctl get`, `user get`,
+and `role get` executions without creating Kubernetes resources during
+observation.
 
 ## Upstream references
 

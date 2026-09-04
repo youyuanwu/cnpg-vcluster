@@ -278,6 +278,9 @@ pvc_count="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" get pvc -o json 2>/
 datastore_ready="$(management_kubectl get datastore default -o jsonpath='{.status.ready}' 2>/dev/null || true)"
 [[ "${datastore_ready}" == "true" ]] && printf 'DataStore/default: ready\n' \
   || unhealthy "DataStore/default is not ready"
+etcd_inspector_is_ready \
+  && printf 'read-only datastore inspector: ready\n' \
+  || unhealthy "read-only datastore inspector is not ready or not owned"
 printf 'TenantControlPlanes: %s\n' \
   "$(management_kubectl get tenantcontrolplanes.kamaji.clastix.io --all-namespaces --no-headers 2>/dev/null | wc -l)"
 

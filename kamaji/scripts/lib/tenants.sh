@@ -731,6 +731,7 @@ blocked_management_plane_is_healthy() {
     && blocked_management_daemonset_is_ready metallb-system speaker \
     && blocked_management_network_is_healthy \
     && blocked_management_deployment_is_ready "${MANAGEMENT_NAMESPACE}" kamaji \
+    && etcd_inspector_is_ready \
     && [[ -n "$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
       get endpoints kamaji-webhook-service \
       -o jsonpath='{.subsets[0].addresses[0].ip}' 2>/dev/null)" ]] \
@@ -754,16 +755,23 @@ blocked_residual_failure() {
 blocked_residual_probe_state() {
   local key="$1"
   shift
-  case "${KAMAJI_TEST_BLOCKED_RESIDUAL:-}" in
-    "${key}:present")
-      printf 'present\n'
-      return 0
-      ;;
-    "${key}:inspection-failed")
-      printf 'inspection-failed\n'
-      return 1
-      ;;
-  esac
+  local injection
+  while IFS= read -r injection; do
+    case "${injection}" in
+      "${key}:absent")
+        printf 'absent\n'
+        return 0
+        ;;
+      "${key}:present")
+        printf 'present\n'
+        return 0
+        ;;
+      "${key}:inspection-failed")
+        printf 'inspection-failed\n'
+        return 1
+        ;;
+    esac
+  done < <(tr ',' '\n' <<<"${KAMAJI_TEST_BLOCKED_RESIDUAL:-}")
   "$@"
 }
 
@@ -1282,86 +1290,74 @@ etcd_readonly() {
     get:*|user:get\ *|role:get\ *) ;;
     *) return 1 ;;
   esac
-  local ca_certificate client_certificate client_key
-  ca_certificate="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
-    get secret kamaji-etcd-ca -o jsonpath='{.data.tls\.crt}' 2>/dev/null)" \
-    || return 1
-  client_certificate="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
-    get secret kamaji-etcd-client-certs -o jsonpath='{.data.tls\.crt}' \
-    2>/dev/null)" || return 1
-  client_key="$(management_kubectl -n "${MANAGEMENT_NAMESPACE}" \
-    get secret kamaji-etcd-client-certs -o jsonpath='{.data.tls\.key}' \
-    2>/dev/null)" || return 1
-  [[ -n "${ca_certificate}" && -n "${client_certificate}" \
-    && -n "${client_key}" ]] || return 1
-
-  {
-    printf '%s\n' "${ca_certificate}"
-    printf '%s\n' "${client_certificate}"
-    printf '%s\n' "${client_key}"
-  } | management_kubectl -n "${MANAGEMENT_NAMESPACE}" exec -i kamaji-etcd-0 \
-    -- sh -c '
-      set -eu
-      cert_dir="$(mktemp -d)"
-      trap '\''rm -rf "${cert_dir}"'\'' EXIT HUP INT TERM
-      IFS= read -r ca_certificate
-      IFS= read -r client_certificate
-      IFS= read -r client_key
-      printf "%s" "${ca_certificate}" | base64 -d >"${cert_dir}/ca.crt"
-      printf "%s" "${client_certificate}" | base64 -d >"${cert_dir}/tls.crt"
-      printf "%s" "${client_key}" | base64 -d >"${cert_dir}/tls.key"
-      ETCDCTL_API=3 etcdctl \
-        --endpoints=https://127.0.0.1:2379 \
-        --cacert="${cert_dir}/ca.crt" \
-        --cert="${cert_dir}/tls.crt" \
-        --key="${cert_dir}/tls.key" \
-        "$@"
-    ' -- "${operation}" "$@"
+  local pod
+  pod="$(etcd_inspector_pod)" || return 1
+  management_kubectl -n "${MANAGEMENT_NAMESPACE}" exec "${pod}" -- \
+    etcdctl \
+    --endpoints="https://kamaji-etcd-0.kamaji-etcd.${MANAGEMENT_NAMESPACE}.svc.cluster.local:2379" \
+    --cacert=/etc/etcd/client/ca.crt \
+    --cert=/etc/etcd/client/tls.crt \
+    --key=/etc/etcd/client/tls.key \
+    "${operation}" "$@"
 }
 
 etcd_readonly_prefix_state() {
-  local output status
-  set +e
-  output="$(etcd_readonly get "/${1}/" --prefix --keys-only 2>&1)"
-  status=$?
-  set -e
-  if (( status != 0 )); then
-    printf 'inspection-failed\n'
-    return 1
-  fi
-  [[ -z "${output}" ]] && printf 'absent\n' || printf 'present\n'
+  local output status attempt
+  for attempt in 1 2 3; do
+    set +e
+    output="$(etcd_readonly get "/${1}/" --prefix --keys-only 2>&1)"
+    status=$?
+    set -e
+    if (( status == 0 )); then
+      [[ -z "${output}" ]] && printf 'absent\n' || printf 'present\n'
+      return 0
+    fi
+    (( attempt == 3 )) || sleep 1
+  done
+  printf 'inspection-failed\n'
+  return 1
 }
 
 etcd_readonly_user_state() {
-  local output status
-  set +e
-  output="$(etcd_readonly user get "$1" 2>&1)"
-  status=$?
-  set -e
-  if (( status == 0 )); then
-    printf 'present\n'
-  elif grep -Eqi 'user .* does not exist|user name not found' <<<"${output}"; then
-    printf 'absent\n'
-  else
-    printf 'inspection-failed\n'
-    return 1
-  fi
+  local output status attempt
+  for attempt in 1 2 3; do
+    set +e
+    output="$(etcd_readonly user get "$1" 2>&1)"
+    status=$?
+    set -e
+    if (( status == 0 )); then
+      printf 'present\n'
+      return 0
+    fi
+    if grep -Eqi 'user .* does not exist|user name not found' <<<"${output}"; then
+      printf 'absent\n'
+      return 0
+    fi
+    (( attempt == 3 )) || sleep 1
+  done
+  printf 'inspection-failed\n'
+  return 1
 }
 
 etcd_readonly_role_state() {
-  local output status
-  set +e
-  output="$(etcd_readonly role get "$1" 2>&1)"
-  status=$?
-  set -e
-  if (( status == 0 )); then
-    printf 'present\n'
-  elif grep -Eqi 'role .* does not exist|role name not found' <<<"${output}"; then
-    printf 'absent\n'
-  else
-    printf 'inspection-failed\n'
-    return 1
-  fi
+  local output status attempt
+  for attempt in 1 2 3; do
+    set +e
+    output="$(etcd_readonly role get "$1" 2>&1)"
+    status=$?
+    set -e
+    if (( status == 0 )); then
+      printf 'present\n'
+      return 0
+    fi
+    if grep -Eqi 'role .* does not exist|role name not found' <<<"${output}"; then
+      printf 'absent\n'
+      return 0
+    fi
+    (( attempt == 3 )) || sleep 1
+  done
+  printf 'inspection-failed\n'
+  return 1
 }
 
 etcd_maintenance() {

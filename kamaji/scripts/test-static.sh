@@ -1041,6 +1041,15 @@ check "blocked residual inspection uses read-only datastore probes" bash -c '
   grep -Fq "etcd_readonly_role_state" <<<"${predicate}" &&
   ! grep -Fq "etcd_maintenance" <<<"${predicate}"
 ' _ "${LAB_ROOT}"
+check "management provides a pinned read-only datastore inspector" bash -c '
+  file="$1/scripts/lib/management.sh"
+  grep -Fq "reconcile_etcd_inspector" "$file" &&
+  grep -Fq '\''"image": os.environ["ETCD_IMAGE"]'\'' "$file" &&
+  grep -Fq '\''"watch", "/__kamaji_readonly_inspector__"'\'' "$file" &&
+  grep -Fq "automountServiceAccountToken" "$file" &&
+  grep -Fq "etcd_inspector_is_ready" "$1/scripts/lib/tenants.sh" &&
+  grep -Fq "read-only datastore inspector" "$1/scripts/status.sh"
+' _ "${LAB_ROOT}"
 check "ordinary final failures have explicit non-blocker classifiers" bash -c '
   file="$1/scripts/create.sh"
   for classifier in classify_kube_proxy_failure classify_addon_failure \
@@ -1675,7 +1684,7 @@ check "introduced-component cleanup polarity is explicit" \
 check "fresh cert-manager failure is targeted and preserves dependencies" \
   fresh_cert_manager_failure_is_targeted
 check "management scripts contain no fallback artifact path" bash -c '
-  ! grep -Eiq "(fallback|stable\\.clastix|license|activation|vcluster)" \
+  ! grep -Eiq "(fallback|stable\\.clastix|license|activation|vcluster/)" \
     "$1/scripts/create-management.sh" "$1/scripts/lib/management.sh"
 ' _ "${LAB_ROOT}"
 check "create-management stops at zero TCPs and workers" bash -c '

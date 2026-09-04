@@ -335,10 +335,10 @@ assert_exact_blocked_residual_validation() {
     "tenant-a.datastore-prefix:present"
   assert_blocked_residual_rejected datastore-user \
     "tenant-a datastore user residual is present" \
-    "tenant-a.datastore-user:present"
+    "tenant-a.datastore-prefix:absent,tenant-a.datastore-user:present"
   assert_blocked_residual_rejected datastore-role \
     "tenant-a datastore role residual is present" \
-    "tenant-a.datastore-role:present"
+    "tenant-a.datastore-prefix:absent,tenant-a.datastore-user:absent,tenant-a.datastore-role:present"
   assert_blocked_residual_rejected datastore-inspection \
     "tenant-a datastore prefix residual inspection failed" \
     "tenant-a.datastore-prefix:inspection-failed"

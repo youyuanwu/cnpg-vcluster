@@ -45,6 +45,9 @@ source "${LAB_ROOT}/config/versions.env"
 # shellcheck disable=SC1091
 source "${LAB_ROOT}/config/settings.env"
 
+ETCD_INSPECTOR_NAME="${LAB_PREFIX}-etcd-inspector"
+ETCD_INSPECTOR_MANIFEST="${RUNTIME_DIR}/rendered/etcd-inspector.json"
+
 export PATH="${BIN_DIR}:${PATH}"
 export TMPDIR="${TOOLS_TMP_DIR}"
 
