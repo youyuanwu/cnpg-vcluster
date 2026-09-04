@@ -1,0 +1,72 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+default:
+    @just --list
+
+# Install and verify lab-local tools and immutable upstream inputs.
+tools:
+    @scripts/tools.sh
+
+# Validate the host and prepared inputs without creating lab infrastructure.
+preflight:
+    @scripts/preflight.sh
+
+# Record and raise only the runtime inotify limits required by this lab.
+prepare-host:
+    @scripts/prepare-host.sh
+
+# Create or reconcile only the management plane.
+create-management:
+    @scripts/create-management.sh
+
+# Run the ephemeral worker compatibility gate and always remove spike state.
+spike:
+    @scripts/create-spike.sh
+
+# Remove only residual compatibility-spike resources.
+destroy-spike:
+    @scripts/destroy-spike.sh
+
+# Reconcile both tenant control planes, workers, add-ons, storage, and CNPG.
+create:
+    @scripts/create.sh
+
+# Explicitly repair one owned incomplete or drifted tenant without auto-adoption.
+repair tenant:
+    @scripts/repair-tenant.sh "{{tenant}}"
+
+# Report read-only summarized state.
+status:
+    @scripts/status.sh
+
+# Report read-only detailed state for all, management, spike, or a tenant.
+diagnose scope="all":
+    @scripts/diagnose.sh "{{scope}}"
+
+# Verify topology, tenant identity, SQL separation, restart, and failover.
+verify:
+    @scripts/verify.sh
+
+# Destroy one tenant and verify the survivor.
+destroy-tenant tenant:
+    @scripts/destroy-tenant.sh "{{tenant}}"
+
+# Destroy all owned lab resources and restore recorded host inotify values.
+destroy:
+    @scripts/destroy.sh
+
+# Run static invariants for the complete lab.
+test-static:
+    @scripts/test-static.sh
+
+# Prove both inotify admission gates reject before mutation.
+test-inotify-negative:
+    @scripts/test-inotify-negative.sh
+
+# Restart one tenant kube-proxy pod and prove the paused remediation survives.
+test-kube-proxy-restart tenant="tenant-a":
+    @scripts/test-kube-proxy-restart.sh "{{tenant}}"
+
+# Run the complete lifecycle and ownership test.
+test-e2e:
+    @scripts/test-e2e.sh
