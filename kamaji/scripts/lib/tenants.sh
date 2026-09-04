@@ -664,7 +664,8 @@ blocked_management_deployment_is_ready() {
     -o jsonpath='{.spec.replicas}' 2>/dev/null)" || return 1
   ready="$(management_kubectl -n "${namespace}" get "deployment/${name}" \
     -o jsonpath='{.status.readyReplicas}' 2>/dev/null)" || return 1
-  [[ -n "${desired}" && "${ready:-0}" -eq "${desired}" ]]
+  [[ -n "${desired}" && "${desired}" -gt 0 \
+    && "${ready:-0}" -eq "${desired}" ]]
 }
 
 blocked_management_daemonset_is_ready() {

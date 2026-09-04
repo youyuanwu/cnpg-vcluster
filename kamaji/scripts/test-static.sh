@@ -653,6 +653,15 @@ blocked_result_validation_fixtures() (
   blocked_result_is_current
 )
 
+blocked_management_rejects_zero_replicas() (
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/lib/tenants.sh"
+  management_kubectl() {
+    printf '0\n'
+  }
+  ! blocked_management_deployment_is_ready namespace deployment
+)
+
 exact_node_set_rejects_extra_node() (
   # shellcheck disable=SC1091
   source "${SCRIPT_DIR}/lib/workers.sh"
@@ -1034,6 +1043,8 @@ check "only compatibility paths can return blocked status" bash -c '
 ' _ "${LAB_ROOT}"
 check "blocked verification requires current consistent records and clean residuals" \
   blocked_result_validation_fixtures
+check "blocked management health rejects scaled-to-zero deployments" \
+  blocked_management_rejects_zero_replicas
 check "blocked residual inspection uses read-only datastore probes" bash -c '
   predicate="$(sed -n "/^blocked_residual_state_is_allowed()/,/^}/p" "$1/scripts/lib/tenants.sh")"
   grep -Fq "etcd_readonly_prefix_state" <<<"${predicate}" &&
