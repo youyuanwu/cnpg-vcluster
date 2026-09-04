@@ -759,10 +759,6 @@ blocked_residual_probe_state() {
   local injection
   while IFS= read -r injection; do
     case "${injection}" in
-      "${key}:absent")
-        printf 'absent\n'
-        return 0
-        ;;
       "${key}:present")
         printf 'present\n'
         return 0

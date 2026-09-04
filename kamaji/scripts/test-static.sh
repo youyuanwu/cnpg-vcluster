@@ -1047,10 +1047,12 @@ check "blocked management health rejects scaled-to-zero deployments" \
   blocked_management_rejects_zero_replicas
 check "blocked residual inspection uses read-only datastore probes" bash -c '
   predicate="$(sed -n "/^blocked_residual_state_is_allowed()/,/^}/p" "$1/scripts/lib/tenants.sh")"
+  injection="$(sed -n "/^blocked_residual_probe_state()/,/^}/p" "$1/scripts/lib/tenants.sh")"
   grep -Fq "etcd_readonly_prefix_state" <<<"${predicate}" &&
   grep -Fq "etcd_readonly_user_state" <<<"${predicate}" &&
   grep -Fq "etcd_readonly_role_state" <<<"${predicate}" &&
-  ! grep -Fq "etcd_maintenance" <<<"${predicate}"
+  ! grep -Fq "etcd_maintenance" <<<"${predicate}" &&
+  ! grep -Fq ":absent" <<<"${injection}"
 ' _ "${LAB_ROOT}"
 check "management provides a pinned read-only datastore inspector" bash -c '
   file="$1/scripts/lib/management.sh"
