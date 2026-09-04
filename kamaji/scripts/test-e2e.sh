@@ -354,15 +354,18 @@ assert_exact_blocked_residual_validation() {
     "spike kubeconfig remains"
   rm -rf "${SPIKE_RUNTIME_DIR}"
 
-  load_management_network
-  management_kubectl -n default create service clusterip "${vip_service}" \
-    --tcp=443:443 >/dev/null
-  management_kubectl -n default patch service "${vip_service}" --type=merge \
-    -p "{\"spec\":{\"externalIPs\":[\"${TENANT_A_VIP}\"]}}" >/dev/null
-  assert_blocked_residual_rejected vip-claim \
-    "borrowed tenant VIP ${TENANT_A_VIP} claim is present"
-  management_kubectl -n default delete service "${vip_service}" \
-    --wait=true --timeout="${KUBERNETES_DELETE_TIMEOUT}" >/dev/null
+  (
+    trap 'management_kubectl -n default delete service "${vip_service}" \
+      --ignore-not-found --wait=true --timeout="${SPIKE_DELETE_TIMEOUT}" \
+      >/dev/null 2>&1 || true' EXIT
+    load_management_network
+    management_kubectl -n default create service clusterip "${vip_service}" \
+      --tcp=443:443 >/dev/null
+    management_kubectl -n default patch service "${vip_service}" --type=merge \
+      -p "{\"spec\":{\"externalIPs\":[\"${TENANT_A_VIP}\"]}}" >/dev/null
+    assert_blocked_residual_rejected vip-claim \
+      "borrowed tenant VIP ${TENANT_A_VIP} claim is present"
+  )
 }
 
 assert_blocker_record_validation() {
