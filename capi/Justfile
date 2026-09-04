@@ -1,0 +1,70 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+default:
+    @just --list
+
+tools:
+    @python3 scripts/lab.py tools
+
+prepare-host:
+    @python3 scripts/lab.py prepare-host
+
+preflight:
+    @python3 scripts/lab.py preflight
+
+create-management:
+    @python3 scripts/lab.py unavailable create-management
+
+test-endpoint:
+    @python3 scripts/lab.py unavailable test-endpoint
+
+test-spike:
+    @python3 scripts/lab.py unavailable test-spike
+
+test-machines:
+    @python3 scripts/lab.py unavailable test-machines
+
+test-storage:
+    @python3 scripts/lab.py unavailable test-storage
+
+test-persistence:
+    @python3 scripts/lab.py unavailable test-persistence
+
+create:
+    @python3 scripts/lab.py unavailable create
+
+repair tenant:
+    @python3 scripts/lab.py unavailable repair "{{tenant}}"
+
+status:
+    @python3 scripts/lab.py unavailable status
+
+diagnose scope="all":
+    @python3 scripts/lab.py unavailable diagnose "{{scope}}"
+
+verify:
+    @python3 scripts/lab.py unavailable verify
+
+destroy-tenant tenant:
+    @python3 scripts/lab.py unavailable destroy-tenant "{{tenant}}"
+
+destroy:
+    @python3 scripts/lab.py unavailable destroy
+
+break-glass kind namespace name uid:
+    @python3 scripts/lab.py unavailable break-glass "{{kind}}" "{{namespace}}" "{{name}}" "{{uid}}"
+
+test-unit:
+    @python3 -m unittest discover -s tests -p "test_*.py"
+
+test-static:
+    @python3 scripts/test_static.py
+
+test-tenant-lifecycle:
+    @python3 scripts/lab.py unavailable test-tenant-lifecycle
+
+test-e2e:
+    @python3 scripts/lab.py unavailable test-e2e
+
+_restore-host:
+    @python3 scripts/lab.py restore-host
