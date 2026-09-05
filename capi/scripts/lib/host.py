@@ -5,12 +5,12 @@ import fcntl
 import os
 import shutil
 import stat
+import uuid
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
 
 from .config import parse_duration
-from .files import ensure_private_dir, has_owner_only_permissions, write_private_file
 from .process import run
 
 
@@ -49,47 +49,92 @@ def _state_path(root: Path) -> Path:
 
 
 @contextmanager
-def _host_lock(root: Path) -> Iterator[None]:
-    host_dir = root / ".runtime" / "host"
-    ensure_private_dir(host_dir)
-    lock_path = host_dir / ".lock"
+def _host_lock(root: Path) -> Iterator[int]:
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    root_fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | nofollow)
+    runtime_fd = -1
+    host_fd = -1
+    lock_fd = -1
     try:
-        descriptor = os.open(
-            lock_path,
-            os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
-            0o600,
+        runtime_fd = _open_private_directory(root_fd, ".runtime", root / ".runtime")
+        host_fd = _open_private_directory(
+            runtime_fd,
+            "host",
+            root / ".runtime" / "host",
         )
+        lock_fd = os.open(
+            ".lock",
+            os.O_CREAT | os.O_RDWR | nofollow,
+            0o600,
+            dir_fd=host_fd,
+        )
+        lock_stat = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_stat.st_mode) or lock_stat.st_uid != os.getuid():
+            raise HostError("host lock is not an owned regular file")
+        if lock_stat.st_mode & 0o077:
+            raise HostError("host lock permissions are broader than owner-only")
+        fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        yield host_fd
     except OSError as exc:
-        raise HostError(f"unable to open host lock {lock_path}: {exc}") from exc
-    try:
-        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
-            raise HostError(f"host lock is not a regular file: {lock_path}")
-        os.fchmod(descriptor, 0o600)
-        fcntl.flock(descriptor, fcntl.LOCK_EX)
-        yield
+        raise HostError(f"unable to open host state without following links: {exc}") from exc
     finally:
-        fcntl.flock(descriptor, fcntl.LOCK_UN)
-        os.close(descriptor)
-        if not _state_path(root).exists():
-            lock_path.unlink(missing_ok=True)
+        if lock_fd >= 0:
+            fcntl.flock(lock_fd, fcntl.LOCK_UN)
+            os.close(lock_fd)
+        remove_directories = host_fd >= 0 and not _entry_exists(host_fd, "inotify.json")
+        if remove_directories:
             try:
-                host_dir.rmdir()
-                host_dir.parent.rmdir()
+                os.unlink(".lock", dir_fd=host_fd)
             except OSError:
                 pass
+        if host_fd >= 0:
+            os.close(host_fd)
+        if remove_directories and runtime_fd >= 0:
+            try:
+                os.rmdir("host", dir_fd=runtime_fd)
+            except OSError:
+                pass
+        if runtime_fd >= 0:
+            os.close(runtime_fd)
+        if remove_directories:
+            try:
+                os.rmdir(".runtime", dir_fd=root_fd)
+            except OSError:
+                pass
+        os.close(root_fd)
 
 
-def _validate_state_record(path: Path, config: dict[str, str]) -> dict[str, int]:
-    if path.is_symlink() or not path.is_file():
-        raise HostError(f"host state record is not a regular file: {path}")
-    if not has_owner_only_permissions(path) or not has_owner_only_permissions(path.parent):
-        raise HostError(f"host state path is not owner-only: {path}")
-    if path.stat().st_uid != os.getuid() or path.parent.stat().st_uid != os.getuid():
-        raise HostError(f"host state path belongs to another user: {path}")
+def _open_private_directory(parent_fd: int, name: str, display: Path) -> int:
     try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
-        raise HostError(f"malformed host state record: {path}") from exc
+        os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+    except FileExistsError:
+        pass
+    descriptor = os.open(
+        name,
+        os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        dir_fd=parent_fd,
+    )
+    details = os.fstat(descriptor)
+    if not stat.S_ISDIR(details.st_mode) or details.st_uid != os.getuid():
+        os.close(descriptor)
+        raise HostError(f"private directory is not an owned directory: {display}")
+    if details.st_mode & 0o077:
+        os.close(descriptor)
+        raise HostError(f"private directory permissions are too broad: {display}")
+    return descriptor
+
+
+def _entry_exists(directory_fd: int, name: str) -> bool:
+    try:
+        os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        return True
+    except FileNotFoundError:
+        return False
+
+
+def _validate_state_payload(payload: object, config: dict[str, str], path: Path) -> dict[str, int]:
+    if not isinstance(payload, dict):
+        raise HostError(f"host state record is not an object: {path}")
     expected_keys = {
         "schema",
         "lab_prefix",
@@ -120,6 +165,64 @@ def _validate_state_record(path: Path, config: dict[str, str]) -> dict[str, int]
     return values
 
 
+def _read_state_record(directory_fd: int, path: Path, config: dict[str, str]) -> dict[str, int]:
+    try:
+        descriptor = os.open(
+            "inotify.json",
+            os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+            dir_fd=directory_fd,
+        )
+    except OSError as exc:
+        raise HostError(f"unable to open host state record safely: {path}: {exc}") from exc
+    try:
+        details = os.fstat(descriptor)
+        if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
+            raise HostError(f"host state record is not an owned regular file: {path}")
+        if details.st_mode & 0o077:
+            raise HostError(f"host state record permissions are too broad: {path}")
+        if details.st_size > 64 * 1024:
+            raise HostError(f"host state record is unexpectedly large: {path}")
+        with os.fdopen(descriptor, "r", encoding="utf-8") as handle:
+            descriptor = -1
+            payload = json.load(handle)
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HostError(f"malformed host state record: {path}") from exc
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+    return _validate_state_payload(payload, config, path)
+
+
+def _write_state_record(directory_fd: int, path: Path, payload: dict[str, object]) -> None:
+    temporary = f".inotify.{os.getpid()}.{uuid.uuid4().hex}"
+    descriptor = os.open(
+        temporary,
+        os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+        dir_fd=directory_fd,
+    )
+    try:
+        data = (json.dumps(payload, sort_keys=True) + "\n").encode("utf-8")
+        written = 0
+        while written < len(data):
+            written += os.write(descriptor, data[written:])
+        os.fsync(descriptor)
+        os.rename(
+            temporary,
+            "inotify.json",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+    except BaseException:
+        try:
+            os.unlink(temporary, dir_fd=directory_fd)
+        except OSError:
+            pass
+        raise
+    finally:
+        os.close(descriptor)
+
+
 def _apply_sysctl(root: Path, config: dict[str, str], name: str, value: int) -> None:
     timeout = parse_duration(config["COMMAND_TIMEOUT"])
     sudo = shutil.which("sudo")
@@ -147,10 +250,10 @@ def _apply_sysctl(root: Path, config: dict[str, str], name: str, value: int) -> 
 
 
 def prepare_inotify(root: Path, config: dict[str, str]) -> None:
-    with _host_lock(root):
+    with _host_lock(root) as host_fd:
         state_path = _state_path(root)
-        if state_path.exists() or state_path.is_symlink():
-            _validate_state_record(state_path, config)
+        if _entry_exists(host_fd, "inotify.json"):
+            _read_state_record(host_fd, state_path, config)
         else:
             state = {
                 "schema": HOST_STATE_SCHEMA,
@@ -160,8 +263,8 @@ def prepare_inotify(root: Path, config: dict[str, str]) -> None:
                 "max_user_instances": read_inotify("max_user_instances"),
                 "max_user_watches": read_inotify("max_user_watches"),
             }
-            write_private_file(state_path, json.dumps(state, sort_keys=True) + "\n")
-            _validate_state_record(state_path, config)
+            _write_state_record(host_fd, state_path, state)
+            _read_state_record(host_fd, state_path, config)
 
         floors = {
             "max_user_instances": int(config["MIN_INOTIFY_INSTANCES"]),
@@ -176,11 +279,11 @@ def prepare_inotify(root: Path, config: dict[str, str]) -> None:
 
 
 def restore_inotify(root: Path, config: dict[str, str]) -> None:
-    with _host_lock(root):
+    with _host_lock(root) as host_fd:
         state_path = _state_path(root)
-        if not state_path.exists() and not state_path.is_symlink():
+        if not _entry_exists(host_fd, "inotify.json"):
             return
-        originals = _validate_state_record(state_path, config)
+        originals = _read_state_record(host_fd, state_path, config)
 
         owned_workers = run(
             [
@@ -201,5 +304,5 @@ def restore_inotify(root: Path, config: dict[str, str]) -> None:
             _apply_sysctl(root, config, name, value)
             if read_inotify(name) != value:
                 raise HostError(f"failed to restore fs.inotify.{name}")
-        state_path.unlink()
+        os.unlink("inotify.json", dir_fd=host_fd)
         print("restored recorded host inotify values")

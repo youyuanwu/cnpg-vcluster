@@ -5,7 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Mapping, Sequence
 
-from .redaction import redact
+from .redaction import redact, redact_argv
 
 
 @dataclass
@@ -15,7 +15,7 @@ class CommandError(RuntimeError):
     output: str
 
     def __str__(self) -> str:
-        command = redact(" ".join(self.command))
+        command = redact_argv(self.command)
         return f"command failed ({self.returncode}): {command}\n{redact(self.output)}"
 
 

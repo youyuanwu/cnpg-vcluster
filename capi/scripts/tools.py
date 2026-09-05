@@ -176,17 +176,44 @@ def _verify_crd(
     conversion: str | None,
 ) -> str:
     document = _yaml_document(path, resource_name)
-    required = (
-        "kind: CustomResourceDefinition",
-        f"name: {storage_version}",
-        "served: true",
-        "storage: true",
-    )
-    for marker in required:
-        if marker not in document:
-            raise IntegrityError(f"{resource_name} is missing required marker {marker!r}")
+    if "kind: CustomResourceDefinition" not in document:
+        raise IntegrityError(f"{resource_name} is not a CustomResourceDefinition")
+    lines = document.splitlines()
+    try:
+        versions_index = next(
+            index for index, line in enumerate(lines) if line == "  versions:"
+        )
+    except StopIteration as exc:
+        raise IntegrityError(f"{resource_name} has no spec.versions list") from exc
+    version_items: list[list[str]] = []
+    current: list[str] | None = None
+    for line in lines[versions_index + 1 :]:
+        if line and len(line) - len(line.lstrip()) < 2:
+            break
+        if line.startswith("  - "):
+            current = [line]
+            version_items.append(current)
+        elif current is not None:
+            current.append(line)
+    matching = [
+        item
+        for item in version_items
+        if any(
+            line in (f"  - name: {storage_version}", f"    name: {storage_version}")
+            for line in item
+        )
+    ]
+    if len(matching) != 1:
+        raise IntegrityError(
+            f"{resource_name} has {len(matching)} {storage_version} version entries"
+        )
+    version = matching[0]
+    if "    served: true" not in version or "    storage: true" not in version:
+        raise IntegrityError(
+            f"{resource_name} version {storage_version} is not both served and storage"
+        )
     conversion_marker = f"strategy: {conversion}" if conversion else None
-    if conversion_marker and conversion_marker not in document:
+    if conversion_marker and f"    {conversion_marker}" not in lines:
         raise IntegrityError(
             f"{resource_name} does not declare conversion strategy {conversion}"
         )

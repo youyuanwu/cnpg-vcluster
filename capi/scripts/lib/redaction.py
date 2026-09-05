@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Sequence
 
 
 CLI_SECRET = re.compile(
@@ -8,6 +9,15 @@ CLI_SECRET = re.compile(
     r"client-certificate-data|certificate-authority-data|kubeadm-token))"
     r"(?:=|\s+)(?:\"[^\"]*\"|'[^']*'|\S+)"
 )
+CLI_SECRET_NAMES = {
+    "--token",
+    "--password",
+    "--pgpassword",
+    "--client-key-data",
+    "--client-certificate-data",
+    "--certificate-authority-data",
+    "--kubeadm-token",
+}
 
 PATTERNS = (
     re.compile(r"-----BEGIN [A-Z ]*PRIVATE KEY-----.*?-----END [A-Z ]*PRIVATE KEY-----", re.DOTALL),
@@ -25,3 +35,29 @@ def redact(value: str) -> str:
         else:
             result = pattern.sub("REDACTED", result)
     return result
+
+
+def redact_argv(arguments: Sequence[str]) -> str:
+    redacted: list[str] = []
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        lowered = argument.lower()
+        if lowered in CLI_SECRET_NAMES:
+            redacted.extend((argument, "REDACTED"))
+            index += 2
+            continue
+        matched_assignment = next(
+            (
+                name
+                for name in CLI_SECRET_NAMES
+                if lowered.startswith(f"{name}=")
+            ),
+            None,
+        )
+        if matched_assignment:
+            redacted.append(f"{argument.split('=', 1)[0]}=REDACTED")
+        else:
+            redacted.append(redact(argument))
+        index += 1
+    return " ".join(redacted)

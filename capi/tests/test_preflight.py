@@ -55,6 +55,17 @@ class PreflightTests(unittest.TestCase):
                 cid_path = Path(command[command.index("--cidfile") + 1])
                 cid_path.write_text("owned-probe-id\n", encoding="utf-8")
                 raise CommandError(tuple(command), 124, "timeout")
+            if len(command) > 1 and command[1] == "inspect":
+                return CompletedProcess(
+                    command,
+                    0,
+                    stdout=(
+                        '[{"Id":"owned-probe-id","Name":"/test-preflight-fixed",'
+                        '"Config":{"Labels":{"test.owner":"true",'
+                        '"cnpg-vcluster.capi/role":"probe"}}}]'
+                    ),
+                    stderr="",
+                )
             return CompletedProcess(command, 0, stdout="", stderr="")
 
         config = {
@@ -63,7 +74,43 @@ class PreflightTests(unittest.TestCase):
             "OWNERSHIP_LABEL": "test.owner",
             "VERIFY_IMAGE": "busybox:1.37.0@sha256:" + "0" * 64,
         }
-        with patch("scripts.preflight.run", side_effect=fake_run):
-            with self.assertRaises(PreflightError):
-                verify_privileged_probe(config)
+        with patch("scripts.preflight.uuid.uuid4") as generated_uuid:
+            generated_uuid.return_value.hex = "fixed"
+            with patch("scripts.preflight.run", side_effect=fake_run):
+                with self.assertRaises(PreflightError):
+                    verify_privileged_probe(config)
         self.assertIn(["docker", "rm", "-f", "owned-probe-id"], commands)
+
+    def test_probe_refuses_arbitrary_cidfile_identifier(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(command: list[str], **_: object) -> CompletedProcess[str]:
+            commands.append(command)
+            if len(command) > 1 and command[1] == "run":
+                cid_path = Path(command[command.index("--cidfile") + 1])
+                cid_path.write_text("foreign-id\n", encoding="utf-8")
+                raise CommandError(tuple(command), 124, "timeout")
+            if len(command) > 1 and command[1] == "inspect":
+                return CompletedProcess(
+                    command,
+                    0,
+                    stdout=(
+                        '[{"Id":"foreign-id","Name":"/foreign",'
+                        '"Config":{"Labels":{"foreign":"true"}}}]'
+                    ),
+                    stderr="",
+                )
+            return CompletedProcess(command, 0, stdout="", stderr="")
+
+        config = {
+            "PREFLIGHT_PROBE_TIMEOUT": "1s",
+            "LAB_PREFIX": "test",
+            "OWNERSHIP_LABEL": "test.owner",
+            "VERIFY_IMAGE": "busybox:1.37.0@sha256:" + "0" * 64,
+        }
+        with patch("scripts.preflight.uuid.uuid4") as generated_uuid:
+            generated_uuid.return_value.hex = "fixed"
+            with patch("scripts.preflight.run", side_effect=fake_run):
+                with self.assertRaises(PreflightError):
+                    verify_privileged_probe(config)
+        self.assertNotIn(["docker", "rm", "-f", "foreign-id"], commands)

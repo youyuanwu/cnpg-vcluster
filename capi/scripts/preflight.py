@@ -5,6 +5,7 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 
@@ -205,60 +206,73 @@ def verify_images(config: dict[str, str], timeout: int) -> None:
 def verify_privileged_probe(config: dict[str, str]) -> None:
     timeout = parse_duration(config["PREFLIGHT_PROBE_TIMEOUT"])
     name = f"{config['LAB_PREFIX']}-preflight-{uuid.uuid4().hex[:12]}"
-    cid_file = Path("/tmp") / f"{name}.cid"
     result = None
-    try:
-        result = run(
-            [
-                "docker",
-                "run",
-                "--rm",
-                "--cidfile",
-                str(cid_file),
-                "--name",
-                name,
-                "--label",
-                f"{config['OWNERSHIP_LABEL']}=true",
-                "--label",
-                "cnpg-vcluster.capi/role=probe",
-                "--privileged",
-                "--cgroupns=private",
-                "--network=none",
-                "--entrypoint",
-                "sh",
-                config["VERIFY_IMAGE"],
-                "-ec",
-                "test -r /proc/1/status && test -d /sys/fs/cgroup",
-            ],
-            timeout=timeout,
-            check=False,
-        )
-    except CommandError as exc:
-        raise PreflightError(f"privileged container probe failed: {exc}") from exc
-    finally:
-        identifier = cid_file.read_text(encoding="utf-8").strip() if cid_file.exists() else ""
-        cid_file.unlink(missing_ok=True)
-        if identifier:
-            run(["docker", "rm", "-f", identifier], timeout=30, check=False)
-        else:
+    with tempfile.TemporaryDirectory(prefix=f"{name}-") as temporary:
+        cid_file = Path(temporary) / "container.cid"
+        try:
+            result = run(
+                [
+                    "docker",
+                    "run",
+                    "--rm",
+                    "--cidfile",
+                    str(cid_file),
+                    "--name",
+                    name,
+                    "--label",
+                    f"{config['OWNERSHIP_LABEL']}=true",
+                    "--label",
+                    "cnpg-vcluster.capi/role=probe",
+                    "--privileged",
+                    "--cgroupns=private",
+                    "--network=none",
+                    "--entrypoint",
+                    "sh",
+                    config["VERIFY_IMAGE"],
+                    "-ec",
+                    "test -r /proc/1/status && test -d /sys/fs/cgroup",
+                ],
+                timeout=timeout,
+                check=False,
+            )
+        except CommandError as exc:
+            raise PreflightError(f"privileged container probe failed: {exc}") from exc
+        finally:
+            identifier = (
+                cid_file.read_text(encoding="utf-8").strip()
+                if cid_file.is_file()
+                else ""
+            )
+            candidate = identifier or name
             inspect = run(
-                ["docker", "inspect", name, "--format", "{{json .Config.Labels}}"],
+                ["docker", "inspect", candidate],
                 timeout=30,
                 check=False,
             )
             if inspect.returncode == 0:
-                labels = json.loads(inspect.stdout)
+                payload = json.loads(inspect.stdout)
+                if len(payload) != 1:
+                    raise PreflightError(f"unexpected probe inventory for {name}")
+                container = payload[0]
+                labels = container.get("Config", {}).get("Labels") or {}
                 if (
-                    labels.get(config["OWNERSHIP_LABEL"]) == "true"
-                    and labels.get("cnpg-vcluster.capi/role") == "probe"
+                    container.get("Name") != f"/{name}"
+                    or labels.get(config["OWNERSHIP_LABEL"]) != "true"
+                    or labels.get("cnpg-vcluster.capi/role") != "probe"
                 ):
-                    run(["docker", "rm", "-f", name], timeout=30, check=False)
-        remaining = run(
-            ["docker", "ps", "-aq", "--filter", f"name=^/{name}$"],
-            timeout=30,
-        ).stdout.strip()
-        if remaining:
-            raise PreflightError(f"privileged probe cleanup failed for {name}")
+                    raise PreflightError(
+                        f"refusing to remove unowned probe candidate {candidate}"
+                    )
+                run(
+                    ["docker", "rm", "-f", container["Id"]],
+                    timeout=30,
+                )
+            remaining = run(
+                ["docker", "ps", "-aq", "--filter", f"name=^/{name}$"],
+                timeout=30,
+            ).stdout.strip()
+            if remaining:
+                raise PreflightError(f"privileged probe cleanup failed for {name}")
     if result is None or result.returncode != 0:
         raise PreflightError("privileged container probe failed")
 

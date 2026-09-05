@@ -7,7 +7,12 @@ import os
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.lib.host import HostError, _validate_state_record, resolve_host_just
+from scripts.lib.host import (
+    HostError,
+    _read_state_record,
+    prepare_inotify,
+    resolve_host_just,
+)
 
 
 class HostTests(unittest.TestCase):
@@ -57,8 +62,12 @@ class HostTests(unittest.TestCase):
                 encoding="utf-8",
             )
             path.chmod(0o600)
-            with self.assertRaises(HostError):
-                _validate_state_record(path, config)
+            descriptor = os.open(host_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(HostError):
+                    _read_state_record(descriptor, path, config)
+            finally:
+                os.close(descriptor)
 
     def test_rejects_broad_inotify_record_permissions(self) -> None:
         config = {
@@ -83,5 +92,20 @@ class HostTests(unittest.TestCase):
                 encoding="utf-8",
             )
             path.chmod(0o644)
+            descriptor = os.open(host_dir, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with self.assertRaises(HostError):
+                    _read_state_record(descriptor, path, config)
+            finally:
+                os.close(descriptor)
+
+    def test_rejects_symlinked_runtime_parent(self) -> None:
+        config = {
+            "LAB_PREFIX": "expected",
+            "OWNERSHIP_LABEL": "expected.owner",
+        }
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as target:
+            root = Path(temporary)
+            (root / ".runtime").symlink_to(target, target_is_directory=True)
             with self.assertRaises(HostError):
-                _validate_state_record(path, config)
+                prepare_inotify(root, config)
