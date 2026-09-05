@@ -1,0 +1,62 @@
+replicaCount: 1
+
+image:
+  repository: clastix/kamaji
+  tag: 26.8.6-edge
+  pullPolicy: IfNotPresent
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+defaultDatastoreName: default
+kubeconfigGenerator:
+  enabled: false
+
+telemetry:
+  disabled: true
+
+kamaji-etcd:
+  deploy: true
+  fullnameOverride: kamaji-etcd
+  clusterDomain: cluster.local
+  replicas: 3
+  image:
+    repository: quay.io/coreos/etcd
+    tag: v3.5.17
+    pullPolicy: IfNotPresent
+  resources:
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 500m
+      memory: 512Mi
+  persistentVolumeClaim:
+    size: 1Gi
+    storageClassName: standard
+    retentionPolicyWhenDeleted: Delete
+  selfSignedCertificates:
+    enabled: false
+  certManager:
+    enabled: true
+    issuerRef:
+      name: kamaji-selfsigned-issuer
+      kind: Issuer
+      group: cert-manager.io
+  datastore:
+    enabled: true
+    name: default
+    headless: true
+  jobs:
+    kubectl:
+      image: clastix/kubectl
+      tag: v1.36
+    etcd:
+      image: quay.io/coreos/etcd
+      tag: v3.5.6
+      pullPolicy: IfNotPresent

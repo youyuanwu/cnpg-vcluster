@@ -12,7 +12,11 @@ from scripts.lib.config import ConfigError, load_configuration
 from scripts.lib.host import HostError, prepare_inotify, restore_inotify
 from scripts.lib.locking import tools_lock
 from scripts.lib.redaction import redact
+from scripts.create_management import create_management
+from scripts.destroy import destroy
+from scripts.diagnose import diagnose
 from scripts.preflight import PreflightError, run_preflight
+from scripts.status import status
 from scripts.tools import prepare_tools
 
 
@@ -42,6 +46,20 @@ def main(arguments: list[str]) -> int:
     if command == "preflight":
         with tools_lock(ROOT, exclusive=False):
             run_preflight(ROOT, config)
+        return 0
+    if command == "create-management":
+        with tools_lock(ROOT, exclusive=True):
+            create_management(ROOT, config)
+        return 0
+    if command == "status":
+        with tools_lock(ROOT, exclusive=False):
+            return status(ROOT, config)
+    if command == "diagnose":
+        with tools_lock(ROOT, exclusive=False):
+            return diagnose(ROOT, config, rest[0] if rest else "all")
+    if command == "destroy":
+        with tools_lock(ROOT, exclusive=True):
+            destroy(ROOT, config)
         return 0
     if command == "unavailable":
         return unavailable(rest)

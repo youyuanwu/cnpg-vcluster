@@ -15,9 +15,9 @@ prepare-host:
 preflight:
     @python3 scripts/lab.py preflight
 
-# [phase 2] Reconcile the management cluster and lifecycle controllers.
+# [implemented] Reconcile the management cluster and lifecycle controllers.
 create-management:
-    @python3 scripts/lab.py unavailable create-management
+    @python3 scripts/lab.py create-management
 
 # [phase 3] Prove authoritative endpoint and worker registration.
 test-endpoint:
@@ -47,13 +47,13 @@ create:
 repair tenant:
     @python3 scripts/lab.py unavailable repair "{{tenant}}"
 
-# [phase 2] Report read-only summarized state.
+# [implemented] Report read-only summarized state.
 status:
-    @python3 scripts/lab.py unavailable status
+    @python3 scripts/lab.py status
 
-# [phase 2] Report read-only scoped diagnostics.
+# [implemented] Report read-only scoped diagnostics.
 diagnose scope="all":
-    @python3 scripts/lab.py unavailable diagnose "{{scope}}"
+    @python3 scripts/lab.py diagnose "{{scope}}"
 
 # [phase 8] Verify tenant isolation and database behavior.
 verify:
@@ -63,9 +63,9 @@ verify:
 destroy-tenant tenant:
     @python3 scripts/lab.py unavailable destroy-tenant "{{tenant}}"
 
-# [phase 10] Delete all exactly owned experiment resources.
+# [implemented through phase 2] Delete exactly owned management resources.
 destroy:
-    @python3 scripts/lab.py unavailable destroy
+    @python3 scripts/lab.py destroy
 
 # [phase 10] Remove one exact stuck finalizer after UID confirmation.
 break-glass kind namespace name uid:
@@ -78,6 +78,10 @@ test-unit:
 # [implemented] Run source and repository-boundary checks.
 test-static:
     @python3 scripts/test_static.py
+
+# [implemented] Exercise the management-only lifecycle.
+test-management:
+    @python3 scripts/test_management.py
 
 # [phase 9] Exercise tenant repair and targeted deletion.
 test-tenant-lifecycle:

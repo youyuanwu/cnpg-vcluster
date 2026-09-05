@@ -33,6 +33,7 @@ EXPECTED_RECIPES = {
     "break-glass",
     "test-unit",
     "test-static",
+    "test-management",
     "test-tenant-lifecycle",
     "test-e2e",
 }
@@ -69,7 +70,7 @@ def check_recipes() -> None:
     }
     check(EXPECTED_RECIPES <= recipes, f"missing recipes: {sorted(EXPECTED_RECIPES - recipes)}")
     check("[implemented]" in result.stdout, "task list does not mark implemented recipes")
-    check("[phase 2]" in result.stdout, "task list does not mark future blocked recipes")
+    check("[phase " in result.stdout, "task list does not mark future blocked recipes")
     unavailable = output(
         "python3",
         "scripts/lab.py",
@@ -98,6 +99,14 @@ def check_configuration() -> None:
         check(f"{prefix}_SHA256" in config, f"{key} lacks SHA-256")
     check(config["CAPI_CONTRACT"] == "v1beta2", "CAPI contract must be v1beta2")
     check(config["KAMAJI_CAPI_CONTRACT"] == "v1beta2", "Kamaji provider contract must be v1beta2")
+    for key in (
+        "VIP_POOL_START_OFFSET_FROM_BROADCAST",
+        "VIP_POOL_END_OFFSET_FROM_BROADCAST",
+        "TENANT_A_API_VIP_SLOT",
+        "TENANT_B_API_VIP_SLOT",
+        "SPIKE_API_VIP_SLOT",
+    ):
+        check(key in config, f"missing VIP configuration {key}")
 
 
 def check_repository_boundaries() -> None:
@@ -109,6 +118,15 @@ def check_repository_boundaries() -> None:
         result = output("git", "check-ignore", candidate, check_result=False)
         check(result.returncode == 0, f"{candidate} is not ignored")
     check(not any(path.is_symlink() for path in ROOT.rglob("*")), "symlinks below capi are forbidden")
+    check((ROOT / "scripts" / "post_renderer.py").stat().st_mode & 0o111 != 0, "post-renderer is not executable")
+    repository = ROOT.parent
+    for path in ("Makefile", "kamaji", "vcluster"):
+        result = subprocess.run(
+            ["git", "diff", "--quiet", "main", "--", path],
+            cwd=repository,
+            check=False,
+        )
+        check(result.returncode == 0, f"baseline path changed during CAPI work: {path}")
     production = [
         ROOT / "Justfile",
         *(ROOT / "config").glob("*"),

@@ -1,0 +1,9 @@
+{
+  "dynamicInfrastructureClusters": [],
+  "featureGates": {
+    "DynamicInfrastructureClusterPatch": false,
+    "ExternalClusterReference": false,
+    "ExternalClusterReferenceCrossNamespace": false,
+    "SkipInfraClusterPatch": true
+  }
+}

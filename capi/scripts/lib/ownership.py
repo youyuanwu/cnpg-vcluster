@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -36,6 +38,14 @@ class IdentityRecord:
 
     @classmethod
     def load(cls, path: Path) -> "IdentityRecord":
+        details = path.lstat()
+        if (
+            stat.S_ISLNK(details.st_mode)
+            or not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise OwnershipError(f"ownership record is not an owner-only regular file: {path}")
         try:
             payload = json.loads(path.read_text(encoding="utf-8"))
             return cls(
