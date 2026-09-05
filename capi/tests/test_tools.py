@@ -5,7 +5,9 @@ import unittest
 from pathlib import Path
 
 from scripts.lib.files import IntegrityError
-from scripts.tools import _verify_crd
+from scripts.tools import _verify_crd, _verify_tag
+from subprocess import CompletedProcess
+from unittest.mock import patch
 
 
 class ToolSchemaTests(unittest.TestCase):
@@ -36,6 +38,19 @@ spec:
                     "v1beta2",
                     conversion="Webhook",
                 )
+
+    def test_annotated_tag_requires_peeled_source_commit(self) -> None:
+        output = (
+                "tag-object refs/tags/v1.2.3\n"
+                "source-commit refs/tags/v1.2.3^{}\n"
+        )
+        with patch(
+                "scripts.tools.run",
+                return_value=CompletedProcess([], 0, stdout=output, stderr=""),
+        ):
+                _verify_tag("https://example.invalid/repo.git", "v1.2.3", "source-commit", 1)
+                with self.assertRaises(IntegrityError):
+                    _verify_tag("https://example.invalid/repo.git", "v1.2.3", "tag-object", 1)
 
     def test_accepts_requested_served_storage_version(self) -> None:
         manifest = """\

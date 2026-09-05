@@ -138,10 +138,19 @@ def _verify_tag(repository: str, tag: str, expected_commit: str, timeout: int) -
         ["git", "ls-remote", repository, f"refs/tags/{tag}", f"refs/tags/{tag}^{{}}"],
         timeout=timeout,
     )
-    commits = {line.split()[0] for line in result.stdout.splitlines() if line.strip()}
-    if expected_commit not in commits:
+    references = {
+        reference: commit
+        for line in result.stdout.splitlines()
+        if line.strip()
+        for commit, reference in [line.split()]
+    }
+    actual_commit = references.get(f"refs/tags/{tag}^{{}}") or references.get(
+        f"refs/tags/{tag}"
+    )
+    if actual_commit != expected_commit:
         raise IntegrityError(
-            f"tag {tag} from {repository} did not resolve to expected commit {expected_commit}"
+            f"tag {tag} from {repository} resolved to {actual_commit}, "
+            f"expected source commit {expected_commit}"
         )
 
 
