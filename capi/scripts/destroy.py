@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import re
 import shutil
 import stat
 from pathlib import Path
@@ -18,6 +19,7 @@ from scripts.lib.management import (
     validate_management_kubeconfig,
 )
 from scripts.lib.providers import delete_providers
+from scripts.lib.tenants import delete_tenant, spike_tenant
 
 
 def _validate_runtime_inventory(root: Path) -> None:
@@ -39,6 +41,18 @@ def _validate_runtime_inventory(root: Path) -> None:
         "rendered/providers/capd-components.yaml",
         "rendered/providers/kamaji-capi-components.yaml",
     }
+    allowed_dynamic = (
+        re.compile(
+            r"^rendered/tenants/(capi-worker-spike|tenant-a|tenant-b)/"
+            r"(control-plane|workers|worker-templates|worker-deployment|"
+            r"invalid-control-plane|invalid-worker)\.yaml$"
+        ),
+        re.compile(r"^tenants/(capi-worker-spike|tenant-a|tenant-b)/kubeconfig$"),
+        re.compile(
+            r"^storage/(spike|tenant-a|tenant-b)/\.capi-owner\.json$"
+        ),
+        re.compile(r"^evidence/endpoint-failure\.txt$"),
+    )
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
         details = path.lstat()
@@ -48,7 +62,9 @@ def _validate_runtime_inventory(root: Path) -> None:
             if details.st_uid != os.getuid() or details.st_mode & 0o077:
                 raise RuntimeError(f"runtime directory is not private: {relative}")
             continue
-        if relative not in allowed_files:
+        if relative not in allowed_files and not any(
+            pattern.fullmatch(relative) for pattern in allowed_dynamic
+        ):
             raise RuntimeError(f"unexpected runtime file blocks cleanup: {relative}")
         if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
             raise RuntimeError(f"runtime file is not an owned regular file: {relative}")
@@ -152,7 +168,9 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         validate_management_kubeconfig(root, config)
         if not status.get("apiReady"):
             raise RuntimeError("owned management API is not reachable; refusing partial cleanup")
-        _delete_kubernetes_stack(root, config, ManagementClient(root, config))
+        client = ManagementClient(root, config)
+        delete_tenant(root, config, client, spike_tenant(root, config))
+        _delete_kubernetes_stack(root, config, client)
         delete_management(root, config)
     restore_inotify(root, config)
     runtime = root / ".runtime"

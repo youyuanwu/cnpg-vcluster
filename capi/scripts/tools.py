@@ -46,6 +46,26 @@ EXPECTED_MANIFEST_IMAGES = {
     "kamaji-capi-components.yaml": "KAMAJI_CAPI_IMAGE_TAGGED",
 }
 
+AUTHORED_INPUTS = (
+    ("config/kind.yaml", "KIND_CONFIG_SHA256"),
+    ("manifests/management/kamaji-values.yaml", "KAMAJI_VALUES_SHA256"),
+    ("manifests/management/metallb-pool.yaml.tpl", "METALLB_POOL_TEMPLATE_SHA256"),
+    (
+        "manifests/management/kamaji-provider-settings.json",
+        "KAMAJI_PROVIDER_SETTINGS_SHA256",
+    ),
+    ("manifests/management/cabpk-kamaji-rbac.yaml", "CABPK_KAMAJI_RBAC_SHA256"),
+    (
+        "manifests/tenants/base/control-plane.yaml.tpl",
+        "CAPI_CONTROL_PLANE_TEMPLATE_SHA256",
+    ),
+    (
+        "manifests/tenants/base/workers.yaml.tpl",
+        "CAPI_WORKER_TEMPLATE_SHA256",
+    ),
+    ("manifests/tenants/base/bootstrap-rbac.yaml", "CAPI_BOOTSTRAP_RBAC_SHA256"),
+)
+
 TAG_SOURCES = (
     ("https://github.com/kubernetes-sigs/cluster-api.git", "CAPI_VERSION", "CAPI_TAG_COMMIT"),
     (
@@ -349,6 +369,8 @@ def verify_all_inputs(root: Path, config: dict[str, str]) -> None:
                 f"{filename} does not contain exactly one {config[image_key]} image"
             )
     _verify_provider_schemas(inputs_dir)
+    for relative, checksum_key in AUTHORED_INPUTS:
+        verify_sha256(root / relative, config[checksum_key])
 
 
 def prepare_tools(root: Path, config: dict[str, str]) -> None:

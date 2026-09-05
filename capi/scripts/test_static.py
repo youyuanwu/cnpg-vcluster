@@ -19,6 +19,7 @@ EXPECTED_RECIPES = {
     "preflight",
     "create-management",
     "test-endpoint",
+    "test-endpoint-negative",
     "test-spike",
     "test-machines",
     "test-storage",

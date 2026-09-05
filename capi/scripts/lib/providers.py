@@ -290,6 +290,24 @@ def reconcile_providers(root: Path, config: dict[str, str], client: ManagementCl
             str(manifest),
         )
         _wait_provider(client, config, provider)
+    client.kubectl(
+        "apply",
+        "--server-side",
+        "--field-manager=capi-kamaji-lab",
+        "--force-conflicts",
+        "-f",
+        str(root / "manifests" / "management" / "cabpk-kamaji-rbac.yaml"),
+    )
+    authorization = client.kubectl(
+        "auth",
+        "can-i",
+        "get",
+        "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
+        "--all-namespaces",
+        "--as=system:serviceaccount:capi-kubeadm-bootstrap-system:capi-kubeadm-bootstrap-manager",
+    ).stdout.strip()
+    if authorization != "yes":
+        raise RuntimeError("CABPK cannot read KamajiControlPlane resources")
     _verify_kamaji_provider_flags(client, config)
 
 
@@ -414,6 +432,13 @@ def provider_status(config: dict[str, str], client: ManagementClient) -> list[di
 
 
 def delete_providers(root: Path, config: dict[str, str], client: ManagementClient) -> None:
+    client.kubectl(
+        "delete",
+        "-f",
+        str(root / "manifests" / "management" / "cabpk-kamaji-rbac.yaml"),
+        "--ignore-not-found",
+        check=False,
+    )
     render_providers(root, config)
     for provider in reversed(PROVIDERS):
         _, manifest = _provider_paths(root, provider)

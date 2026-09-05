@@ -19,9 +19,13 @@ preflight:
 create-management:
     @python3 scripts/lab.py create-management
 
-# [phase 3] Prove authoritative endpoint and worker registration.
+# [implemented] Prove authoritative endpoint and worker registration.
 test-endpoint:
-    @python3 scripts/lab.py unavailable test-endpoint
+    @python3 scripts/lab.py test-endpoint
+
+# [implemented] Prove CAPD ownership and same-name collision semantics.
+test-endpoint-negative:
+    @python3 scripts/test_endpoint_negative.py
 
 # [phase 4] Prove networking and one Ready worker.
 test-spike:
