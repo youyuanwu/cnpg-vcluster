@@ -259,6 +259,24 @@ def _verify_kamaji_provider_flags(client: ManagementClient, config: dict[str, st
         raise RuntimeError("Kamaji provider live CAPI contract label mismatch")
 
 
+def _feature_gates(arguments: list[str]) -> dict[str, bool]:
+    feature_argument = next(
+        (argument for argument in arguments if argument.startswith("--feature-gates=")),
+        "",
+    )
+    if not feature_argument:
+        return {}
+    result: dict[str, bool] = {}
+    for assignment in feature_argument.removeprefix("--feature-gates=").split(","):
+        if "=" not in assignment:
+            return {}
+        name, value = assignment.split("=", 1)
+        if value not in {"true", "false"}:
+            return {}
+        result[name] = value == "true"
+    return result
+
+
 def reconcile_providers(root: Path, config: dict[str, str], client: ManagementClient) -> None:
     render_providers(root, config)
     for provider in PROVIDERS:
@@ -304,6 +322,7 @@ def provider_status(config: dict[str, str], client: ManagementClient) -> list[di
         available = payload.get("status", {}).get("availableReplicas", 0)
         image = payload["spec"]["template"]["spec"]["containers"][0]["image"]
         configuration_ready = True
+        observed_feature_gates: dict[str, bool] = {}
         crds_ready = True
         crd_details: list[dict[str, object]] = []
         for crd_name in provider.crds:
@@ -356,14 +375,16 @@ def provider_status(config: dict[str, str], client: ManagementClient) -> list[di
             )
             webhook_ready = endpoint.returncode == 0 and bool(endpoint.stdout)
         if provider.name == "kamaji-control-plane":
-            arguments = " ".join(
-                payload["spec"]["template"]["spec"]["containers"][0].get("args", [])
+            arguments = payload["spec"]["template"]["spec"]["containers"][0].get(
+                "args", []
             )
-            configuration_ready = (
-                "DynamicInfrastructureClusterPatch=false" in arguments
-                and "SkipInfraClusterPatch=true" in arguments
-                and "DevCluster" not in arguments
-            )
+            observed_feature_gates = _feature_gates(arguments)
+            configuration_ready = observed_feature_gates == {
+                "DynamicInfrastructureClusterPatch": False,
+                "ExternalClusterReference": False,
+                "ExternalClusterReferenceCrossNamespace": False,
+                "SkipInfraClusterPatch": True,
+            } and all("DevCluster" not in argument for argument in arguments)
         result.append(
             {
                 "name": provider.name,
@@ -383,10 +404,7 @@ def provider_status(config: dict[str, str], client: ManagementClient) -> list[di
                 "crds": crd_details,
                 "webhookReady": webhook_ready,
                 "featureGates": (
-                    {
-                        "DynamicInfrastructureClusterPatch": False,
-                        "SkipInfraClusterPatch": True,
-                    }
+                    observed_feature_gates
                     if provider.name == "kamaji-control-plane"
                     else {}
                 ),

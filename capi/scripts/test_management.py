@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import uuid
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -181,6 +182,17 @@ def main() -> int:
         run_just(ROOT, config, "create-management")
         if fingerprint(ROOT, config) != first:
             raise RuntimeError("repeated management creation changed stable identities")
+        with ThreadPoolExecutor(max_workers=2) as executor:
+            results = list(
+                executor.map(
+                    lambda _: run_just(ROOT, config, "create-management"),
+                    range(2),
+                )
+            )
+        if any(result.returncode != 0 for result in results):
+            raise RuntimeError("concurrent management reconciliation failed")
+        if fingerprint(ROOT, config) != first:
+            raise RuntimeError("concurrent management reconciliation changed identities")
         assert_input_tamper_rejected(
             ROOT,
             config,
@@ -198,6 +210,15 @@ def main() -> int:
         ]
         if broad_chart_files:
             raise RuntimeError(f"Kamaji chart files are not owner-only: {broad_chart_files}")
+        broad_chart_directories = [
+            path
+            for path in (ROOT / ".tools" / "charts" / "kamaji").rglob("*")
+            if path.is_dir() and path.stat().st_mode & 0o077
+        ]
+        if broad_chart_directories:
+            raise RuntimeError(
+                f"Kamaji chart directories are not owner-only: {broad_chart_directories}"
+            )
 
         if run_just(ROOT, config, "status", check=False).returncode != 0:
             raise RuntimeError("healthy management status was nonzero")
@@ -207,6 +228,52 @@ def main() -> int:
             raise RuntimeError("status or diagnostics mutated management state")
 
         client = ManagementClient(ROOT, config)
+        deployment = json.loads(
+            client.kubectl(
+                "-n",
+                config["KAMAJI_CAPI_NAMESPACE"],
+                "get",
+                "deployment/capi-kamaji-controller-manager",
+                "-o",
+                "json",
+            ).stdout
+        )
+        arguments = deployment["spec"]["template"]["spec"]["containers"][0]["args"]
+        gate_index = next(
+            index
+            for index, argument in enumerate(arguments)
+            if argument.startswith("--feature-gates=")
+        )
+        drifted_gate = arguments[gate_index].replace(
+            "ExternalClusterReference=false",
+            "ExternalClusterReference=true",
+        )
+        client.kubectl(
+            "-n",
+            config["KAMAJI_CAPI_NAMESPACE"],
+            "patch",
+            "deployment/capi-kamaji-controller-manager",
+            "--type=json",
+            "-p",
+            json.dumps(
+                [
+                    {
+                        "op": "replace",
+                        "path": f"/spec/template/spec/containers/0/args/{gate_index}",
+                        "value": drifted_gate,
+                    }
+                ]
+            ),
+        )
+        if run_just(ROOT, config, "status", check=False).returncode == 0:
+            raise RuntimeError("status accepted drifted Kamaji feature gates")
+        if (
+            run_just(ROOT, config, "diagnose", "management", check=False).returncode
+            == 0
+        ):
+            raise RuntimeError("diagnostics accepted drifted Kamaji feature gates")
+        run_just(ROOT, config, "create-management")
+
         client.kubectl(
             "-n",
             config["CAPD_NAMESPACE"],

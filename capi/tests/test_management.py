@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from scripts.lib.management import _observed_identity
-from scripts.lib.providers import PROVIDERS
+from scripts.lib.providers import PROVIDERS, _feature_gates
 
 
 class ManagementTests(unittest.TestCase):
@@ -48,4 +48,24 @@ class ManagementTests(unittest.TestCase):
         self.assertEqual(
             settings["featureGates"]["DynamicInfrastructureClusterPatch"],
             False,
+        )
+
+    def test_feature_gate_parser_reports_all_observed_values(self) -> None:
+        observed = _feature_gates(
+            [
+                "--leader-elect",
+                "--feature-gates=DynamicInfrastructureClusterPatch=false,"
+                "ExternalClusterReference=true,"
+                "ExternalClusterReferenceCrossNamespace=false,"
+                "SkipInfraClusterPatch=true",
+            ]
+        )
+        self.assertEqual(
+            observed,
+            {
+                "DynamicInfrastructureClusterPatch": False,
+                "ExternalClusterReference": True,
+                "ExternalClusterReferenceCrossNamespace": False,
+                "SkipInfraClusterPatch": True,
+            },
         )
