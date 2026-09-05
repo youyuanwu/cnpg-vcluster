@@ -278,6 +278,12 @@ def prepare_inotify(root: Path, config: dict[str, str]) -> None:
         print(f"host inotify values prepared; originals recorded in {state_path}")
 
 
+def validate_inotify_state(root: Path, config: dict[str, str]) -> None:
+    with _host_lock(root) as host_fd:
+        if _entry_exists(host_fd, "inotify.json"):
+            _read_state_record(host_fd, _state_path(root), config)
+
+
 def restore_inotify(root: Path, config: dict[str, str]) -> None:
     with _host_lock(root) as host_fd:
         state_path = _state_path(root)
@@ -299,6 +305,21 @@ def restore_inotify(root: Path, config: dict[str, str]) -> None:
         ).stdout.split()
         if owned_workers:
             raise HostError("cannot restore host inotify values while owned workers exist")
+        management_name = f"{config['KIND_CLUSTER_NAME']}-control-plane"
+        management = run(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                f"name=^/{management_name}$",
+            ],
+            timeout=30,
+        ).stdout.split()
+        if management or (root / ".runtime" / "management" / "identity.json").exists():
+            raise HostError(
+                "cannot restore host inotify values while management state exists"
+            )
 
         for name, value in originals.items():
             _apply_sysctl(root, config, name, value)

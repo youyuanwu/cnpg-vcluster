@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 
 from scripts.lib.kube import ManagementClient
-from scripts.status import collect_status
+from scripts.status import collect_status, status_healthy
 
 
 def diagnose(root: Path, config: dict[str, str], scope: str) -> int:
@@ -25,4 +25,4 @@ def diagnose(root: Path, config: dict[str, str], scope: str) -> int:
         print(response.stdout)
         if response.stderr:
             print(response.stderr)
-    return 0
+    return 0 if status_healthy(result) else 1

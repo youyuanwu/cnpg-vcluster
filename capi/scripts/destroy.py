@@ -5,7 +5,7 @@ import shutil
 import stat
 from pathlib import Path
 
-from scripts.lib.host import restore_inotify
+from scripts.lib.host import restore_inotify, validate_inotify_state
 from scripts.lib.kube import ManagementClient
 from scripts.lib.management import (
     _render_cert_manager,
@@ -141,6 +141,7 @@ def _delete_kubernetes_stack(root: Path, config: dict[str, str], client: Managem
 
 def destroy(root: Path, config: dict[str, str]) -> None:
     _validate_runtime_inventory(root)
+    validate_inotify_state(root, config)
     status = management_status(root, config)
     any_management = any(
         status.get(key)

@@ -114,3 +114,35 @@ class PreflightTests(unittest.TestCase):
                 with self.assertRaises(PreflightError):
                     verify_privileged_probe(config)
         self.assertNotIn(["docker", "rm", "-f", "foreign-id"], commands)
+
+    def test_probe_refuses_foreign_same_name_container(self) -> None:
+        commands: list[list[str]] = []
+
+        def fake_run(command: list[str], **_: object) -> CompletedProcess[str]:
+            commands.append(command)
+            if len(command) > 1 and command[1] == "run":
+                return CompletedProcess(command, 125, stdout="", stderr="name conflict")
+            if len(command) > 1 and command[1] == "inspect":
+                return CompletedProcess(
+                    command,
+                    0,
+                    stdout=(
+                        '[{"Id":"foreign-id","Name":"/test-preflight-fixed",'
+                        '"Config":{"Labels":{"foreign":"true"}}}]'
+                    ),
+                    stderr="",
+                )
+            return CompletedProcess(command, 0, stdout="foreign-id\n", stderr="")
+
+        config = {
+            "PREFLIGHT_PROBE_TIMEOUT": "1s",
+            "LAB_PREFIX": "test",
+            "OWNERSHIP_LABEL": "test.owner",
+            "VERIFY_IMAGE": "busybox:1.37.0@sha256:" + "0" * 64,
+        }
+        with patch("scripts.preflight.uuid.uuid4") as generated_uuid:
+            generated_uuid.return_value.hex = "fixed"
+            with patch("scripts.preflight.run", side_effect=fake_run):
+                with self.assertRaises(PreflightError):
+                    verify_privileged_probe(config)
+        self.assertNotIn(["docker", "rm", "-f", "foreign-id"], commands)

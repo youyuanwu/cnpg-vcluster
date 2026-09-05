@@ -79,6 +79,29 @@ def fingerprint(root: Path, config: dict[str, str]) -> str:
     ).hexdigest()
 
 
+def assert_input_tamper_rejected(
+    root: Path,
+    config: dict[str, str],
+    path: Path,
+) -> None:
+    original = path.read_bytes()
+    original_mode = path.stat().st_mode & 0o777
+    before = fingerprint(root, config)
+    try:
+        path.write_bytes(original + b"\ntampered\n")
+        path.chmod(original_mode)
+        rejected = run_just(root, config, "create-management", check=False)
+        if rejected.returncode == 0 or "SHA-256 mismatch" not in (
+            rejected.stdout + rejected.stderr
+        ):
+            raise RuntimeError(f"tampered management input was accepted: {path.name}")
+        if fingerprint(root, config) != before:
+            raise RuntimeError(f"tampered management input changed live state: {path.name}")
+    finally:
+        path.write_bytes(original)
+        path.chmod(original_mode)
+
+
 def main() -> int:
     os.umask(0o077)
     config = load_configuration(ROOT)
@@ -148,9 +171,33 @@ def main() -> int:
         run_just(ROOT, config, "preflight")
         run_just(ROOT, config, "create-management")
         first = fingerprint(ROOT, config)
+        restore_live = run_just(ROOT, config, "_restore-host", check=False)
+        if restore_live.returncode == 0 or "management state exists" not in (
+            restore_live.stdout + restore_live.stderr
+        ):
+            raise RuntimeError("host restoration was allowed with live management state")
+        if not (ROOT / ".runtime" / "host" / "inotify.json").is_file():
+            raise RuntimeError("refused host restoration removed its state record")
         run_just(ROOT, config, "create-management")
         if fingerprint(ROOT, config) != first:
             raise RuntimeError("repeated management creation changed stable identities")
+        assert_input_tamper_rejected(
+            ROOT,
+            config,
+            ROOT / ".tools" / "inputs" / f"cert-manager-{config['CERT_MANAGER_VERSION']}.tgz",
+        )
+        assert_input_tamper_rejected(
+            ROOT,
+            config,
+            ROOT / ".tools" / "inputs" / "metallb-native.yaml",
+        )
+        broad_chart_files = [
+            path
+            for path in (ROOT / ".tools" / "charts" / "kamaji").rglob("*")
+            if path.is_file() and path.stat().st_mode & 0o077
+        ]
+        if broad_chart_files:
+            raise RuntimeError(f"Kamaji chart files are not owner-only: {broad_chart_files}")
 
         if run_just(ROOT, config, "status", check=False).returncode != 0:
             raise RuntimeError("healthy management status was nonzero")
@@ -163,12 +210,34 @@ def main() -> int:
         client.kubectl(
             "-n",
             config["CAPD_NAMESPACE"],
+            "set",
+            "image",
+            "deployment/capd-controller-manager",
+            f"manager={config['VERIFY_IMAGE']}",
+        )
+        if run_just(ROOT, config, "status", check=False).returncode == 0:
+            raise RuntimeError("status accepted a drifted provider image")
+        if (
+            run_just(ROOT, config, "diagnose", "management", check=False).returncode
+            == 0
+        ):
+            raise RuntimeError("diagnostics accepted a drifted provider image")
+        run_just(ROOT, config, "create-management")
+
+        client.kubectl(
+            "-n",
+            config["CAPD_NAMESPACE"],
             "scale",
             "deployment/capd-controller-manager",
             "--replicas=0",
         )
         if run_just(ROOT, config, "status", check=False).returncode == 0:
             raise RuntimeError("status accepted an unavailable required controller")
+        if (
+            run_just(ROOT, config, "diagnose", "management", check=False).returncode
+            == 0
+        ):
+            raise RuntimeError("diagnostics accepted an unavailable required controller")
         client.kubectl(
             "-n",
             config["CAPD_NAMESPACE"],
@@ -184,6 +253,16 @@ def main() -> int:
             "deployment/capd-controller-manager",
             f"--timeout={config['PROVIDER_TIMEOUT']}",
         )
+        client.kubectl(
+            "-n",
+            config["CAPD_NAMESPACE"],
+            "delete",
+            "deployment/capd-controller-manager",
+            "--wait=true",
+        )
+        run_just(ROOT, config, "create-management")
+        if run_just(ROOT, config, "status", check=False).returncode != 0:
+            raise RuntimeError("management reconciliation did not recover a missing provider")
 
         unexpected.write_text("foreign\n", encoding="utf-8")
         unexpected.chmod(0o600)
@@ -217,6 +296,36 @@ def main() -> int:
         ):
             raise RuntimeError("refused deletion changed management identity")
         unexpected.unlink()
+
+        host_record = ROOT / ".runtime" / "host" / "inotify.json"
+        original_host_record = host_record.read_bytes()
+        malformed = json.loads(original_host_record)
+        malformed["lab_prefix"] = "foreign"
+        host_record.write_text(json.dumps(malformed, sort_keys=True) + "\n", encoding="utf-8")
+        host_record.chmod(0o600)
+        try:
+            refused = run_just(ROOT, config, "destroy", check=False)
+            if refused.returncode == 0 or "belongs to another lab" not in (
+                refused.stdout + refused.stderr
+            ):
+                raise RuntimeError("foreign host state did not block deletion")
+            if (
+                run(
+                    [
+                        "docker",
+                        "inspect",
+                        f"{config['KIND_CLUSTER_NAME']}-control-plane",
+                        "--format",
+                        "{{.Id}}",
+                    ],
+                    timeout=30,
+                ).stdout.strip()
+                != management_id
+            ):
+                raise RuntimeError("foreign host-state refusal changed management identity")
+        finally:
+            host_record.write_bytes(original_host_record)
+            host_record.chmod(0o600)
 
         run_just(ROOT, config, "destroy")
         run_just(ROOT, config, "destroy")

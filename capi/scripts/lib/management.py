@@ -426,11 +426,16 @@ def _prepare_kamaji_chart(root: Path, config: dict[str, str]) -> Path:
         replacement = charts_dir / ".kamaji-replacement"
         shutil.rmtree(replacement, ignore_errors=True)
         shutil.copytree(source, replacement)
+        for path in replacement.rglob("*"):
+            if path.is_symlink():
+                raise IntegrityError(f"Kamaji chart contains a symlink: {path}")
+            path.chmod(0o700 if path.is_dir() else 0o600)
         dependency_dir = replacement / "charts"
         dependency_dir.mkdir(mode=0o700)
         dependency = root / ".tools" / "inputs" / "kamaji-etcd-0.15.0.tgz"
         verify_sha256(dependency, config["KAMAJI_ETCD_CHART_SHA256"])
         shutil.copyfile(dependency, dependency_dir / dependency.name)
+        (dependency_dir / dependency.name).chmod(0o600)
         backup = charts_dir / ".kamaji-old"
         shutil.rmtree(backup, ignore_errors=True)
         if destination.exists():
@@ -655,6 +660,52 @@ def management_component_status(
             }
         )
     return result
+
+
+def management_auxiliary_status(
+    config: dict[str, str],
+    client: ManagementClient,
+) -> dict[str, object]:
+    endpoints = {}
+    for name, namespace in (
+        ("cert-manager-webhook", "cert-manager"),
+        ("metallb-webhook-service", "metallb-system"),
+        ("kamaji-webhook-service", config["MANAGEMENT_NAMESPACE"]),
+    ):
+        response = client.kubectl(
+            "-n",
+            namespace,
+            "get",
+            f"endpoints/{name}",
+            "-o",
+            "jsonpath={.subsets[0].addresses[0].ip}",
+            check=False,
+        )
+        endpoints[f"{namespace}/{name}"] = response.returncode == 0 and bool(
+            response.stdout
+        )
+    pvc_response = client.kubectl(
+        "-n",
+        config["MANAGEMENT_NAMESPACE"],
+        "get",
+        "pvc",
+        "-o",
+        "json",
+        check=False,
+    )
+    bound_claims = 0
+    if pvc_response.returncode == 0:
+        bound_claims = sum(
+            1
+            for item in json.loads(pvc_response.stdout)["items"]
+            if item["metadata"]["name"].startswith("data-kamaji-etcd-")
+            and item.get("status", {}).get("phase") == "Bound"
+        )
+    return {
+        "webhooks": endpoints,
+        "datastoreBoundPVCs": bound_claims,
+        "ready": all(endpoints.values()) and bound_claims == 3,
+    }
 
 
 def delete_management(root: Path, config: dict[str, str]) -> None:

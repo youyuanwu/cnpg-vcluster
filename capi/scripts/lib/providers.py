@@ -21,6 +21,9 @@ class Provider:
     crds: tuple[str, ...]
     storage_version: str
     conversion: str | None
+    webhook_service: str | None
+    version_key: str
+    contract_key: str
     variables: dict[str, str]
 
 
@@ -36,6 +39,9 @@ PROVIDERS = (
         crds=("clusters.cluster.x-k8s.io", "machines.cluster.x-k8s.io"),
         storage_version="v1beta2",
         conversion="Webhook",
+        webhook_service="capi-webhook-service",
+        version_key="CAPI_VERSION",
+        contract_key="CAPI_CONTRACT",
         variables={},
     ),
     Provider(
@@ -52,6 +58,9 @@ PROVIDERS = (
         ),
         storage_version="v1beta2",
         conversion="Webhook",
+        webhook_service="capi-kubeadm-bootstrap-webhook-service",
+        version_key="CAPI_VERSION",
+        contract_key="CAPI_CONTRACT",
         variables={"KUBEADM_BOOTSTRAP_TOKEN_TTL": "10m"},
     ),
     Provider(
@@ -68,6 +77,9 @@ PROVIDERS = (
         ),
         storage_version="v1beta2",
         conversion="Webhook",
+        webhook_service="capd-webhook-service",
+        version_key="CAPI_VERSION",
+        contract_key="CAPI_CONTRACT",
         variables={"CAPD_DOCKER_HOST": '""'},
     ),
     Provider(
@@ -84,6 +96,9 @@ PROVIDERS = (
         ),
         storage_version="v1alpha2",
         conversion=None,
+        webhook_service=None,
+        version_key="KAMAJI_CAPI_VERSION",
+        contract_key="KAMAJI_CAPI_CONTRACT",
         variables={},
     ),
 )
@@ -252,6 +267,7 @@ def reconcile_providers(root: Path, config: dict[str, str], client: ManagementCl
             "apply",
             "--server-side",
             "--field-manager=capi-kamaji-lab",
+            "--force-conflicts",
             "-f",
             str(manifest),
         )
@@ -273,13 +289,72 @@ def provider_status(config: dict[str, str], client: ManagementClient) -> list[di
             check=False,
         )
         if response.returncode != 0:
-            result.append({"name": provider.name, "available": False, "reason": "missing"})
+            result.append(
+                {
+                    "name": provider.name,
+                    "available": False,
+                    "reason": "missing",
+                    "version": config[provider.version_key],
+                    "contract": config[provider.contract_key],
+                }
+            )
             continue
         payload = json.loads(response.stdout)
         desired = payload.get("spec", {}).get("replicas", 0)
         available = payload.get("status", {}).get("availableReplicas", 0)
         image = payload["spec"]["template"]["spec"]["containers"][0]["image"]
         configuration_ready = True
+        crds_ready = True
+        crd_details: list[dict[str, object]] = []
+        for crd_name in provider.crds:
+            crd_response = client.kubectl(
+                "get",
+                f"crd/{crd_name}",
+                "-o",
+                "json",
+                check=False,
+            )
+            if crd_response.returncode != 0:
+                crds_ready = False
+                crd_details.append({"name": crd_name, "ready": False})
+                continue
+            crd = json.loads(crd_response.stdout)
+            version = next(
+                (
+                    item
+                    for item in crd["spec"]["versions"]
+                    if item["name"] == provider.storage_version
+                ),
+                None,
+            )
+            conversion = crd["spec"].get("conversion", {}).get("strategy")
+            ready = bool(
+                version
+                and version.get("served")
+                and version.get("storage")
+                and (provider.conversion is None or conversion == provider.conversion)
+            )
+            crds_ready = crds_ready and ready
+            crd_details.append(
+                {
+                    "name": crd_name,
+                    "ready": ready,
+                    "storageVersion": provider.storage_version,
+                    "conversion": conversion,
+                }
+            )
+        webhook_ready = True
+        if provider.webhook_service:
+            endpoint = client.kubectl(
+                "-n",
+                namespace,
+                "get",
+                f"endpoints/{provider.webhook_service}",
+                "-o",
+                "jsonpath={.subsets[0].addresses[0].ip}",
+                check=False,
+            )
+            webhook_ready = endpoint.returncode == 0 and bool(endpoint.stdout)
         if provider.name == "kamaji-control-plane":
             arguments = " ".join(
                 payload["spec"]["template"]["spec"]["containers"][0].get("args", [])
@@ -297,10 +372,24 @@ def provider_status(config: dict[str, str], client: ManagementClient) -> list[di
                     and desired > 0
                     and image == config[provider.image_key]
                     and configuration_ready
+                    and crds_ready
+                    and webhook_ready
                 ),
                 "desired": desired,
                 "availableReplicas": available,
                 "image": image,
+                "version": config[provider.version_key],
+                "contract": config[provider.contract_key],
+                "crds": crd_details,
+                "webhookReady": webhook_ready,
+                "featureGates": (
+                    {
+                        "DynamicInfrastructureClusterPatch": False,
+                        "SkipInfraClusterPatch": True,
+                    }
+                    if provider.name == "kamaji-control-plane"
+                    else {}
+                ),
             }
         )
     return result

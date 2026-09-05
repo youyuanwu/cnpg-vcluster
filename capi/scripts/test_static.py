@@ -135,6 +135,7 @@ def check_repository_boundaries() -> None:
             for path in (ROOT / "scripts").rglob("*.py")
             if path.name != "test_static.py"
         ),
+        *(ROOT / "manifests").rglob("*"),
     ]
     forbidden = (
         "../kamaji/.tools",
@@ -147,6 +148,8 @@ def check_repository_boundaries() -> None:
         "az aks",
     )
     for path in production:
+        if not path.is_file():
+            continue
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             check(token not in text, f"{path.relative_to(ROOT)} contains forbidden token {token!r}")
