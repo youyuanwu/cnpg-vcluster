@@ -327,7 +327,12 @@ def _assert_drift_and_repair(root: Path, config: dict[str, str], client, tenant)
         _wait_network_verified(root, config, tenant)
 
 
-def run_network_gate(root: Path, config: dict[str, str]) -> None:
+def run_network_gate(
+    root: Path,
+    config: dict[str, str],
+    *,
+    cleanup: bool = True,
+):
     client, tenant, _ = run_endpoint_gate(root, config, cleanup=False)
     try:
         apply_addons(root, config, client, tenant)
@@ -376,6 +381,8 @@ def run_network_gate(root: Path, config: dict[str, str]) -> None:
         else:
             raise RuntimeError("tenant deletion bypassed add-on pre-delete cleanup")
         print("tenant networking and kube-proxy reconciliation checks passed")
+        return client, tenant
     finally:
-        delete_addons(root, config, client, tenant)
-        delete_tenant(root, config, client, tenant)
+        if cleanup:
+            delete_addons(root, config, client, tenant)
+            delete_tenant(root, config, client, tenant)

@@ -55,6 +55,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         ),
         re.compile(r"^evidence/endpoint-failure\.txt$"),
         re.compile(r"^evidence/endpoint-success\.json$"),
+        re.compile(r"^rendered/negative/foreign-node\.json$"),
         re.compile(
             r"^rendered/addons/(capi-worker-spike|tenant-a|tenant-b)/"
             r"(calico|kube-proxy)\.yaml$"

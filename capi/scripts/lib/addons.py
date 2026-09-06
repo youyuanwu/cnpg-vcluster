@@ -331,16 +331,31 @@ def wait_network_ready(
         node = json.loads(
             _tenant_kubectl(root, config, tenant, "get", "nodes", "-o", "json").stdout
         )
-        if len(node["items"]) != 1:
+        deployment = json.loads(
+            client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"machinedeployment/{tenant.name}-worker",
+                "-o",
+                "json",
+            ).stdout
+        )
+        desired_workers = deployment["spec"]["replicas"]
+        if len(node["items"]) != desired_workers:
             return None
-        node_ready = next(
-            (
-                item
-                for item in node["items"][0]["status"].get("conditions", [])
-                if item["type"] == "Ready"
-            ),
-            {},
-        ).get("status") == "True"
+        node_ready = all(
+            next(
+                (
+                    condition
+                    for condition in item["status"].get("conditions", [])
+                    if condition["type"] == "Ready"
+                ),
+                {},
+            ).get("status")
+            == "True"
+            for item in node["items"]
+        )
         machines = json.loads(
             client.kubectl(
                 "-n",
@@ -353,7 +368,9 @@ def wait_network_ready(
                 "json",
             ).stdout
         )["items"]
-        machine_ready = len(machines) == 1 and condition_true(machines[0], "Ready")
+        machine_ready = len(machines) == desired_workers and all(
+            condition_true(machine, "Ready") for machine in machines
+        )
         checks = (
             ("daemonset/calico-node", "kube-system"),
             ("deployment/calico-kube-controllers", "kube-system"),
@@ -499,6 +516,17 @@ def network_status(
                 "json",
             ).stdout
         )["items"]
+        deployment = json.loads(
+            client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"machinedeployment/{tenant.name}-worker",
+                "-o",
+                "json",
+            ).stdout
+        )
+        desired_workers = deployment["spec"]["replicas"]
         config_map = json.loads(
             _tenant_kubectl(
                 root,
@@ -572,11 +600,17 @@ def network_status(
                 "json",
             ).stdout
         )
-        node_ready = len(nodes) == 1 and any(
-            item.get("type") == "Ready" and item.get("status") == "True"
-            for item in nodes[0].get("status", {}).get("conditions", [])
+        node_ready = len(nodes) == desired_workers and all(
+            any(
+                condition.get("type") == "Ready"
+                and condition.get("status") == "True"
+                for condition in node.get("status", {}).get("conditions", [])
+            )
+            for node in nodes
         )
-        machine_ready = len(machines) == 1 and condition_true(machines[0], "Ready")
+        machine_ready = len(machines) == desired_workers and all(
+            condition_true(machine, "Ready") for machine in machines
+        )
         proxy_ready = (
             daemonset["status"].get("desiredNumberScheduled", 0)
             == daemonset["status"].get("numberAvailable", 0)

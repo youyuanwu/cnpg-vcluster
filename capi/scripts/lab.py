@@ -17,6 +17,7 @@ from scripts.destroy import destroy
 from scripts.diagnose import diagnose
 from scripts.endpoint import run_endpoint_gate
 from scripts.network import run_network_gate
+from scripts.machines import run_machine_gate
 from scripts.preflight import PreflightError, run_preflight
 from scripts.status import status
 from scripts.tools import prepare_tools
@@ -72,6 +73,11 @@ def main(arguments: list[str]) -> int:
         with tools_lock(ROOT, exclusive=True):
             run_preflight(ROOT, config)
             run_network_gate(ROOT, config)
+        return 0
+    if command == "test-machines":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            run_machine_gate(ROOT, config)
         return 0
     if command == "unavailable":
         return unavailable(rest)
