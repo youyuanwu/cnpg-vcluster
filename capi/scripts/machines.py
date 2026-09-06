@@ -16,6 +16,8 @@ from scripts.lib.tenants import (
     verify_worker_runtime,
 )
 from scripts.network import run_network_gate
+from scripts.endpoint import _verify_bootstrap_secret
+from scripts.status import collect_status, status_healthy
 
 
 def _machine_items(client: ManagementClient, tenant) -> list[dict[str, object]]:
@@ -69,12 +71,43 @@ def worker_snapshot(
     tenant,
 ) -> dict[str, dict[str, str]]:
     items = _machine_items(client, tenant)
+    devmachines = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            "devmachines",
+            "-l",
+            f"cluster.x-k8s.io/cluster-name={tenant.name}",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    devmachine_names = {item["metadata"]["name"] for item in devmachines}
+    container_names = set(
+        run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"label=io.x-k8s.kind.cluster={tenant.name}",
+                "--filter",
+                "label=io.x-k8s.kind.role=worker",
+                "--format",
+                "{{.Names}}",
+            ],
+            timeout=30,
+        ).stdout.split()
+    )
     snapshot: dict[str, dict[str, str]] = {}
     for machine in items:
         registered = _registered(client, tenant, machine)
         verify_worker_runtime(config, tenant, registered)
         if not condition_true(machine, "Ready"):
             raise RuntimeError(f"Machine is not Ready: {machine['metadata']['name']}")
+        if not condition_true(registered["devmachine"], "Ready"):
+            raise RuntimeError(f"DevMachine is not Ready: {machine['metadata']['name']}")
         name = machine["metadata"]["name"]
         container_id = run(
             ["docker", "inspect", name, "--format", "{{.Id}}"],
@@ -91,8 +124,13 @@ def worker_snapshot(
     )["items"]
     if len(snapshot) != 3 or len(nodes) != 3:
         raise RuntimeError("three-worker topology is not exact")
-    if {item["metadata"]["name"] for item in nodes} != set(snapshot):
-        raise RuntimeError("Machine and Node names do not match exactly")
+    expected_names = set(snapshot)
+    if (
+        {item["metadata"]["name"] for item in nodes} != expected_names
+        or devmachine_names != expected_names
+        or container_names != expected_names
+    ):
+        raise RuntimeError("Machine, DevMachine, container, and Node sets do not match")
     return snapshot
 
 
@@ -115,7 +153,12 @@ def _scale_three(
     verify_network(root, config, tenant)
 
 
-def _bootstrap_secrets(client: ManagementClient, tenant) -> set[str]:
+def _bootstrap_secrets(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+) -> set[str]:
     machine_names = {
         machine["metadata"]["name"] for machine in _machine_items(client, tenant)
     }
@@ -138,6 +181,16 @@ def _bootstrap_secrets(client: ManagementClient, tenant) -> set[str]:
         owners = secret["metadata"].get("ownerReferences") or []
         if len(owners) != 1 or owners[0].get("kind") != "KubeadmConfig":
             raise RuntimeError("worker bootstrap Secret owner is invalid")
+        machine = next(
+            item for item in _machine_items(client, tenant)
+            if item["metadata"]["name"] == secret["metadata"]["name"]
+        )
+        _verify_bootstrap_secret(
+            config,
+            client,
+            tenant,
+            {"secret": secret["metadata"]["name"], "machine": machine},
+        )
         result.add(secret["metadata"]["name"])
     if len(result) != 3:
         raise RuntimeError("expected one bootstrap Secret per worker")
@@ -237,6 +290,16 @@ def _interrupted_machine_deletion(
     tenant,
 ) -> None:
     before = worker_snapshot(root, config, client, tenant)
+    observed_status = collect_status(root, config)
+    if (
+        not status_healthy(observed_status)
+        or len(observed_status["spikeMachines"]["machines"]) != 3
+        or len(observed_status["spikeMachines"]["devMachines"]) != 3
+        or len(observed_status["spikeMachines"]["containers"]) != 3
+        or len(observed_status["spikeMachines"]["nodes"]) != 3
+        or len(observed_status["spikeMachines"]["bootstrapSecrets"]) != 3
+    ):
+        raise RuntimeError("status does not expose the exact three-worker layers")
     removed_name = sorted(before)[0]
     client.kubectl(
         "-n",
@@ -306,14 +369,16 @@ def run_machine_gate(root: Path, config: dict[str, str]) -> None:
     try:
         _scale_three(root, config, client, tenant)
         before = worker_snapshot(root, config, client, tenant)
-        bootstrap_secrets |= _bootstrap_secrets(client, tenant)
+        bootstrap_secrets |= _bootstrap_secrets(root, config, client, tenant)
         _scale_three(root, config, client, tenant)
         if worker_snapshot(root, config, client, tenant) != before:
             raise RuntimeError("unchanged three-worker declaration changed identities")
         after = _replace_machine(root, config, client, tenant, before)
-        bootstrap_secrets |= _bootstrap_secrets(client, tenant)
+        bootstrap_secrets |= _bootstrap_secrets(root, config, client, tenant)
         _interrupted_machine_deletion(root, config, client, tenant)
-        bootstrap_secrets |= _bootstrap_secrets(client, tenant)
+        bootstrap_secrets |= _bootstrap_secrets(root, config, client, tenant)
+        if not status_healthy(collect_status(root, config)):
+            raise RuntimeError("status remained unhealthy after interrupted replacement")
         _foreign_node_rejected(root, config, client, tenant)
         print(
             json.dumps(
@@ -341,7 +406,12 @@ def run_machine_gate(root: Path, config: dict[str, str]) -> None:
                 == 0
             ):
                 raise RuntimeError(f"bootstrap Secret remained: {secret_name}")
-    from scripts.test_endpoint_negative import partial_label_worker, unlabelled_worker
+    from scripts.test_endpoint_negative import (
+        invalid_worker_condition,
+        partial_label_worker,
+        unlabelled_worker,
+    )
 
+    invalid_worker_condition(root, config, client)
     unlabelled_worker(root, config, client)
     partial_label_worker(root, config, client)

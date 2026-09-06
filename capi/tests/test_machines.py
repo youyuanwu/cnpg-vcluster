@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
+
+from unittest.mock import patch
 
 from scripts.machines import _bootstrap_secrets
 
@@ -55,7 +58,13 @@ class FakeClient:
 class MachineTests(unittest.TestCase):
     def test_bootstrap_secret_inventory_excludes_cluster_kubeconfig(self) -> None:
         tenant = type("Tenant", (), {"namespace": "tenant", "name": "cluster"})()
-        self.assertEqual(
-            _bootstrap_secrets(FakeClient(), tenant),
-            {"worker-a", "worker-b", "worker-c"},
-        )
+        with patch("scripts.machines._verify_bootstrap_secret"):
+            self.assertEqual(
+                _bootstrap_secrets(
+                    Path("."),
+                    {},
+                    FakeClient(),
+                    tenant,
+                ),
+                {"worker-a", "worker-b", "worker-c"},
+            )

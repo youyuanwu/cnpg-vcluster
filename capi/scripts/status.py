@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+from scripts.lib.conditions import condition_true
 from scripts.lib.kube import ManagementClient
 from scripts.lib.host import read_inotify
 from scripts.lib.management import (
@@ -12,7 +13,98 @@ from scripts.lib.management import (
 )
 from scripts.lib.providers import provider_status
 from scripts.lib.addons import network_status
-from scripts.lib.tenants import spike_tenant
+from scripts.lib.process import run
+from scripts.lib.tenants import _tenant_kubectl, spike_tenant
+
+
+def _machine_layer_status(root: Path, config: dict[str, str], client, tenant):
+    deployment = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"machinedeployment/{tenant.name}-worker",
+            "-o",
+            "json",
+        ).stdout
+    )
+    desired = deployment["spec"]["replicas"]
+    machines = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            "machines",
+            "-l",
+            f"cluster.x-k8s.io/cluster-name={tenant.name}",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    devmachines = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            "devmachines",
+            "-l",
+            f"cluster.x-k8s.io/cluster-name={tenant.name}",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    nodes = json.loads(
+        _tenant_kubectl(root, config, tenant, "get", "nodes", "-o", "json").stdout
+    )["items"]
+    containers = run(
+        [
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            f"label=io.x-k8s.kind.cluster={tenant.name}",
+            "--filter",
+            "label=io.x-k8s.kind.role=worker",
+            "--format",
+            "{{.Names}}",
+        ],
+        timeout=30,
+    ).stdout.split()
+    secrets = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            "secrets",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    machine_names = {item["metadata"]["name"] for item in machines}
+    bootstrap = sorted(
+        item["metadata"]["name"]
+        for item in secrets
+        if item.get("type") == "cluster.x-k8s.io/secret"
+        and item["metadata"]["name"] in machine_names
+    )
+    layers = {
+        "desired": desired,
+        "machines": sorted(machine_names),
+        "devMachines": sorted(item["metadata"]["name"] for item in devmachines),
+        "containers": sorted(containers),
+        "nodes": sorted(item["metadata"]["name"] for item in nodes),
+        "bootstrapSecrets": bootstrap,
+    }
+    layers["ready"] = (
+        len(machine_names) == desired
+        and all(condition_true(item, "Ready") for item in machines)
+        and len(devmachines) == desired
+        and all(condition_true(item, "Ready") for item in devmachines)
+        and set(containers) == machine_names
+        and {item["metadata"]["name"] for item in nodes} == machine_names
+        and len(bootstrap) == desired
+    )
+    return layers
 
 
 def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
@@ -49,6 +141,12 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
         )
         if spike_cluster.returncode == 0:
             result["spikeNetwork"] = network_status(root, config, client, spike)
+            try:
+                result["spikeMachines"] = _machine_layer_status(
+                    root, config, client, spike
+                )
+            except RuntimeError as exc:
+                result["spikeMachines"] = {"ready": False, "reason": str(exc)}
         kamaji = client.kubectl(
             "-n",
             config["MANAGEMENT_NAMESPACE"],
@@ -95,6 +193,10 @@ def status_healthy(result: dict[str, object]) -> bool:
         and (
             "spikeNetwork" not in result
             or result["spikeNetwork"].get("ready")
+        )
+        and (
+            "spikeMachines" not in result
+            or result["spikeMachines"].get("ready")
         )
     )
 

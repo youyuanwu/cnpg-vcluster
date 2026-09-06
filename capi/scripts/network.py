@@ -334,6 +334,7 @@ def run_network_gate(
     cleanup: bool = True,
 ):
     client, tenant, _ = run_endpoint_gate(root, config, cleanup=False)
+    succeeded = False
     try:
         apply_addons(root, config, client, tenant)
         wait_network_ready(root, config, tenant)
@@ -381,8 +382,9 @@ def run_network_gate(
         else:
             raise RuntimeError("tenant deletion bypassed add-on pre-delete cleanup")
         print("tenant networking and kube-proxy reconciliation checks passed")
+        succeeded = True
         return client, tenant
     finally:
-        if cleanup:
+        if cleanup or not succeeded:
             delete_addons(root, config, client, tenant)
             delete_tenant(root, config, client, tenant)

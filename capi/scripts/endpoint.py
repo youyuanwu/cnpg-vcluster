@@ -153,6 +153,7 @@ def run_endpoint_gate(
     evidence.unlink(missing_ok=True)
     success_evidence.unlink(missing_ok=True)
     bootstrap_secret_names: list[str] = []
+    succeeded = False
     try:
         apply_control_plane(root, config, client, tenant)
         export_tenant_kubeconfig(root, config, client, tenant)
@@ -294,12 +295,13 @@ def run_endpoint_gate(
                 sort_keys=True,
             )
         )
+        succeeded = True
         return client, tenant, replacement
     except Exception as exc:
         write_private_file(evidence, redact(str(exc)) + "\n")
         raise
     finally:
-        if cleanup:
+        if cleanup or not succeeded:
             delete_tenant(root, config, client, tenant)
             for secret_name in bootstrap_secret_names:
                 if (
