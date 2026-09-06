@@ -95,73 +95,128 @@ def wrong_label_load_balancer(
         run(["docker", "rm", "-f", identifier], timeout=30)
 
 
-def partial_label_worker(
+def exact_label_load_balancer(
     root: Path,
     config: dict[str, str],
     client: ManagementClient,
 ) -> None:
     tenant = spike_tenant(root, config)
     delete_tenant(root, config, client, tenant)
+    fixture_name = f"{tenant.name}-provider-owned-lb"
+    identifier = docker_container(
+        config,
+        fixture_name,
+        {
+            "io.x-k8s.kind.cluster": tenant.name,
+            "io.x-k8s.kind.role": "external-load-balancer",
+        },
+    )
+    try:
+        manifest, _ = render_tenant_manifests(root, config, tenant)
+        client.kubectl("apply", "-f", str(manifest))
+
+        def adopted():
+            response = client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"devcluster/{tenant.name}",
+                "-o",
+                "json",
+                check=False,
+            )
+            if response.returncode != 0:
+                return None
+            resource = json.loads(response.stdout)
+            return resource if resource.get("status", {}).get("conditions") else None
+
+        wait_for("exact-label load balancer adoption", 120, 2, adopted)
+        payload = json.loads(run(["docker", "inspect", identifier], timeout=30).stdout)[0]
+        if (
+            payload["Name"] == f"/{tenant.name}-lb"
+            and payload["Config"]["Image"] == "kindest/haproxy"
+        ):
+            raise RuntimeError("wrong-image load balancer passed lab runtime health")
+    finally:
+        delete_tenant(root, config, client, tenant)
+        if run(["docker", "inspect", identifier], timeout=30, check=False).returncode == 0:
+            raise RuntimeError("CAPD did not delete its exact-label load balancer")
+
+
+def prepare_paused_worker(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+) -> tuple[object, str]:
+    tenant = spike_tenant(root, config)
+    delete_tenant(root, config, client, tenant)
     apply_control_plane(root, config, client, tenant)
     export_tenant_kubeconfig(root, config, client, tenant)
     apply_bootstrap_rbac(root, config, tenant)
+    prepare_storage_directory(root, config, tenant)
+    _, workers = render_tenant_manifests(root, config, tenant)
+    documents = [
+        document.strip()
+        for document in re.split(r"(?m)^---\s*$", workers.read_text(encoding="utf-8"))
+        if document.strip()
+    ]
+    if len(documents) != 3:
+        raise RuntimeError("unexpected worker manifest document inventory")
+    template_path = workers.with_name("worker-templates.yaml")
+    deployment_path = workers.with_name("worker-deployment.yaml")
+    paused_template = documents[1].replace(
+        "  template:\n    spec:",
+        '  template:\n    metadata:\n      annotations:\n        cluster.x-k8s.io/paused: ""\n    spec:',
+        1,
+    )
+    write_private_file(
+        template_path,
+        documents[0] + "\n---\n" + paused_template + "\n",
+    )
+    write_private_file(deployment_path, documents[2] + "\n")
+    client.kubectl(
+        "apply",
+        "--server-side",
+        "--field-manager=capi-kamaji-lab",
+        "--force-conflicts",
+        "-f",
+        str(template_path),
+    )
+    client.kubectl(
+        "apply",
+        "--server-side",
+        "--field-manager=capi-kamaji-lab",
+        "--force-conflicts",
+        "-f",
+        str(deployment_path),
+    )
+
+    def generated_machine():
+        payload = json.loads(
+            client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                "machines",
+                "-l",
+                f"cluster.x-k8s.io/cluster-name={tenant.name}",
+                "-o",
+                "json",
+            ).stdout
+        )
+        return payload["items"][0]["metadata"]["name"] if len(payload["items"]) == 1 else None
+
+    return tenant, wait_for("generated Machine", 120, 2, generated_machine)
+
+
+def partial_label_worker(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    tenant, machine_name = prepare_paused_worker(root, config, client)
     identifier = ""
-    machine_name = ""
     try:
-        prepare_storage_directory(root, config, tenant)
-        _, workers = render_tenant_manifests(root, config, tenant)
-        documents = [
-            document.strip()
-            for document in re.split(r"(?m)^---\s*$", workers.read_text(encoding="utf-8"))
-            if document.strip()
-        ]
-        if len(documents) != 3:
-            raise RuntimeError("unexpected worker manifest document inventory")
-        template_path = workers.with_name("worker-templates.yaml")
-        deployment_path = workers.with_name("worker-deployment.yaml")
-        paused_template = documents[1].replace(
-            "  template:\n    spec:",
-            '  template:\n    metadata:\n      annotations:\n        cluster.x-k8s.io/paused: ""\n    spec:',
-            1,
-        )
-        write_private_file(
-            template_path,
-            documents[0] + "\n---\n" + paused_template + "\n",
-        )
-        write_private_file(deployment_path, documents[2] + "\n")
-        client.kubectl(
-            "apply",
-            "--server-side",
-            "--field-manager=capi-kamaji-lab",
-            "--force-conflicts",
-            "-f",
-            str(template_path),
-        )
-        client.kubectl(
-            "apply",
-            "--server-side",
-            "--field-manager=capi-kamaji-lab",
-            "--force-conflicts",
-            "-f",
-            str(deployment_path),
-        )
-
-        def generated_machine():
-            payload = json.loads(
-                client.kubectl(
-                    "-n",
-                    tenant.namespace,
-                    "get",
-                    "machines",
-                    "-l",
-                    f"cluster.x-k8s.io/cluster-name={tenant.name}",
-                    "-o",
-                    "json",
-                ).stdout
-            )
-            return payload["items"][0]["metadata"]["name"] if len(payload["items"]) == 1 else None
-
-        machine_name = wait_for("generated Machine", 120, 2, generated_machine)
         identifier = docker_container(
             config,
             machine_name,
@@ -212,10 +267,55 @@ def partial_label_worker(
                 raise RuntimeError("CAPD did not delete its adopted partial-label worker")
 
 
+def unlabelled_worker(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    tenant, machine_name = prepare_paused_worker(root, config, client)
+    identifier = docker_container(config, machine_name, {"foreign": "true"})
+    try:
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "annotate",
+            f"devmachine/{machine_name}",
+            "cluster.x-k8s.io/paused-",
+        )
+
+        def rejected():
+            response = client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"devmachine/{machine_name}",
+                "-o",
+                "json",
+                check=False,
+            )
+            if response.returncode != 0:
+                return None
+            resource = json.loads(response.stdout)
+            return resource if _current_false_condition(resource) else None
+
+        wait_for("unlabelled worker collision", 180, 2, rejected)
+        observed = run(
+            ["docker", "inspect", machine_name, "--format", "{{.Id}}"],
+            timeout=30,
+        ).stdout.strip()
+        if observed != identifier:
+            raise RuntimeError("unlabelled worker was adopted or changed")
+    finally:
+        delete_tenant(root, config, client, tenant)
+        if run(["docker", "inspect", identifier], timeout=30, check=False).returncode != 0:
+            raise RuntimeError("host lifecycle deleted the unlabelled worker")
+        run(["docker", "rm", "-f", identifier], timeout=30)
+
+
 def _current_false_condition(resource: dict[str, object]) -> bool:
     generation = resource["metadata"]["generation"]
     return any(
-        condition.get("status") in {"False", "Unknown"}
+        condition.get("status") == "False"
         and condition.get("observedGeneration") == generation
         and condition.get("reason")
         and condition.get("message")
@@ -432,6 +532,8 @@ def main() -> int:
     invalid_control_plane_condition(ROOT, config, client)
     invalid_worker_condition(ROOT, config, client)
     wrong_label_load_balancer(ROOT, config, client)
+    exact_label_load_balancer(ROOT, config, client)
+    unlabelled_worker(ROOT, config, client)
     partial_label_worker(ROOT, config, client)
     print("endpoint ownership and collision checks passed")
     return 0

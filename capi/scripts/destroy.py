@@ -52,6 +52,7 @@ def _validate_runtime_inventory(root: Path) -> None:
             r"^storage/(spike|tenant-a|tenant-b)/\.capi-owner\.json$"
         ),
         re.compile(r"^evidence/endpoint-failure\.txt$"),
+        re.compile(r"^evidence/endpoint-success\.json$"),
     )
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()

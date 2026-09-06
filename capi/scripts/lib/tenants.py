@@ -477,6 +477,14 @@ def verify_worker_runtime(
     }
     expected_mount = mounts.get(config["SPIKE_STORAGE_CONTAINER_PATH"])
     image = payload.get("Config", {}).get("Image")
+    expected_network = json.loads(
+        (
+            tenant.storage_host_path.parents[1]
+            / "management"
+            / "network.json"
+        ).read_text(encoding="utf-8")
+    )["network"]
+    networks = payload.get("NetworkSettings", {}).get("Networks") or {}
     if (
         payload.get("State", {}).get("Running") is not True
         or labels.get("io.x-k8s.kind.cluster") != tenant.name
@@ -484,6 +492,7 @@ def verify_worker_runtime(
         or image != config["KIND_NODE_IMAGE"]
         or not expected_mount
         or Path(expected_mount["Source"]).resolve() != tenant.storage_host_path.resolve()
+        or set(networks) != {expected_network}
     ):
         raise RuntimeError("CAPD worker runtime does not match the declared local profile")
 
@@ -509,10 +518,34 @@ def endpoint_snapshot(
                 "conditions": condition_summary(resource),
             }
     if machine:
+        devmachine = _resource(client, tenant, "devmachine", machine["metadata"]["name"])
+        node_name = machine.get("status", {}).get("nodeRef", {}).get("name")
+        node = None
+        if node_name and tenant_kubeconfig_path(root, tenant).is_file():
+            response = _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "get",
+                f"node/{node_name}",
+                "-o",
+                "json",
+                check=False,
+            )
+            if response.returncode == 0:
+                node = json.loads(response.stdout)
+        container = run(
+            ["docker", "inspect", machine["metadata"]["name"], "--format", "{{.Id}}"],
+            timeout=30,
+            check=False,
+        )
         resources["machine"] = {
             "uid": machine["metadata"]["uid"],
             "nodeRef": machine.get("status", {}).get("nodeRef"),
             "conditions": condition_summary(machine),
+            "devMachineUID": devmachine["metadata"]["uid"] if devmachine else None,
+            "containerID": container.stdout.strip() if container.returncode == 0 else None,
+            "nodeUID": node["metadata"]["uid"] if node else None,
         }
     return resources
 
