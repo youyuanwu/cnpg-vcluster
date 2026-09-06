@@ -68,6 +68,7 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
         "CLUSTER_NAME": tenant.name,
         "OWNERSHIP_LABEL": config["OWNERSHIP_LABEL"],
         "LAB_PREFIX": config["LAB_PREFIX"],
+        "ADDON_PROFILE": tenant.name,
         "API_VIP": tenant.vip,
         "API_PORT": config["SPIKE_API_PORT"],
         "SERVICE_CIDR": tenant.service_cidr,

@@ -137,7 +137,12 @@ def _verify_bootstrap_secret(
             raise RuntimeError(f"bootstrap Secret is readable by {denied}")
 
 
-def run_endpoint_gate(root: Path, config: dict[str, str]) -> None:
+def run_endpoint_gate(
+    root: Path,
+    config: dict[str, str],
+    *,
+    cleanup: bool = True,
+):
     if not management_status(root, config).get("apiReady"):
         create_management(root, config)
     client = ManagementClient(root, config)
@@ -289,20 +294,24 @@ def run_endpoint_gate(root: Path, config: dict[str, str]) -> None:
                 sort_keys=True,
             )
         )
+        return client, tenant, replacement
     except Exception as exc:
         write_private_file(evidence, redact(str(exc)) + "\n")
         raise
     finally:
-        delete_tenant(root, config, client, tenant)
-        for secret_name in bootstrap_secret_names:
-            if (
-                client.kubectl(
-                    "-n",
-                    tenant.namespace,
-                    "get",
-                    f"secret/{secret_name}",
-                    check=False,
-                ).returncode
-                == 0
-            ):
-                raise RuntimeError(f"bootstrap Secret remained after deletion: {secret_name}")
+        if cleanup:
+            delete_tenant(root, config, client, tenant)
+            for secret_name in bootstrap_secret_names:
+                if (
+                    client.kubectl(
+                        "-n",
+                        tenant.namespace,
+                        "get",
+                        f"secret/{secret_name}",
+                        check=False,
+                    ).returncode
+                    == 0
+                ):
+                    raise RuntimeError(
+                        f"bootstrap Secret remained after deletion: {secret_name}"
+                    )

@@ -12,6 +12,7 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+    cnpg-vcluster.capi/addons: ${ADDON_PROFILE}
 spec:
   controlPlaneEndpoint:
     host: ${API_VIP}

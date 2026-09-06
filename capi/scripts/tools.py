@@ -64,6 +64,7 @@ AUTHORED_INPUTS = (
         "CAPI_WORKER_TEMPLATE_SHA256",
     ),
     ("manifests/tenants/base/bootstrap-rbac.yaml", "CAPI_BOOTSTRAP_RBAC_SHA256"),
+    ("manifests/addons/kube-proxy.yaml.tpl", "KUBE_PROXY_TEMPLATE_SHA256"),
 )
 
 TAG_SOURCES = (

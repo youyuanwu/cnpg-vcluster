@@ -53,6 +53,14 @@ def _validate_runtime_inventory(root: Path) -> None:
         ),
         re.compile(r"^evidence/endpoint-failure\.txt$"),
         re.compile(r"^evidence/endpoint-success\.json$"),
+        re.compile(
+            r"^rendered/addons/(capi-worker-spike|tenant-a|tenant-b)/"
+            r"(calico|kube-proxy)\.yaml$"
+        ),
+        re.compile(
+            r"^rendered/addons/(capi-worker-spike|tenant-a|tenant-b)/"
+            r"(resource-set|inventory|repair-[a-z0-9-]+)\.json$"
+        ),
     )
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
