@@ -24,6 +24,7 @@ from scripts.lib.tenants import (
     prepare_storage_directory,
     render_tenant_manifests,
     spike_tenant,
+    verify_load_balancer_runtime,
     verify_worker_runtime,
 )
 
@@ -131,16 +132,70 @@ def exact_label_load_balancer(
             return resource if resource.get("status", {}).get("conditions") else None
 
         wait_for("exact-label load balancer adoption", 120, 2, adopted)
-        payload = json.loads(run(["docker", "inspect", identifier], timeout=30).stdout)[0]
-        if (
-            payload["Name"] == f"/{tenant.name}-lb"
-            and payload["Config"]["Image"] == "kindest/haproxy"
-        ):
+        try:
+            verify_load_balancer_runtime(root, config, tenant)
+        except RuntimeError:
+            pass
+        else:
             raise RuntimeError("wrong-image load balancer passed lab runtime health")
     finally:
         delete_tenant(root, config, client, tenant)
         if run(["docker", "inspect", identifier], timeout=30, check=False).returncode == 0:
             raise RuntimeError("CAPD did not delete its exact-label load balancer")
+
+
+def stopped_exact_label_load_balancer(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    tenant = spike_tenant(root, config)
+    delete_tenant(root, config, client, tenant)
+    name = f"{tenant.name}-lb"
+    identifier = run(
+        [
+            "docker",
+            "create",
+            "--name",
+            name,
+            "--label",
+            f"io.x-k8s.kind.cluster={tenant.name}",
+            "--label",
+            "io.x-k8s.kind.role=external-load-balancer",
+            config["CAPD_LOAD_BALANCER_IMAGE"],
+        ],
+        timeout=60,
+    ).stdout.strip()
+    try:
+        manifest, _ = render_tenant_manifests(root, config, tenant)
+        client.kubectl("apply", "-f", str(manifest))
+
+        def observed():
+            response = client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"devcluster/{tenant.name}",
+                "-o",
+                "json",
+                check=False,
+            )
+            if response.returncode != 0:
+                return None
+            resource = json.loads(response.stdout)
+            return resource if resource.get("status", {}).get("conditions") else None
+
+        wait_for("stopped exact-label load balancer observation", 120, 2, observed)
+        try:
+            verify_load_balancer_runtime(root, config, tenant)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("stopped load balancer passed lab runtime health")
+    finally:
+        delete_tenant(root, config, client, tenant)
+        if run(["docker", "inspect", identifier], timeout=30, check=False).returncode == 0:
+            raise RuntimeError("CAPD did not delete its stopped exact-label load balancer")
 
 
 def prepare_paused_worker(
@@ -533,6 +588,7 @@ def main() -> int:
     invalid_worker_condition(ROOT, config, client)
     wrong_label_load_balancer(ROOT, config, client)
     exact_label_load_balancer(ROOT, config, client)
+    stopped_exact_label_load_balancer(ROOT, config, client)
     unlabelled_worker(ROOT, config, client)
     partial_label_worker(ROOT, config, client)
     print("endpoint ownership and collision checks passed")

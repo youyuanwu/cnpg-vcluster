@@ -449,18 +449,46 @@ def verify_authoritative_endpoint(
         raise RuntimeError(f"authoritative endpoint mismatch: {sources}")
     if expected not in kubeconfig or expected not in bootstrap:
         raise RuntimeError("kubeconfig or CABPK data does not use the authoritative endpoint")
-    load_balancer = f"{tenant.name}-lb"
-    inspect = run(["docker", "inspect", load_balancer], timeout=30)
-    payload = json.loads(inspect.stdout)[0]
-    labels = payload.get("Config", {}).get("Labels") or {}
-    if (
-        labels.get("io.x-k8s.kind.cluster") != tenant.name
-        or labels.get("io.x-k8s.kind.role") != "external-load-balancer"
-    ):
-        raise RuntimeError("CAPD load balancer labels are invalid")
+    payload = verify_load_balancer_runtime(root, config, tenant)
     lb_ip = next(iter(payload["NetworkSettings"]["Networks"].values()))["IPAddress"]
     if lb_ip and (lb_ip in kubeconfig or lb_ip in bootstrap or lb_ip in sources):
         raise RuntimeError("CAPD development load balancer became authoritative")
+
+
+def verify_load_balancer_runtime(
+    root: Path,
+    config: dict[str, str],
+    tenant: Tenant,
+) -> dict[str, object]:
+    load_balancer = f"{tenant.name}-lb"
+    payload = json.loads(
+        run(["docker", "inspect", load_balancer], timeout=30).stdout
+    )[0]
+    labels = payload.get("Config", {}).get("Labels") or {}
+    expected_network = json.loads(
+        (root / ".runtime" / "management" / "network.json").read_text(
+            encoding="utf-8"
+        )
+    )["network"]
+    tagged = config["CAPD_LOAD_BALANCER_IMAGE_TAGGED"]
+    image_details = json.loads(
+        run(["docker", "image", "inspect", tagged], timeout=30).stdout
+    )[0]
+    expected_digest = config["CAPD_LOAD_BALANCER_IMAGE"].rsplit("@", 1)[1]
+    repo_digests = image_details.get("RepoDigests") or []
+    if (
+        payload.get("Name") != f"/{load_balancer}"
+        or payload.get("State", {}).get("Running") is not True
+        or payload.get("Config", {}).get("Image") != tagged
+        or payload.get("Image") != image_details.get("Id")
+        or not any(item.endswith(f"@{expected_digest}") for item in repo_digests)
+        or labels.get("io.x-k8s.kind.cluster") != tenant.name
+        or labels.get("io.x-k8s.kind.role") != "external-load-balancer"
+        or set((payload.get("NetworkSettings", {}).get("Networks") or {}))
+        != {expected_network}
+    ):
+        raise RuntimeError("CAPD load balancer runtime does not match the local profile")
+    return payload
 
 
 def verify_worker_runtime(
