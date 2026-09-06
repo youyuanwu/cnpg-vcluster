@@ -12,6 +12,7 @@ from scripts.lib.addons import (
     _source_object,
     package_source,
     validate_inventory,
+    validate_manifest_hashes,
     validate_resource_set_references,
     render_resource_set,
 )
@@ -120,3 +121,16 @@ class AddonTests(unittest.TestCase):
                 [item["name"] for item in resource_set["spec"]["resources"]],
                 sorted(inventory),
             )
+
+    def test_rejects_tampered_manifest_chunk_before_apply(self) -> None:
+        manifest = {
+            "items": [
+                {
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "source"},
+                    "data": {"addons.yaml": "tampered"},
+                }
+            ]
+        }
+        with self.assertRaises(IntegrityError):
+            validate_manifest_hashes(manifest, {"source": "a" * 64})

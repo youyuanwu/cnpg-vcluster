@@ -10,7 +10,7 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from .conditions import condition_summary, condition_true
+from .conditions import condition_true
 from .config import parse_duration
 from .files import IntegrityError, write_private_file
 from .kube import ManagementClient, wait_for
@@ -543,8 +543,6 @@ def endpoint_snapshot(
         if resource:
             resources[kind] = {
                 "uid": resource["metadata"]["uid"],
-                "generation": resource["metadata"]["generation"],
-                "conditions": condition_summary(resource),
             }
     if machine:
         devmachine = _resource(client, tenant, "devmachine", machine["metadata"]["name"])
@@ -571,7 +569,6 @@ def endpoint_snapshot(
         resources["machine"] = {
             "uid": machine["metadata"]["uid"],
             "nodeRef": machine.get("status", {}).get("nodeRef"),
-            "conditions": condition_summary(machine),
             "devMachineUID": devmachine["metadata"]["uid"] if devmachine else None,
             "containerID": container.stdout.strip() if container.returncode == 0 else None,
             "nodeUID": node["metadata"]["uid"] if node else None,

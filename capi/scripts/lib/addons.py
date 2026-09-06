@@ -191,6 +191,21 @@ def validate_resource_set_references(
         raise IntegrityError("ClusterResourceSet references do not match source inventory")
 
 
+def validate_manifest_hashes(
+    manifest: dict[str, object],
+    inventory: dict[str, str],
+) -> None:
+    observed = {
+        item["metadata"]["name"]: hashlib.sha256(
+            item["data"]["addons.yaml"].encode("utf-8")
+        ).hexdigest()
+        for item in manifest["items"]
+        if item["kind"] == "ConfigMap"
+    }
+    if observed != inventory:
+        raise IntegrityError("ClusterResourceSet manifest content hashes do not match inventory")
+
+
 def render_resource_set(
     root: Path,
     config: dict[str, str],
@@ -266,6 +281,7 @@ def apply_addons(
         item for item in payload["items"] if item["kind"] == "ClusterResourceSet"
     )
     validate_resource_set_references(resource_set, inventory)
+    validate_manifest_hashes(payload, inventory)
     client.kubectl(
         "apply",
         "--server-side",
