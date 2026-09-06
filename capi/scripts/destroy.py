@@ -19,6 +19,7 @@ from scripts.lib.management import (
     validate_management_kubeconfig,
 )
 from scripts.lib.providers import delete_providers
+from scripts.lib.addons import delete_addons
 from scripts.lib.tenants import delete_tenant, spike_tenant
 
 
@@ -49,7 +50,8 @@ def _validate_runtime_inventory(root: Path) -> None:
         ),
         re.compile(r"^tenants/(capi-worker-spike|tenant-a|tenant-b)/kubeconfig$"),
         re.compile(
-            r"^storage/(spike|tenant-a|tenant-b)/\.capi-owner\.json$"
+            r"^storage/(spike|tenant-a|tenant-b)/"
+            r"(\.capi-owner\.json|phase3-marker)$"
         ),
         re.compile(r"^evidence/endpoint-failure\.txt$"),
         re.compile(r"^evidence/endpoint-success\.json$"),
@@ -178,7 +180,10 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         if not status.get("apiReady"):
             raise RuntimeError("owned management API is not reachable; refusing partial cleanup")
         client = ManagementClient(root, config)
-        delete_tenant(root, config, client, spike_tenant(root, config))
+        spike = spike_tenant(root, config)
+        if (root / ".runtime" / "tenants" / spike.name / "kubeconfig").is_file():
+            delete_addons(root, config, client, spike)
+        delete_tenant(root, config, client, spike)
         _delete_kubernetes_stack(root, config, client)
         delete_management(root, config)
     restore_inotify(root, config)

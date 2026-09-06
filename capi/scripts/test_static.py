@@ -21,6 +21,7 @@ EXPECTED_RECIPES = {
     "test-endpoint",
     "test-endpoint-negative",
     "test-spike",
+    "test-network-negative",
     "test-machines",
     "test-storage",
     "test-persistence",

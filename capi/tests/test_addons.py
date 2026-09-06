@@ -4,12 +4,16 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.lib.addons import (
     REFERENCE_LIMIT,
     SOURCE_LIMIT,
     _source_object,
     package_source,
+    validate_inventory,
+    validate_resource_set_references,
+    render_resource_set,
 )
 from scripts.lib.files import IntegrityError
 from scripts.lib.tenants import Tenant
@@ -62,4 +66,57 @@ class AddonTests(unittest.TestCase):
         with self.assertRaises(IntegrityError):
             package_source(
                 self.config, self.tenant, "source", content, limit=200
+            )
+
+    def test_rejects_101_references(self) -> None:
+        with self.assertRaises(IntegrityError):
+            validate_inventory({f"source-{index}": "a" * 64 for index in range(101)})
+
+    def test_rejects_missing_or_extra_hash_coverage(self) -> None:
+        resource_set = {
+            "spec": {
+                "resources": [
+                    {"kind": "ConfigMap", "name": "source-a"},
+                    {"kind": "ConfigMap", "name": "source-extra"},
+                ]
+            }
+        }
+        with self.assertRaises(IntegrityError):
+            validate_resource_set_references(
+                resource_set,
+                {"source-a": "a" * 64, "source-b": "b" * 64},
+            )
+
+    def test_rendered_resource_set_references_every_chunk(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            calico = root / "calico.yaml"
+            proxy = root / "proxy.yaml"
+            calico.write_text(
+                "\n---\n".join(
+                    f"apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: item-{i}\n"
+                    f"data:\n  value: {'x' * 500000}\n"
+                    for i in range(3)
+                ),
+                encoding="utf-8",
+            )
+            proxy.write_text(
+                "apiVersion: v1\nkind: ConfigMap\nmetadata:\n  name: proxy\n",
+                encoding="utf-8",
+            )
+            with patch("scripts.lib.addons.render_calico", return_value=calico), patch(
+                "scripts.lib.addons.render_kube_proxy", return_value=proxy
+            ):
+                manifest, inventory = render_resource_set(
+                    root, self.config, self.tenant
+                )
+            payload = json.loads(manifest.read_text(encoding="utf-8"))
+            resource_set = next(
+                item
+                for item in payload["items"]
+                if item["kind"] == "ClusterResourceSet"
+            )
+            self.assertEqual(
+                [item["name"] for item in resource_set["spec"]["resources"]],
+                sorted(inventory),
             )

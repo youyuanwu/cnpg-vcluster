@@ -585,6 +585,21 @@ def delete_tenant(
     client: ManagementClient,
     tenant: Tenant,
 ) -> None:
+    if tenant_kubeconfig_path(root, tenant).is_file():
+        addon = _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            "kube-system",
+            "get",
+            "daemonset/capi-kube-proxy",
+            check=False,
+        )
+        if addon.returncode == 0:
+            raise RuntimeError(
+                "tenant add-ons must be deleted through the live API before Cluster deletion"
+            )
     client.kubectl(
         "-n",
         tenant.namespace,

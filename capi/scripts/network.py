@@ -16,6 +16,7 @@ from scripts.lib.addons import (
 from scripts.lib.config import parse_duration
 from scripts.lib.kube import wait_for
 from scripts.lib.tenants import _tenant_kubectl, delete_tenant
+from scripts.status import collect_status, status_healthy
 
 
 def _verify_control_plane_active(client, config, tenant) -> None:
@@ -326,38 +327,6 @@ def _assert_drift_and_repair(root: Path, config: dict[str, str], client, tenant)
         _wait_network_verified(root, config, tenant)
 
 
-def _wait_addons_absent(root: Path, config: dict[str, str], tenant) -> None:
-    resources = (
-        ("kube-system", "daemonset/capi-kube-proxy"),
-        ("kube-system", "configmap/capi-kube-proxy"),
-        ("kube-system", "daemonset/calico-node"),
-        ("kube-system", "deployment/calico-kube-controllers"),
-    )
-    wait_for(
-        "tenant add-on deletion",
-        parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"]),
-        parse_duration(config["WAIT_POLL_INTERVAL"]),
-        lambda: (
-            True
-            if all(
-                _tenant_kubectl(
-                    root,
-                    config,
-                    tenant,
-                    "-n",
-                    namespace,
-                    "get",
-                    resource,
-                    check=False,
-                ).returncode
-                != 0
-                for namespace, resource in resources
-            )
-            else None
-        ),
-    )
-
-
 def run_network_gate(root: Path, config: dict[str, str]) -> None:
     client, tenant, _ = run_endpoint_gate(root, config, cleanup=False)
     try:
@@ -390,13 +359,23 @@ def run_network_gate(root: Path, config: dict[str, str]) -> None:
             pass
         else:
             raise RuntimeError("kube-proxy drift was not detected")
+        if status_healthy(collect_status(root, config)):
+            raise RuntimeError("status accepted kube-proxy target drift")
         _repair_addons(root, config, client, tenant)
         wait_network_ready(root, config, tenant)
         _wait_network_verified(root, config, tenant)
+        if not status_healthy(collect_status(root, config)):
+            raise RuntimeError("status did not recover after add-on repair")
         _assert_drift_and_repair(root, config, client, tenant)
         _verify_control_plane_active(client, config, tenant)
+        try:
+            delete_tenant(root, config, client, tenant)
+        except RuntimeError as exc:
+            if "add-ons must be deleted" not in str(exc):
+                raise
+        else:
+            raise RuntimeError("tenant deletion bypassed add-on pre-delete cleanup")
         print("tenant networking and kube-proxy reconciliation checks passed")
     finally:
         delete_addons(root, config, client, tenant)
-        _wait_addons_absent(root, config, tenant)
         delete_tenant(root, config, client, tenant)

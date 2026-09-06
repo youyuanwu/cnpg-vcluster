@@ -31,6 +31,10 @@ test-endpoint-negative:
 test-spike:
     @python3 scripts/lab.py test-spike
 
+# [implemented] Prove add-on input tampering fails before mutation.
+test-network-negative:
+    @python3 scripts/test_network_negative.py
+
 # [phase 5] Prove the three-worker Machine lifecycle.
 test-machines:
     @python3 scripts/lab.py unavailable test-machines

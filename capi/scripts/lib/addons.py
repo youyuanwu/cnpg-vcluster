@@ -9,6 +9,7 @@ from .files import IntegrityError, verify_sha256, write_private_file
 from .kube import ManagementClient, wait_for
 from .tenants import Tenant, _tenant_kubectl
 from .config import parse_duration
+from .conditions import condition_true
 
 
 SOURCE_LIMIT = 900 * 1024
@@ -173,6 +174,23 @@ def package_source(
     ]
 
 
+def validate_inventory(inventory: dict[str, str]) -> None:
+    if len(inventory) > REFERENCE_LIMIT:
+        raise IntegrityError("ClusterResourceSet source reference limit exceeded")
+    if any(not re.fullmatch(r"[0-9a-f]{64}", digest) for digest in inventory.values()):
+        raise IntegrityError("ClusterResourceSet inventory contains an invalid SHA-256")
+
+
+def validate_resource_set_references(
+    resource_set: dict[str, object],
+    inventory: dict[str, str],
+) -> None:
+    references = resource_set["spec"]["resources"]
+    names = [item["name"] for item in references]
+    if names != sorted(inventory) or len(names) != len(set(names)):
+        raise IntegrityError("ClusterResourceSet references do not match source inventory")
+
+
 def render_resource_set(
     root: Path,
     config: dict[str, str],
@@ -193,8 +211,7 @@ def render_resource_set(
         ):
             inventory[name] = digest
             objects.append(payload)
-    if len(inventory) > REFERENCE_LIMIT:
-        raise IntegrityError("ClusterResourceSet source reference limit exceeded")
+    validate_inventory(inventory)
     resource_set = {
         "apiVersion": "addons.cluster.x-k8s.io/v1beta2",
         "kind": "ClusterResourceSet",
@@ -210,10 +227,11 @@ def render_resource_set(
             },
             "resources": [
                 {"kind": "ConfigMap", "name": name}
-                for name in sorted(sources)
+                for name in sorted(inventory)
             ],
         },
     }
+    validate_resource_set_references(resource_set, inventory)
     objects.append(resource_set)
     manifest = {
         "apiVersion": "v1",
@@ -243,6 +261,11 @@ def apply_addons(
     tenant: Tenant,
 ) -> dict[str, str]:
     manifest, inventory = render_resource_set(root, config, tenant)
+    payload = json.loads(manifest.read_text(encoding="utf-8"))
+    resource_set = next(
+        item for item in payload["items"] if item["kind"] == "ClusterResourceSet"
+    )
+    validate_resource_set_references(resource_set, inventory)
     client.kubectl(
         "apply",
         "--server-side",
@@ -273,6 +296,7 @@ def wait_network_ready(
 ) -> None:
     timeout = parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"])
     interval = parse_duration(config["WAIT_POLL_INTERVAL"])
+    client = ManagementClient(root, config)
 
     def ready():
         node = json.loads(
@@ -288,6 +312,19 @@ def wait_network_ready(
             ),
             {},
         ).get("status") == "True"
+        machines = json.loads(
+            client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                "machines",
+                "-l",
+                f"cluster.x-k8s.io/cluster-name={tenant.name}",
+                "-o",
+                "json",
+            ).stdout
+        )["items"]
+        machine_ready = len(machines) == 1 and condition_true(machines[0], "Ready")
         checks = (
             ("daemonset/calico-node", "kube-system"),
             ("deployment/calico-kube-controllers", "kube-system"),
@@ -320,7 +357,7 @@ def wait_network_ready(
             if not desired or desired != available:
                 workloads_ready = False
                 break
-        return True if node_ready and workloads_ready else None
+        return True if node_ready and machine_ready and workloads_ready else None
 
     wait_for("tenant network readiness", timeout, interval, ready)
 
@@ -405,6 +442,175 @@ def verify_network(
     )
 
 
+def network_status(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant: Tenant,
+) -> dict[str, object]:
+    result: dict[str, object] = {"ready": False}
+    if not (root / ".runtime" / "tenants" / tenant.name / "kubeconfig").is_file():
+        result["reason"] = "kubeconfig-missing"
+        return result
+    try:
+        nodes = json.loads(
+            _tenant_kubectl(
+                root, config, tenant, "get", "nodes", "-o", "json"
+            ).stdout
+        )["items"]
+        machines = json.loads(
+            client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                "machines",
+                "-l",
+                f"cluster.x-k8s.io/cluster-name={tenant.name}",
+                "-o",
+                "json",
+            ).stdout
+        )["items"]
+        config_map = json.loads(
+            _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "-n",
+                "kube-system",
+                "get",
+                "configmap/capi-kube-proxy",
+                "-o",
+                "json",
+            ).stdout
+        )
+        daemonset = json.loads(
+            _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "-n",
+                "kube-system",
+                "get",
+                "daemonset/capi-kube-proxy",
+                "-o",
+                "json",
+            ).stdout
+        )
+        calico_node = json.loads(
+            _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "-n",
+                "kube-system",
+                "get",
+                "daemonset/calico-node",
+                "-o",
+                "json",
+            ).stdout
+        )
+        calico_controllers = json.loads(
+            _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "-n",
+                "kube-system",
+                "get",
+                "deployment/calico-kube-controllers",
+                "-o",
+                "json",
+            ).stdout
+        )
+        binding = json.loads(
+            _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "get",
+                "clusterrolebinding/capi-system:node-proxier",
+                "-o",
+                "json",
+            ).stdout
+        )
+        kcp = json.loads(
+            client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"kamajicontrolplane/{tenant.name}",
+                "-o",
+                "json",
+            ).stdout
+        )
+        node_ready = len(nodes) == 1 and any(
+            item.get("type") == "Ready" and item.get("status") == "True"
+            for item in nodes[0].get("status", {}).get("conditions", [])
+        )
+        machine_ready = len(machines) == 1 and condition_true(machines[0], "Ready")
+        proxy_ready = (
+            daemonset["status"].get("desiredNumberScheduled", 0)
+            == daemonset["status"].get("numberAvailable", 0)
+            > 0
+            and daemonset["spec"]["template"]["spec"]["containers"][0]["image"]
+            == config["KUBE_PROXY_IMAGE"]
+            and re.search(
+                r"maxPerCore:\s*0",
+                config_map["data"]["config.conf"],
+            )
+            is not None
+        )
+        calico_ready = (
+            calico_node["status"].get("desiredNumberScheduled", 0)
+            == calico_node["status"].get("numberAvailable", 0)
+            > 0
+            and calico_node["spec"]["template"]["spec"]["containers"][0]["image"]
+            == config["CALICO_NODE_IMAGE"]
+            and calico_controllers["status"].get("availableReplicas", 0)
+            == calico_controllers["spec"].get("replicas", 0)
+            > 0
+            and calico_controllers["spec"]["template"]["spec"]["containers"][0][
+                "image"
+            ]
+            == config["CALICO_KUBE_CONTROLLERS_IMAGE"]
+        )
+        rbac_ready = (
+            binding["roleRef"].get("name") == "system:node-proxier"
+            and binding.get("subjects")
+            == [
+                {
+                    "kind": "ServiceAccount",
+                    "name": "capi-kube-proxy",
+                    "namespace": "kube-system",
+                }
+            ]
+        )
+        control_plane_active = "cluster.x-k8s.io/paused" not in (
+            kcp["metadata"].get("annotations") or {}
+        )
+        result.update(
+            {
+                "ready": (
+                    node_ready
+                    and machine_ready
+                    and proxy_ready
+                    and calico_ready
+                    and rbac_ready
+                    and control_plane_active
+                ),
+                "nodeReady": node_ready,
+                "machineReady": machine_ready,
+                "kubeProxyReady": proxy_ready,
+                "calicoReady": calico_ready,
+                "kubeProxyRBACReady": rbac_ready,
+                "controlPlaneActive": control_plane_active,
+            }
+        )
+    except RuntimeError as exc:
+        result["reason"] = str(exc)
+    return result
+
+
 def delete_addons(
     root: Path,
     config: dict[str, str],
@@ -445,4 +651,33 @@ def delete_addons(
         "--ignore-not-found",
         "--wait=false",
         check=False,
+    )
+    resources = (
+        ("kube-system", "daemonset/capi-kube-proxy"),
+        ("kube-system", "configmap/capi-kube-proxy"),
+        ("kube-system", "daemonset/calico-node"),
+        ("kube-system", "deployment/calico-kube-controllers"),
+    )
+    wait_for(
+        "tenant add-on deletion",
+        parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"]),
+        parse_duration(config["WAIT_POLL_INTERVAL"]),
+        lambda: (
+            True
+            if all(
+                _tenant_kubectl(
+                    root,
+                    config,
+                    tenant,
+                    "-n",
+                    namespace,
+                    "get",
+                    resource,
+                    check=False,
+                ).returncode
+                != 0
+                for namespace, resource in resources
+            )
+            else None
+        ),
     )

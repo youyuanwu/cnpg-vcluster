@@ -11,6 +11,8 @@ from scripts.lib.management import (
     management_status,
 )
 from scripts.lib.providers import provider_status
+from scripts.lib.addons import network_status
+from scripts.lib.tenants import spike_tenant
 
 
 def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
@@ -37,6 +39,16 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
         result["providers"] = provider_status(config, client)
         result["components"] = management_component_status(config, client)
         result["auxiliary"] = management_auxiliary_status(config, client)
+        spike = spike_tenant(root, config)
+        spike_cluster = client.kubectl(
+            "-n",
+            spike.namespace,
+            "get",
+            f"cluster/{spike.name}",
+            check=False,
+        )
+        if spike_cluster.returncode == 0:
+            result["spikeNetwork"] = network_status(root, config, client, spike)
         kamaji = client.kubectl(
             "-n",
             config["MANAGEMENT_NAMESPACE"],
@@ -80,6 +92,10 @@ def status_healthy(result: dict[str, object]) -> bool:
         and all(provider.get("available") for provider in providers)
         and len(components) == 7
         and all(component.get("available") for component in components)
+        and (
+            "spikeNetwork" not in result
+            or result["spikeNetwork"].get("ready")
+        )
     )
 
 
