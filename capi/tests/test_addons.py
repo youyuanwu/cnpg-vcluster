@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import tempfile
 import unittest
 from pathlib import Path
@@ -88,6 +89,20 @@ class AddonTests(unittest.TestCase):
                 {"source-a": "a" * 64, "source-b": "b" * 64},
             )
 
+    def test_rejects_non_configmap_reference_kind(self) -> None:
+        resource_set = {
+            "spec": {
+                "resources": [
+                    {"kind": "Secret", "name": "source-a"},
+                ]
+            }
+        }
+        with self.assertRaises(IntegrityError):
+            validate_resource_set_references(
+                resource_set,
+                {"source-a": "a" * 64},
+            )
+
     def test_rendered_resource_set_references_every_chunk(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -134,3 +149,23 @@ class AddonTests(unittest.TestCase):
         }
         with self.assertRaises(IntegrityError):
             validate_manifest_hashes(manifest, {"source": "a" * 64})
+
+    def test_rejects_duplicate_manifest_source_names(self) -> None:
+        content = "kind: ConfigMap\n"
+        digest = hashlib.sha256(content.encode()).hexdigest()
+        manifest = {
+            "items": [
+                {
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "source"},
+                    "data": {"addons.yaml": "tampered"},
+                },
+                {
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "source"},
+                    "data": {"addons.yaml": content},
+                },
+            ]
+        }
+        with self.assertRaises(IntegrityError):
+            validate_manifest_hashes(manifest, {"source": digest})

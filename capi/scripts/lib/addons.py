@@ -187,7 +187,14 @@ def validate_resource_set_references(
 ) -> None:
     references = resource_set["spec"]["resources"]
     names = [item["name"] for item in references]
-    if names != sorted(inventory) or len(names) != len(set(names)):
+    if (
+        names != sorted(inventory)
+        or len(names) != len(set(names))
+        or any(
+            set(item) != {"kind", "name"} or item["kind"] != "ConfigMap"
+            for item in references
+        )
+    ):
         raise IntegrityError("ClusterResourceSet references do not match source inventory")
 
 
@@ -195,13 +202,19 @@ def validate_manifest_hashes(
     manifest: dict[str, object],
     inventory: dict[str, str],
 ) -> None:
-    observed = {
-        item["metadata"]["name"]: hashlib.sha256(
-            item["data"]["addons.yaml"].encode("utf-8")
-        ).hexdigest()
+    entries = [
+        (
+            item["metadata"]["name"],
+            hashlib.sha256(item["data"]["addons.yaml"].encode("utf-8")).hexdigest(),
+        )
         for item in manifest["items"]
         if item["kind"] == "ConfigMap"
-    }
+    ]
+    if len(entries) != len(inventory) or len({name for name, _ in entries}) != len(
+        entries
+    ):
+        raise IntegrityError("ClusterResourceSet manifest has duplicate or missing sources")
+    observed = dict(entries)
     if observed != inventory:
         raise IntegrityError("ClusterResourceSet manifest content hashes do not match inventory")
 
