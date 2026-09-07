@@ -50,7 +50,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         ),
         re.compile(r"^tenants/(capi-worker-spike|tenant-a|tenant-b)/kubeconfig$"),
         re.compile(
-            r"^storage/(spike|tenant-a|tenant-b)/"
+            r"^storage/(capi-worker-spike|tenant-a|tenant-b)/"
             r"volume\.json$"
         ),
         re.compile(r"^evidence/endpoint-failure\.txt$"),
@@ -67,6 +67,10 @@ def _validate_runtime_inventory(root: Path) -> None:
         re.compile(
             r"^rendered/storage/(capi-worker-spike|tenant-a|tenant-b)/"
             r"smoke\.yaml$"
+        ),
+        re.compile(
+            r"^rendered/cnpg/(capi-worker-spike|tenant-a|tenant-b)/"
+            r"(operator|cluster|static-pvs)\.yaml$"
         ),
     )
     for path in runtime.rglob("*"):
@@ -188,8 +192,24 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         spike = spike_tenant(root, config)
         if (root / ".runtime" / "tenants" / spike.name / "kubeconfig").is_file():
             from scripts.lib.tenants import _tenant_kubectl
+            from scripts.cnpg import delete_cnpg
             from scripts.storage import _delete_storage
 
+            cnpg_present = (
+                _tenant_kubectl(
+                    root,
+                    config,
+                    spike,
+                    "-n",
+                    config["DATABASE_NAMESPACE"],
+                    "get",
+                    f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
+                    check=False,
+                ).returncode
+                == 0
+            )
+            if cnpg_present:
+                delete_cnpg(root, config, spike)
             storage_present = any(
                 _tenant_kubectl(
                     root,

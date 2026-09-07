@@ -165,8 +165,14 @@ def _delete_storage(root: Path, config: dict[str, str], tenant) -> None:
             raise RuntimeError(f"storage resource remained after deletion: {resource}")
 
 
-def run_storage_gate(root: Path, config: dict[str, str]) -> None:
+def run_storage_gate(
+    root: Path,
+    config: dict[str, str],
+    *,
+    cleanup: bool = True,
+):
     client, tenant = run_network_gate(root, config, cleanup=False)
+    succeeded = False
     try:
         _scale_three(root, config, client, tenant)
         before_workers = worker_snapshot(root, config, client, tenant)
@@ -194,6 +200,17 @@ def run_storage_gate(root: Path, config: dict[str, str]) -> None:
             "--wait=true",
             f"--timeout={config['DELETE_TIMEOUT']}",
         )
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "delete",
+            f"pod/{smoke['name']}",
+            "--grace-period=0",
+            "--force",
+            "--ignore-not-found",
+            "--wait=false",
+        )
         wait_network_ready(root, config, tenant)
         after_workers = worker_snapshot(root, config, client, tenant)
         replacement = _wait_smoke(root, config, tenant)
@@ -213,7 +230,10 @@ def run_storage_gate(root: Path, config: dict[str, str]) -> None:
         if set(before_workers) == set(after_workers):
             raise RuntimeError("Machine replacement did not change worker identity")
         print("Docker-volume-backed hostPath storage checks passed")
+        succeeded = True
+        return client, tenant, after_workers
     finally:
-        _delete_storage(root, config, tenant)
-        delete_addons(root, config, client, tenant)
-        delete_tenant(root, config, client, tenant)
+        if cleanup or not succeeded:
+            _delete_storage(root, config, tenant)
+            delete_addons(root, config, client, tenant)
+            delete_tenant(root, config, client, tenant)

@@ -26,6 +26,7 @@ EXPECTED_RECIPES = {
     "test-storage",
     "test-storage-negative",
     "test-persistence",
+    "test-persistence-negative",
     "create",
     "repair",
     "status",

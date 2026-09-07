@@ -68,6 +68,8 @@ AUTHORED_INPUTS = (
         "manifests/storage/hostpath-smoke.yaml.tpl",
         "HOSTPATH_STORAGE_TEMPLATE_SHA256",
     ),
+    ("manifests/cnpg/cluster.yaml.tpl", "CNPG_CLUSTER_TEMPLATE_SHA256"),
+    ("manifests/cnpg/static-pvs.yaml.tpl", "CNPG_STATIC_PVS_TEMPLATE_SHA256"),
 )
 
 TAG_SOURCES = (

@@ -47,9 +47,13 @@ test-storage:
 test-storage-negative:
     @python3 scripts/test_storage_negative.py
 
-# [phase 7] Prove CNPG continuity through Machine replacement.
+# [implemented] Prove CNPG continuity through Machine replacement.
 test-persistence:
-    @python3 scripts/lab.py unavailable test-persistence
+    @python3 scripts/lab.py test-persistence
+
+# [implemented] Prove CNPG input tampering fails before mutation.
+test-persistence-negative:
+    @python3 scripts/test_persistence_negative.py
 
 # [phase 8] Reconcile both tenant clusters.
 create:

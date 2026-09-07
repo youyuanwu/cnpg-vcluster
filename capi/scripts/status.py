@@ -187,6 +187,104 @@ def _storage_layer_status(root: Path, config: dict[str, str], tenant):
     return result
 
 
+def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
+    cluster = _tenant_kubectl(
+        root,
+        config,
+        tenant,
+        "-n",
+        config["DATABASE_NAMESPACE"],
+        "get",
+        f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
+        "-o",
+        "json",
+        check=False,
+    )
+    if cluster.returncode != 0:
+        return {"ready": False, "reason": "cluster-missing"}
+    cluster_payload = json.loads(cluster.stdout)
+    pods = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            "pods",
+            "-l",
+            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    pvcs = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            "pvc",
+            "-l",
+            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    ready_pods = [
+        pod
+        for pod in pods
+        if any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in pod.get("status", {}).get("conditions", [])
+        )
+    ]
+    operator = _tenant_kubectl(
+        root,
+        config,
+        tenant,
+        "-n",
+        config["CNPG_NAMESPACE"],
+        "get",
+        "deployment/cnpg-controller-manager",
+        "-o",
+        "json",
+        check=False,
+    )
+    operator_ready = False
+    if operator.returncode == 0:
+        payload = json.loads(operator.stdout)
+        operator_ready = (
+            payload["status"].get("availableReplicas", 0)
+            == payload["spec"].get("replicas", 0)
+            > 0
+            and payload["spec"]["template"]["spec"]["containers"][0]["image"]
+            == config["CNPG_CONTROLLER_IMAGE"]
+        )
+    result = {
+        "clusterPhase": cluster_payload.get("status", {}).get("phase"),
+        "currentPrimary": cluster_payload.get("status", {}).get("currentPrimary"),
+        "operatorReady": operator_ready,
+        "pods": sorted(pod["metadata"]["name"] for pod in pods),
+        "nodes": sorted({pod["spec"].get("nodeName") for pod in ready_pods}),
+        "pvcs": sorted(
+            f"{pvc['metadata']['name']}:{pvc['status'].get('phase')}:{pvc['spec'].get('volumeName')}"
+            for pvc in pvcs
+        ),
+    }
+    result["ready"] = (
+        operator_ready
+        and result["clusterPhase"] == "Cluster in healthy state"
+        and len(ready_pods) == 3
+        and len(result["nodes"]) == 3
+        and len(pvcs) == 3
+        and all(pvc["status"].get("phase") == "Bound" for pvc in pvcs)
+    )
+    return result
+
+
 def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
     management = management_status(root, config)
     host = {
@@ -230,6 +328,27 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
             result["spikeStorage"] = _storage_layer_status(
                 root, config, spike
             )
+            cnpg = client.kubectl(
+                "-n",
+                spike.namespace,
+                "get",
+                f"cluster/{spike.name}",
+                check=False,
+            )
+            if cnpg.returncode == 0 and (
+                _tenant_kubectl(
+                    root,
+                    config,
+                    spike,
+                    "-n",
+                    config["DATABASE_NAMESPACE"],
+                    "get",
+                    f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
+                    check=False,
+                ).returncode
+                == 0
+            ):
+                result["spikeCNPG"] = _cnpg_layer_status(root, config, spike)
         kamaji = client.kubectl(
             "-n",
             config["MANAGEMENT_NAMESPACE"],
@@ -284,6 +403,10 @@ def status_healthy(result: dict[str, object]) -> bool:
         and (
             "spikeStorage" not in result
             or result["spikeStorage"].get("ready")
+        )
+        and (
+            "spikeCNPG" not in result
+            or result["spikeCNPG"].get("ready")
         )
     )
 

@@ -727,6 +727,20 @@ def delete_tenant(
                 raise RuntimeError(
                     "tenant storage API resources must be deleted before Cluster deletion"
                 )
+        cnpg_cluster = _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
+            check=False,
+        )
+        if cnpg_cluster.returncode == 0:
+            raise RuntimeError(
+                "tenant CNPG resources must be deleted before Cluster deletion"
+            )
     client.kubectl(
         "-n",
         tenant.namespace,
