@@ -22,6 +22,7 @@ from scripts.cnpg import (
 from scripts.create import create, stable_tenant_snapshot
 from scripts.endpoint import _verify_bootstrap_secret
 from scripts.lib.addons import verify_network
+from scripts.lib.conditions import condition_true
 from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
@@ -81,6 +82,12 @@ def _cluster_identity(root: Path, config: dict[str, str], client, tenant):
         or network["pods"]["cidrBlocks"] != [tenant.pod_cidr]
         or network["services"]["cidrBlocks"] != [tenant.service_cidr]
         or network["serviceDomain"] != tenant.domain
+        or not condition_true(cluster, "Available")
+        or not condition_true(kcp, "Available")
+        or kcp.get("status", {})
+        .get("initialization", {})
+        .get("controlPlaneInitialized")
+        is not True
         or "cluster.x-k8s.io/paused" in (kcp["metadata"].get("annotations") or {})
     ):
         raise RuntimeError(f"tenant control-plane identity drift: {tenant.name}")
@@ -244,11 +251,13 @@ def _reject_kubernetes_credential(
             raise RuntimeError(
                 f"{source.name} Kubernetes credential accessed {target.name}"
             )
-        if not re.search(
-            r"\b(unauthorized|forbidden)\b",
-            result.stdout + result.stderr,
-            re.IGNORECASE,
-        ):
+        rejection = result.stdout + result.stderr
+        unauthorized = re.search(r"\bunauthorized\b", rejection, re.IGNORECASE)
+        anonymous_forbidden = (
+            re.search(r"\bforbidden\b", rejection, re.IGNORECASE)
+            and 'User "system:anonymous"' in rejection
+        )
+        if not unauthorized and not anonymous_forbidden:
             raise RuntimeError(
                 f"cross-tenant Kubernetes rejection was inconclusive: {target.name}"
             )
@@ -371,7 +380,7 @@ def _reject_postgres_credential(
         path.unlink(missing_ok=True)
 
 
-def _management_absence(config: dict[str, str], client, workers) -> None:
+def _management_absence(config: dict[str, str], client, tenants, workers) -> None:
     nodes = json.loads(client.kubectl("get", "nodes", "-o", "json").stdout)["items"]
     tenant_nodes = set().union(*(set(items) for items in workers.values()))
     if tenant_nodes & {item["metadata"]["name"] for item in nodes}:
@@ -379,6 +388,11 @@ def _management_absence(config: dict[str, str], client, workers) -> None:
     for resource in (
         f"namespace/{config['DATABASE_NAMESPACE']}",
         "crd/clusters.postgresql.cnpg.io",
+        *(
+            f"pv/{tenant.cnpg_cluster}-pv-{ordinal}"
+            for tenant in tenants
+            for ordinal in (1, 2, 3)
+        ),
     ):
         if client.kubectl("get", resource, check=False).returncode == 0:
             raise RuntimeError(f"tenant database resource appeared in management: {resource}")
@@ -428,7 +442,7 @@ def verify(root: Path, config: dict[str, str]) -> dict[str, object]:
         if len(set(passwords.values())) != len(passwords):
             raise RuntimeError("tenant PostgreSQL credentials are identical")
         _storage_isolation(root, config, tenants, workers)
-        _management_absence(config, client, workers)
+        _management_absence(config, client, tenants, workers)
         for source, target in ((tenants[0], tenants[1]), (tenants[1], tenants[0])):
             _reject_kubernetes_credential(root, config, source, target)
             _reject_postgres_credential(

@@ -9,7 +9,7 @@ from scripts.verify import _reject_kubernetes_credential
 
 
 class VerifyTests(unittest.TestCase):
-    def test_cross_kubernetes_transport_failure_is_not_rejection(self) -> None:
+    def _assert_inconclusive(self, stderr: str) -> None:
         source = type("Tenant", (), {"name": "tenant-a", "vip": "172.18.0.10"})()
         target = type("Tenant", (), {"name": "tenant-b", "vip": "172.18.0.11"})()
         with tempfile.TemporaryDirectory() as temporary:
@@ -26,18 +26,14 @@ class VerifyTests(unittest.TestCase):
                 (),
                 {"returncode": 0, "stdout": "node\n", "stderr": ""},
             )()
-            refused = type(
+            rejected = type(
                 "Result",
                 (),
-                {
-                    "returncode": 1,
-                    "stdout": "",
-                    "stderr": "connection refused",
-                },
+                {"returncode": 1, "stdout": "", "stderr": stderr},
             )()
             with (
                 patch("scripts.verify._tenant_kubectl", return_value=reachable),
-                patch("scripts.verify.run", return_value=refused),
+                patch("scripts.verify.run", return_value=rejected),
             ):
                 with self.assertRaisesRegex(RuntimeError, "inconclusive"):
                     _reject_kubernetes_credential(
@@ -49,3 +45,11 @@ class VerifyTests(unittest.TestCase):
                         source,
                         target,
                     )
+
+    def test_cross_kubernetes_transport_failure_is_not_rejection(self) -> None:
+        self._assert_inconclusive("connection refused")
+
+    def test_named_forbidden_identity_is_not_credential_rejection(self) -> None:
+        self._assert_inconclusive(
+            'Error from server (Forbidden): User "tenant-a-admin" cannot list nodes'
+        )

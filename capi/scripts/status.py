@@ -285,6 +285,42 @@ def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
     return result
 
 
+def _control_plane_layer_status(config: dict[str, str], client, tenant, cluster):
+    kcp = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"kamajicontrolplane/{tenant.name}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    endpoint = cluster["spec"].get("controlPlaneEndpoint", {})
+    return {
+        "ready": (
+            condition_true(cluster, "Available")
+            and condition_true(kcp, "Available")
+            and kcp.get("status", {})
+            .get("initialization", {})
+            .get("controlPlaneInitialized")
+            is True
+            and endpoint.get("host") == tenant.vip
+            and int(endpoint.get("port", 0)) == int(config["SPIKE_API_PORT"])
+            and "cluster.x-k8s.io/paused"
+            not in (kcp["metadata"].get("annotations") or {})
+        ),
+        "clusterAvailable": condition_true(cluster, "Available"),
+        "controlPlaneAvailable": condition_true(kcp, "Available"),
+        "controlPlaneInitialized": kcp.get("status", {})
+        .get("initialization", {})
+        .get("controlPlaneInitialized")
+        is True,
+        "paused": "cluster.x-k8s.io/paused"
+        in (kcp["metadata"].get("annotations") or {}),
+    }
+
+
 def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
     management = management_status(root, config)
     host = {
@@ -357,6 +393,8 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
                 tenant.namespace,
                 "get",
                 f"cluster/{tenant.name}",
+                "-o",
+                "json",
                 check=False,
             )
             if cluster.returncode != 0:
@@ -366,10 +404,14 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
                 }
                 continue
             configured_cluster_present = True
+            cluster_payload = json.loads(cluster.stdout)
             tenant_status = {
                 "endpoint": f"{tenant.vip}:{config['SPIKE_API_PORT']}",
                 "domain": tenant.domain,
                 "database": tenant.cnpg_cluster,
+                "controlPlane": _control_plane_layer_status(
+                    config, client, tenant, cluster_payload
+                ),
                 "network": network_status(root, config, client, tenant),
             }
             try:
@@ -382,7 +424,13 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
             tenant_status["cnpg"] = _cnpg_layer_status(root, config, tenant)
             tenant_status["ready"] = all(
                 tenant_status[layer].get("ready")
-                for layer in ("network", "machines", "storage", "cnpg")
+                for layer in (
+                    "controlPlane",
+                    "network",
+                    "machines",
+                    "storage",
+                    "cnpg",
+                )
             )
             result["tenants"][tenant.name] = tenant_status
         result["tenantModeExpected"] = (
