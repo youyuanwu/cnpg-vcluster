@@ -408,6 +408,18 @@ def prepare_tools(root: Path, config: dict[str, str]) -> None:
         config["HELM_BINARY_SHA256"],
     )
     _ensure_cert_manager_chart(config, inputs_dir, bin_dir, timeout)
+    allowed_inputs = {
+        filename for filename, _, _ in DOWNLOADS
+    } | {
+        f"cert-manager-{config['CERT_MANAGER_VERSION']}.tgz",
+        f"cert-manager-{config['CERT_MANAGER_VERSION']}.digest",
+    }
+    for path in inputs_dir.iterdir():
+        if path.name in allowed_inputs:
+            continue
+        if not path.is_file() or path.is_symlink():
+            raise IntegrityError(f"unexpected non-file tool input blocks pruning: {path}")
+        path.unlink()
 
     for repository, version_key, commit_key in TAG_SOURCES:
         tag = config[version_key]

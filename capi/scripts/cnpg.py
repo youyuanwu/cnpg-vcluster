@@ -7,6 +7,7 @@ from pathlib import Path
 from scripts.lib.files import IntegrityError, verify_sha256, write_private_file
 from scripts.lib.kube import wait_for
 from scripts.lib.process import run
+from scripts.lib.redaction import redact
 from scripts.lib.tenants import _tenant_kubectl
 from scripts.lib.tenants import storage_volume_name
 from scripts.lib.addons import delete_addons
@@ -365,8 +366,7 @@ for ordinal in 1 2 3; do
   test -f "$file"
   echo "instance=$ordinal file=$file metadata=$(stat -c %u:%g:%a "$file")"
   test "$(stat -c %u:%g "$file")" = 26:26
-  file_mode=$(stat -c %a "$file")
-  test "$file_mode" -le 600
+  test "$(stat -c %a "$file")" = 600
 done
 """
     run(
@@ -492,6 +492,26 @@ def _replica_restart(root: Path, config: dict[str, str], tenant) -> None:
         root, config, tenant, "-n", "database", "get", f"pvc/{pvc}",
         "-o", "jsonpath={.spec.volumeName}"
     ).stdout
+    new_pod = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            "database",
+            "get",
+            f"pod/{name}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    new_pvc = next(
+        volume["persistentVolumeClaim"]["claimName"]
+        for volume in new_pod["spec"]["volumes"]
+        if "persistentVolumeClaim" in volume
+    )
+    if new_pvc != pvc:
+        raise RuntimeError("replacement replica PVC identity changed")
     if new_pv != pv:
         raise RuntimeError("replica PV identity changed")
 
@@ -578,8 +598,53 @@ def delete_cnpg(root: Path, config: dict[str, str], tenant) -> None:
     )
 
 
+def cnpg_artifacts_present(root: Path, config: dict[str, str], tenant) -> bool:
+    checks = (
+        (
+            ("-n", config["DATABASE_NAMESPACE"]),
+            f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
+        ),
+        (
+            ("-n", config["DATABASE_NAMESPACE"]),
+            "pvc",
+        ),
+        ((), f"pv/{config['SPIKE_CNPG_CLUSTER']}-pv-1"),
+        (
+            ("-n", config["CNPG_NAMESPACE"]),
+            "deployment/cnpg-controller-manager",
+        ),
+        ((), "crd/clusters.postgresql.cnpg.io"),
+    )
+    for scope, resource in checks:
+        arguments = [*scope, "get", resource]
+        is_list = resource == "pvc"
+        if is_list:
+            arguments.extend(
+                (
+                    "-l",
+                    f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+                    "-o",
+                    "name",
+                )
+            )
+        response = _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            *arguments,
+            check=False,
+        )
+        if response.returncode == 0 and (not is_list or response.stdout.strip()):
+            return True
+    return False
+
+
 def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
     client, tenant, _ = run_storage_gate(root, config, cleanup=False)
+    failure = root / ".runtime" / "evidence" / "cnpg-failure.txt"
+    success = root / ".runtime" / "evidence" / "cnpg-success.json"
+    failure.unlink(missing_ok=True)
+    success.unlink(missing_ok=True)
     try:
         install_cnpg(root, config, tenant)
         from scripts.status import collect_status, status_healthy
@@ -598,7 +663,24 @@ def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
         _primary_failover(root, config, tenant)
         _verify_marker(root, config, tenant)
         _verify_filesystem(config, tenant)
+        write_private_file(
+            success,
+            json.dumps(
+                {
+                    "cluster": config["SPIKE_CNPG_CLUSTER"],
+                    "operatorImage": config["CNPG_CONTROLLER_IMAGE"],
+                    "postgresImage": config["POSTGRES_IMAGE"],
+                    "revision": config["CNPG_COMPATIBILITY_REVISION"],
+                    "storage": _storage_identity(root, config, tenant),
+                },
+                sort_keys=True,
+            )
+            + "\n",
+        )
         print("CNPG persistence checks passed")
+    except Exception as exc:
+        write_private_file(failure, redact(str(exc)) + "\n")
+        raise
     finally:
         delete_cnpg(root, config, tenant)
         _delete_storage(root, config, tenant)

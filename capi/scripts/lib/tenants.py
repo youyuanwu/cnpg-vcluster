@@ -727,17 +727,39 @@ def delete_tenant(
                 raise RuntimeError(
                     "tenant storage API resources must be deleted before Cluster deletion"
                 )
-        cnpg_cluster = _tenant_kubectl(
-            root,
-            config,
-            tenant,
-            "-n",
-            config["DATABASE_NAMESPACE"],
-            "get",
-            f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
-            check=False,
+        cnpg_resources = (
+            (("-n", config["DATABASE_NAMESPACE"]), f"cluster/{config['SPIKE_CNPG_CLUSTER']}"),
+            (("-n", config["DATABASE_NAMESPACE"]), "pvc"),
+            ((), f"pv/{config['SPIKE_CNPG_CLUSTER']}-pv-1"),
+            (("-n", config["CNPG_NAMESPACE"]), "deployment/cnpg-controller-manager"),
+            ((), "crd/clusters.postgresql.cnpg.io"),
         )
-        if cnpg_cluster.returncode == 0:
+        cnpg_present = False
+        for scope, resource in cnpg_resources:
+            arguments = [*scope, "get", resource]
+            is_list = resource == "pvc"
+            if is_list:
+                arguments.extend(
+                    (
+                        "-l",
+                        f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+                        "-o",
+                        "name",
+                    )
+                )
+            response = _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                *arguments,
+                check=False,
+            )
+            if response.returncode == 0 and (
+                not is_list or response.stdout.strip()
+            ):
+                cnpg_present = True
+                break
+        if cnpg_present:
             raise RuntimeError(
                 "tenant CNPG resources must be deleted before Cluster deletion"
             )

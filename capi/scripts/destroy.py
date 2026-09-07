@@ -55,6 +55,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         ),
         re.compile(r"^evidence/endpoint-failure\.txt$"),
         re.compile(r"^evidence/endpoint-success\.json$"),
+        re.compile(r"^evidence/cnpg-(success\.json|failure\.txt)$"),
         re.compile(r"^rendered/negative/foreign-node\.json$"),
         re.compile(
             r"^rendered/addons/(capi-worker-spike|tenant-a|tenant-b)/"
@@ -192,23 +193,10 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         spike = spike_tenant(root, config)
         if (root / ".runtime" / "tenants" / spike.name / "kubeconfig").is_file():
             from scripts.lib.tenants import _tenant_kubectl
-            from scripts.cnpg import delete_cnpg
+            from scripts.cnpg import cnpg_artifacts_present, delete_cnpg
             from scripts.storage import _delete_storage
 
-            cnpg_present = (
-                _tenant_kubectl(
-                    root,
-                    config,
-                    spike,
-                    "-n",
-                    config["DATABASE_NAMESPACE"],
-                    "get",
-                    f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
-                    check=False,
-                ).returncode
-                == 0
-            )
-            if cnpg_present:
+            if cnpg_artifacts_present(root, config, spike):
                 delete_cnpg(root, config, spike)
             storage_present = any(
                 _tenant_kubectl(
