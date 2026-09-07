@@ -14,7 +14,7 @@ from scripts.lib.management import (
 from scripts.lib.providers import provider_status
 from scripts.lib.addons import network_status
 from scripts.lib.process import run
-from scripts.lib.tenants import _tenant_kubectl, spike_tenant
+from scripts.lib.tenants import _tenant_kubectl, configured_tenants, spike_tenant
 from scripts.lib.tenants import (
     inspect_storage_volume,
     storage_record_path,
@@ -195,7 +195,7 @@ def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
         "-n",
         config["DATABASE_NAMESPACE"],
         "get",
-        f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
+        f"cluster/{tenant.cnpg_cluster}",
         "-o",
         "json",
         check=False,
@@ -213,7 +213,7 @@ def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
             "get",
             "pods",
             "-l",
-            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            f"cnpg.io/cluster={tenant.cnpg_cluster}",
             "-o",
             "json",
         ).stdout
@@ -228,7 +228,7 @@ def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
             "get",
             "pvc",
             "-l",
-            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            f"cnpg.io/cluster={tenant.cnpg_cluster}",
             "-o",
             "json",
         ).stdout
@@ -343,12 +343,57 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
                     "-n",
                     config["DATABASE_NAMESPACE"],
                     "get",
-                    f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
+                    f"cluster/{spike.cnpg_cluster}",
                     check=False,
                 ).returncode
                 == 0
             ):
                 result["spikeCNPG"] = _cnpg_layer_status(root, config, spike)
+        result["tenants"] = {}
+        configured_cluster_present = False
+        for tenant in configured_tenants(root, config):
+            cluster = client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"cluster/{tenant.name}",
+                check=False,
+            )
+            if cluster.returncode != 0:
+                result["tenants"][tenant.name] = {
+                    "ready": False,
+                    "reason": "cluster-missing",
+                }
+                continue
+            configured_cluster_present = True
+            tenant_status = {
+                "endpoint": f"{tenant.vip}:{config['SPIKE_API_PORT']}",
+                "domain": tenant.domain,
+                "database": tenant.cnpg_cluster,
+                "network": network_status(root, config, client, tenant),
+            }
+            try:
+                tenant_status["machines"] = _machine_layer_status(
+                    root, config, client, tenant
+                )
+            except RuntimeError as exc:
+                tenant_status["machines"] = {"ready": False, "reason": str(exc)}
+            tenant_status["storage"] = _storage_layer_status(root, config, tenant)
+            tenant_status["cnpg"] = _cnpg_layer_status(root, config, tenant)
+            tenant_status["ready"] = all(
+                tenant_status[layer].get("ready")
+                for layer in ("network", "machines", "storage", "cnpg")
+            )
+            result["tenants"][tenant.name] = tenant_status
+        result["tenantModeExpected"] = (
+            configured_cluster_present
+            or (root / ".runtime" / "evidence" / "create-success.json").is_file()
+        )
+        result["tenantIsolationModel"] = {
+            "workers": "exclusive CAPD containers",
+            "storage": "distinct Docker volumes",
+            "kernel": "shared host kernel",
+        }
         kamaji = client.kubectl(
             "-n",
             config["MANAGEMENT_NAMESPACE"],
@@ -407,6 +452,16 @@ def status_healthy(result: dict[str, object]) -> bool:
         and (
             "spikeCNPG" not in result
             or result["spikeCNPG"].get("ready")
+        )
+        and (
+            not result.get("tenantModeExpected")
+            or (
+                len(result.get("tenants") or {}) == 2
+                and all(
+                    tenant.get("ready")
+                    for tenant in (result.get("tenants") or {}).values()
+                )
+            )
         )
     )
 

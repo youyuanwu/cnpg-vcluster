@@ -42,7 +42,7 @@ metadata:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
 spec:
   clusterName: ${CLUSTER_NAME}
-  replicas: 1
+  replicas: ${WORKER_REPLICAS}
   machineNaming:
     template: "{{ .cluster.name }}-worker-{{ .random }}"
   selector:

@@ -404,6 +404,31 @@ def reconcile_metallb(
         "speaker": config["METALLB_SPEAKER_IMAGE"],
     }:
         raise RuntimeError("MetalLB live image identities do not match")
+    wait_for(
+        "MetalLB admission webhook endpoints",
+        parse_duration(config["METALLB_TIMEOUT"]),
+        parse_duration(config["WAIT_POLL_INTERVAL"]),
+        lambda: (
+            True
+            if (
+                (response := client.kubectl(
+                    "-n",
+                    "metallb-system",
+                    "get",
+                    "endpoints/metallb-webhook-service",
+                    "-o",
+                    "json",
+                    check=False,
+                )).returncode
+                == 0
+                and any(
+                    subset.get("addresses")
+                    for subset in json.loads(response.stdout).get("subsets", [])
+                )
+            )
+            else None
+        ),
+    )
     client.kubectl("apply", "-f", str(_render_metallb_pool(root, config, network)))
 
 

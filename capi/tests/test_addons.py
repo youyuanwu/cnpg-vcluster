@@ -32,6 +32,8 @@ class AddonTests(unittest.TestCase):
             dns_ip="10.2.0.10",
             domain="spike.local",
             storage_host_path=Path("/tmp/spike"),
+            cnpg_cluster="spike-postgres",
+            workers=1,
         )
         self.config = {
             "OWNERSHIP_LABEL": "example.owner",

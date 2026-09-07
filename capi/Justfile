@@ -55,9 +55,9 @@ test-persistence:
 test-persistence-negative:
     @python3 scripts/test_persistence_negative.py
 
-# [phase 8] Reconcile both tenant clusters.
+# [implemented] Reconcile both tenant clusters.
 create:
-    @python3 scripts/lab.py unavailable create
+    @python3 scripts/lab.py create
 
 # [phase 9] Repair one exactly identified tenant.
 repair tenant:
@@ -71,9 +71,9 @@ status:
 diagnose scope="all":
     @python3 scripts/lab.py diagnose "{{scope}}"
 
-# [phase 8] Verify tenant isolation and database behavior.
+# [implemented] Verify tenant isolation and database behavior.
 verify:
-    @python3 scripts/lab.py unavailable verify
+    @python3 scripts/lab.py verify
 
 # [phase 9] Delete one tenant and verify the survivor.
 destroy-tenant tenant:

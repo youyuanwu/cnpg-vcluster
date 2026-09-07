@@ -13,6 +13,7 @@ from scripts.lib.host import HostError, prepare_inotify, restore_inotify
 from scripts.lib.locking import tools_lock
 from scripts.lib.redaction import redact
 from scripts.create_management import create_management
+from scripts.create import create
 from scripts.destroy import destroy
 from scripts.diagnose import diagnose
 from scripts.endpoint import run_endpoint_gate
@@ -23,6 +24,7 @@ from scripts.cnpg import run_cnpg_gate
 from scripts.preflight import PreflightError, run_preflight
 from scripts.status import status
 from scripts.tools import prepare_tools
+from scripts.verify import verify
 
 
 def unavailable(arguments: list[str]) -> int:
@@ -55,6 +57,16 @@ def main(arguments: list[str]) -> int:
     if command == "create-management":
         with tools_lock(ROOT, exclusive=True):
             create_management(ROOT, config)
+        return 0
+    if command == "create":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            create(ROOT, config)
+        return 0
+    if command == "verify":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            verify(ROOT, config)
         return 0
     if command == "status":
         with tools_lock(ROOT, exclusive=False):

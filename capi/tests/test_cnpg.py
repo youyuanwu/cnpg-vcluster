@@ -11,7 +11,9 @@ from scripts.cnpg import _render_cluster, _verify_marker, delete_cnpg, run_cnpg_
 
 class CnpgTests(unittest.TestCase):
     def test_marker_verification_is_read_only(self) -> None:
-        tenant = type("Tenant", (), {"name": "spike"})()
+        tenant = type(
+            "Tenant", (), {"name": "spike", "cnpg_cluster": "postgres"}
+        )()
         with patch("scripts.cnpg._sql", return_value="capi-marker") as sql:
             _verify_marker(Path("."), {}, tenant)
         statement = sql.call_args.args[3]
@@ -32,7 +34,9 @@ class CnpgTests(unittest.TestCase):
                     ),
                     encoding="utf-8",
                 )
-            tenant = type("Tenant", (), {"name": "spike"})()
+            tenant = type(
+                "Tenant", (), {"name": "spike", "cnpg_cluster": "postgres"}
+            )()
             config = {
                 "SPIKE_CNPG_CLUSTER": "postgres",
                 "POSTGRES_IMAGE": "postgres@sha256:" + "a" * 64,
@@ -64,7 +68,9 @@ class CnpgTests(unittest.TestCase):
             )
 
     def test_cnpg_delete_rejects_pvc_inspection_failure(self) -> None:
-        tenant = type("Tenant", (), {"name": "spike"})()
+        tenant = type(
+            "Tenant", (), {"name": "spike", "cnpg_cluster": "postgres"}
+        )()
         responses = [
             type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
             type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})(),

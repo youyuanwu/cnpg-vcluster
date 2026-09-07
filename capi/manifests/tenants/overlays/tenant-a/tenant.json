@@ -1,0 +1,11 @@
+{
+  "clusterDomain": "tenant-a.capi.local",
+  "cnpgCluster": "tenant-a-postgres",
+  "dnsServiceIP": "10.140.0.10",
+  "name": "tenant-a",
+  "namespace": "tenant-a",
+  "podCIDRKey": "TENANT_A_POD_CIDR",
+  "serviceCIDRKey": "TENANT_A_SERVICE_CIDR",
+  "vipSlot": "tenant-a",
+  "workers": 3
+}

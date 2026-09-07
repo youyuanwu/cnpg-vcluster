@@ -62,6 +62,14 @@ AUTHORED_INPUTS = (
         "manifests/tenants/base/workers.yaml.tpl",
         "CAPI_WORKER_TEMPLATE_SHA256",
     ),
+    (
+        "manifests/tenants/overlays/tenant-a/tenant.json",
+        "CAPI_TENANT_A_OVERLAY_SHA256",
+    ),
+    (
+        "manifests/tenants/overlays/tenant-b/tenant.json",
+        "CAPI_TENANT_B_OVERLAY_SHA256",
+    ),
     ("manifests/tenants/base/bootstrap-rbac.yaml", "CAPI_BOOTSTRAP_RBAC_SHA256"),
     ("manifests/addons/kube-proxy.yaml.tpl", "KUBE_PROXY_TEMPLATE_SHA256"),
     (

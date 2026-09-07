@@ -31,7 +31,7 @@ def _render_operator(root: Path, config: dict[str, str], tenant) -> Path:
 
 def _render_cluster(root: Path, config: dict[str, str], tenant) -> tuple[Path, Path]:
     replacements = {
-        "${CNPG_CLUSTER}": config["SPIKE_CNPG_CLUSTER"],
+        "${CNPG_CLUSTER}": tenant.cnpg_cluster,
         "${POSTGRES_IMAGE}": config["POSTGRES_IMAGE"],
         "${STORAGE_CLASS}": config["SPIKE_STORAGE_CLASS"],
         "${STORAGE_PATH}": config["SPIKE_STORAGE_CONTAINER_PATH"],
@@ -106,7 +106,7 @@ def _cnpg_ready(root: Path, config: dict[str, str], tenant) -> bool:
         "-n",
         config["DATABASE_NAMESPACE"],
         "get",
-        f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
+        f"cluster/{tenant.cnpg_cluster}",
         "-o",
         "json",
         check=False,
@@ -124,7 +124,7 @@ def _cnpg_ready(root: Path, config: dict[str, str], tenant) -> bool:
             "get",
             "pods",
             "-l",
-            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            f"cnpg.io/cluster={tenant.cnpg_cluster}",
             "-o",
             "json",
         ).stdout
@@ -147,7 +147,7 @@ def _cnpg_ready(root: Path, config: dict[str, str], tenant) -> bool:
             "get",
             "pvc",
             "-l",
-            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            f"cnpg.io/cluster={tenant.cnpg_cluster}",
             "-o",
             "json",
         ).stdout
@@ -177,7 +177,7 @@ def _cnpg_ready(root: Path, config: dict[str, str], tenant) -> bool:
         "-n",
         config["DATABASE_NAMESPACE"],
         "get",
-        f"endpoints/{config['SPIKE_CNPG_CLUSTER']}-rw",
+        f"endpoints/{tenant.cnpg_cluster}-rw",
         "-o",
         "jsonpath={.subsets[0].addresses[0].ip}",
         check=False,
@@ -260,7 +260,7 @@ def _sql(root: Path, config: dict[str, str], tenant, sql: str) -> str:
                                     "name": "PGPASSWORD",
                                     "valueFrom": {
                                         "secretKeyRef": {
-                                            "name": f"{config['SPIKE_CNPG_CLUSTER']}-app",
+                                            "name": f"{tenant.cnpg_cluster}-app",
                                             "key": "password",
                                         }
                                     },
@@ -304,7 +304,7 @@ def _sql(root: Path, config: dict[str, str], tenant, sql: str) -> str:
             "-v",
             "ON_ERROR_STOP=1",
             "-h",
-            f"{config['SPIKE_CNPG_CLUSTER']}-rw",
+            f"{tenant.cnpg_cluster}-rw",
             "-U",
             "app",
             "-d",
@@ -397,7 +397,7 @@ def _storage_identity(root: Path, config: dict[str, str], tenant) -> dict[str, s
             "get",
             "pvc",
             "-l",
-            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            f"cnpg.io/cluster={tenant.cnpg_cluster}",
             "-o",
             "json",
         ).stdout
@@ -421,7 +421,7 @@ def _replace_machine(root: Path, config: dict[str, str], client, tenant) -> None
             "get",
             "pods",
             "-l",
-            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            f"cnpg.io/cluster={tenant.cnpg_cluster}",
             "-o",
             "json",
         ).stdout
@@ -444,14 +444,14 @@ def _replace_machine(root: Path, config: dict[str, str], client, tenant) -> None
 
 
 def _replica_restart(root: Path, config: dict[str, str], tenant) -> None:
-    cluster = config["SPIKE_CNPG_CLUSTER"]
+    cluster = tenant.cnpg_cluster
     primary = _tenant_kubectl(
-        root, config, tenant, "-n", "database", "get", f"cluster/{cluster}",
+        root, config, tenant, "-n", config["DATABASE_NAMESPACE"], "get", f"cluster/{cluster}",
         "-o", "jsonpath={.status.currentPrimary}"
     ).stdout
     pods = json.loads(
         _tenant_kubectl(
-            root, config, tenant, "-n", "database", "get", "pods",
+            root, config, tenant, "-n", config["DATABASE_NAMESPACE"], "get", "pods",
             "-l", f"cnpg.io/cluster={cluster}", "-o", "json"
         ).stdout
     )["items"]
@@ -464,10 +464,10 @@ def _replica_restart(root: Path, config: dict[str, str], tenant) -> None:
         if "persistentVolumeClaim" in volume
     )
     pv = _tenant_kubectl(
-        root, config, tenant, "-n", "database", "get", f"pvc/{pvc}",
+        root, config, tenant, "-n", config["DATABASE_NAMESPACE"], "get", f"pvc/{pvc}",
         "-o", "jsonpath={.spec.volumeName}"
     ).stdout
-    _tenant_kubectl(root, config, tenant, "-n", "database", "delete", f"pod/{name}", "--wait=false")
+    _tenant_kubectl(root, config, tenant, "-n", config["DATABASE_NAMESPACE"], "delete", f"pod/{name}", "--wait=false")
     wait_for(
         "CNPG replica replacement",
         parse_duration(config["CNPG_TIMEOUT"]),
@@ -476,7 +476,7 @@ def _replica_restart(root: Path, config: dict[str, str], tenant) -> None:
             True
             if (
                 (response := _tenant_kubectl(
-                    root, config, tenant, "-n", "database", "get", f"pod/{name}",
+                    root, config, tenant, "-n", config["DATABASE_NAMESPACE"], "get", f"pod/{name}",
                     "-o", "json", check=False
                 )).returncode == 0
                 and json.loads(response.stdout)["metadata"]["uid"] != uid
@@ -489,7 +489,7 @@ def _replica_restart(root: Path, config: dict[str, str], tenant) -> None:
         ),
     )
     new_pv = _tenant_kubectl(
-        root, config, tenant, "-n", "database", "get", f"pvc/{pvc}",
+        root, config, tenant, "-n", config["DATABASE_NAMESPACE"], "get", f"pvc/{pvc}",
         "-o", "jsonpath={.spec.volumeName}"
     ).stdout
     new_pod = json.loads(
@@ -498,7 +498,7 @@ def _replica_restart(root: Path, config: dict[str, str], tenant) -> None:
             config,
             tenant,
             "-n",
-            "database",
+            config["DATABASE_NAMESPACE"],
             "get",
             f"pod/{name}",
             "-o",
@@ -517,12 +517,12 @@ def _replica_restart(root: Path, config: dict[str, str], tenant) -> None:
 
 
 def _primary_failover(root: Path, config: dict[str, str], tenant) -> None:
-    cluster = config["SPIKE_CNPG_CLUSTER"]
+    cluster = tenant.cnpg_cluster
     old = _tenant_kubectl(
-        root, config, tenant, "-n", "database", "get", f"cluster/{cluster}",
+        root, config, tenant, "-n", config["DATABASE_NAMESPACE"], "get", f"cluster/{cluster}",
         "-o", "jsonpath={.status.currentPrimary}"
     ).stdout
-    _tenant_kubectl(root, config, tenant, "-n", "database", "delete", f"pod/{old}", "--wait=false")
+    _tenant_kubectl(root, config, tenant, "-n", config["DATABASE_NAMESPACE"], "delete", f"pod/{old}", "--wait=false")
     wait_for(
         "CNPG primary failover",
         parse_duration(config["CNPG_TIMEOUT"]),
@@ -530,7 +530,7 @@ def _primary_failover(root: Path, config: dict[str, str], tenant) -> None:
         lambda: (
             current
             if (current := _tenant_kubectl(
-                root, config, tenant, "-n", "database", "get", f"cluster/{cluster}",
+                root, config, tenant, "-n", config["DATABASE_NAMESPACE"], "get", f"cluster/{cluster}",
                 "-o", "jsonpath={.status.currentPrimary}", check=False
             ).stdout) and current != old
             else None
@@ -578,7 +578,7 @@ def delete_cnpg(root: Path, config: dict[str, str], tenant) -> None:
         "get",
         "pvc",
         "-l",
-        f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+        f"cnpg.io/cluster={tenant.cnpg_cluster}",
         "-o",
         "name",
         check=False,
@@ -606,13 +606,13 @@ def cnpg_artifacts_present(root: Path, config: dict[str, str], tenant) -> bool:
     checks = (
         (
             ("-n", config["DATABASE_NAMESPACE"]),
-            f"cluster/{config['SPIKE_CNPG_CLUSTER']}",
+            f"cluster/{tenant.cnpg_cluster}",
         ),
         (
             ("-n", config["DATABASE_NAMESPACE"]),
             "pvc",
         ),
-        ((), f"pv/{config['SPIKE_CNPG_CLUSTER']}-pv-1"),
+        ((), f"pv/{tenant.cnpg_cluster}-pv-1"),
         (
             ("-n", config["CNPG_NAMESPACE"]),
             "deployment/cnpg-controller-manager",
@@ -626,7 +626,7 @@ def cnpg_artifacts_present(root: Path, config: dict[str, str], tenant) -> bool:
             arguments.extend(
                 (
                     "-l",
-                    f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+                    f"cnpg.io/cluster={tenant.cnpg_cluster}",
                     "-o",
                     "name",
                 )
@@ -673,7 +673,7 @@ def _evidence_payload(root: Path, config: dict[str, str], client, tenant) -> dic
             "get",
             "pods",
             "-l",
-            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            f"cnpg.io/cluster={tenant.cnpg_cluster}",
             "-o",
             "json",
         ).stdout
@@ -688,7 +688,7 @@ def _evidence_payload(root: Path, config: dict[str, str], client, tenant) -> dic
             "get",
             "pvc",
             "-l",
-            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            f"cnpg.io/cluster={tenant.cnpg_cluster}",
             "-o",
             "json",
         ).stdout
@@ -709,7 +709,7 @@ def _evidence_payload(root: Path, config: dict[str, str], client, tenant) -> dic
             )
         )
     return {
-        "cluster": config["SPIKE_CNPG_CLUSTER"],
+        "cluster": tenant.cnpg_cluster,
         "operatorImage": config["CNPG_CONTROLLER_IMAGE"],
         "postgresImage": config["POSTGRES_IMAGE"],
         "revision": config["CNPG_COMPATIBILITY_REVISION"],

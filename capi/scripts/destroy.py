@@ -20,7 +20,7 @@ from scripts.lib.management import (
 )
 from scripts.lib.providers import delete_providers
 from scripts.lib.addons import delete_addons
-from scripts.lib.tenants import delete_tenant, spike_tenant
+from scripts.lib.tenants import configured_tenants, delete_tenant, spike_tenant
 
 
 def _validate_runtime_inventory(root: Path) -> None:
@@ -56,6 +56,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         re.compile(r"^evidence/endpoint-failure\.txt$"),
         re.compile(r"^evidence/endpoint-success\.json$"),
         re.compile(r"^evidence/cnpg-(success\.json|failure\.txt)$"),
+        re.compile(r"^evidence/(create|verify)-(success\.json|failure\.txt)$"),
         re.compile(r"^rendered/negative/foreign-node\.json$"),
         re.compile(
             r"^rendered/addons/(capi-worker-spike|tenant-a|tenant-b)/"
@@ -71,8 +72,13 @@ def _validate_runtime_inventory(root: Path) -> None:
         ),
         re.compile(
             r"^rendered/cnpg/(capi-worker-spike|tenant-a|tenant-b)/"
-            r"(operator|cluster|static-pvs)\.yaml$"
+            r"((operator|cluster|static-pvs)\.yaml|cross-db-[a-z0-9-]+\.json)$"
         ),
+        re.compile(
+            r"^tenants/cross-(tenant-a-to-tenant-b|tenant-b-to-tenant-a)"
+            r"\.kubeconfig$"
+        ),
+        re.compile(r"^tenants/cross-(tenant-a|tenant-b)-postgres\.env$"),
     )
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
@@ -190,19 +196,24 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         if not status.get("apiReady"):
             raise RuntimeError("owned management API is not reachable; refusing partial cleanup")
         client = ManagementClient(root, config)
-        spike = spike_tenant(root, config)
-        if (root / ".runtime" / "tenants" / spike.name / "kubeconfig").is_file():
+        tenants = [spike_tenant(root, config), *configured_tenants(root, config)]
+        for tenant in tenants:
+            if not (
+                root / ".runtime" / "tenants" / tenant.name / "kubeconfig"
+            ).is_file():
+                delete_tenant(root, config, client, tenant)
+                continue
             from scripts.lib.tenants import _tenant_kubectl
             from scripts.cnpg import cnpg_artifacts_present, delete_cnpg
             from scripts.storage import _delete_storage
 
-            if cnpg_artifacts_present(root, config, spike):
-                delete_cnpg(root, config, spike)
+            if cnpg_artifacts_present(root, config, tenant):
+                delete_cnpg(root, config, tenant)
             storage_present = any(
                 _tenant_kubectl(
                     root,
                     config,
-                    spike,
+                    tenant,
                     "get",
                     resource,
                     check=False,
@@ -210,14 +221,14 @@ def destroy(root: Path, config: dict[str, str]) -> None:
                 == 0
                 for resource in (
                     "pvc/storage-smoke",
-                    f"pv/{spike.name}-storage-smoke",
+                    f"pv/{tenant.name}-storage-smoke",
                     f"storageclass/{config['SPIKE_STORAGE_CLASS']}",
                 )
             )
             if storage_present:
-                _delete_storage(root, config, spike)
-            delete_addons(root, config, client, spike)
-        delete_tenant(root, config, client, spike)
+                _delete_storage(root, config, tenant)
+            delete_addons(root, config, client, tenant)
+            delete_tenant(root, config, client, tenant)
         _delete_kubernetes_stack(root, config, client)
         delete_management(root, config)
     restore_inotify(root, config)

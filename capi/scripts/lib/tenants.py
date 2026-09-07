@@ -26,6 +26,8 @@ class Tenant:
     dns_ip: str
     domain: str
     storage_host_path: Path
+    cnpg_cluster: str
+    workers: int
 
 
 def spike_tenant(root: Path, config: dict[str, str]) -> Tenant:
@@ -40,7 +42,97 @@ def spike_tenant(root: Path, config: dict[str, str]) -> Tenant:
         dns_ip=config["SPIKE_DNS_SERVICE_IP"],
         domain=config["SPIKE_CLUSTER_DOMAIN"],
         storage_host_path=root / ".runtime" / "storage" / "spike",
+        cnpg_cluster=config["SPIKE_CNPG_CLUSTER"],
+        workers=1,
     )
+
+
+def configured_tenants(root: Path, config: dict[str, str]) -> list[Tenant]:
+    network_path = root / ".runtime" / "management" / "network.json"
+    network = json.loads(network_path.read_text(encoding="utf-8"))
+    expected_names = config["TENANT_NAMES"].split()
+    if expected_names != ["tenant-a", "tenant-b"]:
+        raise IntegrityError("TENANT_NAMES must be exactly: tenant-a tenant-b")
+    tenants = []
+    for name in expected_names:
+        path = root / "manifests" / "tenants" / "overlays" / name / "tenant.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        required = {
+            "clusterDomain",
+            "cnpgCluster",
+            "dnsServiceIP",
+            "name",
+            "namespace",
+            "podCIDRKey",
+            "serviceCIDRKey",
+            "vipSlot",
+            "workers",
+        }
+        if set(payload) != required or payload["name"] != name:
+            raise IntegrityError(f"invalid tenant overlay: {path}")
+        pod_key = str(payload["podCIDRKey"])
+        service_key = str(payload["serviceCIDRKey"])
+        vip_slot = str(payload["vipSlot"])
+        if pod_key not in config or service_key not in config:
+            raise IntegrityError(f"tenant overlay references unknown CIDR key: {name}")
+        if vip_slot not in network["slots"]:
+            raise IntegrityError(f"tenant overlay references unknown VIP slot: {name}")
+        workers = int(payload["workers"])
+        if workers != int(config["WORKERS_PER_TENANT"]):
+            raise IntegrityError(f"tenant worker count does not match settings: {name}")
+        tenant = Tenant(
+            name=name,
+            namespace=str(payload["namespace"]),
+            vip=str(network["slots"][vip_slot]),
+            pod_cidr=config[pod_key],
+            service_cidr=config[service_key],
+            dns_ip=str(payload["dnsServiceIP"]),
+            domain=str(payload["clusterDomain"]),
+            storage_host_path=root / ".runtime" / "storage" / name,
+            cnpg_cluster=str(payload["cnpgCluster"]),
+            workers=workers,
+        )
+        volume_name = storage_volume_name(config, tenant)
+        volume = inspect_storage_volume(volume_name)
+        if volume is not None:
+            labels = volume.get("Labels") or {}
+            record_path = storage_record_path(root, tenant)
+            expected_record = {
+                "schema": 1,
+                "tenant": tenant.name,
+                "volumeName": volume_name,
+                "createdAt": volume.get("CreatedAt"),
+                "mountpoint": volume.get("Mountpoint"),
+            }
+            if (
+                labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
+                or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
+                or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
+                or not record_path.is_file()
+                or record_path.is_symlink()
+                or record_path.lstat().st_uid != os.getuid()
+                or record_path.lstat().st_mode & 0o077
+                or json.loads(record_path.read_text(encoding="utf-8"))
+                != expected_record
+            ):
+                raise RuntimeError(
+                    f"existing tenant storage identity cannot be proven: {tenant.name}"
+                )
+            tenant.storage_host_path = Path(str(volume["Mountpoint"]))
+        tenants.append(tenant)
+    identities = (
+        [tenant.name for tenant in tenants],
+        [tenant.namespace for tenant in tenants],
+        [tenant.vip for tenant in tenants],
+        [tenant.pod_cidr for tenant in tenants],
+        [tenant.service_cidr for tenant in tenants],
+        [tenant.dns_ip for tenant in tenants],
+        [tenant.domain for tenant in tenants],
+        [tenant.cnpg_cluster for tenant in tenants],
+    )
+    if any(len(values) != len(set(values)) for values in identities):
+        raise IntegrityError("tenant overlays do not define distinct identities")
+    return tenants
 
 
 def _render_template(
@@ -90,6 +182,7 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
         "KIND_NODE_IMAGE": config["KIND_NODE_IMAGE"],
         "STORAGE_HOST_PATH": str(tenant.storage_host_path),
         "STORAGE_CONTAINER_PATH": config["SPIKE_STORAGE_CONTAINER_PATH"],
+        "WORKER_REPLICAS": str(tenant.workers),
     }
 
 
@@ -728,9 +821,9 @@ def delete_tenant(
                     "tenant storage API resources must be deleted before Cluster deletion"
                 )
         cnpg_resources = (
-            (("-n", config["DATABASE_NAMESPACE"]), f"cluster/{config['SPIKE_CNPG_CLUSTER']}"),
+            (("-n", config["DATABASE_NAMESPACE"]), f"cluster/{tenant.cnpg_cluster}"),
             (("-n", config["DATABASE_NAMESPACE"]), "pvc"),
-            ((), f"pv/{config['SPIKE_CNPG_CLUSTER']}-pv-1"),
+            ((), f"pv/{tenant.cnpg_cluster}-pv-1"),
             (("-n", config["CNPG_NAMESPACE"]), "deployment/cnpg-controller-manager"),
             ((), "crd/clusters.postgresql.cnpg.io"),
         )
@@ -742,7 +835,7 @@ def delete_tenant(
                 arguments.extend(
                     (
                         "-l",
-                        f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+                        f"cnpg.io/cluster={tenant.cnpg_cluster}",
                         "-o",
                         "name",
                     )
