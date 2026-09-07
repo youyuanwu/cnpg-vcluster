@@ -2,13 +2,76 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import json
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
-from scripts.verify import _reject_kubernetes_credential
+from scripts.verify import (
+    _endpoint_matches,
+    _management_absence,
+    _reject_kubernetes_credential,
+)
 
 
 class VerifyTests(unittest.TestCase):
+    def test_authoritative_endpoint_requires_exact_host_and_port(self) -> None:
+        tenant = type("Tenant", (), {"vip": "172.18.0.10"})()
+        config = {"SPIKE_API_PORT": "6443"}
+        self.assertTrue(
+            _endpoint_matches(
+                {"host": "172.18.0.10", "port": 6443},
+                tenant,
+                config,
+            )
+        )
+        self.assertFalse(
+            _endpoint_matches(
+                {"host": "172.18.0.11", "port": 6443},
+                tenant,
+                config,
+            )
+        )
+        self.assertFalse(
+            _endpoint_matches(
+                {"host": "172.18.0.10", "port": 7443},
+                tenant,
+                config,
+            )
+        )
+
+    def test_management_absence_rejects_inspection_failure(self) -> None:
+        client = Mock()
+        client.kubectl.side_effect = [
+            type(
+                "Result",
+                (),
+                {
+                    "returncode": 0,
+                    "stdout": json.dumps({"items": []}),
+                    "stderr": "",
+                },
+            )(),
+            type(
+                "Result",
+                (),
+                {
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": "connection refused",
+                },
+            )(),
+        ]
+        tenants = [
+            type("Tenant", (), {"cnpg_cluster": "tenant-a-postgres"})(),
+            type("Tenant", (), {"cnpg_cluster": "tenant-b-postgres"})(),
+        ]
+        with self.assertRaisesRegex(RuntimeError, "inspection failed"):
+            _management_absence(
+                {"DATABASE_NAMESPACE": "database"},
+                client,
+                tenants,
+                {"tenant-a": {}, "tenant-b": {}},
+            )
     def _assert_inconclusive(self, stderr: str) -> None:
         source = type("Tenant", (), {"name": "tenant-a", "vip": "172.18.0.10"})()
         target = type("Tenant", (), {"name": "tenant-b", "vip": "172.18.0.11"})()

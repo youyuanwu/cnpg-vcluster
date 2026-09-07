@@ -286,6 +286,16 @@ def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
 
 
 def _control_plane_layer_status(config: dict[str, str], client, tenant, cluster):
+    devcluster = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"devcluster/{tenant.name}",
+            "-o",
+            "json",
+        ).stdout
+    )
     kcp = json.loads(
         client.kubectl(
             "-n",
@@ -296,7 +306,16 @@ def _control_plane_layer_status(config: dict[str, str], client, tenant, cluster)
             "json",
         ).stdout
     )
-    endpoint = cluster["spec"].get("controlPlaneEndpoint", {})
+    endpoints = (
+        cluster["spec"].get("controlPlaneEndpoint", {}),
+        devcluster["spec"].get("controlPlaneEndpoint", {}),
+        kcp["spec"].get("controlPlaneEndpoint", {}),
+    )
+    endpoint_ready = all(
+        endpoint.get("host") == tenant.vip
+        and int(endpoint.get("port", 0)) == int(config["SPIKE_API_PORT"])
+        for endpoint in endpoints
+    )
     return {
         "ready": (
             condition_true(cluster, "Available")
@@ -305,8 +324,7 @@ def _control_plane_layer_status(config: dict[str, str], client, tenant, cluster)
             .get("initialization", {})
             .get("controlPlaneInitialized")
             is True
-            and endpoint.get("host") == tenant.vip
-            and int(endpoint.get("port", 0)) == int(config["SPIKE_API_PORT"])
+            and endpoint_ready
             and "cluster.x-k8s.io/paused"
             not in (kcp["metadata"].get("annotations") or {})
         ),
@@ -318,6 +336,7 @@ def _control_plane_layer_status(config: dict[str, str], client, tenant, cluster)
         is True,
         "paused": "cluster.x-k8s.io/paused"
         in (kcp["metadata"].get("annotations") or {}),
+        "authoritativeEndpoints": endpoint_ready,
     }
 
 

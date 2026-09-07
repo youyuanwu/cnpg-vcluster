@@ -54,6 +54,17 @@ def _ca_fingerprint(path: Path) -> str:
     return hashlib.sha256(base64.b64decode(match.group(1))).hexdigest()
 
 
+def _endpoint_matches(
+    endpoint: dict[str, object],
+    tenant,
+    config: dict[str, str],
+) -> bool:
+    return (
+        endpoint.get("host") == tenant.vip
+        and int(endpoint.get("port", 0)) == int(config["SPIKE_API_PORT"])
+    )
+
+
 def _cluster_identity(root: Path, config: dict[str, str], client, tenant):
     cluster = json.loads(
         client.kubectl(
@@ -61,6 +72,16 @@ def _cluster_identity(root: Path, config: dict[str, str], client, tenant):
             tenant.namespace,
             "get",
             f"cluster/{tenant.name}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    devcluster = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"devcluster/{tenant.name}",
             "-o",
             "json",
         ).stdout
@@ -75,10 +96,17 @@ def _cluster_identity(root: Path, config: dict[str, str], client, tenant):
             "json",
         ).stdout
     )
-    endpoint = cluster["spec"]["controlPlaneEndpoint"]
     network = cluster["spec"]["clusterNetwork"]
     if (
-        endpoint != {"host": tenant.vip, "port": int(config["SPIKE_API_PORT"])}
+        not _endpoint_matches(
+            cluster["spec"]["controlPlaneEndpoint"], tenant, config
+        )
+        or not _endpoint_matches(
+            devcluster["spec"]["controlPlaneEndpoint"], tenant, config
+        )
+        or not _endpoint_matches(
+            kcp["spec"]["controlPlaneEndpoint"], tenant, config
+        )
         or network["pods"]["cidrBlocks"] != [tenant.pod_cidr]
         or network["services"]["cidrBlocks"] != [tenant.service_cidr]
         or network["serviceDomain"] != tenant.domain
@@ -394,8 +422,14 @@ def _management_absence(config: dict[str, str], client, tenants, workers) -> Non
             for ordinal in (1, 2, 3)
         ),
     ):
-        if client.kubectl("get", resource, check=False).returncode == 0:
+        response = client.kubectl("get", resource, check=False)
+        if response.returncode == 0:
             raise RuntimeError(f"tenant database resource appeared in management: {resource}")
+        if "not found" not in response.stderr.lower():
+            raise RuntimeError(
+                f"management absence inspection failed for {resource}: "
+                f"{response.stderr}"
+            )
 
 
 def verify(root: Path, config: dict[str, str]) -> dict[str, object]:
