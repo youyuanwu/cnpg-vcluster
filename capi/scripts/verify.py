@@ -425,7 +425,11 @@ def _management_absence(config: dict[str, str], client, tenants, workers) -> Non
         response = client.kubectl("get", resource, check=False)
         if response.returncode == 0:
             raise RuntimeError(f"tenant database resource appeared in management: {resource}")
-        if "not found" not in response.stderr.lower():
+        if not re.search(
+            r"Error from server \(NotFound\):",
+            response.stderr,
+            re.IGNORECASE,
+        ):
             raise RuntimeError(
                 f"management absence inspection failed for {resource}: "
                 f"{response.stderr}"
