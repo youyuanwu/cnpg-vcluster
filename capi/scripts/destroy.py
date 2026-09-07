@@ -203,6 +203,7 @@ def destroy(root: Path, config: dict[str, str]) -> None:
                 for resource in (
                     "pvc/storage-smoke",
                     f"pv/{spike.name}-storage-smoke",
+                    f"storageclass/{config['SPIKE_STORAGE_CLASS']}",
                 )
             )
             if storage_present:

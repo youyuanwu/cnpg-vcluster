@@ -309,6 +309,7 @@ def prepare_storage_directory(root: Path, config: dict[str, str], tenant: Tenant
     ensure_private_dir(root / ".runtime" / "storage")
     volume_name = storage_volume_name(config, tenant)
     payload = inspect_storage_volume(volume_name)
+    introduced = payload is None
     if payload is None:
         run(
             [
@@ -344,7 +345,11 @@ def prepare_storage_directory(root: Path, config: dict[str, str], tenant: Tenant
         "mountpoint": payload["Mountpoint"],
     }
     record_path = storage_record_path(root, tenant)
-    if record_path.exists() or record_path.is_symlink():
+    if introduced:
+        if record_path.exists() or record_path.is_symlink():
+            raise RuntimeError("stale tenant storage identity record blocks creation")
+        write_private_file(record_path, json.dumps(record, sort_keys=True) + "\n")
+    elif record_path.exists() or record_path.is_symlink():
         details = record_path.lstat()
         if (
             record_path.is_symlink()
@@ -355,7 +360,7 @@ def prepare_storage_directory(root: Path, config: dict[str, str], tenant: Tenant
         ):
             raise RuntimeError("tenant storage volume identity record mismatch")
     else:
-        write_private_file(record_path, json.dumps(record, sort_keys=True) + "\n")
+        raise RuntimeError("existing tenant storage volume has no identity record")
 
 
 def storage_volume_name(config: dict[str, str], tenant: Tenant) -> str:
@@ -706,6 +711,7 @@ def delete_tenant(
             "deployment/storage-smoke",
             "pvc/storage-smoke",
             f"pv/{tenant.name}-storage-smoke",
+            f"storageclass/{config['SPIKE_STORAGE_CLASS']}",
         ):
             if (
                 _tenant_kubectl(
@@ -783,11 +789,21 @@ def delete_tenant(
             or not record_path.is_file()
         ):
             raise RuntimeError("refusing to remove unproven tenant storage volume")
-        record = json.loads(record_path.read_text(encoding="utf-8"))
+        details = record_path.lstat()
+        expected_record = {
+            "schema": 1,
+            "tenant": tenant.name,
+            "volumeName": volume_name,
+            "createdAt": payload.get("CreatedAt"),
+            "mountpoint": payload.get("Mountpoint"),
+        }
         if (
-            record.get("volumeName") != volume_name
-            or record.get("createdAt") != payload.get("CreatedAt")
-            or record.get("mountpoint") != payload.get("Mountpoint")
+            record_path.is_symlink()
+            or not record_path.is_file()
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+            or json.loads(record_path.read_text(encoding="utf-8"))
+            != expected_record
         ):
             raise RuntimeError("tenant storage volume identity changed")
         run(["docker", "volume", "rm", volume_name], timeout=30)

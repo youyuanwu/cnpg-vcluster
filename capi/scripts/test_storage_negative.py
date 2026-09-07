@@ -64,6 +64,21 @@ def main() -> int:
         payload = json.loads(
             run(["docker", "volume", "inspect", created], timeout=30).stdout
         )[0]
+        missing_record = run(
+            [str(just), "--justfile", str(ROOT / "Justfile"), "test-storage"],
+            timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
+            cwd=ROOT,
+            check=False,
+        )
+        missing_output = missing_record.stdout + missing_record.stderr
+        if missing_record.returncode == 0 or not any(
+            message in missing_output
+            for message in (
+                "no identity record",
+                "unproven tenant storage volume",
+            )
+        ):
+            raise RuntimeError("existing labelled volume without record was adopted")
         record = storage_record_path(ROOT, tenant)
         write_private_file(
             record,
