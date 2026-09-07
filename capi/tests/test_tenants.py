@@ -1,11 +1,10 @@
 from __future__ import annotations
 
-import json
 import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.lib.tenants import Tenant, _render_template, prepare_storage_directory
+from scripts.lib.tenants import Tenant, _render_template, storage_volume_name
 
 
 class TenantTests(unittest.TestCase):
@@ -17,7 +16,7 @@ class TenantTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 _render_template(source, destination, {"NAME": "value"})
 
-    def test_storage_marker_is_exact_and_owner_only(self) -> None:
+    def test_storage_volume_name_is_tenant_scoped(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             tenant = Tenant(
@@ -30,9 +29,7 @@ class TenantTests(unittest.TestCase):
                 domain="spike.local",
                 storage_host_path=root / ".runtime" / "storage" / "spike",
             )
-            config = {"LAB_PREFIX": "test"}
-            prepare_storage_directory(root, config, tenant)
-            marker = tenant.storage_host_path / ".capi-owner.json"
-            self.assertEqual(json.loads(marker.read_text())["tenant"], "spike")
-            self.assertEqual(marker.stat().st_mode & 0o077, 0)
-            prepare_storage_directory(root, config, tenant)
+            self.assertEqual(
+                storage_volume_name({"LAB_PREFIX": "test"}, tenant),
+                "test-spike-storage",
+            )

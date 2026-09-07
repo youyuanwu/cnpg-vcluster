@@ -24,6 +24,7 @@ EXPECTED_RECIPES = {
     "test-network-negative",
     "test-machines",
     "test-storage",
+    "test-storage-negative",
     "test-persistence",
     "create",
     "repair",

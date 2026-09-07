@@ -35,7 +35,6 @@ DOWNLOADS = (
     ("kamaji-etcd-0.15.0.tgz", "KAMAJI_ETCD_CHART_URL", "KAMAJI_ETCD_CHART_SHA256"),
     ("metallb-native.yaml", "METALLB_MANIFEST_URL", "METALLB_MANIFEST_SHA256"),
     ("calico.yaml", "CALICO_MANIFEST_URL", "CALICO_MANIFEST_SHA256"),
-    ("nfs-subdir-external-provisioner-4.0.18.tgz", "NFS_PROVISIONER_CHART_URL", "NFS_PROVISIONER_CHART_SHA256"),
     ("cnpg.yaml", "CNPG_MANIFEST_URL", "CNPG_MANIFEST_SHA256"),
 )
 
@@ -65,6 +64,10 @@ AUTHORED_INPUTS = (
     ),
     ("manifests/tenants/base/bootstrap-rbac.yaml", "CAPI_BOOTSTRAP_RBAC_SHA256"),
     ("manifests/addons/kube-proxy.yaml.tpl", "KUBE_PROXY_TEMPLATE_SHA256"),
+    (
+        "manifests/storage/hostpath-smoke.yaml.tpl",
+        "HOSTPATH_STORAGE_TEMPLATE_SHA256",
+    ),
 )
 
 TAG_SOURCES = (
@@ -75,12 +78,6 @@ TAG_SOURCES = (
         "KAMAJI_CAPI_TAG_COMMIT",
     ),
     ("https://github.com/clastix/kamaji.git", "KAMAJI_VERSION", "KAMAJI_TAG_COMMIT"),
-    ("https://github.com/ehough/docker-nfs-server.git", "NFS_SERVER_VERSION", "NFS_SERVER_TAG_COMMIT"),
-    (
-        "https://github.com/kubernetes-sigs/nfs-subdir-external-provisioner.git",
-        "NFS_PROVISIONER_CHART_VERSION",
-        "NFS_PROVISIONER_CHART_TAG_COMMIT",
-    ),
 )
 
 
@@ -412,8 +409,6 @@ def prepare_tools(root: Path, config: dict[str, str]) -> None:
 
     for repository, version_key, commit_key in TAG_SOURCES:
         tag = config[version_key]
-        if version_key == "NFS_PROVISIONER_CHART_VERSION":
-            tag = f"nfs-subdir-external-provisioner-{tag}"
         _verify_tag(repository, tag, config[commit_key], timeout)
 
     verify_all_inputs(root, config)

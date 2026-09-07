@@ -307,7 +307,7 @@ def partial_label_worker(
             "devmachine": devmachine,
         }
         try:
-            verify_worker_runtime(config, tenant, fake)
+            verify_worker_runtime(root, config, tenant, fake)
         except RuntimeError:
             pass
         else:

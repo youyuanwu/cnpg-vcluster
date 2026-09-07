@@ -15,6 +15,7 @@ from scripts.lib.providers import provider_status
 from scripts.lib.addons import network_status
 from scripts.lib.process import run
 from scripts.lib.tenants import _tenant_kubectl, spike_tenant
+from scripts.lib.tenants import storage_volume_name
 
 
 def _machine_layer_status(root: Path, config: dict[str, str], client, tenant):
@@ -107,6 +108,74 @@ def _machine_layer_status(root: Path, config: dict[str, str], client, tenant):
     return layers
 
 
+def _storage_layer_status(root: Path, config: dict[str, str], tenant):
+    volume_name = storage_volume_name(config, tenant)
+    volume = run(
+        ["docker", "volume", "inspect", volume_name],
+        timeout=30,
+        check=False,
+    )
+    if volume.returncode != 0:
+        return {"ready": False, "reason": "volume-missing"}
+    payload = json.loads(volume.stdout)[0]
+    labels = payload.get("Labels") or {}
+    result = {
+        "volume": volume_name,
+        "createdAt": payload.get("CreatedAt"),
+        "mountpoint": payload.get("Mountpoint"),
+        "owned": (
+            labels.get(config["OWNERSHIP_LABEL"]) == config["LAB_PREFIX"]
+            and labels.get("cnpg-vcluster.capi/role") == "tenant-storage"
+            and labels.get("cnpg-vcluster.capi/tenant") == tenant.name
+        ),
+        "pvc": None,
+        "pv": None,
+    }
+    if (root / ".runtime" / "tenants" / tenant.name / "kubeconfig").is_file():
+        pvc = _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "get",
+            "pvc/storage-smoke",
+            "-o",
+            "json",
+            check=False,
+        )
+        pv = _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "get",
+            f"pv/{tenant.name}-storage-smoke",
+            "-o",
+            "json",
+            check=False,
+        )
+        if pvc.returncode == 0 and pv.returncode == 0:
+            pvc_payload = json.loads(pvc.stdout)
+            pv_payload = json.loads(pv.stdout)
+            result["pvc"] = {
+                "uid": pvc_payload["metadata"]["uid"],
+                "phase": pvc_payload["status"].get("phase"),
+            }
+            result["pv"] = {
+                "uid": pv_payload["metadata"]["uid"],
+                "phase": pv_payload["status"].get("phase"),
+                "nodeAffinity": "nodeAffinity" in pv_payload["spec"],
+            }
+    storage_objects_ready = (
+        result["pvc"] is None
+        or (
+            result["pvc"]["phase"] == "Bound"
+            and result["pv"]["phase"] == "Bound"
+            and result["pv"]["nodeAffinity"] is False
+        )
+    )
+    result["ready"] = result["owned"] and storage_objects_ready
+    return result
+
+
 def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
     management = management_status(root, config)
     host = {
@@ -147,6 +216,9 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
                 )
             except RuntimeError as exc:
                 result["spikeMachines"] = {"ready": False, "reason": str(exc)}
+            result["spikeStorage"] = _storage_layer_status(
+                root, config, spike
+            )
         kamaji = client.kubectl(
             "-n",
             config["MANAGEMENT_NAMESPACE"],
@@ -197,6 +269,10 @@ def status_healthy(result: dict[str, object]) -> bool:
         and (
             "spikeMachines" not in result
             or result["spikeMachines"].get("ready")
+        )
+        and (
+            "spikeStorage" not in result
+            or result["spikeStorage"].get("ready")
         )
     )
 

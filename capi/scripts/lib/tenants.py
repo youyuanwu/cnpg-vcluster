@@ -2,10 +2,8 @@ from __future__ import annotations
 
 import base64
 import json
-import os
 import re
 import shutil
-import stat
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,7 +15,7 @@ from .kube import ManagementClient, wait_for
 from .process import run
 
 
-@dataclass(frozen=True)
+@dataclass
 class Tenant:
     name: str
     namespace: str
@@ -307,20 +305,100 @@ def apply_bootstrap_rbac(
 
 
 def prepare_storage_directory(root: Path, config: dict[str, str], tenant: Tenant) -> None:
-    tenant.storage_host_path.mkdir(parents=True, exist_ok=True, mode=0o700)
-    tenant.storage_host_path.chmod(0o700)
-    marker = tenant.storage_host_path / ".capi-owner.json"
-    expected = {
+    volume_name = storage_volume_name(config, tenant)
+    response = run(
+        ["docker", "volume", "inspect", volume_name],
+        timeout=30,
+        check=False,
+    )
+    if response.returncode != 0:
+        run(
+            [
+                "docker",
+                "volume",
+                "create",
+                "--label",
+                f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
+                "--label",
+                "cnpg-vcluster.capi/role=tenant-storage",
+                "--label",
+                f"cnpg-vcluster.capi/tenant={tenant.name}",
+                volume_name,
+            ],
+            timeout=30,
+        )
+        response = run(["docker", "volume", "inspect", volume_name], timeout=30)
+    payload = json.loads(response.stdout)[0]
+    labels = payload.get("Labels") or {}
+    if (
+        labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
+        or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
+        or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
+    ):
+        raise RuntimeError("tenant storage Docker volume ownership cannot be proven")
+    tenant.storage_host_path = Path(payload["Mountpoint"])
+    record = {
         "schema": 1,
-        "lab": config["LAB_PREFIX"],
         "tenant": tenant.name,
-        "uid": os.getuid(),
+        "volumeName": volume_name,
+        "createdAt": payload["CreatedAt"],
+        "mountpoint": payload["Mountpoint"],
     }
-    if marker.exists():
-        if marker.is_symlink() or json.loads(marker.read_text(encoding="utf-8")) != expected:
-            raise RuntimeError("tenant storage directory ownership cannot be proven")
-    else:
-        write_private_file(marker, json.dumps(expected, sort_keys=True) + "\n")
+    write_private_file(
+        root / ".runtime" / "storage" / tenant.name / "volume.json",
+        json.dumps(record, sort_keys=True) + "\n",
+    )
+
+
+def storage_volume_name(config: dict[str, str], tenant: Tenant) -> str:
+    return f"{config['LAB_PREFIX']}-{tenant.name}-storage"
+
+
+def write_storage_marker(
+    config: dict[str, str],
+    tenant: Tenant,
+    relative_path: str,
+    value: str,
+) -> None:
+    run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{storage_volume_name(config, tenant)}:/data",
+            "-e",
+            f"CAPI_MARKER_VALUE={value}",
+            "--entrypoint",
+            "sh",
+            config["VERIFY_IMAGE"],
+            "-ec",
+            f"mkdir -p \"$(dirname '/data/{relative_path}')\"; "
+            f"printf '%s' \"$CAPI_MARKER_VALUE\" > '/data/{relative_path}'",
+        ],
+        timeout=60,
+    )
+
+
+def read_storage_marker(
+    config: dict[str, str],
+    tenant: Tenant,
+    relative_path: str,
+) -> str:
+    return run(
+        [
+            "docker",
+            "run",
+            "--rm",
+            "-v",
+            f"{storage_volume_name(config, tenant)}:/data:ro",
+            "--entrypoint",
+            "cat",
+            config["VERIFY_IMAGE"],
+            f"/data/{relative_path}",
+        ],
+        timeout=60,
+    ).stdout
 
 
 def apply_workers(
@@ -493,6 +571,7 @@ def verify_load_balancer_runtime(
 
 
 def verify_worker_runtime(
+    root: Path,
     config: dict[str, str],
     tenant: Tenant,
     registered: dict[str, object],
@@ -507,11 +586,9 @@ def verify_worker_runtime(
     expected_mount = mounts.get(config["SPIKE_STORAGE_CONTAINER_PATH"])
     image = payload.get("Config", {}).get("Image")
     expected_network = json.loads(
-        (
-            tenant.storage_host_path.parents[1]
-            / "management"
-            / "network.json"
-        ).read_text(encoding="utf-8")
+        (root / ".runtime" / "management" / "network.json").read_text(
+            encoding="utf-8"
+        )
     )["network"]
     networks = payload.get("NetworkSettings", {}).get("Networks") or {}
     if (
@@ -647,13 +724,29 @@ def delete_tenant(
     kubeconfig.unlink(missing_ok=True)
     rendered = root / ".runtime" / "rendered" / "tenants" / tenant.name
     shutil.rmtree(rendered, ignore_errors=True)
-    marker = tenant.storage_host_path / ".capi-owner.json"
-    if tenant.storage_host_path.exists():
-        details = tenant.storage_host_path.lstat()
+    volume_name = storage_volume_name(config, tenant)
+    volume = run(
+        ["docker", "volume", "inspect", volume_name],
+        timeout=30,
+        check=False,
+    )
+    if volume.returncode == 0:
+        payload = json.loads(volume.stdout)[0]
+        labels = payload.get("Labels") or {}
+        record_path = root / ".runtime" / "storage" / tenant.name / "volume.json"
         if (
-            stat.S_ISLNK(details.st_mode)
-            or details.st_uid != os.getuid()
-            or not marker.is_file()
+            labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
+            or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
+            or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
+            or not record_path.is_file()
         ):
-            raise RuntimeError("refusing to remove unproven tenant storage directory")
-        shutil.rmtree(tenant.storage_host_path)
+            raise RuntimeError("refusing to remove unproven tenant storage volume")
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        if (
+            record.get("volumeName") != volume_name
+            or record.get("createdAt") != payload.get("CreatedAt")
+            or record.get("mountpoint") != payload.get("Mountpoint")
+        ):
+            raise RuntimeError("tenant storage volume identity changed")
+        run(["docker", "volume", "rm", volume_name], timeout=30)
+        record_path.unlink()

@@ -51,7 +51,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         re.compile(r"^tenants/(capi-worker-spike|tenant-a|tenant-b)/kubeconfig$"),
         re.compile(
             r"^storage/(spike|tenant-a|tenant-b)/"
-            r"(\.capi-owner\.json|phase3-marker)$"
+            r"volume\.json$"
         ),
         re.compile(r"^evidence/endpoint-failure\.txt$"),
         re.compile(r"^evidence/endpoint-success\.json$"),
@@ -63,6 +63,10 @@ def _validate_runtime_inventory(root: Path) -> None:
         re.compile(
             r"^rendered/addons/(capi-worker-spike|tenant-a|tenant-b)/"
             r"(resource-set|inventory|repair-[a-z0-9-]+)\.json$"
+        ),
+        re.compile(
+            r"^rendered/storage/(capi-worker-spike|tenant-a|tenant-b)/"
+            r"smoke\.yaml$"
         ),
     )
     for path in runtime.rglob("*"):

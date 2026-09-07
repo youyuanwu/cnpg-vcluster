@@ -12,6 +12,7 @@ from scripts.lib.process import run
 from scripts.lib.tenants import (
     _tenant_kubectl,
     delete_tenant,
+    read_storage_marker,
     tenant_kubeconfig_path,
     verify_worker_runtime,
 )
@@ -103,7 +104,7 @@ def worker_snapshot(
     snapshot: dict[str, dict[str, str]] = {}
     for machine in items:
         registered = _registered(client, tenant, machine)
-        verify_worker_runtime(config, tenant, registered)
+        verify_worker_runtime(root, config, tenant, registered)
         if not condition_true(machine, "Ready"):
             raise RuntimeError(f"Machine is not Ready: {machine['metadata']['name']}")
         if not condition_true(registered["devmachine"], "Ready"):
@@ -238,8 +239,7 @@ def _replace_machine(
             raise RuntimeError(f"unaffected worker identity changed: {name}")
     if run(["docker", "inspect", removed_name], timeout=30, check=False).returncode == 0:
         raise RuntimeError("removed Machine container still exists")
-    marker = tenant.storage_host_path / "phase3-marker"
-    if marker.read_text(encoding="utf-8") != "phase3-marker\n":
+    if read_storage_marker(config, tenant, "phase3-marker") != "phase3-marker\n":
         raise RuntimeError("tenant host marker did not survive worker replacement")
     return after
 

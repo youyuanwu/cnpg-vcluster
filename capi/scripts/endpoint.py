@@ -23,6 +23,8 @@ from scripts.lib.tenants import (
     export_tenant_kubeconfig,
     spike_tenant,
     tenant_kubeconfig_path,
+    write_storage_marker,
+    read_storage_marker,
     verify_authoritative_endpoint,
     verify_worker_runtime,
     wait_for_registered_node,
@@ -179,7 +181,7 @@ def run_endpoint_gate(
         apply_workers(root, config, client, tenant)
         registered = wait_for_registered_node(root, config, client, tenant)
         verify_authoritative_endpoint(root, config, client, tenant, registered)
-        verify_worker_runtime(config, tenant, registered)
+        verify_worker_runtime(root, config, tenant, registered)
         _verify_bootstrap_secret(config, client, tenant, registered)
         bootstrap_secret_names.append(str(registered["secret"]))
         kcp = json.loads(
@@ -240,8 +242,7 @@ def run_endpoint_gate(
                 "pre-CNI Node does not report the expected network-plugin NotReady condition"
             )
 
-        marker = tenant.storage_host_path / "phase3-marker"
-        write_private_file(marker, "phase3-marker\n")
+        write_storage_marker(config, tenant, "phase3-marker", "phase3-marker\n")
         old_machine_uid = registered["machine"]["metadata"]["uid"]
         old_machine_name = registered["machine"]["metadata"]["name"]
         client.kubectl(
@@ -260,10 +261,10 @@ def run_endpoint_gate(
             == 0
         ):
             raise RuntimeError("old CAPD worker container remained after Machine replacement")
-        if marker.read_text(encoding="utf-8") != "phase3-marker\n":
+        if read_storage_marker(config, tenant, "phase3-marker") != "phase3-marker\n":
             raise RuntimeError("tenant host marker did not survive Machine replacement")
         verify_authoritative_endpoint(root, config, client, tenant, replacement)
-        verify_worker_runtime(config, tenant, replacement)
+        verify_worker_runtime(root, config, tenant, replacement)
         _verify_bootstrap_secret(config, client, tenant, replacement)
         bootstrap_secret_names.append(str(replacement["secret"]))
 

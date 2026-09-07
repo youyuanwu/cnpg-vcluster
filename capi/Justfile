@@ -39,9 +39,13 @@ test-network-negative:
 test-machines:
     @python3 scripts/lab.py test-machines
 
-# [phase 6] Prove Machine-independent local storage.
+# [implemented] Prove Machine-independent local storage.
 test-storage:
-    @python3 scripts/lab.py unavailable test-storage
+    @python3 scripts/lab.py test-storage
+
+# [implemented] Prove unowned storage volumes are never adopted or deleted.
+test-storage-negative:
+    @python3 scripts/test_storage_negative.py
 
 # [phase 7] Prove CNPG continuity through Machine replacement.
 test-persistence:
