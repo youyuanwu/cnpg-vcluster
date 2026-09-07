@@ -585,6 +585,10 @@ def delete_cnpg(root: Path, config: dict[str, str], tenant) -> None:
     )
     if leftovers.returncode == 0 and leftovers.stdout.strip():
         raise RuntimeError("CNPG PVCs remain after cluster deletion")
+    if leftovers.returncode != 0 and "not found" not in leftovers.stderr.lower():
+        raise RuntimeError(
+            f"CNPG PVC deletion inspection failed: {leftovers.stderr}"
+        )
     operator = _render_operator(root, config, tenant)
     _tenant_kubectl(
         root,

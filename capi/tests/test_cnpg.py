@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.cnpg import _render_cluster, _verify_marker, run_cnpg_gate
+from scripts.cnpg import _render_cluster, _verify_marker, delete_cnpg, run_cnpg_gate
 
 
 class CnpgTests(unittest.TestCase):
@@ -61,3 +62,52 @@ class CnpgTests(unittest.TestCase):
             self.assertTrue(
                 (root / ".runtime" / "evidence" / "cnpg-failure.txt").is_file()
             )
+
+    def test_cnpg_delete_rejects_pvc_inspection_failure(self) -> None:
+        tenant = type("Tenant", (), {"name": "spike"})()
+        responses = [
+            type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+            type("Result", (), {"returncode": 0, "stdout": "", "stderr": ""})(),
+            type(
+                "Result",
+                (),
+                {
+                    "returncode": 1,
+                    "stdout": "",
+                    "stderr": "connection refused",
+                },
+            )(),
+        ]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "manifests" / "cnpg"
+            target.mkdir(parents=True)
+            repository = Path(__file__).resolve().parents[1]
+            for name in ("cluster.yaml.tpl", "static-pvs.yaml.tpl"):
+                target.joinpath(name).write_text(
+                    repository.joinpath("manifests/cnpg", name).read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
+            inputs = root / ".tools" / "inputs"
+            inputs.mkdir(parents=True)
+            source = repository / ".tools" / "inputs" / "cnpg.yaml"
+            inputs.joinpath("cnpg.yaml").write_bytes(source.read_bytes())
+            config = {
+                "SPIKE_CNPG_CLUSTER": "postgres",
+                "POSTGRES_IMAGE": "postgres@sha256:" + "a" * 64,
+                "SPIKE_STORAGE_CLASS": "hostpath",
+                "SPIKE_STORAGE_CONTAINER_PATH": "/shared",
+                "CNPG_MANIFEST_SHA256": hashlib.sha256(
+                    source.read_bytes()
+                ).hexdigest(),
+                "CNPG_CONTROLLER_IMAGE_TAGGED": "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0",
+                "CNPG_CONTROLLER_IMAGE": "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0@sha256:"
+                + "a" * 64,
+                "DELETE_TIMEOUT": "1s",
+                "DATABASE_NAMESPACE": "database",
+            }
+            with patch("scripts.cnpg._tenant_kubectl", side_effect=responses):
+                with self.assertRaises(RuntimeError):
+                    delete_cnpg(root, config, tenant)
