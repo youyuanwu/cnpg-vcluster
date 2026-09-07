@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.cnpg import _render_cluster, _verify_marker
+from scripts.cnpg import _render_cluster, _verify_marker, run_cnpg_gate
 
 
 class CnpgTests(unittest.TestCase):
@@ -44,3 +44,20 @@ class CnpgTests(unittest.TestCase):
         for ordinal in (1, 2, 3):
             self.assertIn(f"name: postgres-pv-{ordinal}", rendered)
             self.assertIn(f"name: postgres-{ordinal}", rendered)
+
+    def test_lower_layer_failure_clears_stale_success_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            success = root / ".runtime" / "evidence" / "cnpg-success.json"
+            success.parent.mkdir(parents=True)
+            success.write_text('{"stale":true}\n', encoding="utf-8")
+            with patch(
+                "scripts.cnpg.run_storage_gate",
+                side_effect=RuntimeError("injected storage failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    run_cnpg_gate(root, {})
+            self.assertFalse(success.exists())
+            self.assertTrue(
+                (root / ".runtime" / "evidence" / "cnpg-failure.txt").is_file()
+            )

@@ -636,16 +636,113 @@ def cnpg_artifacts_present(root: Path, config: dict[str, str], tenant) -> bool:
         )
         if response.returncode == 0 and (not is_list or response.stdout.strip()):
             return True
+        if response.returncode != 0 and "not found" not in response.stderr.lower():
+            raise RuntimeError(
+                f"CNPG artifact inspection failed for {resource}: {response.stderr}"
+            )
     return False
 
 
+def _evidence_payload(root: Path, config: dict[str, str], client, tenant) -> dict[str, object]:
+    machines = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            "machines",
+            "-l",
+            f"cluster.x-k8s.io/cluster-name={tenant.name}",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    nodes = json.loads(
+        _tenant_kubectl(root, config, tenant, "get", "nodes", "-o", "json").stdout
+    )["items"]
+    pods = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            "pods",
+            "-l",
+            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    pvcs = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            "pvc",
+            "-l",
+            f"cnpg.io/cluster={config['SPIKE_CNPG_CLUSTER']}",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    pvs = []
+    for pvc in pvcs:
+        pvs.append(
+            json.loads(
+                _tenant_kubectl(
+                    root,
+                    config,
+                    tenant,
+                    "get",
+                    f"pv/{pvc['spec']['volumeName']}",
+                    "-o",
+                    "json",
+                ).stdout
+            )
+        )
+    return {
+        "cluster": config["SPIKE_CNPG_CLUSTER"],
+        "operatorImage": config["CNPG_CONTROLLER_IMAGE"],
+        "postgresImage": config["POSTGRES_IMAGE"],
+        "revision": config["CNPG_COMPATIBILITY_REVISION"],
+        "machines": {
+            item["metadata"]["name"]: item["metadata"]["uid"] for item in machines
+        },
+        "nodes": {
+            item["metadata"]["name"]: item["metadata"]["uid"] for item in nodes
+        },
+        "databasePods": {
+            item["metadata"]["name"]: item["metadata"]["uid"] for item in pods
+        },
+        "storage": {
+            pvc["metadata"]["name"]: {
+                "pvcUID": pvc["metadata"]["uid"],
+                "pv": pvc["spec"]["volumeName"],
+                "pvUID": next(
+                    pv["metadata"]["uid"]
+                    for pv in pvs
+                    if pv["metadata"]["name"] == pvc["spec"]["volumeName"]
+                ),
+            }
+            for pvc in pvcs
+        },
+    }
+
+
 def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
-    client, tenant, _ = run_storage_gate(root, config, cleanup=False)
     failure = root / ".runtime" / "evidence" / "cnpg-failure.txt"
     success = root / ".runtime" / "evidence" / "cnpg-success.json"
     failure.unlink(missing_ok=True)
     success.unlink(missing_ok=True)
+    client = None
+    tenant = None
+    evidence = None
     try:
+        client, tenant, _ = run_storage_gate(root, config, cleanup=False)
         install_cnpg(root, config, tenant)
         from scripts.status import collect_status, status_healthy
 
@@ -663,26 +760,22 @@ def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
         _primary_failover(root, config, tenant)
         _verify_marker(root, config, tenant)
         _verify_filesystem(config, tenant)
-        write_private_file(
-            success,
-            json.dumps(
-                {
-                    "cluster": config["SPIKE_CNPG_CLUSTER"],
-                    "operatorImage": config["CNPG_CONTROLLER_IMAGE"],
-                    "postgresImage": config["POSTGRES_IMAGE"],
-                    "revision": config["CNPG_COMPATIBILITY_REVISION"],
-                    "storage": _storage_identity(root, config, tenant),
-                },
-                sort_keys=True,
-            )
-            + "\n",
-        )
-        print("CNPG persistence checks passed")
+        evidence = _evidence_payload(root, config, client, tenant)
     except Exception as exc:
         write_private_file(failure, redact(str(exc)) + "\n")
         raise
     finally:
-        delete_cnpg(root, config, tenant)
-        _delete_storage(root, config, tenant)
-        delete_addons(root, config, client, tenant)
-        delete_tenant(root, config, client, tenant)
+        if client is not None and tenant is not None:
+            try:
+                delete_cnpg(root, config, tenant)
+                _delete_storage(root, config, tenant)
+                delete_addons(root, config, client, tenant)
+                delete_tenant(root, config, client, tenant)
+            except Exception as exc:
+                success.unlink(missing_ok=True)
+                write_private_file(failure, redact(str(exc)) + "\n")
+                raise
+    if evidence is None:
+        raise RuntimeError("CNPG evidence was not produced")
+    write_private_file(success, json.dumps(evidence, sort_keys=True) + "\n")
+    print("CNPG persistence checks passed")

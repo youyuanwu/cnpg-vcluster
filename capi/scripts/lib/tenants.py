@@ -759,6 +759,14 @@ def delete_tenant(
             ):
                 cnpg_present = True
                 break
+            if (
+                response.returncode != 0
+                and "not found" not in response.stderr.lower()
+            ):
+                raise RuntimeError(
+                    f"CNPG artifact inspection failed for {resource}: "
+                    f"{response.stderr}"
+                )
         if cnpg_present:
             raise RuntimeError(
                 "tenant CNPG resources must be deleted before Cluster deletion"
