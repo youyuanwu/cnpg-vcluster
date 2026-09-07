@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import re
 import shutil
 import time
@@ -10,7 +11,7 @@ from pathlib import Path
 
 from .conditions import condition_true
 from .config import parse_duration
-from .files import IntegrityError, write_private_file
+from .files import IntegrityError, ensure_private_dir, write_private_file
 from .kube import ManagementClient, wait_for
 from .process import run
 
@@ -305,13 +306,10 @@ def apply_bootstrap_rbac(
 
 
 def prepare_storage_directory(root: Path, config: dict[str, str], tenant: Tenant) -> None:
+    ensure_private_dir(root / ".runtime" / "storage")
     volume_name = storage_volume_name(config, tenant)
-    response = run(
-        ["docker", "volume", "inspect", volume_name],
-        timeout=30,
-        check=False,
-    )
-    if response.returncode != 0:
+    payload = inspect_storage_volume(volume_name)
+    if payload is None:
         run(
             [
                 "docker",
@@ -327,8 +325,9 @@ def prepare_storage_directory(root: Path, config: dict[str, str], tenant: Tenant
             ],
             timeout=30,
         )
-        response = run(["docker", "volume", "inspect", volume_name], timeout=30)
-    payload = json.loads(response.stdout)[0]
+        payload = inspect_storage_volume(volume_name)
+        if payload is None:
+            raise RuntimeError("tenant storage volume was not created")
     labels = payload.get("Labels") or {}
     if (
         labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
@@ -344,14 +343,43 @@ def prepare_storage_directory(root: Path, config: dict[str, str], tenant: Tenant
         "createdAt": payload["CreatedAt"],
         "mountpoint": payload["Mountpoint"],
     }
-    write_private_file(
-        root / ".runtime" / "storage" / tenant.name / "volume.json",
-        json.dumps(record, sort_keys=True) + "\n",
-    )
+    record_path = storage_record_path(root, tenant)
+    if record_path.exists() or record_path.is_symlink():
+        details = record_path.lstat()
+        if (
+            record_path.is_symlink()
+            or not record_path.is_file()
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+            or json.loads(record_path.read_text(encoding="utf-8")) != record
+        ):
+            raise RuntimeError("tenant storage volume identity record mismatch")
+    else:
+        write_private_file(record_path, json.dumps(record, sort_keys=True) + "\n")
 
 
 def storage_volume_name(config: dict[str, str], tenant: Tenant) -> str:
     return f"{config['LAB_PREFIX']}-{tenant.name}-storage"
+
+
+def storage_record_path(root: Path, tenant: Tenant) -> Path:
+    return root / ".runtime" / "storage" / tenant.name / "volume.json"
+
+
+def inspect_storage_volume(name: str) -> dict[str, object] | None:
+    response = run(
+        ["docker", "volume", "inspect", name],
+        timeout=30,
+        check=False,
+    )
+    if response.returncode == 0:
+        payload = json.loads(response.stdout)
+        if len(payload) != 1:
+            raise RuntimeError(f"unexpected Docker volume inventory for {name}")
+        return payload[0]
+    if "no such volume" in response.stderr.lower():
+        return None
+    raise RuntimeError(f"Docker volume inspection failed for {name}: {response.stderr}")
 
 
 def write_storage_marker(
@@ -674,6 +702,25 @@ def delete_tenant(
             raise RuntimeError(
                 "tenant add-ons must be deleted through the live API before Cluster deletion"
             )
+        for storage_resource in (
+            "deployment/storage-smoke",
+            "pvc/storage-smoke",
+            f"pv/{tenant.name}-storage-smoke",
+        ):
+            if (
+                _tenant_kubectl(
+                    root,
+                    config,
+                    tenant,
+                    "get",
+                    storage_resource,
+                    check=False,
+                ).returncode
+                == 0
+            ):
+                raise RuntimeError(
+                    "tenant storage API resources must be deleted before Cluster deletion"
+                )
     client.kubectl(
         "-n",
         tenant.namespace,
@@ -725,15 +772,10 @@ def delete_tenant(
     rendered = root / ".runtime" / "rendered" / "tenants" / tenant.name
     shutil.rmtree(rendered, ignore_errors=True)
     volume_name = storage_volume_name(config, tenant)
-    volume = run(
-        ["docker", "volume", "inspect", volume_name],
-        timeout=30,
-        check=False,
-    )
-    if volume.returncode == 0:
-        payload = json.loads(volume.stdout)[0]
+    payload = inspect_storage_volume(volume_name)
+    if payload is not None:
         labels = payload.get("Labels") or {}
-        record_path = root / ".runtime" / "storage" / tenant.name / "volume.json"
+        record_path = storage_record_path(root, tenant)
         if (
             labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
             or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
@@ -750,3 +792,8 @@ def delete_tenant(
             raise RuntimeError("tenant storage volume identity changed")
         run(["docker", "volume", "rm", volume_name], timeout=30)
         record_path.unlink()
+        for directory in (record_path.parent, record_path.parent.parent):
+            try:
+                directory.rmdir()
+            except OSError:
+                pass

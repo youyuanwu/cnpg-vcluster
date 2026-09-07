@@ -187,6 +187,26 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         client = ManagementClient(root, config)
         spike = spike_tenant(root, config)
         if (root / ".runtime" / "tenants" / spike.name / "kubeconfig").is_file():
+            from scripts.lib.tenants import _tenant_kubectl
+            from scripts.storage import _delete_storage
+
+            storage_present = any(
+                _tenant_kubectl(
+                    root,
+                    config,
+                    spike,
+                    "get",
+                    resource,
+                    check=False,
+                ).returncode
+                == 0
+                for resource in (
+                    "pvc/storage-smoke",
+                    f"pv/{spike.name}-storage-smoke",
+                )
+            )
+            if storage_present:
+                _delete_storage(root, config, spike)
             delete_addons(root, config, client, spike)
         delete_tenant(root, config, client, spike)
         _delete_kubernetes_stack(root, config, client)

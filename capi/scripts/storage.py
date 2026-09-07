@@ -9,6 +9,7 @@ from scripts.lib.process import run
 from scripts.lib.tenants import (
     _tenant_kubectl,
     delete_tenant,
+    inspect_storage_volume,
     storage_volume_name,
 )
 from scripts.machines import _scale_three, worker_snapshot
@@ -18,9 +19,9 @@ from scripts.status import collect_status, status_healthy
 
 def _volume_identity(config: dict[str, str], tenant) -> dict[str, object]:
     name = storage_volume_name(config, tenant)
-    payload = json.loads(
-        run(["docker", "volume", "inspect", name], timeout=30).stdout
-    )[0]
+    payload = inspect_storage_volume(name)
+    if payload is None:
+        raise RuntimeError("tenant storage volume is absent")
     labels = payload.get("Labels") or {}
     if (
         labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
@@ -134,18 +135,34 @@ def _storage_status(root: Path, config: dict[str, str], tenant) -> dict[str, obj
 
 
 def _delete_storage(root: Path, config: dict[str, str], tenant) -> None:
-    manifest = _render_storage(root, config, tenant)
-    _tenant_kubectl(
-        root,
-        config,
-        tenant,
-        "delete",
-        "-f",
-        str(manifest),
-        "--ignore-not-found",
-        "--wait=true",
-        check=False,
-    )
+    for resource in (
+        "deployment/storage-smoke",
+        "pvc/storage-smoke",
+        f"pv/{tenant.name}-storage-smoke",
+        f"storageclass/{config['SPIKE_STORAGE_CLASS']}",
+    ):
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "delete",
+            resource,
+            "--ignore-not-found",
+            "--wait=true",
+            f"--timeout={config['DELETE_TIMEOUT']}",
+        )
+        if (
+            _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "get",
+                resource,
+                check=False,
+            ).returncode
+            == 0
+        ):
+            raise RuntimeError(f"storage resource remained after deletion: {resource}")
 
 
 def run_storage_gate(root: Path, config: dict[str, str]) -> None:

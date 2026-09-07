@@ -15,7 +15,11 @@ from scripts.lib.providers import provider_status
 from scripts.lib.addons import network_status
 from scripts.lib.process import run
 from scripts.lib.tenants import _tenant_kubectl, spike_tenant
-from scripts.lib.tenants import storage_volume_name
+from scripts.lib.tenants import (
+    inspect_storage_volume,
+    storage_record_path,
+    storage_volume_name,
+)
 
 
 def _machine_layer_status(root: Path, config: dict[str, str], client, tenant):
@@ -110,20 +114,27 @@ def _machine_layer_status(root: Path, config: dict[str, str], client, tenant):
 
 def _storage_layer_status(root: Path, config: dict[str, str], tenant):
     volume_name = storage_volume_name(config, tenant)
-    volume = run(
-        ["docker", "volume", "inspect", volume_name],
-        timeout=30,
-        check=False,
-    )
-    if volume.returncode != 0:
+    try:
+        payload = inspect_storage_volume(volume_name)
+    except RuntimeError as exc:
+        return {"ready": False, "reason": "inspection-failed", "message": str(exc)}
+    if payload is None:
         return {"ready": False, "reason": "volume-missing"}
-    payload = json.loads(volume.stdout)[0]
     labels = payload.get("Labels") or {}
+    record_path = storage_record_path(root, tenant)
+    record_ready = False
+    if record_path.is_file():
+        record = json.loads(record_path.read_text(encoding="utf-8"))
+        record_ready = (
+            record.get("volumeName") == volume_name
+            and record.get("createdAt") == payload.get("CreatedAt")
+            and record.get("mountpoint") == payload.get("Mountpoint")
+        )
     result = {
         "volume": volume_name,
         "createdAt": payload.get("CreatedAt"),
         "mountpoint": payload.get("Mountpoint"),
-        "owned": (
+        "owned": record_ready and (
             labels.get(config["OWNERSHIP_LABEL"]) == config["LAB_PREFIX"]
             and labels.get("cnpg-vcluster.capi/role") == "tenant-storage"
             and labels.get("cnpg-vcluster.capi/tenant") == tenant.name
