@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.create_management import create_management
+from scripts.endpoint import _verify_bootstrap_secret
 from scripts.lib.conditions import condition_summary, condition_true
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.kube import ManagementClient, wait_for
@@ -534,14 +535,14 @@ def invalid_worker_condition(
     apply_bootstrap_rbac(root, config, tenant)
     _, workers = render_tenant_manifests(root, config, tenant)
     invalid = workers.with_name("invalid-worker.yaml")
-    missing_path = root / ".runtime" / "intentionally-missing" / "worker"
     write_private_file(
         invalid,
         workers.read_text(encoding="utf-8").replace(
-            str(tenant.storage_host_path),
-            str(missing_path),
+            config["KIND_NODE_IMAGE"],
+            "registry.invalid/capi-missing-node:v0",
         ),
     )
+    secret_name = ""
     try:
         client.kubectl("apply", "-f", str(invalid))
 
@@ -560,9 +561,54 @@ def invalid_worker_condition(
             items = json.loads(response.stdout)["items"]
             return items[0] if len(items) == 1 and _current_false_condition(items[0]) else None
 
-        wait_for("invalid worker condition", 180, 2, failed)
+        failed_resource = wait_for("invalid worker condition", 180, 2, failed)
+        secret_name = failed_resource["metadata"]["name"]
+        wait_for(
+            "failed-worker bootstrap Secret",
+            120,
+            2,
+            lambda: (
+                True
+                if client.kubectl(
+                    "-n",
+                    tenant.namespace,
+                    "get",
+                    f"secret/{secret_name}",
+                    check=False,
+                ).returncode
+                == 0
+                else None
+            ),
+        )
+        machine = json.loads(
+            client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"machine/{failed_resource['metadata']['name']}",
+                "-o",
+                "json",
+            ).stdout
+        )
+        _verify_bootstrap_secret(
+            config,
+            client,
+            tenant,
+            {"secret": secret_name, "machine": machine},
+        )
     finally:
         delete_tenant(root, config, client, tenant)
+        if secret_name and (
+            client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"secret/{secret_name}",
+                check=False,
+            ).returncode
+            == 0
+        ):
+            raise RuntimeError("failed-worker bootstrap Secret remained after cleanup")
 
 
 def main() -> int:

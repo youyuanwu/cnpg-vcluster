@@ -79,7 +79,24 @@ def _verify_bootstrap_secret(
         ).stdout
     )
     owners = secret["metadata"].get("ownerReferences") or []
-    if len(owners) != 1 or owners[0].get("kind") != "KubeadmConfig":
+    kubeadm = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"kubeadmconfig/{name}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    owner = owners[0] if len(owners) == 1 else {}
+    if (
+        owner.get("apiVersion") != "bootstrap.cluster.x-k8s.io/v1beta2"
+        or owner.get("kind") != "KubeadmConfig"
+        or owner.get("name") != name
+        or owner.get("uid") != kubeadm["metadata"]["uid"]
+        or owner.get("controller") is not True
+    ):
         raise RuntimeError("bootstrap Secret lacks one KubeadmConfig owner")
     if secret.get("type") != "cluster.x-k8s.io/secret":
         raise RuntimeError("bootstrap Secret type is unexpected")
