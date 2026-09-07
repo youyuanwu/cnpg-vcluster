@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import re
 from pathlib import Path
 
 from scripts.cnpg import (
@@ -194,7 +195,11 @@ def reconcile_tenant(root: Path, config: dict[str, str], client, tenant):
         )
         if response.returncode == 0:
             existing_database = True
-        elif "not found" in response.stderr.lower():
+        elif re.search(
+            r"Error from server \(NotFound\):",
+            response.stderr,
+            re.IGNORECASE,
+        ):
             existing_database = False
         else:
             raise RuntimeError(
