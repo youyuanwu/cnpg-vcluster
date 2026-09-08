@@ -9,7 +9,9 @@ from scripts.create import reconcile_tenant, validate_create_inputs
 from scripts.create_management import create_management
 from scripts.destroy import destroy
 from scripts.destroy_tenant import (
+    _journal_path,
     finish_prepared_tenant_deletion,
+    finish_journaled_tenant_deletion,
     prepare_tenant_deletion,
 )
 from scripts.lib.host import prepare_inotify
@@ -22,10 +24,13 @@ from scripts.lib.process import run
 from scripts.lib.tenants import (
     ensure_tenant_kubeconfig,
     inspect_management_resource,
+    inspect_storage_volume,
+    storage_volume_name,
+    tenant_kubeconfig_path,
     verify_tenant_management_ownership,
 )
 from scripts.lib.files import write_private_file
-from scripts.tools import _verify_private_input
+from scripts.tools import _verify_private_input, verify_all_inputs
 
 
 RETAINED_SCHEMA = 1
@@ -103,6 +108,14 @@ def validate_retained_state(root: Path, config: dict[str, str]) -> None:
 
 
 def dev_bootstrap(root: Path, config: dict[str, str]) -> None:
+    state = retained_path(root)
+    management_identity = root / ".runtime" / "management" / "identity.json"
+    if state.exists() or state.is_symlink():
+        validate_retained_state(root, config)
+    elif management_identity.exists() or management_identity.is_symlink():
+        raise RuntimeError(
+            "management exists without retained binding; run `just dev-clean` first"
+        )
     prepare_inotify(root, config)
     create_management(root, config)
     write_retained_state(root, config)
@@ -117,7 +130,25 @@ def _delete_representative_tenant(
 ) -> None:
     owned = verify_tenant_management_ownership(config, client, tenant)
     cluster = owned.get("cluster")
+    journal = _journal_path(root, tenant)
+    if cluster is None and (journal.exists() or journal.is_symlink()):
+        finish_journaled_tenant_deletion(root, config, client, tenant)
+        return
     if cluster is None:
+        partial = any(
+            value is not None
+            for key, value in owned.items()
+            if key not in {"cluster", "namespace"}
+        )
+        if (
+            partial
+            or tenant_kubeconfig_path(root, tenant).exists()
+            or tenant_kubeconfig_path(root, tenant).is_symlink()
+            or inspect_storage_volume(storage_volume_name(config, tenant)) is not None
+        ):
+            raise RuntimeError(
+                "partial retained tenant state blocks recreation; run `just dev-clean`"
+            )
         return
     ensure_tenant_kubeconfig(root, config, client, tenant)
     prepare_tenant_deletion(root, config, client, tenant, cluster)
@@ -126,6 +157,7 @@ def _delete_representative_tenant(
 
 def dev_tenant(root: Path, config: dict[str, str]) -> None:
     validate_retained_state(root, config)
+    verify_all_inputs(root, config)
     client = ManagementClient(root, config)
     tenant = validate_create_inputs(root, config)[0]
     _delete_representative_tenant(root, config, client, tenant)

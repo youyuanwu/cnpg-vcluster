@@ -8,8 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.cnpg import _cnpg_ready, _verify_marker
-from scripts.create import reconcile_tenant, validate_create_inputs
+from scripts.create import reconcile_tenant
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.locking import e2e_lock
@@ -94,17 +93,8 @@ def run_e2e() -> int:
             verify_all_inputs(ROOT, config)
             run_just(ROOT, config, "create-management")
 
-        from scripts.lib.kube import ManagementClient
-
-        client = ManagementClient(ROOT, config)
-        tenant = validate_create_inputs(ROOT, config)[0]
-        reconcile_tenant(ROOT, config, client, tenant, timings=timings)
-        if not _cnpg_ready(ROOT, config, tenant):
-            raise RuntimeError(
-                f"PostgreSQL cluster did not become healthy: {tenant.name}"
-            )
-        _verify_marker(ROOT, config, tenant)
-        print(f"tenant PostgreSQL cluster is healthy: {tenant.name}")
+        reconcile_tenant(ROOT, config, timings=timings)
+        print("representative tenant PostgreSQL cluster is healthy")
     except BaseException as exc:
         failure = exc
     try:

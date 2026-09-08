@@ -235,8 +235,8 @@ def verified_tenant_snapshot(
 def reconcile_tenant(
     root: Path,
     config: dict[str, str],
-    client,
-    tenant,
+    client=None,
+    tenant=None,
     *,
     before: dict[str, object] | None = None,
     repair_mode: bool = False,
@@ -244,6 +244,10 @@ def reconcile_tenant(
 ):
     phase = timings.phase if timings is not None else lambda _: nullcontext()
     with phase("tenant_control_plane"):
+        if client is None:
+            client = ManagementClient(root, config)
+        if tenant is None:
+            tenant = validate_create_inputs(root, config)[0]
         existing_database = None
         if not repair_mode and tenant_kubeconfig_path(root, tenant).is_file():
             response = _tenant_kubectl(

@@ -63,11 +63,21 @@ class RetainedTests(unittest.TestCase):
             dev_bootstrap(Path("."), {})
         self.assertEqual(calls, ["host", "management", "state"])
 
+    def test_bootstrap_refuses_unbound_existing_management(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            identity = root / ".runtime/management/identity.json"
+            identity.parent.mkdir(parents=True)
+            identity.write_text("{}")
+            with self.assertRaisesRegex(RuntimeError, "dev-clean"):
+                dev_bootstrap(root, {})
+
     def test_tenant_loop_validates_deletes_recreates_and_rebinds(self) -> None:
         calls: list[str] = []
         tenant = type("Tenant", (), {"name": "tenant-a"})()
         with (
             patch("scripts.retained.validate_retained_state", side_effect=lambda *_: calls.append("validate")),
+            patch("scripts.retained.verify_all_inputs", side_effect=lambda *_: calls.append("inputs")),
             patch("scripts.retained.ManagementClient", return_value=object()),
             patch("scripts.retained.validate_create_inputs", return_value=[tenant]),
             patch("scripts.retained._delete_representative_tenant", side_effect=lambda *_: calls.append("delete")),
@@ -75,7 +85,7 @@ class RetainedTests(unittest.TestCase):
             patch("scripts.retained.write_retained_state", side_effect=lambda *_: calls.append("state")),
         ):
             dev_tenant(Path("."), {})
-        self.assertEqual(calls, ["validate", "delete", "recreate", "state"])
+        self.assertEqual(calls, ["validate", "inputs", "delete", "recreate", "state"])
 
     def test_clean_routes_through_authoritative_destroy(self) -> None:
         with patch("scripts.retained.destroy") as destroy:
