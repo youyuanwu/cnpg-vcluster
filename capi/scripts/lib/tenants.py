@@ -30,6 +30,101 @@ class Tenant:
     workers: int
 
 
+NOT_FOUND = re.compile(r"Error from server \(NotFound\):", re.IGNORECASE)
+
+
+def inspect_management_resource(
+    client: ManagementClient,
+    tenant: Tenant,
+    resource: str,
+) -> dict[str, object] | None:
+    response = client.kubectl(
+        "-n",
+        tenant.namespace,
+        "get",
+        resource,
+        "-o",
+        "json",
+        check=False,
+    )
+    if response.returncode == 0:
+        return json.loads(response.stdout)
+    if NOT_FOUND.search(response.stderr):
+        return None
+    raise RuntimeError(
+        f"tenant management inspection failed for {resource}: {response.stderr}"
+    )
+
+
+def verify_tenant_management_ownership(
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant: Tenant,
+) -> dict[str, dict[str, object]]:
+    present = {}
+    namespace_response = client.kubectl(
+        "get",
+        f"namespace/{tenant.namespace}",
+        "-o",
+        "json",
+        check=False,
+    )
+    if namespace_response.returncode == 0:
+        namespace = json.loads(namespace_response.stdout)
+        labels = namespace["metadata"].get("labels") or {}
+        if labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]:
+            raise RuntimeError(f"tenant namespace ownership mismatch: {tenant.name}")
+        present["namespace"] = namespace
+    elif not NOT_FOUND.search(namespace_response.stderr):
+        raise RuntimeError(
+            f"tenant namespace inspection failed: {namespace_response.stderr}"
+        )
+    resources = (
+        ("cluster", tenant.name),
+        ("devcluster", tenant.name),
+        ("kamajicontrolplane", tenant.name),
+        ("machinedeployment", f"{tenant.name}-worker"),
+        ("kubeadmconfigtemplate", f"{tenant.name}-worker"),
+        ("devmachinetemplate", f"{tenant.name}-worker"),
+    )
+    for kind, name in resources:
+        payload = inspect_management_resource(client, tenant, f"{kind}/{name}")
+        if payload is None:
+            continue
+        labels = payload["metadata"].get("labels") or {}
+        if labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]:
+            raise RuntimeError(
+                f"tenant resource ownership mismatch: {kind}/{name}"
+            )
+        present[kind] = payload
+    machines_response = client.kubectl(
+        "-n",
+        tenant.namespace,
+        "get",
+        "machines",
+        "-l",
+        f"cluster.x-k8s.io/cluster-name={tenant.name}",
+        "-o",
+        "json",
+        check=False,
+    )
+    if machines_response.returncode == 0:
+        machines = json.loads(machines_response.stdout)["items"]
+        for machine in machines:
+            labels = machine["metadata"].get("labels") or {}
+            if labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]:
+                raise RuntimeError(
+                    f"tenant Machine ownership mismatch: "
+                    f"{machine['metadata']['name']}"
+                )
+        present["machines"] = machines
+    elif not NOT_FOUND.search(machines_response.stderr):
+        raise RuntimeError(
+            f"tenant Machine inspection failed: {machines_response.stderr}"
+        )
+    return present
+
+
 def spike_tenant(root: Path, config: dict[str, str]) -> Tenant:
     network_path = root / ".runtime" / "management" / "network.json"
     network = json.loads(network_path.read_text(encoding="utf-8"))
@@ -779,12 +874,76 @@ def endpoint_snapshot(
     return resources
 
 
+def remove_tenant_storage_volume(
+    root: Path,
+    config: dict[str, str],
+    tenant: Tenant,
+) -> None:
+    volume_name = storage_volume_name(config, tenant)
+    payload = inspect_storage_volume(volume_name)
+    record_path = storage_record_path(root, tenant)
+    if payload is not None:
+        labels = payload.get("Labels") or {}
+        if (
+            labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
+            or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
+            or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
+            or not record_path.is_file()
+        ):
+            raise RuntimeError("refusing to remove unproven tenant storage volume")
+        details = record_path.lstat()
+        expected_record = {
+            "schema": 1,
+            "tenant": tenant.name,
+            "volumeName": volume_name,
+            "createdAt": payload.get("CreatedAt"),
+            "mountpoint": payload.get("Mountpoint"),
+        }
+        if (
+            record_path.is_symlink()
+            or not record_path.is_file()
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+            or json.loads(record_path.read_text(encoding="utf-8"))
+            != expected_record
+        ):
+            raise RuntimeError("tenant storage volume identity changed")
+        run(["docker", "volume", "rm", volume_name], timeout=30)
+        record_path.unlink()
+    elif record_path.exists() or record_path.is_symlink():
+        details = record_path.lstat()
+        record = (
+            json.loads(record_path.read_text(encoding="utf-8"))
+            if record_path.is_file() and not record_path.is_symlink()
+            else {}
+        )
+        if (
+            record_path.is_symlink()
+            or not record_path.is_file()
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+            or record.get("schema") != 1
+            or record.get("tenant") != tenant.name
+            or record.get("volumeName") != volume_name
+            or not record.get("createdAt")
+            or not record.get("mountpoint")
+        ):
+            raise RuntimeError("orphaned tenant storage identity record is invalid")
+        record_path.unlink()
+    for directory in (record_path.parent, record_path.parent.parent):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
+
+
 def delete_tenant(
     root: Path,
     config: dict[str, str],
     client: ManagementClient,
     tenant: Tenant,
 ) -> None:
+    verify_tenant_management_ownership(config, client, tenant)
     if tenant_kubeconfig_path(root, tenant).is_file():
         addon = _tenant_kubectl(
             root,
@@ -800,30 +959,47 @@ def delete_tenant(
             raise RuntimeError(
                 "tenant add-ons must be deleted through the live API before Cluster deletion"
             )
+        if not re.search(
+            r"Error from server \(NotFound\):",
+            addon.stderr,
+            re.IGNORECASE,
+        ):
+            raise RuntimeError(
+                f"tenant add-on inspection failed before deletion: {addon.stderr}"
+            )
         for storage_resource in (
             "deployment/storage-smoke",
             "pvc/storage-smoke",
             f"pv/{tenant.name}-storage-smoke",
             f"storageclass/{config['SPIKE_STORAGE_CLASS']}",
         ):
-            if (
-                _tenant_kubectl(
-                    root,
-                    config,
-                    tenant,
-                    "get",
-                    storage_resource,
-                    check=False,
-                ).returncode
-                == 0
-            ):
+            response = _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "get",
+                storage_resource,
+                check=False,
+            )
+            if response.returncode == 0:
                 raise RuntimeError(
                     "tenant storage API resources must be deleted before Cluster deletion"
+                )
+            if not re.search(
+                r"Error from server \(NotFound\):",
+                response.stderr,
+                re.IGNORECASE,
+            ):
+                raise RuntimeError(
+                    f"tenant storage inspection failed before deletion: "
+                    f"{response.stderr}"
                 )
         cnpg_resources = (
             (("-n", config["DATABASE_NAMESPACE"]), f"cluster/{tenant.cnpg_cluster}"),
             (("-n", config["DATABASE_NAMESPACE"]), "pvc"),
             ((), f"pv/{tenant.cnpg_cluster}-pv-1"),
+            ((), f"pv/{tenant.cnpg_cluster}-pv-2"),
+            ((), f"pv/{tenant.cnpg_cluster}-pv-3"),
             (("-n", config["CNPG_NAMESPACE"]), "deployment/cnpg-controller-manager"),
             ((), "crd/clusters.postgresql.cnpg.io"),
         )
@@ -854,7 +1030,11 @@ def delete_tenant(
                 break
             if (
                 response.returncode != 0
-                and "not found" not in response.stderr.lower()
+                and not re.search(
+                    r"Error from server \(NotFound\):",
+                    response.stderr,
+                    re.IGNORECASE,
+                )
             ):
                 raise RuntimeError(
                     f"CNPG artifact inspection failed for {resource}: "
@@ -864,7 +1044,7 @@ def delete_tenant(
             raise RuntimeError(
                 "tenant CNPG resources must be deleted before Cluster deletion"
             )
-    client.kubectl(
+    cluster_delete = client.kubectl(
         "-n",
         tenant.namespace,
         "delete",
@@ -874,7 +1054,11 @@ def delete_tenant(
         f"--timeout={config['DELETE_TIMEOUT']}",
         check=False,
     )
-    client.kubectl(
+    if cluster_delete.returncode != 0 and not NOT_FOUND.search(
+        cluster_delete.stderr
+    ):
+        raise RuntimeError(f"tenant Cluster deletion failed: {cluster_delete.stderr}")
+    namespace_delete = client.kubectl(
         "delete",
         "namespace",
         tenant.namespace,
@@ -883,20 +1067,32 @@ def delete_tenant(
         f"--timeout={config['DELETE_TIMEOUT']}",
         check=False,
     )
+    if namespace_delete.returncode != 0 and not NOT_FOUND.search(
+        namespace_delete.stderr
+    ):
+        raise RuntimeError(
+            f"tenant namespace deletion failed: {namespace_delete.stderr}"
+        )
+
+    def namespace_absent():
+        response = client.kubectl(
+            "get",
+            f"namespace/{tenant.namespace}",
+            check=False,
+        )
+        if response.returncode == 0:
+            return None
+        if NOT_FOUND.search(response.stderr):
+            return True
+        raise RuntimeError(
+            f"tenant namespace deletion inspection failed: {response.stderr}"
+        )
+
     wait_for(
         f"namespace {tenant.namespace} deletion",
         parse_duration(config["DELETE_TIMEOUT"]),
         parse_duration(config["WAIT_POLL_INTERVAL"]),
-        lambda: (
-            True
-            if client.kubectl(
-                "get",
-                f"namespace/{tenant.namespace}",
-                check=False,
-            ).returncode
-            != 0
-            else None
-        ),
+        namespace_absent,
     )
     leftovers = run(
         [
@@ -912,41 +1108,10 @@ def delete_tenant(
         raise RuntimeError(f"CAPD resources remain after tenant deletion: {leftovers}")
     kubeconfig = tenant_kubeconfig_path(root, tenant)
     kubeconfig.unlink(missing_ok=True)
+    try:
+        kubeconfig.parent.rmdir()
+    except OSError:
+        pass
     rendered = root / ".runtime" / "rendered" / "tenants" / tenant.name
     shutil.rmtree(rendered, ignore_errors=True)
-    volume_name = storage_volume_name(config, tenant)
-    payload = inspect_storage_volume(volume_name)
-    if payload is not None:
-        labels = payload.get("Labels") or {}
-        record_path = storage_record_path(root, tenant)
-        if (
-            labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
-            or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
-            or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
-            or not record_path.is_file()
-        ):
-            raise RuntimeError("refusing to remove unproven tenant storage volume")
-        details = record_path.lstat()
-        expected_record = {
-            "schema": 1,
-            "tenant": tenant.name,
-            "volumeName": volume_name,
-            "createdAt": payload.get("CreatedAt"),
-            "mountpoint": payload.get("Mountpoint"),
-        }
-        if (
-            record_path.is_symlink()
-            or not record_path.is_file()
-            or details.st_uid != os.getuid()
-            or details.st_mode & 0o077
-            or json.loads(record_path.read_text(encoding="utf-8"))
-            != expected_record
-        ):
-            raise RuntimeError("tenant storage volume identity changed")
-        run(["docker", "volume", "rm", volume_name], timeout=30)
-        record_path.unlink()
-        for directory in (record_path.parent, record_path.parent.parent):
-            try:
-                directory.rmdir()
-            except OSError:
-                pass
+    remove_tenant_storage_volume(root, config, tenant)

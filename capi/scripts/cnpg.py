@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import time
 from pathlib import Path
 
@@ -585,7 +586,11 @@ def delete_cnpg(root: Path, config: dict[str, str], tenant) -> None:
     )
     if leftovers.returncode == 0 and leftovers.stdout.strip():
         raise RuntimeError("CNPG PVCs remain after cluster deletion")
-    if leftovers.returncode != 0 and "not found" not in leftovers.stderr.lower():
+    if leftovers.returncode != 0 and not re.search(
+        r"Error from server \(NotFound\):",
+        leftovers.stderr,
+        re.IGNORECASE,
+    ):
         raise RuntimeError(
             f"CNPG PVC deletion inspection failed: {leftovers.stderr}"
         )
@@ -601,6 +606,43 @@ def delete_cnpg(root: Path, config: dict[str, str], tenant) -> None:
         "--wait=false",
     )
 
+    def operator_absent():
+        for arguments in (
+            (
+                "-n",
+                config["CNPG_NAMESPACE"],
+                "get",
+                "deployment/cnpg-controller-manager",
+            ),
+            ("get", "crd/clusters.postgresql.cnpg.io"),
+        ):
+            response = _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                *arguments,
+                check=False,
+            )
+            if response.returncode == 0:
+                return None
+            if not re.search(
+                r"Error from server \(NotFound\):",
+                response.stderr,
+                re.IGNORECASE,
+            ):
+                raise RuntimeError(
+                    f"CNPG operator deletion inspection failed: "
+                    f"{response.stderr}"
+                )
+        return True
+
+    wait_for(
+        "CNPG operator deletion",
+        parse_duration(config["DELETE_TIMEOUT"]),
+        parse_duration(config["WAIT_POLL_INTERVAL"]),
+        operator_absent,
+    )
+
 
 def cnpg_artifacts_present(root: Path, config: dict[str, str], tenant) -> bool:
     checks = (
@@ -613,6 +655,8 @@ def cnpg_artifacts_present(root: Path, config: dict[str, str], tenant) -> bool:
             "pvc",
         ),
         ((), f"pv/{tenant.cnpg_cluster}-pv-1"),
+        ((), f"pv/{tenant.cnpg_cluster}-pv-2"),
+        ((), f"pv/{tenant.cnpg_cluster}-pv-3"),
         (
             ("-n", config["CNPG_NAMESPACE"]),
             "deployment/cnpg-controller-manager",
@@ -640,7 +684,11 @@ def cnpg_artifacts_present(root: Path, config: dict[str, str], tenant) -> bool:
         )
         if response.returncode == 0 and (not is_list or response.stdout.strip()):
             return True
-        if response.returncode != 0 and "not found" not in response.stderr.lower():
+        if response.returncode != 0 and not re.search(
+            r"Error from server \(NotFound\):",
+            response.stderr,
+            re.IGNORECASE,
+        ):
             raise RuntimeError(
                 f"CNPG artifact inspection failed for {resource}: {response.stderr}"
             )

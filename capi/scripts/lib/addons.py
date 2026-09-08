@@ -7,7 +7,7 @@ from pathlib import Path
 
 from .files import IntegrityError, verify_sha256, write_private_file
 from .kube import ManagementClient, wait_for
-from .tenants import Tenant, _tenant_kubectl
+from .tenants import NOT_FOUND, Tenant, _tenant_kubectl
 from .config import parse_duration
 from .conditions import condition_true
 
@@ -282,12 +282,48 @@ def render_resource_set(
     return destination, inventory
 
 
+def verify_addon_source_ownership(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant: Tenant,
+) -> None:
+    _, inventory = render_resource_set(root, config, tenant)
+    resources = [
+        f"clusterresourceset/{tenant.name}-network",
+        *(f"configmap/{name}" for name in sorted(inventory)),
+    ]
+    for resource in resources:
+        response = client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            resource,
+            "-o",
+            "json",
+            check=False,
+        )
+        if response.returncode == 0:
+            payload = json.loads(response.stdout)
+            labels = payload["metadata"].get("labels") or {}
+            if labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]:
+                raise RuntimeError(
+                    f"tenant add-on source ownership mismatch: {resource}"
+                )
+        elif not NOT_FOUND.search(response.stderr):
+            raise RuntimeError(
+                f"tenant add-on source inspection failed for {resource}: "
+                f"{response.stderr}"
+            )
+
+
 def apply_addons(
     root: Path,
     config: dict[str, str],
     client: ManagementClient,
     tenant: Tenant,
 ) -> dict[str, str]:
+    verify_addon_source_ownership(root, config, client, tenant)
     manifest, inventory = render_resource_set(root, config, tenant)
     payload = json.loads(manifest.read_text(encoding="utf-8"))
     resource_set = next(
@@ -680,7 +716,8 @@ def delete_addons(
     client: ManagementClient,
     tenant: Tenant,
 ) -> None:
-    _tenant_kubectl(
+    verify_addon_source_ownership(root, config, client, tenant)
+    revision_delete = _tenant_kubectl(
         root,
         config,
         tenant,
@@ -691,11 +728,17 @@ def delete_addons(
         "--ignore-not-found",
         check=False,
     )
+    if revision_delete.returncode != 0 and not NOT_FOUND.search(
+        revision_delete.stderr
+    ):
+        raise RuntimeError(
+            f"tenant add-on revision deletion failed: {revision_delete.stderr}"
+        )
     for path in (
         render_kube_proxy(root, config, tenant),
         render_calico(root, config, tenant),
     ):
-        _tenant_kubectl(
+        response = _tenant_kubectl(
             root,
             config,
             tenant,
@@ -706,8 +749,10 @@ def delete_addons(
             "--wait=false",
             check=False,
         )
+        if response.returncode != 0 and not NOT_FOUND.search(response.stderr):
+            raise RuntimeError(f"tenant add-on deletion failed: {response.stderr}")
     manifest, _ = render_resource_set(root, config, tenant)
-    client.kubectl(
+    source_delete = client.kubectl(
         "delete",
         "-f",
         str(manifest),
@@ -715,32 +760,42 @@ def delete_addons(
         "--wait=false",
         check=False,
     )
+    if source_delete.returncode != 0 and not NOT_FOUND.search(
+        source_delete.stderr
+    ):
+        raise RuntimeError(
+            f"tenant add-on source deletion failed: {source_delete.stderr}"
+        )
     resources = (
         ("kube-system", "daemonset/capi-kube-proxy"),
         ("kube-system", "configmap/capi-kube-proxy"),
         ("kube-system", "daemonset/calico-node"),
         ("kube-system", "deployment/calico-kube-controllers"),
     )
+    def addons_absent():
+        for namespace, resource in resources:
+            response = _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "-n",
+                namespace,
+                "get",
+                resource,
+                check=False,
+            )
+            if response.returncode == 0:
+                return None
+            if not NOT_FOUND.search(response.stderr):
+                raise RuntimeError(
+                    f"tenant add-on deletion inspection failed for {resource}: "
+                    f"{response.stderr}"
+                )
+        return True
+
     wait_for(
         "tenant add-on deletion",
         parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"]),
         parse_duration(config["WAIT_POLL_INTERVAL"]),
-        lambda: (
-            True
-            if all(
-                _tenant_kubectl(
-                    root,
-                    config,
-                    tenant,
-                    "-n",
-                    namespace,
-                    "get",
-                    resource,
-                    check=False,
-                ).returncode
-                != 0
-                for namespace, resource in resources
-            )
-            else None
-        ),
+        addons_absent,
     )

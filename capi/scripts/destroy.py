@@ -20,7 +20,13 @@ from scripts.lib.management import (
 )
 from scripts.lib.providers import delete_providers
 from scripts.lib.addons import delete_addons
-from scripts.lib.tenants import configured_tenants, delete_tenant, spike_tenant
+from scripts.lib.tenants import (
+    configured_tenants,
+    delete_tenant,
+    inspect_management_resource,
+    spike_tenant,
+    verify_tenant_management_ownership,
+)
 
 
 def _validate_runtime_inventory(root: Path) -> None:
@@ -57,6 +63,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         re.compile(r"^evidence/endpoint-success\.json$"),
         re.compile(r"^evidence/cnpg-(success\.json|failure\.txt)$"),
         re.compile(r"^evidence/(create|verify)-(success\.json|failure\.txt)$"),
+        re.compile(r"^deletions/(tenant-a|tenant-b)\.json$"),
         re.compile(r"^rendered/negative/foreign-node\.json$"),
         re.compile(
             r"^rendered/addons/(capi-worker-spike|tenant-a|tenant-b)/"
@@ -197,7 +204,43 @@ def destroy(root: Path, config: dict[str, str]) -> None:
             raise RuntimeError("owned management API is not reachable; refusing partial cleanup")
         client = ManagementClient(root, config)
         tenants = [spike_tenant(root, config), *configured_tenants(root, config)]
+        configured_names = set(config["TENANT_NAMES"].split())
         for tenant in tenants:
+            deletion_journal = (
+                root / ".runtime" / "deletions" / f"{tenant.name}.json"
+            )
+            cluster = inspect_management_resource(
+                client, tenant, f"cluster/{tenant.name}"
+            )
+            if tenant.name in configured_names and cluster is not None:
+                from scripts.destroy_tenant import (
+                    finish_prepared_tenant_deletion,
+                    prepare_tenant_deletion,
+                )
+                from scripts.lib.tenants import export_tenant_kubeconfig
+
+                verify_tenant_management_ownership(config, client, tenant)
+                export_tenant_kubeconfig(root, config, client, tenant)
+                prepare_tenant_deletion(
+                    root, config, client, tenant, cluster
+                )
+                finish_prepared_tenant_deletion(
+                    root, config, client, tenant
+                )
+                continue
+            if cluster is not None and deletion_journal.is_file():
+                from scripts.destroy_tenant import validate_deletion_journal
+
+                validate_deletion_journal(
+                    root, tenant, str(cluster["metadata"]["uid"])
+                )
+            if cluster is None and deletion_journal.is_file():
+                from scripts.destroy_tenant import finish_journaled_tenant_deletion
+
+                finish_journaled_tenant_deletion(
+                    root, config, client, tenant
+                )
+                continue
             if not (
                 root / ".runtime" / "tenants" / tenant.name / "kubeconfig"
             ).is_file():
@@ -209,22 +252,31 @@ def destroy(root: Path, config: dict[str, str]) -> None:
 
             if cnpg_artifacts_present(root, config, tenant):
                 delete_cnpg(root, config, tenant)
-            storage_present = any(
-                _tenant_kubectl(
+            storage_present = False
+            for resource in (
+                "pvc/storage-smoke",
+                f"pv/{tenant.name}-storage-smoke",
+                f"storageclass/{config['SPIKE_STORAGE_CLASS']}",
+            ):
+                response = _tenant_kubectl(
                     root,
                     config,
                     tenant,
                     "get",
                     resource,
                     check=False,
-                ).returncode
-                == 0
-                for resource in (
-                    "pvc/storage-smoke",
-                    f"pv/{tenant.name}-storage-smoke",
-                    f"storageclass/{config['SPIKE_STORAGE_CLASS']}",
                 )
-            )
+                if response.returncode == 0:
+                    storage_present = True
+                elif not re.search(
+                    r"Error from server \(NotFound\):",
+                    response.stderr,
+                    re.IGNORECASE,
+                ):
+                    raise RuntimeError(
+                        f"storage cleanup inspection failed for {resource}: "
+                        f"{response.stderr}"
+                    )
             if storage_present:
                 _delete_storage(root, config, tenant)
             delete_addons(root, config, client, tenant)

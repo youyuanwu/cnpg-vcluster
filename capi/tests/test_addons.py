@@ -16,6 +16,7 @@ from scripts.lib.addons import (
     validate_manifest_hashes,
     validate_resource_set_references,
     render_resource_set,
+    verify_addon_source_ownership,
 )
 from scripts.lib.files import IntegrityError
 from scripts.lib.tenants import Tenant
@@ -44,6 +45,33 @@ class AddonTests(unittest.TestCase):
         payload = _source_object(self.config, self.tenant, "source", "kind: List\n")
         serialized = json.dumps(payload, separators=(",", ":")).encode()
         self.assertLess(len(serialized), SOURCE_LIMIT)
+
+    def test_addon_source_ownership_rejects_foreign_configmap(self) -> None:
+        client = type(
+            "Client",
+            (),
+            {
+                "kubectl": lambda self, *args, **kwargs: type(
+                    "Result",
+                    (),
+                    {
+                        "returncode": 0,
+                        "stdout": json.dumps(
+                            {"metadata": {"labels": {}}}
+                        ),
+                        "stderr": "",
+                    },
+                )()
+            },
+        )()
+        with patch(
+            "scripts.lib.addons.render_resource_set",
+            return_value=(Path("resource-set.json"), {"source": "a" * 64}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "ownership mismatch"):
+                verify_addon_source_ownership(
+                    Path("."), self.config, client, self.tenant
+                )
 
     def test_limits_are_explicit(self) -> None:
         self.assertEqual(SOURCE_LIMIT, 900 * 1024)

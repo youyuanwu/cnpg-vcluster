@@ -7,6 +7,7 @@ from scripts.lib.addons import delete_addons, wait_network_ready
 from scripts.lib.files import IntegrityError, write_private_file
 from scripts.lib.process import run
 from scripts.lib.tenants import (
+    NOT_FOUND,
     _tenant_kubectl,
     delete_tenant,
     inspect_storage_volume,
@@ -151,18 +152,21 @@ def _delete_storage(root: Path, config: dict[str, str], tenant) -> None:
             "--wait=true",
             f"--timeout={config['DELETE_TIMEOUT']}",
         )
-        if (
-            _tenant_kubectl(
-                root,
-                config,
-                tenant,
-                "get",
-                resource,
-                check=False,
-            ).returncode
-            == 0
-        ):
+        inspection = _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "get",
+            resource,
+            check=False,
+        )
+        if inspection.returncode == 0:
             raise RuntimeError(f"storage resource remained after deletion: {resource}")
+        if not NOT_FOUND.search(inspection.stderr):
+            raise RuntimeError(
+                f"storage deletion inspection failed for {resource}: "
+                f"{inspection.stderr}"
+            )
 
 
 def run_storage_gate(

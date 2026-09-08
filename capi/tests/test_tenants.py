@@ -11,6 +11,7 @@ from scripts.lib.tenants import (
     Tenant,
     _render_template,
     configured_tenants,
+    remove_tenant_storage_volume,
     storage_volume_name,
 )
 from scripts.lib.files import IntegrityError
@@ -105,3 +106,43 @@ class TenantTests(unittest.TestCase):
             network.write_text('{"slots":{}}\n', encoding="utf-8")
             with self.assertRaises(IntegrityError):
                 configured_tenants(root, {"TENANT_NAMES": "tenant-a"})
+
+    def test_absent_volume_removes_valid_orphaned_identity_record(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tenant = Tenant(
+                name="tenant-a",
+                namespace="tenant-a",
+                vip="172.18.0.10",
+                pod_cidr="10.70.0.0/16",
+                service_cidr="10.140.0.0/16",
+                dns_ip="10.140.0.10",
+                domain="tenant-a.local",
+                storage_host_path=root / "storage",
+                cnpg_cluster="tenant-a-postgres",
+                workers=3,
+            )
+            record = root / ".runtime" / "storage" / tenant.name / "volume.json"
+            record.parent.mkdir(parents=True)
+            record.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "tenant": tenant.name,
+                        "volumeName": "lab-tenant-a-storage",
+                        "createdAt": "2026-01-01T00:00:00Z",
+                        "mountpoint": "/var/lib/docker/volumes/test/_data",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            record.chmod(0o600)
+            with patch(
+                "scripts.lib.tenants.inspect_storage_volume",
+                return_value=None,
+            ):
+                remove_tenant_storage_volume(
+                    root, {"LAB_PREFIX": "lab"}, tenant
+                )
+            self.assertFalse(record.exists())
+            self.assertFalse(record.parent.exists())

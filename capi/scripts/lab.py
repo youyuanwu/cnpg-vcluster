@@ -16,14 +16,17 @@ from scripts.create_management import create_management
 from scripts.create import create
 from scripts.destroy import destroy
 from scripts.diagnose import diagnose
+from scripts.destroy_tenant import destroy_tenant_stack
 from scripts.endpoint import run_endpoint_gate
 from scripts.network import run_network_gate
 from scripts.machines import run_machine_gate
 from scripts.storage import run_storage_gate
 from scripts.cnpg import run_cnpg_gate
 from scripts.preflight import PreflightError, run_preflight
+from scripts.repair import repair
 from scripts.status import status
 from scripts.tools import prepare_tools
+from scripts.test_tenant_lifecycle import run_tenant_lifecycle
 from scripts.verify import verify
 
 
@@ -67,6 +70,24 @@ def main(arguments: list[str]) -> int:
         with tools_lock(ROOT, exclusive=True):
             run_preflight(ROOT, config)
             verify(ROOT, config)
+        return 0
+    if command == "repair":
+        if len(rest) != 1:
+            raise RuntimeError("repair requires exactly one tenant name")
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            repair(ROOT, config, rest[0])
+        return 0
+    if command == "destroy-tenant":
+        if len(rest) != 1:
+            raise RuntimeError("destroy-tenant requires exactly one tenant name")
+        with tools_lock(ROOT, exclusive=True):
+            destroy_tenant_stack(ROOT, config, rest[0])
+        return 0
+    if command == "test-tenant-lifecycle":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            run_tenant_lifecycle(ROOT, config)
         return 0
     if command == "status":
         with tools_lock(ROOT, exclusive=False):

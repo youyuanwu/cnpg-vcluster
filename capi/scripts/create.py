@@ -62,6 +62,23 @@ def validate_create_inputs(root: Path, config: dict[str, str]):
     return tenants
 
 
+def require_no_pending_deletions(root: Path, tenants) -> None:
+    pending = [
+        tenant.name
+        for tenant in tenants
+        if (
+            root / ".runtime" / "deletions" / f"{tenant.name}.json"
+        ).exists()
+        or (
+            root / ".runtime" / "deletions" / f"{tenant.name}.json"
+        ).is_symlink()
+    ]
+    if pending:
+        raise RuntimeError(
+            f"pending tenant deletion blocks reconciliation: {', '.join(pending)}"
+        )
+
+
 def stable_tenant_snapshot(
     root: Path,
     config: dict[str, str],
@@ -180,9 +197,17 @@ def stable_tenant_snapshot(
         raise
 
 
-def reconcile_tenant(root: Path, config: dict[str, str], client, tenant):
+def reconcile_tenant(
+    root: Path,
+    config: dict[str, str],
+    client,
+    tenant,
+    *,
+    before: dict[str, object] | None = None,
+    repair_mode: bool = False,
+):
     existing_database = None
-    if tenant_kubeconfig_path(root, tenant).is_file():
+    if not repair_mode and tenant_kubeconfig_path(root, tenant).is_file():
         response = _tenant_kubectl(
             root,
             config,
@@ -205,13 +230,14 @@ def reconcile_tenant(root: Path, config: dict[str, str], client, tenant):
             raise RuntimeError(
                 f"tenant database inspection failed: {tenant.name}: {response.stderr}"
             )
-    before = stable_tenant_snapshot(
-        root,
-        config,
-        client,
-        tenant,
-        allow_incomplete=existing_database is not True,
-    )
+    if before is None and not repair_mode:
+        before = stable_tenant_snapshot(
+            root,
+            config,
+            client,
+            tenant,
+            allow_incomplete=existing_database is not True,
+        )
     apply_control_plane(root, config, client, tenant)
     export_tenant_kubeconfig(root, config, client, tenant)
     apply_bootstrap_rbac(root, config, tenant)
@@ -234,6 +260,7 @@ def reconcile_tenant(root: Path, config: dict[str, str], client, tenant):
 def create(root: Path, config: dict[str, str]) -> dict[str, object]:
     create_management(root, config)
     tenants = validate_create_inputs(root, config)
+    require_no_pending_deletions(root, tenants)
     client = ManagementClient(root, config)
     snapshots = {
         tenant.name: reconcile_tenant(root, config, client, tenant)

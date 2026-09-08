@@ -60,3 +60,23 @@ class StorageTests(unittest.TestCase):
                     },
                     tenant,
                 )
+
+    def test_storage_post_delete_inspection_failure_is_not_absence(self) -> None:
+        tenant = type("Tenant", (), {"name": "spike"})()
+        deleted = CompletedProcess([], 0, stdout="", stderr="")
+        failed = CompletedProcess(
+            [], 1, stdout="", stderr="connection refused"
+        )
+        with patch(
+            "scripts.storage._tenant_kubectl",
+            side_effect=[deleted, failed],
+        ):
+            with self.assertRaisesRegex(RuntimeError, "inspection failed"):
+                _delete_storage(
+                    Path("."),
+                    {
+                        "DELETE_TIMEOUT": "1s",
+                        "SPIKE_STORAGE_CLASS": "test",
+                    },
+                    tenant,
+                )
