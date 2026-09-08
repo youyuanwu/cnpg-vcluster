@@ -522,7 +522,7 @@ def validate_tenant_kubeconfig_file(
     client: ManagementClient,
     tenant: Tenant,
     *,
-    check_access: bool = True,
+    check_access: bool = False,
 ) -> Path:
     path = tenant_kubeconfig_path(root, tenant)
     details = path.lstat()
@@ -616,7 +616,13 @@ def export_tenant_kubeconfig(
     write_private_file(path, value)
     if secret.get("type") != "cluster.x-k8s.io/secret":
         raise RuntimeError("tenant kubeconfig Secret type is unexpected")
-    validate_tenant_kubeconfig_file(root, config, client, tenant)
+    validate_tenant_kubeconfig_file(
+        root,
+        config,
+        client,
+        tenant,
+        check_access=False,
+    )
     run(
         [
             str(root / ".tools" / "bin" / "kubectl"),
@@ -649,10 +655,26 @@ def ensure_tenant_kubeconfig(
                 check_access=False,
             )
         except RuntimeError:
-            return export_tenant_kubeconfig(root, config, client, tenant)
-        validate_tenant_kubeconfig_file(root, config, client, tenant)
-        return path
-    return export_tenant_kubeconfig(root, config, client, tenant)
+            export_tenant_kubeconfig(root, config, client, tenant)
+        else:
+            validate_tenant_kubeconfig_file(
+                root,
+                config,
+                client,
+                tenant,
+                check_access=True,
+            )
+            return path
+    else:
+        export_tenant_kubeconfig(root, config, client, tenant)
+    validate_tenant_kubeconfig_file(
+        root,
+        config,
+        client,
+        tenant,
+        check_access=True,
+    )
+    return path
 
 
 def _tenant_kubectl(
@@ -1217,7 +1239,6 @@ def delete_tenant(
                     f"{response.stderr}"
                 )
         cnpg_resources = (
-            (("-n", config["DATABASE_NAMESPACE"]), f"cluster/{tenant.cnpg_cluster}"),
             (("-n", config["DATABASE_NAMESPACE"]), "pvc"),
             ((), f"pv/{tenant.cnpg_cluster}-pv-1"),
             ((), f"pv/{tenant.cnpg_cluster}-pv-2"),

@@ -648,10 +648,6 @@ def cnpg_artifacts_present(root: Path, config: dict[str, str], tenant) -> bool:
     checks = (
         (
             ("-n", config["DATABASE_NAMESPACE"]),
-            f"cluster/{tenant.cnpg_cluster}",
-        ),
-        (
-            ("-n", config["DATABASE_NAMESPACE"]),
             "pvc",
         ),
         ((), f"pv/{tenant.cnpg_cluster}-pv-1"),

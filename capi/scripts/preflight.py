@@ -6,6 +6,7 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import uuid
 from pathlib import Path
 
@@ -184,18 +185,39 @@ def verify_images(config: dict[str, str], timeout: int) -> None:
         if tagged_key not in config:
             raise PreflightError(f"{key} is missing provenance key {tagged_key}")
         expected = config[key].rsplit("@", 1)[1]
-        result = run(
-            [
-                "docker",
-                "buildx",
-                "imagetools",
-                "inspect",
-                config[tagged_key],
-                "--format",
-                "{{json .Manifest}}",
-            ],
-            timeout=timeout,
-        )
+        command = [
+            "docker",
+            "buildx",
+            "imagetools",
+            "inspect",
+            config[tagged_key],
+            "--format",
+            "{{json .Manifest}}",
+        ]
+        result = None
+        for attempt in range(4):
+            try:
+                result = run(command, timeout=timeout)
+                break
+            except CommandError as exc:
+                transient = any(
+                    marker in exc.output.lower()
+                    for marker in (
+                        "500 internal server error",
+                        "502 bad gateway",
+                        "503 service unavailable",
+                        "504 gateway timeout",
+                        "tls handshake timeout",
+                        "connection reset",
+                        "i/o timeout",
+                        "unexpected eof",
+                    )
+                )
+                if not transient or attempt == 3:
+                    raise
+                time.sleep(5)
+        if result is None:
+            raise PreflightError(f"image inspection produced no result: {tagged_key}")
         actual = json.loads(result.stdout)["digest"]
         if actual != expected:
             raise PreflightError(

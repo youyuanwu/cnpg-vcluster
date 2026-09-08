@@ -30,3 +30,27 @@ def tools_lock(root: Path, *, exclusive: bool) -> Iterator[None]:
     finally:
         fcntl.flock(descriptor, fcntl.LOCK_UN)
         os.close(descriptor)
+
+
+@contextmanager
+def e2e_lock(root: Path, *, exclusive: bool) -> Iterator[None]:
+    tools_dir = root / ".tools"
+    ensure_private_dir(tools_dir)
+    lock_path = tools_dir / ".e2e.lock"
+    descriptor = os.open(
+        lock_path,
+        os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0),
+        0o600,
+    )
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            raise RuntimeError(f"E2E lock is not a regular file: {lock_path}")
+        os.fchmod(descriptor, 0o600)
+        fcntl.flock(
+            descriptor,
+            fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH,
+        )
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)

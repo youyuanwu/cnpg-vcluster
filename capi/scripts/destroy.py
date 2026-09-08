@@ -63,6 +63,10 @@ def _validate_runtime_inventory(root: Path) -> None:
         re.compile(r"^evidence/endpoint-success\.json$"),
         re.compile(r"^evidence/cnpg-(success\.json|failure\.txt)$"),
         re.compile(r"^evidence/(create|verify)-(success\.json|failure\.txt)$"),
+        re.compile(
+            r"^evidence/break-glass-[a-z0-9.-]+-[a-z0-9.-]+-[a-z0-9.-]+"
+            r"\.json$"
+        ),
         re.compile(r"^deletions/(tenant-a|tenant-b)\.json$"),
         re.compile(r"^rendered/negative/foreign-node\.json$"),
         re.compile(

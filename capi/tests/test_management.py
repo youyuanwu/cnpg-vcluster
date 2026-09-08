@@ -3,12 +3,32 @@ from __future__ import annotations
 import unittest
 import json
 from pathlib import Path
+from subprocess import CompletedProcess
 
-from scripts.lib.management import _observed_identity
+from scripts.lib.management import _observed_identity, metallb_pool_apply_result
 from scripts.lib.providers import PROVIDERS, _feature_gates
 
 
 class ManagementTests(unittest.TestCase):
+    def test_metallb_webhook_connection_refusal_is_retryable(self) -> None:
+        response = CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr="failed calling webhook: connect: connection refused",
+        )
+        self.assertIsNone(metallb_pool_apply_result(response))
+
+    def test_metallb_nontransient_admission_failure_is_fatal(self) -> None:
+        response = CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr="Error from server (Forbidden): denied",
+        )
+        with self.assertRaisesRegex(RuntimeError, "admission failed"):
+            metallb_pool_apply_result(response)
+
     def test_kind_identity_uses_exact_standard_label(self) -> None:
         config = {
             "KIND_CLUSTER_NAME": "management",

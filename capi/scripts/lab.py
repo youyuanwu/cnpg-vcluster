@@ -10,9 +10,10 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import ConfigError, load_configuration
 from scripts.lib.host import HostError, prepare_inotify, restore_inotify
-from scripts.lib.locking import tools_lock
+from scripts.lib.locking import e2e_lock, tools_lock
 from scripts.lib.redaction import redact
 from scripts.create_management import create_management
+from scripts.break_glass import break_glass
 from scripts.create import create
 from scripts.destroy import destroy
 from scripts.diagnose import diagnose
@@ -84,6 +85,14 @@ def main(arguments: list[str]) -> int:
         with tools_lock(ROOT, exclusive=True):
             destroy_tenant_stack(ROOT, config, rest[0])
         return 0
+    if command == "break-glass":
+        if len(rest) != 4:
+            raise RuntimeError(
+                "break-glass requires kind namespace name and UID"
+            )
+        with tools_lock(ROOT, exclusive=True):
+            break_glass(ROOT, config, *rest)
+        return 0
     if command == "test-tenant-lifecycle":
         with tools_lock(ROOT, exclusive=True):
             run_preflight(ROOT, config)
@@ -132,7 +141,12 @@ def main(arguments: list[str]) -> int:
 
 if __name__ == "__main__":
     try:
-        raise SystemExit(main(sys.argv[1:]))
+        if os.environ.get("CAPI_E2E_CHILD") == "1":
+            code = main(sys.argv[1:])
+        else:
+            with e2e_lock(ROOT, exclusive=False):
+                code = main(sys.argv[1:])
+        raise SystemExit(code)
     except (ConfigError, HostError, PreflightError, RuntimeError) as exc:
         print(redact(str(exc)), file=sys.stderr)
         raise SystemExit(1)

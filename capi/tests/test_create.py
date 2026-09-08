@@ -15,6 +15,7 @@ class CreateTests(unittest.TestCase):
             "CNPG_COMPATIBILITY_REVISION": "docker-volume-hostpath-v1",
         }
         with (
+            patch("scripts.create.verify_all_inputs"),
             patch("scripts.create.create_management"),
             patch(
                 "scripts.create.validate_create_inputs",
@@ -25,6 +26,18 @@ class CreateTests(unittest.TestCase):
             with self.assertRaises(IntegrityError):
                 create(Path("."), config)
         reconcile.assert_not_called()
+
+    def test_verified_inputs_precede_management_mutation(self) -> None:
+        with (
+            patch(
+                "scripts.create.verify_all_inputs",
+                side_effect=IntegrityError("injected full-create tamper"),
+            ),
+            patch("scripts.create.create_management") as create_management,
+        ):
+            with self.assertRaises(IntegrityError):
+                create(Path("."), {})
+        create_management.assert_not_called()
 
     def test_reconcile_rejects_database_inspection_dns_failure_before_mutation(self) -> None:
         tenant = type(

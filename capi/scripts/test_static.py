@@ -74,7 +74,7 @@ def check_recipes() -> None:
     }
     check(EXPECTED_RECIPES <= recipes, f"missing recipes: {sorted(EXPECTED_RECIPES - recipes)}")
     check("[implemented]" in result.stdout, "task list does not mark implemented recipes")
-    check("[phase " in result.stdout, "task list does not mark future blocked recipes")
+    check("[phase " not in result.stdout, "task list still marks blocked recipes")
     unavailable = output(
         "python3",
         "scripts/lab.py",

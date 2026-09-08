@@ -39,6 +39,7 @@ from scripts.lib.tenants import (
     verify_tenant_management_ownership,
 )
 from scripts.machines import worker_snapshot
+from scripts.tools import verify_all_inputs
 
 
 TENANT_COMPATIBILITY_REVISION = "capi-kamaji-two-tenant-v1"
@@ -285,6 +286,7 @@ def reconcile_tenant(
 
 
 def create(root: Path, config: dict[str, str]) -> dict[str, object]:
+    verify_all_inputs(root, config)
     create_management(root, config)
     tenants = validate_create_inputs(root, config)
     require_no_pending_deletions(root, tenants)

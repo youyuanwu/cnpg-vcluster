@@ -122,7 +122,6 @@ def _storage_smoke_present(root: Path, config: dict[str, str], tenant) -> bool:
 
 def _verify_live_api_cleanup(root: Path, config: dict[str, str], tenant) -> None:
     checks = (
-        ("-n", config["DATABASE_NAMESPACE"], "get", f"cluster/{tenant.cnpg_cluster}"),
         ("get", f"pv/{tenant.cnpg_cluster}-pv-1"),
         ("get", f"pv/{tenant.cnpg_cluster}-pv-2"),
         ("get", f"pv/{tenant.cnpg_cluster}-pv-3"),

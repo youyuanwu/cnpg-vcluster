@@ -6,7 +6,13 @@ import hashlib
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.cnpg import _render_cluster, _verify_marker, delete_cnpg, run_cnpg_gate
+from scripts.cnpg import (
+    _render_cluster,
+    _verify_marker,
+    cnpg_artifacts_present,
+    delete_cnpg,
+    run_cnpg_gate,
+)
 
 
 class CnpgTests(unittest.TestCase):
@@ -117,3 +123,37 @@ class CnpgTests(unittest.TestCase):
             with patch("scripts.cnpg._tenant_kubectl", side_effect=responses):
                 with self.assertRaises(RuntimeError):
                     delete_cnpg(root, config, tenant)
+
+    def test_cnpg_presence_does_not_query_absent_custom_resource_type(self) -> None:
+        tenant = type(
+            "Tenant", (), {"name": "spike", "cnpg_cluster": "postgres"}
+        )()
+        not_found = type(
+            "Result",
+            (),
+            {
+                "returncode": 1,
+                "stdout": "",
+                "stderr": "Error from server (NotFound): item not found",
+            },
+        )()
+        with patch(
+            "scripts.cnpg._tenant_kubectl",
+            return_value=not_found,
+        ) as kubectl:
+            self.assertFalse(
+                cnpg_artifacts_present(
+                    Path("."),
+                    {
+                        "DATABASE_NAMESPACE": "database",
+                        "CNPG_NAMESPACE": "cnpg-system",
+                    },
+                    tenant,
+                )
+            )
+        queried = " ".join(
+            str(argument)
+            for call in kubectl.call_args_list
+            for argument in call.args
+        )
+        self.assertNotIn("cluster/postgres", queried)

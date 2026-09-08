@@ -3,6 +3,7 @@ from __future__ import annotations
 import ipaddress
 import json
 import os
+import re
 import shutil
 import stat
 import tarfile
@@ -350,6 +351,20 @@ def _render_metallb_pool(root: Path, config: dict[str, str], network: dict[str, 
     return path
 
 
+def metallb_pool_apply_result(response) -> bool | None:
+    if response.returncode == 0:
+        return True
+    output = response.stdout + response.stderr
+    if re.search(
+        r"failed calling webhook.*(?:connect: connection refused|"
+        r"no endpoints available|service unavailable)",
+        output,
+        re.IGNORECASE | re.DOTALL,
+    ):
+        return None
+    raise RuntimeError(f"MetalLB pool admission failed: {output}")
+
+
 def reconcile_metallb(
     root: Path,
     config: dict[str, str],
@@ -429,7 +444,23 @@ def reconcile_metallb(
             else None
         ),
     )
-    client.kubectl("apply", "-f", str(_render_metallb_pool(root, config, network)))
+    pool = _render_metallb_pool(root, config, network)
+
+    def apply_pool():
+        response = client.kubectl(
+            "apply",
+            "-f",
+            str(pool),
+            check=False,
+        )
+        return metallb_pool_apply_result(response)
+
+    wait_for(
+        "MetalLB admission readiness",
+        parse_duration(config["METALLB_TIMEOUT"]),
+        parse_duration(config["WAIT_POLL_INTERVAL"]),
+        apply_pool,
+    )
 
 
 def _prepare_kamaji_chart(root: Path, config: dict[str, str]) -> Path:

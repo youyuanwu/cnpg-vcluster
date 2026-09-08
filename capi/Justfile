@@ -25,7 +25,7 @@ test-endpoint:
 
 # [implemented] Prove CAPD ownership and same-name collision semantics.
 test-endpoint-negative:
-    @python3 scripts/test_endpoint_negative.py
+    @python3 scripts/run_locked.py scripts/test_endpoint_negative.py
 
 # [implemented] Prove networking and one Ready worker.
 test-spike:
@@ -33,7 +33,7 @@ test-spike:
 
 # [implemented] Prove add-on input tampering fails before mutation.
 test-network-negative:
-    @python3 scripts/test_network_negative.py
+    @python3 scripts/run_locked.py scripts/test_network_negative.py
 
 # [implemented] Prove the three-worker Machine lifecycle.
 test-machines:
@@ -45,7 +45,7 @@ test-storage:
 
 # [implemented] Prove unowned storage volumes are never adopted or deleted.
 test-storage-negative:
-    @python3 scripts/test_storage_negative.py
+    @python3 scripts/run_locked.py scripts/test_storage_negative.py
 
 # [implemented] Prove CNPG continuity through Machine replacement.
 test-persistence:
@@ -53,7 +53,7 @@ test-persistence:
 
 # [implemented] Prove CNPG input tampering fails before mutation.
 test-persistence-negative:
-    @python3 scripts/test_persistence_negative.py
+    @python3 scripts/run_locked.py scripts/test_persistence_negative.py
 
 # [implemented] Reconcile both tenant clusters.
 create:
@@ -83,9 +83,9 @@ destroy-tenant tenant:
 destroy:
     @python3 scripts/lab.py destroy
 
-# [phase 10] Remove one exact stuck finalizer after UID confirmation.
+# [implemented] Remove one exact stuck finalizer after UID confirmation.
 break-glass kind namespace name uid:
-    @python3 scripts/lab.py unavailable break-glass "{{kind}}" "{{namespace}}" "{{name}}" "{{uid}}"
+    @python3 scripts/lab.py break-glass "{{kind}}" "{{namespace}}" "{{name}}" "{{uid}}"
 
 # [implemented] Run standard-library unit tests.
 test-unit:
@@ -97,15 +97,15 @@ test-static:
 
 # [implemented] Exercise the management-only lifecycle.
 test-management:
-    @python3 scripts/test_management.py
+    @python3 scripts/run_locked.py scripts/test_management.py
 
 # [implemented] Exercise tenant repair and targeted deletion.
 test-tenant-lifecycle:
     @python3 scripts/lab.py test-tenant-lifecycle
 
-# [phase 10] Run the full clean-to-clean lifecycle.
+# [implemented] Run the full clean-to-clean lifecycle.
 test-e2e:
-    @python3 scripts/lab.py unavailable test-e2e
+    @python3 scripts/test_e2e.py
 
 _restore-host:
     @python3 scripts/lab.py restore-host
