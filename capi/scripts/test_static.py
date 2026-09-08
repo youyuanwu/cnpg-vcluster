@@ -176,6 +176,13 @@ def check_documentation() -> None:
         "Status, conditions, and exits",
         "CAPI implementation does not emit it",
         "Cluster in healthy state",
+        "26.8.6-edge",
+        "capped at 100 references",
+        "HAProxy container remains required",
+        "authoritative tenant endpoint",
+        "local persistence proof only",
+        "Kubernetes controllers own CAPI and provider resource reconciliation",
+        "PVC, PV, and bytes",
     )
     required_design = (
         "SkipInfraClusterPatch=true",
@@ -189,6 +196,7 @@ def check_documentation() -> None:
         "| Verification |",
         "No Azure CLI",
         "representative tenant, requires one three-instance PostgreSQL",
+        "future tenants are not separate AKS clusters",
     )
     for token in required_readme:
         check(token in readme, f"CAPI README lacks documentation assertion: {token}")
@@ -200,7 +208,7 @@ def check_documentation() -> None:
         "CloudNativePG",
         "PostgreSQL",
         "BusyBox",
-        "etcd",
+        "| etcd | directly pinned server",
     ):
         check(project in notices, f"third-party notices omit {project}")
     check(
