@@ -18,10 +18,18 @@ def result(returncode: int, stdout: str = "", stderr: str = ""):
 
 
 class BreakGlassTests(unittest.TestCase):
-    def test_kamaji_finalizer_matches_pinned_provider(self) -> None:
+    def test_supported_finalizers_match_pinned_providers(self) -> None:
         self.assertEqual(
-            FINALIZERS["kamajicontrolplane"],
-            "ecr.kamaji.clastix.io/finalizer",
+            FINALIZERS,
+            {
+                "cluster": "cluster.cluster.x-k8s.io",
+                "machine": "machine.cluster.x-k8s.io",
+                "machinedeployment": "cluster.x-k8s.io/machinedeployment",
+                "devcluster": "dockercluster.infrastructure.cluster.x-k8s.io",
+                "devmachine": "dockermachine.infrastructure.cluster.x-k8s.io",
+                "kamajicontrolplane": "ecr.kamaji.clastix.io/finalizer",
+                "configmap": "cnpg-vcluster.capi/break-glass",
+            },
         )
 
     def resource(self):

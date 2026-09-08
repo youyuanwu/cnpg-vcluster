@@ -18,8 +18,8 @@ from scripts.lib.tenants import NOT_FOUND
 FINALIZERS = {
     "cluster": "cluster.cluster.x-k8s.io",
     "machine": "machine.cluster.x-k8s.io",
-    "machinedeployment": "machinedeployment.cluster.x-k8s.io",
-    "devcluster": "devcluster.infrastructure.cluster.x-k8s.io",
+    "machinedeployment": "cluster.x-k8s.io/machinedeployment",
+    "devcluster": "dockercluster.infrastructure.cluster.x-k8s.io",
     "devmachine": "dockermachine.infrastructure.cluster.x-k8s.io",
     "kamajicontrolplane": "ecr.kamaji.clastix.io/finalizer",
     "configmap": "cnpg-vcluster.capi/break-glass",
