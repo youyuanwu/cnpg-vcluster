@@ -159,12 +159,59 @@ def check_repository_boundaries() -> None:
             check(token not in text, f"{path.relative_to(ROOT)} contains forbidden token {token!r}")
 
 
+def check_documentation() -> None:
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    design = (ROOT / "docs" / "high-level-design.md").read_text(
+        encoding="utf-8"
+    )
+    notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
+    root_readme = (ROOT.parent / "README.md").read_text(encoding="utf-8")
+    required_readme = (
+        "CAPD `DevCluster` and `DevMachine` resources are development-only",
+        "sharing the host kernel",
+        "900 KiB",
+        "Break-glass finalizer removal",
+        "independently provisioned AKS management cluster",
+        "does not create or configure Azure resources",
+    )
+    required_design = (
+        "SkipInfraClusterPatch=true",
+        "DynamicInfrastructureClusterPatch=false",
+        "ClusterResourceSet packages the initial sources",
+        "Azure CSI",
+        "CAPZ self-managed `AzureCluster`/`AzureMachine` workers",
+        "No Azure CLI",
+        "representative tenant, requires one three-instance PostgreSQL",
+    )
+    for token in required_readme:
+        check(token in readme, f"CAPI README lacks documentation assertion: {token}")
+    for token in required_design:
+        check(token in design, f"CAPI design lacks documentation assertion: {token}")
+    for project in (
+        "Cluster API",
+        "Kamaji CAPI provider",
+        "CloudNativePG",
+        "PostgreSQL",
+        "BusyBox",
+    ):
+        check(project in notices, f"third-party notices omit {project}")
+    check(
+        "three independent local CloudNativePG experiments" in root_readme,
+        "root README does not index all three labs",
+    )
+    check(
+        (ROOT / "licenses" / "README.md").is_file(),
+        "license reference directory is missing",
+    )
+
+
 def main() -> int:
     check(compileall.compile_dir(ROOT / "scripts", quiet=1), "Python source compilation failed")
     check(compileall.compile_dir(ROOT / "tests", quiet=1), "Python test compilation failed")
     check_recipes()
     check_configuration()
     check_repository_boundaries()
+    check_documentation()
     print("static checks passed")
     return 0
 
