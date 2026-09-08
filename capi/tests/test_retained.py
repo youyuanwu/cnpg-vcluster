@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.retained import (
+    _delete_representative_tenant,
     dev_bootstrap,
     dev_clean,
     dev_tenant,
@@ -86,6 +87,34 @@ class RetainedTests(unittest.TestCase):
         ):
             dev_tenant(Path("."), {})
         self.assertEqual(calls, ["validate", "inputs", "delete", "recreate", "state"])
+
+    def test_partial_namespace_or_storage_record_blocks_recreation(self) -> None:
+        tenant = type(
+            "Tenant", (), {"name": "tenant-a", "namespace": "tenant-a"}
+        )()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    return_value={"cluster": None, "namespace": {}},
+                ),
+                patch("scripts.retained.inspect_storage_volume", return_value=None),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "partial"):
+                    _delete_representative_tenant(root, {}, object(), tenant)
+            record = root / ".runtime/storage/tenant-a/volume.json"
+            record.parent.mkdir(parents=True)
+            record.write_text("{}")
+            with (
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    return_value={"cluster": None, "namespace": None},
+                ),
+                patch("scripts.retained.inspect_storage_volume", return_value=None),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "partial"):
+                    _delete_representative_tenant(root, {}, object(), tenant)
 
     def test_clean_routes_through_authoritative_destroy(self) -> None:
         with patch("scripts.retained.destroy") as destroy:

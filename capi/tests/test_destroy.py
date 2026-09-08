@@ -6,9 +6,32 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from scripts.destroy import destroy, inspect_host_residue
+from scripts.destroy_tenant import prepare_tenant_deletion
 
 
 class DestroyTests(unittest.TestCase):
+    def test_dangling_deletion_journal_blocks_live_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal = root / ".runtime/deletions/tenant-a.json"
+            journal.parent.mkdir(parents=True)
+            journal.symlink_to(root / "missing")
+            tenant = type("Tenant", (), {"name": "tenant-a"})()
+            with (
+                patch("scripts.destroy_tenant.delete_cnpg") as delete_cnpg,
+                patch("scripts.destroy_tenant.delete_addons") as delete_addons,
+            ):
+                with self.assertRaises(RuntimeError):
+                    prepare_tenant_deletion(
+                        root,
+                        {},
+                        object(),
+                        tenant,
+                        {"metadata": {"uid": "cluster-uid"}},
+                    )
+            delete_cnpg.assert_not_called()
+            delete_addons.assert_not_called()
+
     def test_management_absent_residue_preserves_runtime_and_host_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

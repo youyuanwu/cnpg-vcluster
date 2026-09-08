@@ -147,7 +147,7 @@ def prepare_tenant_deletion(
     cluster: dict[str, object],
 ) -> None:
     journal_path = _journal_path(root, tenant)
-    if journal_path.exists():
+    if journal_path.exists() or journal_path.is_symlink():
         validate_deletion_journal(
             root, tenant, str(cluster["metadata"]["uid"])
         )

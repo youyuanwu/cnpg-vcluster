@@ -25,6 +25,7 @@ from scripts.lib.tenants import (
     ensure_tenant_kubeconfig,
     inspect_management_resource,
     inspect_storage_volume,
+    storage_record_path,
     storage_volume_name,
     tenant_kubeconfig_path,
     verify_tenant_management_ownership,
@@ -138,12 +139,14 @@ def _delete_representative_tenant(
         partial = any(
             value is not None
             for key, value in owned.items()
-            if key not in {"cluster", "namespace"}
+            if key != "cluster"
         )
         if (
             partial
             or tenant_kubeconfig_path(root, tenant).exists()
             or tenant_kubeconfig_path(root, tenant).is_symlink()
+            or storage_record_path(root, tenant).exists()
+            or storage_record_path(root, tenant).is_symlink()
             or inspect_storage_volume(storage_volume_name(config, tenant)) is not None
         ):
             raise RuntimeError(
