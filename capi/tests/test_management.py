@@ -1,0 +1,91 @@
+from __future__ import annotations
+
+import unittest
+import json
+from pathlib import Path
+from subprocess import CompletedProcess
+
+from scripts.lib.management import _observed_identity, metallb_pool_apply_result
+from scripts.lib.providers import PROVIDERS, _feature_gates
+
+
+class ManagementTests(unittest.TestCase):
+    def test_metallb_webhook_connection_refusal_is_retryable(self) -> None:
+        response = CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr="failed calling webhook: connect: connection refused",
+        )
+        self.assertIsNone(metallb_pool_apply_result(response))
+
+    def test_metallb_nontransient_admission_failure_is_fatal(self) -> None:
+        response = CompletedProcess(
+            [],
+            1,
+            stdout="",
+            stderr="Error from server (Forbidden): denied",
+        )
+        with self.assertRaisesRegex(RuntimeError, "admission failed"):
+            metallb_pool_apply_result(response)
+
+    def test_kind_identity_uses_exact_standard_label(self) -> None:
+        config = {
+            "KIND_CLUSTER_NAME": "management",
+            "OWNERSHIP_LABEL": "example.owner",
+        }
+        payload = {
+            "Id": "container-id",
+            "Config": {
+                "Labels": {
+                    "io.x-k8s.kind.cluster": "management",
+                    "io.x-k8s.kind.role": "control-plane",
+                }
+            },
+        }
+        identity = _observed_identity(config, payload)
+        self.assertEqual(identity.identifier, "container-id")
+        self.assertEqual(identity.labels["io.x-k8s.kind.cluster"], "management")
+        self.assertEqual(identity.labels["example.owner"], "")
+
+    def test_provider_order_and_endpoint_feature_gate(self) -> None:
+        self.assertEqual(
+            [provider.name for provider in PROVIDERS],
+            ["capi-core", "cabpk", "capd", "kamaji-control-plane"],
+        )
+        settings = json.loads(
+            (
+                Path(__file__).resolve().parents[1]
+                / "manifests"
+                / "management"
+                / "kamaji-provider-settings.json"
+            ).read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            settings["featureGates"]["SkipInfraClusterPatch"],
+            True,
+        )
+        self.assertEqual(
+            settings["featureGates"]["DynamicInfrastructureClusterPatch"],
+            False,
+        )
+
+    def test_feature_gate_parser_reports_all_observed_values(self) -> None:
+        observed = _feature_gates(
+            [
+                "--leader-elect",
+                "--feature-gates=DynamicInfrastructureClusterPatch=false,"
+                "ExternalClusterReference=true,"
+                "ExternalClusterReferenceCrossNamespace=false,"
+                "SkipInfraClusterPatch=true",
+            ]
+        )
+        self.assertEqual(
+            observed,
+            {
+                "DynamicInfrastructureClusterPatch": False,
+                "ExternalClusterReference": True,
+                "ExternalClusterReferenceCrossNamespace": False,
+                "SkipInfraClusterPatch": True,
+            },
+        )

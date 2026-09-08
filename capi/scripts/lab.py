@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import os
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.lib.config import ConfigError, load_configuration
+from scripts.lib.host import HostError, prepare_inotify, restore_inotify
+from scripts.lib.locking import e2e_lock, tools_lock
+from scripts.lib.redaction import redact
+from scripts.create_management import create_management
+from scripts.break_glass import break_glass
+from scripts.create import create
+from scripts.destroy import destroy
+from scripts.diagnose import diagnose
+from scripts.destroy_tenant import destroy_tenant_stack
+from scripts.endpoint import run_endpoint_gate
+from scripts.network import run_network_gate
+from scripts.machines import run_machine_gate
+from scripts.storage import run_storage_gate
+from scripts.cnpg import run_cnpg_gate
+from scripts.preflight import PreflightError, run_preflight
+from scripts.repair import repair
+from scripts.status import status
+from scripts.tools import prepare_tools
+from scripts.test_tenant_lifecycle import run_tenant_lifecycle
+from scripts.verify import verify
+
+
+def unavailable(arguments: list[str]) -> int:
+    operation = " ".join(arguments) if arguments else "unknown"
+    print(f"{operation} is not available until its implementation phase", file=sys.stderr)
+    return 1
+
+
+def main(arguments: list[str]) -> int:
+    os.umask(0o077)
+    if not arguments:
+        print("usage: lab.py <command>", file=sys.stderr)
+        return 1
+    config = load_configuration(ROOT)
+    command, rest = arguments[0], arguments[1:]
+    if command == "tools":
+        with tools_lock(ROOT, exclusive=True):
+            prepare_tools(ROOT, config)
+        return 0
+    if command == "prepare-host":
+        prepare_inotify(ROOT, config)
+        return 0
+    if command == "restore-host":
+        restore_inotify(ROOT, config)
+        return 0
+    if command == "preflight":
+        with tools_lock(ROOT, exclusive=False):
+            run_preflight(ROOT, config)
+        return 0
+    if command == "create-management":
+        with tools_lock(ROOT, exclusive=True):
+            create_management(ROOT, config)
+        return 0
+    if command == "create":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            create(ROOT, config)
+        return 0
+    if command == "verify":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            verify(ROOT, config)
+        return 0
+    if command == "repair":
+        if len(rest) != 1:
+            raise RuntimeError("repair requires exactly one tenant name")
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            repair(ROOT, config, rest[0])
+        return 0
+    if command == "destroy-tenant":
+        if len(rest) != 1:
+            raise RuntimeError("destroy-tenant requires exactly one tenant name")
+        with tools_lock(ROOT, exclusive=True):
+            destroy_tenant_stack(ROOT, config, rest[0])
+        return 0
+    if command == "break-glass":
+        if len(rest) != 4:
+            raise RuntimeError(
+                "break-glass requires kind namespace name and UID"
+            )
+        with tools_lock(ROOT, exclusive=True):
+            break_glass(ROOT, config, *rest)
+        return 0
+    if command == "test-tenant-lifecycle":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            run_tenant_lifecycle(ROOT, config)
+        return 0
+    if command == "status":
+        with tools_lock(ROOT, exclusive=False):
+            return status(ROOT, config)
+    if command == "diagnose":
+        with tools_lock(ROOT, exclusive=False):
+            return diagnose(ROOT, config, rest[0] if rest else "all")
+    if command == "destroy":
+        with tools_lock(ROOT, exclusive=True):
+            destroy(ROOT, config)
+        return 0
+    if command == "test-endpoint":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            run_endpoint_gate(ROOT, config)
+        return 0
+    if command == "test-spike":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            run_network_gate(ROOT, config)
+        return 0
+    if command == "test-machines":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            run_machine_gate(ROOT, config)
+        return 0
+    if command == "test-storage":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            run_storage_gate(ROOT, config)
+        return 0
+    if command == "test-persistence":
+        with tools_lock(ROOT, exclusive=True):
+            run_preflight(ROOT, config)
+            run_cnpg_gate(ROOT, config)
+        return 0
+    if command == "unavailable":
+        return unavailable(rest)
+    print(f"unknown command: {command}", file=sys.stderr)
+    return 1
+
+
+if __name__ == "__main__":
+    try:
+        if os.environ.get("CAPI_E2E_CHILD") == "1":
+            code = main(sys.argv[1:])
+        else:
+            with e2e_lock(ROOT, exclusive=False):
+                code = main(sys.argv[1:])
+        raise SystemExit(code)
+    except (ConfigError, HostError, PreflightError, RuntimeError) as exc:
+        print(redact(str(exc)), file=sys.stderr)
+        raise SystemExit(1)

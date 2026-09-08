@@ -1,0 +1,30 @@
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: capi-kamaji-cabpk-control-plane-reader
+  labels:
+    io.cnpg-vcluster.capi-lab: capi-kamaji-tenants
+rules:
+  - apiGroups:
+      - controlplane.cluster.x-k8s.io
+    resources:
+      - kamajicontrolplanes
+    verbs:
+      - get
+      - list
+      - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: capi-kamaji-cabpk-control-plane-reader
+  labels:
+    io.cnpg-vcluster.capi-lab: capi-kamaji-tenants
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: capi-kamaji-cabpk-control-plane-reader
+subjects:
+  - kind: ServiceAccount
+    name: capi-kubeadm-bootstrap-manager
+    namespace: capi-kubeadm-bootstrap-system

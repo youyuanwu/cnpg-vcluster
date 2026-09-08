@@ -1,0 +1,111 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
+default:
+    @just --list
+
+# [implemented] Download and verify pinned tools and immutable inputs.
+tools:
+    @python3 scripts/lab.py tools
+
+# [implemented] Record and raise the local host inotify floors.
+prepare-host:
+    @python3 scripts/lab.py prepare-host
+
+# [implemented] Validate prepared inputs and the local Docker host.
+preflight:
+    @python3 scripts/lab.py preflight
+
+# [implemented] Reconcile the management cluster and lifecycle controllers.
+create-management:
+    @python3 scripts/lab.py create-management
+
+# [implemented] Prove authoritative endpoint and worker registration.
+test-endpoint:
+    @python3 scripts/lab.py test-endpoint
+
+# [implemented] Prove CAPD ownership and same-name collision semantics.
+test-endpoint-negative:
+    @python3 scripts/run_locked.py scripts/test_endpoint_negative.py
+
+# [implemented] Prove networking and one Ready worker.
+test-spike:
+    @python3 scripts/lab.py test-spike
+
+# [implemented] Prove add-on input tampering fails before mutation.
+test-network-negative:
+    @python3 scripts/run_locked.py scripts/test_network_negative.py
+
+# [implemented] Prove the three-worker Machine lifecycle.
+test-machines:
+    @python3 scripts/lab.py test-machines
+
+# [implemented] Prove Machine-independent local storage.
+test-storage:
+    @python3 scripts/lab.py test-storage
+
+# [implemented] Prove unowned storage volumes are never adopted or deleted.
+test-storage-negative:
+    @python3 scripts/run_locked.py scripts/test_storage_negative.py
+
+# [implemented] Prove CNPG continuity through Machine replacement.
+test-persistence:
+    @python3 scripts/lab.py test-persistence
+
+# [implemented] Prove CNPG input tampering fails before mutation.
+test-persistence-negative:
+    @python3 scripts/run_locked.py scripts/test_persistence_negative.py
+
+# [implemented] Reconcile both tenant clusters.
+create:
+    @python3 scripts/lab.py create
+
+# [implemented] Repair one exactly identified tenant.
+repair tenant:
+    @python3 scripts/lab.py repair "{{tenant}}"
+
+# [implemented] Report read-only summarized state.
+status:
+    @python3 scripts/lab.py status
+
+# [implemented] Report read-only scoped diagnostics.
+diagnose scope="all":
+    @python3 scripts/lab.py diagnose "{{scope}}"
+
+# [implemented] Verify tenant isolation and database behavior.
+verify:
+    @python3 scripts/lab.py verify
+
+# [implemented] Delete one tenant and verify the survivor.
+destroy-tenant tenant:
+    @python3 scripts/lab.py destroy-tenant "{{tenant}}"
+
+# [implemented through phase 2] Delete exactly owned management resources.
+destroy:
+    @python3 scripts/lab.py destroy
+
+# [implemented] Remove one exact stuck finalizer after UID confirmation.
+break-glass kind namespace name uid:
+    @python3 scripts/lab.py break-glass "{{kind}}" "{{namespace}}" "{{name}}" "{{uid}}"
+
+# [implemented] Run standard-library unit tests.
+test-unit:
+    @python3 -m unittest discover -s tests -p "test_*.py"
+
+# [implemented] Run source and repository-boundary checks.
+test-static:
+    @python3 scripts/test_static.py
+
+# [implemented] Exercise the management-only lifecycle.
+test-management:
+    @python3 scripts/run_locked.py scripts/test_management.py
+
+# [implemented] Exercise tenant repair and targeted deletion.
+test-tenant-lifecycle:
+    @python3 scripts/lab.py test-tenant-lifecycle
+
+# [implemented] Run the full clean-to-clean lifecycle.
+test-e2e:
+    @python3 scripts/test_e2e.py
+
+_restore-host:
+    @python3 scripts/lab.py restore-host
