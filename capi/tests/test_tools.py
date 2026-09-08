@@ -17,6 +17,7 @@ class ToolSchemaTests(unittest.TestCase):
         with (
             patch("scripts.cache.verify_cache"),
             patch("scripts.cache.materialize_inputs"),
+            patch("scripts.cache.materialize_images"),
             patch("scripts.tools._install_tools"),
             patch("scripts.tools.run") as run,
         ):

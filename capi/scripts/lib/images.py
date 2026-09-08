@@ -11,6 +11,7 @@ from scripts.lib.config import parse_duration
 from scripts.lib.files import ensure_private_dir, write_private_file
 from scripts.lib.kube import wait_for
 from scripts.lib.process import run
+from scripts.lib.redaction import redact
 
 
 MANAGEMENT_IMAGE_KEYS = (
@@ -110,6 +111,8 @@ def import_container_images(
                     "images",
                     "import",
                     "--digests",
+                    "--index-name",
+                    reference,
                     destination,
                 ],
                 timeout=timeout,
@@ -124,6 +127,23 @@ def import_container_images(
             raise RuntimeError(
                 f"container {container} lacks imported exact image {key}"
             )
+
+
+def verify_container_images(
+    config: dict[str, str],
+    container: str,
+    keys: tuple[str, ...],
+) -> None:
+    timeout = parse_duration(config["COMMAND_TIMEOUT"])
+    missing = [
+        key
+        for key in keys
+        if not _container_has_image(container, config[key], timeout)
+    ]
+    if missing:
+        raise RuntimeError(
+            f"container {container} lacks exact images: {', '.join(sorted(missing))}"
+        )
 
 
 def _pre_cni_worker_names(client, tenant) -> tuple[str, ...] | None:
@@ -186,12 +206,13 @@ def preload_worker_images(
         started = time.monotonic()
         try:
             import_container_images(root, config, container, WORKER_IMAGE_KEYS)
-        except BaseException:
+        except BaseException as exc:
             return {
                 "node": container,
                 "started": started,
                 "finished": time.monotonic(),
                 "status": "failed",
+                "error": redact(str(exc)),
             }
         return {
             "node": container,
@@ -207,7 +228,7 @@ def preload_worker_images(
             results[result["node"]] = result
 
     ordered = [results[name] for name in sorted(results)]
-    failures = [item["node"] for item in ordered if item["status"] != "passed"]
+    failures = [item for item in ordered if item["status"] != "passed"]
     intervals = [
         (float(item["started"]), float(item["finished"])) for item in ordered
     ]
@@ -230,7 +251,11 @@ def preload_worker_images(
     )
     if failures:
         raise RuntimeError(
-            f"worker image preload failed for nodes: {', '.join(sorted(failures))}"
+            "worker image preload failed: "
+            + "; ".join(
+                f"{item['node']}: {item.get('error', 'unknown error')}"
+                for item in failures
+            )
         )
     if len(containers) > 1 and not overlap:
         raise RuntimeError("worker image preload did not overlap across independent nodes")

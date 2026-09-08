@@ -14,6 +14,7 @@ from .config import parse_duration
 from .files import IntegrityError, ensure_private_dir, write_private_file
 from .kube import ManagementClient, wait_for
 from .process import run
+from .images import WORKER_IMAGE_KEYS, verify_container_images
 
 
 @dataclass
@@ -343,6 +344,7 @@ def _render_template(
 
 
 def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[str, str]:
+    cache_container_path = "/var/lib/capi-image-cache"
     return {
         "NAMESPACE": tenant.namespace,
         "CLUSTER_NAME": tenant.name,
@@ -372,6 +374,17 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
         "STORAGE_HOST_PATH": str(tenant.storage_host_path),
         "STORAGE_CONTAINER_PATH": config["SPIKE_STORAGE_CONTAINER_PATH"],
         "WORKER_REPLICAS": str(tenant.workers),
+        "IMAGE_CACHE_HOST_PATH": str(
+            root / ".tools" / "cache" / "materialized" / "images"
+        ),
+        "IMAGE_CACHE_CONTAINER_PATH": cache_container_path,
+        "WORKER_PRELOAD_COMMANDS": "\n".join(
+            "        - >-\n"
+            "          ctr --namespace k8s.io images import --digests "
+            f"--index-name '{config[key]}' "
+            f"'{cache_container_path}/images/{key.lower()}.tar'"
+            for key in sorted(WORKER_IMAGE_KEYS)
+        ),
         "WORKER_PRELOAD_IMAGES": "\n".join(
             f"            - {reference}"
             for reference in sorted(
@@ -1115,6 +1128,7 @@ def verify_worker_runtime(
         or set(networks) != {expected_network}
     ):
         raise RuntimeError("CAPD worker runtime does not match the declared local profile")
+    verify_container_images(config, machine_name, WORKER_IMAGE_KEYS)
 
 
 def endpoint_snapshot(

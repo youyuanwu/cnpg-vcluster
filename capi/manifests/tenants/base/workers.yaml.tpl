@@ -8,6 +8,8 @@ metadata:
 spec:
   template:
     spec:
+      preKubeadmCommands:
+${WORKER_PRELOAD_COMMANDS}
       joinConfiguration:
         nodeRegistration:
           kubeletExtraArgs:
@@ -31,6 +33,9 @@ spec:
           preLoadImages:
 ${WORKER_PRELOAD_IMAGES}
           extraMounts:
+            - hostPath: ${IMAGE_CACHE_HOST_PATH}
+              containerPath: ${IMAGE_CACHE_CONTAINER_PATH}
+              readOnly: true
             - hostPath: ${STORAGE_HOST_PATH}
               containerPath: ${STORAGE_CONTAINER_PATH}
               readOnly: false

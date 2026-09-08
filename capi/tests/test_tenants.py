@@ -19,6 +19,7 @@ from scripts.lib.tenants import (
     validate_tenant_kubeconfig_view,
 )
 from scripts.lib.files import IntegrityError
+from scripts.lib.images import WORKER_IMAGE_KEYS
 
 
 class TenantTests(unittest.TestCase):
@@ -60,12 +61,19 @@ class TenantTests(unittest.TestCase):
             4,
         ):
             config[key] = f"example/{key.lower()}:v1@sha256:{index:064x}"
-        lines = _tenant_values(Path("."), config, tenant)[
-            "WORKER_PRELOAD_IMAGES"
-        ].splitlines()
+        values = _tenant_values(Path("/repo"), config, tenant)
+        lines = values["WORKER_PRELOAD_IMAGES"].splitlines()
         references = [line.strip().removeprefix("- ") for line in lines]
         self.assertEqual(references, sorted(references))
         self.assertTrue(all("@sha256:" in reference for reference in references))
+        commands = values["WORKER_PRELOAD_COMMANDS"]
+        for key in WORKER_IMAGE_KEYS:
+            self.assertIn(config[key], commands)
+            self.assertIn(f"/images/{key.lower()}.tar", commands)
+        self.assertEqual(
+            values["IMAGE_CACHE_HOST_PATH"],
+            "/repo/.tools/cache/materialized/images",
+        )
 
     def test_template_rejects_unresolved_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
