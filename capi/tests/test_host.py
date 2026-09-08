@@ -12,6 +12,7 @@ from scripts.lib.host import (
     _read_state_record,
     prepare_inotify,
     resolve_host_just,
+    restore_inotify,
 )
 
 
@@ -109,3 +110,62 @@ class HostTests(unittest.TestCase):
             (root / ".runtime").symlink_to(target, target_is_directory=True)
             with self.assertRaises(HostError):
                 prepare_inotify(root, config)
+
+    def test_restore_rejects_capd_load_balancer_residue(self) -> None:
+        config = {
+            "LAB_PREFIX": "lab",
+            "OWNERSHIP_LABEL": "example.owner",
+            "SPIKE_NAME": "spike",
+            "TENANT_NAMES": "tenant-a tenant-b",
+            "KIND_CLUSTER_NAME": "management",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            host = root / ".runtime" / "host"
+            (root / ".runtime").mkdir(mode=0o700)
+            host.mkdir(mode=0o700)
+            state = host / "inotify.json"
+            state.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "lab_prefix": "lab",
+                        "ownership_label": "example.owner",
+                        "owner_uid": os.getuid(),
+                        "max_user_instances": 128,
+                        "max_user_watches": 524288,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            state.chmod(0o600)
+
+            def fake_run(command, **kwargs):
+                if command[:3] == ["docker", "ps", "-aq"] and (
+                    "label=io.x-k8s.kind.cluster=tenant-a" in command
+                ):
+                    return type(
+                        "Result",
+                        (),
+                        {"returncode": 0, "stdout": "tenant-a-lb\n", "stderr": ""},
+                    )()
+                if command[:3] == ["docker", "volume", "inspect"]:
+                    return type(
+                        "Result",
+                        (),
+                        {
+                            "returncode": 1,
+                            "stdout": "",
+                            "stderr": "No such volume",
+                        },
+                    )()
+                return type(
+                    "Result",
+                    (),
+                    {"returncode": 0, "stdout": "", "stderr": ""},
+                )()
+
+            with patch("scripts.lib.host.run", side_effect=fake_run):
+                with self.assertRaisesRegex(HostError, "provider-owned"):
+                    restore_inotify(root, config)
+            self.assertTrue(state.exists())

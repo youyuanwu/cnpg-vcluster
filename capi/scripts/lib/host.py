@@ -291,20 +291,57 @@ def restore_inotify(root: Path, config: dict[str, str]) -> None:
             return
         originals = _read_state_record(host_fd, state_path, config)
 
-        owned_workers = run(
-            [
-                "docker",
-                "ps",
-                "-aq",
-                "--filter",
-                f"label={config['OWNERSHIP_LABEL']}=true",
-                "--filter",
-                "label=cnpg-vcluster.capi/role=worker",
-            ],
-            timeout=30,
-        ).stdout.split()
-        if owned_workers:
-            raise HostError("cannot restore host inotify values while owned workers exist")
+        provider_residue = []
+        for cluster_name in (
+            config["SPIKE_NAME"],
+            *config["TENANT_NAMES"].split(),
+        ):
+            provider_residue.extend(
+                run(
+                    [
+                        "docker",
+                        "ps",
+                        "-aq",
+                        "--filter",
+                        f"label=io.x-k8s.kind.cluster={cluster_name}",
+                    ],
+                    timeout=30,
+                ).stdout.split()
+            )
+            volume_name = (
+                f"{config['LAB_PREFIX']}-{cluster_name}-storage"
+            )
+            volume = run(
+                ["docker", "volume", "inspect", volume_name],
+                timeout=30,
+                check=False,
+            )
+            if volume.returncode == 0:
+                provider_residue.append(volume_name)
+            elif "no such volume" not in volume.stderr.lower():
+                raise HostError(
+                    f"unable to inspect tenant storage volume before host "
+                    f"restoration: {volume.stderr}"
+                )
+        provider_residue.extend(
+            run(
+                [
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    f"label={config['OWNERSHIP_LABEL']}=true",
+                    "--filter",
+                    "label=cnpg-vcluster.capi/role=probe",
+                ],
+                timeout=30,
+            ).stdout.split()
+        )
+        if provider_residue:
+            raise HostError(
+                "cannot restore host inotify values while provider-owned "
+                "containers, probes, or volumes exist"
+            )
         management_name = f"{config['KIND_CLUSTER_NAME']}-control-plane"
         management = run(
             [

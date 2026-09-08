@@ -13,6 +13,7 @@ from scripts.cnpg import (
     delete_cnpg,
     run_cnpg_gate,
 )
+from scripts.lib.files import ensure_private_dir
 
 
 class CnpgTests(unittest.TestCase):
@@ -60,7 +61,7 @@ class CnpgTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             success = root / ".runtime" / "evidence" / "cnpg-success.json"
-            success.parent.mkdir(parents=True)
+            ensure_private_dir(success.parent)
             success.write_text('{"stale":true}\n', encoding="utf-8")
             with patch(
                 "scripts.cnpg.run_storage_gate",

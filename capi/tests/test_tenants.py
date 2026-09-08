@@ -12,6 +12,7 @@ from scripts.lib.tenants import (
     Tenant,
     _render_template,
     configured_tenants,
+    prepare_storage_directory,
     remove_tenant_storage_volume,
     storage_volume_name,
     validate_tenant_kubeconfig_view,
@@ -185,4 +186,147 @@ class TenantTests(unittest.TestCase):
                 tenant,
                 view,
                 expected_ca,
+            )
+
+    def test_stale_storage_record_blocks_before_volume_creation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tenant = Tenant(
+                name="tenant-a",
+                namespace="tenant-a",
+                vip="172.18.0.10",
+                pod_cidr="10.70.0.0/16",
+                service_cidr="10.140.0.0/16",
+                dns_ip="10.140.0.10",
+                domain="tenant-a.local",
+                storage_host_path=root / "storage",
+                cnpg_cluster="tenant-a-postgres",
+                workers=3,
+            )
+            record = root / ".runtime" / "storage" / tenant.name / "volume.json"
+            for directory in (
+                root / ".runtime",
+                root / ".runtime" / "storage",
+                record.parent,
+            ):
+                directory.mkdir(mode=0o700)
+            record.write_text("{}\n", encoding="utf-8")
+            record.chmod(0o600)
+            with (
+                patch(
+                    "scripts.lib.tenants.inspect_storage_volume",
+                    return_value=None,
+                ),
+                patch("scripts.lib.tenants.run") as run,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "stale"):
+                    prepare_storage_directory(
+                        root,
+                        {
+                            "LAB_PREFIX": "lab",
+                            "OWNERSHIP_LABEL": "example.owner",
+                        },
+                        tenant,
+                    )
+            run.assert_not_called()
+
+    def test_storage_record_failure_rolls_back_new_volume(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tenant = Tenant(
+                name="tenant-a",
+                namespace="tenant-a",
+                vip="172.18.0.10",
+                pod_cidr="10.70.0.0/16",
+                service_cidr="10.140.0.0/16",
+                dns_ip="10.140.0.10",
+                domain="tenant-a.local",
+                storage_host_path=root / "storage",
+                cnpg_cluster="tenant-a-postgres",
+                workers=3,
+            )
+            payload = {
+                "Name": "lab-tenant-a-storage",
+                "CreatedAt": "2026-01-01T00:00:00Z",
+                "Mountpoint": "/var/lib/docker/volumes/test/_data",
+                "Labels": {
+                    "example.owner": "lab",
+                    "cnpg-vcluster.capi/role": "tenant-storage",
+                    "cnpg-vcluster.capi/tenant": "tenant-a",
+                },
+            }
+            with (
+                patch(
+                    "scripts.lib.tenants.inspect_storage_volume",
+                    side_effect=[None, payload, payload],
+                ),
+                patch("scripts.lib.tenants.run") as run,
+                patch(
+                    "scripts.lib.tenants.write_private_file",
+                    side_effect=IntegrityError("injected write failure"),
+                ),
+            ):
+                with self.assertRaises(IntegrityError):
+                    prepare_storage_directory(
+                        root,
+                        {
+                            "LAB_PREFIX": "lab",
+                            "OWNERSHIP_LABEL": "example.owner",
+                        },
+                        tenant,
+                    )
+            self.assertEqual(run.call_count, 2)
+            self.assertEqual(
+                run.call_args_list[-1].args[0],
+                ["docker", "volume", "rm", "lab-tenant-a-storage"],
+            )
+
+    def test_storage_post_create_inspection_failure_attempts_rollback(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tenant = Tenant(
+                name="tenant-a",
+                namespace="tenant-a",
+                vip="172.18.0.10",
+                pod_cidr="10.70.0.0/16",
+                service_cidr="10.140.0.0/16",
+                dns_ip="10.140.0.10",
+                domain="tenant-a.local",
+                storage_host_path=root / "storage",
+                cnpg_cluster="tenant-a-postgres",
+                workers=3,
+            )
+            payload = {
+                "Name": "lab-tenant-a-storage",
+                "CreatedAt": "2026-01-01T00:00:00Z",
+                "Mountpoint": "/var/lib/docker/volumes/test/_data",
+                "Labels": {
+                    "example.owner": "lab",
+                    "cnpg-vcluster.capi/role": "tenant-storage",
+                    "cnpg-vcluster.capi/tenant": "tenant-a",
+                },
+            }
+            with (
+                patch(
+                    "scripts.lib.tenants.inspect_storage_volume",
+                    side_effect=[
+                        None,
+                        RuntimeError("injected inspect failure"),
+                        payload,
+                    ],
+                ),
+                patch("scripts.lib.tenants.run") as run,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "inspect failure"):
+                    prepare_storage_directory(
+                        root,
+                        {
+                            "LAB_PREFIX": "lab",
+                            "OWNERSHIP_LABEL": "example.owner",
+                        },
+                        tenant,
+                    )
+            self.assertEqual(
+                run.call_args_list[-1].args[0],
+                ["docker", "volume", "rm", "lab-tenant-a-storage"],
             )

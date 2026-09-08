@@ -14,6 +14,7 @@ from scripts.verify import (
     _management_absence,
     _reject_kubernetes_credential,
 )
+from scripts.lib.files import ensure_private_dir
 
 
 class VerifyTests(unittest.TestCase):
@@ -134,7 +135,7 @@ class VerifyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             kubeconfig = root / ".runtime" / "tenants" / tenant.name / "kubeconfig"
-            kubeconfig.parent.mkdir(parents=True)
+            ensure_private_dir(kubeconfig.parent)
             kubeconfig.write_text(
                 f"server: https://{tenant.vip}:6443\n"
                 f"certificate-authority-data: "
@@ -199,7 +200,7 @@ class VerifyTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             kubeconfig = root / ".runtime" / "tenants" / source.name / "kubeconfig"
-            kubeconfig.parent.mkdir(parents=True)
+            ensure_private_dir(kubeconfig.parent)
             kubeconfig.write_text(
                 "server: https://172.18.0.10:6443\n",
                 encoding="utf-8",

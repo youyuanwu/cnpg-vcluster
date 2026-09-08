@@ -5,10 +5,79 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from scripts.destroy import destroy
+from scripts.destroy import destroy, inspect_host_residue
 
 
 class DestroyTests(unittest.TestCase):
+    def test_management_absent_residue_preserves_runtime_and_host_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / ".runtime"
+            runtime.mkdir(mode=0o700)
+            with (
+                patch("scripts.destroy._validate_runtime_inventory"),
+                patch("scripts.destroy.validate_inotify_state"),
+                patch(
+                    "scripts.destroy.management_status",
+                    return_value={},
+                ),
+                patch(
+                    "scripts.destroy.inspect_host_residue",
+                    return_value={
+                        "containers": ["worker"],
+                        "probes": [],
+                        "volumes": [],
+                    },
+                ),
+                patch("scripts.destroy.restore_inotify") as restore,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "residue remains"):
+                    destroy(root, {})
+            restore.assert_not_called()
+            self.assertTrue(runtime.exists())
+
+    def test_host_residue_reports_workers_probes_and_volumes(self) -> None:
+        responses = [
+            Mock(stdout="worker-a\n", returncode=0, stderr=""),
+            Mock(stdout="", returncode=0, stderr=""),
+            Mock(stdout="", returncode=0, stderr=""),
+            Mock(stdout="probe-a\n", returncode=0, stderr=""),
+            Mock(stdout="", returncode=1, stderr="No such volume"),
+            Mock(stdout="[]", returncode=0, stderr=""),
+            Mock(stdout="", returncode=1, stderr="No such volume"),
+        ]
+        with patch("scripts.destroy.run", side_effect=responses):
+            residue = inspect_host_residue(
+                {
+                    "SPIKE_NAME": "spike",
+                    "TENANT_NAMES": "tenant-a tenant-b",
+                    "OWNERSHIP_LABEL": "example.owner",
+                    "LAB_PREFIX": "lab",
+                }
+            )
+        self.assertEqual(residue["containers"], ["worker-a"])
+        self.assertEqual(residue["probes"], ["probe-a"])
+        self.assertEqual(residue["volumes"], ["lab-tenant-a-storage"])
+
+    def test_host_residue_rejects_volume_inspection_failure(self) -> None:
+        responses = [
+            Mock(stdout="", returncode=0, stderr=""),
+            Mock(stdout="", returncode=0, stderr=""),
+            Mock(stdout="", returncode=0, stderr=""),
+            Mock(stdout="", returncode=0, stderr=""),
+            Mock(stdout="", returncode=1, stderr="daemon unavailable"),
+        ]
+        with patch("scripts.destroy.run", side_effect=responses):
+            with self.assertRaisesRegex(RuntimeError, "inspection failed"):
+                inspect_host_residue(
+                    {
+                        "SPIKE_NAME": "spike",
+                        "TENANT_NAMES": "tenant-a tenant-b",
+                        "OWNERSHIP_LABEL": "example.owner",
+                        "LAB_PREFIX": "lab",
+                    }
+                )
+
     def test_global_destroy_resumes_second_tenant_journal_without_survivor(self) -> None:
         spike = type("Tenant", (), {"name": "spike"})()
         tenant_a = type("Tenant", (), {"name": "tenant-a"})()

@@ -27,6 +27,7 @@ from scripts.lib.tenants import (
     spike_tenant,
     verify_tenant_management_ownership,
 )
+from scripts.lib.process import run
 
 
 def _validate_runtime_inventory(root: Path) -> None:
@@ -61,6 +62,9 @@ def _validate_runtime_inventory(root: Path) -> None:
         ),
         re.compile(r"^evidence/endpoint-failure\.txt$"),
         re.compile(r"^evidence/endpoint-success\.json$"),
+        re.compile(
+            r"^evidence/negative-condition-[a-z0-9.-]+-[a-z0-9.-]+\.json$"
+        ),
         re.compile(r"^evidence/cnpg-(success\.json|failure\.txt)$"),
         re.compile(r"^evidence/(create|verify)-(success\.json|failure\.txt)$"),
         re.compile(
@@ -193,6 +197,56 @@ def _delete_kubernetes_stack(root: Path, config: dict[str, str], client: Managem
     )
 
 
+def inspect_host_residue(config: dict[str, str]) -> dict[str, list[str]]:
+    clusters = [config["SPIKE_NAME"], *config["TENANT_NAMES"].split()]
+    containers = []
+    for name in clusters:
+        containers.extend(
+            run(
+                [
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    f"label=io.x-k8s.kind.cluster={name}",
+                ],
+                timeout=30,
+            ).stdout.split()
+        )
+    probes = run(
+        [
+            "docker",
+            "ps",
+            "-aq",
+            "--filter",
+            f"label={config['OWNERSHIP_LABEL']}=true",
+            "--filter",
+            "label=cnpg-vcluster.capi/role=probe",
+        ],
+        timeout=30,
+    ).stdout.split()
+    volumes = []
+    for name in clusters:
+        volume_name = f"{config['LAB_PREFIX']}-{name}-storage"
+        response = run(
+            ["docker", "volume", "inspect", volume_name],
+            timeout=30,
+            check=False,
+        )
+        if response.returncode == 0:
+            volumes.append(volume_name)
+        elif "no such volume" not in response.stderr.lower():
+            raise RuntimeError(
+                f"Docker volume inspection failed for {volume_name}: "
+                f"{response.stderr}"
+            )
+    return {
+        "containers": sorted(set(containers)),
+        "probes": sorted(set(probes)),
+        "volumes": sorted(volumes),
+    }
+
+
 def destroy(root: Path, config: dict[str, str]) -> None:
     _validate_runtime_inventory(root)
     validate_inotify_state(root, config)
@@ -304,6 +358,13 @@ def destroy(root: Path, config: dict[str, str]) -> None:
             delete_tenant(root, config, client, tenant)
         _delete_kubernetes_stack(root, config, client)
         delete_management(root, config)
+    else:
+        residue = inspect_host_residue(config)
+        if any(residue.values()):
+            raise RuntimeError(
+                "management state is absent while provider-owned host residue "
+                f"remains; preserving runtime and host settings: {residue}"
+            )
     restore_inotify(root, config)
     runtime = root / ".runtime"
     if runtime.exists():

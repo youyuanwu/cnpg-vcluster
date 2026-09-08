@@ -740,9 +740,12 @@ def apply_bootstrap_rbac(
 def prepare_storage_directory(root: Path, config: dict[str, str], tenant: Tenant) -> None:
     ensure_private_dir(root / ".runtime" / "storage")
     volume_name = storage_volume_name(config, tenant)
+    record_path = storage_record_path(root, tenant)
     payload = inspect_storage_volume(volume_name)
     introduced = payload is None
     if payload is None:
+        if record_path.exists() or record_path.is_symlink():
+            raise RuntimeError("stale tenant storage identity record blocks creation")
         run(
             [
                 "docker",
@@ -758,41 +761,71 @@ def prepare_storage_directory(root: Path, config: dict[str, str], tenant: Tenant
             ],
             timeout=30,
         )
-        payload = inspect_storage_volume(volume_name)
-        if payload is None:
-            raise RuntimeError("tenant storage volume was not created")
-    labels = payload.get("Labels") or {}
-    if (
-        labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
-        or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
-        or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
-    ):
-        raise RuntimeError("tenant storage Docker volume ownership cannot be proven")
-    tenant.storage_host_path = Path(payload["Mountpoint"])
-    record = {
-        "schema": 1,
-        "tenant": tenant.name,
-        "volumeName": volume_name,
-        "createdAt": payload["CreatedAt"],
-        "mountpoint": payload["Mountpoint"],
-    }
-    record_path = storage_record_path(root, tenant)
-    if introduced:
-        if record_path.exists() or record_path.is_symlink():
-            raise RuntimeError("stale tenant storage identity record blocks creation")
-        write_private_file(record_path, json.dumps(record, sort_keys=True) + "\n")
-    elif record_path.exists() or record_path.is_symlink():
-        details = record_path.lstat()
+    try:
+        if introduced:
+            payload = inspect_storage_volume(volume_name)
+            if payload is None:
+                raise RuntimeError("tenant storage volume was not created")
+        labels = payload.get("Labels") or {}
         if (
-            record_path.is_symlink()
-            or not record_path.is_file()
-            or details.st_uid != os.getuid()
-            or details.st_mode & 0o077
-            or json.loads(record_path.read_text(encoding="utf-8")) != record
+            labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
+            or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
+            or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
         ):
-            raise RuntimeError("tenant storage volume identity record mismatch")
-    else:
-        raise RuntimeError("existing tenant storage volume has no identity record")
+            raise RuntimeError(
+                "tenant storage Docker volume ownership cannot be proven"
+            )
+        tenant.storage_host_path = Path(payload["Mountpoint"])
+        record = {
+            "schema": 1,
+            "tenant": tenant.name,
+            "volumeName": volume_name,
+            "createdAt": payload["CreatedAt"],
+            "mountpoint": payload["Mountpoint"],
+        }
+        if introduced:
+            write_private_file(
+                record_path, json.dumps(record, sort_keys=True) + "\n"
+            )
+        elif record_path.exists() or record_path.is_symlink():
+            details = record_path.lstat()
+            if (
+                record_path.is_symlink()
+                or not record_path.is_file()
+                or details.st_uid != os.getuid()
+                or details.st_mode & 0o077
+                or json.loads(record_path.read_text(encoding="utf-8")) != record
+            ):
+                raise RuntimeError(
+                    "tenant storage volume identity record mismatch"
+                )
+        else:
+            raise RuntimeError(
+                "existing tenant storage volume has no identity record"
+            )
+    except BaseException as exc:
+        if introduced:
+            try:
+                rollback = inspect_storage_volume(volume_name)
+                rollback_labels = (rollback or {}).get("Labels") or {}
+                if (
+                    rollback is None
+                    or rollback_labels.get(config["OWNERSHIP_LABEL"])
+                    != config["LAB_PREFIX"]
+                    or rollback_labels.get("cnpg-vcluster.capi/role")
+                    != "tenant-storage"
+                    or rollback_labels.get("cnpg-vcluster.capi/tenant")
+                    != tenant.name
+                ):
+                    raise RuntimeError(
+                        "cannot prove newly created storage volume for rollback"
+                    )
+                run(["docker", "volume", "rm", volume_name], timeout=30)
+            except BaseException as cleanup:
+                exc.add_note(
+                    f"new storage volume rollback also failed: {cleanup}"
+                )
+        raise
 
 
 def storage_volume_name(config: dict[str, str], tenant: Tenant) -> str:

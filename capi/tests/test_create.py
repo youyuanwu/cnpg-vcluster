@@ -93,7 +93,7 @@ class CreateTests(unittest.TestCase):
                 side_effect=[None, expected],
             ),
             patch("scripts.create.apply_control_plane") as apply_control_plane,
-            patch("scripts.create.ensure_tenant_kubeconfig"),
+            patch("scripts.create.export_tenant_kubeconfig"),
             patch("scripts.create.apply_bootstrap_rbac"),
             patch("scripts.create.apply_workers"),
             patch("scripts.create.apply_addons"),

@@ -12,7 +12,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.create_management import create_management
 from scripts.endpoint import _verify_bootstrap_secret
-from scripts.lib.conditions import condition_summary, condition_true
+from scripts.lib.conditions import sanitized_condition_summary, condition_true
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.files import write_private_file
@@ -70,7 +70,7 @@ def wrong_label_load_balancer(
             if response.returncode != 0:
                 return None
             resource = json.loads(response.stdout)
-            conditions = condition_summary(resource)
+            conditions = sanitized_condition_summary(resource)
             return conditions if any(
                 item["status"] == "False"
                 and "container" in (item.get("message") or "").lower()
@@ -379,6 +379,32 @@ def _current_false_condition(resource: dict[str, object]) -> bool:
     )
 
 
+def _write_condition_evidence(root: Path, resource: dict[str, object]) -> None:
+    metadata = resource["metadata"]
+    kind = str(resource.get("kind") or "resource").lower()
+    name = metadata["name"]
+    conditions = sanitized_condition_summary(resource)
+    write_private_file(
+        root
+        / ".runtime"
+        / "evidence"
+        / f"negative-condition-{kind}-{name}.json",
+        json.dumps(
+            {
+                "apiVersion": resource.get("apiVersion"),
+                "kind": resource.get("kind"),
+                "namespace": metadata.get("namespace"),
+                "name": name,
+                "uid": metadata.get("uid"),
+                "generation": metadata.get("generation"),
+                "conditions": conditions,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+
 def invalid_cluster_condition(
     root: Path,
     config: dict[str, str],
@@ -432,7 +458,8 @@ spec:
             resource = json.loads(response.stdout)
             return resource if _current_false_condition(resource) else None
 
-        wait_for("invalid Cluster condition", 120, 2, failed)
+        failed_resource = wait_for("invalid Cluster condition", 120, 2, failed)
+        _write_condition_evidence(root, failed_resource)
     finally:
         client.kubectl(
             "delete",
@@ -481,7 +508,10 @@ def invalid_control_plane_condition(
             resource = json.loads(response.stdout)
             return resource if _current_false_condition(resource) else None
 
-        wait_for("invalid control-plane condition", 120, 2, failed)
+        failed_resource = wait_for(
+            "invalid control-plane condition", 120, 2, failed
+        )
+        _write_condition_evidence(root, failed_resource)
     finally:
         response = client.kubectl(
             "-n",
@@ -562,6 +592,7 @@ def invalid_worker_condition(
             return items[0] if len(items) == 1 and _current_false_condition(items[0]) else None
 
         failed_resource = wait_for("invalid worker condition", 180, 2, failed)
+        _write_condition_evidence(root, failed_resource)
         secret_name = failed_resource["metadata"]["name"]
         wait_for(
             "failed-worker bootstrap Secret",

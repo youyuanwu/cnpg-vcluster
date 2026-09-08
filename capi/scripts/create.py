@@ -31,6 +31,7 @@ from scripts.lib.tenants import (
     apply_workers,
     configured_tenants,
     ensure_tenant_kubeconfig,
+    export_tenant_kubeconfig,
     inspect_storage_volume,
     render_tenant_manifests,
     tenant_kubeconfig_path,
@@ -267,7 +268,10 @@ def reconcile_tenant(
             allow_incomplete=existing_database is not True,
         )
     apply_control_plane(root, config, client, tenant)
-    ensure_tenant_kubeconfig(root, config, client, tenant)
+    if repair_mode:
+        ensure_tenant_kubeconfig(root, config, client, tenant)
+    else:
+        export_tenant_kubeconfig(root, config, client, tenant)
     apply_bootstrap_rbac(root, config, tenant)
     apply_workers(root, config, client, tenant)
     apply_addons(root, config, client, tenant)

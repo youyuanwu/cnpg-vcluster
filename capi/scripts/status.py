@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scripts.lib.conditions import condition_true
+from scripts.lib.conditions import sanitized_condition_summary, condition_true
 from scripts.lib.kube import ManagementClient
 from scripts.lib.host import read_inotify
 from scripts.lib.management import (
@@ -99,6 +99,14 @@ def _machine_layer_status(root: Path, config: dict[str, str], client, tenant):
         "containers": sorted(containers),
         "nodes": sorted(item["metadata"]["name"] for item in nodes),
         "bootstrapSecrets": bootstrap,
+        "machineConditions": {
+            item["metadata"]["name"]: sanitized_condition_summary(item)
+            for item in machines
+        },
+        "devMachineConditions": {
+            item["metadata"]["name"]: sanitized_condition_summary(item)
+            for item in devmachines
+        },
     }
     layers["ready"] = (
         len(machine_names) == desired
@@ -337,6 +345,8 @@ def _control_plane_layer_status(config: dict[str, str], client, tenant, cluster)
         "paused": "cluster.x-k8s.io/paused"
         in (kcp["metadata"].get("annotations") or {}),
         "authoritativeEndpoints": endpoint_ready,
+        "clusterConditions": sanitized_condition_summary(cluster),
+        "controlPlaneConditions": sanitized_condition_summary(kcp),
     }
 
 
