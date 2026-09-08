@@ -287,12 +287,15 @@ def verify_addon_source_ownership(
     config: dict[str, str],
     client: ManagementClient,
     tenant: Tenant,
+    *,
+    require_present: bool = False,
 ) -> None:
     _, inventory = render_resource_set(root, config, tenant)
     resources = [
         f"clusterresourceset/{tenant.name}-network",
         *(f"configmap/{name}" for name in sorted(inventory)),
     ]
+    missing = []
     for resource in resources:
         response = client.kubectl(
             "-n",
@@ -315,6 +318,12 @@ def verify_addon_source_ownership(
                 f"tenant add-on source inspection failed for {resource}: "
                 f"{response.stderr}"
             )
+        else:
+            missing.append(resource)
+    if require_present and missing:
+        raise RuntimeError(
+            f"tenant add-on sources are missing: {', '.join(missing)}"
+        )
 
 
 def apply_addons(

@@ -7,7 +7,7 @@ import shutil
 from pathlib import Path
 
 from scripts.cnpg import _verify_marker, cnpg_artifacts_present, delete_cnpg
-from scripts.create import stable_tenant_snapshot, validate_create_inputs
+from scripts.create import validate_create_inputs, verified_tenant_snapshot
 from scripts.lib.addons import delete_addons, verify_network
 from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient
@@ -21,7 +21,7 @@ from scripts.lib.tenants import (
     delete_tenant,
     inspect_management_resource,
     inspect_storage_volume,
-    export_tenant_kubeconfig,
+    ensure_tenant_kubeconfig,
     storage_record_path,
     storage_volume_name,
     tenant_kubeconfig_path,
@@ -256,13 +256,14 @@ def destroy_tenant_stack(root: Path, config: dict[str, str], name: str) -> None:
     require_management_ownership(root, config)
     validate_management_kubeconfig(root, config)
     client = ManagementClient(root, config)
-    survivor_before = stable_tenant_snapshot(root, config, client, survivor)
-    _verify_marker(root, config, survivor)
+    survivor_before = verified_tenant_snapshot(
+        root, config, client, survivor
+    )
     owned = verify_tenant_management_ownership(config, client, tenant)
     cluster = owned.get("cluster")
     journal = _journal_path(root, tenant)
     if cluster is not None:
-        export_tenant_kubeconfig(root, config, client, tenant)
+        ensure_tenant_kubeconfig(root, config, client, tenant)
         prepare_tenant_deletion(root, config, client, tenant, cluster)
     elif (
         not journal.exists()
@@ -282,14 +283,9 @@ def destroy_tenant_stack(root: Path, config: dict[str, str], name: str) -> None:
             raise RuntimeError("tenant deletion journal does not match target")
         tenant_kubeconfig_path(root, tenant).unlink(missing_ok=True)
     finish_prepared_tenant_deletion(root, config, client, tenant)
-    verify_network(root, config, survivor)
-    worker_snapshot(root, config, client, survivor)
-    from scripts.cnpg import _cnpg_ready
-
-    if not _cnpg_ready(root, config, survivor):
-        raise RuntimeError(f"survivor CNPG is not healthy: {survivor.name}")
-    _verify_marker(root, config, survivor)
-    survivor_after = stable_tenant_snapshot(root, config, client, survivor)
+    survivor_after = verified_tenant_snapshot(
+        root, config, client, survivor
+    )
     if survivor_after != survivor_before:
         raise RuntimeError(f"targeted deletion changed survivor: {survivor.name}")
     print(f"tenant deleted; survivor remains healthy: {tenant.name} -> {survivor.name}")

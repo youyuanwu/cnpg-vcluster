@@ -73,6 +73,35 @@ class AddonTests(unittest.TestCase):
                     Path("."), self.config, client, self.tenant
                 )
 
+    def test_addon_source_presence_is_required_for_survivor(self) -> None:
+        client = type(
+            "Client",
+            (),
+            {
+                "kubectl": lambda self, *args, **kwargs: type(
+                    "Result",
+                    (),
+                    {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": 'Error from server (NotFound): item not found',
+                    },
+                )()
+            },
+        )()
+        with patch(
+            "scripts.lib.addons.render_resource_set",
+            return_value=(Path("resource-set.json"), {"source": "a" * 64}),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "sources are missing"):
+                verify_addon_source_ownership(
+                    Path("."),
+                    self.config,
+                    client,
+                    self.tenant,
+                    require_present=True,
+                )
+
     def test_limits_are_explicit(self) -> None:
         self.assertEqual(SOURCE_LIMIT, 900 * 1024)
         self.assertEqual(REFERENCE_LIMIT, 100)

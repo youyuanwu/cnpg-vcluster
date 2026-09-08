@@ -4,6 +4,7 @@ import tempfile
 import unittest
 import json
 import shutil
+import base64
 from pathlib import Path
 from unittest.mock import patch
 
@@ -13,6 +14,7 @@ from scripts.lib.tenants import (
     configured_tenants,
     remove_tenant_storage_volume,
     storage_volume_name,
+    validate_tenant_kubeconfig_view,
 )
 from scripts.lib.files import IntegrityError
 
@@ -146,3 +148,41 @@ class TenantTests(unittest.TestCase):
                 )
             self.assertFalse(record.exists())
             self.assertFalse(record.parent.exists())
+
+    def test_kubeconfig_validation_uses_active_context_only(self) -> None:
+        tenant = type("Tenant", (), {"vip": "172.18.0.10"})()
+        expected_ca = b"tenant-ca"
+        view = {
+            "current-context": "wrong",
+            "contexts": [
+                {"name": "expected", "context": {"cluster": "expected"}},
+                {"name": "wrong", "context": {"cluster": "wrong"}},
+            ],
+            "clusters": [
+                {
+                    "name": "expected",
+                    "cluster": {
+                        "server": "https://172.18.0.10:6443",
+                        "certificate-authority-data": base64.b64encode(
+                            expected_ca
+                        ).decode(),
+                    },
+                },
+                {
+                    "name": "wrong",
+                    "cluster": {
+                        "server": "https://172.18.0.11:6443",
+                        "certificate-authority-data": base64.b64encode(
+                            expected_ca
+                        ).decode(),
+                    },
+                },
+            ],
+        }
+        with self.assertRaisesRegex(RuntimeError, "active context"):
+            validate_tenant_kubeconfig_view(
+                {"SPIKE_API_PORT": "6443"},
+                tenant,
+                view,
+                expected_ca,
+            )

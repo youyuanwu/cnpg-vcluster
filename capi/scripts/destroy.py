@@ -217,10 +217,10 @@ def destroy(root: Path, config: dict[str, str]) -> None:
                     finish_prepared_tenant_deletion,
                     prepare_tenant_deletion,
                 )
-                from scripts.lib.tenants import export_tenant_kubeconfig
+                from scripts.lib.tenants import ensure_tenant_kubeconfig
 
                 verify_tenant_management_ownership(config, client, tenant)
-                export_tenant_kubeconfig(root, config, client, tenant)
+                ensure_tenant_kubeconfig(root, config, client, tenant)
                 prepare_tenant_deletion(
                     root, config, client, tenant, cluster
                 )

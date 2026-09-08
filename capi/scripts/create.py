@@ -6,6 +6,7 @@ import re
 from pathlib import Path
 
 from scripts.cnpg import (
+    _cnpg_ready,
     _render_cluster,
     _render_operator,
     _verify_marker,
@@ -18,6 +19,7 @@ from scripts.lib.addons import (
     render_resource_set,
     verify_network,
     wait_network_ready,
+    verify_addon_source_ownership,
 )
 from scripts.lib.files import IntegrityError, write_private_file
 from scripts.lib.kube import ManagementClient
@@ -28,11 +30,13 @@ from scripts.lib.tenants import (
     apply_control_plane,
     apply_workers,
     configured_tenants,
-    export_tenant_kubeconfig,
+    ensure_tenant_kubeconfig,
     inspect_storage_volume,
     render_tenant_manifests,
     tenant_kubeconfig_path,
     storage_volume_name,
+    verify_tenant_control_plane_contract,
+    verify_tenant_management_ownership,
 )
 from scripts.machines import worker_snapshot
 
@@ -197,6 +201,29 @@ def stable_tenant_snapshot(
         raise
 
 
+def verified_tenant_snapshot(
+    root: Path,
+    config: dict[str, str],
+    client,
+    tenant,
+):
+    resources = verify_tenant_management_ownership(config, client, tenant)
+    verify_tenant_control_plane_contract(config, tenant, resources)
+    verify_addon_source_ownership(
+        root, config, client, tenant, require_present=True
+    )
+    ensure_tenant_kubeconfig(root, config, client, tenant)
+    verify_network(root, config, tenant)
+    worker_snapshot(root, config, client, tenant)
+    if not _cnpg_ready(root, config, tenant):
+        raise RuntimeError(f"tenant CNPG is not healthy: {tenant.name}")
+    _verify_marker(root, config, tenant)
+    snapshot = stable_tenant_snapshot(root, config, client, tenant)
+    if snapshot is None:
+        raise RuntimeError(f"tenant identity snapshot is incomplete: {tenant.name}")
+    return snapshot
+
+
 def reconcile_tenant(
     root: Path,
     config: dict[str, str],
@@ -239,7 +266,7 @@ def reconcile_tenant(
             allow_incomplete=existing_database is not True,
         )
     apply_control_plane(root, config, client, tenant)
-    export_tenant_kubeconfig(root, config, client, tenant)
+    ensure_tenant_kubeconfig(root, config, client, tenant)
     apply_bootstrap_rbac(root, config, tenant)
     apply_workers(root, config, client, tenant)
     apply_addons(root, config, client, tenant)

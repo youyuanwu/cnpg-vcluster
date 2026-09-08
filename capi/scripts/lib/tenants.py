@@ -110,12 +110,63 @@ def verify_tenant_management_ownership(
     )
     if machines_response.returncode == 0:
         machines = json.loads(machines_response.stdout)["items"]
+        deployment = present.get("machinedeployment")
         for machine in machines:
             labels = machine["metadata"].get("labels") or {}
-            if labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]:
+            owners = [
+                owner
+                for owner in machine["metadata"].get("ownerReferences") or []
+                if owner.get("controller") is True
+            ]
+            if (
+                labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
+                or labels.get("cluster.x-k8s.io/cluster-name") != tenant.name
+                or labels.get("cnpg-vcluster.capi/nodepool") != "worker"
+                or len(owners) != 1
+                or owners[0].get("apiVersion")
+                != "cluster.x-k8s.io/v1beta2"
+                or owners[0].get("kind") != "MachineSet"
+            ):
                 raise RuntimeError(
                     f"tenant Machine ownership mismatch: "
                     f"{machine['metadata']['name']}"
+                )
+            machine_set = inspect_management_resource(
+                client,
+                tenant,
+                f"machineset/{owners[0]['name']}",
+            )
+            set_owners = (
+                machine_set["metadata"].get("ownerReferences") or []
+                if machine_set
+                else []
+            )
+            set_controller = [
+                owner
+                for owner in set_owners
+                if owner.get("controller") is True
+            ]
+            set_labels = machine_set["metadata"].get("labels") or {} if machine_set else {}
+            if (
+                machine_set is None
+                or owners[0].get("uid") != machine_set["metadata"]["uid"]
+                or set_labels.get(config["OWNERSHIP_LABEL"])
+                != config["LAB_PREFIX"]
+                or set_labels.get("cluster.x-k8s.io/cluster-name")
+                != tenant.name
+                or deployment is None
+                or len(set_controller) != 1
+                or set_controller[0].get("apiVersion")
+                != "cluster.x-k8s.io/v1beta2"
+                or set_controller[0].get("kind") != "MachineDeployment"
+                or set_controller[0].get("name")
+                != f"{tenant.name}-worker"
+                or set_controller[0].get("uid")
+                != deployment["metadata"]["uid"]
+            ):
+                raise RuntimeError(
+                    f"tenant MachineSet ownership mismatch: "
+                    f"{owners[0]['name']}"
                 )
         present["machines"] = machines
     elif not NOT_FOUND.search(machines_response.stderr):
@@ -123,6 +174,49 @@ def verify_tenant_management_ownership(
             f"tenant Machine inspection failed: {machines_response.stderr}"
         )
     return present
+
+
+def verify_tenant_control_plane_contract(
+    config: dict[str, str],
+    tenant: Tenant,
+    resources: dict[str, dict[str, object]],
+) -> None:
+    required = ("cluster", "devcluster", "kamajicontrolplane")
+    if any(kind not in resources for kind in required):
+        raise RuntimeError(
+            f"tenant control-plane resources are incomplete: {tenant.name}"
+        )
+    cluster = resources["cluster"]
+    devcluster = resources["devcluster"]
+    kcp = resources["kamajicontrolplane"]
+    endpoints = (
+        cluster["spec"].get("controlPlaneEndpoint", {}),
+        devcluster["spec"].get("controlPlaneEndpoint", {}),
+        kcp["spec"].get("controlPlaneEndpoint", {}),
+    )
+    network = cluster["spec"].get("clusterNetwork", {})
+    if (
+        any(
+            endpoint.get("host") != tenant.vip
+            or int(endpoint.get("port", 0)) != int(config["SPIKE_API_PORT"])
+            for endpoint in endpoints
+        )
+        or network.get("pods", {}).get("cidrBlocks") != [tenant.pod_cidr]
+        or network.get("services", {}).get("cidrBlocks")
+        != [tenant.service_cidr]
+        or network.get("serviceDomain") != tenant.domain
+        or not condition_true(cluster, "Available")
+        or not condition_true(kcp, "Available")
+        or kcp.get("status", {})
+        .get("initialization", {})
+        .get("controlPlaneInitialized")
+        is not True
+        or "cluster.x-k8s.io/paused"
+        in (kcp["metadata"].get("annotations") or {})
+    ):
+        raise RuntimeError(
+            f"tenant control-plane contract is unhealthy: {tenant.name}"
+        )
 
 
 def spike_tenant(root: Path, config: dict[str, str]) -> Tenant:
@@ -396,6 +490,103 @@ def tenant_kubeconfig_path(root: Path, tenant: Tenant) -> Path:
     return root / ".runtime" / "tenants" / tenant.name / "kubeconfig"
 
 
+def validate_tenant_kubeconfig_view(
+    config: dict[str, str],
+    tenant: Tenant,
+    view: dict[str, object],
+    expected_ca: bytes,
+) -> None:
+    contexts = {
+        item["name"]: item["context"] for item in view.get("contexts", [])
+    }
+    clusters = {
+        item["name"]: item["cluster"] for item in view.get("clusters", [])
+    }
+    current = contexts.get(view.get("current-context"), {})
+    selected = clusters.get(current.get("cluster"), {})
+    expected_server = f"https://{tenant.vip}:{config['SPIKE_API_PORT']}"
+    if (
+        selected.get("server") != expected_server
+        or not selected.get("certificate-authority-data")
+        or base64.b64decode(selected["certificate-authority-data"])
+        != expected_ca
+    ):
+        raise RuntimeError(
+            "tenant kubeconfig active context does not match its endpoint and CA"
+        )
+
+
+def validate_tenant_kubeconfig_file(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant: Tenant,
+    *,
+    check_access: bool = True,
+) -> Path:
+    path = tenant_kubeconfig_path(root, tenant)
+    details = path.lstat()
+    if (
+        path.is_symlink()
+        or not path.is_file()
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise RuntimeError("tenant kubeconfig is not an owner-only regular file")
+    ca_secret = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"secret/{tenant.name}-ca",
+            "-o",
+            "json",
+        ).stdout
+    )
+    if ca_secret.get("type") != "Opaque":
+        raise RuntimeError("tenant CA Secret type is unexpected")
+    view = json.loads(
+        run(
+            [
+                str(root / ".tools" / "bin" / "kubectl"),
+                "--kubeconfig",
+                str(path),
+                "config",
+                "view",
+                "--raw",
+                "-o",
+                "json",
+            ],
+            timeout=parse_duration(config["COMMAND_TIMEOUT"]),
+        ).stdout
+    )
+    validate_tenant_kubeconfig_view(
+        config,
+        tenant,
+        view,
+        base64.b64decode(ca_secret.get("data", {}).get("ca.crt", "")),
+    )
+    if check_access:
+        authorized = run(
+            [
+                str(root / ".tools" / "bin" / "kubectl"),
+                "--kubeconfig",
+                str(path),
+                "--request-timeout",
+                config["KUBECTL_REQUEST_TIMEOUT"],
+                "auth",
+                "can-i",
+                "*",
+                "*",
+                "--all-namespaces",
+            ],
+            timeout=parse_duration(config["COMMAND_TIMEOUT"]),
+        ).stdout.strip()
+        if authorized != "yes":
+            raise RuntimeError("tenant kubeconfig is not cluster-admin authorized")
+    return path
+
+
 def export_tenant_kubeconfig(
     root: Path,
     config: dict[str, str],
@@ -415,9 +606,9 @@ def export_tenant_kubeconfig(
     value = base64.b64decode(secret["data"]["value"])
     path = tenant_kubeconfig_path(root, tenant)
     write_private_file(path, value)
-    text = value.decode("utf-8")
-    if f"https://{tenant.vip}:{config['SPIKE_API_PORT']}" not in text:
-        raise RuntimeError("tenant kubeconfig does not use the authoritative endpoint")
+    if secret.get("type") != "cluster.x-k8s.io/secret":
+        raise RuntimeError("tenant kubeconfig Secret type is unexpected")
+    validate_tenant_kubeconfig_file(root, config, client, tenant)
     run(
         [
             str(root / ".tools" / "bin" / "kubectl"),
@@ -431,6 +622,29 @@ def export_tenant_kubeconfig(
         timeout=parse_duration(config["COMMAND_TIMEOUT"]),
     )
     return path
+
+
+def ensure_tenant_kubeconfig(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant: Tenant,
+) -> Path:
+    path = tenant_kubeconfig_path(root, tenant)
+    if path.exists() or path.is_symlink():
+        try:
+            validate_tenant_kubeconfig_file(
+                root,
+                config,
+                client,
+                tenant,
+                check_access=False,
+            )
+        except RuntimeError:
+            return export_tenant_kubeconfig(root, config, client, tenant)
+        validate_tenant_kubeconfig_file(root, config, client, tenant)
+        return path
+    return export_tenant_kubeconfig(root, config, client, tenant)
 
 
 def _tenant_kubectl(
