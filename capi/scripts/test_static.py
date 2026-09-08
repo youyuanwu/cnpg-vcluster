@@ -173,6 +173,9 @@ def check_documentation() -> None:
         "Break-glass finalizer removal",
         "independently provisioned AKS management cluster",
         "does not create or configure Azure resources",
+        "Status, conditions, and exits",
+        "CAPI implementation does not emit it",
+        "Cluster in healthy state",
     )
     required_design = (
         "SkipInfraClusterPatch=true",
@@ -180,6 +183,10 @@ def check_documentation() -> None:
         "ClusterResourceSet packages the initial sources",
         "Azure CSI",
         "CAPZ self-managed `AzureCluster`/`AzureMachine` workers",
+        "AzureCluster.spec.controlPlaneEnabled: false",
+        "| Identity |",
+        "| Add-ons |",
+        "| Verification |",
         "No Azure CLI",
         "representative tenant, requires one three-instance PostgreSQL",
     )
@@ -193,6 +200,7 @@ def check_documentation() -> None:
         "CloudNativePG",
         "PostgreSQL",
         "BusyBox",
+        "etcd",
     ):
         check(project in notices, f"third-party notices omit {project}")
     check(

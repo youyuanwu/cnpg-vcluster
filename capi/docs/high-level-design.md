@@ -204,13 +204,16 @@ inventory is unchanged.
 | Tenant control plane | Hosted upstream Kubernetes APIs. | Kamaji on kind with MetalLB VIPs. | Kamaji on AKS with Azure load-balancer integration and production datastore design. |
 | Cluster lifecycle | Declarative CAPI ownership and conditions. | CAPI core v1.14.1 with the v1beta2 contract. | The same CAPI intent and higher-level tenant API. |
 | Bootstrap | Generate standard kubeadm join data. | CABPK. | CABPK or another compatible bootstrap provider if required by the Azure worker image. |
-| Worker infrastructure | Three tenant-exclusive workers. | CAPD `DevMachine` Docker containers. | CAPZ self-managed `AzureCluster`/`AzureMachine` workers, with hosted control plane rather than CAPZ-managed control-plane VMs. |
+| Worker infrastructure | Three tenant-exclusive workers. | CAPD `DevMachine` Docker containers. | CAPZ self-managed `AzureCluster`/`AzureMachine` workers with `AzureCluster.spec.controlPlaneEnabled: false`, because Kamaji supplies the hosted control plane rather than CAPZ-managed control-plane VMs. |
 | Cloud integration | Tenant Nodes interact with their cloud environment. | No cloud provider. | External Azure cloud provider and required node identities/RBAC. |
 | Networking | Tenant-specific Pod/Service networks and DNS identity. | Calico plus repository-owned kube-proxy. | Azure-compatible CNI selected during Azure design validation; CIDR and DNS separation remain required. |
 | Storage | Tenant-owned durable volumes survive worker replacement. | Shared Docker volume mounted into workers, static hostPath PVs. | Azure CSI volumes with attach/detach, fencing, zone, snapshot, and recovery tests. |
 | Credentials | Explicit, scoped, non-cross-tenant access. | Owner-only kubeconfigs and generated PostgreSQL Secrets. | Azure Workload Identity/managed identities and production secret distribution; no credentials are defined here. |
+| Identity | Bind operations to the intended management cluster, tenant, and cloud resources. | Active-context endpoint/CA validation, exact ownership records, labels, and UID chains. | AKS and Azure Workload Identity, scoped managed identities, and Azure resource IDs validated before mutation. |
+| Add-ons | Deliver verified tenant networking and platform components. | ClusterResourceSet bootstrap sources with explicit target drift repair. | A separately selected Azure-compatible CNI and GitOps/add-on controller; integrity and tenant scoping remain mandatory. |
 | Endpoint | One authoritative API endpoint per tenant. | MetalLB VIP, consistently preseeded across CAPI/Kamaji/CABPK. | Azure load-balancer endpoint, consistently represented in the same contracts. |
 | Cleanup | Delete tenant API resources before infrastructure and prove survivor health. | UID journals plus exact Docker ownership. | Provider finalizers plus Azure resource IDs, locks, and deletion evidence. |
+| Verification | Prove observable health, isolation, persistence, repair, and cleanup. | Targeted suites plus a bounded representative PostgreSQL E2E. | Add Azure VM, load-balancer, identity, disk attach/detach, fencing, zone, snapshot, and deletion evidence. |
 
 ## Explicit non-goals
 

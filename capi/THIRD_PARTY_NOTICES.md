@@ -18,6 +18,7 @@ copyright, license, and NOTICE files remain authoritative.
 | Kamaji CAPI provider | `v0.20.0` | Apache-2.0 |
 | Kamaji | `26.8.6-edge` source | Apache-2.0 |
 | kamaji-etcd | chart `0.15.0` | Apache-2.0 |
+| etcd | directly pinned server `v3.5.17` and setup image `v3.5.6` | Apache-2.0 |
 | cert-manager | OCI chart `v1.21.1` | Apache-2.0 |
 | MetalLB | native manifest `v0.16.1` | Apache-2.0 |
 | Calico | manifest and selected images `v3.32.2` | Apache-2.0 |
@@ -36,6 +37,7 @@ Source and license references:
 - <https://github.com/kubernetes-sigs/cluster-api>
 - <https://github.com/clastix/cluster-api-control-plane-provider-kamaji>
 - <https://github.com/clastix/kamaji>
+- <https://github.com/etcd-io/etcd>
 - <https://github.com/cert-manager/cert-manager>
 - <https://github.com/metallb/metallb>
 - <https://github.com/projectcalico/calico>

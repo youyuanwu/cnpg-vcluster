@@ -159,6 +159,34 @@ Repair and deletion are fail-closed:
 - an absent Docker volume with a valid retained identity record is treated as
   an interrupted cleanup and completed safely.
 
+## Status, conditions, and exits
+
+`just status` returns `0` only when every observed layer is healthy. It returns
+`1` when the lab is absent, incomplete, drifted, unavailable, or cannot be
+inspected. Mutating commands and test recipes return `0` on success and `1` on
+validation, ownership, admission, reconciliation, timeout, or cleanup failure.
+The settings reserve exit `2` for a possible blocked outcome, but the current
+CAPI implementation does not emit it.
+
+Condition checks require the current resource generation rather than accepting
+a stale `True` condition. A healthy tenant requires:
+
+- management API readiness, four available CAPI providers, required
+  controller workloads, ready webhooks, Kamaji, and its datastore;
+- CAPI `Cluster` and `KamajiControlPlane` `Available=True`, initialized and
+  unpaused control plane, plus matching Cluster/DevCluster/Kamaji endpoints;
+- exact Ready Machine, DevMachine, Docker container, Node, and bootstrap
+  Secret inventories;
+- Ready Calico, CoreDNS, Konnectivity, and repository-owned kube-proxy;
+- owned Docker volume and static PV/PVC state without PV node affinity;
+- digest-pinned CNPG operator, `Cluster in healthy state`, three Ready
+  PostgreSQL Pods on distinct workers, three Bound PVCs, and a reachable
+  read-write endpoint.
+
+Canonical Kubernetes `Error from server (NotFound):` is the only accepted
+absence proof in fail-closed lifecycle inspections. Other API errors are
+failures, not absent or healthy states.
+
 ## Break-glass finalizer removal
 
 Normal recovery is:
