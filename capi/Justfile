@@ -3,7 +3,11 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# [implemented] Download and verify pinned tools and immutable inputs.
+# [implemented] Acquire and verify every pinned artifact and OCI image online.
+cache:
+    @python3 scripts/lab.py cache
+
+# [implemented] Install and verify tools from the complete local cache.
 tools:
     @python3 scripts/lab.py tools
 

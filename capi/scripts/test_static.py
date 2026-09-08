@@ -14,6 +14,7 @@ from scripts.lib.config import load_configuration
 
 
 EXPECTED_RECIPES = {
+    "cache",
     "tools",
     "prepare-host",
     "preflight",

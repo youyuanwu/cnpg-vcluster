@@ -6,7 +6,6 @@ import os
 import shutil
 import sys
 import tempfile
-import time
 import uuid
 from pathlib import Path
 
@@ -15,6 +14,7 @@ from scripts.lib.files import verify_sha256
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.ownership import IdentityRecord, OwnershipError
 from scripts.lib.process import CommandError, run
+from scripts.cache import restore_host_image, verify_cache
 from scripts.tools import verify_all_inputs
 
 
@@ -174,59 +174,13 @@ def verify_inotify(config: dict[str, str]) -> None:
             raise PreflightError(f"fs.inotify.{name}={current} is below required {floor}")
 
 
-def verify_images(config: dict[str, str], timeout: int) -> None:
-    image_keys = sorted(
-        key
-        for key, value in config.items()
-        if key.endswith("_IMAGE") and "@sha256:" in value
-    )
-    for key in image_keys:
-        tagged_key = f"{key}_TAGGED"
-        if tagged_key not in config:
-            raise PreflightError(f"{key} is missing provenance key {tagged_key}")
-        expected = config[key].rsplit("@", 1)[1]
-        command = [
-            "docker",
-            "buildx",
-            "imagetools",
-            "inspect",
-            config[tagged_key],
-            "--format",
-            "{{json .Manifest}}",
-        ]
-        result = None
-        for attempt in range(4):
-            try:
-                result = run(command, timeout=timeout)
-                break
-            except CommandError as exc:
-                transient = any(
-                    marker in exc.output.lower()
-                    for marker in (
-                        "500 internal server error",
-                        "502 bad gateway",
-                        "503 service unavailable",
-                        "504 gateway timeout",
-                        "tls handshake timeout",
-                        "connection reset",
-                        "i/o timeout",
-                        "unexpected eof",
-                    )
-                )
-                if not transient or attempt == 3:
-                    raise
-                time.sleep(5)
-        if result is None:
-            raise PreflightError(f"image inspection produced no result: {tagged_key}")
-        actual = json.loads(result.stdout)["digest"]
-        if actual != expected:
-            raise PreflightError(
-                f"{tagged_key} resolved to {actual}, expected {expected}"
-            )
+def verify_images(root: Path, config: dict[str, str]) -> None:
+    verify_cache(root, config)
 
 
-def verify_privileged_probe(config: dict[str, str]) -> None:
+def verify_privileged_probe(root: Path, config: dict[str, str]) -> None:
     timeout = parse_duration(config["PREFLIGHT_PROBE_TIMEOUT"])
+    restore_host_image(root, config, "VERIFY_IMAGE", timeout)
     name = f"{config['LAB_PREFIX']}-preflight-{uuid.uuid4().hex[:12]}"
     result = None
     with tempfile.TemporaryDirectory(prefix=f"{name}-") as temporary:
@@ -236,6 +190,7 @@ def verify_privileged_probe(config: dict[str, str]) -> None:
                 [
                     "docker",
                     "run",
+                    "--pull=never",
                     "--rm",
                     "--cidfile",
                     str(cid_file),
@@ -307,6 +262,6 @@ def run_preflight(root: Path, config: dict[str, str]) -> None:
     verify_management_name(root, config, timeout)
     verify_inotify(config)
     verify_no_network_overlap(config, timeout)
-    verify_images(config, timeout)
-    verify_privileged_probe(config)
+    verify_images(root, config)
+    verify_privileged_probe(root, config)
     print("preflight passed")

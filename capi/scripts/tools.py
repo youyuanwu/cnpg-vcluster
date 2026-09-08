@@ -381,7 +381,36 @@ def verify_all_inputs(root: Path, config: dict[str, str]) -> None:
         verify_sha256(root / relative, config[checksum_key])
 
 
+def _install_binaries(root: Path, config: dict[str, str]) -> None:
+    inputs_dir = root / ".tools" / "inputs"
+    bin_dir = root / ".tools" / "bin"
+    ensure_private_dir(inputs_dir)
+    ensure_private_dir(bin_dir)
+    downloaded = {filename: inputs_dir / filename for filename, _, _ in DOWNLOADS}
+    _install_copy(downloaded["kind-linux-amd64"], bin_dir / "kind")
+    _install_copy(downloaded["kubectl-linux-amd64"], bin_dir / "kubectl")
+    _install_copy(downloaded["clusterctl-linux-amd64"], bin_dir / "clusterctl")
+    _install_helm(
+        downloaded["helm-linux-amd64.tar.gz"],
+        bin_dir / "helm",
+        config["HELM_BINARY_SHA256"],
+    )
+
+
+def _install_tools(root: Path, config: dict[str, str]) -> None:
+    verify_all_inputs(root, config)
+    _install_binaries(root, config)
+
+
 def prepare_tools(root: Path, config: dict[str, str]) -> None:
+    _install_tools(root, config)
+    from scripts.cache import verify_cache
+
+    verify_cache(root, config)
+    print(f"verified local tools, inputs, and cache under {root / '.tools'}")
+
+
+def acquire_tools(root: Path, config: dict[str, str]) -> None:
     require(
         config,
         "DOWNLOAD_TIMEOUT",
@@ -407,14 +436,7 @@ def prepare_tools(root: Path, config: dict[str, str]) -> None:
             timeout,
         )
 
-    _install_copy(downloaded["kind-linux-amd64"], bin_dir / "kind")
-    _install_copy(downloaded["kubectl-linux-amd64"], bin_dir / "kubectl")
-    _install_copy(downloaded["clusterctl-linux-amd64"], bin_dir / "clusterctl")
-    _install_helm(
-        downloaded["helm-linux-amd64.tar.gz"],
-        bin_dir / "helm",
-        config["HELM_BINARY_SHA256"],
-    )
+    _install_binaries(root, config)
     _ensure_cert_manager_chart(config, inputs_dir, bin_dir, timeout)
     allowed_inputs = {
         filename for filename, _, _ in DOWNLOADS
@@ -434,4 +456,4 @@ def prepare_tools(root: Path, config: dict[str, str]) -> None:
         _verify_tag(repository, tag, config[commit_key], timeout)
 
     verify_all_inputs(root, config)
-    print(f"prepared verified tools and inputs under {tools_dir}")
+    print(f"acquired verified tools and inputs under {tools_dir}")
