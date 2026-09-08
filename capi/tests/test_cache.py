@@ -21,6 +21,7 @@ from scripts.cache import (
     verify_cache,
 )
 from scripts.lib.files import IntegrityError
+from scripts.lib.files import write_private_file as real_write_private_file
 
 
 TAGGED = "example.invalid/lab/image:v1"
@@ -287,6 +288,50 @@ class CacheTests(unittest.TestCase):
                 "old",
             )
             self.assertFalse((cache / "generations/new").exists())
+
+    def test_active_pointer_publication_failure_keeps_old_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / ".tools/cache"
+            cache.mkdir(parents=True, mode=0o700)
+            for directory in (root / ".tools", cache):
+                directory.chmod(0o700)
+            active = cache / "active.json"
+            active.write_text(
+                json.dumps({"schema": ACTIVE_SCHEMA, "generation": "old"}),
+                encoding="utf-8",
+            )
+            active.chmod(0o600)
+
+            def fake_acquire_tools(*_, tools_dir: Path, **__) -> None:
+                (tools_dir / "bin").mkdir(mode=0o700)
+                (tools_dir / "inputs").mkdir(mode=0o700)
+
+            def publishing_write(path: Path, content) -> None:
+                if path.name == "active.json":
+                    raise OSError("simulated pointer failure")
+                real_write_private_file(path, content)
+
+            with (
+                patch("scripts.cache.uuid.uuid4") as generated,
+                patch("scripts.cache.acquire_tools", side_effect=fake_acquire_tools) as acquire,
+                patch("scripts.cache.image_keys", return_value=()),
+                patch("scripts.cache._requirements", return_value={}),
+                patch("scripts.cache.verify_generation"),
+                patch("scripts.cache.write_private_file", side_effect=publishing_write),
+            ):
+                generated.return_value.hex = "new"
+                with self.assertRaises(OSError):
+                    acquire_cache(root, {"DOWNLOAD_TIMEOUT": "1s"})
+            self.assertEqual(
+                json.loads(active.read_text(encoding="utf-8"))["generation"],
+                "old",
+            )
+            self.assertFalse((cache / "generations/new").exists())
+            self.assertEqual(
+                acquire.call_args.kwargs["tools_dir"],
+                cache / "generations/new",
+            )
 
     def test_restore_loads_archive_then_requires_exact_repo_digest(self) -> None:
         config = {
