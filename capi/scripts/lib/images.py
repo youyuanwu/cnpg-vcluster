@@ -5,6 +5,7 @@ import time
 import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+import re
 
 from scripts.cache import archive_path, restore_host_image
 from scripts.lib.config import parse_duration
@@ -65,24 +66,28 @@ def restore_host_images(
 
 
 def _container_has_image(container: str, reference: str, timeout: int) -> bool:
-    return (
-        run(
-            [
-                "docker",
-                "exec",
-                container,
-                "ctr",
-                "--namespace",
-                "k8s.io",
-                "images",
-                "inspect",
-                reference,
-            ],
-            timeout=timeout,
-            check=False,
-        ).returncode
-        == 0
+    result = run(
+        [
+            "docker",
+            "exec",
+            container,
+            "ctr",
+            "--namespace",
+            "k8s.io",
+            "images",
+            "inspect",
+            reference,
+        ],
+        timeout=timeout,
+        check=False,
     )
+    if result.returncode != 0:
+        return False
+    match = re.search(
+        r"(?m)^[└├]──[^\n]*@(sha256:[0-9a-f]{64})",
+        result.stdout,
+    )
+    return match is not None and match.group(1) == reference.rsplit("@", 1)[1]
 
 
 def import_container_images(

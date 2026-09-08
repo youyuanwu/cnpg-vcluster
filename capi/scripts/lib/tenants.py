@@ -374,15 +374,17 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
         "STORAGE_HOST_PATH": str(tenant.storage_host_path),
         "STORAGE_CONTAINER_PATH": config["SPIKE_STORAGE_CONTAINER_PATH"],
         "WORKER_REPLICAS": str(tenant.workers),
-        "IMAGE_CACHE_HOST_PATH": str(
-            root / ".tools" / "cache" / "materialized" / "images"
-        ),
+        "IMAGE_CACHE_HOST_PATH": str(root / ".tools" / "cache"),
         "IMAGE_CACHE_CONTAINER_PATH": cache_container_path,
         "WORKER_PRELOAD_COMMANDS": "\n".join(
             "        - >-\n"
-            "          ctr --namespace k8s.io images import --digests "
+            "          generation=$(sed -n "
+            "'s/.*\"generation\":\"\\([^\"]*\\)\".*/\\1/p' "
+            f"'{cache_container_path}/active.json'); "
+            "test -n \"$generation\"; "
+            "ctr --namespace k8s.io images import --digests "
             f"--index-name '{config[key]}' "
-            f"'{cache_container_path}/images/{key.lower()}.tar'"
+            f"'{cache_container_path}/generations/$generation/images/{key.lower()}.tar'"
             for key in sorted(WORKER_IMAGE_KEYS)
         ),
         "WORKER_PRELOAD_IMAGES": "\n".join(
@@ -944,7 +946,60 @@ def apply_workers(
         "-f",
         str(workers),
     )
+    verify_worker_preload_contract(root, config, client, tenant)
     return workers
+
+
+def verify_worker_preload_contract(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant: Tenant,
+) -> None:
+    devmachine = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"devmachinetemplate/{tenant.name}-worker",
+            "-o",
+            "json",
+        ).stdout
+    )
+    docker = devmachine["spec"]["template"]["spec"]["backend"]["docker"]
+    expected_images = list(sorted(config[key] for key in WORKER_IMAGE_KEYS))
+    if docker.get("preLoadImages") != expected_images:
+        raise RuntimeError("live worker preload image inventory does not match")
+    cache_mounts = [
+        mount
+        for mount in docker.get("extraMounts", [])
+        if mount.get("containerPath") == "/var/lib/capi-image-cache"
+    ]
+    if cache_mounts != [
+        {
+            "hostPath": str(root / ".tools" / "cache"),
+            "containerPath": "/var/lib/capi-image-cache",
+            "readOnly": True,
+        }
+    ]:
+        raise RuntimeError("live worker cache mount does not match")
+    kubeadm = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"kubeadmconfigtemplate/{tenant.name}-worker",
+            "-o",
+            "json",
+        ).stdout
+    )
+    commands = kubeadm["spec"]["template"]["spec"].get("preKubeadmCommands", [])
+    if len(commands) != len(WORKER_IMAGE_KEYS) or any(
+        config[key] not in "\n".join(commands)
+        or f"/images/{key.lower()}.tar" not in "\n".join(commands)
+        for key in WORKER_IMAGE_KEYS
+    ):
+        raise RuntimeError("live worker exact preload commands do not match")
 
 
 def _machine(client: ManagementClient, tenant: Tenant) -> dict[str, object] | None:

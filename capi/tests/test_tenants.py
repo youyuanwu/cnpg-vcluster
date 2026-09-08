@@ -17,12 +17,62 @@ from scripts.lib.tenants import (
     remove_tenant_storage_volume,
     storage_volume_name,
     validate_tenant_kubeconfig_view,
+    verify_worker_preload_contract,
 )
 from scripts.lib.files import IntegrityError
 from scripts.lib.images import WORKER_IMAGE_KEYS
 
 
 class TenantTests(unittest.TestCase):
+    def test_live_worker_templates_match_exact_preload_contract(self) -> None:
+        tenant = type(
+            "Tenant", (), {"name": "tenant-a", "namespace": "tenant-a"}
+        )()
+        config = {
+            key: f"example/{key.lower()}:v1@sha256:{index:064x}"
+            for index, key in enumerate(WORKER_IMAGE_KEYS, 1)
+        }
+        commands = [
+            f"ctr --index-name '{config[key]}' /cache/images/{key.lower()}.tar"
+            for key in WORKER_IMAGE_KEYS
+        ]
+        devmachine = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "backend": {
+                            "docker": {
+                                "preLoadImages": sorted(config.values()),
+                                "extraMounts": [
+                                    {
+                                        "hostPath": "/repo/.tools/cache",
+                                        "containerPath": "/var/lib/capi-image-cache",
+                                        "readOnly": True,
+                                    }
+                                ],
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        kubeadm = {
+            "spec": {"template": {"spec": {"preKubeadmCommands": commands}}}
+        }
+        client = type("Client", (), {})()
+        client.kubectl = lambda *args: type(
+            "Result",
+            (),
+            {
+                "stdout": json.dumps(
+                    devmachine if "devmachinetemplate/tenant-a-worker" in args else kubeadm
+                )
+            },
+        )()
+        verify_worker_preload_contract(
+            Path("/repo"), config, client, tenant
+        )
+
     def test_worker_preload_values_are_sorted_exact_references(self) -> None:
         tenant = Tenant(
             name="tenant-a",
@@ -72,7 +122,7 @@ class TenantTests(unittest.TestCase):
             self.assertIn(f"/images/{key.lower()}.tar", commands)
         self.assertEqual(
             values["IMAGE_CACHE_HOST_PATH"],
-            "/repo/.tools/cache/materialized/images",
+            "/repo/.tools/cache",
         )
 
     def test_template_rejects_unresolved_values(self) -> None:

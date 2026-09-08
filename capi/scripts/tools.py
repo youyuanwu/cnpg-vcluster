@@ -498,11 +498,10 @@ def _install_tools(
 
 
 def prepare_tools(root: Path, config: dict[str, str]) -> None:
-    from scripts.cache import materialize_images, materialize_inputs, verify_cache
+    from scripts.cache import materialize_inputs, verify_cache
 
     verify_cache(root, config)
     materialize_inputs(root, config)
-    materialize_images(root, config)
     _install_tools(root, config)
     print(f"verified local tools, inputs, and cache under {root / '.tools'}")
 

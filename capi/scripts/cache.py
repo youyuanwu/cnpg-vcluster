@@ -475,27 +475,6 @@ def materialize_inputs(root: Path, config: dict[str, str]) -> None:
     verify_all_inputs(root, config)
 
 
-def materialize_images(root: Path, config: dict[str, str]) -> Path:
-    generation = active_generation(root)
-    inventory = verify_generation(root, config, generation)
-    destination_dir = root / ".tools" / "cache" / "materialized" / "images"
-    ensure_private_dir(destination_dir)
-    allowed = set()
-    for entry in inventory["imageArchives"]:
-        name = Path(entry["path"]).name
-        allowed.add(name)
-        destination = destination_dir / name
-        _copy_private(generation / entry["path"], destination)
-        _private_regular_file(destination)
-        verify_sha256(destination, entry["sha256"])
-    for path in destination_dir.iterdir():
-        if path.name in allowed:
-            continue
-        _private_regular_file(path)
-        path.unlink()
-    return destination_dir
-
-
 def acquire_cache(root: Path, config: dict[str, str]) -> None:
     timeout = parse_duration(config["DOWNLOAD_TIMEOUT"]) * 4
     generations = _generation_root(root)
@@ -542,7 +521,6 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
         published = True
         verify_cache(root, config)
         materialize_inputs(root, config)
-        materialize_images(root, config)
     except BaseException:
         if not published:
             shutil.rmtree(generation, ignore_errors=True)

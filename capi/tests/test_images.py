@@ -14,6 +14,7 @@ from scripts.lib.images import (
     preload_worker_images,
     references,
     import_container_images,
+    _container_has_image,
 )
 
 
@@ -23,11 +24,17 @@ class ImagePreloadTests(unittest.TestCase):
         config = {"DOWNLOAD_TIMEOUT": "1s", "TEST_IMAGE": exact}
         missing = CompletedProcess([], 1, stdout="", stderr="missing")
         success = CompletedProcess([], 0, stdout="", stderr="")
+        present = CompletedProcess(
+            [],
+            0,
+            stdout=f"{exact}\n└── application/vnd.oci.image.index.v1+json @{exact.rsplit('@', 1)[1]}\n",
+            stderr="",
+        )
         with (
             patch("scripts.lib.images.archive_path", return_value=Path("/cache/image.tar")),
             patch(
                 "scripts.lib.images.run",
-                side_effect=[missing, success, success, success, success],
+                side_effect=[missing, success, success, success, present],
             ) as run,
         ):
             import_container_images(
@@ -57,6 +64,20 @@ class ImagePreloadTests(unittest.TestCase):
                 import_container_images(
                     Path("/repo"), config, "worker-a", ("TEST_IMAGE",)
                 )
+
+    def test_container_image_name_with_wrong_target_digest_is_rejected(self) -> None:
+        exact = "example/image:v1@sha256:" + "a" * 64
+        result = CompletedProcess(
+            [],
+            0,
+            stdout=(
+                f"{exact}\n└── application/vnd.oci.image.index.v1+json "
+                f"@sha256:{'b' * 64}\n"
+            ),
+            stderr="",
+        )
+        with patch("scripts.lib.images.run", return_value=result):
+            self.assertFalse(_container_has_image("worker-a", exact, 1))
 
     def test_references_are_deterministic_exact_digests(self) -> None:
         config = {
@@ -107,7 +128,7 @@ class ImagePreloadTests(unittest.TestCase):
 
             def importer(_, __, name, ___):
                 if name in {"worker-b", "worker-a"}:
-                    raise RuntimeError("injected")
+                    raise RuntimeError("token=super-secret injected")
 
             with (
                 patch(
@@ -120,6 +141,14 @@ class ImagePreloadTests(unittest.TestCase):
                     RuntimeError, "worker-a:.*worker-b:"
                 ):
                     preload_worker_images(root, {}, object(), tenant)
+            evidence = json.loads(
+                (root / ".runtime/evidence/preload-tenant-a.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            errors = " ".join(item.get("error", "") for item in evidence["nodes"])
+            self.assertNotIn("super-secret", errors)
+            self.assertIn("REDACTED", errors)
 
 
 if __name__ == "__main__":
