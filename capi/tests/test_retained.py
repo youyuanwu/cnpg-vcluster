@@ -116,6 +116,61 @@ class RetainedTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "partial"):
                     _delete_representative_tenant(root, {}, object(), tenant)
 
+    def test_cluster_absent_journal_is_finished_before_recreation(self) -> None:
+        tenant = type(
+            "Tenant", (), {"name": "tenant-a", "namespace": "tenant-a"}
+        )()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal = root / ".runtime/deletions/tenant-a.json"
+            journal.parent.mkdir(parents=True)
+            journal.write_text("{}")
+            with (
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    return_value={"cluster": None},
+                ),
+                patch("scripts.retained.finish_journaled_tenant_deletion") as finish,
+            ):
+                _delete_representative_tenant(root, {}, object(), tenant)
+            finish.assert_called_once()
+
+    def test_invalid_or_dangling_journal_blocks_recreation(self) -> None:
+        tenant = type(
+            "Tenant", (), {"name": "tenant-a", "namespace": "tenant-a"}
+        )()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal = root / ".runtime/deletions/tenant-a.json"
+            journal.parent.mkdir(parents=True)
+            journal.symlink_to(root / "missing")
+            with (
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    return_value={"cluster": None},
+                ),
+                patch(
+                    "scripts.retained.finish_journaled_tenant_deletion",
+                    side_effect=RuntimeError("invalid journal"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "invalid journal"):
+                    _delete_representative_tenant(root, {}, object(), tenant)
+
+    def test_other_owned_resource_blocks_recreation(self) -> None:
+        tenant = type(
+            "Tenant", (), {"name": "tenant-a", "namespace": "tenant-a"}
+        )()
+        with tempfile.TemporaryDirectory() as temporary:
+            with patch(
+                "scripts.retained.verify_tenant_management_ownership",
+                return_value={"cluster": None, "devMachineTemplate": {}},
+            ):
+                with self.assertRaisesRegex(RuntimeError, "partial"):
+                    _delete_representative_tenant(
+                        Path(temporary), {}, object(), tenant
+                    )
+
     def test_clean_routes_through_authoritative_destroy(self) -> None:
         with patch("scripts.retained.destroy") as destroy:
             dev_clean(Path("."), {})
