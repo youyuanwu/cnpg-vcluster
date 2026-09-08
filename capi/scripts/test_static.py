@@ -166,6 +166,9 @@ def check_documentation() -> None:
     )
     notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
     root_readme = (ROOT.parent / "README.md").read_text(encoding="utf-8")
+    readme_flat = " ".join(readme.split())
+    design_flat = " ".join(design.split())
+    notices_flat = " ".join(notices.split())
     required_readme = (
         "CAPD `DevCluster` and `DevMachine` resources are development-only",
         "sharing the host kernel",
@@ -180,9 +183,11 @@ def check_documentation() -> None:
         "capped at 100 references",
         "HAProxy container remains required",
         "authoritative tenant endpoint",
-        "local persistence proof only",
-        "Kubernetes controllers own CAPI and provider resource reconciliation",
-        "PVC, PV, and bytes",
+        "Prebound static hostPath PVs have no node affinity",
+        "This is a local persistence proof only.",
+        "Kubernetes controllers own CAPI and provider resource reconciliation.",
+        "Host code owns only exact kind/CAPD Docker identities, tenant Docker volumes, runtime records, and host setting restoration.",
+        "while retaining its PVC, PV, and bytes.",
     )
     required_design = (
         "SkipInfraClusterPatch=true",
@@ -199,18 +204,35 @@ def check_documentation() -> None:
         "future tenants are not separate AKS clusters",
     )
     for token in required_readme:
-        check(token in readme, f"CAPI README lacks documentation assertion: {token}")
+        check(
+            token in readme_flat,
+            f"CAPI README lacks documentation assertion: {token}",
+        )
     for token in required_design:
-        check(token in design, f"CAPI design lacks documentation assertion: {token}")
+        check(
+            token in design_flat,
+            f"CAPI design lacks documentation assertion: {token}",
+        )
     for project in (
         "Cluster API",
         "Kamaji CAPI provider",
         "CloudNativePG",
         "PostgreSQL",
         "BusyBox",
-        "| etcd | directly pinned server",
     ):
         check(project in notices, f"third-party notices omit {project}")
+    direct_etcd = (
+        "| etcd | directly pinned server `v3.5.17` and setup image `v3.5.6` "
+        "| Apache-2.0 |"
+    )
+    check(
+        direct_etcd in notices_flat,
+        "third-party notices do not pin the complete direct etcd row",
+    )
+    check(
+        "<https://github.com/etcd-io/etcd>" in notices,
+        "third-party notices omit the direct etcd source URL",
+    )
     check(
         "three independent local CloudNativePG experiments" in root_readme,
         "root README does not index all three labs",
