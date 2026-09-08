@@ -67,6 +67,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         ),
         re.compile(r"^evidence/cnpg-(success\.json|failure\.txt)$"),
         re.compile(r"^evidence/(create|verify)-(success\.json|failure\.txt)$"),
+        re.compile(r"^evidence/preload-(capi-worker-spike|tenant-a|tenant-b)\.json$"),
         re.compile(
             r"^evidence/break-glass-[a-z0-9.-]+-[a-z0-9.-]+-[a-z0-9.-]+"
             r"\.json$"

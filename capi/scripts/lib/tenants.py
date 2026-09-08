@@ -372,6 +372,22 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
         "STORAGE_HOST_PATH": str(tenant.storage_host_path),
         "STORAGE_CONTAINER_PATH": config["SPIKE_STORAGE_CONTAINER_PATH"],
         "WORKER_REPLICAS": str(tenant.workers),
+        "WORKER_PRELOAD_IMAGES": "\n".join(
+            f"            - {reference}"
+            for reference in sorted(
+                config[key]
+                for key in (
+                    "CALICO_CNI_IMAGE",
+                    "CALICO_KUBE_CONTROLLERS_IMAGE",
+                    "CALICO_NODE_IMAGE",
+                    "KUBE_PROXY_IMAGE",
+                    "KONNECTIVITY_AGENT_IMAGE",
+                    "CNPG_CONTROLLER_IMAGE",
+                    "POSTGRES_IMAGE",
+                    "VERIFY_IMAGE",
+                )
+            )
+        ),
     }
 
 

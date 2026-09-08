@@ -41,6 +41,11 @@ from scripts.lib.tenants import (
 )
 from scripts.machines import worker_snapshot
 from scripts.tools import verify_all_inputs
+from scripts.lib.images import (
+    TENANT_HOST_IMAGE_KEYS,
+    preload_worker_images,
+    restore_host_images,
+)
 
 
 TENANT_COMPATIBILITY_REVISION = "capi-kamaji-two-tenant-v1"
@@ -273,7 +278,9 @@ def reconcile_tenant(
     else:
         export_tenant_kubeconfig(root, config, client, tenant)
     apply_bootstrap_rbac(root, config, tenant)
+    restore_host_images(root, config, TENANT_HOST_IMAGE_KEYS)
     apply_workers(root, config, client, tenant)
+    preload_worker_images(root, config, client, tenant)
     apply_addons(root, config, client, tenant)
     wait_network_ready(root, config, tenant)
     verify_network(root, config, tenant)

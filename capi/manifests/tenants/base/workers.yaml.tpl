@@ -28,6 +28,8 @@ spec:
         docker:
           customImage: ${KIND_NODE_IMAGE}
           bootstrapTimeout: 5m
+          preLoadImages:
+${WORKER_PRELOAD_IMAGES}
           extraMounts:
             - hostPath: ${STORAGE_HOST_PATH}
               containerPath: ${STORAGE_CONTAINER_PATH}

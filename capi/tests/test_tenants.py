@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from scripts.lib.tenants import (
     Tenant,
+    _tenant_values,
     _render_template,
     configured_tenants,
     prepare_storage_directory,
@@ -21,6 +22,51 @@ from scripts.lib.files import IntegrityError
 
 
 class TenantTests(unittest.TestCase):
+    def test_worker_preload_values_are_sorted_exact_references(self) -> None:
+        tenant = Tenant(
+            name="tenant-a",
+            namespace="tenant-a",
+            vip="172.18.0.10",
+            pod_cidr="10.1.0.0/16",
+            service_cidr="10.2.0.0/16",
+            dns_ip="10.2.0.10",
+            domain="tenant-a.local",
+            storage_host_path=Path("/storage"),
+            cnpg_cluster="postgres",
+            workers=3,
+        )
+        config = {
+            "OWNERSHIP_LABEL": "example.owner",
+            "LAB_PREFIX": "example",
+            "SPIKE_API_PORT": "6443",
+            "KUBERNETES_VERSION": "v1.36.4",
+            "KONNECTIVITY_SERVER_IMAGE_TAGGED": "server:v1",
+            "KONNECTIVITY_SERVER_IMAGE": "server:v1@sha256:" + "1" * 64,
+            "KONNECTIVITY_AGENT_IMAGE_TAGGED": "agent:v1",
+            "KONNECTIVITY_AGENT_IMAGE": "agent:v1@sha256:" + "2" * 64,
+            "KIND_NODE_IMAGE": "kind:v1@sha256:" + "3" * 64,
+            "SPIKE_STORAGE_CONTAINER_PATH": "/storage",
+        }
+        for index, key in enumerate(
+            (
+                "CALICO_CNI_IMAGE",
+                "CALICO_KUBE_CONTROLLERS_IMAGE",
+                "CALICO_NODE_IMAGE",
+                "KUBE_PROXY_IMAGE",
+                "CNPG_CONTROLLER_IMAGE",
+                "POSTGRES_IMAGE",
+                "VERIFY_IMAGE",
+            ),
+            4,
+        ):
+            config[key] = f"example/{key.lower()}:v1@sha256:{index:064x}"
+        lines = _tenant_values(Path("."), config, tenant)[
+            "WORKER_PRELOAD_IMAGES"
+        ].splitlines()
+        references = [line.strip().removeprefix("- ") for line in lines]
+        self.assertEqual(references, sorted(references))
+        self.assertTrue(all("@sha256:" in reference for reference in references))
+
     def test_template_rejects_unresolved_values(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             source = Path(temporary) / "source.yaml"

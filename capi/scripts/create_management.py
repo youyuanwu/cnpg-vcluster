@@ -11,11 +11,27 @@ from scripts.lib.management import (
 )
 from scripts.lib.providers import reconcile_providers
 from scripts.preflight import run_preflight
+from scripts.lib.images import (
+    MANAGEMENT_IMAGE_KEYS,
+    import_container_images,
+    restore_host_images,
+)
 
 
 def create_management(root: Path, config: dict[str, str]) -> None:
     run_preflight(root, config)
+    restore_host_images(
+        root,
+        config,
+        ("KIND_NODE_IMAGE", *MANAGEMENT_IMAGE_KEYS),
+    )
     client = reconcile_kind(root, config)
+    import_container_images(
+        root,
+        config,
+        f"{config['KIND_CLUSTER_NAME']}-control-plane",
+        MANAGEMENT_IMAGE_KEYS,
+    )
     network = reconcile_network(root, config)
     reconcile_cert_manager(root, config, client)
     reconcile_metallb(root, config, client, network)
