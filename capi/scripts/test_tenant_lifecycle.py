@@ -101,24 +101,6 @@ def _repair_input_tamper_blocked(
         raise RuntimeError("tampered repair changed the survivor tenant")
 
 
-def _repair_incomplete_control_plane(
-    root: Path,
-    config: dict[str, str],
-    client,
-    tenant,
-) -> None:
-    client.kubectl(
-        "-n",
-        tenant.namespace,
-        "delete",
-        f"kamajicontrolplane/{tenant.name}",
-        "--wait=true",
-        f"--timeout={config['DELETE_TIMEOUT']}",
-    )
-    repair(root, config, tenant.name)
-    _verify_marker(root, config, tenant)
-
-
 def _repair_refuses_unowned_cluster(
     root: Path,
     config: dict[str, str],
@@ -166,6 +148,14 @@ def _repair_refuses_unowned_machine(
     survivor_before = stable_tenant_snapshot(root, config, client, survivor)
     machine_name = sorted(target_before["workers"])[0]
     machine_uid = target_before["workers"][machine_name]["machineUID"]
+    client.kubectl(
+        "-n",
+        tenant.namespace,
+        "delete",
+        f"kamajicontrolplane/{tenant.name}",
+        "--wait=true",
+        f"--timeout={config['DELETE_TIMEOUT']}",
+    )
     machine = json.loads(
         client.kubectl(
             "-n",
@@ -224,6 +214,13 @@ def _repair_refuses_unowned_machine(
             pass
         else:
             raise RuntimeError("repair accepted an incorrectly owned Machine")
+        if (
+            inspect_management_resource(
+                client, tenant, f"kamajicontrolplane/{tenant.name}"
+            )
+            is not None
+        ):
+            raise RuntimeError("refused repair recreated the missing control plane")
         observed_uid = client.kubectl(
             "-n",
             tenant.namespace,
@@ -253,6 +250,14 @@ def _repair_refuses_unowned_machine(
             )
     if stable_tenant_snapshot(root, config, client, survivor) != survivor_before:
         raise RuntimeError("unowned Machine repair attempt changed the survivor")
+    repair(root, config, tenant.name)
+    recovered = stable_tenant_snapshot(root, config, client, tenant)
+    if any(
+        worker["machineUID"] == machine_uid
+        for worker in recovered["workers"].values()
+    ):
+        raise RuntimeError("incomplete-KCP repair retained the original Machine")
+    _verify_marker(root, config, tenant)
 
 
 def _interrupt_before_cluster_deletion(
@@ -311,9 +316,6 @@ def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
         )
         _repair_refuses_unowned_machine(
             root, config, client, tenant_a, tenant_b
-        )
-        _repair_incomplete_control_plane(
-            root, config, client, tenant_a
         )
         _repair_refuses_missing_identity_record(
             root, config, client, tenant_a, tenant_b
