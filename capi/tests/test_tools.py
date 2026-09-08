@@ -5,12 +5,36 @@ import unittest
 from pathlib import Path
 
 from scripts.lib.files import IntegrityError
-from scripts.tools import _verify_crd, _verify_tag
+from scripts.tools import _verify_crd, _verify_private_input, _verify_tag, prepare_tools
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
 
 class ToolSchemaTests(unittest.TestCase):
+    def test_prepare_tools_uses_local_cache_without_network_commands(self) -> None:
+        with (
+            patch("scripts.cache.verify_cache"),
+            patch("scripts.cache.materialize_inputs"),
+            patch("scripts.tools._install_tools"),
+            patch("scripts.tools.run") as run,
+        ):
+            prepare_tools(Path("/tmp/example"), {})
+        run.assert_not_called()
+
+    def test_cached_input_rejects_symlink_and_broad_permissions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.write_text("content", encoding="utf-8")
+            target.chmod(0o600)
+            link = root / "link"
+            link.symlink_to(target)
+            with self.assertRaises(IntegrityError):
+                _verify_private_input(link)
+            target.chmod(0o644)
+            with self.assertRaises(IntegrityError):
+                _verify_private_input(target)
+
     def test_served_and_storage_must_belong_to_requested_version(self) -> None:
         manifest = """\
 apiVersion: apiextensions.k8s.io/v1

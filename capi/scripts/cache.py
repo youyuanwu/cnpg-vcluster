@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import os
 import shutil
 import stat
@@ -51,6 +52,15 @@ def _repository_digest(reference: str) -> str:
     if ":" in last:
         name = name.rsplit(":", 1)[0]
     return f"{name}@{digest}"
+
+
+def _canonical_tagged(reference: str) -> str:
+    if "/" not in reference:
+        return f"docker.io/library/{reference}"
+    first = reference.split("/", 1)[0]
+    if "." not in first and ":" not in first and first != "localhost":
+        reference = f"docker.io/{reference}"
+    return reference
 
 
 def _private_regular_file(path: Path) -> None:
@@ -211,6 +221,30 @@ def _verify_archive_metadata(path: Path, tagged: str, exact: str) -> None:
     expected_digest = exact.rsplit("@", 1)[1]
     try:
         with tarfile.open(path, "r") as archive:
+            names = set(archive.getnames())
+
+            def read_blob(digest: str) -> bytes:
+                if not digest.startswith("sha256:") or len(digest) != 71:
+                    raise IntegrityError(
+                        f"image archive {path} has invalid blob digest {digest!r}"
+                    )
+                member_name = f"blobs/sha256/{digest.removeprefix('sha256:')}"
+                if member_name not in names:
+                    raise IntegrityError(
+                        f"image archive {path} lacks content blob {digest}"
+                    )
+                extracted_blob = archive.extractfile(member_name)
+                if extracted_blob is None:
+                    raise IntegrityError(
+                        f"image archive content blob cannot be read: {digest}"
+                    )
+                data = extracted_blob.read()
+                if hashlib.sha256(data).hexdigest() != digest.removeprefix("sha256:"):
+                    raise IntegrityError(
+                        f"image archive content blob checksum mismatch: {digest}"
+                    )
+                return data
+
             index_member = archive.getmember("index.json")
             if not index_member.isfile():
                 raise IntegrityError(f"image archive index is not a regular file: {path}")
@@ -218,6 +252,28 @@ def _verify_archive_metadata(path: Path, tagged: str, exact: str) -> None:
             if extracted is None:
                 raise IntegrityError(f"image archive index cannot be read: {path}")
             index = json.loads(extracted.read())
+            source_manifest = json.loads(read_blob(expected_digest))
+            platform = next(
+                (
+                    item
+                    for item in source_manifest.get("manifests", [])
+                    if (item.get("platform") or {}).get("os") == "linux"
+                    and (item.get("platform") or {}).get("architecture") == "amd64"
+                ),
+                None,
+            )
+            if platform is None:
+                raise IntegrityError(
+                    f"image archive {path} lacks linux/amd64 platform metadata"
+                )
+            platform_digest = platform.get("digest", "")
+            manifest = json.loads(read_blob(platform_digest))
+            required_blobs = [manifest.get("config", {}).get("digest", "")]
+            required_blobs.extend(
+                layer.get("digest", "") for layer in manifest.get("layers", [])
+            )
+            for digest in required_blobs:
+                read_blob(digest)
     except (KeyError, tarfile.TarError, json.JSONDecodeError) as exc:
         raise IntegrityError(f"invalid OCI image archive {path}: {exc}") from exc
     descriptors = index.get("manifests") or []
@@ -226,7 +282,10 @@ def _verify_archive_metadata(path: Path, tagged: str, exact: str) -> None:
             f"image archive {path} does not contain source digest {expected_digest}"
         )
     if not any(
-        (item.get("annotations") or {}).get("io.containerd.image.name") == tagged
+        _canonical_tagged(
+            (item.get("annotations") or {}).get("io.containerd.image.name", "")
+        )
+        == _canonical_tagged(tagged)
         for item in descriptors
     ):
         raise IntegrityError(
@@ -322,6 +381,16 @@ def verify_generation(
     if observed_keys != expected_keys:
         missing = sorted(expected_keys - observed_keys)
         raise IntegrityError(f"cache image inventory is incomplete: {missing}")
+    inputs_dir = generation / "inputs"
+    verify_all_inputs(root, config, inputs_dir)
+    for filename, _, _ in DOWNLOADS:
+        allowed.add(f"inputs/{filename}")
+    allowed.update(
+        {
+            f"inputs/cert-manager-{config['CERT_MANAGER_VERSION']}.tgz",
+            f"inputs/cert-manager-{config['CERT_MANAGER_VERSION']}.digest",
+        }
+    )
     for path in generation.rglob("*"):
         if path.is_dir():
             ensure_private_dir(path)
@@ -329,7 +398,6 @@ def verify_generation(
         relative = str(path.relative_to(generation))
         if relative not in allowed:
             raise IntegrityError(f"unexpected cache generation entry: {path}")
-    verify_all_inputs(root, config)
     return inventory
 
 
@@ -366,15 +434,58 @@ def restore_host_image(
     _require_host_digest(config, key, effective_timeout)
 
 
+def _copy_private(source: Path, destination: Path) -> None:
+    _private_regular_file(source)
+    ensure_private_dir(destination.parent)
+    if destination.exists() or destination.is_symlink():
+        _private_regular_file(destination)
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix=f".{destination.name}.", dir=destination.parent
+    )
+    os.close(descriptor)
+    temporary = Path(temporary_name)
+    try:
+        with source.open("rb") as input_file, temporary.open("wb") as output:
+            shutil.copyfileobj(input_file, output)
+        temporary.chmod(0o600)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def materialize_inputs(root: Path, config: dict[str, str]) -> None:
+    generation = active_generation(root)
+    verify_generation(root, config, generation)
+    source_dir = generation / "inputs"
+    destination_dir = root / ".tools" / "inputs"
+    ensure_private_dir(destination_dir)
+    allowed = {
+        filename for filename, _, _ in DOWNLOADS
+    } | {
+        f"cert-manager-{config['CERT_MANAGER_VERSION']}.tgz",
+        f"cert-manager-{config['CERT_MANAGER_VERSION']}.digest",
+    }
+    for name in sorted(allowed):
+        _copy_private(source_dir / name, destination_dir / name)
+    for path in destination_dir.iterdir():
+        if path.name in allowed:
+            continue
+        _private_regular_file(path)
+        path.unlink()
+    verify_all_inputs(root, config)
+
+
 def acquire_cache(root: Path, config: dict[str, str]) -> None:
-    acquire_tools(root, config)
     timeout = parse_duration(config["DOWNLOAD_TIMEOUT"]) * 4
     generations = _generation_root(root)
     ensure_private_dir(generations)
     generation_id = uuid.uuid4().hex
     generation = generations / generation_id
     ensure_private_dir(generation)
+    published = False
     try:
+        acquire_tools(root, config, tools_dir=generation)
+        shutil.rmtree(generation / "bin")
         entries = []
         for key in image_keys(config):
             relative = f"images/{key.lower()}.tar"
@@ -407,9 +518,12 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
             )
             + "\n",
         )
+        published = True
         verify_cache(root, config)
+        materialize_inputs(root, config)
     except BaseException:
-        shutil.rmtree(generation, ignore_errors=True)
+        if not published:
+            shutil.rmtree(generation, ignore_errors=True)
         raise
     print(
         f"prepared verified cache generation {generation_id} "

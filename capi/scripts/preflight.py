@@ -15,7 +15,7 @@ from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.ownership import IdentityRecord, OwnershipError
 from scripts.lib.process import CommandError, run
 from scripts.cache import restore_host_image, verify_cache
-from scripts.tools import verify_all_inputs
+from scripts.tools import prepare_tools
 
 
 class PreflightError(RuntimeError):
@@ -256,7 +256,7 @@ def verify_privileged_probe(root: Path, config: dict[str, str]) -> None:
 
 def run_preflight(root: Path, config: dict[str, str]) -> None:
     timeout = parse_duration(config["COMMAND_TIMEOUT"])
-    verify_all_inputs(root, config)
+    prepare_tools(root, config)
     verify_tools(root, config, timeout)
     verify_docker(config, timeout)
     verify_management_name(root, config, timeout)

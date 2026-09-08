@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
 import tarfile
 import tempfile
 import urllib.error
@@ -13,7 +14,6 @@ from scripts.lib.config import parse_duration, require
 from scripts.lib.files import (
     IntegrityError,
     ensure_private_dir,
-    has_owner_only_permissions,
     verify_sha256,
     write_private_file,
 )
@@ -344,21 +344,39 @@ def _ensure_cert_manager_chart(
     return destination
 
 
-def verify_all_inputs(root: Path, config: dict[str, str]) -> None:
-    inputs_dir = root / ".tools" / "inputs"
+def _verify_private_input(path: Path, expected_sha256: str | None = None) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError as exc:
+        raise IntegrityError(f"required verified input is missing: {path}") from exc
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise IntegrityError(f"verified input is not an owner-only regular file: {path}")
+    if expected_sha256 is not None:
+        verify_sha256(path, expected_sha256)
+
+
+def verify_all_inputs(
+    root: Path,
+    config: dict[str, str],
+    inputs_dir: Path | None = None,
+) -> None:
+    inputs_dir = inputs_dir or root / ".tools" / "inputs"
     for filename, _, sha_key in DOWNLOADS:
-        verify_sha256(inputs_dir / filename, config[sha_key])
-    verify_sha256(
-        inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.tgz",
+        _verify_private_input(inputs_dir / filename, config[sha_key])
+    chart_path = inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.tgz"
+    _verify_private_input(
+        chart_path,
         config["CERT_MANAGER_CHART_SHA256"],
     )
     digest_path = inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.digest"
-    if not digest_path.is_file():
-        raise IntegrityError("cert-manager OCI descriptor record is missing")
+    _verify_private_input(digest_path)
     if digest_path.read_text(encoding="utf-8").strip() != config["CERT_MANAGER_OCI_DIGEST"]:
         raise IntegrityError("cert-manager OCI descriptor record does not match")
-    if not has_owner_only_permissions(digest_path):
-        raise IntegrityError("cert-manager OCI descriptor record is not owner-only")
 
     _verify_metadata(
         inputs_dir / "capi-metadata.yaml",
@@ -381,9 +399,15 @@ def verify_all_inputs(root: Path, config: dict[str, str]) -> None:
         verify_sha256(root / relative, config[checksum_key])
 
 
-def _install_binaries(root: Path, config: dict[str, str]) -> None:
-    inputs_dir = root / ".tools" / "inputs"
-    bin_dir = root / ".tools" / "bin"
+def _install_binaries(
+    root: Path,
+    config: dict[str, str],
+    *,
+    inputs_dir: Path | None = None,
+    bin_dir: Path | None = None,
+) -> None:
+    inputs_dir = inputs_dir or root / ".tools" / "inputs"
+    bin_dir = bin_dir or root / ".tools" / "bin"
     ensure_private_dir(inputs_dir)
     ensure_private_dir(bin_dir)
     downloaded = {filename: inputs_dir / filename for filename, _, _ in DOWNLOADS}
@@ -397,20 +421,32 @@ def _install_binaries(root: Path, config: dict[str, str]) -> None:
     )
 
 
-def _install_tools(root: Path, config: dict[str, str]) -> None:
-    verify_all_inputs(root, config)
-    _install_binaries(root, config)
+def _install_tools(
+    root: Path,
+    config: dict[str, str],
+    *,
+    inputs_dir: Path | None = None,
+    bin_dir: Path | None = None,
+) -> None:
+    verify_all_inputs(root, config, inputs_dir)
+    _install_binaries(root, config, inputs_dir=inputs_dir, bin_dir=bin_dir)
 
 
 def prepare_tools(root: Path, config: dict[str, str]) -> None:
-    _install_tools(root, config)
-    from scripts.cache import verify_cache
+    from scripts.cache import materialize_inputs, verify_cache
 
     verify_cache(root, config)
+    materialize_inputs(root, config)
+    _install_tools(root, config)
     print(f"verified local tools, inputs, and cache under {root / '.tools'}")
 
 
-def acquire_tools(root: Path, config: dict[str, str]) -> None:
+def acquire_tools(
+    root: Path,
+    config: dict[str, str],
+    *,
+    tools_dir: Path | None = None,
+) -> None:
     require(
         config,
         "DOWNLOAD_TIMEOUT",
@@ -420,7 +456,7 @@ def acquire_tools(root: Path, config: dict[str, str]) -> None:
         "CERT_MANAGER_CHART_SHA256",
     )
     timeout = parse_duration(config["DOWNLOAD_TIMEOUT"])
-    tools_dir = root / ".tools"
+    tools_dir = tools_dir or root / ".tools"
     inputs_dir = tools_dir / "inputs"
     bin_dir = tools_dir / "bin"
     ensure_private_dir(inputs_dir)
@@ -436,7 +472,7 @@ def acquire_tools(root: Path, config: dict[str, str]) -> None:
             timeout,
         )
 
-    _install_binaries(root, config)
+    _install_binaries(root, config, inputs_dir=inputs_dir, bin_dir=bin_dir)
     _ensure_cert_manager_chart(config, inputs_dir, bin_dir, timeout)
     allowed_inputs = {
         filename for filename, _, _ in DOWNLOADS
@@ -455,5 +491,5 @@ def acquire_tools(root: Path, config: dict[str, str]) -> None:
         tag = config[version_key]
         _verify_tag(repository, tag, config[commit_key], timeout)
 
-    verify_all_inputs(root, config)
+    verify_all_inputs(root, config, inputs_dir)
     print(f"acquired verified tools and inputs under {tools_dir}")

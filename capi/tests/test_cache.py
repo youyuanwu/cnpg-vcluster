@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import hashlib
 import json
 import os
 import tarfile
@@ -16,31 +17,89 @@ from scripts.cache import (
     IMAGE_PLATFORM,
     _verify_archive_metadata,
     restore_host_image,
+    acquire_cache,
     verify_cache,
 )
 from scripts.lib.files import IntegrityError
 
 
-EXACT = "example.invalid/lab/image:v1@sha256:" + "a" * 64
 TAGGED = "example.invalid/lab/image:v1"
+CONFIG_BYTES = b'{"architecture":"amd64","os":"linux"}'
+LAYER_BYTES = b"layer"
+CONFIG_DIGEST = "sha256:" + hashlib.sha256(CONFIG_BYTES).hexdigest()
+LAYER_DIGEST = "sha256:" + hashlib.sha256(LAYER_BYTES).hexdigest()
+PLATFORM_MANIFEST = json.dumps(
+    {
+        "schemaVersion": 2,
+        "config": {"digest": CONFIG_DIGEST},
+        "layers": [{"digest": LAYER_DIGEST}],
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+).encode()
+PLATFORM_DIGEST = "sha256:" + hashlib.sha256(PLATFORM_MANIFEST).hexdigest()
+SOURCE_INDEX = json.dumps(
+    {
+        "schemaVersion": 2,
+        "manifests": [
+            {
+                "digest": PLATFORM_DIGEST,
+                "platform": {"os": "linux", "architecture": "amd64"},
+            }
+        ],
+    },
+    sort_keys=True,
+    separators=(",", ":"),
+).encode()
+SOURCE_DIGEST = "sha256:" + hashlib.sha256(SOURCE_INDEX).hexdigest()
+EXACT = f"example.invalid/lab/image:v1@{SOURCE_DIGEST}"
 
 
-def write_archive(path: Path, *, digest: str = "sha256:" + "a" * 64) -> None:
+def write_archive(
+    path: Path,
+    *,
+    tagged: str = TAGGED,
+    architecture: str = "amd64",
+) -> str:
+    source_index = json.dumps(
+        {
+            "schemaVersion": 2,
+            "manifests": [
+                {
+                    "digest": PLATFORM_DIGEST,
+                    "platform": {"os": "linux", "architecture": architecture},
+                }
+            ],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    source_digest = "sha256:" + hashlib.sha256(source_index).hexdigest()
     index = {
         "schemaVersion": 2,
         "manifests": [
             {
-                "digest": digest,
-                "annotations": {"io.containerd.image.name": TAGGED},
+                "digest": source_digest,
+                "annotations": {"io.containerd.image.name": tagged},
             }
         ],
     }
     with tarfile.open(path, "w") as archive:
-        data = json.dumps(index).encode()
-        member = tarfile.TarInfo("index.json")
-        member.size = len(data)
-        archive.addfile(member, io.BytesIO(data))
+        def add(name: str, data: bytes) -> None:
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            archive.addfile(member, io.BytesIO(data))
+
+        add("index.json", json.dumps(index).encode())
+        add(f"blobs/sha256/{source_digest.removeprefix('sha256:')}", source_index)
+        add(
+            f"blobs/sha256/{PLATFORM_DIGEST.removeprefix('sha256:')}",
+            PLATFORM_MANIFEST,
+        )
+        add(f"blobs/sha256/{CONFIG_DIGEST.removeprefix('sha256:')}", CONFIG_BYTES)
+        add(f"blobs/sha256/{LAYER_DIGEST.removeprefix('sha256:')}", LAYER_BYTES)
     path.chmod(0o600)
+    return f"example.invalid/lab/image:v1@{source_digest}"
 
 
 class CacheTests(unittest.TestCase):
@@ -49,9 +108,42 @@ class CacheTests(unittest.TestCase):
             archive = Path(temporary) / "image.tar"
             write_archive(archive)
             _verify_archive_metadata(archive, TAGGED, EXACT)
-            write_archive(archive, digest="sha256:" + "b" * 64)
             with self.assertRaises(IntegrityError):
-                _verify_archive_metadata(archive, TAGGED, EXACT)
+                _verify_archive_metadata(
+                    archive,
+                    TAGGED,
+                    "example.invalid/lab/image:v1@sha256:" + "b" * 64,
+                )
+
+    def test_archive_rejects_platform_mismatch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "image.tar"
+            exact = write_archive(archive, architecture="arm64")
+            with self.assertRaises(IntegrityError):
+                _verify_archive_metadata(archive, TAGGED, exact)
+
+    def test_archive_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target.tar"
+            write_archive(target)
+            link = root / "link.tar"
+            link.symlink_to(target)
+            with self.assertRaises(IntegrityError):
+                _verify_archive_metadata(link, TAGGED, EXACT)
+
+    def test_archive_normalizes_docker_hub_tag(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "image.tar"
+            write_archive(
+                archive,
+                tagged="docker.io/example/image:v1",
+            )
+            _verify_archive_metadata(
+                archive,
+                "example/image:v1",
+                EXACT.replace("example.invalid/lab/image", "example/image"),
+            )
 
     def test_complete_inventory_verifies_and_tampering_fails(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -69,8 +161,6 @@ class CacheTests(unittest.TestCase):
                 directory.chmod(0o700)
             archive = images / "test_image.tar"
             write_archive(archive)
-            import hashlib
-
             checksum = hashlib.sha256(archive.read_bytes()).hexdigest()
             requirements = {
                 "inputs": [],
@@ -107,7 +197,11 @@ class CacheTests(unittest.TestCase):
                 encoding="utf-8",
             )
             active.chmod(0o600)
-            config = {"TEST_IMAGE": EXACT, "TEST_IMAGE_TAGGED": TAGGED}
+            config = {
+                "TEST_IMAGE": EXACT,
+                "TEST_IMAGE_TAGGED": TAGGED,
+                "CERT_MANAGER_VERSION": "v1",
+            }
             with (
                 patch("scripts.cache._requirements", return_value=requirements),
                 patch("scripts.cache.verify_all_inputs"),
@@ -117,6 +211,40 @@ class CacheTests(unittest.TestCase):
                     output.write(b"tampered")
                 with self.assertRaises(IntegrityError):
                     verify_cache(root, config)
+
+    def test_pin_drift_rejects_previous_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            active = root / ".tools/cache/active.json"
+            generation = root / ".tools/cache/generations/g1"
+            generation.mkdir(parents=True, mode=0o700)
+            for directory in (
+                root / ".tools",
+                root / ".tools/cache",
+                root / ".tools/cache/generations",
+                generation,
+            ):
+                directory.chmod(0o700)
+            (generation / "inventory.json").write_text(
+                json.dumps(
+                    {
+                        "schema": CACHE_SCHEMA,
+                        "platform": IMAGE_PLATFORM,
+                        "requirements": {"old": True},
+                        "imageArchives": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            (generation / "inventory.json").chmod(0o600)
+            active.write_text(
+                json.dumps({"schema": ACTIVE_SCHEMA, "generation": "g1"}),
+                encoding="utf-8",
+            )
+            active.chmod(0o600)
+            with patch("scripts.cache._requirements", return_value={"new": True}):
+                with self.assertRaises(IntegrityError):
+                    verify_cache(root, {"TEST_IMAGE": EXACT, "TEST_IMAGE_TAGGED": TAGGED})
 
     def test_missing_active_generation_fails_without_creating_it(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -134,6 +262,32 @@ class CacheTests(unittest.TestCase):
                 verify_cache(root, {"TEST_IMAGE": EXACT, "TEST_IMAGE_TAGGED": TAGGED})
             self.assertFalse((root / ".tools/cache/generations/missing").exists())
 
+    def test_failed_refresh_preserves_previous_active_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = root / ".tools/cache"
+            cache.mkdir(parents=True, mode=0o700)
+            (root / ".tools").chmod(0o700)
+            cache.chmod(0o700)
+            active = cache / "active.json"
+            active.write_text(
+                json.dumps({"schema": ACTIVE_SCHEMA, "generation": "old"}),
+                encoding="utf-8",
+            )
+            active.chmod(0o600)
+            with (
+                patch("scripts.cache.uuid.uuid4") as generated,
+                patch("scripts.cache.acquire_tools", side_effect=RuntimeError("offline")),
+            ):
+                generated.return_value.hex = "new"
+                with self.assertRaises(RuntimeError):
+                    acquire_cache(root, {"DOWNLOAD_TIMEOUT": "1s"})
+            self.assertEqual(
+                json.loads(active.read_text(encoding="utf-8"))["generation"],
+                "old",
+            )
+            self.assertFalse((cache / "generations/new").exists())
+
     def test_restore_loads_archive_then_requires_exact_repo_digest(self) -> None:
         config = {
             "DOWNLOAD_TIMEOUT": "1s",
@@ -144,7 +298,7 @@ class CacheTests(unittest.TestCase):
         present = CompletedProcess(
             [],
             0,
-            stdout=json.dumps(["example.invalid/lab/image@sha256:" + "a" * 64]),
+            stdout=json.dumps([f"example.invalid/lab/image@{SOURCE_DIGEST}"]),
             stderr="",
         )
         with (
