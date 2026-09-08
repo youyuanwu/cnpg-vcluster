@@ -18,6 +18,7 @@ from scripts.lib.tenants import (
     storage_volume_name,
     validate_tenant_kubeconfig_view,
     verify_worker_preload_contract,
+    worker_preload_commands,
 )
 from scripts.lib.files import IntegrityError
 from scripts.lib.images import WORKER_IMAGE_KEYS
@@ -32,10 +33,7 @@ class TenantTests(unittest.TestCase):
             key: f"example/{key.lower()}:v1@sha256:{index:064x}"
             for index, key in enumerate(WORKER_IMAGE_KEYS, 1)
         }
-        commands = [
-            f"ctr --index-name '{config[key]}' /cache/images/{key.lower()}.tar"
-            for key in WORKER_IMAGE_KEYS
-        ]
+        commands = worker_preload_commands(config)
         devmachine = {
             "spec": {
                 "template": {
@@ -72,6 +70,11 @@ class TenantTests(unittest.TestCase):
         verify_worker_preload_contract(
             Path("/repo"), config, client, tenant
         )
+        kubeadm["spec"]["template"]["spec"]["preKubeadmCommands"][0] = "true"
+        with self.assertRaisesRegex(RuntimeError, "exact preload commands"):
+            verify_worker_preload_contract(
+                Path("/repo"), config, client, tenant
+            )
 
     def test_worker_preload_values_are_sorted_exact_references(self) -> None:
         tenant = Tenant(

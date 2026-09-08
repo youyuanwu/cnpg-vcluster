@@ -377,15 +377,8 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
         "IMAGE_CACHE_HOST_PATH": str(root / ".tools" / "cache"),
         "IMAGE_CACHE_CONTAINER_PATH": cache_container_path,
         "WORKER_PRELOAD_COMMANDS": "\n".join(
-            "        - >-\n"
-            "          generation=$(sed -n "
-            "'s/.*\"generation\":\"\\([^\"]*\\)\".*/\\1/p' "
-            f"'{cache_container_path}/active.json'); "
-            "test -n \"$generation\"; "
-            "ctr --namespace k8s.io images import --digests "
-            f"--index-name '{config[key]}' "
-            f"'{cache_container_path}/generations/$generation/images/{key.lower()}.tar'"
-            for key in sorted(WORKER_IMAGE_KEYS)
+            f"        - >-\n          {command}"
+            for command in worker_preload_commands(config)
         ),
         "WORKER_PRELOAD_IMAGES": "\n".join(
             f"            - {reference}"
@@ -404,6 +397,20 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
             )
         ),
     }
+
+
+def worker_preload_commands(config: dict[str, str]) -> list[str]:
+    cache_container_path = "/var/lib/capi-image-cache"
+    return [
+        "generation=$(sed -n "
+        "'s/.*\"generation\":\"\\([^\"]*\\)\".*/\\1/p' "
+        f"'{cache_container_path}/active.json'); "
+        "test -n \"$generation\"; "
+        "ctr --namespace k8s.io images import --digests "
+        f"--index-name '{config[key]}' "
+        f"'{cache_container_path}/generations/$generation/images/{key.lower()}.tar'"
+        for key in sorted(WORKER_IMAGE_KEYS)
+    ]
 
 
 def render_tenant_manifests(
@@ -994,11 +1001,7 @@ def verify_worker_preload_contract(
         ).stdout
     )
     commands = kubeadm["spec"]["template"]["spec"].get("preKubeadmCommands", [])
-    if len(commands) != len(WORKER_IMAGE_KEYS) or any(
-        config[key] not in "\n".join(commands)
-        or f"/images/{key.lower()}.tar" not in "\n".join(commands)
-        for key in WORKER_IMAGE_KEYS
-    ):
+    if commands != worker_preload_commands(config):
         raise RuntimeError("live worker exact preload commands do not match")
 
 
