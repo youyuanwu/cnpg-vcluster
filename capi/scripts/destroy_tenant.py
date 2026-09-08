@@ -152,6 +152,7 @@ def prepare_tenant_deletion(
         validate_deletion_journal(
             root, tenant, str(cluster["metadata"]["uid"])
         )
+        return
     if cnpg_artifacts_present(root, config, tenant):
         delete_cnpg(root, config, tenant)
     if _storage_smoke_present(root, config, tenant):
@@ -218,6 +219,8 @@ def finish_prepared_tenant_deletion(
     client,
     tenant,
 ) -> None:
+    validate_deletion_journal(root, tenant)
+    tenant_kubeconfig_path(root, tenant).unlink(missing_ok=True)
     delete_tenant(root, config, client, tenant)
     for relative in (
         Path("rendered/addons") / tenant.name,
@@ -262,6 +265,7 @@ def destroy_tenant_stack(root: Path, config: dict[str, str], name: str) -> None:
     owned = verify_tenant_management_ownership(config, client, tenant)
     cluster = owned.get("cluster")
     journal = _journal_path(root, tenant)
+    already_absent = False
     if cluster is not None:
         ensure_tenant_kubeconfig(root, config, client, tenant)
         prepare_tenant_deletion(root, config, client, tenant, cluster)
@@ -277,12 +281,16 @@ def destroy_tenant_stack(root: Path, config: dict[str, str], name: str) -> None:
             Path("rendered/cnpg") / tenant.name,
         ):
             shutil.rmtree(root / ".runtime" / relative, ignore_errors=True)
+        already_absent = True
     else:
         record = validate_deletion_journal(root, tenant)
         if record["tenant"] != tenant.name:
             raise RuntimeError("tenant deletion journal does not match target")
         tenant_kubeconfig_path(root, tenant).unlink(missing_ok=True)
-    finish_prepared_tenant_deletion(root, config, client, tenant)
+    if already_absent:
+        _verify_deleted(root, config, client, tenant)
+    else:
+        finish_prepared_tenant_deletion(root, config, client, tenant)
     survivor_after = verified_tenant_snapshot(
         root, config, client, survivor
     )

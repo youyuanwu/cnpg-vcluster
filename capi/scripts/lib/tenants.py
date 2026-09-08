@@ -567,23 +567,31 @@ def validate_tenant_kubeconfig_file(
         base64.b64decode(ca_secret.get("data", {}).get("ca.crt", "")),
     )
     if check_access:
-        authorized = run(
-            [
-                str(root / ".tools" / "bin" / "kubectl"),
-                "--kubeconfig",
-                str(path),
-                "--request-timeout",
-                config["KUBECTL_REQUEST_TIMEOUT"],
-                "auth",
-                "can-i",
-                "*",
-                "*",
-                "--all-namespaces",
-            ],
-            timeout=parse_duration(config["COMMAND_TIMEOUT"]),
-        ).stdout.strip()
-        if authorized != "yes":
-            raise RuntimeError("tenant kubeconfig is not cluster-admin authorized")
+        checks = (
+            ("patch", "configmaps", "--namespace=kube-system"),
+            ("patch", "customresourcedefinitions.apiextensions.k8s.io"),
+            ("delete", "namespaces"),
+        )
+        for verb, resource, *scope in checks:
+            authorized = run(
+                [
+                    str(root / ".tools" / "bin" / "kubectl"),
+                    "--kubeconfig",
+                    str(path),
+                    "--request-timeout",
+                    config["KUBECTL_REQUEST_TIMEOUT"],
+                    "auth",
+                    "can-i",
+                    verb,
+                    resource,
+                    *scope,
+                ],
+                timeout=parse_duration(config["COMMAND_TIMEOUT"]),
+            ).stdout.strip()
+            if authorized != "yes":
+                raise RuntimeError(
+                    f"tenant kubeconfig lacks required {verb} {resource} access"
+                )
     return path
 
 

@@ -203,7 +203,24 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         if not status.get("apiReady"):
             raise RuntimeError("owned management API is not reachable; refusing partial cleanup")
         client = ManagementClient(root, config)
-        tenants = [spike_tenant(root, config), *configured_tenants(root, config)]
+        cluster_crd = client.kubectl(
+            "get",
+            "crd/clusters.cluster.x-k8s.io",
+            check=False,
+        )
+        if cluster_crd.returncode == 0:
+            tenants = [spike_tenant(root, config), *configured_tenants(root, config)]
+        elif re.search(
+            r"Error from server \(NotFound\):",
+            cluster_crd.stderr,
+            re.IGNORECASE,
+        ):
+            tenants = []
+        else:
+            raise RuntimeError(
+                f"CAPI Cluster CRD inspection failed during cleanup: "
+                f"{cluster_crd.stderr}"
+            )
         configured_names = set(config["TENANT_NAMES"].split())
         for tenant in tenants:
             deletion_journal = (

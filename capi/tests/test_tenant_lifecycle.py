@@ -6,7 +6,11 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from scripts.destroy_tenant import _tenant_resource, prepare_tenant_deletion
+from scripts.destroy_tenant import (
+    _tenant_resource,
+    destroy_tenant_stack,
+    prepare_tenant_deletion,
+)
 from scripts.create import require_no_pending_deletions
 from scripts.lib.files import IntegrityError
 from scripts.lib.tenants import (
@@ -130,6 +134,36 @@ class TenantLifecycleTests(unittest.TestCase):
                     {"metadata": {"uid": "new"}},
                 )
 
+    def test_matching_journal_skips_repeated_live_api_cleanup(self) -> None:
+        tenant = type("Tenant", (), {"name": "tenant-a"})()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal = root / ".runtime" / "deletions" / "tenant-a.json"
+            journal.parent.mkdir(parents=True)
+            journal.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "tenant": "tenant-a",
+                        "clusterUID": "same",
+                        "phase": "api-cleanup-complete",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            journal.chmod(0o600)
+            with patch(
+                "scripts.destroy_tenant.cnpg_artifacts_present"
+            ) as cnpg_present:
+                prepare_tenant_deletion(
+                    root,
+                    {},
+                    object(),
+                    tenant,
+                    {"metadata": {"uid": "same"}},
+                )
+            cnpg_present.assert_not_called()
+
     def test_pending_deletion_blocks_reconciliation(self) -> None:
         tenant = type("Tenant", (), {"name": "tenant-a"})()
         with tempfile.TemporaryDirectory() as temporary:
@@ -139,3 +173,43 @@ class TenantLifecycleTests(unittest.TestCase):
             journal.write_text("{}\n", encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "pending tenant deletion"):
                 require_no_pending_deletions(root, [tenant])
+
+    def test_repeated_targeted_deletion_needs_no_journal(self) -> None:
+        tenant = type(
+            "Tenant",
+            (),
+            {"name": "tenant-a", "namespace": "tenant-a"},
+        )()
+        survivor = type("Tenant", (), {"name": "tenant-b"})()
+        snapshot = {"survivor": "stable"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with (
+                patch("scripts.destroy_tenant.verify_all_inputs"),
+                patch(
+                    "scripts.destroy_tenant._selected_tenants",
+                    return_value=(tenant, survivor),
+                ),
+                patch("scripts.destroy_tenant.require_management_ownership"),
+                patch("scripts.destroy_tenant.validate_management_kubeconfig"),
+                patch("scripts.destroy_tenant.ManagementClient"),
+                patch(
+                    "scripts.destroy_tenant.verified_tenant_snapshot",
+                    return_value=snapshot,
+                ),
+                patch(
+                    "scripts.destroy_tenant.verify_tenant_management_ownership",
+                    return_value={},
+                ),
+                patch(
+                    "scripts.destroy_tenant.inspect_storage_volume",
+                    return_value=None,
+                ),
+                patch("scripts.destroy_tenant._verify_deleted") as verify_deleted,
+                patch(
+                    "scripts.destroy_tenant.finish_prepared_tenant_deletion"
+                ) as finish,
+            ):
+                destroy_tenant_stack(root, {"LAB_PREFIX": "lab"}, tenant.name)
+            verify_deleted.assert_called_once()
+            finish.assert_not_called()

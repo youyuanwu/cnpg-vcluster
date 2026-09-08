@@ -18,6 +18,10 @@ class DestroyTests(unittest.TestCase):
             journal = root / ".runtime" / "deletions" / "tenant-b.json"
             journal.parent.mkdir(parents=True)
             journal.write_text("{}\n", encoding="utf-8")
+            client = Mock()
+            client.kubectl.return_value = Mock(
+                returncode=0, stdout="", stderr=""
+            )
             with (
                 patch("scripts.destroy._validate_runtime_inventory"),
                 patch("scripts.destroy.validate_inotify_state"),
@@ -30,7 +34,7 @@ class DestroyTests(unittest.TestCase):
                 ),
                 patch("scripts.destroy.require_management_ownership"),
                 patch("scripts.destroy.validate_management_kubeconfig"),
-                patch("scripts.destroy.ManagementClient", return_value=Mock()),
+                patch("scripts.destroy.ManagementClient", return_value=client),
                 patch("scripts.destroy.spike_tenant", return_value=spike),
                 patch(
                     "scripts.destroy.configured_tenants",

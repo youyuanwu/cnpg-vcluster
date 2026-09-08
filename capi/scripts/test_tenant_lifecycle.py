@@ -12,6 +12,7 @@ from scripts.destroy_tenant import (
 )
 from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient
+from scripts.lib.redaction import redact
 from scripts.lib.tenants import (
     configured_tenants,
     inspect_management_resource,
@@ -154,6 +155,106 @@ def _repair_refuses_unowned_cluster(
         raise RuntimeError("unowned repair attempt changed the survivor")
 
 
+def _repair_refuses_unowned_machine(
+    root: Path,
+    config: dict[str, str],
+    client,
+    tenant,
+    survivor,
+) -> None:
+    target_before = stable_tenant_snapshot(root, config, client, tenant)
+    survivor_before = stable_tenant_snapshot(root, config, client, survivor)
+    machine_name = sorted(target_before["workers"])[0]
+    machine_uid = target_before["workers"][machine_name]["machineUID"]
+    machine = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"machine/{machine_name}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    machine_set = next(
+        owner["name"]
+        for owner in machine["metadata"].get("ownerReferences") or []
+        if owner.get("kind") == "MachineSet"
+        and owner.get("controller") is True
+    )
+    paused_resources = (
+        f"cluster/{tenant.name}",
+        f"machinedeployment/{tenant.name}-worker",
+        f"machineset/{machine_set}",
+    )
+    for resource in paused_resources:
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "annotate",
+            resource,
+            "cluster.x-k8s.io/paused=true",
+            "--overwrite",
+        )
+    client.kubectl(
+        "-n",
+        tenant.namespace,
+        "label",
+        f"machine/{machine_name}",
+        f"{config['OWNERSHIP_LABEL']}=foreign",
+        "--overwrite",
+    )
+    try:
+        observed_label = client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"machine/{machine_name}",
+            "-o",
+            "json",
+        ).stdout
+        observed_label = json.loads(observed_label)["metadata"]["labels"].get(
+            config["OWNERSHIP_LABEL"]
+        )
+        if observed_label != "foreign":
+            raise RuntimeError("foreign Machine ownership fixture did not persist")
+        try:
+            repair(root, config, tenant.name)
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("repair accepted an incorrectly owned Machine")
+        observed_uid = client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"machine/{machine_name}",
+            "-o",
+            "jsonpath={.metadata.uid}",
+        ).stdout
+        if observed_uid != machine_uid:
+            raise RuntimeError("refused Machine changed identity")
+    finally:
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "label",
+            f"machine/{machine_name}",
+            f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
+            "--overwrite",
+        )
+        for resource in reversed(paused_resources):
+            client.kubectl(
+                "-n",
+                tenant.namespace,
+                "annotate",
+                resource,
+                "cluster.x-k8s.io/paused-",
+            )
+    if stable_tenant_snapshot(root, config, client, survivor) != survivor_before:
+        raise RuntimeError("unowned Machine repair attempt changed the survivor")
+
+
 def _interrupt_before_cluster_deletion(
     root: Path,
     config: dict[str, str],
@@ -189,6 +290,7 @@ def _interrupt_after_cluster_deletion(
 
 
 def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
+    failure = None
     try:
         create(root, config)
         client = ManagementClient(root, config)
@@ -205,6 +307,9 @@ def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
             root, config, client, tenant_a, tenant_b
         )
         _repair_refuses_unowned_cluster(
+            root, config, client, tenant_a, tenant_b
+        )
+        _repair_refuses_unowned_machine(
             root, config, client, tenant_a, tenant_b
         )
         _repair_incomplete_control_plane(
@@ -238,5 +343,13 @@ def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
                 sort_keys=True,
             )
         )
-    finally:
+    except BaseException as exc:
+        failure = exc
+    try:
         destroy(root, config)
+    except BaseException as cleanup:
+        if failure is None:
+            raise
+        failure.add_note(f"cleanup also failed: {redact(str(cleanup))}")
+    if failure is not None:
+        raise failure
