@@ -16,6 +16,7 @@ from scripts.lib.locking import e2e_lock
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
 from scripts.tools import verify_all_inputs
+from scripts.lib.timing import PhaseTimings
 
 
 def run_just(
@@ -81,18 +82,23 @@ def run_e2e() -> int:
         "max_user_watches": read_inotify("max_user_watches"),
     }
     failure = None
+    timings = PhaseTimings()
     try:
-        run_just(ROOT, config, "tools")
-        run_just(ROOT, config, "destroy")
-        run_just(ROOT, config, "prepare-host")
-        verify_all_inputs(ROOT, config)
-        run_just(ROOT, config, "create-management")
+        with timings.phase("tools_cache"):
+            run_just(ROOT, config, "tools")
+        with timings.phase("initial_cleanup"):
+            run_just(ROOT, config, "destroy")
+        with timings.phase("host_preparation"):
+            run_just(ROOT, config, "prepare-host")
+        with timings.phase("management_bootstrap"):
+            verify_all_inputs(ROOT, config)
+            run_just(ROOT, config, "create-management")
 
         from scripts.lib.kube import ManagementClient
 
         client = ManagementClient(ROOT, config)
         tenant = validate_create_inputs(ROOT, config)[0]
-        reconcile_tenant(ROOT, config, client, tenant)
+        reconcile_tenant(ROOT, config, client, tenant, timings=timings)
         if not _cnpg_ready(ROOT, config, tenant):
             raise RuntimeError(
                 f"PostgreSQL cluster did not become healthy: {tenant.name}"
@@ -102,18 +108,20 @@ def run_e2e() -> int:
     except BaseException as exc:
         failure = exc
     try:
-        run_just(ROOT, config, "destroy")
-        verify_no_lab_residue(config)
-        if (ROOT / ".runtime").exists():
-            raise RuntimeError("runtime remained after E2E teardown")
-        for name, expected in original_inotify.items():
-            if read_inotify(name) != expected:
-                raise RuntimeError(f"host inotify was not restored: {name}")
+        with timings.phase("teardown"):
+            run_just(ROOT, config, "destroy")
+            verify_no_lab_residue(config)
+            if (ROOT / ".runtime").exists():
+                raise RuntimeError("runtime remained after E2E teardown")
+            for name, expected in original_inotify.items():
+                if read_inotify(name) != expected:
+                    raise RuntimeError(f"host inotify was not restored: {name}")
     except BaseException as cleanup:
         if failure is None:
             failure = cleanup
         else:
             failure.add_note(f"cleanup also failed: {redact(str(cleanup))}")
+    timings.emit()
     if failure is not None:
         raise failure
     return 0

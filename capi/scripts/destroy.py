@@ -40,6 +40,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         "management/identity.json",
         "management/network.json",
         "management/kubeconfig",
+        "retained-management.json",
         "rendered/cert-manager.yaml",
         "rendered/kamaji.yaml",
         "rendered/metallb-pool.yaml",

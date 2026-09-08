@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from contextlib import nullcontext
 import hashlib
 import re
 from pathlib import Path
@@ -239,61 +240,66 @@ def reconcile_tenant(
     *,
     before: dict[str, object] | None = None,
     repair_mode: bool = False,
+    timings=None,
 ):
-    existing_database = None
-    if not repair_mode and tenant_kubeconfig_path(root, tenant).is_file():
-        response = _tenant_kubectl(
-            root,
-            config,
-            tenant,
-            "-n",
-            config["DATABASE_NAMESPACE"],
-            "get",
-            f"cluster/{tenant.cnpg_cluster}",
-            check=False,
-        )
-        if response.returncode == 0:
-            existing_database = True
-        elif re.search(
-            r"Error from server \(NotFound\):",
-            response.stderr,
-            re.IGNORECASE,
-        ):
-            existing_database = False
-        else:
-            raise RuntimeError(
-                f"tenant database inspection failed: {tenant.name}: {response.stderr}"
+    phase = timings.phase if timings is not None else lambda _: nullcontext()
+    with phase("tenant_control_plane"):
+        existing_database = None
+        if not repair_mode and tenant_kubeconfig_path(root, tenant).is_file():
+            response = _tenant_kubectl(
+                root,
+                config,
+                tenant,
+                "-n",
+                config["DATABASE_NAMESPACE"],
+                "get",
+                f"cluster/{tenant.cnpg_cluster}",
+                check=False,
             )
-    if before is None and not repair_mode:
-        before = stable_tenant_snapshot(
-            root,
-            config,
-            client,
-            tenant,
-            allow_incomplete=existing_database is not True,
-        )
-    apply_control_plane(root, config, client, tenant)
-    if repair_mode:
-        ensure_tenant_kubeconfig(root, config, client, tenant)
-    else:
-        export_tenant_kubeconfig(root, config, client, tenant)
-    apply_bootstrap_rbac(root, config, tenant)
-    restore_host_images(root, config, TENANT_HOST_IMAGE_KEYS)
-    apply_workers(root, config, client, tenant)
-    preload_worker_images(root, config, client, tenant)
-    apply_addons(root, config, client, tenant)
-    wait_network_ready(root, config, tenant)
-    verify_network(root, config, tenant)
-    worker_snapshot(root, config, client, tenant)
-    install_cnpg(root, config, tenant)
-    _write_marker(root, config, tenant)
-    _verify_marker(root, config, tenant)
-    after = stable_tenant_snapshot(root, config, client, tenant)
-    if after is None:
-        raise RuntimeError(f"tenant identity snapshot is incomplete: {tenant.name}")
-    if before is not None and before != after:
-        raise RuntimeError(f"repeated create changed healthy identities: {tenant.name}")
-    return after
+            if response.returncode == 0:
+                existing_database = True
+            elif re.search(
+                r"Error from server \(NotFound\):",
+                response.stderr,
+                re.IGNORECASE,
+            ):
+                existing_database = False
+            else:
+                raise RuntimeError(
+                    f"tenant database inspection failed: {tenant.name}: {response.stderr}"
+                )
+        if before is None and not repair_mode:
+            before = stable_tenant_snapshot(
+                root,
+                config,
+                client,
+                tenant,
+                allow_incomplete=existing_database is not True,
+            )
+        apply_control_plane(root, config, client, tenant)
+        if repair_mode:
+            ensure_tenant_kubeconfig(root, config, client, tenant)
+        else:
+            export_tenant_kubeconfig(root, config, client, tenant)
+        apply_bootstrap_rbac(root, config, tenant)
+    with phase("tenant_workers_network"):
+        restore_host_images(root, config, TENANT_HOST_IMAGE_KEYS)
+        apply_workers(root, config, client, tenant)
+        preload_worker_images(root, config, client, tenant)
+        apply_addons(root, config, client, tenant)
+        wait_network_ready(root, config, tenant)
+        verify_network(root, config, tenant)
+        worker_snapshot(root, config, client, tenant)
+    with phase("cnpg_readiness_sql"):
+        install_cnpg(root, config, tenant)
+        _write_marker(root, config, tenant)
+        _verify_marker(root, config, tenant)
+        after = stable_tenant_snapshot(root, config, client, tenant)
+        if after is None:
+            raise RuntimeError(f"tenant identity snapshot is incomplete: {tenant.name}")
+        if before is not None and before != after:
+            raise RuntimeError(f"repeated create changed healthy identities: {tenant.name}")
+        return after
 
 
 def create(root: Path, config: dict[str, str]) -> dict[str, object]:

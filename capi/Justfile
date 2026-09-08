@@ -23,6 +23,18 @@ preflight:
 create-management:
     @python3 scripts/lab.py create-management
 
+# [implemented] Bootstrap and bind a retained management development context.
+dev-bootstrap:
+    @python3 scripts/lab.py dev-bootstrap
+
+# [implemented] Recreate and verify tenant A without rebuilding management.
+dev-tenant:
+    @python3 scripts/lab.py dev-tenant
+
+# [implemented] Remove retained tenants, management, runtime state, and host changes.
+dev-clean:
+    @python3 scripts/lab.py dev-clean
+
 # [implemented] Prove authoritative endpoint and worker registration.
 test-endpoint:
     @python3 scripts/lab.py test-endpoint
