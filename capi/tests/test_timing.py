@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import tempfile
 import unittest
 from pathlib import Path
 from contextlib import redirect_stdout
@@ -41,21 +42,23 @@ class TimingTests(unittest.TestCase):
     def test_e2e_tenant_setup_failure_marks_phase_and_runs_teardown(self) -> None:
         output = io.StringIO()
         config = {}
-        with (
-            patch("scripts.test_e2e.load_configuration", return_value=config),
-            patch("scripts.test_e2e.read_inotify", return_value=1),
-            patch("scripts.test_e2e.run_just"),
-            patch("scripts.test_e2e.verify_all_inputs"),
-            patch("scripts.test_e2e.verify_no_lab_residue"),
-            patch("scripts.create.ManagementClient", return_value=object()),
-            patch(
-                "scripts.create.validate_create_inputs",
-                side_effect=RuntimeError("injected tenant setup failure"),
-            ),
-            redirect_stdout(output),
-        ):
-            with self.assertRaisesRegex(RuntimeError, "tenant setup failure"):
-                run_e2e()
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch("scripts.test_e2e.ROOT", Path(temporary)),
+                patch("scripts.test_e2e.load_configuration", return_value=config),
+                patch("scripts.test_e2e.read_inotify", return_value=1),
+                patch("scripts.test_e2e.run_just"),
+                patch("scripts.test_e2e.verify_all_inputs"),
+                patch("scripts.test_e2e.verify_no_lab_residue"),
+                patch("scripts.create.ManagementClient", return_value=object()),
+                patch(
+                    "scripts.create.validate_create_inputs",
+                    side_effect=RuntimeError("injected tenant setup failure"),
+                ),
+                redirect_stdout(output),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "tenant setup failure"):
+                    run_e2e()
         records = {
             item["phase"]: item
             for item in (

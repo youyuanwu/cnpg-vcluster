@@ -8,6 +8,7 @@ from pathlib import Path
 import re
 
 from scripts.cache import (
+    VerifiedCache,
     active_generation,
     canonical_tagged,
     canonical_exact_reference,
@@ -73,10 +74,18 @@ def restore_host_images(
     root: Path,
     config: dict[str, str],
     keys: tuple[str, ...],
+    *,
+    verified_cache: VerifiedCache | None = None,
 ) -> None:
     timeout = parse_duration(config["DOWNLOAD_TIMEOUT"])
     for key in keys:
-        restore_host_image(root, config, key, timeout)
+        restore_host_image(
+            root,
+            config,
+            key,
+            timeout,
+            verified=verified_cache,
+        )
 
 
 def enforce_offline_node_egress(

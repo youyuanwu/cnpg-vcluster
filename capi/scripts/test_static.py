@@ -21,6 +21,8 @@ EXPECTED_RECIPES = {
     "create-management",
     "dev-bootstrap",
     "dev-tenant",
+    "dev-up",
+    "dev-test",
     "dev-clean",
     "test-endpoint",
     "test-endpoint-negative",

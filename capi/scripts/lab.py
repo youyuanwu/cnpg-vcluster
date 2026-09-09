@@ -30,7 +30,7 @@ from scripts.tools import prepare_tools
 from scripts.cache import acquire_cache
 from scripts.test_tenant_lifecycle import run_tenant_lifecycle
 from scripts.verify import verify
-from scripts.retained import dev_bootstrap, dev_clean, dev_tenant
+from scripts.retained import dev_bootstrap, dev_clean, dev_tenant, dev_test, dev_up
 
 
 def unavailable(arguments: list[str]) -> int:
@@ -57,6 +57,16 @@ def main(arguments: list[str]) -> int:
     if command == "dev-tenant":
         with tools_lock(ROOT, exclusive=True):
             dev_tenant(ROOT, config)
+        return 0
+    if command == "dev-up":
+        with tools_lock(ROOT, exclusive=True):
+            dev_up(ROOT, config)
+        return 0
+    if command == "dev-test":
+        if len(rest) != 1:
+            raise RuntimeError("dev-test requires exactly one suite name")
+        with tools_lock(ROOT, exclusive=False):
+            dev_test(ROOT, config, rest[0])
         return 0
     if command == "dev-clean":
         with tools_lock(ROOT, exclusive=True):

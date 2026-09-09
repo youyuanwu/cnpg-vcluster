@@ -25,11 +25,12 @@ from scripts.lib.registry import (
 
 
 def create_management(root: Path, config: dict[str, str]) -> None:
-    run_preflight(root, config)
+    verified_cache = run_preflight(root, config)
     restore_host_images(
         root,
         config,
         ("KIND_NODE_IMAGE", *MANAGEMENT_HOST_IMAGE_KEYS),
+        verified_cache=verified_cache,
     )
     client = reconcile_kind(root, config)
     import_container_images(

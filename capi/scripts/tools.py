@@ -10,6 +10,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from scripts.lib.config import parse_duration, require
 from scripts.lib.files import (
@@ -20,6 +21,9 @@ from scripts.lib.files import (
     write_private_file,
 )
 from scripts.lib.process import run
+
+if TYPE_CHECKING:
+    from scripts.cache import VerifiedCache
 
 
 DOWNLOADS = (
@@ -492,18 +496,21 @@ def _install_tools(
     *,
     inputs_dir: Path | None = None,
     bin_dir: Path | None = None,
+    inputs_verified: bool = False,
 ) -> None:
-    verify_all_inputs(root, config, inputs_dir)
+    if not inputs_verified:
+        verify_all_inputs(root, config, inputs_dir)
     _install_binaries(root, config, inputs_dir=inputs_dir, bin_dir=bin_dir)
 
 
-def prepare_tools(root: Path, config: dict[str, str]) -> None:
+def prepare_tools(root: Path, config: dict[str, str]) -> VerifiedCache:
     from scripts.cache import materialize_inputs, verify_cache
 
-    verify_cache(root, config)
-    materialize_inputs(root, config)
-    _install_tools(root, config)
+    verified = verify_cache(root, config)
+    materialize_inputs(root, config, verified=verified)
+    _install_tools(root, config, inputs_verified=True)
     print(f"verified local tools, inputs, and cache under {root / '.tools'}")
+    return verified
 
 
 def acquire_tools(

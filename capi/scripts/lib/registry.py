@@ -263,7 +263,7 @@ def build_registry_data(
     root: Path,
     config: dict[str, str],
 ) -> tuple[list[MirrorImage], dict[str, str], str]:
-    inventory = verify_cache(root, config)
+    inventory = verify_cache(root, config).inventory
     generation = (root / ".tools" / "cache" / "active.json")
     generation_name = json.loads(generation.read_text(encoding="utf-8"))["generation"]
     data_root = _data_path(root)
