@@ -76,6 +76,24 @@ def _private_file(path: Path) -> None:
         raise OwnershipError(f"registry file is not an owner-only regular file: {path}")
 
 
+def _private_dir(path: Path) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError as exc:
+        raise OwnershipError(f"registry directory is missing: {path}") from exc
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise OwnershipError(f"registry directory is not owner-only: {path}")
+
+
+def _path_present(path: Path) -> bool:
+    return os.path.lexists(path)
+
+
 def _read_blob(archive: tarfile.TarFile, digest: str) -> bytes:
     if not digest.startswith("sha256:") or len(digest) != 71:
         raise IntegrityError(f"invalid OCI digest in registry mirror: {digest!r}")
@@ -224,6 +242,7 @@ def _write_image(data_root: Path, image: MirrorImage) -> None:
 
 
 def _tree_inventory(data_root: Path) -> dict[str, str]:
+    _private_dir(data_root)
     inventory: dict[str, str] = {}
     for path in sorted(data_root.rglob("*")):
         relative = path.relative_to(data_root).as_posix()
@@ -248,7 +267,7 @@ def build_registry_data(
     generation = (root / ".tools" / "cache" / "active.json")
     generation_name = json.loads(generation.read_text(encoding="utf-8"))["generation"]
     data_root = _data_path(root)
-    if data_root.exists():
+    if _path_present(data_root):
         raise OwnershipError("offline registry data exists without a reusable record")
     ensure_private_dir(data_root)
     images: list[MirrorImage] = []
@@ -489,9 +508,12 @@ def reconcile_offline_registry(
     name = registry_name(config)
     record_path = _record_path(root)
     existing = _inspect_container(name)
-    if existing is not None or record_path.exists() or _data_path(root).exists():
-        if existing is None or not record_path.is_file() or not _data_path(root).is_dir():
+    record_present = _path_present(record_path)
+    data_present = _path_present(_data_path(root))
+    if existing is not None or record_present or data_present:
+        if existing is None or not record_present or not data_present:
             raise OwnershipError("offline registry state is partial or unowned")
+        _private_dir(_data_path(root))
         record = validate_registry_state(root, config)
         verify_cache(root, config)
         observed_images = [
@@ -639,13 +661,16 @@ def delete_offline_registry(root: Path, config: dict[str, str]) -> None:
     name = registry_name(config)
     record_path = _record_path(root)
     payload = _inspect_container(name)
-    state_present = payload is not None or record_path.exists() or _data_path(root).exists()
+    record_present = _path_present(record_path)
+    data_present = _path_present(_data_path(root))
+    state_present = payload is not None or record_present or data_present
     if not state_present:
         for hosts in _hosts_path(root).parent.glob("registry-hosts-*.toml"):
             hosts.unlink(missing_ok=True)
         return
-    if payload is None or not record_path.is_file() or not _data_path(root).is_dir():
+    if payload is None or not record_present or not data_present:
         raise OwnershipError("offline registry cleanup refused partial state")
+    _private_dir(_data_path(root))
     validate_registry_state(root, config)
     run(["docker", "rm", "--force", name], timeout=30)
     if _inspect_container(name) is not None:

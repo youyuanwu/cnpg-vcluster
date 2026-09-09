@@ -41,9 +41,11 @@ def _validate_runtime_inventory(root: Path) -> None:
         return
     registry_record = runtime / "management" / "offline-registry.json"
     registry_data = runtime / "management" / "offline-registry-data"
-    if registry_record.exists() != registry_data.exists():
+    registry_record_present = os.path.lexists(registry_record)
+    registry_data_present = os.path.lexists(registry_data)
+    if registry_record_present != registry_data_present:
         raise RuntimeError("offline registry runtime state is partial")
-    if registry_record.exists():
+    if registry_record_present:
         validate_registry_state_files(root)
     allowed_files = {
         "host/inotify.json",
