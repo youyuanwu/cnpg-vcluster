@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+import time
 from pathlib import Path
 
 from .files import IntegrityError, verify_sha256, write_private_file
@@ -14,6 +15,10 @@ from .conditions import condition_true
 
 SOURCE_LIMIT = 900 * 1024
 REFERENCE_LIMIT = 100
+
+
+class NetworkProbeCleanupError(RuntimeError):
+    pass
 
 
 def render_calico(root: Path, config: dict[str, str], tenant: Tenant) -> Path:
@@ -511,26 +516,50 @@ def verify_network(
         ]
     ):
         raise RuntimeError("kube-proxy RBAC drift detected")
-    _tenant_kubectl(
-        root,
-        config,
-        tenant,
-        "run",
-        "network-smoke",
-        "--image",
-        config["VERIFY_IMAGE"],
-        "--restart=Never",
-        "--rm",
-        "--attach",
-        "--command",
-        "--",
-        "sh",
-        "-ec",
-        f"nslookup kubernetes.default.svc.{tenant.domain} && "
-        "wget -qO- --timeout=5 "
-        f"https://kubernetes.default.svc.{tenant.domain}/version "
-        "--no-check-certificate >/dev/null",
-    )
+    name = f"network-smoke-{time.time_ns()}"
+    try:
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "run",
+            name,
+            "--image",
+            config["VERIFY_IMAGE"],
+            "--restart=Never",
+            "--attach",
+            "--command",
+            "--",
+            "sh",
+            "-ec",
+            f"nslookup kubernetes.default.svc.{tenant.domain} && "
+            "wget -qO- --timeout=5 "
+            f"https://kubernetes.default.svc.{tenant.domain}/version "
+            "--no-check-certificate >/dev/null",
+        )
+    finally:
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "delete",
+            f"pod/{name}",
+            "--ignore-not-found",
+            "--wait=true",
+            check=False,
+        )
+        remaining = _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "get",
+            f"pod/{name}",
+            check=False,
+        )
+        if remaining.returncode == 0 or not NOT_FOUND.search(remaining.stderr):
+            raise NetworkProbeCleanupError(
+                f"network verification pod cleanup failed: {name}"
+            )
 
 
 def network_status(
@@ -538,6 +567,8 @@ def network_status(
     config: dict[str, str],
     client: ManagementClient,
     tenant: Tenant,
+    *,
+    strict: bool = False,
 ) -> dict[str, object]:
     result: dict[str, object] = {"ready": False}
     if not (root / ".runtime" / "tenants" / tenant.name / "kubeconfig").is_file():
@@ -715,6 +746,8 @@ def network_status(
             }
         )
     except RuntimeError as exc:
+        if strict and not NOT_FOUND.search(str(exc)):
+            raise
         result["reason"] = str(exc)
     return result
 

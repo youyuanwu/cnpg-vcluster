@@ -94,7 +94,7 @@ just test-tenant-lifecycle
 | `just create-management` | Reconcile the kind management cluster and lifecycle controllers. |
 | `just dev-bootstrap` | Prepare and bind a retained management context to the current user, host, Docker daemon, branch, revision, configuration, and exact management identity. |
 | `just dev-tenant` | Delete, recreate, and validate tenant A while retaining the bound management cluster. |
-| `just dev-up` | Idempotently reconcile retained management and a complete tenant A stack without deleting healthy infrastructure. |
+| `just dev-up` | Validate retained management and tenant A health first, return an unchanged healthy stack, or reconcile only the unhealthy layer when ownership permits. |
 | `just dev-test endpoint` | Run one fast non-destructive retained check: `endpoint`, `network`, `machines`, `storage`, or `database`; omit the argument to run all checks. |
 | `just dev-clean` | Run authoritative cleanup for retained tenant, management, runtime, and host state. |
 | `just create` | Reconcile both tenant control planes, workers, networking, storage, and databases. |
@@ -127,10 +127,19 @@ just dev-clean
 ```
 
 The first `dev-up` pays the management, worker, network, storage, and database
-startup cost. Later `dev-up` calls reconcile in place, and `dev-test` only
-validates the retained stack, so individual checks normally complete in
-seconds. `dev-test` fails closed when the private retained record is missing,
-stale, unsafe, or inconsistent. `dev-tenant` remains available when a test
+startup cost. Later `dev-up` calls validate the retained binding, immutable
+inputs, host and runtime, complete management health, tenant-A ownership,
+credentials, endpoints, workers, network, storage, database, and stable
+identity before reconciling. A fully healthy compatible stack returns without
+management or tenant reconciliation. Healthy management with canonically
+absent or safely repairable tenant A reconciles only tenant A; unhealthy
+management uses full reconciliation. Missing migration evidence performs one
+full reconciliation to establish the owner-only health identity record.
+Stale, foreign, unsafe, partial, or non-authoritatively inspected state still
+fails closed.
+
+`dev-test` runs the independently selectable retained suites and normally
+completes each check in seconds. `dev-tenant` remains available when a test
 specifically needs a clean tenant while retaining management. Always run
 `just test-e2e` or `just test-e2e-offline` before treating a change as
 lifecycle-complete.
@@ -312,6 +321,14 @@ not include commands, environment values, credentials, or exception text.
 The enforced-offline gate also prints `CAPI_OFFLINE_EGRESS` records with the
 node and counted reject-rule packets, plus `CAPI_OFFLINE_MIRROR` records for
 each exact digest-qualified image exercised through the local mirror.
+
+Each successful `dev-up` also prints one compact `CAPI_DEV_UP` record with
+`schema`, `path`, `status`, and elapsed `seconds`. `path` is one of
+`bootstrap`, `full-reconcile`, `tenant-reconcile`, or `healthy`. To compare
+warm performance, establish the retained environment once and then collect at
+least three consecutive `just dev-up` samples on the same unchanged host. The
+`healthy` path is the only sample that represents a reconciliation-free warm
+run.
 
 Exact versions, URLs, checksums, source commits, and image digests are in
 [`config/versions.env`](config/versions.env). See

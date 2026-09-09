@@ -2,16 +2,72 @@ from __future__ import annotations
 
 import unittest
 import json
+import tempfile
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-from scripts.lib.management import _observed_identity, metallb_pool_apply_result
+from scripts.lib.management import (
+    _observed_identity,
+    metallb_pool_apply_result,
+    validate_management_network,
+    validate_management_server_version,
+)
 from scripts.lib.providers import PROVIDERS, _feature_gates
 from scripts.create_management import create_management
 
 
 class ManagementTests(unittest.TestCase):
+    def test_management_server_version_must_match_exactly(self) -> None:
+        client = type(
+            "Client",
+            (),
+            {
+                "kubectl": lambda *_args, **_kwargs: CompletedProcess(
+                    [], 0, stdout='{"serverVersion":{"gitVersion":"v1.34.1"}}'
+                )
+            },
+        )()
+        validate_management_server_version(
+            {"KUBERNETES_VERSION": "v1.34.1"}, client
+        )
+        with self.assertRaisesRegex(RuntimeError, "version mismatch"):
+            validate_management_server_version(
+                {"KUBERNETES_VERSION": "v1.34.2"}, client
+            )
+
+    def test_management_network_record_must_match_live_identity(self) -> None:
+        record = {
+            "schema": 1,
+            "network": "kind",
+            "network_id": "network-id",
+            "subnet": "172.18.0.0/16",
+            "pool_start": "172.18.255.250",
+            "pool_end": "172.18.255.240",
+            "pool_cidrs": [],
+            "slots": {},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / ".runtime/management/network.json"
+            path.parent.mkdir(parents=True)
+            path.write_text(json.dumps(record))
+            path.chmod(0o600)
+            with patch(
+                "scripts.lib.management._observed_management_network",
+                return_value=record,
+            ):
+                self.assertEqual(
+                    validate_management_network(root, {}), record
+                )
+            changed = dict(record, network_id="foreign")
+            with patch(
+                "scripts.lib.management._observed_management_network",
+                return_value=changed,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "identity changed"):
+                    validate_management_network(root, {})
+
     def test_management_images_are_restored_and_imported_before_workloads(self) -> None:
         calls: list[str] = []
         config = {"KIND_CLUSTER_NAME": "management"}

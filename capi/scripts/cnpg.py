@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
@@ -9,12 +10,16 @@ from scripts.lib.files import IntegrityError, verify_sha256, write_private_file
 from scripts.lib.kube import wait_for
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
-from scripts.lib.tenants import _tenant_kubectl
+from scripts.lib.tenants import NOT_FOUND, _tenant_kubectl
 from scripts.lib.tenants import storage_volume_name
 from scripts.lib.addons import delete_addons
 from scripts.lib.tenants import delete_tenant
 from scripts.storage import _delete_storage, run_storage_gate
 from scripts.lib.config import parse_duration
+
+
+class SQLProbeCleanupError(RuntimeError):
+    pass
 
 
 def _render_operator(root: Path, config: dict[str, str], tenant) -> Path:
@@ -323,10 +328,24 @@ def _sql(root: Path, config: dict[str, str], tenant, sql: str) -> str:
             "delete",
             f"pod/{name}",
             "--ignore-not-found",
-            "--wait=false",
+            "--wait=true",
             check=False,
         )
         manifest.unlink(missing_ok=True)
+        remaining = _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            f"pod/{name}",
+            check=False,
+        )
+        if remaining.returncode == 0 or not NOT_FOUND.search(remaining.stderr):
+            raise SQLProbeCleanupError(
+                f"SQL verification pod cleanup failed: {name}"
+            )
 
 
 def _write_marker(root: Path, config: dict[str, str], tenant) -> None:
@@ -349,6 +368,66 @@ def _verify_marker(root: Path, config: dict[str, str], tenant) -> None:
         tenant,
         "SELECT marker FROM verification WHERE marker='capi-marker';",
     )
+    if not result.splitlines() or result.splitlines()[-1] != "capi-marker":
+        raise RuntimeError("CNPG marker was not retained")
+
+
+def verify_retained_marker(root: Path, config: dict[str, str], tenant) -> None:
+    cluster = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            f"cluster/{tenant.cnpg_cluster}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    primary = cluster.get("status", {}).get("currentPrimary")
+    if not primary:
+        raise RuntimeError("CNPG primary identity is absent")
+    secret = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            f"secret/{tenant.cnpg_cluster}-app",
+            "-o",
+            "json",
+        ).stdout
+    )
+    encoded_password = secret.get("data", {}).get("password")
+    if not encoded_password:
+        raise RuntimeError("CNPG application credential is absent")
+    try:
+        password = base64.b64decode(encoded_password, validate=True).decode()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError("CNPG application credential is invalid") from exc
+    result = _tenant_kubectl(
+        root,
+        config,
+        tenant,
+        "-n",
+        config["DATABASE_NAMESPACE"],
+        "exec",
+        "-i",
+        f"pod/{primary}",
+        "--",
+        "sh",
+        "-ec",
+        "IFS= read -r PGPASSWORD; export PGPASSWORD; "
+        "exec psql -X -qAt -v ON_ERROR_STOP=1 "
+        f"-h {tenant.cnpg_cluster}-rw -U app -d app "
+        "-c \"SELECT marker FROM verification "
+        "WHERE marker='capi-marker';\"",
+        input_text=password + "\n",
+    ).stdout.strip()
     if not result.splitlines() or result.splitlines()[-1] != "capi-marker":
         raise RuntimeError("CNPG marker was not retained")
 

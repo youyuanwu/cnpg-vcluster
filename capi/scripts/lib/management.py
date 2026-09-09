@@ -16,6 +16,7 @@ from .kube import ManagementClient, wait_for
 from .ownership import IdentityRecord, OwnershipError
 from .process import run
 from .rendering import replace_known_images
+from .tenants import NOT_FOUND
 
 
 def _kind(root: Path) -> Path:
@@ -106,6 +107,17 @@ def validate_management_kubeconfig(root: Path, config: dict[str, str]) -> None:
         raise OwnershipError("management kubeconfig does not match the exact kind cluster")
 
 
+def validate_management_server_version(
+    config: dict[str, str], client: ManagementClient
+) -> None:
+    server_version = client.kubectl("version", "-o", "json").stdout
+    if (
+        json.loads(server_version)["serverVersion"]["gitVersion"]
+        != config["KUBERNETES_VERSION"]
+    ):
+        raise RuntimeError("management Kubernetes version mismatch")
+
+
 def reconcile_kind(root: Path, config: dict[str, str]) -> ManagementClient:
     clusters = _kind_clusters(root, config)
     payload = _container_payload(config)
@@ -164,13 +176,11 @@ def reconcile_kind(root: Path, config: dict[str, str]) -> ManagementClient:
     validate_management_kubeconfig(root, config)
     client = ManagementClient(root, config)
     client.kubectl("get", "--raw=/readyz")
-    server_version = client.kubectl("version", "-o", "json").stdout
-    if json.loads(server_version)["serverVersion"]["gitVersion"] != config["KUBERNETES_VERSION"]:
-        raise RuntimeError("management Kubernetes version mismatch")
+    validate_management_server_version(config, client)
     return client
 
 
-def reconcile_network(root: Path, config: dict[str, str]) -> dict[str, object]:
+def _observed_management_network(config: dict[str, str]) -> dict[str, object]:
     payload = _container_payload(config)
     if payload is None:
         raise RuntimeError("management container is absent")
@@ -215,21 +225,37 @@ def reconcile_network(root: Path, config: dict[str, str]) -> dict[str, object]:
         "pool_cidrs": [str(item) for item in pool],
         "slots": slots,
     }
+    return record
+
+
+def validate_management_network(
+    root: Path, config: dict[str, str]
+) -> dict[str, object]:
     path = _network_path(root)
-    if path.exists():
-        details = path.lstat()
-        if (
-            stat.S_ISLNK(details.st_mode)
-            or not stat.S_ISREG(details.st_mode)
-            or details.st_uid != os.getuid()
-            or details.st_mode & 0o077
-        ):
-            raise RuntimeError("management network record is not owner-only")
+    details = path.lstat()
+    if (
+        stat.S_ISLNK(details.st_mode)
+        or not stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise RuntimeError("management network record is not owner-only")
+    try:
         current = json.loads(path.read_text(encoding="utf-8"))
-        if current != record:
-            raise RuntimeError("management network identity changed")
-    else:
-        write_private_file(path, json.dumps(record, sort_keys=True) + "\n")
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("management network record is malformed") from exc
+    record = _observed_management_network(config)
+    if current != record:
+        raise RuntimeError("management network identity changed")
+    return record
+
+
+def reconcile_network(root: Path, config: dict[str, str]) -> dict[str, object]:
+    path = _network_path(root)
+    if path.exists() or path.is_symlink():
+        return validate_management_network(root, config)
+    record = _observed_management_network(config)
+    write_private_file(path, json.dumps(record, sort_keys=True) + "\n")
     return record
 
 
@@ -665,6 +691,8 @@ def management_status(root: Path, config: dict[str, str]) -> dict[str, object]:
 def management_component_status(
     config: dict[str, str],
     client: ManagementClient,
+    *,
+    strict: bool = False,
 ) -> list[dict[str, object]]:
     components = (
         ("Deployment", "cert-manager", "cert-manager", "CERT_MANAGER_CONTROLLER_IMAGE"),
@@ -702,6 +730,11 @@ def management_component_status(
             check=False,
         )
         if response.returncode != 0:
+            if strict and not NOT_FOUND.search(response.stderr):
+                raise RuntimeError(
+                    f"management component inspection failed: "
+                    f"{namespace}/{name}: {response.stderr}"
+                )
             result.append({"name": f"{namespace}/{name}", "available": False})
             continue
         payload = json.loads(response.stdout)
@@ -730,6 +763,8 @@ def management_component_status(
 def management_auxiliary_status(
     config: dict[str, str],
     client: ManagementClient,
+    *,
+    strict: bool = False,
 ) -> dict[str, object]:
     endpoints = {}
     for name, namespace in (
@@ -746,6 +781,15 @@ def management_auxiliary_status(
             "jsonpath={.subsets[0].addresses[0].ip}",
             check=False,
         )
+        if (
+            strict
+            and response.returncode != 0
+            and not NOT_FOUND.search(response.stderr)
+        ):
+            raise RuntimeError(
+                f"management webhook inspection failed: "
+                f"{namespace}/{name}: {response.stderr}"
+            )
         endpoints[f"{namespace}/{name}"] = response.returncode == 0 and bool(
             response.stdout
         )
@@ -758,6 +802,14 @@ def management_auxiliary_status(
         "json",
         check=False,
     )
+    if (
+        strict
+        and pvc_response.returncode != 0
+        and not NOT_FOUND.search(pvc_response.stderr)
+    ):
+        raise RuntimeError(
+            f"management PVC inspection failed: {pvc_response.stderr}"
+        )
     bound_claims = 0
     if pvc_response.returncode == 0:
         bound_claims = sum(

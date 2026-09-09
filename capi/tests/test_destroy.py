@@ -10,6 +10,17 @@ from scripts.destroy_tenant import prepare_tenant_deletion
 
 
 class DestroyTests(unittest.TestCase):
+    def test_runtime_inventory_accepts_dev_up_success_evidence(self) -> None:
+        from scripts.destroy import _validate_runtime_inventory
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = root / ".runtime/evidence/dev-up-success.json"
+            evidence.parent.mkdir(parents=True, mode=0o700)
+            evidence.write_text("{}")
+            evidence.chmod(0o600)
+            _validate_runtime_inventory(root)
+
     def test_dangling_deletion_journal_blocks_live_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

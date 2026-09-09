@@ -4,11 +4,35 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.create import create, reconcile_tenant
+from scripts.create import _incomplete_snapshot_error, create, reconcile_tenant
 from scripts.lib.files import IntegrityError
 
 
 class CreateTests(unittest.TestCase):
+    def test_snapshot_only_suppresses_canonical_incomplete_errors(self) -> None:
+        self.assertTrue(
+            _incomplete_snapshot_error(
+                RuntimeError(
+                    'Error from server (NotFound): machines "worker" not found'
+                )
+            )
+        )
+        self.assertTrue(
+            _incomplete_snapshot_error(
+                RuntimeError("three-worker topology is not exact")
+            )
+        )
+        self.assertFalse(
+            _incomplete_snapshot_error(
+                RuntimeError("management API connection refused")
+            )
+        )
+        self.assertFalse(
+            _incomplete_snapshot_error(
+                RuntimeError("worker runtime ownership mismatch")
+            )
+        )
+
     def test_input_failure_precedes_tenant_reconciliation(self) -> None:
         config = {
             "TENANT_COMPATIBILITY_REVISION": "capi-kamaji-two-tenant-v1",

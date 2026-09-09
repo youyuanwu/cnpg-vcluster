@@ -14,7 +14,12 @@ from scripts.lib.management import (
 from scripts.lib.providers import provider_status
 from scripts.lib.addons import network_status
 from scripts.lib.process import run
-from scripts.lib.tenants import _tenant_kubectl, configured_tenants, spike_tenant
+from scripts.lib.tenants import (
+    NOT_FOUND,
+    _tenant_kubectl,
+    configured_tenants,
+    spike_tenant,
+)
 from scripts.lib.tenants import (
     inspect_storage_volume,
     storage_record_path,
@@ -120,11 +125,19 @@ def _machine_layer_status(root: Path, config: dict[str, str], client, tenant):
     return layers
 
 
-def _storage_layer_status(root: Path, config: dict[str, str], tenant):
+def _storage_layer_status(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+    *,
+    strict: bool = False,
+):
     volume_name = storage_volume_name(config, tenant)
     try:
         payload = inspect_storage_volume(volume_name)
     except RuntimeError as exc:
+        if strict:
+            raise
         return {"ready": False, "reason": "inspection-failed", "message": str(exc)}
     if payload is None:
         return {"ready": False, "reason": "volume-missing"}
@@ -195,7 +208,13 @@ def _storage_layer_status(root: Path, config: dict[str, str], tenant):
     return result
 
 
-def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
+def _cnpg_layer_status(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+    *,
+    strict: bool = False,
+):
     cluster = _tenant_kubectl(
         root,
         config,
@@ -209,6 +228,10 @@ def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
         check=False,
     )
     if cluster.returncode != 0:
+        if strict and not NOT_FOUND.search(cluster.stderr):
+            raise RuntimeError(
+                f"tenant CNPG inspection failed: {tenant.name}: {cluster.stderr}"
+            )
         return {"ready": False, "reason": "cluster-missing"}
     cluster_payload = json.loads(cluster.stdout)
     pods = json.loads(
@@ -350,7 +373,59 @@ def _control_plane_layer_status(config: dict[str, str], client, tenant, cluster)
     }
 
 
-def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
+def collect_tenant_status(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+    cluster_payload: dict[str, object],
+    *,
+    strict: bool = False,
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "endpoint": f"{tenant.vip}:{config['SPIKE_API_PORT']}",
+        "domain": tenant.domain,
+        "database": tenant.cnpg_cluster,
+        "controlPlane": _control_plane_layer_status(
+            config, client, tenant, cluster_payload
+        ),
+        "network": network_status(
+            root, config, client, tenant, strict=strict
+        ),
+    }
+    try:
+        result["machines"] = _machine_layer_status(
+            root, config, client, tenant
+        )
+    except RuntimeError as exc:
+        if strict:
+            raise
+        result["machines"] = {"ready": False, "reason": str(exc)}
+    result["storage"] = _storage_layer_status(
+        root, config, tenant, strict=strict
+    )
+    result["cnpg"] = _cnpg_layer_status(
+        root, config, tenant, strict=strict
+    )
+    result["ready"] = all(
+        result[layer].get("ready")
+        for layer in (
+            "controlPlane",
+            "network",
+            "machines",
+            "storage",
+            "cnpg",
+        )
+    )
+    return result
+
+
+def collect_management_status(
+    root: Path,
+    config: dict[str, str],
+    *,
+    strict: bool = False,
+) -> dict[str, object]:
     management = management_status(root, config)
     host = {
         "maxUserInstances": read_inotify("max_user_instances"),
@@ -371,9 +446,78 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
     }
     if management.get("apiReady"):
         client = ManagementClient(root, config)
-        result["providers"] = provider_status(config, client)
-        result["components"] = management_component_status(config, client)
-        result["auxiliary"] = management_auxiliary_status(config, client)
+        result["providers"] = provider_status(
+            config, client, strict=strict
+        )
+        result["components"] = management_component_status(
+            config, client, strict=strict
+        )
+        result["auxiliary"] = management_auxiliary_status(
+            config, client, strict=strict
+        )
+        kamaji = client.kubectl(
+            "-n",
+            config["MANAGEMENT_NAMESPACE"],
+            "get",
+            "deployment/kamaji",
+            "-o",
+            "json",
+            check=False,
+        )
+        datastore = client.kubectl(
+            "get",
+            "datastore/default",
+            "-o",
+            "jsonpath={.status.ready}",
+            check=False,
+        )
+        for name, response in (
+            ("Kamaji deployment", kamaji),
+            ("Kamaji datastore", datastore),
+        ):
+            if (
+                strict
+                and response.returncode != 0
+                and not NOT_FOUND.search(response.stderr)
+            ):
+                raise RuntimeError(
+                    f"{name} inspection failed: {response.stderr}"
+                )
+        result["kamaji"] = {
+            "available": False,
+            "datastoreReady": datastore.returncode == 0 and datastore.stdout == "true",
+        }
+        if kamaji.returncode == 0:
+            payload = json.loads(kamaji.stdout)
+            result["kamaji"]["available"] = (
+                payload.get("spec", {}).get("replicas", 0)
+                == payload.get("status", {}).get("availableReplicas", 0)
+                > 0
+            )
+    return result
+
+
+def management_status_healthy(result: dict[str, object]) -> bool:
+    providers = result.get("providers") or []
+    components = result.get("components") or []
+    return bool(
+        result["management"].get("apiReady")
+        and result["host"].get("ready")
+        and result.get("kamaji", {}).get("available")
+        and result.get("kamaji", {}).get("datastoreReady")
+        and result.get("auxiliary", {}).get("ready")
+        and len(providers) == 4
+        and all(provider.get("available") for provider in providers)
+        and len(components) == 7
+        and all(component.get("available") for component in components)
+    )
+
+
+def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
+    result = collect_management_status(root, config)
+    management = result["management"]
+    if management.get("apiReady"):
+        client = ManagementClient(root, config)
         spike = spike_tenant(root, config)
         spike_cluster = client.kubectl(
             "-n",
@@ -434,34 +578,13 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
                 continue
             configured_cluster_present = True
             cluster_payload = json.loads(cluster.stdout)
-            tenant_status = {
-                "endpoint": f"{tenant.vip}:{config['SPIKE_API_PORT']}",
-                "domain": tenant.domain,
-                "database": tenant.cnpg_cluster,
-                "controlPlane": _control_plane_layer_status(
-                    config, client, tenant, cluster_payload
-                ),
-                "network": network_status(root, config, client, tenant),
-            }
-            try:
-                tenant_status["machines"] = _machine_layer_status(
-                    root, config, client, tenant
-                )
-            except RuntimeError as exc:
-                tenant_status["machines"] = {"ready": False, "reason": str(exc)}
-            tenant_status["storage"] = _storage_layer_status(root, config, tenant)
-            tenant_status["cnpg"] = _cnpg_layer_status(root, config, tenant)
-            tenant_status["ready"] = all(
-                tenant_status[layer].get("ready")
-                for layer in (
-                    "controlPlane",
-                    "network",
-                    "machines",
-                    "storage",
-                    "cnpg",
-                )
+            result["tenants"][tenant.name] = collect_tenant_status(
+                root,
+                config,
+                client,
+                tenant,
+                cluster_payload,
             )
-            result["tenants"][tenant.name] = tenant_status
         result["tenantModeExpected"] = (
             configured_cluster_present
             or (root / ".runtime" / "evidence" / "create-success.json").is_file()
@@ -471,49 +594,12 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
             "storage": "distinct Docker volumes",
             "kernel": "shared host kernel",
         }
-        kamaji = client.kubectl(
-            "-n",
-            config["MANAGEMENT_NAMESPACE"],
-            "get",
-            "deployment/kamaji",
-            "-o",
-            "json",
-            check=False,
-        )
-        datastore = client.kubectl(
-            "get",
-            "datastore/default",
-            "-o",
-            "jsonpath={.status.ready}",
-            check=False,
-        )
-        result["kamaji"] = {
-            "available": False,
-            "datastoreReady": datastore.returncode == 0 and datastore.stdout == "true",
-        }
-        if kamaji.returncode == 0:
-            payload = json.loads(kamaji.stdout)
-            result["kamaji"]["available"] = (
-                payload.get("spec", {}).get("replicas", 0)
-                == payload.get("status", {}).get("availableReplicas", 0)
-                > 0
-            )
     return result
 
 
 def status_healthy(result: dict[str, object]) -> bool:
-    providers = result.get("providers") or []
-    components = result.get("components") or []
     return bool(
-        result["management"].get("apiReady")
-        and result["host"].get("ready")
-        and result.get("kamaji", {}).get("available")
-        and result.get("kamaji", {}).get("datastoreReady")
-        and result.get("auxiliary", {}).get("ready")
-        and len(providers) == 4
-        and all(provider.get("available") for provider in providers)
-        and len(components) == 7
-        and all(component.get("available") for component in components)
+        management_status_healthy(result)
         and (
             "spikeNetwork" not in result
             or result["spikeNetwork"].get("ready")

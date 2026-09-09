@@ -133,10 +133,20 @@ tenant isolation.
 
 A separate retained-management development mode binds the current management
 identity to the user, repository root, branch and revision, configuration,
-host, and Docker daemon. It may recreate tenant A repeatedly, but it rejects
-partial or incompatible state and never replaces the final clean-to-clean
-gate. Its cleanup uses the same authoritative destroy and host restoration
-path.
+host, and Docker daemon. `dev-up` validates that binding, immutable inputs,
+host/runtime preflight, management readiness and compatibility, and tenant-A
+health before choosing a path. A fully healthy tenant must retain its recorded
+management-resource, worker, runtime, storage, database, and kubeconfig
+identity; the health check then returns without reconciliation. If management
+is healthy but tenant A is canonically absent or provably owned and
+repairable, only tenant A is reconciled. Missing health evidence or unhealthy
+management uses full reconciliation once, while stale, foreign, unsafe,
+partial, and non-authoritative inspection results remain failures.
+
+Active network and SQL-marker checks may create uniquely named transient pods.
+Both paths delete the exact probe and confirm its absence before returning.
+The retained mode never replaces the final clean-to-clean gate, and cleanup
+uses the same authoritative destroy and host restoration path.
 
 ## Networking and ClusterResourceSet handoff
 

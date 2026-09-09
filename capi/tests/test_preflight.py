@@ -6,7 +6,13 @@ from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from scripts.preflight import PreflightError, configured_networks, verify_images, verify_management_name
+from scripts.preflight import (
+    PreflightError,
+    configured_networks,
+    run_retained_preflight,
+    verify_images,
+    verify_management_name,
+)
 from scripts.preflight import verify_privileged_probe
 from scripts.lib.process import CommandError
 
@@ -24,6 +30,71 @@ BASE = {
 
 
 class PreflightTests(unittest.TestCase):
+    def test_retained_preflight_verifies_without_install_or_overlap(self) -> None:
+        calls: list[str] = []
+        with (
+            patch(
+                "scripts.preflight.parse_duration", return_value=30
+            ),
+            patch(
+                "scripts.preflight.verify_cache",
+                side_effect=lambda *_: calls.append("cache") or object(),
+            ),
+            patch(
+                "scripts.preflight.verify_all_inputs",
+                side_effect=lambda *_: calls.append("inputs"),
+            ),
+            patch(
+                "scripts.preflight.verify_tools",
+                side_effect=lambda *_: calls.append("tools"),
+            ),
+            patch(
+                "scripts.preflight.configured_networks",
+                side_effect=lambda *_: calls.append("networks"),
+            ),
+            patch(
+                "scripts.preflight.verify_docker",
+                side_effect=lambda *_: calls.append("docker"),
+            ),
+            patch(
+                "scripts.preflight.verify_management_name",
+                side_effect=lambda *_: calls.append("management"),
+            ),
+            patch(
+                "scripts.preflight.verify_inotify",
+                side_effect=lambda *_: calls.append("inotify"),
+            ),
+            patch(
+                "scripts.preflight.verify_images",
+                side_effect=lambda *_: calls.append("images"),
+            ),
+            patch(
+                "scripts.preflight.verify_privileged_probe",
+                side_effect=lambda *_: calls.append("probe"),
+            ),
+            patch("scripts.preflight.prepare_tools") as prepare,
+            patch("scripts.preflight.verify_no_network_overlap") as overlap,
+        ):
+            run_retained_preflight(
+                Path("/tmp/example"), {"COMMAND_TIMEOUT": "30s"}
+            )
+        self.assertEqual(
+            calls,
+            [
+                "cache",
+                "inputs",
+                "tools",
+                "networks",
+                "docker",
+                "management",
+                "inotify",
+                "images",
+                "probe",
+            ],
+        )
+        prepare.assert_not_called()
+        overlap.assert_not_called()
+
     def test_image_verification_is_local_cache_only(self) -> None:
         with patch("scripts.preflight.verify_cache") as verify:
             verify_images(Path("/tmp/example"), {"TEST": "value"})

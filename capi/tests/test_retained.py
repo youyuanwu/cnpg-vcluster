@@ -3,18 +3,25 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from scripts.retained import (
     _delete_representative_tenant,
+    _tenant_is_healthy,
     dev_bootstrap,
     dev_clean,
+    dev_up_evidence_path,
     dev_test,
     dev_tenant,
     dev_up,
+    load_dev_up_evidence,
     retained_path,
     validate_retained_state,
+    write_dev_up_evidence,
 )
 
 
@@ -91,20 +98,450 @@ class RetainedTests(unittest.TestCase):
             dev_tenant(Path("."), {})
         self.assertEqual(calls, ["validate", "inputs", "delete", "recreate", "state"])
 
-    def test_dev_up_reconciles_without_deleting_tenant(self) -> None:
+    def test_dev_up_bootstraps_when_retained_state_is_missing(self) -> None:
         calls: list[str] = []
-        tenant = type("Tenant", (), {"name": "tenant-a"})()
-        with (
-            patch("scripts.retained.dev_bootstrap", side_effect=lambda *_: calls.append("bootstrap")),
-            patch("scripts.retained.ManagementClient", return_value=object()),
-            patch("scripts.retained.validate_create_inputs", return_value=[tenant]),
-            patch("scripts.retained.reconcile_tenant", side_effect=lambda *_: calls.append("reconcile")),
-            patch("scripts.retained.write_retained_state", side_effect=lambda *_: calls.append("state")),
-        ):
-            dev_up(Path("."), {})
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch(
+                    "scripts.retained.dev_bootstrap",
+                    side_effect=lambda *_: calls.append("bootstrap"),
+                ),
+                patch("scripts.retained.ManagementClient", return_value=object()),
+                patch(
+                    "scripts.retained.validate_create_inputs",
+                    return_value=[tenant],
+                ),
+                patch(
+                    "scripts.retained.reconcile_tenant",
+                    side_effect=lambda *_: calls.append("reconcile") or {"uid": "a"},
+                ),
+                patch(
+                    "scripts.retained.write_dev_up_evidence",
+                    side_effect=lambda *_: calls.append("evidence"),
+                ),
+                patch(
+                    "scripts.retained.write_retained_state",
+                    side_effect=lambda *_: calls.append("state"),
+                ),
+            ):
+                dev_up(Path(temporary), {})
         self.assertEqual(
-            calls, ["bootstrap", "reconcile", "state"]
+            calls, ["bootstrap", "reconcile", "evidence", "state"]
         )
+
+    def test_dev_up_exits_without_reconciliation_when_fully_healthy(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = retained_path(root)
+            state.parent.mkdir(parents=True)
+            state.write_text("{}")
+            evidence = dev_up_evidence_path(root)
+            evidence.parent.mkdir(parents=True)
+            evidence.write_text("{}")
+            with (
+                patch("scripts.retained.validate_retained_state"),
+                patch("scripts.retained.run_retained_preflight"),
+                patch("scripts.retained.validate_inotify_state"),
+                patch(
+                    "scripts.retained.validate_create_inputs",
+                    return_value=[tenant],
+                ),
+                patch("scripts.retained.ManagementClient", return_value=object()),
+                patch(
+                    "scripts.retained.load_dev_up_evidence",
+                    return_value={"uid": "a"},
+                ),
+                patch("scripts.retained._management_is_healthy", return_value=True),
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    return_value={"cluster": {"metadata": {"uid": "cluster"}}},
+                ),
+                patch("scripts.retained._tenant_is_healthy", return_value=True),
+                patch("scripts.retained._reconcile_dev_up") as reconcile,
+                patch("scripts.retained._delete_representative_tenant") as delete,
+            ):
+                dev_up(root, {})
+            reconcile.assert_not_called()
+            delete.assert_not_called()
+
+    def test_dev_up_runs_full_reconcile_when_evidence_is_missing(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            state = retained_path(root)
+            state.parent.mkdir(parents=True)
+            state.write_text("{}")
+            with (
+                patch("scripts.retained.validate_retained_state"),
+                patch("scripts.retained.run_retained_preflight"),
+                patch("scripts.retained.validate_inotify_state"),
+                patch(
+                    "scripts.retained.validate_create_inputs",
+                    return_value=[tenant],
+                ),
+                patch("scripts.retained.ManagementClient", return_value=object()),
+                patch("scripts.retained._reconcile_dev_up") as reconcile,
+                patch("scripts.retained._management_is_healthy") as healthy,
+            ):
+                dev_up(root, {})
+            reconcile.assert_called_once()
+            self.assertTrue(reconcile.call_args.kwargs["include_management"])
+            healthy.assert_not_called()
+
+    def test_dev_up_reconciles_only_tenant_when_management_is_healthy(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (retained_path(root), dev_up_evidence_path(root)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}")
+            with (
+                patch("scripts.retained.validate_retained_state"),
+                patch("scripts.retained.run_retained_preflight"),
+                patch("scripts.retained.validate_inotify_state"),
+                patch(
+                    "scripts.retained.validate_create_inputs",
+                    return_value=[tenant],
+                ),
+                patch("scripts.retained.ManagementClient", return_value=object()),
+                patch(
+                    "scripts.retained.load_dev_up_evidence",
+                    return_value={"uid": "a"},
+                ),
+                patch("scripts.retained._management_is_healthy", return_value=True),
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    return_value={"cluster": {"metadata": {"uid": "cluster"}}},
+                ),
+                patch("scripts.retained._tenant_is_healthy", return_value=False),
+                patch("scripts.retained._reconcile_dev_up") as reconcile,
+            ):
+                dev_up(root, {})
+            reconcile.assert_called_once()
+            self.assertFalse(reconcile.call_args.kwargs["include_management"])
+
+    def test_dev_up_reconciles_management_when_health_is_incomplete(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (retained_path(root), dev_up_evidence_path(root)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}")
+            with (
+                patch("scripts.retained.validate_retained_state"),
+                patch("scripts.retained.run_retained_preflight"),
+                patch("scripts.retained.validate_inotify_state"),
+                patch(
+                    "scripts.retained.validate_create_inputs",
+                    return_value=[tenant],
+                ),
+                patch("scripts.retained.ManagementClient", return_value=object()),
+                patch(
+                    "scripts.retained.load_dev_up_evidence",
+                    return_value={"uid": "a"},
+                ),
+                patch("scripts.retained._management_is_healthy", return_value=False),
+                patch("scripts.retained._reconcile_dev_up") as reconcile,
+            ):
+                dev_up(root, {})
+            reconcile.assert_called_once()
+            self.assertTrue(reconcile.call_args.kwargs["include_management"])
+
+    def test_dev_up_canonical_absence_uses_tenant_only_reconciliation(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (retained_path(root), dev_up_evidence_path(root)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}")
+            with (
+                patch("scripts.retained.validate_retained_state"),
+                patch("scripts.retained.run_retained_preflight"),
+                patch("scripts.retained.validate_inotify_state"),
+                patch(
+                    "scripts.retained.validate_create_inputs",
+                    return_value=[tenant],
+                ),
+                patch("scripts.retained.ManagementClient", return_value=object()),
+                patch(
+                    "scripts.retained.load_dev_up_evidence",
+                    return_value={"uid": "a"},
+                ),
+                patch("scripts.retained._management_is_healthy", return_value=True),
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    return_value={"cluster": None},
+                ),
+                patch(
+                    "scripts.retained._delete_representative_tenant"
+                ) as delete,
+                patch("scripts.retained._reconcile_dev_up") as reconcile,
+            ):
+                dev_up(root, {})
+            delete.assert_called_once()
+            reconcile.assert_called_once()
+            self.assertFalse(reconcile.call_args.kwargs["include_management"])
+
+    def test_dev_up_resumes_valid_live_cluster_deletion_journal(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (
+                retained_path(root),
+                dev_up_evidence_path(root),
+                root / ".runtime/deletions/tenant-a.json",
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}")
+            with (
+                patch("scripts.retained.validate_retained_state"),
+                patch("scripts.retained.run_retained_preflight"),
+                patch("scripts.retained.validate_inotify_state"),
+                patch(
+                    "scripts.retained.validate_create_inputs",
+                    return_value=[tenant],
+                ),
+                patch("scripts.retained.ManagementClient", return_value=object()),
+                patch(
+                    "scripts.retained.load_dev_up_evidence",
+                    return_value={"uid": "a"},
+                ),
+                patch("scripts.retained._management_is_healthy", return_value=True),
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    return_value={"cluster": {"metadata": {"uid": "cluster"}}},
+                ),
+                patch("scripts.retained._tenant_is_healthy") as healthy,
+                patch(
+                    "scripts.retained._delete_representative_tenant"
+                ) as delete,
+                patch("scripts.retained._reconcile_dev_up") as reconcile,
+            ):
+                dev_up(root, {})
+            healthy.assert_not_called()
+            delete.assert_called_once()
+            reconcile.assert_called_once()
+            self.assertFalse(reconcile.call_args.kwargs["include_management"])
+
+    def test_dev_up_propagates_authoritative_inspection_failure(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (retained_path(root), dev_up_evidence_path(root)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}")
+            with (
+                patch("scripts.retained.validate_retained_state"),
+                patch("scripts.retained.run_retained_preflight"),
+                patch("scripts.retained.validate_inotify_state"),
+                patch(
+                    "scripts.retained.validate_create_inputs",
+                    return_value=[tenant],
+                ),
+                patch("scripts.retained.ManagementClient", return_value=object()),
+                patch(
+                    "scripts.retained.load_dev_up_evidence",
+                    return_value={"uid": "a"},
+                ),
+                patch("scripts.retained._management_is_healthy", return_value=True),
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    side_effect=RuntimeError("management API connection refused"),
+                ),
+                patch("scripts.retained._reconcile_dev_up") as reconcile,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "connection refused"):
+                    dev_up(root, {})
+            reconcile.assert_not_called()
+
+    def test_dev_up_emits_machine_readable_healthy_timing(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for path in (retained_path(root), dev_up_evidence_path(root)):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}")
+            output = StringIO()
+            with (
+                patch("scripts.retained.validate_retained_state"),
+                patch("scripts.retained.run_retained_preflight"),
+                patch("scripts.retained.validate_inotify_state"),
+                patch(
+                    "scripts.retained.validate_create_inputs",
+                    return_value=[tenant],
+                ),
+                patch("scripts.retained.ManagementClient", return_value=object()),
+                patch(
+                    "scripts.retained.load_dev_up_evidence",
+                    return_value={"uid": "a"},
+                ),
+                patch("scripts.retained._management_is_healthy", return_value=True),
+                patch(
+                    "scripts.retained.verify_tenant_management_ownership",
+                    return_value={"cluster": {"metadata": {"uid": "cluster"}}},
+                ),
+                patch("scripts.retained._tenant_is_healthy", return_value=True),
+                redirect_stdout(output),
+            ):
+                dev_up(root, {})
+        record = next(
+            json.loads(line.removeprefix("CAPI_DEV_UP "))
+            for line in output.getvalue().splitlines()
+            if line.startswith("CAPI_DEV_UP ")
+        )
+        self.assertEqual(record["path"], "healthy")
+        self.assertEqual(record["schema"], 1)
+        self.assertEqual(record["status"], "passed")
+
+    def test_dev_up_evidence_is_owner_only_and_exact(self) -> None:
+        tenant = SimpleNamespace(
+            name="tenant-a",
+            namespace="tenant-a",
+            vip="172.18.0.10",
+            pod_cidr="10.70.0.0/16",
+            service_cidr="10.140.0.0/16",
+            domain="tenant-a.test",
+            cnpg_cluster="tenant-a-db",
+        )
+        config = {
+            "TENANT_COMPATIBILITY_REVISION": "tenant-v1",
+            "CNPG_COMPATIBILITY_REVISION": "cnpg-v1",
+            "SPIKE_API_PORT": "6443",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            write_dev_up_evidence(root, config, tenant, {"uid": "a"})
+            path = dev_up_evidence_path(root)
+            self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(
+                load_dev_up_evidence(root, config, tenant), {"uid": "a"}
+            )
+            payload = json.loads(path.read_text())
+            payload["tenant"]["domain"] = "foreign.test"
+            path.write_text(json.dumps(payload))
+            path.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                load_dev_up_evidence(root, config, tenant)
+
+    def test_tenant_health_preserves_identity_around_all_suites(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        identity = {"resources": {"cluster": "uid"}}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kubeconfig = root / "kubeconfig"
+            kubeconfig.write_text("config")
+            with (
+                patch(
+                    "scripts.retained.tenant_kubeconfig_path",
+                    return_value=kubeconfig,
+                ),
+                patch("scripts.retained.validate_tenant_kubeconfig_file"),
+                patch("scripts.retained.verify_addon_source_ownership"),
+                patch(
+                    "scripts.retained.stable_tenant_snapshot",
+                    side_effect=[identity, identity],
+                ),
+                patch(
+                    "scripts.retained.collect_tenant_status",
+                    return_value={"ready": True},
+                ),
+                patch("scripts.retained._dev_test_endpoint") as endpoint,
+                patch("scripts.retained._dev_test_network") as network,
+                patch("scripts.retained._dev_test_storage") as storage,
+                patch("scripts.retained._cnpg_ready", return_value=True),
+                patch(
+                    "scripts.retained.verify_retained_marker"
+                ) as database,
+            ):
+                self.assertTrue(
+                    _tenant_is_healthy(
+                        root,
+                        {},
+                        object(),
+                        tenant,
+                        {"metadata": {"uid": "cluster"}},
+                        identity,
+                    )
+                )
+            for suite in (endpoint, network, storage, database):
+                suite.assert_called_once()
+
+    def test_tenant_health_rejects_complete_identity_mismatch(self) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kubeconfig = root / "kubeconfig"
+            kubeconfig.write_text("config")
+            with (
+                patch(
+                    "scripts.retained.tenant_kubeconfig_path",
+                    return_value=kubeconfig,
+                ),
+                patch("scripts.retained.validate_tenant_kubeconfig_file"),
+                patch("scripts.retained.verify_addon_source_ownership"),
+                patch(
+                    "scripts.retained.stable_tenant_snapshot",
+                    return_value={"uid": "foreign"},
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "incompatible"):
+                    _tenant_is_healthy(
+                        root,
+                        {},
+                        object(),
+                        tenant,
+                        {"metadata": {"uid": "cluster"}},
+                        {"uid": "expected"},
+                    )
+
+    def test_tenant_health_treats_missing_owned_addon_sources_as_repairable(
+        self,
+    ) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        identity = {"uid": "expected"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kubeconfig = root / "kubeconfig"
+            kubeconfig.write_text("config")
+            with (
+                patch(
+                    "scripts.retained.tenant_kubeconfig_path",
+                    return_value=kubeconfig,
+                ),
+                patch("scripts.retained.validate_tenant_kubeconfig_file"),
+                patch(
+                    "scripts.retained.verify_addon_source_ownership",
+                    side_effect=[
+                        None,
+                        RuntimeError(
+                            "tenant add-on sources are missing: configmap/source"
+                        ),
+                    ],
+                ),
+                patch(
+                    "scripts.retained.stable_tenant_snapshot",
+                    return_value=identity,
+                ),
+                patch(
+                    "scripts.retained.collect_tenant_status",
+                    return_value={"ready": True},
+                ),
+                patch("scripts.retained._dev_test_endpoint"),
+                patch("scripts.retained._dev_test_machines"),
+                patch("scripts.retained._dev_test_storage"),
+            ):
+                self.assertFalse(
+                    _tenant_is_healthy(
+                        root,
+                        {},
+                        object(),
+                        tenant,
+                        {"metadata": {"uid": "cluster"}},
+                        identity,
+                    )
+                )
 
     def test_dev_test_runs_selected_suite_without_reconciliation(self) -> None:
         tenant = type("Tenant", (), {"name": "tenant-a"})()

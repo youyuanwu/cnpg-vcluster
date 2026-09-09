@@ -7,6 +7,7 @@ from pathlib import Path
 from .files import IntegrityError
 from .kube import ManagementClient
 from .rendering import render_release_manifest
+from .tenants import NOT_FOUND
 
 
 @dataclass(frozen=True)
@@ -311,7 +312,12 @@ def reconcile_providers(root: Path, config: dict[str, str], client: ManagementCl
     _verify_kamaji_provider_flags(client, config)
 
 
-def provider_status(config: dict[str, str], client: ManagementClient) -> list[dict[str, object]]:
+def provider_status(
+    config: dict[str, str],
+    client: ManagementClient,
+    *,
+    strict: bool = False,
+) -> list[dict[str, object]]:
     result: list[dict[str, object]] = []
     for provider in PROVIDERS:
         namespace = config[provider.namespace]
@@ -325,6 +331,11 @@ def provider_status(config: dict[str, str], client: ManagementClient) -> list[di
             check=False,
         )
         if response.returncode != 0:
+            if strict and not NOT_FOUND.search(response.stderr):
+                raise RuntimeError(
+                    f"provider inspection failed: {provider.name}: "
+                    f"{response.stderr}"
+                )
             result.append(
                 {
                     "name": provider.name,
@@ -352,6 +363,11 @@ def provider_status(config: dict[str, str], client: ManagementClient) -> list[di
                 check=False,
             )
             if crd_response.returncode != 0:
+                if strict and not NOT_FOUND.search(crd_response.stderr):
+                    raise RuntimeError(
+                        f"provider CRD inspection failed: {crd_name}: "
+                        f"{crd_response.stderr}"
+                    )
                 crds_ready = False
                 crd_details.append({"name": crd_name, "ready": False})
                 continue
@@ -391,6 +407,15 @@ def provider_status(config: dict[str, str], client: ManagementClient) -> list[di
                 "jsonpath={.subsets[0].addresses[0].ip}",
                 check=False,
             )
+            if (
+                strict
+                and endpoint.returncode != 0
+                and not NOT_FOUND.search(endpoint.stderr)
+            ):
+                raise RuntimeError(
+                    f"provider webhook inspection failed: {provider.name}: "
+                    f"{endpoint.stderr}"
+                )
             webhook_ready = endpoint.returncode == 0 and bool(endpoint.stdout)
         if provider.name == "kamaji-control-plane":
             arguments = payload["spec"]["template"]["spec"]["containers"][0].get(
