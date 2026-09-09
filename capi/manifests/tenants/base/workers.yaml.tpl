@@ -29,6 +29,9 @@ spec:
           customImage: ${KIND_NODE_IMAGE}
           bootstrapTimeout: 5m
           extraMounts:
+            - hostPath: ${IMAGE_CACHE_HOST_PATH}
+              containerPath: ${IMAGE_CACHE_CONTAINER_PATH}
+              readOnly: true
             - hostPath: ${STORAGE_HOST_PATH}
               containerPath: ${STORAGE_CONTAINER_PATH}
               readOnly: false

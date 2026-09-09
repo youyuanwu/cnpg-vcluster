@@ -3,6 +3,8 @@ from __future__ import annotations
 import os
 import re
 import shutil
+import stat
+import hashlib
 import tarfile
 import tempfile
 import urllib.error
@@ -13,7 +15,7 @@ from scripts.lib.config import parse_duration, require
 from scripts.lib.files import (
     IntegrityError,
     ensure_private_dir,
-    has_owner_only_permissions,
+    private_directory,
     verify_sha256,
     write_private_file,
 )
@@ -182,17 +184,22 @@ def _verify_tag(repository: str, tag: str, expected_commit: str, timeout: int) -
         )
 
 
-def _verify_metadata(path: Path, minor: str, contract: str) -> None:
-    text = path.read_text(encoding="utf-8")
+def _verify_metadata_text(text: str, display: str, minor: str, contract: str) -> None:
     pattern = re.compile(
         rf"(?m)^\s*-\s+major:\s+[01]\s*$\n\s+minor:\s+{re.escape(minor)}\s*$\n\s+contract:\s+{re.escape(contract)}\s*$"
     )
     if not pattern.search(text):
-        raise IntegrityError(f"{path} does not advertise minor {minor} contract {contract}")
+        raise IntegrityError(
+            f"{display} does not advertise minor {minor} contract {contract}"
+        )
 
 
-def _yaml_document(path: Path, resource_name: str) -> str:
-    documents = re.split(r"(?m)^---\s*$", path.read_text(encoding="utf-8"))
+def _verify_metadata(path: Path, minor: str, contract: str) -> None:
+    _verify_metadata_text(path.read_text(encoding="utf-8"), str(path), minor, contract)
+
+
+def _yaml_document_text(text: str, display: str, resource_name: str) -> str:
+    documents = re.split(r"(?m)^---\s*$", text)
     matches = [
         document
         for document in documents
@@ -200,9 +207,15 @@ def _yaml_document(path: Path, resource_name: str) -> str:
     ]
     if len(matches) != 1:
         raise IntegrityError(
-            f"{path} contains {len(matches)} documents named {resource_name}, expected one"
+            f"{display} contains {len(matches)} documents named {resource_name}, expected one"
         )
     return matches[0]
+
+
+def _yaml_document(path: Path, resource_name: str) -> str:
+    return _yaml_document_text(
+        path.read_text(encoding="utf-8"), str(path), resource_name
+    )
 
 
 def _verify_crd(
@@ -212,7 +225,24 @@ def _verify_crd(
     *,
     conversion: str | None,
 ) -> str:
-    document = _yaml_document(path, resource_name)
+    return _verify_crd_text(
+        path.read_text(encoding="utf-8"),
+        str(path),
+        resource_name,
+        storage_version,
+        conversion=conversion,
+    )
+
+
+def _verify_crd_text(
+    text: str,
+    display: str,
+    resource_name: str,
+    storage_version: str,
+    *,
+    conversion: str | None,
+) -> str:
+    document = _yaml_document_text(text, display, resource_name)
     if "kind: CustomResourceDefinition" not in document:
         raise IntegrityError(f"{resource_name} is not a CustomResourceDefinition")
     lines = document.splitlines()
@@ -257,15 +287,17 @@ def _verify_crd(
     return document
 
 
-def _verify_provider_schemas(inputs_dir: Path) -> None:
-    _verify_crd(
-        inputs_dir / "capi-core-components.yaml",
+def _verify_provider_schema_contents(contents: dict[str, bytes]) -> None:
+    _verify_crd_text(
+        contents["capi-core-components.yaml"].decode(),
+        "capi-core-components.yaml",
         "clusters.cluster.x-k8s.io",
         "v1beta2",
         conversion="Webhook",
     )
-    _verify_crd(
-        inputs_dir / "capi-bootstrap-components.yaml",
+    _verify_crd_text(
+        contents["capi-bootstrap-components.yaml"].decode(),
+        "capi-bootstrap-components.yaml",
         "kubeadmconfigs.bootstrap.cluster.x-k8s.io",
         "v1beta2",
         conversion="Webhook",
@@ -274,14 +306,16 @@ def _verify_provider_schemas(inputs_dir: Path) -> None:
         "devclusters.infrastructure.cluster.x-k8s.io",
         "devmachines.infrastructure.cluster.x-k8s.io",
     ):
-        _verify_crd(
-            inputs_dir / "capd-components.yaml",
+        _verify_crd_text(
+            contents["capd-components.yaml"].decode(),
+            "capd-components.yaml",
             resource_name,
             "v1beta2",
             conversion="Webhook",
         )
-    kamaji = _verify_crd(
-        inputs_dir / "kamaji-capi-components.yaml",
+    kamaji = _verify_crd_text(
+        contents["kamaji-capi-components.yaml"].decode(),
+        "kamaji-capi-components.yaml",
         "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
         "v1alpha2",
         conversion=None,
@@ -299,7 +333,7 @@ def _verify_provider_schemas(inputs_dir: Path) -> None:
     ):
         if marker not in kamaji:
             raise IntegrityError(f"KamajiControlPlane CRD is missing {marker!r}")
-    components = (inputs_dir / "kamaji-capi-components.yaml").read_text(encoding="utf-8")
+    components = contents["kamaji-capi-components.yaml"].decode()
     for marker in ("kamaji.clastix.io", "tenantcontrolplanes"):
         if marker not in components:
             raise IntegrityError(f"Kamaji provider components are missing {marker!r}")
@@ -344,44 +378,140 @@ def _ensure_cert_manager_chart(
     return destination
 
 
-def verify_all_inputs(root: Path, config: dict[str, str]) -> None:
-    inputs_dir = root / ".tools" / "inputs"
+def _verify_private_input(path: Path, expected_sha256: str | None = None) -> bytes:
+    with private_directory(path.parent) as parent_fd:
+        try:
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except FileNotFoundError as exc:
+            raise IntegrityError(f"required verified input is missing: {path}") from exc
+        except OSError as exc:
+            raise IntegrityError(
+                f"unable to open verified input without following links: {path}: {exc}"
+            ) from exc
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.getuid()
+                or details.st_mode & 0o077
+            ):
+                raise IntegrityError(
+                    f"verified input is not an owner-only regular file: {path}"
+                )
+            chunks = []
+            while True:
+                chunk = os.read(descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+            data = b"".join(chunks)
+        finally:
+            os.close(descriptor)
+    if (
+        expected_sha256 is not None
+        and hashlib.sha256(data).hexdigest() != expected_sha256
+    ):
+        raise IntegrityError(f"SHA-256 mismatch for {path}")
+    return data
+
+
+def verify_all_inputs(
+    root: Path,
+    config: dict[str, str],
+    inputs_dir: Path | None = None,
+) -> None:
+    inputs_dir = inputs_dir or root / ".tools" / "inputs"
+    contents: dict[str, bytes] = {}
     for filename, _, sha_key in DOWNLOADS:
-        verify_sha256(inputs_dir / filename, config[sha_key])
-    verify_sha256(
-        inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.tgz",
+        contents[filename] = _verify_private_input(
+            inputs_dir / filename, config[sha_key]
+        )
+    chart_path = inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.tgz"
+    contents[chart_path.name] = _verify_private_input(
+        chart_path,
         config["CERT_MANAGER_CHART_SHA256"],
     )
     digest_path = inputs_dir / f"cert-manager-{config['CERT_MANAGER_VERSION']}.digest"
-    if not digest_path.is_file():
-        raise IntegrityError("cert-manager OCI descriptor record is missing")
-    if digest_path.read_text(encoding="utf-8").strip() != config["CERT_MANAGER_OCI_DIGEST"]:
+    digest_data = _verify_private_input(digest_path)
+    contents[digest_path.name] = digest_data
+    if digest_data.decode().strip() != config["CERT_MANAGER_OCI_DIGEST"]:
         raise IntegrityError("cert-manager OCI descriptor record does not match")
-    if not has_owner_only_permissions(digest_path):
-        raise IntegrityError("cert-manager OCI descriptor record is not owner-only")
 
-    _verify_metadata(
-        inputs_dir / "capi-metadata.yaml",
+    _verify_metadata_text(
+        contents["capi-metadata.yaml"].decode(),
+        "capi-metadata.yaml",
         config["CAPI_VERSION"].removeprefix("v").split(".")[1],
         config["CAPI_CONTRACT"],
     )
-    _verify_metadata(
-        inputs_dir / "kamaji-capi-metadata.yaml",
+    _verify_metadata_text(
+        contents["kamaji-capi-metadata.yaml"].decode(),
+        "kamaji-capi-metadata.yaml",
         config["KAMAJI_CAPI_VERSION"].removeprefix("v").split(".")[1],
         config["KAMAJI_CAPI_CONTRACT"],
     )
     for filename, image_key in EXPECTED_MANIFEST_IMAGES.items():
-        text = (inputs_dir / filename).read_text(encoding="utf-8")
+        text = contents[filename].decode()
         if text.count(config[image_key]) != 1:
             raise IntegrityError(
                 f"{filename} does not contain exactly one {config[image_key]} image"
             )
-    _verify_provider_schemas(inputs_dir)
+    _verify_provider_schema_contents(contents)
     for relative, checksum_key in AUTHORED_INPUTS:
         verify_sha256(root / relative, config[checksum_key])
 
 
+def _install_binaries(
+    root: Path,
+    config: dict[str, str],
+    *,
+    inputs_dir: Path | None = None,
+    bin_dir: Path | None = None,
+) -> None:
+    inputs_dir = inputs_dir or root / ".tools" / "inputs"
+    bin_dir = bin_dir or root / ".tools" / "bin"
+    ensure_private_dir(inputs_dir)
+    ensure_private_dir(bin_dir)
+    downloaded = {filename: inputs_dir / filename for filename, _, _ in DOWNLOADS}
+    _install_copy(downloaded["kind-linux-amd64"], bin_dir / "kind")
+    _install_copy(downloaded["kubectl-linux-amd64"], bin_dir / "kubectl")
+    _install_copy(downloaded["clusterctl-linux-amd64"], bin_dir / "clusterctl")
+    _install_helm(
+        downloaded["helm-linux-amd64.tar.gz"],
+        bin_dir / "helm",
+        config["HELM_BINARY_SHA256"],
+    )
+
+
+def _install_tools(
+    root: Path,
+    config: dict[str, str],
+    *,
+    inputs_dir: Path | None = None,
+    bin_dir: Path | None = None,
+) -> None:
+    verify_all_inputs(root, config, inputs_dir)
+    _install_binaries(root, config, inputs_dir=inputs_dir, bin_dir=bin_dir)
+
+
 def prepare_tools(root: Path, config: dict[str, str]) -> None:
+    from scripts.cache import materialize_inputs, verify_cache
+
+    verify_cache(root, config)
+    materialize_inputs(root, config)
+    _install_tools(root, config)
+    print(f"verified local tools, inputs, and cache under {root / '.tools'}")
+
+
+def acquire_tools(
+    root: Path,
+    config: dict[str, str],
+    *,
+    tools_dir: Path | None = None,
+) -> None:
     require(
         config,
         "DOWNLOAD_TIMEOUT",
@@ -391,7 +521,7 @@ def prepare_tools(root: Path, config: dict[str, str]) -> None:
         "CERT_MANAGER_CHART_SHA256",
     )
     timeout = parse_duration(config["DOWNLOAD_TIMEOUT"])
-    tools_dir = root / ".tools"
+    tools_dir = tools_dir or root / ".tools"
     inputs_dir = tools_dir / "inputs"
     bin_dir = tools_dir / "bin"
     ensure_private_dir(inputs_dir)
@@ -407,14 +537,7 @@ def prepare_tools(root: Path, config: dict[str, str]) -> None:
             timeout,
         )
 
-    _install_copy(downloaded["kind-linux-amd64"], bin_dir / "kind")
-    _install_copy(downloaded["kubectl-linux-amd64"], bin_dir / "kubectl")
-    _install_copy(downloaded["clusterctl-linux-amd64"], bin_dir / "clusterctl")
-    _install_helm(
-        downloaded["helm-linux-amd64.tar.gz"],
-        bin_dir / "helm",
-        config["HELM_BINARY_SHA256"],
-    )
+    _install_binaries(root, config, inputs_dir=inputs_dir, bin_dir=bin_dir)
     _ensure_cert_manager_chart(config, inputs_dir, bin_dir, timeout)
     allowed_inputs = {
         filename for filename, _, _ in DOWNLOADS
@@ -433,5 +556,5 @@ def prepare_tools(root: Path, config: dict[str, str]) -> None:
         tag = config[version_key]
         _verify_tag(repository, tag, config[commit_key], timeout)
 
-    verify_all_inputs(root, config)
-    print(f"prepared verified tools and inputs under {tools_dir}")
+    verify_all_inputs(root, config, inputs_dir)
+    print(f"acquired verified tools and inputs under {tools_dir}")

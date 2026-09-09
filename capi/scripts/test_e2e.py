@@ -8,14 +8,15 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.cnpg import _cnpg_ready, _verify_marker
-from scripts.create import reconcile_tenant, validate_create_inputs
+from scripts.create import reconcile_tenant
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.locking import e2e_lock
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
 from scripts.tools import verify_all_inputs
+from scripts.lib.timing import PhaseTimings
+from scripts.lib.registry import registry_name
 
 
 def run_just(
@@ -24,7 +25,7 @@ def run_just(
     *arguments: str,
     check: bool = True,
 ):
-    return run(
+    result = run(
         [
             str(resolve_host_just(root, config)),
             "--justfile",
@@ -36,6 +37,10 @@ def run_just(
         env={**os.environ, "CAPI_E2E_CHILD": "1"},
         check=check,
     )
+    for line in result.stdout.splitlines():
+        if line.startswith("CAPI_OFFLINE_"):
+            print(line)
+    return result
 
 
 def verify_no_lab_residue(config: dict[str, str]) -> None:
@@ -71,6 +76,13 @@ def verify_no_lab_residue(config: dict[str, str]) -> None:
     ).stdout.split()
     if volumes:
         raise RuntimeError(f"owned Docker volumes remain: {volumes}")
+    registry = run(
+        ["docker", "inspect", registry_name(config)],
+        timeout=30,
+        check=False,
+    )
+    if registry.returncode == 0:
+        raise RuntimeError("offline registry container remained after teardown")
 
 
 def run_e2e() -> int:
@@ -81,39 +93,37 @@ def run_e2e() -> int:
         "max_user_watches": read_inotify("max_user_watches"),
     }
     failure = None
+    timings = PhaseTimings()
     try:
-        run_just(ROOT, config, "tools")
-        run_just(ROOT, config, "destroy")
-        run_just(ROOT, config, "prepare-host")
-        verify_all_inputs(ROOT, config)
-        run_just(ROOT, config, "create-management")
+        with timings.phase("tools_cache"):
+            run_just(ROOT, config, "tools")
+        with timings.phase("initial_cleanup"):
+            run_just(ROOT, config, "destroy")
+        with timings.phase("host_preparation"):
+            run_just(ROOT, config, "prepare-host")
+        with timings.phase("management_bootstrap"):
+            verify_all_inputs(ROOT, config)
+            run_just(ROOT, config, "create-management")
 
-        from scripts.lib.kube import ManagementClient
-
-        client = ManagementClient(ROOT, config)
-        tenant = validate_create_inputs(ROOT, config)[0]
-        reconcile_tenant(ROOT, config, client, tenant)
-        if not _cnpg_ready(ROOT, config, tenant):
-            raise RuntimeError(
-                f"PostgreSQL cluster did not become healthy: {tenant.name}"
-            )
-        _verify_marker(ROOT, config, tenant)
-        print(f"tenant PostgreSQL cluster is healthy: {tenant.name}")
+        reconcile_tenant(ROOT, config, timings=timings)
+        print("representative tenant PostgreSQL cluster is healthy")
     except BaseException as exc:
         failure = exc
     try:
-        run_just(ROOT, config, "destroy")
-        verify_no_lab_residue(config)
-        if (ROOT / ".runtime").exists():
-            raise RuntimeError("runtime remained after E2E teardown")
-        for name, expected in original_inotify.items():
-            if read_inotify(name) != expected:
-                raise RuntimeError(f"host inotify was not restored: {name}")
+        with timings.phase("teardown"):
+            run_just(ROOT, config, "destroy")
+            verify_no_lab_residue(config)
+            if (ROOT / ".runtime").exists():
+                raise RuntimeError("runtime remained after E2E teardown")
+            for name, expected in original_inotify.items():
+                if read_inotify(name) != expected:
+                    raise RuntimeError(f"host inotify was not restored: {name}")
     except BaseException as cleanup:
         if failure is None:
             failure = cleanup
         else:
             failure.add_note(f"cleanup also failed: {redact(str(cleanup))}")
+    timings.emit()
     if failure is not None:
         raise failure
     return 0

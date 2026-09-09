@@ -3,7 +3,11 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# [implemented] Download and verify pinned tools and immutable inputs.
+# [implemented] Acquire and verify every pinned artifact and OCI image online.
+cache:
+    @python3 scripts/lab.py cache
+
+# [implemented] Install and verify tools from the complete local cache.
 tools:
     @python3 scripts/lab.py tools
 
@@ -18,6 +22,18 @@ preflight:
 # [implemented] Reconcile the management cluster and lifecycle controllers.
 create-management:
     @python3 scripts/lab.py create-management
+
+# [implemented] Bootstrap and bind a retained management development context.
+dev-bootstrap:
+    @python3 scripts/lab.py dev-bootstrap
+
+# [implemented] Recreate and verify tenant A without rebuilding management.
+dev-tenant:
+    @python3 scripts/lab.py dev-tenant
+
+# [implemented] Remove retained tenants, management, runtime state, and host changes.
+dev-clean:
+    @python3 scripts/lab.py dev-clean
 
 # [implemented] Prove authoritative endpoint and worker registration.
 test-endpoint:
@@ -106,6 +122,10 @@ test-tenant-lifecycle:
 # [implemented] Run the full clean-to-clean lifecycle.
 test-e2e:
     @python3 scripts/test_e2e.py
+
+# [implemented] Run clean-to-clean with host acquisition and node registry egress denied.
+test-e2e-offline:
+    @CAPI_OFFLINE_ENFORCED=1 python3 scripts/test_e2e.py
 
 _restore-host:
     @python3 scripts/lab.py restore-host

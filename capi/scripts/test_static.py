@@ -14,10 +14,14 @@ from scripts.lib.config import load_configuration
 
 
 EXPECTED_RECIPES = {
+    "cache",
     "tools",
     "prepare-host",
     "preflight",
     "create-management",
+    "dev-bootstrap",
+    "dev-tenant",
+    "dev-clean",
     "test-endpoint",
     "test-endpoint-negative",
     "test-spike",
@@ -40,6 +44,7 @@ EXPECTED_RECIPES = {
     "test-management",
     "test-tenant-lifecycle",
     "test-e2e",
+    "test-e2e-offline",
 }
 
 
@@ -188,6 +193,12 @@ def check_documentation() -> None:
         "Kubernetes controllers own CAPI and provider resource reconciliation.",
         "Host code owns only exact kind/CAPD Docker identities, tenant Docker volumes, runtime records, and host setting restoration.",
         "while retaining its PVC, PV, and bytes.",
+        "`just cache` is the explicit online acquisition",
+        "The retained workflow is a development optimization, not a final gate",
+        "`tools_cache`",
+        "does not silently acquire missing content",
+        "owner-only registry storage tree",
+        "only on the private kind Docker network",
     )
     required_design = (
         "SkipInfraClusterPatch=true",
@@ -202,6 +213,10 @@ def check_documentation() -> None:
         "No Azure CLI",
         "representative tenant, requires one three-instance PostgreSQL",
         "future tenants are not separate AKS clusters",
+        "Verified acquisition and image distribution",
+        "explicit concurrent import and exact-target verification barrier",
+        "`just test-e2e-offline`",
+        "Distribution storage tree exclusively from the verified active cache",
     )
     for token in required_readme:
         check(
@@ -219,6 +234,7 @@ def check_documentation() -> None:
         "CloudNativePG",
         "PostgreSQL",
         "BusyBox",
+        "Distribution",
     ):
         check(project in notices, f"third-party notices omit {project}")
     direct_etcd = (

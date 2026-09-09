@@ -6,9 +6,32 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from scripts.destroy import destroy, inspect_host_residue
+from scripts.destroy_tenant import prepare_tenant_deletion
 
 
 class DestroyTests(unittest.TestCase):
+    def test_dangling_deletion_journal_blocks_live_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            journal = root / ".runtime/deletions/tenant-a.json"
+            journal.parent.mkdir(parents=True)
+            journal.symlink_to(root / "missing")
+            tenant = type("Tenant", (), {"name": "tenant-a"})()
+            with (
+                patch("scripts.destroy_tenant.delete_cnpg") as delete_cnpg,
+                patch("scripts.destroy_tenant.delete_addons") as delete_addons,
+            ):
+                with self.assertRaises(RuntimeError):
+                    prepare_tenant_deletion(
+                        root,
+                        {},
+                        object(),
+                        tenant,
+                        {"metadata": {"uid": "cluster-uid"}},
+                    )
+            delete_cnpg.assert_not_called()
+            delete_addons.assert_not_called()
+
     def test_management_absent_residue_preserves_runtime_and_host_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -26,9 +49,11 @@ class DestroyTests(unittest.TestCase):
                     return_value={
                         "containers": ["worker"],
                         "probes": [],
+                        "registries": [],
                         "volumes": [],
                     },
                 ),
+                patch("scripts.destroy.delete_offline_registry"),
                 patch("scripts.destroy.restore_inotify") as restore,
             ):
                 with self.assertRaisesRegex(RuntimeError, "residue remains"):
@@ -42,6 +67,7 @@ class DestroyTests(unittest.TestCase):
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="probe-a\n", returncode=0, stderr=""),
+            Mock(stdout="registry-a\n", returncode=0, stderr=""),
             Mock(stdout="", returncode=1, stderr="No such volume"),
             Mock(stdout="[]", returncode=0, stderr=""),
             Mock(stdout="", returncode=1, stderr="No such volume"),
@@ -57,10 +83,12 @@ class DestroyTests(unittest.TestCase):
             )
         self.assertEqual(residue["containers"], ["worker-a"])
         self.assertEqual(residue["probes"], ["probe-a"])
+        self.assertEqual(residue["registries"], ["registry-a"])
         self.assertEqual(residue["volumes"], ["lab-tenant-a-storage"])
 
     def test_host_residue_rejects_volume_inspection_failure(self) -> None:
         responses = [
+            Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
@@ -118,6 +146,7 @@ class DestroyTests(unittest.TestCase):
                     "scripts.destroy_tenant.finish_journaled_tenant_deletion"
                 ) as finish_journaled,
                 patch("scripts.destroy._delete_kubernetes_stack"),
+                patch("scripts.destroy.delete_offline_registry"),
                 patch("scripts.destroy.delete_management"),
                 patch("scripts.destroy.restore_inotify"),
             ):

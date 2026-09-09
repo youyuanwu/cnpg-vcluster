@@ -13,6 +13,7 @@ copyright, license, and NOTICE files remain authoritative.
 |---|---|---|
 | kind | `v0.33.0` binary and `kindest/node:v1.36.4` | Apache-2.0 |
 | Kubernetes | kubectl, kube-proxy, and Kubernetes `v1.36.4` | Apache-2.0 |
+| Distribution | registry image `2.8.3` for the private offline mirror | Apache-2.0 |
 | Helm | `v3.21.4` binary | Apache-2.0 |
 | Cluster API | core, clusterctl, CABPK, and CAPD `v1.14.1` | Apache-2.0 |
 | Kamaji CAPI provider | `v0.20.0` | Apache-2.0 |
@@ -33,6 +34,7 @@ Source and license references:
 
 - <https://github.com/kubernetes-sigs/kind>
 - <https://github.com/kubernetes/kubernetes>
+- <https://github.com/distribution/distribution>
 - <https://github.com/helm/helm>
 - <https://github.com/kubernetes-sigs/cluster-api>
 - <https://github.com/clastix/cluster-api-control-plane-provider-kamaji>

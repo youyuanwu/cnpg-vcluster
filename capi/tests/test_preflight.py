@@ -6,12 +6,7 @@ from subprocess import CompletedProcess
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
 
-from scripts.preflight import (
-    PreflightError,
-    configured_networks,
-    verify_images,
-    verify_management_name,
-)
+from scripts.preflight import PreflightError, configured_networks, verify_images, verify_management_name
 from scripts.preflight import verify_privileged_probe
 from scripts.lib.process import CommandError
 
@@ -29,31 +24,10 @@ BASE = {
 
 
 class PreflightTests(unittest.TestCase):
-    def test_image_inspection_retries_transient_registry_failure(self) -> None:
-        digest = "sha256:" + "a" * 64
-        failure = CommandError(
-            ("docker",),
-            1,
-            "failed to authorize: 500 Internal Server Error",
-        )
-        success = CompletedProcess(
-            [],
-            0,
-            stdout=f'{{"digest":"{digest}"}}',
-            stderr="",
-        )
-        with (
-            patch("scripts.preflight.run", side_effect=[failure, success]) as run,
-            patch("scripts.preflight.time.sleep"),
-        ):
-            verify_images(
-                {
-                    "TEST_IMAGE": f"example.invalid/test@{digest}",
-                    "TEST_IMAGE_TAGGED": "example.invalid/test:v1",
-                },
-                30,
-            )
-        self.assertEqual(run.call_count, 2)
+    def test_image_verification_is_local_cache_only(self) -> None:
+        with patch("scripts.preflight.verify_cache") as verify:
+            verify_images(Path("/tmp/example"), {"TEST": "value"})
+        verify.assert_called_once_with(Path("/tmp/example"), {"TEST": "value"})
 
     def test_accepts_disjoint_networks(self) -> None:
         self.assertEqual(len(configured_networks(BASE)), 8)
@@ -107,10 +81,14 @@ class PreflightTests(unittest.TestCase):
         }
         with patch("scripts.preflight.uuid.uuid4") as generated_uuid:
             generated_uuid.return_value.hex = "fixed"
-            with patch("scripts.preflight.run", side_effect=fake_run):
+            with (
+                patch("scripts.preflight.run", side_effect=fake_run),
+                patch("scripts.preflight.restore_host_image"),
+            ):
                 with self.assertRaises(PreflightError):
-                    verify_privileged_probe(config)
+                    verify_privileged_probe(Path("/tmp/example"), config)
         self.assertIn(["docker", "rm", "-f", "owned-probe-id"], commands)
+        self.assertTrue(any("--pull=never" in command for command in commands))
 
     def test_probe_refuses_arbitrary_cidfile_identifier(self) -> None:
         commands: list[list[str]] = []
@@ -141,9 +119,12 @@ class PreflightTests(unittest.TestCase):
         }
         with patch("scripts.preflight.uuid.uuid4") as generated_uuid:
             generated_uuid.return_value.hex = "fixed"
-            with patch("scripts.preflight.run", side_effect=fake_run):
+            with (
+                patch("scripts.preflight.run", side_effect=fake_run),
+                patch("scripts.preflight.restore_host_image"),
+            ):
                 with self.assertRaises(PreflightError):
-                    verify_privileged_probe(config)
+                    verify_privileged_probe(Path("/tmp/example"), config)
         self.assertNotIn(["docker", "rm", "-f", "foreign-id"], commands)
 
     def test_probe_refuses_foreign_same_name_container(self) -> None:
@@ -173,7 +154,10 @@ class PreflightTests(unittest.TestCase):
         }
         with patch("scripts.preflight.uuid.uuid4") as generated_uuid:
             generated_uuid.return_value.hex = "fixed"
-            with patch("scripts.preflight.run", side_effect=fake_run):
+            with (
+                patch("scripts.preflight.run", side_effect=fake_run),
+                patch("scripts.preflight.restore_host_image"),
+            ):
                 with self.assertRaises(PreflightError):
-                    verify_privileged_probe(config)
+                    verify_privileged_probe(Path("/tmp/example"), config)
         self.assertNotIn(["docker", "rm", "-f", "foreign-id"], commands)

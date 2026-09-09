@@ -27,8 +27,10 @@ from scripts.preflight import PreflightError, run_preflight
 from scripts.repair import repair
 from scripts.status import status
 from scripts.tools import prepare_tools
+from scripts.cache import acquire_cache
 from scripts.test_tenant_lifecycle import run_tenant_lifecycle
 from scripts.verify import verify
+from scripts.retained import dev_bootstrap, dev_clean, dev_tenant
 
 
 def unavailable(arguments: list[str]) -> int:
@@ -44,6 +46,22 @@ def main(arguments: list[str]) -> int:
         return 1
     config = load_configuration(ROOT)
     command, rest = arguments[0], arguments[1:]
+    if command == "cache":
+        with tools_lock(ROOT, exclusive=True):
+            acquire_cache(ROOT, config)
+        return 0
+    if command == "dev-bootstrap":
+        with tools_lock(ROOT, exclusive=True):
+            dev_bootstrap(ROOT, config)
+        return 0
+    if command == "dev-tenant":
+        with tools_lock(ROOT, exclusive=True):
+            dev_tenant(ROOT, config)
+        return 0
+    if command == "dev-clean":
+        with tools_lock(ROOT, exclusive=True):
+            dev_clean(ROOT, config)
+        return 0
     if command == "tools":
         with tools_lock(ROOT, exclusive=True):
             prepare_tools(ROOT, config)

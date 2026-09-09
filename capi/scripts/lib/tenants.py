@@ -14,6 +14,7 @@ from .config import parse_duration
 from .files import IntegrityError, ensure_private_dir, write_private_file
 from .kube import ManagementClient, wait_for
 from .process import run
+from .images import WORKER_IMAGE_KEYS, verify_container_images
 
 
 @dataclass
@@ -343,6 +344,7 @@ def _render_template(
 
 
 def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[str, str]:
+    cache_container_path = "/var/lib/capi-image-cache"
     return {
         "NAMESPACE": tenant.namespace,
         "CLUSTER_NAME": tenant.name,
@@ -372,6 +374,8 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
         "STORAGE_HOST_PATH": str(tenant.storage_host_path),
         "STORAGE_CONTAINER_PATH": config["SPIKE_STORAGE_CONTAINER_PATH"],
         "WORKER_REPLICAS": str(tenant.workers),
+        "IMAGE_CACHE_HOST_PATH": str(root / ".tools" / "cache"),
+        "IMAGE_CACHE_CONTAINER_PATH": cache_container_path,
     }
 
 
@@ -456,7 +460,6 @@ def apply_control_plane(
         "-f",
         str(control_plane),
     )
-
     def ready():
         devcluster = _resource(client, tenant, "devcluster", tenant.name)
         kcp = _resource(client, tenant, "kamajicontrolplane", tenant.name)
@@ -915,7 +918,42 @@ def apply_workers(
         "-f",
         str(workers),
     )
+    verify_worker_preload_contract(root, config, client, tenant)
     return workers
+
+
+def verify_worker_preload_contract(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant: Tenant,
+) -> None:
+    devmachine = json.loads(
+        client.kubectl(
+            "-n",
+            tenant.namespace,
+            "get",
+            f"devmachinetemplate/{tenant.name}-worker",
+            "-o",
+            "json",
+        ).stdout
+    )
+    docker = devmachine["spec"]["template"]["spec"]["backend"]["docker"]
+    if docker.get("preLoadImages"):
+        raise RuntimeError("live worker template duplicates bootstrap image imports")
+    cache_mounts = [
+        mount
+        for mount in docker.get("extraMounts", [])
+        if mount.get("containerPath") == "/var/lib/capi-image-cache"
+    ]
+    if cache_mounts != [
+        {
+            "hostPath": str(root / ".tools" / "cache"),
+            "containerPath": "/var/lib/capi-image-cache",
+            "readOnly": True,
+        }
+    ]:
+        raise RuntimeError("live worker cache mount does not match")
 
 
 def _machine(client: ManagementClient, tenant: Tenant) -> dict[str, object] | None:
@@ -1099,6 +1137,7 @@ def verify_worker_runtime(
         or set(networks) != {expected_network}
     ):
         raise RuntimeError("CAPD worker runtime does not match the declared local profile")
+    verify_container_images(config, machine_name, WORKER_IMAGE_KEYS)
 
 
 def endpoint_snapshot(
