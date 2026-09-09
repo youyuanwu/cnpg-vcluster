@@ -14,13 +14,21 @@ from unittest.mock import patch
 
 class ToolSchemaTests(unittest.TestCase):
     def test_prepare_tools_uses_local_cache_without_network_commands(self) -> None:
+        verified = object()
         with (
-            patch("scripts.cache.verify_cache"),
-            patch("scripts.cache.materialize_inputs"),
-            patch("scripts.tools._install_tools"),
+            patch("scripts.cache.verify_cache", return_value=verified),
+            patch("scripts.cache.materialize_inputs") as materialize,
+            patch("scripts.tools._install_tools") as install,
             patch("scripts.tools.run") as run,
         ):
-            prepare_tools(Path("/tmp/example"), {})
+            result = prepare_tools(Path("/tmp/example"), {})
+        self.assertIs(result, verified)
+        materialize.assert_called_once_with(
+            Path("/tmp/example"), {}, verified=verified
+        )
+        install.assert_called_once_with(
+            Path("/tmp/example"), {}, inputs_verified=True
+        )
         run.assert_not_called()
 
     def test_cached_input_rejects_symlink_and_broad_permissions(self) -> None:

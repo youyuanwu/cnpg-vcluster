@@ -3,8 +3,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import time
 from pathlib import Path
 
+from scripts.cnpg import (
+    _cnpg_ready,
+    _storage_identity,
+    _verify_filesystem,
+    _verify_marker,
+)
 from scripts.create import reconcile_tenant, validate_create_inputs
 from scripts.create_management import create_management
 from scripts.destroy import destroy
@@ -14,27 +21,36 @@ from scripts.destroy_tenant import (
     finish_journaled_tenant_deletion,
     prepare_tenant_deletion,
 )
+from scripts.endpoint import _verify_bootstrap_secret
+from scripts.lib.addons import verify_network, wait_network_ready
 from scripts.lib.host import prepare_inotify
 from scripts.lib.kube import ManagementClient
 from scripts.lib.management import (
     require_management_ownership,
     validate_management_kubeconfig,
 )
+from scripts.machines import worker_snapshot
 from scripts.lib.process import run
 from scripts.lib.tenants import (
+    _tenant_kubectl,
+    configured_tenants,
     ensure_tenant_kubeconfig,
     inspect_management_resource,
     inspect_storage_volume,
     storage_record_path,
     storage_volume_name,
     tenant_kubeconfig_path,
+    verify_authoritative_endpoint,
+    verify_tenant_control_plane_contract,
     verify_tenant_management_ownership,
+    verify_worker_runtime,
 )
 from scripts.lib.files import write_private_file
 from scripts.tools import _verify_private_input, verify_all_inputs
 
 
 RETAINED_SCHEMA = 1
+DEV_TESTS = ("endpoint", "network", "machines", "storage", "database")
 
 
 def retained_path(root: Path) -> Path:
@@ -167,6 +183,157 @@ def dev_tenant(root: Path, config: dict[str, str]) -> None:
     reconcile_tenant(root, config, client, tenant)
     write_retained_state(root, config)
     print(f"retained management tenant recreated and verified: {tenant.name}")
+
+
+def dev_up(root: Path, config: dict[str, str]) -> None:
+    dev_bootstrap(root, config)
+    client = ManagementClient(root, config)
+    tenant = validate_create_inputs(root, config)[0]
+    reconcile_tenant(root, config, client, tenant)
+    write_retained_state(root, config)
+    print(f"retained development infrastructure is ready: {tenant.name}")
+
+
+def _registered_worker(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+    machine: dict[str, object],
+) -> dict[str, object]:
+    name = machine["metadata"]["name"]
+    devmachine = inspect_management_resource(
+        client, tenant, f"devmachine/{name}"
+    )
+    kubeadm = inspect_management_resource(
+        client, tenant, f"kubeadmconfig/{name}"
+    )
+    node_name = machine.get("status", {}).get("nodeRef", {}).get("name")
+    secret_name = (
+        kubeadm.get("status", {}).get("dataSecretName")
+        if kubeadm is not None
+        else None
+    )
+    if devmachine is None or kubeadm is None or not node_name or not secret_name:
+        raise RuntimeError(f"worker registration is incomplete: {name}")
+    node = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "get",
+            f"node/{node_name}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    return {
+        "machine": machine,
+        "devmachine": devmachine,
+        "kubeadm": kubeadm,
+        "node": node,
+        "secret": secret_name,
+    }
+
+
+def _dev_test_endpoint(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+) -> None:
+    resources = verify_tenant_management_ownership(config, client, tenant)
+    verify_tenant_control_plane_contract(config, tenant, resources)
+    machines = resources.get("machines") or []
+    if len(machines) != tenant.workers:
+        raise RuntimeError(f"worker count is not exact: {tenant.name}")
+    for machine in machines:
+        registered = _registered_worker(
+            root, config, client, tenant, machine
+        )
+        verify_authoritative_endpoint(
+            root, config, client, tenant, registered
+        )
+        verify_worker_runtime(root, config, tenant, registered)
+        _verify_bootstrap_secret(config, client, tenant, registered)
+
+
+def _dev_test_network(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+) -> None:
+    wait_network_ready(root, config, tenant)
+    verify_network(root, config, tenant)
+
+
+def _dev_test_machines(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+) -> None:
+    worker_snapshot(root, config, client, tenant)
+
+
+def _dev_test_storage(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+) -> None:
+    del client
+    _storage_identity(root, config, tenant)
+    _verify_filesystem(config, tenant)
+
+
+def _dev_test_database(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+) -> None:
+    del client
+    if not _cnpg_ready(root, config, tenant):
+        raise RuntimeError(f"tenant CNPG is not healthy: {tenant.name}")
+    _verify_marker(root, config, tenant)
+
+
+def dev_test(root: Path, config: dict[str, str], suite: str) -> None:
+    validate_retained_state(root, config)
+    client = ManagementClient(root, config)
+    tenant = configured_tenants(root, config)[0]
+    runners = {
+        "endpoint": _dev_test_endpoint,
+        "network": _dev_test_network,
+        "machines": _dev_test_machines,
+        "storage": _dev_test_storage,
+        "database": _dev_test_database,
+    }
+    selected = DEV_TESTS if suite == "all" else (suite,)
+    unknown = [name for name in selected if name not in runners]
+    if unknown:
+        raise RuntimeError(
+            f"unknown retained test {unknown[0]!r}; expected all or one of: "
+            + " ".join(DEV_TESTS)
+        )
+    for name in selected:
+        started = time.monotonic()
+        runners[name](root, config, client, tenant)
+        print(
+            "CAPI_DEV_TEST "
+            + json.dumps(
+                {
+                    "schema": 1,
+                    "suite": name,
+                    "seconds": round(time.monotonic() - started, 3),
+                    "status": "passed",
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        )
 
 
 def dev_clean(root: Path, config: dict[str, str]) -> None:

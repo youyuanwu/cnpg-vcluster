@@ -94,6 +94,8 @@ just test-tenant-lifecycle
 | `just create-management` | Reconcile the kind management cluster and lifecycle controllers. |
 | `just dev-bootstrap` | Prepare and bind a retained management context to the current user, host, Docker daemon, branch, revision, configuration, and exact management identity. |
 | `just dev-tenant` | Delete, recreate, and validate tenant A while retaining the bound management cluster. |
+| `just dev-up` | Idempotently reconcile retained management and a complete tenant A stack without deleting healthy infrastructure. |
+| `just dev-test endpoint` | Run one fast non-destructive retained check: `endpoint`, `network`, `machines`, `storage`, or `database`; omit the argument to run all checks. |
 | `just dev-clean` | Run authoritative cleanup for retained tenant, management, runtime, and host state. |
 | `just create` | Reconcile both tenant control planes, workers, networking, storage, and databases. |
 | `just repair tenant-a` | Explicitly repair one owned tenant while proving the other tenant is unchanged. |
@@ -108,19 +110,30 @@ surviving state. Generated credentials and identity records are owner-only
 files below ignored `.runtime/`. Commands use explicit kubeconfig paths and do
 not depend on the user's current Kubernetes context.
 
-The retained workflow is a development optimization, not a final gate:
+The retained workflow is a development optimization, not a final gate. It
+separates infrastructure provisioning from fast, independently runnable
+checks:
 
 ```bash
-just dev-bootstrap
-just dev-tenant
-just dev-tenant
+just dev-up
+just dev-test endpoint
+just dev-test network
+just dev-test machines
+just dev-test storage
+just dev-test database
+# or run every retained check:
+just dev-test
 just dev-clean
 ```
 
-`dev-tenant` never bootstraps management implicitly. It fails closed when the
-private retained record is missing, stale, unsafe, or inconsistent, and it
-resumes only a valid journaled tenant deletion. Always run `just test-e2e` or
-`just test-e2e-offline` before treating a change as lifecycle-complete.
+The first `dev-up` pays the management, worker, network, storage, and database
+startup cost. Later `dev-up` calls reconcile in place, and `dev-test` only
+validates the retained stack, so individual checks normally complete in
+seconds. `dev-test` fails closed when the private retained record is missing,
+stale, unsafe, or inconsistent. `dev-tenant` remains available when a test
+specifically needs a clean tenant while retaining management. Always run
+`just test-e2e` or `just test-e2e-offline` before treating a change as
+lifecycle-complete.
 
 ## Local isolation model
 
@@ -262,11 +275,15 @@ digests, validates the archived `linux/amd64` manifest and blobs, and switches
 the active pointer only after the whole generation passes. A failed refresh
 leaves the previous generation active.
 
-Normal preflight verifies the active inventory, owner-only file boundaries,
-current pins, archive checksums, OCI identities, and local tool versions. It
-does not silently acquire missing content. Missing, changed, symlinked,
-broad-permission, platform-mismatched, or stale entries require a new online
-`just cache`.
+Normal preflight compares the active generation and inventory with the current
+pins and records a private verification stamp after checking archive
+checksums, OCI identities, authored inputs, and owner-only file boundaries.
+An unchanged generation uses kernel-controlled inode, size, mtime, and ctime
+metadata to reuse that result; any cache, inventory, permission, authored
+input, or pin change forces full content verification again. Local tool
+versions are still checked on every preflight. Preflight does not silently
+acquire missing content. Missing, changed, symlinked, broad-permission,
+platform-mismatched, or stale entries require a new online `just cache`.
 
 Management images are imported before controller installation. Worker images
 are imported before ClusterResourceSet workloads and retain exact

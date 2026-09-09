@@ -14,7 +14,7 @@ from scripts.lib.files import verify_sha256
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.ownership import IdentityRecord, OwnershipError
 from scripts.lib.process import CommandError, run
-from scripts.cache import restore_host_image, verify_cache
+from scripts.cache import VerifiedCache, restore_host_image, verify_cache
 from scripts.tools import prepare_tools
 
 
@@ -174,8 +174,13 @@ def verify_inotify(config: dict[str, str]) -> None:
             raise PreflightError(f"fs.inotify.{name}={current} is below required {floor}")
 
 
-def verify_images(root: Path, config: dict[str, str]) -> None:
-    verify_cache(root, config)
+def verify_images(
+    root: Path,
+    config: dict[str, str],
+    verified: VerifiedCache | None = None,
+) -> None:
+    if verified is None:
+        verify_cache(root, config)
 
 
 def verify_privileged_probe(root: Path, config: dict[str, str]) -> None:
@@ -254,14 +259,15 @@ def verify_privileged_probe(root: Path, config: dict[str, str]) -> None:
         raise PreflightError("privileged container probe failed")
 
 
-def run_preflight(root: Path, config: dict[str, str]) -> None:
+def run_preflight(root: Path, config: dict[str, str]) -> VerifiedCache:
     timeout = parse_duration(config["COMMAND_TIMEOUT"])
-    prepare_tools(root, config)
+    verified = prepare_tools(root, config)
     verify_tools(root, config, timeout)
     verify_docker(config, timeout)
     verify_management_name(root, config, timeout)
     verify_inotify(config)
     verify_no_network_overlap(config, timeout)
-    verify_images(root, config)
+    verify_images(root, config, verified)
     verify_privileged_probe(root, config)
     print("preflight passed")
+    return verified

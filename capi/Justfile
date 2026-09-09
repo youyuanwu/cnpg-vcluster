@@ -31,6 +31,14 @@ dev-bootstrap:
 dev-tenant:
     @python3 scripts/lab.py dev-tenant
 
+# [implemented] Reconcile retained management and a complete tenant A stack.
+dev-up:
+    @python3 scripts/lab.py dev-up
+
+# [implemented] Run one fast non-destructive check against retained infrastructure.
+dev-test suite="all":
+    @python3 scripts/lab.py dev-test "{{suite}}"
+
 # [implemented] Remove retained tenants, management, runtime state, and host changes.
 dev-clean:
     @python3 scripts/lab.py dev-clean

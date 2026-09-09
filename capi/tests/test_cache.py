@@ -207,7 +207,14 @@ class CacheTests(unittest.TestCase):
                 patch("scripts.cache._requirements", return_value=requirements),
                 patch("scripts.cache.verify_all_inputs"),
             ):
-                verify_cache(root, config)
+                verified = verify_cache(root, config)
+                self.assertEqual(verified.generation, generation)
+                with patch(
+                    "scripts.cache.verify_generation",
+                    side_effect=AssertionError("unchanged generation was rehashed"),
+                ):
+                    cached = verify_cache(root, config)
+                self.assertEqual(cached.state_sha256, verified.state_sha256)
                 with archive.open("ab") as output:
                     output.write(b"tampered")
                 with self.assertRaises(IntegrityError):

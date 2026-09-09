@@ -14,6 +14,7 @@ import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from dataclasses import dataclass
 from pathlib import Path
 
 from scripts.lib.config import parse_duration
@@ -30,7 +31,15 @@ from scripts.tools import AUTHORED_INPUTS, DOWNLOADS, TAG_SOURCES, acquire_tools
 
 CACHE_SCHEMA = 1
 ACTIVE_SCHEMA = 1
+CACHE_VERIFICATION_SCHEMA = 1
 IMAGE_PLATFORM = "linux/amd64"
+
+
+@dataclass(frozen=True)
+class VerifiedCache:
+    generation: Path
+    inventory: dict[str, object]
+    state_sha256: str
 
 
 def image_keys(config: dict[str, str]) -> tuple[str, ...]:
@@ -509,6 +518,10 @@ def _active_path(root: Path) -> Path:
     return root / ".tools" / "cache" / "active.json"
 
 
+def _verification_path(root: Path) -> Path:
+    return root / ".tools" / "cache" / "verified.json"
+
+
 def _load_json(path: Path) -> dict[str, object]:
     _private_regular_file(path)
     try:
@@ -518,6 +531,143 @@ def _load_json(path: Path) -> dict[str, object]:
     if not isinstance(payload, dict):
         raise IntegrityError(f"cache record is not an object: {path}")
     return payload
+
+
+def _requirements_sha256(requirements: dict[str, object]) -> str:
+    return hashlib.sha256(
+        json.dumps(
+            requirements,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _metadata_entry(path: Path, name: str, *, private: bool) -> dict[str, object]:
+    try:
+        details = path.lstat()
+    except FileNotFoundError as exc:
+        raise IntegrityError(f"required cache path is missing: {path}") from exc
+    if stat.S_ISLNK(details.st_mode):
+        raise IntegrityError(f"cache state path is a symlink: {path}")
+    if private and (
+        details.st_uid != os.getuid() or details.st_mode & 0o077
+    ):
+        raise IntegrityError(f"cache state path is not owner-only: {path}")
+    if stat.S_ISDIR(details.st_mode):
+        kind = "directory"
+    elif stat.S_ISREG(details.st_mode):
+        kind = "file"
+    else:
+        raise IntegrityError(f"cache state path has unsupported type: {path}")
+    return {
+        "path": name,
+        "kind": kind,
+        "device": details.st_dev,
+        "inode": details.st_ino,
+        "mode": stat.S_IMODE(details.st_mode),
+        "size": details.st_size,
+        "mtimeNs": details.st_mtime_ns,
+        "ctimeNs": details.st_ctime_ns,
+    }
+
+
+def _cache_state_sha256(
+    root: Path,
+    generation: Path,
+    requirements: dict[str, object],
+) -> str:
+    entries = [
+        _metadata_entry(generation, ".", private=True),
+        *(
+            _metadata_entry(
+                path,
+                path.relative_to(generation).as_posix(),
+                private=True,
+            )
+            for path in sorted(generation.rglob("*"))
+        ),
+    ]
+    authored = requirements.get("authoredInputs")
+    if not isinstance(authored, list):
+        raise IntegrityError("cache authored-input requirements are missing")
+    for item in authored:
+        if not isinstance(item, dict) or not isinstance(item.get("path"), str):
+            raise IntegrityError("cache authored-input requirement is invalid")
+        relative = item["path"]
+        entries.append(
+            _metadata_entry(
+                root / relative,
+                f"authored:{relative}",
+                private=False,
+            )
+        )
+    return hashlib.sha256(
+        json.dumps(
+            {
+                "generation": generation.name,
+                "requirementsSha256": _requirements_sha256(requirements),
+                "entries": entries,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+
+
+def _load_inventory_header(
+    generation: Path,
+    requirements: dict[str, object],
+) -> dict[str, object]:
+    inventory_path = generation / "inventory.json"
+    inventory = _load_json(inventory_path)
+    if inventory.get("schema") != CACHE_SCHEMA:
+        raise IntegrityError("unsupported cache inventory schema")
+    if inventory.get("platform") != IMAGE_PLATFORM:
+        raise IntegrityError("cache platform does not match linux/amd64")
+    if inventory.get("requirements") != requirements:
+        raise IntegrityError("cache inventory does not match current pinned requirements")
+    return inventory
+
+
+def _verification_matches(
+    root: Path,
+    generation: Path,
+    requirements_sha256: str,
+    state_sha256: str,
+) -> bool:
+    path = _verification_path(root)
+    if not path.exists() and not path.is_symlink():
+        return False
+    record = _load_json(path)
+    return (
+        record.get("schema") == CACHE_VERIFICATION_SCHEMA
+        and record.get("generation") == generation.name
+        and record.get("requirementsSha256") == requirements_sha256
+        and record.get("stateSha256") == state_sha256
+    )
+
+
+def _write_verification(
+    root: Path,
+    generation: Path,
+    requirements_sha256: str,
+    state_sha256: str,
+) -> None:
+    write_private_file(
+        _verification_path(root),
+        json.dumps(
+            {
+                "schema": CACHE_VERIFICATION_SCHEMA,
+                "generation": generation.name,
+                "requirementsSha256": requirements_sha256,
+                "stateSha256": state_sha256,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+    )
 
 
 def active_generation(root: Path) -> Path:
@@ -609,16 +759,55 @@ def verify_generation(
     return inventory
 
 
-def verify_cache(root: Path, config: dict[str, str]) -> dict[str, object]:
-    return verify_generation(root, config, active_generation(root))
-
-
-def archive_path(root: Path, config: dict[str, str], key: str) -> Path:
+def verify_cache(
+    root: Path,
+    config: dict[str, str],
+    *,
+    force: bool = False,
+) -> VerifiedCache:
     generation = active_generation(root)
+    requirements = _requirements(config)
+    inventory = _load_inventory_header(generation, requirements)
+    requirements_sha256 = _requirements_sha256(requirements)
+    state_sha256 = _cache_state_sha256(root, generation, requirements)
+    if (
+        not force
+        and _verification_matches(
+            root,
+            generation,
+            requirements_sha256,
+            state_sha256,
+        )
+    ):
+        return VerifiedCache(generation, inventory, state_sha256)
     inventory = verify_generation(root, config, generation)
-    for entry in inventory["imageArchives"]:
+    verified_state_sha256 = _cache_state_sha256(
+        root,
+        generation,
+        requirements,
+    )
+    if verified_state_sha256 != state_sha256:
+        raise IntegrityError("cache generation changed during verification")
+    _write_verification(
+        root,
+        generation,
+        requirements_sha256,
+        verified_state_sha256,
+    )
+    return VerifiedCache(generation, inventory, verified_state_sha256)
+
+
+def archive_path(
+    root: Path,
+    config: dict[str, str],
+    key: str,
+    *,
+    verified: VerifiedCache | None = None,
+) -> Path:
+    cache = verified or verify_cache(root, config)
+    for entry in cache.inventory["imageArchives"]:
         if entry["key"] == key:
-            return generation / entry["path"]
+            return cache.generation / entry["path"]
     raise IntegrityError(f"cache image archive is missing: {key}")
 
 
@@ -627,6 +816,8 @@ def restore_host_image(
     config: dict[str, str],
     key: str,
     timeout: int | None = None,
+    *,
+    verified: VerifiedCache | None = None,
 ) -> None:
     effective_timeout = timeout or parse_duration(config["DOWNLOAD_TIMEOUT"])
     try:
@@ -634,7 +825,7 @@ def restore_host_image(
         return
     except IntegrityError:
         pass
-    path = archive_path(root, config, key)
+    path = archive_path(root, config, key, verified=verified)
     run(
         ["docker", "image", "load", "--input", str(path)],
         timeout=effective_timeout,
@@ -661,10 +852,14 @@ def _copy_private(source: Path, destination: Path) -> None:
         temporary.unlink(missing_ok=True)
 
 
-def materialize_inputs(root: Path, config: dict[str, str]) -> None:
-    generation = active_generation(root)
-    verify_generation(root, config, generation)
-    source_dir = generation / "inputs"
+def materialize_inputs(
+    root: Path,
+    config: dict[str, str],
+    *,
+    verified: VerifiedCache | None = None,
+) -> None:
+    cache = verified or verify_cache(root, config)
+    source_dir = cache.generation / "inputs"
     destination_dir = root / ".tools" / "inputs"
     ensure_private_dir(destination_dir)
     allowed = {
@@ -727,8 +922,8 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
             + "\n",
         )
         published = True
-        verify_cache(root, config)
-        materialize_inputs(root, config)
+        verified = verify_cache(root, config, force=True)
+        materialize_inputs(root, config, verified=verified)
     except BaseException:
         if not published:
             shutil.rmtree(generation, ignore_errors=True)

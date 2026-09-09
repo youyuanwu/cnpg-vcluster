@@ -10,7 +10,9 @@ from scripts.retained import (
     _delete_representative_tenant,
     dev_bootstrap,
     dev_clean,
+    dev_test,
     dev_tenant,
+    dev_up,
     retained_path,
     validate_retained_state,
 )
@@ -56,12 +58,13 @@ class RetainedTests(unittest.TestCase):
 
     def test_bootstrap_prepares_host_before_management_and_state(self) -> None:
         calls: list[str] = []
-        with (
-            patch("scripts.retained.prepare_inotify", side_effect=lambda *_: calls.append("host")),
-            patch("scripts.retained.create_management", side_effect=lambda *_: calls.append("management")),
-            patch("scripts.retained.write_retained_state", side_effect=lambda *_: calls.append("state")),
-        ):
-            dev_bootstrap(Path("."), {})
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch("scripts.retained.prepare_inotify", side_effect=lambda *_: calls.append("host")),
+                patch("scripts.retained.create_management", side_effect=lambda *_: calls.append("management")),
+                patch("scripts.retained.write_retained_state", side_effect=lambda *_: calls.append("state")),
+            ):
+                dev_bootstrap(Path(temporary), {})
         self.assertEqual(calls, ["host", "management", "state"])
 
     def test_bootstrap_refuses_unbound_existing_management(self) -> None:
@@ -87,6 +90,42 @@ class RetainedTests(unittest.TestCase):
         ):
             dev_tenant(Path("."), {})
         self.assertEqual(calls, ["validate", "inputs", "delete", "recreate", "state"])
+
+    def test_dev_up_reconciles_without_deleting_tenant(self) -> None:
+        calls: list[str] = []
+        tenant = type("Tenant", (), {"name": "tenant-a"})()
+        with (
+            patch("scripts.retained.dev_bootstrap", side_effect=lambda *_: calls.append("bootstrap")),
+            patch("scripts.retained.ManagementClient", return_value=object()),
+            patch("scripts.retained.validate_create_inputs", return_value=[tenant]),
+            patch("scripts.retained.reconcile_tenant", side_effect=lambda *_: calls.append("reconcile")),
+            patch("scripts.retained.write_retained_state", side_effect=lambda *_: calls.append("state")),
+        ):
+            dev_up(Path("."), {})
+        self.assertEqual(
+            calls, ["bootstrap", "reconcile", "state"]
+        )
+
+    def test_dev_test_runs_selected_suite_without_reconciliation(self) -> None:
+        tenant = type("Tenant", (), {"name": "tenant-a"})()
+        with (
+            patch("scripts.retained.validate_retained_state"),
+            patch("scripts.retained.ManagementClient", return_value=object()),
+            patch("scripts.retained.configured_tenants", return_value=[tenant]),
+            patch("scripts.retained._dev_test_network") as network,
+        ):
+            dev_test(Path("."), {}, "network")
+        network.assert_called_once()
+
+    def test_dev_test_rejects_unknown_suite(self) -> None:
+        tenant = type("Tenant", (), {"name": "tenant-a"})()
+        with (
+            patch("scripts.retained.validate_retained_state"),
+            patch("scripts.retained.ManagementClient", return_value=object()),
+            patch("scripts.retained.configured_tenants", return_value=[tenant]),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "unknown retained test"):
+                dev_test(Path("."), {}, "unknown")
 
     def test_partial_namespace_or_storage_record_blocks_recreation(self) -> None:
         tenant = type(

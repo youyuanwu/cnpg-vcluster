@@ -17,7 +17,10 @@ class ManagementTests(unittest.TestCase):
         config = {"KIND_CLUSTER_NAME": "management"}
         with (
             patch("scripts.create_management.run_preflight", side_effect=lambda *_: calls.append("preflight")),
-            patch("scripts.create_management.restore_host_images", side_effect=lambda *_: calls.append("restore")),
+            patch(
+                "scripts.create_management.restore_host_images",
+                side_effect=lambda *_, **__: calls.append("restore"),
+            ),
             patch("scripts.create_management.reconcile_kind", side_effect=lambda *_: calls.append("kind") or object()),
             patch("scripts.create_management.import_container_images", side_effect=lambda *_: calls.append("import")),
             patch("scripts.create_management.reconcile_network", side_effect=lambda *_: calls.append("network") or {}),
