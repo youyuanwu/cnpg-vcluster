@@ -686,6 +686,7 @@ def _tenant_kubectl(
     tenant: Tenant,
     *arguments: str,
     check: bool = True,
+    input_text: str | None = None,
 ):
     return run(
         [
@@ -697,6 +698,7 @@ def _tenant_kubectl(
             *arguments,
         ],
         timeout=parse_duration(config["COMMAND_TIMEOUT"]),
+        input_text=input_text,
         check=check,
     )
 

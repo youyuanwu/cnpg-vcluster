@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import tempfile
 import unittest
 import hashlib
@@ -40,6 +41,19 @@ class CnpgTests(unittest.TestCase):
                 "Result",
                 (),
                 {
+                    "stdout": (
+                        '{"data":{"password":"'
+                        + base64.b64encode(b"secret-value").decode()
+                        + '"}}'
+                    ),
+                    "returncode": 0,
+                    "stderr": "",
+                },
+            )(),
+            type(
+                "Result",
+                (),
+                {
                     "stdout": "capi-marker\n",
                     "returncode": 0,
                     "stderr": "",
@@ -58,9 +72,15 @@ class CnpgTests(unittest.TestCase):
             " ".join(str(argument) for argument in call.args)
             for call in kubectl.call_args_list
         ]
-        self.assertTrue(any("exec pod/postgres-1" in item for item in commands))
+        self.assertTrue(any("exec -i pod/postgres-1" in item for item in commands))
+        self.assertTrue(any("-h postgres-rw -U app" in item for item in commands))
         self.assertFalse(any(" apply " in f" {item} " for item in commands))
         self.assertFalse(any(" run " in f" {item} " for item in commands))
+        self.assertFalse(any("secret-value" in item for item in commands))
+        self.assertEqual(
+            kubectl.call_args_list[-1].kwargs["input_text"],
+            "secret-value\n",
+        )
 
     def test_sql_probe_is_removed_after_wait_failure(self) -> None:
         calls: list[tuple[str, ...]] = []

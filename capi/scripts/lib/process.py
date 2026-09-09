@@ -26,6 +26,7 @@ def run(
     timeout: int,
     cwd: Path | None = None,
     env: Mapping[str, str] | None = None,
+    input_text: str | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
     effective = list(command)
@@ -52,6 +53,7 @@ def run(
             effective,
             cwd=cwd,
             env=env,
+            input=input_text,
             check=False,
             capture_output=True,
             text=True,

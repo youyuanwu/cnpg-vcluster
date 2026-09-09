@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import json
 import re
 import time
@@ -388,6 +389,26 @@ def verify_retained_marker(root: Path, config: dict[str, str], tenant) -> None:
     primary = cluster.get("status", {}).get("currentPrimary")
     if not primary:
         raise RuntimeError("CNPG primary identity is absent")
+    secret = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            f"secret/{tenant.cnpg_cluster}-app",
+            "-o",
+            "json",
+        ).stdout
+    )
+    encoded_password = secret.get("data", {}).get("password")
+    if not encoded_password:
+        raise RuntimeError("CNPG application credential is absent")
+    try:
+        password = base64.b64decode(encoded_password, validate=True).decode()
+    except (ValueError, UnicodeDecodeError) as exc:
+        raise RuntimeError("CNPG application credential is invalid") from exc
     result = _tenant_kubectl(
         root,
         config,
@@ -395,19 +416,17 @@ def verify_retained_marker(root: Path, config: dict[str, str], tenant) -> None:
         "-n",
         config["DATABASE_NAMESPACE"],
         "exec",
+        "-i",
         f"pod/{primary}",
         "--",
-        "psql",
-        "-X",
-        "-qAt",
-        "-v",
-        "ON_ERROR_STOP=1",
-        "-U",
-        "postgres",
-        "-d",
-        "app",
-        "-c",
-        "SELECT marker FROM verification WHERE marker='capi-marker';",
+        "sh",
+        "-ec",
+        "IFS= read -r PGPASSWORD; export PGPASSWORD; "
+        "exec psql -X -qAt -v ON_ERROR_STOP=1 "
+        f"-h {tenant.cnpg_cluster}-rw -U app -d app "
+        "-c \"SELECT marker FROM verification "
+        "WHERE marker='capi-marker';\"",
+        input_text=password + "\n",
     ).stdout.strip()
     if not result.splitlines() or result.splitlines()[-1] != "capi-marker":
         raise RuntimeError("CNPG marker was not retained")
