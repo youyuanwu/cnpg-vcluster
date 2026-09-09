@@ -723,26 +723,21 @@ check "complete just task surface" bash -c '
   done
 ' _ "${LAB_ROOT}/Justfile"
 check "Kamaji has no Makefile" test ! -e "${LAB_ROOT}/Makefile"
-check "root Makefile is byte-for-byte unchanged" files_identical_to_main Makefile
-check "root README is a two-lab index with preserved vCluster Make commands" bash -c '
+check "obsolete root Makefile is absent" test ! -e "${LAB_ROOT}/../Makefile"
+check "root README indexes the remaining labs" bash -c '
   file="$1/../README.md"
-  grep -Fq "vCluster lab" "$file" &&
+  grep -Fq "two independent local CloudNativePG experiments" "$file" &&
   grep -Fq "Kamaji lab" "$file" &&
-  grep -Fq "make create" "$file" &&
+  grep -Fq "Cluster API lab" "$file" &&
   grep -Fq "cd kamaji" "$file" &&
-  grep -Fq "just create" "$file"
+  grep -Fq "cd capi" "$file" &&
+  ! grep -Fiq "vcluster" "$file"
 ' _ "${LAB_ROOT}"
-check "vcluster tree is unchanged from main" \
-  git -C "${LAB_ROOT}/.." diff --quiet main -- vcluster
+check "obsolete vcluster lab is absent" test ! -e "${LAB_ROOT}/../vcluster"
 check "no PAW artifact is tracked" \
   test -z "$(git -C "${LAB_ROOT}/.." ls-files .paw)"
 check "no symlink exists below kamaji" \
   test -z "$(find "${LAB_ROOT}" -type l -print)"
-check "scripts/config/task runner do not couple to vcluster paths" bash -c '
-  ! grep -R -F "vcluster/" \
-    "$1/scripts" "$1/config" "$1/Justfile" \
-    --exclude=test-static.sh
-' _ "${LAB_ROOT}"
 
 check "tools verifies the host just prerequisite" \
   has_text 'require_exact_just' "${LAB_ROOT}/scripts/tools.sh"
@@ -1455,8 +1450,7 @@ check "CNPG installation is per-tenant digest-pinned and readiness-gated" bash -
   grep -Fq "cnpg_expected_crds" "$file" &&
   grep -Fq "cnpg_operator_ready" "$file" &&
   grep -Fq "cnpg_tenant_ready" "$file" &&
-  grep -Fq "automountServiceAccountToken: false" "$file" &&
-  ! grep -Fq "vcluster/" "$file"
+  grep -Fq "automountServiceAccountToken: false" "$file"
 ' _ "${LAB_ROOT}"
 check "create gates CNPG after add-ons and preserves skip and pause behavior" bash -c '
   file="$1/scripts/create.sh"
@@ -1720,7 +1714,7 @@ check "introduced-component cleanup polarity is explicit" \
 check "fresh cert-manager failure is targeted and preserves dependencies" \
   fresh_cert_manager_failure_is_targeted
 check "management scripts contain no fallback artifact path" bash -c '
-  ! grep -Eiq "(fallback|stable\\.clastix|license|activation|vcluster/)" \
+  ! grep -Eiq "(fallback|stable\\.clastix|license|activation)" \
     "$1/scripts/create-management.sh" "$1/scripts/lib/management.sh"
 ' _ "${LAB_ROOT}"
 check "create-management stops at zero TCPs and workers" bash -c '

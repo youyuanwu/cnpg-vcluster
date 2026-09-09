@@ -131,13 +131,8 @@ def check_repository_boundaries() -> None:
     check(not any(path.is_symlink() for path in ROOT.rglob("*")), "symlinks below capi are forbidden")
     check((ROOT / "scripts" / "post_renderer.py").stat().st_mode & 0o111 != 0, "post-renderer is not executable")
     repository = ROOT.parent
-    for path in ("Makefile", "kamaji", "vcluster"):
-        result = subprocess.run(
-            ["git", "diff", "--quiet", "main", "--", path],
-            cwd=repository,
-            check=False,
-        )
-        check(result.returncode == 0, f"baseline path changed during CAPI work: {path}")
+    check(not (repository / "Makefile").exists(), "obsolete root Makefile remains")
+    check(not (repository / "vcluster").exists(), "obsolete vcluster lab remains")
     production = [
         ROOT / "Justfile",
         *(ROOT / "config").glob("*"),
@@ -151,8 +146,6 @@ def check_repository_boundaries() -> None:
     forbidden = (
         "../kamaji/.tools",
         "../kamaji/.runtime",
-        "../vcluster/.tools",
-        "../vcluster/.runtime",
         "AzureCluster",
         "CAPZ",
         "az login",
@@ -252,8 +245,8 @@ def check_documentation() -> None:
         "third-party notices omit the direct etcd source URL",
     )
     check(
-        "three independent local CloudNativePG experiments" in root_readme,
-        "root README does not index all three labs",
+        "two independent local CloudNativePG experiments" in root_readme,
+        "root README does not index both remaining labs",
     )
     check(
         (ROOT / "licenses" / "README.md").is_file(),
