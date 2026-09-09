@@ -1036,10 +1036,18 @@ def verify_authoritative_endpoint(
     client: ManagementClient,
     tenant: Tenant,
     registered: dict[str, object],
+    resources: dict[str, dict[str, object]] | None = None,
 ) -> None:
-    cluster = _resource(client, tenant, "cluster", tenant.name)
-    devcluster = _resource(client, tenant, "devcluster", tenant.name)
-    kcp = _resource(client, tenant, "kamajicontrolplane", tenant.name)
+    resources = resources or {}
+    cluster = resources.get("cluster") or _resource(
+        client, tenant, "cluster", tenant.name
+    )
+    devcluster = resources.get("devcluster") or _resource(
+        client, tenant, "devcluster", tenant.name
+    )
+    kcp = resources.get("kamajicontrolplane") or _resource(
+        client, tenant, "kamajicontrolplane", tenant.name
+    )
     if not cluster or not devcluster or not kcp:
         raise RuntimeError("tenant control-plane resources are missing")
     secret = json.loads(

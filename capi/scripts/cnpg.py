@@ -371,6 +371,48 @@ def _verify_marker(root: Path, config: dict[str, str], tenant) -> None:
         raise RuntimeError("CNPG marker was not retained")
 
 
+def verify_retained_marker(root: Path, config: dict[str, str], tenant) -> None:
+    cluster = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            f"cluster/{tenant.cnpg_cluster}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    primary = cluster.get("status", {}).get("currentPrimary")
+    if not primary:
+        raise RuntimeError("CNPG primary identity is absent")
+    result = _tenant_kubectl(
+        root,
+        config,
+        tenant,
+        "-n",
+        config["DATABASE_NAMESPACE"],
+        "exec",
+        f"pod/{primary}",
+        "--",
+        "psql",
+        "-X",
+        "-qAt",
+        "-v",
+        "ON_ERROR_STOP=1",
+        "-U",
+        "postgres",
+        "-d",
+        "app",
+        "-c",
+        "SELECT marker FROM verification WHERE marker='capi-marker';",
+    ).stdout.strip()
+    if not result.splitlines() or result.splitlines()[-1] != "capi-marker":
+        raise RuntimeError("CNPG marker was not retained")
+
+
 def _verify_filesystem(config: dict[str, str], tenant) -> None:
     script = """\
 set -eu

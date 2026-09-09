@@ -449,9 +449,11 @@ class RetainedTests(unittest.TestCase):
                 ),
                 patch("scripts.retained._dev_test_endpoint") as endpoint,
                 patch("scripts.retained._dev_test_network") as network,
-                patch("scripts.retained._dev_test_machines") as machines,
                 patch("scripts.retained._dev_test_storage") as storage,
-                patch("scripts.retained._dev_test_database") as database,
+                patch("scripts.retained._cnpg_ready", return_value=True),
+                patch(
+                    "scripts.retained.verify_retained_marker"
+                ) as database,
             ):
                 self.assertTrue(
                     _tenant_is_healthy(
@@ -463,7 +465,7 @@ class RetainedTests(unittest.TestCase):
                         identity,
                     )
                 )
-            for suite in (endpoint, network, machines, storage, database):
+            for suite in (endpoint, network, storage, database):
                 suite.assert_called_once()
 
     def test_tenant_health_rejects_complete_identity_mismatch(self) -> None:

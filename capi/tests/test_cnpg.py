@@ -11,6 +11,7 @@ from scripts.cnpg import (
     _render_cluster,
     _sql,
     _verify_marker,
+    verify_retained_marker,
     cnpg_artifacts_present,
     delete_cnpg,
     run_cnpg_gate,
@@ -19,6 +20,48 @@ from scripts.lib.files import ensure_private_dir
 
 
 class CnpgTests(unittest.TestCase):
+    def test_retained_marker_uses_existing_primary_without_creating_pod(
+        self,
+    ) -> None:
+        tenant = type(
+            "Tenant", (), {"name": "tenant-a", "cnpg_cluster": "postgres"}
+        )()
+        responses = [
+            type(
+                "Result",
+                (),
+                {
+                    "stdout": '{"status":{"currentPrimary":"postgres-1"}}',
+                    "returncode": 0,
+                    "stderr": "",
+                },
+            )(),
+            type(
+                "Result",
+                (),
+                {
+                    "stdout": "capi-marker\n",
+                    "returncode": 0,
+                    "stderr": "",
+                },
+            )(),
+        ]
+        with patch(
+            "scripts.cnpg._tenant_kubectl", side_effect=responses
+        ) as kubectl:
+            verify_retained_marker(
+                Path("."),
+                {"DATABASE_NAMESPACE": "database"},
+                tenant,
+            )
+        commands = [
+            " ".join(str(argument) for argument in call.args)
+            for call in kubectl.call_args_list
+        ]
+        self.assertTrue(any("exec pod/postgres-1" in item for item in commands))
+        self.assertFalse(any(" apply " in f" {item} " for item in commands))
+        self.assertFalse(any(" run " in f" {item} " for item in commands))
+
     def test_sql_probe_is_removed_after_wait_failure(self) -> None:
         calls: list[tuple[str, ...]] = []
         tenant = type(

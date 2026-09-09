@@ -55,6 +55,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         "management/kubeconfig",
         "management/offline-registry.json",
         "retained-management.json",
+        "evidence/dev-up-success.json",
         "rendered/cert-manager.yaml",
         "rendered/kind.yaml",
         "rendered/kamaji.yaml",

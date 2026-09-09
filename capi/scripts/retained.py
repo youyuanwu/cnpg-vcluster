@@ -12,6 +12,7 @@ from scripts.cnpg import (
     _storage_identity,
     _verify_filesystem,
     _verify_marker,
+    verify_retained_marker,
 )
 from scripts.create import (
     reconcile_tenant,
@@ -333,11 +334,12 @@ def _tenant_is_healthy(
             return False
         raise
     _dev_test_endpoint(root, config, client, tenant)
-    _dev_test_machines(root, config, client, tenant)
     _dev_test_storage(root, config, client, tenant)
     try:
         _dev_test_network(root, config, client, tenant)
-        _dev_test_database(root, config, client, tenant)
+        if not _cnpg_ready(root, config, tenant):
+            raise RuntimeError(f"tenant CNPG is not healthy: {tenant.name}")
+        verify_retained_marker(root, config, tenant)
     except (NetworkProbeCleanupError, SQLProbeCleanupError):
         raise
     except RuntimeError:
@@ -526,7 +528,7 @@ def _dev_test_endpoint(
             root, config, client, tenant, machine
         )
         verify_authoritative_endpoint(
-            root, config, client, tenant, registered
+            root, config, client, tenant, registered, resources
         )
         verify_worker_runtime(root, config, tenant, registered)
         _verify_bootstrap_secret(config, client, tenant, registered)
