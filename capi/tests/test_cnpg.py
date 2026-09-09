@@ -7,6 +7,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.cnpg import (
+    SQLProbeCleanupError,
     _render_cluster,
     _sql,
     _verify_marker,
@@ -64,6 +65,42 @@ class CnpgTests(unittest.TestCase):
                 for call in calls
             )
         )
+
+    def test_sql_probe_cleanup_inspection_failure_is_fatal(self) -> None:
+        tenant = type(
+            "Tenant", (), {"name": "spike", "cnpg_cluster": "postgres"}
+        )()
+
+        def kubectl(*args, **_kwargs):
+            if "get" in args:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": "tenant API connection refused",
+                    },
+                )()
+            stdout = "1\n" if "exec" in args else ""
+            return type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": stdout, "stderr": ""},
+            )()
+
+        config = {
+            "DATABASE_NAMESPACE": "database",
+            "POSTGRES_IMAGE": "postgres@sha256:" + "a" * 64,
+            "SQL_TIMEOUT": "10s",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch("scripts.cnpg._tenant_kubectl", side_effect=kubectl),
+                patch("scripts.cnpg.time.time_ns", return_value=123),
+            ):
+                with self.assertRaises(SQLProbeCleanupError):
+                    _sql(Path(temporary), config, tenant, "SELECT 1;")
 
     def test_marker_verification_is_read_only(self) -> None:
         tenant = type(

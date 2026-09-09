@@ -26,6 +26,7 @@ from scripts.lib.files import IntegrityError, write_private_file
 from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
 from scripts.lib.tenants import (
+    NOT_FOUND,
     _tenant_kubectl,
     apply_bootstrap_rbac,
     apply_control_plane,
@@ -51,6 +52,19 @@ from scripts.lib.images import (
 
 TENANT_COMPATIBILITY_REVISION = "capi-kamaji-two-tenant-v1"
 CNPG_COMPATIBILITY_REVISION = "docker-volume-hostpath-v1"
+
+
+def _incomplete_snapshot_error(exc: RuntimeError) -> bool:
+    message = str(exc)
+    return bool(
+        NOT_FOUND.search(message)
+        or "no such object" in message.lower()
+        or message.startswith("Machine is not Ready:")
+        or message.startswith("DevMachine is not Ready:")
+        or message == "three-worker topology is not exact"
+        or message
+        == "Machine, DevMachine, container, and Node sets do not match"
+    )
 
 
 def _require_compatibility(config: dict[str, str]) -> None:
@@ -203,8 +217,8 @@ def stable_tenant_snapshot(
                 tenant_kubeconfig_path(root, tenant).read_bytes()
             ).hexdigest(),
         }
-    except RuntimeError:
-        if allow_incomplete:
+    except RuntimeError as exc:
+        if allow_incomplete and _incomplete_snapshot_error(exc):
             return None
         raise
 

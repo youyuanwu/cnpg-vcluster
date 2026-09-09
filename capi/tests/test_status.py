@@ -6,6 +6,7 @@ from unittest.mock import patch
 
 from scripts.status import (
     collect_management_status,
+    collect_tenant_status,
     management_status_healthy,
 )
 
@@ -45,6 +46,37 @@ class StatusTests(unittest.TestCase):
             )
         self.assertFalse(management_status_healthy(result))
         client.assert_not_called()
+
+    def test_strict_tenant_status_propagates_inspection_failure(self) -> None:
+        tenant = type(
+            "Tenant",
+            (),
+            {
+                "name": "tenant-a",
+                "vip": "172.18.0.10",
+                "domain": "tenant.test",
+                "cnpg_cluster": "postgres",
+            },
+        )()
+        with (
+            patch(
+                "scripts.status._control_plane_layer_status",
+                return_value={"ready": True},
+            ),
+            patch(
+                "scripts.status.network_status",
+                side_effect=RuntimeError("tenant API connection refused"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "connection refused"):
+                collect_tenant_status(
+                    Path("."),
+                    {"SPIKE_API_PORT": "6443"},
+                    object(),
+                    tenant,
+                    {},
+                    strict=True,
+                )
 
 
 if __name__ == "__main__":

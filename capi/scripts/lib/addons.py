@@ -567,6 +567,8 @@ def network_status(
     config: dict[str, str],
     client: ManagementClient,
     tenant: Tenant,
+    *,
+    strict: bool = False,
 ) -> dict[str, object]:
     result: dict[str, object] = {"ready": False}
     if not (root / ".runtime" / "tenants" / tenant.name / "kubeconfig").is_file():
@@ -744,6 +746,8 @@ def network_status(
             }
         )
     except RuntimeError as exc:
+        if strict:
+            raise
         result["reason"] = str(exc)
     return result
 

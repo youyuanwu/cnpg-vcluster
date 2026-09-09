@@ -320,9 +320,9 @@ def _tenant_is_healthy(
         raise RuntimeError(
             f"retained tenant identity is incompatible: {tenant.name}"
         )
-    if not collect_tenant_status(root, config, client, tenant, cluster).get(
-        "ready"
-    ):
+    if not collect_tenant_status(
+        root, config, client, tenant, cluster, strict=True
+    ).get("ready"):
         return False
     verify_addon_source_ownership(
         root, config, client, tenant, require_present=True
@@ -423,6 +423,13 @@ def dev_up(root: Path, config: dict[str, str]) -> None:
                     config, client, tenant
                 )
                 cluster = owned.get("cluster")
+                journal = _journal_path(root, tenant)
+                if cluster is not None and (
+                    journal.exists() or journal.is_symlink()
+                ):
+                    raise RuntimeError(
+                        f"pending tenant deletion blocks reconciliation: {tenant.name}"
+                    )
                 if cluster is not None and _tenant_is_healthy(
                     root,
                     config,

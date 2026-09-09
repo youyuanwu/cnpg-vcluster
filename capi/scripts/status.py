@@ -14,7 +14,12 @@ from scripts.lib.management import (
 from scripts.lib.providers import provider_status
 from scripts.lib.addons import network_status
 from scripts.lib.process import run
-from scripts.lib.tenants import _tenant_kubectl, configured_tenants, spike_tenant
+from scripts.lib.tenants import (
+    NOT_FOUND,
+    _tenant_kubectl,
+    configured_tenants,
+    spike_tenant,
+)
 from scripts.lib.tenants import (
     inspect_storage_volume,
     storage_record_path,
@@ -120,11 +125,19 @@ def _machine_layer_status(root: Path, config: dict[str, str], client, tenant):
     return layers
 
 
-def _storage_layer_status(root: Path, config: dict[str, str], tenant):
+def _storage_layer_status(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+    *,
+    strict: bool = False,
+):
     volume_name = storage_volume_name(config, tenant)
     try:
         payload = inspect_storage_volume(volume_name)
     except RuntimeError as exc:
+        if strict:
+            raise
         return {"ready": False, "reason": "inspection-failed", "message": str(exc)}
     if payload is None:
         return {"ready": False, "reason": "volume-missing"}
@@ -195,7 +208,13 @@ def _storage_layer_status(root: Path, config: dict[str, str], tenant):
     return result
 
 
-def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
+def _cnpg_layer_status(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+    *,
+    strict: bool = False,
+):
     cluster = _tenant_kubectl(
         root,
         config,
@@ -209,6 +228,10 @@ def _cnpg_layer_status(root: Path, config: dict[str, str], tenant):
         check=False,
     )
     if cluster.returncode != 0:
+        if strict and not NOT_FOUND.search(cluster.stderr):
+            raise RuntimeError(
+                f"tenant CNPG inspection failed: {tenant.name}: {cluster.stderr}"
+            )
         return {"ready": False, "reason": "cluster-missing"}
     cluster_payload = json.loads(cluster.stdout)
     pods = json.loads(
@@ -356,6 +379,8 @@ def collect_tenant_status(
     client: ManagementClient,
     tenant,
     cluster_payload: dict[str, object],
+    *,
+    strict: bool = False,
 ) -> dict[str, object]:
     result: dict[str, object] = {
         "endpoint": f"{tenant.vip}:{config['SPIKE_API_PORT']}",
@@ -364,16 +389,24 @@ def collect_tenant_status(
         "controlPlane": _control_plane_layer_status(
             config, client, tenant, cluster_payload
         ),
-        "network": network_status(root, config, client, tenant),
+        "network": network_status(
+            root, config, client, tenant, strict=strict
+        ),
     }
     try:
         result["machines"] = _machine_layer_status(
             root, config, client, tenant
         )
     except RuntimeError as exc:
+        if strict:
+            raise
         result["machines"] = {"ready": False, "reason": str(exc)}
-    result["storage"] = _storage_layer_status(root, config, tenant)
-    result["cnpg"] = _cnpg_layer_status(root, config, tenant)
+    result["storage"] = _storage_layer_status(
+        root, config, tenant, strict=strict
+    )
+    result["cnpg"] = _cnpg_layer_status(
+        root, config, tenant, strict=strict
+    )
     result["ready"] = all(
         result[layer].get("ready")
         for layer in (
