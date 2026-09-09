@@ -60,10 +60,14 @@ After it succeeds, `just tools` and `just preflight` verify and use the local
 cache without Git or registry lookups. `just test-e2e-offline` applies the same
 policy to the clean-to-clean gate by blocking acquisition commands, forcing
 Docker consumers to `--pull=never`, and denying external HTTP/HTTPS inside the
-disposable nodes. The current pinned Kamaji release still renders tenant
-API-server and Konnectivity containers with `imagePullPolicy: Always`; the
-offline gate intentionally fails closed at that upstream behavior rather than
-silently allowing registry access.
+disposable nodes. The pinned Kamaji release renders tenant API-server and
+Konnectivity containers with `imagePullPolicy: Always` and exposes no supported
+pull-policy field. Offline management therefore starts an owner-labeled
+Distribution registry only on the private kind Docker network. Its read-only
+storage is generated from the verified active cache, maps the original
+`registry.k8s.io` tags and digests to their pinned OCI manifests, and is
+configured as the management node's only local mirror before tenant
+reconciliation. External registry egress remains denied.
 
 Use the targeted suites during development instead of repeatedly running the
 full isolation gate:
@@ -269,6 +273,17 @@ are imported before ClusterResourceSet workloads and retain exact
 digest-qualified runtime validation. Runtime transforms still replace expected
 tags only and fail on changed image counts or unresolved placeholders.
 
+The enforced-offline path additionally verifies and restores the pinned
+Kubernetes API-server, controller-manager, scheduler, Konnectivity server, and
+Distribution images. It creates an owner-only registry storage tree from the
+active immutable generation, verifies every served manifest/blob digest, and
+starts the registry without a published host port. The registry is reachable
+only on the disposable management Docker network. Containerd's
+`registry.k8s.io` host configuration points to that endpoint while preserving
+the upstream server as a fail-closed fallback; the node egress rule rejects any
+fallback attempt. Cleanup requires the exact recorded container ID, image ID,
+labels, network, address, generation-backed file inventory, and checksums.
+
 ## Lifecycle timing
 
 The clean-to-clean gates print one `CAPI_TIMING` JSON record for each of:
@@ -277,6 +292,9 @@ The clean-to-clean gates print one `CAPI_TIMING` JSON record for each of:
 `tenant_workers_network`, `cnpg_readiness_sql`, and `teardown`. Records contain
 only schema, phase, passed/failed/skipped status, and elapsed seconds. They do
 not include commands, environment values, credentials, or exception text.
+The enforced-offline gate also prints `CAPI_OFFLINE_EGRESS` records with the
+node and counted reject-rule packets, plus `CAPI_OFFLINE_MIRROR` records for
+each exact digest-qualified image exercised through the local mirror.
 
 Exact versions, URLs, checksums, source commits, and image digests are in
 [`config/versions.env`](config/versions.env). See
@@ -290,6 +308,9 @@ Exact versions, URLs, checksums, source commits, and image digests are in
 - Kamaji is pinned to an experimental edge release.
 - Local static hostPath storage is not an Azure storage simulation.
 - The management kind node mounts the host Docker socket for CAPD.
+- The offline registry is an ephemeral, unauthenticated service on the private
+  disposable kind Docker network only; it has no published host port and is
+  removed by authoritative teardown.
 - `just create` reconciles tenants sequentially, favoring deterministic
   diagnostics over speed.
 - No Azure provider, credentials, resources, commands, or executable manifests

@@ -37,6 +37,14 @@ MANAGEMENT_IMAGE_KEYS = (
     "KAMAJI_ETCD_JOB_IMAGE",
     "KAMAJI_KUBECTL_JOB_IMAGE",
     "KONNECTIVITY_SERVER_IMAGE",
+    "KUBE_APISERVER_IMAGE",
+    "KUBE_CONTROLLER_MANAGER_IMAGE",
+    "KUBE_SCHEDULER_IMAGE",
+)
+
+MANAGEMENT_HOST_IMAGE_KEYS = (
+    "OFFLINE_REGISTRY_IMAGE",
+    *MANAGEMENT_IMAGE_KEYS,
 )
 
 WORKER_IMAGE_KEYS = (
@@ -118,7 +126,7 @@ def enforce_offline_node_egress(
             f"iptables -Z {chain}; "
             "timeout 3 bash -c '</dev/tcp/1.1.1.1/443'; rc=$?; "
             f"hits=$(iptables -L {chain} -n -v -x | "
-            "awk '$1 ~ /^[0-9]+$/ && $8 == \"1.1.1.1\" {sum += $1} "
+            "awk '$1 ~ /^[0-9]+$/ && $9 == \"1.1.1.1\" {sum += $1} "
             "END {print sum + 0}'); "
             "printf '%s %s\\n' \"$rc\" \"$hits\"",
         ],
@@ -138,6 +146,19 @@ def enforce_offline_node_egress(
             f"offline egress probe could not verify denial for {container}: "
             f"exit {probe_returncode}"
         )
+    print(
+        "CAPI_OFFLINE_EGRESS "
+        + json.dumps(
+            {
+                "container": container,
+                "probe": "1.1.1.1:443",
+                "rejectedPackets": hits,
+                "schema": 1,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
 
 
 def _container_has_image(container: str, reference: str, timeout: int) -> bool:
@@ -356,7 +377,18 @@ def preload_worker_images(
         started = time.monotonic()
         try:
             import_container_images(root, config, container, WORKER_IMAGE_KEYS)
+            from scripts.lib.registry import (
+                configure_offline_registry_node,
+                verify_offline_registry_pulls,
+            )
+
+            configure_offline_registry_node(root, config, container)
             enforce_offline_node_egress(root, config, container)
+            verify_offline_registry_pulls(
+                config,
+                container,
+                ("CNPG_CONTROLLER_IMAGE",),
+            )
         except BaseException as exc:
             return {
                 "node": container,

@@ -5,6 +5,8 @@ import tempfile
 import threading
 import unittest
 import os
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
@@ -40,14 +42,16 @@ class ImagePreloadTests(unittest.TestCase):
                     ],
                 ) as run,
             ):
-                enforce_offline_node_egress(
-                    root,
-                    {
-                        "MANAGEMENT_POD_CIDR": "10.210.0.0/16",
-                        "TENANT_A_POD_CIDR": "10.70.0.0/16",
-                    },
-                    "worker-a",
-                )
+                output = StringIO()
+                with redirect_stdout(output):
+                    enforce_offline_node_egress(
+                        root,
+                        {
+                            "MANAGEMENT_POD_CIDR": "10.210.0.0/16",
+                            "TENANT_A_POD_CIDR": "10.70.0.0/16",
+                        },
+                        "worker-a",
+                    )
             scripts = [
                 call.args[0][-1]
                 for call in run.call_args_list
@@ -61,6 +65,11 @@ class ImagePreloadTests(unittest.TestCase):
             probe = run.call_args_list[-1].args[0]
             self.assertIn("timeout 3", probe[-1])
             self.assertIn("iptables -Z", probe[-1])
+            self.assertIn('$9 == "1.1.1.1"', probe[-1])
+            evidence = json.loads(
+                output.getvalue().removeprefix("CAPI_OFFLINE_EGRESS ")
+            )
+            self.assertEqual(evidence["rejectedPackets"], 1)
 
     def test_offline_node_guard_rejects_successful_or_broken_probe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

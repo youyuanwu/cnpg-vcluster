@@ -273,10 +273,20 @@ of being repeated in a long mega-test.
 
 `just test-e2e-offline` attempts the same lifecycle while blocking host
 acquisition commands, forcing Docker runs not to pull, and rejecting external
-HTTP/HTTPS egress from disposable node runtimes. With the current pinned
-Kamaji release it fails closed when generated tenant API-server and
-Konnectivity containers request `imagePullPolicy: Always`; this is retained as
-an explicit unresolved upstream compatibility finding rather than bypassing
-the registry-denial proof. Both gates emit structured durations for
+HTTP/HTTPS egress from disposable node runtimes. The pinned Kamaji API has
+registry/image-name overrides and extra-container fields but no supported pull
+policy for its generated API-server or Konnectivity containers, while the
+controller unconditionally renders `imagePullPolicy: Always`. Before
+reconciliation, the offline path therefore materializes a read-only
+Distribution storage tree exclusively from the verified active cache, starts
+an exactly owned registry on the private management Docker network, and
+configures the management node's `registry.k8s.io` containerd host to resolve
+through it. The served tag and digest endpoints retain the pinned upstream OCI
+index and selected `linux/amd64` manifest identities. No host port is
+published, registry fallback remains subject to active egress rejection, and
+teardown validates the registry container and every generated file before
+removing them. Both gates emit structured durations for
 cache/tools, cleanup, host preparation, management, tenant control plane,
-worker/network, CNPG/SQL, and teardown phases.
+worker/network, CNPG/SQL, and teardown phases. The offline gate additionally
+emits structured per-node reject-counter evidence and exact mirror-pull
+records.

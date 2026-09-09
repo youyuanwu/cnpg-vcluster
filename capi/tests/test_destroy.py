@@ -49,9 +49,11 @@ class DestroyTests(unittest.TestCase):
                     return_value={
                         "containers": ["worker"],
                         "probes": [],
+                        "registries": [],
                         "volumes": [],
                     },
                 ),
+                patch("scripts.destroy.delete_offline_registry"),
                 patch("scripts.destroy.restore_inotify") as restore,
             ):
                 with self.assertRaisesRegex(RuntimeError, "residue remains"):
@@ -65,6 +67,7 @@ class DestroyTests(unittest.TestCase):
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="probe-a\n", returncode=0, stderr=""),
+            Mock(stdout="registry-a\n", returncode=0, stderr=""),
             Mock(stdout="", returncode=1, stderr="No such volume"),
             Mock(stdout="[]", returncode=0, stderr=""),
             Mock(stdout="", returncode=1, stderr="No such volume"),
@@ -80,10 +83,12 @@ class DestroyTests(unittest.TestCase):
             )
         self.assertEqual(residue["containers"], ["worker-a"])
         self.assertEqual(residue["probes"], ["probe-a"])
+        self.assertEqual(residue["registries"], ["registry-a"])
         self.assertEqual(residue["volumes"], ["lab-tenant-a-storage"])
 
     def test_host_residue_rejects_volume_inspection_failure(self) -> None:
         responses = [
+            Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
@@ -141,6 +146,7 @@ class DestroyTests(unittest.TestCase):
                     "scripts.destroy_tenant.finish_journaled_tenant_deletion"
                 ) as finish_journaled,
                 patch("scripts.destroy._delete_kubernetes_stack"),
+                patch("scripts.destroy.delete_offline_registry"),
                 patch("scripts.destroy.delete_management"),
                 patch("scripts.destroy.restore_inotify"),
             ):

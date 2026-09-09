@@ -16,6 +16,7 @@ from scripts.lib.process import run
 from scripts.lib.redaction import redact
 from scripts.tools import verify_all_inputs
 from scripts.lib.timing import PhaseTimings
+from scripts.lib.registry import registry_name
 
 
 def run_just(
@@ -24,7 +25,7 @@ def run_just(
     *arguments: str,
     check: bool = True,
 ):
-    return run(
+    result = run(
         [
             str(resolve_host_just(root, config)),
             "--justfile",
@@ -36,6 +37,10 @@ def run_just(
         env={**os.environ, "CAPI_E2E_CHILD": "1"},
         check=check,
     )
+    for line in result.stdout.splitlines():
+        if line.startswith("CAPI_OFFLINE_"):
+            print(line)
+    return result
 
 
 def verify_no_lab_residue(config: dict[str, str]) -> None:
@@ -71,6 +76,13 @@ def verify_no_lab_residue(config: dict[str, str]) -> None:
     ).stdout.split()
     if volumes:
         raise RuntimeError(f"owned Docker volumes remain: {volumes}")
+    registry = run(
+        ["docker", "inspect", registry_name(config)],
+        timeout=30,
+        check=False,
+    )
+    if registry.returncode == 0:
+        raise RuntimeError("offline registry container remained after teardown")
 
 
 def run_e2e() -> int:

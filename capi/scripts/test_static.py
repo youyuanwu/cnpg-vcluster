@@ -197,6 +197,8 @@ def check_documentation() -> None:
         "The retained workflow is a development optimization, not a final gate",
         "`tools_cache`",
         "does not silently acquire missing content",
+        "owner-only registry storage tree",
+        "only on the private kind Docker network",
     )
     required_design = (
         "SkipInfraClusterPatch=true",
@@ -214,6 +216,7 @@ def check_documentation() -> None:
         "Verified acquisition and image distribution",
         "explicit concurrent import and exact-target verification barrier",
         "`just test-e2e-offline`",
+        "Distribution storage tree exclusively from the verified active cache",
     )
     for token in required_readme:
         check(
@@ -231,6 +234,7 @@ def check_documentation() -> None:
         "CloudNativePG",
         "PostgreSQL",
         "BusyBox",
+        "Distribution",
     ):
         check(project in notices, f"third-party notices omit {project}")
     direct_etcd = (

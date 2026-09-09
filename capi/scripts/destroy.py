@@ -28,18 +28,30 @@ from scripts.lib.tenants import (
     verify_tenant_management_ownership,
 )
 from scripts.lib.process import run
+from scripts.lib.registry import (
+    delete_offline_registry,
+    registry_name,
+    validate_registry_state_files,
+)
 
 
 def _validate_runtime_inventory(root: Path) -> None:
     runtime = root / ".runtime"
     if not runtime.exists():
         return
+    registry_record = runtime / "management" / "offline-registry.json"
+    registry_data = runtime / "management" / "offline-registry-data"
+    if registry_record.exists() != registry_data.exists():
+        raise RuntimeError("offline registry runtime state is partial")
+    if registry_record.exists():
+        validate_registry_state_files(root)
     allowed_files = {
         "host/inotify.json",
         "host/.lock",
         "management/identity.json",
         "management/network.json",
         "management/kubeconfig",
+        "management/offline-registry.json",
         "retained-management.json",
         "rendered/cert-manager.yaml",
         "rendered/kind.yaml",
@@ -92,6 +104,7 @@ def _validate_runtime_inventory(root: Path) -> None:
             r"^rendered/cnpg/(capi-worker-spike|tenant-a|tenant-b)/"
             r"((operator|cluster|static-pvs)\.yaml|cross-db-[a-z0-9-]+\.json)$"
         ),
+        re.compile(r"^rendered/registry-hosts-[a-z0-9.-]+\.toml$"),
         re.compile(
             r"^tenants/cross-(tenant-a-to-tenant-b|tenant-b-to-tenant-a)"
             r"\.kubeconfig$"
@@ -100,6 +113,10 @@ def _validate_runtime_inventory(root: Path) -> None:
     )
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
+        if relative == "management/offline-registry-data" or relative.startswith(
+            "management/offline-registry-data/"
+        ):
+            continue
         details = path.lstat()
         if stat.S_ISLNK(details.st_mode):
             raise RuntimeError(f"runtime path is a symlink: {relative}")
@@ -228,6 +245,16 @@ def inspect_host_residue(config: dict[str, str]) -> dict[str, list[str]]:
         ],
         timeout=30,
     ).stdout.split()
+    registries = run(
+        [
+            "docker",
+            "ps",
+            "-aq",
+            "--filter",
+            f"name=^{registry_name(config)}$",
+        ],
+        timeout=30,
+    ).stdout.split()
     volumes = []
     for name in clusters:
         volume_name = f"{config['LAB_PREFIX']}-{name}-storage"
@@ -246,6 +273,7 @@ def inspect_host_residue(config: dict[str, str]) -> dict[str, list[str]]:
     return {
         "containers": sorted(set(containers)),
         "probes": sorted(set(probes)),
+        "registries": sorted(set(registries)),
         "volumes": sorted(volumes),
     }
 
@@ -372,9 +400,11 @@ def destroy(root: Path, config: dict[str, str]) -> None:
                 _delete_storage(root, config, tenant)
             delete_addons(root, config, client, tenant)
             delete_tenant(root, config, client, tenant)
+        delete_offline_registry(root, config)
         _delete_kubernetes_stack(root, config, client)
         delete_management(root, config)
     else:
+        delete_offline_registry(root, config)
         residue = inspect_host_residue(config)
         if any(residue.values()):
             raise RuntimeError(

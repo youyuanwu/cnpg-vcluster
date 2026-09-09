@@ -21,6 +21,9 @@ class ManagementTests(unittest.TestCase):
             patch("scripts.create_management.reconcile_kind", side_effect=lambda *_: calls.append("kind") or object()),
             patch("scripts.create_management.import_container_images", side_effect=lambda *_: calls.append("import")),
             patch("scripts.create_management.reconcile_network", side_effect=lambda *_: calls.append("network") or {}),
+            patch("scripts.create_management.reconcile_offline_registry", side_effect=lambda *_: calls.append("registry")),
+            patch("scripts.create_management.enforce_offline_node_egress", side_effect=lambda *_: calls.append("egress")),
+            patch("scripts.create_management.verify_offline_registry_pulls", side_effect=lambda *_: calls.append("mirror-pulls")),
             patch("scripts.create_management.reconcile_cert_manager", side_effect=lambda *_: calls.append("cert-manager")),
             patch("scripts.create_management.reconcile_metallb"),
             patch("scripts.create_management.reconcile_kamaji"),
@@ -29,7 +32,17 @@ class ManagementTests(unittest.TestCase):
             create_management(Path("."), config)
         self.assertEqual(
             calls,
-            ["preflight", "restore", "kind", "import", "network", "cert-manager"],
+            [
+                "preflight",
+                "restore",
+                "kind",
+                "import",
+                "network",
+                "registry",
+                "egress",
+                "mirror-pulls",
+                "cert-manager",
+            ],
         )
 
     def test_metallb_webhook_connection_refusal_is_retryable(self) -> None:
