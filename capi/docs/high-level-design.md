@@ -54,6 +54,27 @@ flowchart TB
 The management kind node mounts `/var/run/docker.sock` because CAPD creates
 worker and load-balancer containers through the host Docker daemon.
 
+## Verified acquisition and image distribution
+
+Online acquisition is explicit. A cache generation contains the pinned file
+inputs plus one checksum-recorded OCI archive for every tagged/digest image
+pair. The archive retains the upstream index digest, the selected
+`linux/amd64` manifest, and its content blobs. The generation becomes active
+only after complete local verification; ordinary preflight does not refresh
+Git tags, charts, or registry descriptors.
+
+The host restores the exact kind node and controller images before kind or
+CAPD consumes them. After kind creation, management images are imported into
+the node's `k8s.io` containerd namespace before controller workloads are
+applied.
+
+The same cache is mounted read-only into every CAPD worker. Orchestration waits
+for all new worker containers and their containerd sockets, then runs an
+explicit concurrent import and exact-target verification barrier before
+ClusterResourceSet application. The replacement path performs the same
+barrier before accepting network readiness. This ordering prevents add-on and
+CNPG validation from racing image availability.
+
 ## Resource model
 
 Each tenant is represented in the management cluster by:
@@ -109,6 +130,13 @@ Machine-to-MachineSet-to-MachineDeployment UID and ownership chain.
 Workers are privileged `kindest/node` containers with private cgroup
 namespaces. They remain a shared-host development mechanism, not hostile
 tenant isolation.
+
+A separate retained-management development mode binds the current management
+identity to the user, repository root, branch and revision, configuration,
+host, and Docker daemon. It may recreate tenant A repeatedly, but it rejects
+partial or incompatible state and never replaces the final clean-to-clean
+gate. Its cleanup uses the same authoritative destroy and host restoration
+path.
 
 ## Networking and ClusterResourceSet handoff
 
@@ -242,3 +270,13 @@ representative tenant, requires one three-instance PostgreSQL cluster and SQL
 marker healthy, then performs complete teardown and host restoration. The
 two-tenant and disruption guarantees remain in their targeted suites instead
 of being repeated in a long mega-test.
+
+`just test-e2e-offline` attempts the same lifecycle while blocking host
+acquisition commands, forcing Docker runs not to pull, and rejecting external
+HTTP/HTTPS egress from disposable node runtimes. With the current pinned
+Kamaji release it fails closed when generated tenant API-server and
+Konnectivity containers request `imagePullPolicy: Always`; this is retained as
+an explicit unresolved upstream compatibility finding rather than bypassing
+the registry-denial proof. Both gates emit structured durations for
+cache/tools, cleanup, host preparation, management, tenant control plane,
+worker/network, CNPG/SQL, and teardown phases.

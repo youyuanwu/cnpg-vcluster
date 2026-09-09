@@ -15,6 +15,7 @@ from scripts.lib.images import (
     MANAGEMENT_IMAGE_KEYS,
     import_container_images,
     restore_host_images,
+    enforce_offline_node_egress,
 )
 
 
@@ -33,6 +34,11 @@ def create_management(root: Path, config: dict[str, str]) -> None:
         MANAGEMENT_IMAGE_KEYS,
     )
     network = reconcile_network(root, config)
+    enforce_offline_node_egress(
+        root,
+        config,
+        f"{config['KIND_CLUSTER_NAME']}-control-plane",
+    )
     reconcile_cert_manager(root, config, client)
     reconcile_metallb(root, config, client, network)
     reconcile_kamaji(root, config, client)

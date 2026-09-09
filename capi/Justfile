@@ -123,5 +123,9 @@ test-tenant-lifecycle:
 test-e2e:
     @python3 scripts/test_e2e.py
 
+# [implemented] Run clean-to-clean with host acquisition and node registry egress denied.
+test-e2e-offline:
+    @CAPI_OFFLINE_ENFORCED=1 python3 scripts/test_e2e.py
+
 _restore-host:
     @python3 scripts/lab.py restore-host

@@ -18,7 +18,6 @@ from scripts.lib.tenants import (
     storage_volume_name,
     validate_tenant_kubeconfig_view,
     verify_worker_preload_contract,
-    worker_preload_commands,
 )
 from scripts.lib.files import IntegrityError
 from scripts.lib.images import WORKER_IMAGE_KEYS
@@ -33,14 +32,18 @@ class TenantTests(unittest.TestCase):
             key: f"example/{key.lower()}:v1@sha256:{index:064x}"
             for index, key in enumerate(WORKER_IMAGE_KEYS, 1)
         }
-        commands = worker_preload_commands(config)
+        config.update(
+            {
+                f"{key}_TAGGED": config[key].split("@", 1)[0]
+                for key in WORKER_IMAGE_KEYS
+            }
+        )
         devmachine = {
             "spec": {
                 "template": {
                     "spec": {
                         "backend": {
                             "docker": {
-                                "preLoadImages": sorted(config.values()),
                                 "extraMounts": [
                                     {
                                         "hostPath": "/repo/.tools/cache",
@@ -54,27 +57,19 @@ class TenantTests(unittest.TestCase):
                 }
             }
         }
-        kubeadm = {
-            "spec": {"template": {"spec": {"preKubeadmCommands": commands}}}
-        }
         client = type("Client", (), {})()
         client.kubectl = lambda *args: type(
             "Result",
             (),
             {
                 "stdout": json.dumps(
-                    devmachine if "devmachinetemplate/tenant-a-worker" in args else kubeadm
+                    devmachine
                 )
             },
         )()
         verify_worker_preload_contract(
             Path("/repo"), config, client, tenant
         )
-        kubeadm["spec"]["template"]["spec"]["preKubeadmCommands"][0] = "true"
-        with self.assertRaisesRegex(RuntimeError, "exact preload commands"):
-            verify_worker_preload_contract(
-                Path("/repo"), config, client, tenant
-            )
 
     def test_worker_preload_values_are_sorted_exact_references(self) -> None:
         tenant = Tenant(
@@ -114,15 +109,9 @@ class TenantTests(unittest.TestCase):
             4,
         ):
             config[key] = f"example/{key.lower()}:v1@sha256:{index:064x}"
-        values = _tenant_values(Path("/repo"), config, tenant)
-        lines = values["WORKER_PRELOAD_IMAGES"].splitlines()
-        references = [line.strip().removeprefix("- ") for line in lines]
-        self.assertEqual(references, sorted(references))
-        self.assertTrue(all("@sha256:" in reference for reference in references))
-        commands = values["WORKER_PRELOAD_COMMANDS"]
         for key in WORKER_IMAGE_KEYS:
-            self.assertIn(config[key], commands)
-            self.assertIn(f"/images/{key.lower()}.tar", commands)
+            config[f"{key}_TAGGED"] = config[key].split("@", 1)[0]
+        values = _tenant_values(Path("/repo"), config, tenant)
         self.assertEqual(
             values["IMAGE_CACHE_HOST_PATH"],
             "/repo/.tools/cache",

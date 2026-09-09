@@ -44,6 +44,7 @@ EXPECTED_RECIPES = {
     "test-management",
     "test-tenant-lifecycle",
     "test-e2e",
+    "test-e2e-offline",
 }
 
 
@@ -192,6 +193,10 @@ def check_documentation() -> None:
         "Kubernetes controllers own CAPI and provider resource reconciliation.",
         "Host code owns only exact kind/CAPD Docker identities, tenant Docker volumes, runtime records, and host setting restoration.",
         "while retaining its PVC, PV, and bytes.",
+        "`just cache` is the explicit online acquisition",
+        "The retained workflow is a development optimization, not a final gate",
+        "`tools_cache`",
+        "does not silently acquire missing content",
     )
     required_design = (
         "SkipInfraClusterPatch=true",
@@ -206,6 +211,9 @@ def check_documentation() -> None:
         "No Azure CLI",
         "representative tenant, requires one three-instance PostgreSQL",
         "future tenants are not separate AKS clusters",
+        "Verified acquisition and image distribution",
+        "explicit concurrent import and exact-target verification barrier",
+        "`just test-e2e-offline`",
     )
     for token in required_readme:
         check(

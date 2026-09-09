@@ -2,13 +2,18 @@ from __future__ import annotations
 
 import json
 import hashlib
+import io
 import os
+import re
 import shutil
 import stat
 import tarfile
 import tempfile
 import time
 import uuid
+import urllib.error
+import urllib.parse
+import urllib.request
 from pathlib import Path
 
 from scripts.lib.config import parse_duration
@@ -54,7 +59,27 @@ def _repository_digest(reference: str) -> str:
     return f"{name}@{digest}"
 
 
-def _canonical_tagged(reference: str) -> str:
+def _canonical_repo_digest(reference: str) -> str:
+    name, digest = reference.rsplit("@", 1)
+    if "/" not in name:
+        name = f"docker.io/library/{name}"
+    else:
+        first = name.split("/", 1)[0]
+        if "." not in first and ":" not in first and first != "localhost":
+            name = f"docker.io/{name}"
+    return f"{name}@{digest}"
+
+
+def runtime_digest_reference(reference: str) -> str:
+    return _canonical_repo_digest(_repository_digest(reference))
+
+
+def canonical_exact_reference(reference: str) -> str:
+    name, digest = reference.rsplit("@", 1)
+    return f"{canonical_tagged(name)}@{digest}"
+
+
+def canonical_tagged(reference: str) -> str:
     if "/" not in reference:
         return f"docker.io/library/{reference}"
     first = reference.split("/", 1)[0]
@@ -173,8 +198,8 @@ def _require_host_digest(config: dict[str, str], key: str, timeout: int) -> None
     if result.returncode != 0:
         raise IntegrityError(f"host image is missing exact digest reference: {key}")
     repo_digests = json.loads(result.stdout)
-    expected = _repository_digest(config[key])
-    if expected not in repo_digests:
+    expected = runtime_digest_reference(config[key])
+    if expected not in {_canonical_repo_digest(item) for item in repo_digests}:
         raise IntegrityError(
             f"host image {key} lacks exact RepoDigest {expected}"
         )
@@ -192,10 +217,7 @@ def _archive_image(
     actual = _remote_image_digest(tagged, timeout)
     if actual != expected:
         raise IntegrityError(f"{key}_TAGGED resolved to {actual}, expected {expected}")
-    run(
-        ["docker", "pull", "--platform", IMAGE_PLATFORM, exact],
-        timeout=timeout,
-    )
+    run(["docker", "pull", "--platform", IMAGE_PLATFORM, exact], timeout=timeout)
     _require_host_digest(config, key, timeout)
     run(["docker", "tag", exact, tagged], timeout=timeout)
     ensure_private_dir(destination.parent)
@@ -205,15 +227,201 @@ def _archive_image(
     os.close(descriptor)
     temporary = Path(temporary_name)
     try:
-        run(
-            ["docker", "image", "save", "--output", str(temporary), tagged, exact],
-            timeout=timeout,
-        )
+        _write_registry_oci_archive(tagged, exact, temporary, timeout)
         temporary.chmod(0o600)
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
     _verify_archive_metadata(destination, tagged, exact)
+
+
+def _registry_coordinates(reference: str) -> tuple[str, str]:
+    name = reference.split("@", 1)[0]
+    last = name.rsplit("/", 1)[-1]
+    if ":" in last:
+        name = name.rsplit(":", 1)[0]
+    if "/" not in name:
+        return "registry-1.docker.io", f"library/{name}"
+    first, remainder = name.split("/", 1)
+    if "." in first or ":" in first or first == "localhost":
+        registry = "registry-1.docker.io" if first == "docker.io" else first
+        return registry, remainder
+    return "registry-1.docker.io", name
+
+
+def _registry_get(
+    registry: str,
+    repository: str,
+    path: str,
+    timeout: int,
+    *,
+    accept: str | None = None,
+) -> bytes:
+    url = f"https://{registry}/v2/{repository}/{path}"
+    headers = {"User-Agent": "cnpg-vcluster-capi-lab"}
+    if accept:
+        headers["Accept"] = accept
+
+    def request(extra: dict[str, str] | None = None):
+        return urllib.request.urlopen(
+            urllib.request.Request(url, headers=headers | (extra or {})),
+            timeout=timeout,
+        )
+
+    try:
+        with request() as response:
+            return response.read()
+    except urllib.error.HTTPError as exc:
+        challenge = exc.headers.get("WWW-Authenticate", "")
+        if exc.code != 401 or not challenge.lower().startswith("bearer "):
+            raise IntegrityError(f"registry request failed for {url}: {exc}") from exc
+    parameters = dict(
+        re.findall(r'([a-zA-Z]+)="([^"]*)"', challenge.removeprefix("Bearer "))
+    )
+    realm = parameters.get("realm")
+    if not realm:
+        raise IntegrityError(f"registry did not provide a bearer realm: {registry}")
+    query = urllib.parse.urlencode(
+        {
+            key: value
+            for key, value in (
+                ("service", parameters.get("service")),
+                ("scope", parameters.get("scope") or f"repository:{repository}:pull"),
+            )
+            if value
+        }
+    )
+    token_url = f"{realm}?{query}" if query else realm
+    with urllib.request.urlopen(
+        urllib.request.Request(
+            token_url, headers={"User-Agent": "cnpg-vcluster-capi-lab"}
+        ),
+        timeout=timeout,
+    ) as response:
+        token_payload = json.loads(response.read())
+    token = token_payload.get("token") or token_payload.get("access_token")
+    if not token:
+        raise IntegrityError(f"registry token response was empty: {registry}")
+    with request({"Authorization": f"Bearer {token}"}) as response:
+        return response.read()
+
+
+def _write_registry_oci_archive(
+    tagged: str,
+    exact: str,
+    destination: Path,
+    timeout: int,
+) -> None:
+    registry, repository = _registry_coordinates(exact)
+    expected = exact.rsplit("@", 1)[1]
+    manifest_accept = ", ".join(
+        (
+            "application/vnd.oci.image.index.v1+json",
+            "application/vnd.docker.distribution.manifest.list.v2+json",
+            "application/vnd.oci.image.manifest.v1+json",
+            "application/vnd.docker.distribution.manifest.v2+json",
+        )
+    )
+    source_bytes = _registry_get(
+        registry,
+        repository,
+        f"manifests/{expected}",
+        timeout,
+        accept=manifest_accept,
+    )
+    if hashlib.sha256(source_bytes).hexdigest() != expected.removeprefix("sha256:"):
+        raise IntegrityError(f"registry source manifest digest mismatch: {exact}")
+    source = json.loads(source_bytes)
+    source_media_type = source.get("mediaType", "application/vnd.oci.image.index.v1+json")
+    if "manifests" in source:
+        platform = next(
+            (
+                item
+                for item in source["manifests"]
+                if (item.get("platform") or {}).get("os") == "linux"
+                and (item.get("platform") or {}).get("architecture") == "amd64"
+            ),
+            None,
+        )
+        if platform is None:
+            raise IntegrityError(f"registry image lacks linux/amd64: {exact}")
+        platform_digest = platform["digest"]
+        platform_bytes = _registry_get(
+            registry,
+            repository,
+            f"manifests/{platform_digest}",
+            timeout,
+            accept=manifest_accept,
+        )
+    else:
+        platform_digest = expected
+        platform_bytes = source_bytes
+    if hashlib.sha256(platform_bytes).hexdigest() != platform_digest.removeprefix("sha256:"):
+        raise IntegrityError(f"registry platform manifest digest mismatch: {exact}")
+    platform_manifest = json.loads(platform_bytes)
+    blobs: dict[str, bytes] = {
+        expected: source_bytes,
+        platform_digest: platform_bytes,
+    }
+    for descriptor in [
+        platform_manifest.get("config", {}),
+        *platform_manifest.get("layers", []),
+    ]:
+        digest = descriptor.get("digest")
+        if not digest:
+            raise IntegrityError(f"registry platform manifest is incomplete: {exact}")
+        data = _registry_get(
+            registry,
+            repository,
+            f"blobs/{digest}",
+            timeout,
+        )
+        if hashlib.sha256(data).hexdigest() != digest.removeprefix("sha256:"):
+            raise IntegrityError(f"registry blob digest mismatch: {digest}")
+        blobs[digest] = data
+    index = {
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.index.v1+json",
+        "manifests": [
+            {
+                "mediaType": source_media_type,
+                "digest": expected,
+                "size": len(source_bytes),
+                "annotations": {
+                    "containerd.io/distribution.source." + registry: repository,
+                    "io.containerd.image.name": canonical_tagged(tagged),
+                    "org.opencontainers.image.ref.name": tagged.rsplit(":", 1)[-1],
+                },
+            }
+        ],
+    }
+    entries = {
+        "oci-layout": b'{"imageLayoutVersion":"1.0.0"}\n',
+        "index.json": json.dumps(
+            index, sort_keys=True, separators=(",", ":")
+        ).encode()
+        + b"\n",
+    }
+    entries.update(
+        {
+            f"blobs/sha256/{digest.removeprefix('sha256:')}": data
+            for digest, data in blobs.items()
+        }
+    )
+    with tarfile.open(destination, "w") as archive:
+        for directory in ("blobs", "blobs/sha256"):
+            member = tarfile.TarInfo(directory)
+            member.type = tarfile.DIRTYPE
+            member.mode = 0o700
+            member.mtime = 0
+            archive.addfile(member)
+        for name in sorted(entries):
+            data = entries[name]
+            member = tarfile.TarInfo(name)
+            member.size = len(data)
+            member.mode = 0o600
+            member.mtime = 0
+            archive.addfile(member, io.BytesIO(data))
 
 
 def _verify_archive_metadata(path: Path, tagged: str, exact: str) -> None:
@@ -282,10 +490,10 @@ def _verify_archive_metadata(path: Path, tagged: str, exact: str) -> None:
             f"image archive {path} does not contain source digest {expected_digest}"
         )
     if not any(
-        _canonical_tagged(
+        canonical_tagged(
             (item.get("annotations") or {}).get("io.containerd.image.name", "")
         )
-        == _canonical_tagged(tagged)
+        == canonical_tagged(tagged)
         for item in descriptors
     ):
         raise IntegrityError(

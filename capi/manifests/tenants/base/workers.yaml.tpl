@@ -8,8 +8,6 @@ metadata:
 spec:
   template:
     spec:
-      preKubeadmCommands:
-${WORKER_PRELOAD_COMMANDS}
       joinConfiguration:
         nodeRegistration:
           kubeletExtraArgs:
@@ -30,8 +28,6 @@ spec:
         docker:
           customImage: ${KIND_NODE_IMAGE}
           bootstrapTimeout: 5m
-          preLoadImages:
-${WORKER_PRELOAD_IMAGES}
           extraMounts:
             - hostPath: ${IMAGE_CACHE_HOST_PATH}
               containerPath: ${IMAGE_CACHE_CONTAINER_PATH}

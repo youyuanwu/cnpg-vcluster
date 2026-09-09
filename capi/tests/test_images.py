@@ -4,6 +4,7 @@ import json
 import tempfile
 import threading
 import unittest
+import os
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
@@ -15,13 +16,41 @@ from scripts.lib.images import (
     references,
     import_container_images,
     _container_has_image,
+    enforce_offline_node_egress,
 )
 
 
 class ImagePreloadTests(unittest.TestCase):
-    def test_container_import_assigns_exact_index_name(self) -> None:
+    def test_offline_node_guard_allows_lab_networks_and_rejects_web_egress(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = root / ".runtime/management/network.json"
+            record.parent.mkdir(parents=True)
+            record.write_text(json.dumps({"subnet": "172.18.0.0/16"}))
+            with (
+                patch.dict(os.environ, {"CAPI_OFFLINE_ENFORCED": "1"}),
+                patch("scripts.lib.images.run") as run,
+            ):
+                enforce_offline_node_egress(
+                    root,
+                    {
+                        "MANAGEMENT_POD_CIDR": "10.210.0.0/16",
+                        "TENANT_A_POD_CIDR": "10.70.0.0/16",
+                    },
+                    "worker-a",
+                )
+            script = run.call_args.args[0][-1]
+            self.assertIn("-d 172.18.0.0/16 -j RETURN", script)
+            self.assertIn("-d 10.70.0.0/16 -j RETURN", script)
+            self.assertIn("--dports 80,443 -j REJECT", script)
+
+    def test_container_import_tags_exact_digest_name(self) -> None:
         exact = "example/image:v1@sha256:" + "a" * 64
-        config = {"DOWNLOAD_TIMEOUT": "1s", "TEST_IMAGE": exact}
+        config = {
+            "DOWNLOAD_TIMEOUT": "1s",
+            "TEST_IMAGE": exact,
+            "TEST_IMAGE_TAGGED": "example/image:v1",
+        }
         missing = CompletedProcess([], 1, stdout="", stderr="missing")
         success = CompletedProcess([], 0, stdout="", stderr="")
         present = CompletedProcess(
@@ -31,33 +60,47 @@ class ImagePreloadTests(unittest.TestCase):
             stderr="",
         )
         with (
-            patch("scripts.lib.images.archive_path", return_value=Path("/cache/image.tar")),
+            patch(
+                "scripts.lib.images.active_generation",
+                return_value=Path("/cache/generations/g1"),
+            ),
             patch(
                 "scripts.lib.images.run",
-                side_effect=[missing, success, success, success, present],
+                side_effect=[missing, success, success, success, success, success, present],
             ) as run,
         ):
             import_container_images(
                 Path("/repo"), config, "worker-a", ("TEST_IMAGE",)
             )
         commands = [call.args[0] for call in run.call_args_list]
-        import_command = next(command for command in commands if "import" in command)
-        self.assertIn("--index-name", import_command)
+        tag_commands = [command for command in commands if "tag" in command]
+        self.assertEqual(tag_commands[0][-1], exact)
         self.assertEqual(
-            import_command[import_command.index("--index-name") + 1],
-            exact,
+            tag_commands[1][-1],
+            "docker.io/example/image:v1@sha256:" + "a" * 64,
+        )
+        self.assertEqual(
+            tag_commands[2][-1],
+            "docker.io/example/image@sha256:" + "a" * 64,
         )
 
     def test_container_import_fails_when_exact_name_is_still_missing(self) -> None:
         exact = "example/image:v1@sha256:" + "a" * 64
-        config = {"DOWNLOAD_TIMEOUT": "1s", "TEST_IMAGE": exact}
+        config = {
+            "DOWNLOAD_TIMEOUT": "1s",
+            "TEST_IMAGE": exact,
+            "TEST_IMAGE_TAGGED": "example/image:v1",
+        }
         missing = CompletedProcess([], 1, stdout="", stderr="missing")
         success = CompletedProcess([], 0, stdout="", stderr="")
         with (
-            patch("scripts.lib.images.archive_path", return_value=Path("/cache/image.tar")),
+            patch(
+                "scripts.lib.images.active_generation",
+                return_value=Path("/cache/generations/g1"),
+            ),
             patch(
                 "scripts.lib.images.run",
-                side_effect=[missing, success, success, success, missing],
+                side_effect=[missing, success, success, success, success, success, missing],
             ),
         ):
             with self.assertRaisesRegex(RuntimeError, "lacks imported exact image"):

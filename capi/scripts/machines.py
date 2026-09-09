@@ -19,6 +19,7 @@ from scripts.lib.tenants import (
 from scripts.network import run_network_gate
 from scripts.endpoint import _verify_bootstrap_secret
 from scripts.status import collect_status, status_healthy
+from scripts.lib.images import preload_worker_images
 
 
 def _machine_items(client: ManagementClient, tenant) -> list[dict[str, object]]:
@@ -218,6 +219,7 @@ def _replace_machine(
 
     def replaced():
         try:
+            preload_worker_images(root, config, client, tenant)
             wait_network_ready(root, config, tenant)
             snapshot = worker_snapshot(root, config, client, tenant)
         except RuntimeError:

@@ -376,41 +376,7 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
         "WORKER_REPLICAS": str(tenant.workers),
         "IMAGE_CACHE_HOST_PATH": str(root / ".tools" / "cache"),
         "IMAGE_CACHE_CONTAINER_PATH": cache_container_path,
-        "WORKER_PRELOAD_COMMANDS": "\n".join(
-            f"        - >-\n          {command}"
-            for command in worker_preload_commands(config)
-        ),
-        "WORKER_PRELOAD_IMAGES": "\n".join(
-            f"            - {reference}"
-            for reference in sorted(
-                config[key]
-                for key in (
-                    "CALICO_CNI_IMAGE",
-                    "CALICO_KUBE_CONTROLLERS_IMAGE",
-                    "CALICO_NODE_IMAGE",
-                    "KUBE_PROXY_IMAGE",
-                    "KONNECTIVITY_AGENT_IMAGE",
-                    "CNPG_CONTROLLER_IMAGE",
-                    "POSTGRES_IMAGE",
-                    "VERIFY_IMAGE",
-                )
-            )
-        ),
     }
-
-
-def worker_preload_commands(config: dict[str, str]) -> list[str]:
-    cache_container_path = "/var/lib/capi-image-cache"
-    return [
-        "generation=$(sed -n "
-        "'s/.*\"generation\":\"\\([^\"]*\\)\".*/\\1/p' "
-        f"'{cache_container_path}/active.json'); "
-        "test -n \"$generation\"; "
-        "ctr --namespace k8s.io images import --digests "
-        f"--index-name '{config[key]}' "
-        f"'{cache_container_path}/generations/$generation/images/{key.lower()}.tar'"
-        for key in sorted(WORKER_IMAGE_KEYS)
-    ]
 
 
 def render_tenant_manifests(
@@ -494,8 +460,63 @@ def apply_control_plane(
         "-f",
         str(control_plane),
     )
+    if os.environ.get("CAPI_OFFLINE_ENFORCED") == "1":
+        def patch_pull_policy():
+            response = client.kubectl(
+                "-n",
+                tenant.namespace,
+                "get",
+                f"deployment/{tenant.name}",
+                "-o",
+                "json",
+                check=False,
+            )
+            if response.returncode != 0:
+                return None
+            deployment = json.loads(response.stdout)
+            containers = deployment["spec"]["template"]["spec"]["containers"]
+            if any(
+                container.get("imagePullPolicy") == "Always"
+                for container in containers
+            ):
+                client.kubectl(
+                    "-n",
+                    tenant.namespace,
+                    "patch",
+                    f"deployment/{tenant.name}",
+                    "--type=strategic",
+                    "-p",
+                    json.dumps(
+                        {
+                            "spec": {
+                                "template": {
+                                    "spec": {
+                                        "containers": [
+                                            {
+                                                "name": container["name"],
+                                                "imagePullPolicy": "IfNotPresent",
+                                            }
+                                            for container in containers
+                                        ]
+                                    }
+                                }
+                            }
+                        },
+                        separators=(",", ":"),
+                    ),
+                )
+            return True
+
+        wait_for(
+            f"offline pull policy for {tenant.name}",
+            parse_duration(config["CONDITION_TIMEOUT"]),
+            parse_duration(config["WAIT_POLL_INTERVAL"]),
+            patch_pull_policy,
+        )
 
     def ready():
+        if os.environ.get("CAPI_OFFLINE_ENFORCED") == "1":
+            patch_pull_policy()
         devcluster = _resource(client, tenant, "devcluster", tenant.name)
         kcp = _resource(client, tenant, "kamajicontrolplane", tenant.name)
         cluster = _resource(client, tenant, "cluster", tenant.name)
@@ -974,9 +995,8 @@ def verify_worker_preload_contract(
         ).stdout
     )
     docker = devmachine["spec"]["template"]["spec"]["backend"]["docker"]
-    expected_images = list(sorted(config[key] for key in WORKER_IMAGE_KEYS))
-    if docker.get("preLoadImages") != expected_images:
-        raise RuntimeError("live worker preload image inventory does not match")
+    if docker.get("preLoadImages"):
+        raise RuntimeError("live worker template duplicates bootstrap image imports")
     cache_mounts = [
         mount
         for mount in docker.get("extraMounts", [])
@@ -990,19 +1010,6 @@ def verify_worker_preload_contract(
         }
     ]:
         raise RuntimeError("live worker cache mount does not match")
-    kubeadm = json.loads(
-        client.kubectl(
-            "-n",
-            tenant.namespace,
-            "get",
-            f"kubeadmconfigtemplate/{tenant.name}-worker",
-            "-o",
-            "json",
-        ).stdout
-    )
-    commands = kubeadm["spec"]["template"]["spec"].get("preKubeadmCommands", [])
-    if commands != worker_preload_commands(config):
-        raise RuntimeError("live worker exact preload commands do not match")
 
 
 def _machine(client: ManagementClient, tenant: Tenant) -> dict[str, object] | None:

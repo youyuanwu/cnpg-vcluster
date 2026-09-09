@@ -28,13 +28,15 @@ a production worker substrate.
   `fs.inotify.max_user_watches=524288`.
 - `git`, `python3`, `curl`, `tar`, and host-installed `just` 1.58.0.
 
-The lab downloads its own pinned kind, kubectl, Helm, and clusterctl binaries
-under ignored `.tools/`. It does not install or replace `just`.
+The lab caches its own pinned kind, kubectl, Helm, clusterctl, charts,
+manifests, source provenance, and OCI images under ignored owner-only
+`.tools/`. It does not install or replace `just`.
 
 ## Quick start
 
 ```bash
 cd capi
+just cache
 just tools
 just prepare-host
 just preflight
@@ -52,6 +54,16 @@ become healthy and that teardown restores a clean host:
 ```bash
 just test-e2e
 ```
+
+`just cache` is the explicit online acquisition and provenance-refresh step.
+After it succeeds, `just tools` and `just preflight` verify and use the local
+cache without Git or registry lookups. `just test-e2e-offline` applies the same
+policy to the clean-to-clean gate by blocking acquisition commands, forcing
+Docker consumers to `--pull=never`, and denying external HTTP/HTTPS inside the
+disposable nodes. The current pinned Kamaji release still renders tenant
+API-server and Konnectivity containers with `imagePullPolicy: Always`; the
+offline gate intentionally fails closed at that upstream behavior rather than
+silently allowing registry access.
 
 Use the targeted suites during development instead of repeatedly running the
 full isolation gate:
@@ -71,10 +83,14 @@ just test-tenant-lifecycle
 
 | Command | Purpose |
 |---|---|
-| `just tools` | Download and verify immutable tools, charts, manifests, source archives, and OCI provenance. |
+| `just cache` | Online-only acquisition of every pinned input and OCI image into a verified immutable generation. |
+| `just tools` | Install and verify tools and inputs from the active local cache without provenance refresh. |
 | `just prepare-host` | Securely record and raise runtime inotify values. |
 | `just preflight` | Check tools, inputs, Docker capacity, CIDRs, image digests, ownership collisions, and privileged-container support. |
 | `just create-management` | Reconcile the kind management cluster and lifecycle controllers. |
+| `just dev-bootstrap` | Prepare and bind a retained management context to the current user, host, Docker daemon, branch, revision, configuration, and exact management identity. |
+| `just dev-tenant` | Delete, recreate, and validate tenant A while retaining the bound management cluster. |
+| `just dev-clean` | Run authoritative cleanup for retained tenant, management, runtime, and host state. |
 | `just create` | Reconcile both tenant control planes, workers, networking, storage, and databases. |
 | `just repair tenant-a` | Explicitly repair one owned tenant while proving the other tenant is unchanged. |
 | `just verify` | Verify two-tenant endpoint, credential, worker, storage, and PostgreSQL isolation plus replacement/failover behavior. |
@@ -87,6 +103,20 @@ All mutating create and repair paths validate the pinned inputs before changing
 surviving state. Generated credentials and identity records are owner-only
 files below ignored `.runtime/`. Commands use explicit kubeconfig paths and do
 not depend on the user's current Kubernetes context.
+
+The retained workflow is a development optimization, not a final gate:
+
+```bash
+just dev-bootstrap
+just dev-tenant
+just dev-tenant
+just dev-clean
+```
+
+`dev-tenant` never bootstraps management implicitly. It fails closed when the
+private retained record is missing, stale, unsafe, or inconsistent, and it
+resumes only a valid journaled tenant deletion. Always run `just test-e2e` or
+`just test-e2e-offline` before treating a change as lifecycle-complete.
 
 ## Local isolation model
 
@@ -125,6 +155,11 @@ ClusterResourceSet is the bootstrap and source-change delivery mechanism. Once
 the source objects are handed off, arbitrary target drift is detected by
 status and repaired explicitly; the lab does not assume ClusterResourceSet
 will continuously repair every target mutation.
+
+Before the ClusterResourceSet is applied, the lab restores exact worker images
+from the active cache and verifies concurrent imports in all pre-CNI worker
+containerd stores. Replacement validation invokes the same import barrier
+before accepting network readiness.
 
 The custom kube-proxy name prevents Kamaji from cleaning the repository-owned
 resources. `conntrack.maxPerCore: 0` avoids the nested-container
@@ -216,15 +251,32 @@ commands as part of recovery.
 
 ## Supply chain
 
-Large upstream YAML is not committed. `just tools` fetches pinned release
-assets into `.tools/inputs/`, checks SHA-256 values, verifies annotated tags
-against peeled source commits, and verifies image tag provenance against OCI
-digests. Runtime transforms replace expected tags only and fail on changed
-image counts or unresolved placeholders.
+Large upstream YAML and OCI archives are not committed. `just cache` stages a
+new private generation, checks release SHA-256 values, verifies annotated tags
+against peeled source commits, verifies image tag provenance against OCI
+digests, validates the archived `linux/amd64` manifest and blobs, and switches
+the active pointer only after the whole generation passes. A failed refresh
+leaves the previous generation active.
 
-Remote registry availability is required. Bounded retries cover transient
-registry 5xx and transport failures; digest mismatches and nontransient errors
-remain fatal.
+Normal preflight verifies the active inventory, owner-only file boundaries,
+current pins, archive checksums, OCI identities, and local tool versions. It
+does not silently acquire missing content. Missing, changed, symlinked,
+broad-permission, platform-mismatched, or stale entries require a new online
+`just cache`.
+
+Management images are imported before controller installation. Worker images
+are imported before ClusterResourceSet workloads and retain exact
+digest-qualified runtime validation. Runtime transforms still replace expected
+tags only and fail on changed image counts or unresolved placeholders.
+
+## Lifecycle timing
+
+The clean-to-clean gates print one `CAPI_TIMING` JSON record for each of:
+`tools_cache`, `initial_cleanup`, `host_preparation`,
+`management_bootstrap`, `tenant_control_plane`,
+`tenant_workers_network`, `cnpg_readiness_sql`, and `teardown`. Records contain
+only schema, phase, passed/failed/skipped status, and elapsed seconds. They do
+not include commands, environment values, credentials, or exception text.
 
 Exact versions, URLs, checksums, source commits, and image digests are in
 [`config/versions.env`](config/versions.env). See

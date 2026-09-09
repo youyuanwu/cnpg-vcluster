@@ -114,6 +114,15 @@ def reconcile_kind(root: Path, config: dict[str, str]) -> ManagementClient:
     if cluster_present or payload or record_path.exists():
         require_management_ownership(root, config)
     else:
+        kind_config = root / ".runtime" / "rendered" / "kind.yaml"
+        source = (root / "config" / "kind.yaml").read_text(encoding="utf-8")
+        placeholder = "${IMAGE_CACHE_HOST_PATH}"
+        if source.count(placeholder) != 1:
+            raise RuntimeError("kind cache mount placeholder is invalid")
+        write_private_file(
+            kind_config,
+            source.replace(placeholder, str(root / ".tools" / "cache")),
+        )
         result = run(
             [
                 str(_kind(root)),
@@ -122,7 +131,7 @@ def reconcile_kind(root: Path, config: dict[str, str]) -> ManagementClient:
                 "--name",
                 config["KIND_CLUSTER_NAME"],
                 "--config",
-                str(root / "config" / "kind.yaml"),
+                str(kind_config),
                 "--wait",
                 config["KIND_CREATE_TIMEOUT"],
             ],

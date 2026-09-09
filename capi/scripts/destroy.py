@@ -42,6 +42,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         "management/kubeconfig",
         "retained-management.json",
         "rendered/cert-manager.yaml",
+        "rendered/kind.yaml",
         "rendered/kamaji.yaml",
         "rendered/metallb-pool.yaml",
         "rendered/metallb.yaml",
@@ -296,7 +297,20 @@ def destroy(root: Path, config: dict[str, str]) -> None:
                 )
                 from scripts.lib.tenants import ensure_tenant_kubeconfig
 
-                verify_tenant_management_ownership(config, client, tenant)
+                owned = verify_tenant_management_ownership(config, client, tenant)
+                kubeconfig_path = (
+                    root / ".runtime" / "tenants" / tenant.name / "kubeconfig"
+                )
+                kcp = owned.get("kamajicontrolplane", {})
+                initialized = (
+                    kcp.get("status", {})
+                    .get("initialization", {})
+                    .get("controlPlaneInitialized")
+                    is True
+                )
+                if not kubeconfig_path.is_file() and not initialized:
+                    delete_tenant(root, config, client, tenant)
+                    continue
                 ensure_tenant_kubeconfig(root, config, client, tenant)
                 prepare_tenant_deletion(
                     root, config, client, tenant, cluster

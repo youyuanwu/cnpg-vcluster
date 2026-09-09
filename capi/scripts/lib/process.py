@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import subprocess
 from dataclasses import dataclass
+import os
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -27,9 +28,28 @@ def run(
     env: Mapping[str, str] | None = None,
     check: bool = True,
 ) -> subprocess.CompletedProcess[str]:
+    effective = list(command)
+    if os.environ.get("CAPI_OFFLINE_ENFORCED") == "1":
+        blocked = (
+            effective[:2] == ["git", "ls-remote"]
+            or (len(effective) >= 2 and effective[0].endswith("/helm") and effective[1] == "pull")
+            or effective[:2] == ["helm", "pull"]
+            or effective[:3] == ["docker", "buildx", "imagetools"]
+            or effective[:2] == ["docker", "pull"]
+        )
+        if blocked:
+            raise CommandError(
+                tuple(effective),
+                125,
+                "offline enforcement blocked network acquisition",
+            )
+        if effective[:2] == ["docker", "run"] and not any(
+            argument.startswith("--pull") for argument in effective[2:]
+        ):
+            effective.insert(2, "--pull=never")
     try:
         result = subprocess.run(
-            list(command),
+            effective,
             cwd=cwd,
             env=env,
             check=False,
@@ -39,9 +59,9 @@ def run(
         )
     except subprocess.TimeoutExpired as exc:
         output = f"{exc.stdout or ''}{exc.stderr or ''}"
-        raise CommandError(tuple(command), 124, redact(output)) from exc
+        raise CommandError(tuple(effective), 124, redact(output)) from exc
     except OSError as exc:
-        raise CommandError(tuple(command), 126, str(exc)) from exc
+        raise CommandError(tuple(effective), 126, str(exc)) from exc
     if check and result.returncode != 0:
-        raise CommandError(tuple(command), result.returncode, result.stdout + result.stderr)
+        raise CommandError(tuple(effective), result.returncode, result.stdout + result.stderr)
     return result

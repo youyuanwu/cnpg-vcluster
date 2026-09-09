@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import json
+import os
 import time
-import uuid
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 import re
 
-from scripts.cache import archive_path, restore_host_image
+from scripts.cache import (
+    active_generation,
+    canonical_tagged,
+    canonical_exact_reference,
+    restore_host_image,
+    runtime_digest_reference,
+)
 from scripts.lib.config import parse_duration
 from scripts.lib.files import ensure_private_dir, write_private_file
 from scripts.lib.kube import wait_for
@@ -65,7 +71,46 @@ def restore_host_images(
         restore_host_image(root, config, key, timeout)
 
 
+def enforce_offline_node_egress(
+    root: Path,
+    config: dict[str, str],
+    container: str,
+) -> None:
+    if os.environ.get("CAPI_OFFLINE_ENFORCED") != "1":
+        return
+    allowed = {"127.0.0.0/8"}
+    allowed.update(
+        value
+        for key, value in config.items()
+        if key.endswith("_CIDR") and "/" in value
+    )
+    network_record = root / ".runtime" / "management" / "network.json"
+    if network_record.is_file():
+        network = json.loads(network_record.read_text(encoding="utf-8"))
+        subnet = network.get("subnet")
+        if subnet:
+            allowed.add(subnet)
+    chain = "CAPI_OFFLINE"
+    commands = [
+        f"iptables -N {chain} 2>/dev/null || true",
+        f"iptables -F {chain}",
+        *(
+            f"iptables -A {chain} -d {cidr} -j RETURN"
+            for cidr in sorted(allowed)
+        ),
+        f"iptables -A {chain} -p tcp -m multiport --dports 80,443 -j REJECT",
+        f"iptables -A {chain} -j RETURN",
+        f"iptables -C OUTPUT -j {chain} 2>/dev/null || iptables -I OUTPUT 1 -j {chain}",
+        f"iptables -C {chain} -p tcp -m multiport --dports 80,443 -j REJECT",
+    ]
+    run(
+        ["docker", "exec", container, "sh", "-ec", "; ".join(commands)],
+        timeout=30,
+    )
+
+
 def _container_has_image(container: str, reference: str, timeout: int) -> bool:
+    runtime_reference = runtime_digest_reference(reference)
     result = run(
         [
             "docker",
@@ -76,7 +121,7 @@ def _container_has_image(container: str, reference: str, timeout: int) -> bool:
             "k8s.io",
             "images",
             "inspect",
-            reference,
+            runtime_reference,
         ],
         timeout=timeout,
         check=False,
@@ -101,11 +146,23 @@ def import_container_images(
         reference = config[key]
         if _container_has_image(container, reference, timeout):
             continue
-        source = archive_path(root, config, key)
-        destination = f"/tmp/capi-cache-{key.lower()}-{uuid.uuid4().hex}.tar"
-        try:
-            run(["docker", "cp", str(source), f"{container}:{destination}"], timeout=timeout)
+        generation = active_generation(root).name
+        destination = (
+            f"/var/lib/capi-image-cache/generations/{generation}/"
+            f"images/{key.lower()}.tar"
+        )
+        if (
             run(
+                ["docker", "exec", container, "test", "-f", destination],
+                timeout=30,
+                check=False,
+            ).returncode
+            != 0
+        ):
+            raise RuntimeError(
+                f"container {container} cannot read cache archive {key}"
+            )
+        run(
                 [
                     "docker",
                     "exec",
@@ -116,18 +173,58 @@ def import_container_images(
                     "images",
                     "import",
                     "--digests",
-                    "--index-name",
-                    reference,
                     destination,
                 ],
                 timeout=timeout,
-            )
-        finally:
-            run(
-                ["docker", "exec", container, "rm", "-f", destination],
-                timeout=30,
-                check=False,
-            )
+        )
+        run(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "ctr",
+                    "--namespace",
+                    "k8s.io",
+                    "images",
+                    "tag",
+                    "--force",
+                    canonical_tagged(config[f"{key}_TAGGED"]),
+                    reference,
+                ],
+                timeout=timeout,
+        )
+        run(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "ctr",
+                    "--namespace",
+                    "k8s.io",
+                    "images",
+                    "tag",
+                    "--force",
+                    canonical_tagged(config[f"{key}_TAGGED"]),
+                    canonical_exact_reference(reference),
+                ],
+                timeout=timeout,
+        )
+        run(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "ctr",
+                    "--namespace",
+                    "k8s.io",
+                    "images",
+                    "tag",
+                    "--force",
+                    canonical_tagged(config[f"{key}_TAGGED"]),
+                    runtime_digest_reference(reference),
+                ],
+                timeout=timeout,
+        )
         if not _container_has_image(container, reference, timeout):
             raise RuntimeError(
                 f"container {container} lacks imported exact image {key}"
@@ -167,8 +264,6 @@ def _pre_cni_worker_names(client, tenant) -> tuple[str, ...] | None:
     if len(machines) != tenant.workers:
         return None
     names = tuple(sorted(item["metadata"]["name"] for item in machines))
-    if any(not item.get("status", {}).get("nodeRef", {}).get("name") for item in machines):
-        return None
     containers = tuple(
         sorted(
             run(
@@ -186,7 +281,26 @@ def _pre_cni_worker_names(client, tenant) -> tuple[str, ...] | None:
             ).stdout.split()
         )
     )
-    return names if containers == names else None
+    if containers != names:
+        return None
+    for container in containers:
+        if (
+            run(
+                [
+                    "docker",
+                    "exec",
+                    container,
+                    "test",
+                    "-S",
+                    "/run/containerd/containerd.sock",
+                ],
+                timeout=30,
+                check=False,
+            ).returncode
+            != 0
+        ):
+            return None
+    return names
 
 
 def wait_pre_cni_workers(root: Path, config: dict[str, str], client, tenant) -> tuple[str, ...]:
@@ -211,6 +325,7 @@ def preload_worker_images(
         started = time.monotonic()
         try:
             import_container_images(root, config, container, WORKER_IMAGE_KEYS)
+            enforce_offline_node_egress(root, config, container)
         except BaseException as exc:
             return {
                 "node": container,
