@@ -421,7 +421,10 @@ def collect_tenant_status(
 
 
 def collect_management_status(
-    root: Path, config: dict[str, str]
+    root: Path,
+    config: dict[str, str],
+    *,
+    strict: bool = False,
 ) -> dict[str, object]:
     management = management_status(root, config)
     host = {
@@ -443,9 +446,15 @@ def collect_management_status(
     }
     if management.get("apiReady"):
         client = ManagementClient(root, config)
-        result["providers"] = provider_status(config, client)
-        result["components"] = management_component_status(config, client)
-        result["auxiliary"] = management_auxiliary_status(config, client)
+        result["providers"] = provider_status(
+            config, client, strict=strict
+        )
+        result["components"] = management_component_status(
+            config, client, strict=strict
+        )
+        result["auxiliary"] = management_auxiliary_status(
+            config, client, strict=strict
+        )
         kamaji = client.kubectl(
             "-n",
             config["MANAGEMENT_NAMESPACE"],
@@ -462,6 +471,18 @@ def collect_management_status(
             "jsonpath={.status.ready}",
             check=False,
         )
+        for name, response in (
+            ("Kamaji deployment", kamaji),
+            ("Kamaji datastore", datastore),
+        ):
+            if (
+                strict
+                and response.returncode != 0
+                and not NOT_FOUND.search(response.stderr)
+            ):
+                raise RuntimeError(
+                    f"{name} inspection failed: {response.stderr}"
+                )
         result["kamaji"] = {
             "available": False,
             "datastoreReady": datastore.returncode == 0 and datastore.stdout == "true",

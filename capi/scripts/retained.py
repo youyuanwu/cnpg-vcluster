@@ -279,7 +279,7 @@ def dev_tenant(root: Path, config: dict[str, str]) -> None:
 
 
 def _management_is_healthy(root: Path, config: dict[str, str]) -> bool:
-    observed = collect_management_status(root, config)
+    observed = collect_management_status(root, config, strict=True)
     if not management_status_healthy(observed):
         return False
     client = ManagementClient(root, config)

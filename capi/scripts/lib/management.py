@@ -16,6 +16,7 @@ from .kube import ManagementClient, wait_for
 from .ownership import IdentityRecord, OwnershipError
 from .process import run
 from .rendering import replace_known_images
+from .tenants import NOT_FOUND
 
 
 def _kind(root: Path) -> Path:
@@ -690,6 +691,8 @@ def management_status(root: Path, config: dict[str, str]) -> dict[str, object]:
 def management_component_status(
     config: dict[str, str],
     client: ManagementClient,
+    *,
+    strict: bool = False,
 ) -> list[dict[str, object]]:
     components = (
         ("Deployment", "cert-manager", "cert-manager", "CERT_MANAGER_CONTROLLER_IMAGE"),
@@ -727,6 +730,11 @@ def management_component_status(
             check=False,
         )
         if response.returncode != 0:
+            if strict and not NOT_FOUND.search(response.stderr):
+                raise RuntimeError(
+                    f"management component inspection failed: "
+                    f"{namespace}/{name}: {response.stderr}"
+                )
             result.append({"name": f"{namespace}/{name}", "available": False})
             continue
         payload = json.loads(response.stdout)
@@ -755,6 +763,8 @@ def management_component_status(
 def management_auxiliary_status(
     config: dict[str, str],
     client: ManagementClient,
+    *,
+    strict: bool = False,
 ) -> dict[str, object]:
     endpoints = {}
     for name, namespace in (
@@ -771,6 +781,15 @@ def management_auxiliary_status(
             "jsonpath={.subsets[0].addresses[0].ip}",
             check=False,
         )
+        if (
+            strict
+            and response.returncode != 0
+            and not NOT_FOUND.search(response.stderr)
+        ):
+            raise RuntimeError(
+                f"management webhook inspection failed: "
+                f"{namespace}/{name}: {response.stderr}"
+            )
         endpoints[f"{namespace}/{name}"] = response.returncode == 0 and bool(
             response.stdout
         )
@@ -783,6 +802,14 @@ def management_auxiliary_status(
         "json",
         check=False,
     )
+    if (
+        strict
+        and pvc_response.returncode != 0
+        and not NOT_FOUND.search(pvc_response.stderr)
+    ):
+        raise RuntimeError(
+            f"management PVC inspection failed: {pvc_response.stderr}"
+        )
     bound_claims = 0
     if pvc_response.returncode == 0:
         bound_claims = sum(

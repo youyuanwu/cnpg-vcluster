@@ -78,6 +78,34 @@ class StatusTests(unittest.TestCase):
                     strict=True,
                 )
 
+    def test_strict_management_status_propagates_provider_inspection_failure(
+        self,
+    ) -> None:
+        with (
+            patch(
+                "scripts.status.management_status",
+                return_value={"apiReady": True},
+            ),
+            patch(
+                "scripts.status.read_inotify",
+                side_effect=[128, 1048576],
+            ),
+            patch("scripts.status.ManagementClient", return_value=object()),
+            patch(
+                "scripts.status.provider_status",
+                side_effect=RuntimeError("provider API connection refused"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "connection refused"):
+                collect_management_status(
+                    Path("/tmp/example"),
+                    {
+                        "MIN_INOTIFY_INSTANCES": "128",
+                        "MIN_INOTIFY_WATCHES": "1048576",
+                    },
+                    strict=True,
+                )
+
 
 if __name__ == "__main__":
     unittest.main()

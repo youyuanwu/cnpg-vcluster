@@ -746,7 +746,7 @@ def network_status(
             }
         )
     except RuntimeError as exc:
-        if strict:
+        if strict and not NOT_FOUND.search(str(exc)):
             raise
         result["reason"] = str(exc)
     return result

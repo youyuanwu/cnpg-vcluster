@@ -19,6 +19,7 @@ from scripts.lib.addons import (
     render_resource_set,
     verify_addon_source_ownership,
     verify_network,
+    network_status,
 )
 from scripts.lib.files import IntegrityError
 from scripts.lib.tenants import Tenant
@@ -163,6 +164,26 @@ class AddonTests(unittest.TestCase):
         ):
             with self.assertRaises(NetworkProbeCleanupError):
                 verify_network(Path("."), config, self.tenant)
+
+    def test_strict_network_status_treats_not_found_as_incomplete(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kubeconfig = (
+                root / ".runtime/tenants" / self.tenant.name / "kubeconfig"
+            )
+            kubeconfig.parent.mkdir(parents=True)
+            kubeconfig.write_text("config")
+            with patch(
+                "scripts.lib.addons._tenant_kubectl",
+                side_effect=RuntimeError(
+                    'Error from server (NotFound): nodes "worker" not found'
+                ),
+            ):
+                result = network_status(
+                    root, {}, object(), self.tenant, strict=True
+                )
+        self.assertFalse(result["ready"])
+        self.assertIn("NotFound", result["reason"])
 
     def test_addon_source_ownership_rejects_foreign_configmap(self) -> None:
         client = type(
