@@ -36,7 +36,7 @@ class ImagePreloadTests(unittest.TestCase):
                     "scripts.lib.images.run",
                     side_effect=[
                         CompletedProcess([], 0, stdout="", stderr=""),
-                        CompletedProcess([], 1, stdout="", stderr="refused"),
+                        CompletedProcess([], 0, stdout="1 1\n", stderr="refused"),
                     ],
                 ) as run,
             ):
@@ -60,6 +60,7 @@ class ImagePreloadTests(unittest.TestCase):
             self.assertIn("--dports 80,443 -j REJECT", script)
             probe = run.call_args_list[-1].args[0]
             self.assertIn("timeout 3", probe[-1])
+            self.assertIn("iptables -Z", probe[-1])
 
     def test_offline_node_guard_rejects_successful_or_broken_probe(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -67,9 +68,10 @@ class ImagePreloadTests(unittest.TestCase):
             record = root / ".runtime/management/network.json"
             record.parent.mkdir(parents=True)
             record.write_text(json.dumps({"subnet": "172.18.0.0/16"}))
-            for returncode, message in (
-                (0, "unexpectedly succeeded"),
-                (127, "could not verify denial"),
+            for evidence, message in (
+                ("0 1\n", "denial was not proven"),
+                ("1 0\n", "denial was not proven"),
+                ("127 1\n", "could not verify denial"),
             ):
                 with (
                     patch.dict(os.environ, {"CAPI_OFFLINE_ENFORCED": "1"}),
@@ -78,7 +80,7 @@ class ImagePreloadTests(unittest.TestCase):
                         side_effect=[
                             CompletedProcess([], 0, stdout="", stderr=""),
                             CompletedProcess(
-                                [], returncode, stdout="", stderr="probe"
+                                [], 0, stdout=evidence, stderr="probe"
                             ),
                         ],
                     ),

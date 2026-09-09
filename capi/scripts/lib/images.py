@@ -98,6 +98,7 @@ def enforce_offline_node_egress(
             f"iptables -A {chain} -d {cidr} -j RETURN"
             for cidr in sorted(allowed)
         ),
+        f"iptables -A {chain} -d 1.1.1.1/32 -p tcp --dport 443 -j REJECT",
         f"iptables -A {chain} -p tcp -m multiport --dports 80,443 -j REJECT",
         f"iptables -A {chain} -j RETURN",
         f"iptables -C OUTPUT -j {chain} 2>/dev/null || iptables -I OUTPUT 1 -j {chain}",
@@ -113,18 +114,29 @@ def enforce_offline_node_egress(
             "exec",
             container,
             "bash",
-            "-ec",
-            "timeout 3 bash -c '</dev/tcp/1.1.1.1/443'",
+            "-c",
+            f"iptables -Z {chain}; "
+            "timeout 3 bash -c '</dev/tcp/1.1.1.1/443'; rc=$?; "
+            f"hits=$(iptables -L {chain} -n -v -x | "
+            "awk '$1 ~ /^[0-9]+$/ && $8 == \"1.1.1.1\" {sum += $1} "
+            "END {print sum + 0}'); "
+            "printf '%s %s\\n' \"$rc\" \"$hits\"",
         ],
         timeout=10,
         check=False,
     )
-    if denied.returncode == 0:
-        raise RuntimeError(f"offline egress probe unexpectedly succeeded: {container}")
-    if denied.returncode not in {1, 124}:
+    try:
+        probe_returncode, hits = (int(value) for value in denied.stdout.split())
+    except (ValueError, TypeError) as exc:
+        raise RuntimeError(
+            f"offline egress probe produced invalid evidence for {container}"
+        ) from exc
+    if probe_returncode == 0 or hits < 1:
+        raise RuntimeError(f"offline egress denial was not proven for {container}")
+    if probe_returncode not in {1, 124}:
         raise RuntimeError(
             f"offline egress probe could not verify denial for {container}: "
-            f"exit {denied.returncode}"
+            f"exit {probe_returncode}"
         )
 
 
