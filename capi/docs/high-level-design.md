@@ -12,10 +12,10 @@ The future tenants are not separate AKS clusters. AKS is the shared management
 cluster; each tenant remains a Kamaji hosted control plane with
 CAPZ-managed Azure worker machines.
 
-The design preserves the behavioral contract already proven by the independent
-`kamaji/` lab: two isolated tenant APIs, three exclusive workers per tenant,
-tenant-owned networking and storage, one three-instance PostgreSQL cluster per
-tenant, explicit repair, targeted deletion, and deterministic cleanup.
+The design requires two isolated tenant APIs, three exclusive workers per
+tenant, tenant-owned networking and storage, one three-instance PostgreSQL
+cluster per tenant, explicit repair, targeted deletion, and deterministic
+cleanup.
 
 ## As-built topology
 

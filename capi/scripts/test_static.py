@@ -133,6 +133,7 @@ def check_repository_boundaries() -> None:
     repository = ROOT.parent
     check(not (repository / "Makefile").exists(), "obsolete root Makefile remains")
     check(not (repository / "vcluster").exists(), "obsolete vcluster lab remains")
+    check(not (repository / "kamaji").exists(), "obsolete standalone Kamaji lab remains")
     production = [
         ROOT / "Justfile",
         *(ROOT / "config").glob("*"),
@@ -144,8 +145,6 @@ def check_repository_boundaries() -> None:
         *(ROOT / "manifests").rglob("*"),
     ]
     forbidden = (
-        "../kamaji/.tools",
-        "../kamaji/.runtime",
         "AzureCluster",
         "CAPZ",
         "az login",
@@ -245,8 +244,8 @@ def check_documentation() -> None:
         "third-party notices omit the direct etcd source URL",
     )
     check(
-        "two independent local CloudNativePG experiments" in root_readme,
-        "root README does not index both remaining labs",
+        "one local CloudNativePG experiment" in root_readme,
+        "root README does not identify CAPI as the remaining lab",
     )
     check(
         (ROOT / "licenses" / "README.md").is_file(),

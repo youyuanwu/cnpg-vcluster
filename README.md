@@ -1,31 +1,10 @@
-# CNPG multi-tenant labs
+# CNPG multi-tenant lab
 
-This repository contains two independent local CloudNativePG experiments:
+This repository contains one local CloudNativePG experiment:
 
-- [`kamaji/`](kamaji/) uses the public Kamaji edge release with no account or
-  activation. Its interface is `just` from inside that directory.
 - [`capi/`](capi/) uses Cluster API, CABPK, CAPD development resources,
   Kamaji, and the Kamaji control-plane provider. Its interface is `just` from
   inside that directory.
-
-## Kamaji lab
-
-The Kamaji lab creates one kind management cluster, two hosted tenant control
-planes, six exclusive container workers, and two tenant-owned three-instance
-CloudNativePG clusters:
-
-```sh
-cd kamaji
-just tools
-just prepare-host
-just preflight
-just create
-just verify
-just destroy
-```
-
-See [`kamaji/README.md`](kamaji/README.md) for its experimental worker,
-licensing, verification, and teardown boundaries.
 
 ## Cluster API lab
 
