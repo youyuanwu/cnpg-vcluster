@@ -121,6 +121,11 @@ def enforce_offline_node_egress(
     )
     if denied.returncode == 0:
         raise RuntimeError(f"offline egress probe unexpectedly succeeded: {container}")
+    if denied.returncode not in {1, 124}:
+        raise RuntimeError(
+            f"offline egress probe could not verify denial for {container}: "
+            f"exit {denied.returncode}"
+        )
 
 
 def _container_has_image(container: str, reference: str, timeout: int) -> bool:

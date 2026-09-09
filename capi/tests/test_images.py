@@ -32,7 +32,13 @@ class ImagePreloadTests(unittest.TestCase):
                     os.environ,
                     {"CAPI_OFFLINE_ENFORCED": "1"},
                 ),
-                patch("scripts.lib.images.run") as run,
+                patch(
+                    "scripts.lib.images.run",
+                    side_effect=[
+                        CompletedProcess([], 0, stdout="", stderr=""),
+                        CompletedProcess([], 1, stdout="", stderr="refused"),
+                    ],
+                ) as run,
             ):
                 enforce_offline_node_egress(
                     root,
@@ -52,6 +58,37 @@ class ImagePreloadTests(unittest.TestCase):
             self.assertIn("-d 172.18.0.0/16 -j RETURN", script)
             self.assertIn("-d 10.70.0.0/16 -j RETURN", script)
             self.assertIn("--dports 80,443 -j REJECT", script)
+            probe = run.call_args_list[-1].args[0]
+            self.assertIn("timeout 3", probe[-1])
+
+    def test_offline_node_guard_rejects_successful_or_broken_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            record = root / ".runtime/management/network.json"
+            record.parent.mkdir(parents=True)
+            record.write_text(json.dumps({"subnet": "172.18.0.0/16"}))
+            for returncode, message in (
+                (0, "unexpectedly succeeded"),
+                (127, "could not verify denial"),
+            ):
+                with (
+                    patch.dict(os.environ, {"CAPI_OFFLINE_ENFORCED": "1"}),
+                    patch(
+                        "scripts.lib.images.run",
+                        side_effect=[
+                            CompletedProcess([], 0, stdout="", stderr=""),
+                            CompletedProcess(
+                                [], returncode, stdout="", stderr="probe"
+                            ),
+                        ],
+                    ),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, message):
+                        enforce_offline_node_egress(
+                            root,
+                            {"MANAGEMENT_POD_CIDR": "10.210.0.0/16"},
+                            "worker-a",
+                        )
 
     def test_container_import_tags_exact_digest_name(self) -> None:
         exact = "example/image:v1@sha256:" + "a" * 64
