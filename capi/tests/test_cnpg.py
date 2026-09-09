@@ -8,6 +8,7 @@ from unittest.mock import patch
 
 from scripts.cnpg import (
     _render_cluster,
+    _sql,
     _verify_marker,
     cnpg_artifacts_present,
     delete_cnpg,
@@ -17,6 +18,53 @@ from scripts.lib.files import ensure_private_dir
 
 
 class CnpgTests(unittest.TestCase):
+    def test_sql_probe_is_removed_after_wait_failure(self) -> None:
+        calls: list[tuple[str, ...]] = []
+        tenant = type(
+            "Tenant", (), {"name": "spike", "cnpg_cluster": "postgres"}
+        )()
+
+        def kubectl(*args, **_kwargs):
+            calls.append(tuple(str(item) for item in args))
+            if "wait" in args:
+                raise RuntimeError("pod did not become ready")
+            if "get" in args:
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": "Error from server (NotFound): pod not found",
+                    },
+                )()
+            return type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": "", "stderr": ""},
+            )()
+
+        config = {
+            "DATABASE_NAMESPACE": "database",
+            "POSTGRES_IMAGE": "postgres@sha256:" + "a" * 64,
+            "SQL_TIMEOUT": "10s",
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            with (
+                patch("scripts.cnpg._tenant_kubectl", side_effect=kubectl),
+                patch("scripts.cnpg.time.time_ns", return_value=123),
+            ):
+                with self.assertRaisesRegex(
+                    RuntimeError, "pod did not become ready"
+                ):
+                    _sql(Path(temporary), config, tenant, "SELECT 1;")
+        self.assertTrue(
+            any(
+                "delete" in call and "pod/cnpg-sql-123" in call
+                for call in calls
+            )
+        )
+
     def test_marker_verification_is_read_only(self) -> None:
         tenant = type(
             "Tenant", (), {"name": "spike", "cnpg_cluster": "postgres"}

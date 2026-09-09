@@ -450,6 +450,43 @@ def _verify_registry(address: str, images: list[MirrorImage]) -> None:
                 )
 
 
+def _validate_reusable_registry_record(
+    root: Path,
+    config: dict[str, str],
+    network: dict[str, object],
+) -> dict[str, object]:
+    record = validate_registry_state(root, config)
+    verify_cache(root, config)
+    observed_images = [
+        {
+            key: image.get(key)
+            for key in ("key", "registry", "repository", "tag", "sourceDigest")
+        }
+        for image in record.get("images", [])
+        if isinstance(image, dict)
+    ]
+    if (
+        record.get("network") != network.get("network")
+        or record.get("networkIdentifier") != network.get("network_id")
+        or record.get("generation") != active_generation(root).name
+        or observed_images != _expected_images(config)
+    ):
+        raise OwnershipError("offline registry cache or network identity changed")
+    return record
+
+
+def validate_retained_offline_registry(
+    root: Path,
+    config: dict[str, str],
+    management_container: str,
+    network: dict[str, object],
+) -> None:
+    if os.environ.get("CAPI_OFFLINE_ENFORCED") != "1":
+        return
+    _validate_reusable_registry_record(root, config, network)
+    verify_offline_registry_pulls(config, management_container)
+
+
 def _configure_containerd(
     root: Path,
     config: dict[str, str],
@@ -514,23 +551,7 @@ def reconcile_offline_registry(
         if existing is None or not record_present or not data_present:
             raise OwnershipError("offline registry state is partial or unowned")
         _private_dir(_data_path(root))
-        record = validate_registry_state(root, config)
-        verify_cache(root, config)
-        observed_images = [
-            {
-                key: image.get(key)
-                for key in ("key", "registry", "repository", "tag", "sourceDigest")
-            }
-            for image in record.get("images", [])
-            if isinstance(image, dict)
-        ]
-        if (
-            record.get("network") != network.get("network")
-            or record.get("networkIdentifier") != network.get("network_id")
-            or record.get("generation") != active_generation(root).name
-            or observed_images != _expected_images(config)
-        ):
-            raise OwnershipError("offline registry cache or network identity changed")
+        record = _validate_reusable_registry_record(root, config, network)
         _configure_containerd(
             root, config, management_container, str(record["address"])
         )

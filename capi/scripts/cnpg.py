@@ -9,12 +9,16 @@ from scripts.lib.files import IntegrityError, verify_sha256, write_private_file
 from scripts.lib.kube import wait_for
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
-from scripts.lib.tenants import _tenant_kubectl
+from scripts.lib.tenants import NOT_FOUND, _tenant_kubectl
 from scripts.lib.tenants import storage_volume_name
 from scripts.lib.addons import delete_addons
 from scripts.lib.tenants import delete_tenant
 from scripts.storage import _delete_storage, run_storage_gate
 from scripts.lib.config import parse_duration
+
+
+class SQLProbeCleanupError(RuntimeError):
+    pass
 
 
 def _render_operator(root: Path, config: dict[str, str], tenant) -> Path:
@@ -323,10 +327,24 @@ def _sql(root: Path, config: dict[str, str], tenant, sql: str) -> str:
             "delete",
             f"pod/{name}",
             "--ignore-not-found",
-            "--wait=false",
+            "--wait=true",
             check=False,
         )
         manifest.unlink(missing_ok=True)
+        remaining = _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "-n",
+            config["DATABASE_NAMESPACE"],
+            "get",
+            f"pod/{name}",
+            check=False,
+        )
+        if remaining.returncode == 0 or not NOT_FOUND.search(remaining.stderr):
+            raise SQLProbeCleanupError(
+                f"SQL verification pod cleanup failed: {name}"
+            )
 
 
 def _write_marker(root: Path, config: dict[str, str], tenant) -> None:

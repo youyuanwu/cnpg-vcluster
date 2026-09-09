@@ -21,11 +21,31 @@ from scripts.lib.registry import (
     delete_offline_registry,
     load_mirror_image,
     reconcile_offline_registry,
+    validate_retained_offline_registry,
 )
 from tests.test_cache import EXACT, SOURCE_DIGEST, TAGGED, write_archive
 
 
 class RegistryTests(unittest.TestCase):
+    def test_retained_offline_validation_checks_state_and_pulls(self) -> None:
+        with (
+            patch.dict(os.environ, {"CAPI_OFFLINE_ENFORCED": "1"}),
+            patch(
+                "scripts.lib.registry._validate_reusable_registry_record"
+            ) as validate,
+            patch(
+                "scripts.lib.registry.verify_offline_registry_pulls"
+            ) as pulls,
+        ):
+            validate_retained_offline_registry(
+                Path("/tmp/example"),
+                {},
+                "management-control-plane",
+                {"network": "kind"},
+            )
+        validate.assert_called_once()
+        pulls.assert_called_once_with({}, "management-control-plane")
+
     @staticmethod
     def config() -> dict[str, str]:
         config = {

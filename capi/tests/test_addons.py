@@ -17,6 +17,7 @@ from scripts.lib.addons import (
     validate_resource_set_references,
     render_resource_set,
     verify_addon_source_ownership,
+    verify_network,
 )
 from scripts.lib.files import IntegrityError
 from scripts.lib.tenants import Tenant
@@ -45,6 +46,73 @@ class AddonTests(unittest.TestCase):
         payload = _source_object(self.config, self.tenant, "source", "kind: List\n")
         serialized = json.dumps(payload, separators=(",", ":")).encode()
         self.assertLess(len(serialized), SOURCE_LIMIT)
+
+    def test_network_probe_is_removed_after_probe_failure(self) -> None:
+        calls: list[tuple[str, ...]] = []
+
+        def kubectl(*args, **_kwargs):
+            calls.append(tuple(str(item) for item in args))
+            if "run" in args:
+                raise RuntimeError("probe failed")
+            if "delete" in args:
+                return type(
+                    "Result",
+                    (),
+                    {"returncode": 0, "stdout": "", "stderr": ""},
+                )()
+            if any(str(item).startswith("pod/network-smoke-") for item in args):
+                return type(
+                    "Result",
+                    (),
+                    {
+                        "returncode": 1,
+                        "stdout": "",
+                        "stderr": "Error from server (NotFound): pod not found",
+                    },
+                )()
+            if "configmap/capi-kube-proxy" in args:
+                stdout = json.dumps({"data": {"config.conf": "maxPerCore: 0"}})
+            elif "daemonset/capi-kube-proxy" in args:
+                stdout = "proxy@sha256:" + "a" * 64
+            else:
+                stdout = json.dumps(
+                    {
+                        "roleRef": {
+                            "apiGroup": "rbac.authorization.k8s.io",
+                            "kind": "ClusterRole",
+                            "name": "system:node-proxier",
+                        },
+                        "subjects": [
+                            {
+                                "kind": "ServiceAccount",
+                                "name": "capi-kube-proxy",
+                                "namespace": "kube-system",
+                            }
+                        ],
+                    }
+                )
+            return type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": stdout, "stderr": ""},
+            )()
+
+        config = {
+            "KUBE_PROXY_IMAGE": "proxy@sha256:" + "a" * 64,
+            "VERIFY_IMAGE": "verify@sha256:" + "b" * 64,
+        }
+        with (
+            patch("scripts.lib.addons._tenant_kubectl", side_effect=kubectl),
+            patch("scripts.lib.addons.time.time_ns", return_value=123),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "probe failed"):
+                verify_network(Path("."), config, self.tenant)
+        self.assertTrue(
+            any(
+                "delete" in call and "pod/network-smoke-123" in call
+                for call in calls
+            )
+        )
 
     def test_addon_source_ownership_rejects_foreign_configmap(self) -> None:
         client = type(

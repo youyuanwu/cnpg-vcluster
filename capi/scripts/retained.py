@@ -7,12 +7,17 @@ import time
 from pathlib import Path
 
 from scripts.cnpg import (
+    SQLProbeCleanupError,
     _cnpg_ready,
     _storage_identity,
     _verify_filesystem,
     _verify_marker,
 )
-from scripts.create import reconcile_tenant, validate_create_inputs
+from scripts.create import (
+    reconcile_tenant,
+    stable_tenant_snapshot,
+    validate_create_inputs,
+)
 from scripts.create_management import create_management
 from scripts.destroy import destroy
 from scripts.destroy_tenant import (
@@ -22,13 +27,21 @@ from scripts.destroy_tenant import (
     prepare_tenant_deletion,
 )
 from scripts.endpoint import _verify_bootstrap_secret
-from scripts.lib.addons import verify_network, wait_network_ready
-from scripts.lib.host import prepare_inotify
+from scripts.lib.addons import (
+    NetworkProbeCleanupError,
+    verify_addon_source_ownership,
+    verify_network,
+    wait_network_ready,
+)
+from scripts.lib.host import prepare_inotify, validate_inotify_state
 from scripts.lib.kube import ManagementClient
 from scripts.lib.management import (
     require_management_ownership,
+    validate_management_network,
     validate_management_kubeconfig,
+    validate_management_server_version,
 )
+from scripts.lib.registry import validate_retained_offline_registry
 from scripts.machines import worker_snapshot
 from scripts.lib.process import run
 from scripts.lib.tenants import (
@@ -40,21 +53,33 @@ from scripts.lib.tenants import (
     storage_record_path,
     storage_volume_name,
     tenant_kubeconfig_path,
+    validate_tenant_kubeconfig_file,
     verify_authoritative_endpoint,
     verify_tenant_control_plane_contract,
     verify_tenant_management_ownership,
     verify_worker_runtime,
 )
 from scripts.lib.files import write_private_file
+from scripts.preflight import run_retained_preflight
+from scripts.status import (
+    collect_management_status,
+    collect_tenant_status,
+    management_status_healthy,
+)
 from scripts.tools import _verify_private_input, verify_all_inputs
 
 
 RETAINED_SCHEMA = 1
+DEV_UP_EVIDENCE_SCHEMA = 1
 DEV_TESTS = ("endpoint", "network", "machines", "storage", "database")
 
 
 def retained_path(root: Path) -> Path:
     return root / ".runtime" / "retained-management.json"
+
+
+def dev_up_evidence_path(root: Path) -> Path:
+    return root / ".runtime" / "evidence" / "dev-up-success.json"
 
 
 def _hash(value: str | bytes) -> str:
@@ -102,6 +127,74 @@ def write_retained_state(root: Path, config: dict[str, str]) -> None:
         )
         + "\n",
     )
+
+
+def _dev_up_evidence_payload(
+    config: dict[str, str],
+    tenant,
+    identity: dict[str, object],
+) -> dict[str, object]:
+    return {
+        "schema": DEV_UP_EVIDENCE_SCHEMA,
+        "tenantCompatibilityRevision": config["TENANT_COMPATIBILITY_REVISION"],
+        "cnpgCompatibilityRevision": config["CNPG_COMPATIBILITY_REVISION"],
+        "tenant": {
+            "name": tenant.name,
+            "namespace": tenant.namespace,
+            "endpoint": f"{tenant.vip}:{config['SPIKE_API_PORT']}",
+            "podCIDR": tenant.pod_cidr,
+            "serviceCIDR": tenant.service_cidr,
+            "domain": tenant.domain,
+            "database": tenant.cnpg_cluster,
+            "identity": identity,
+        },
+    }
+
+
+def write_dev_up_evidence(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+    identity: dict[str, object],
+) -> None:
+    write_private_file(
+        dev_up_evidence_path(root),
+        json.dumps(
+            _dev_up_evidence_payload(config, tenant, identity),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        + "\n",
+    )
+
+
+def load_dev_up_evidence(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+) -> dict[str, object]:
+    path = dev_up_evidence_path(root)
+    try:
+        payload = json.loads(_verify_private_input(path).decode())
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise RuntimeError("retained dev-up evidence is invalid") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("retained dev-up evidence is invalid")
+    tenant_payload = payload.get("tenant")
+    identity = (
+        tenant_payload.get("identity")
+        if isinstance(tenant_payload, dict)
+        else None
+    )
+    if not isinstance(identity, dict):
+        raise RuntimeError("retained dev-up evidence identity is invalid")
+    expected = _dev_up_evidence_payload(config, tenant, identity)
+    if payload != expected:
+        raise RuntimeError(
+            "retained dev-up evidence is stale or incompatible; "
+            "run `just dev-clean` then `just dev-up`"
+        )
+    return identity
 
 
 def validate_retained_state(root: Path, config: dict[str, str]) -> None:
@@ -185,12 +278,174 @@ def dev_tenant(root: Path, config: dict[str, str]) -> None:
     print(f"retained management tenant recreated and verified: {tenant.name}")
 
 
-def dev_up(root: Path, config: dict[str, str]) -> None:
-    dev_bootstrap(root, config)
+def _management_is_healthy(root: Path, config: dict[str, str]) -> bool:
+    observed = collect_management_status(root, config)
+    if not management_status_healthy(observed):
+        return False
     client = ManagementClient(root, config)
-    tenant = validate_create_inputs(root, config)[0]
-    reconcile_tenant(root, config, client, tenant)
+    validate_management_server_version(config, client)
+    network = validate_management_network(root, config)
+    validate_retained_offline_registry(
+        root,
+        config,
+        f"{config['KIND_CLUSTER_NAME']}-control-plane",
+        network,
+    )
+    return True
+
+
+def _tenant_is_healthy(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+    cluster: dict[str, object],
+    expected_identity: dict[str, object],
+) -> bool:
+    kubeconfig = tenant_kubeconfig_path(root, tenant)
+    if not kubeconfig.exists() and not kubeconfig.is_symlink():
+        return False
+    validate_tenant_kubeconfig_file(
+        root, config, client, tenant, check_access=True
+    )
+    verify_addon_source_ownership(
+        root, config, client, tenant, require_present=False
+    )
+    before = stable_tenant_snapshot(
+        root, config, client, tenant, allow_incomplete=True
+    )
+    if before is None:
+        return False
+    if before != expected_identity:
+        raise RuntimeError(
+            f"retained tenant identity is incompatible: {tenant.name}"
+        )
+    if not collect_tenant_status(root, config, client, tenant, cluster).get(
+        "ready"
+    ):
+        return False
+    verify_addon_source_ownership(
+        root, config, client, tenant, require_present=True
+    )
+    _dev_test_endpoint(root, config, client, tenant)
+    _dev_test_machines(root, config, client, tenant)
+    _dev_test_storage(root, config, client, tenant)
+    try:
+        _dev_test_network(root, config, client, tenant)
+        _dev_test_database(root, config, client, tenant)
+    except (NetworkProbeCleanupError, SQLProbeCleanupError):
+        raise
+    except RuntimeError:
+        return False
+    after = stable_tenant_snapshot(root, config, client, tenant)
+    if after != before or after != expected_identity:
+        raise RuntimeError(
+            f"retained tenant identity changed during health validation: {tenant.name}"
+        )
+    return True
+
+
+def _reconcile_dev_up(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+    *,
+    include_management: bool,
+) -> None:
+    if include_management:
+        prepare_inotify(root, config)
+        create_management(root, config)
+        client = ManagementClient(root, config)
+    identity = reconcile_tenant(root, config, client, tenant)
+    write_dev_up_evidence(root, config, tenant, identity)
     write_retained_state(root, config)
+
+
+def _emit_dev_up_result(path: str, started: float) -> None:
+    print(
+        "CAPI_DEV_UP "
+        + json.dumps(
+            {
+                "path": path,
+                "schema": 1,
+                "seconds": round(time.monotonic() - started, 3),
+                "status": "passed",
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+
+
+def dev_up(root: Path, config: dict[str, str]) -> None:
+    started = time.monotonic()
+    state = retained_path(root)
+    if not state.exists() and not state.is_symlink():
+        dev_bootstrap(root, config)
+        client = ManagementClient(root, config)
+        tenant = validate_create_inputs(root, config)[0]
+        identity = reconcile_tenant(root, config, client, tenant)
+        write_dev_up_evidence(root, config, tenant, identity)
+        write_retained_state(root, config)
+        path = "bootstrap"
+    else:
+        validate_retained_state(root, config)
+        run_retained_preflight(root, config, require_inotify=False)
+        validate_inotify_state(root, config)
+        tenant = validate_create_inputs(root, config)[0]
+        client = ManagementClient(root, config)
+        evidence_path = dev_up_evidence_path(root)
+        if not evidence_path.exists() and not evidence_path.is_symlink():
+            _reconcile_dev_up(
+                root,
+                config,
+                client,
+                tenant,
+                include_management=True,
+            )
+            path = "full-reconcile"
+        else:
+            expected_identity = load_dev_up_evidence(
+                root, config, tenant
+            )
+            if not _management_is_healthy(root, config):
+                _reconcile_dev_up(
+                    root,
+                    config,
+                    client,
+                    tenant,
+                    include_management=True,
+                )
+                path = "full-reconcile"
+            else:
+                owned = verify_tenant_management_ownership(
+                    config, client, tenant
+                )
+                cluster = owned.get("cluster")
+                if cluster is not None and _tenant_is_healthy(
+                    root,
+                    config,
+                    client,
+                    tenant,
+                    cluster,
+                    expected_identity,
+                ):
+                    path = "healthy"
+                else:
+                    if cluster is None:
+                        _delete_representative_tenant(
+                            root, config, client, tenant
+                        )
+                    _reconcile_dev_up(
+                        root,
+                        config,
+                        client,
+                        tenant,
+                        include_management=False,
+                    )
+                    path = "tenant-reconcile"
+    _emit_dev_up_result(path, started)
     print(f"retained development infrastructure is ready: {tenant.name}")
 
 
