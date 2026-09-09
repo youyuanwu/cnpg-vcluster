@@ -460,63 +460,7 @@ def apply_control_plane(
         "-f",
         str(control_plane),
     )
-    if os.environ.get("CAPI_OFFLINE_ENFORCED") == "1":
-        def patch_pull_policy():
-            response = client.kubectl(
-                "-n",
-                tenant.namespace,
-                "get",
-                f"deployment/{tenant.name}",
-                "-o",
-                "json",
-                check=False,
-            )
-            if response.returncode != 0:
-                return None
-            deployment = json.loads(response.stdout)
-            containers = deployment["spec"]["template"]["spec"]["containers"]
-            if any(
-                container.get("imagePullPolicy") == "Always"
-                for container in containers
-            ):
-                client.kubectl(
-                    "-n",
-                    tenant.namespace,
-                    "patch",
-                    f"deployment/{tenant.name}",
-                    "--type=strategic",
-                    "-p",
-                    json.dumps(
-                        {
-                            "spec": {
-                                "template": {
-                                    "spec": {
-                                        "containers": [
-                                            {
-                                                "name": container["name"],
-                                                "imagePullPolicy": "IfNotPresent",
-                                            }
-                                            for container in containers
-                                        ]
-                                    }
-                                }
-                            }
-                        },
-                        separators=(",", ":"),
-                    ),
-                )
-            return True
-
-        wait_for(
-            f"offline pull policy for {tenant.name}",
-            parse_duration(config["CONDITION_TIMEOUT"]),
-            parse_duration(config["WAIT_POLL_INTERVAL"]),
-            patch_pull_policy,
-        )
-
     def ready():
-        if os.environ.get("CAPI_OFFLINE_ENFORCED") == "1":
-            patch_pull_policy()
         devcluster = _resource(client, tenant, "devcluster", tenant.name)
         kcp = _resource(client, tenant, "kamajicontrolplane", tenant.name)
         cluster = _resource(client, tenant, "cluster", tenant.name)

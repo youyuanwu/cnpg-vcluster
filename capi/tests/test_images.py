@@ -28,7 +28,10 @@ class ImagePreloadTests(unittest.TestCase):
             record.parent.mkdir(parents=True)
             record.write_text(json.dumps({"subnet": "172.18.0.0/16"}))
             with (
-                patch.dict(os.environ, {"CAPI_OFFLINE_ENFORCED": "1"}),
+                patch.dict(
+                    os.environ,
+                    {"CAPI_OFFLINE_ENFORCED": "1"},
+                ),
                 patch("scripts.lib.images.run") as run,
             ):
                 enforce_offline_node_egress(
@@ -39,7 +42,13 @@ class ImagePreloadTests(unittest.TestCase):
                     },
                     "worker-a",
                 )
-            script = run.call_args.args[0][-1]
+            scripts = [
+                call.args[0][-1]
+                for call in run.call_args_list
+                if call.args[0][:3] == ["docker", "exec", "worker-a"]
+                and "iptables" in call.args[0][-1]
+            ]
+            script = scripts[0]
             self.assertIn("-d 172.18.0.0/16 -j RETURN", script)
             self.assertIn("-d 10.70.0.0/16 -j RETURN", script)
             self.assertIn("--dports 80,443 -j REJECT", script)

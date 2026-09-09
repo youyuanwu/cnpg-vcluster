@@ -107,6 +107,20 @@ def enforce_offline_node_egress(
         ["docker", "exec", container, "sh", "-ec", "; ".join(commands)],
         timeout=30,
     )
+    denied = run(
+        [
+            "docker",
+            "exec",
+            container,
+            "bash",
+            "-ec",
+            "timeout 3 bash -c '</dev/tcp/1.1.1.1/443'",
+        ],
+        timeout=10,
+        check=False,
+    )
+    if denied.returncode == 0:
+        raise RuntimeError(f"offline egress probe unexpectedly succeeded: {container}")
 
 
 def _container_has_image(container: str, reference: str, timeout: int) -> bool:
