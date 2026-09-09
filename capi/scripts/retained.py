@@ -324,9 +324,14 @@ def _tenant_is_healthy(
         root, config, client, tenant, cluster, strict=True
     ).get("ready"):
         return False
-    verify_addon_source_ownership(
-        root, config, client, tenant, require_present=True
-    )
+    try:
+        verify_addon_source_ownership(
+            root, config, client, tenant, require_present=True
+        )
+    except RuntimeError as exc:
+        if str(exc).startswith("tenant add-on sources are missing:"):
+            return False
+        raise
     _dev_test_endpoint(root, config, client, tenant)
     _dev_test_machines(root, config, client, tenant)
     _dev_test_storage(root, config, client, tenant)
@@ -424,13 +429,20 @@ def dev_up(root: Path, config: dict[str, str]) -> None:
                 )
                 cluster = owned.get("cluster")
                 journal = _journal_path(root, tenant)
-                if cluster is not None and (
-                    journal.exists() or journal.is_symlink()
-                ):
-                    raise RuntimeError(
-                        f"pending tenant deletion blocks reconciliation: {tenant.name}"
+                journal_present = journal.exists() or journal.is_symlink()
+                if journal_present:
+                    _delete_representative_tenant(
+                        root, config, client, tenant
                     )
-                if cluster is not None and _tenant_is_healthy(
+                    _reconcile_dev_up(
+                        root,
+                        config,
+                        client,
+                        tenant,
+                        include_management=False,
+                    )
+                    path = "tenant-reconcile"
+                elif cluster is not None and _tenant_is_healthy(
                     root,
                     config,
                     client,

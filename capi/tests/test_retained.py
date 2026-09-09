@@ -284,7 +284,7 @@ class RetainedTests(unittest.TestCase):
             reconcile.assert_called_once()
             self.assertFalse(reconcile.call_args.kwargs["include_management"])
 
-    def test_dev_up_refuses_live_cluster_with_pending_deletion(self) -> None:
+    def test_dev_up_resumes_valid_live_cluster_deletion_journal(self) -> None:
         tenant = SimpleNamespace(name="tenant-a")
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -314,12 +314,16 @@ class RetainedTests(unittest.TestCase):
                     return_value={"cluster": {"metadata": {"uid": "cluster"}}},
                 ),
                 patch("scripts.retained._tenant_is_healthy") as healthy,
+                patch(
+                    "scripts.retained._delete_representative_tenant"
+                ) as delete,
                 patch("scripts.retained._reconcile_dev_up") as reconcile,
             ):
-                with self.assertRaisesRegex(RuntimeError, "pending tenant deletion"):
-                    dev_up(root, {})
+                dev_up(root, {})
             healthy.assert_not_called()
-            reconcile.assert_not_called()
+            delete.assert_called_once()
+            reconcile.assert_called_once()
+            self.assertFalse(reconcile.call_args.kwargs["include_management"])
 
     def test_dev_up_propagates_authoritative_inspection_failure(self) -> None:
         tenant = SimpleNamespace(name="tenant-a")
@@ -489,6 +493,53 @@ class RetainedTests(unittest.TestCase):
                         {"metadata": {"uid": "cluster"}},
                         {"uid": "expected"},
                     )
+
+    def test_tenant_health_treats_missing_owned_addon_sources_as_repairable(
+        self,
+    ) -> None:
+        tenant = SimpleNamespace(name="tenant-a")
+        identity = {"uid": "expected"}
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            kubeconfig = root / "kubeconfig"
+            kubeconfig.write_text("config")
+            with (
+                patch(
+                    "scripts.retained.tenant_kubeconfig_path",
+                    return_value=kubeconfig,
+                ),
+                patch("scripts.retained.validate_tenant_kubeconfig_file"),
+                patch(
+                    "scripts.retained.verify_addon_source_ownership",
+                    side_effect=[
+                        None,
+                        RuntimeError(
+                            "tenant add-on sources are missing: configmap/source"
+                        ),
+                    ],
+                ),
+                patch(
+                    "scripts.retained.stable_tenant_snapshot",
+                    return_value=identity,
+                ),
+                patch(
+                    "scripts.retained.collect_tenant_status",
+                    return_value={"ready": True},
+                ),
+                patch("scripts.retained._dev_test_endpoint"),
+                patch("scripts.retained._dev_test_machines"),
+                patch("scripts.retained._dev_test_storage"),
+            ):
+                self.assertFalse(
+                    _tenant_is_healthy(
+                        root,
+                        {},
+                        object(),
+                        tenant,
+                        {"metadata": {"uid": "cluster"}},
+                        identity,
+                    )
+                )
 
     def test_dev_test_runs_selected_suite_without_reconciliation(self) -> None:
         tenant = type("Tenant", (), {"name": "tenant-a"})()
