@@ -42,3 +42,39 @@ jobs:
 
       - name: Run static tests
         run: just test-static
+
+  e2e:
+    name: CAPI end-to-end
+    needs: fast-tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    env:
+      MIN_DOCKER_CPUS: "2"
+      MIN_DOCKER_MEMORY_GIB: "6"
+      MIN_DOCKER_STORAGE_GIB: "10"
+    defaults:
+      run:
+        working-directory: capi
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up just
+        uses: extractions/setup-just@v4
+        with:
+          just-version: "1.58.0"
+
+      - name: Show Docker capacity
+        run: docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}} DockerRoot={{.DockerRootDir}}'
+
+      - name: Acquire pinned tools and images
+        run: just cache
+
+      - name: Run end-to-end test
+        run: just test-e2e
