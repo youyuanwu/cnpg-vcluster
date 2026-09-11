@@ -253,17 +253,21 @@ class CnpgTests(unittest.TestCase):
                 )
             inputs = root / ".tools" / "inputs"
             inputs.mkdir(parents=True)
-            source = repository / ".tools" / "inputs" / "cnpg.yaml"
-            inputs.joinpath("cnpg.yaml").write_bytes(source.read_bytes())
+            tagged_image = "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0"
+            operator_manifest = (
+                f"image: {tagged_image}\n"
+                f"operatorImage: {tagged_image}\n"
+            ).encode()
+            inputs.joinpath("cnpg.yaml").write_bytes(operator_manifest)
             config = {
                 "SPIKE_CNPG_CLUSTER": "postgres",
                 "POSTGRES_IMAGE": "postgres@sha256:" + "a" * 64,
                 "SPIKE_STORAGE_CLASS": "hostpath",
                 "SPIKE_STORAGE_CONTAINER_PATH": "/shared",
                 "CNPG_MANIFEST_SHA256": hashlib.sha256(
-                    source.read_bytes()
+                    operator_manifest
                 ).hexdigest(),
-                "CNPG_CONTROLLER_IMAGE_TAGGED": "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0",
+                "CNPG_CONTROLLER_IMAGE_TAGGED": tagged_image,
                 "CNPG_CONTROLLER_IMAGE": "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0@sha256:"
                 + "a" * 64,
                 "DELETE_TIMEOUT": "1s",
