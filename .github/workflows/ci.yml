@@ -1,0 +1,44 @@
+name: CAPI tests
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: capi-tests-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  fast-tests:
+    name: Unit and static tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: capi
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up just
+        uses: extractions/setup-just@v4
+        with:
+          just-version: "1.58.0"
+
+      - name: Run unit tests
+        run: just test-unit
+
+      - name: Run static tests
+        run: just test-static
