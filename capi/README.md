@@ -12,6 +12,28 @@ independently provisioned AKS management cluster with Kamaji control planes,
 CAPZ-managed Azure worker machines, the external Azure cloud provider, and
 Azure CSI. This repository does not create or configure Azure resources.
 
+The proposed minimal Azure experiment is documented in
+[`docs/azure-experiment-design.md`](docs/azure-experiment-design.md). It
+deliberately prioritizes a one-tenant AKS, Kamaji, CAPZ, VMSS, and CNPG proof
+over production infrastructure and operational hardening.
+
+The implemented Azure first milestone uses the ignored owner-only
+`config/azure.local.env` selectors and these commands:
+
+```bash
+just azure-preflight
+just azure-create-foundation
+just azure-create-management
+just azure-create-tenant-control-plane
+just azure-create-worker
+just azure-install-addons
+just azure-status
+```
+
+This leaves one `Standard_B2s` VMSS worker Ready in the Kamaji tenant. The
+Azure resources remain billable until `just azure-destroy` starts deletion of
+the exact recorded experiment resource group.
+
 Kamaji uses the public `26.8.6-edge` source release. The edge channel is
 experimental, but it requires no account, activation key, or paid artifact.
 CAPD `DevCluster` and `DevMachine` resources are development-only and are not

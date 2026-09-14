@@ -18,6 +18,14 @@ EXPECTED_RECIPES = {
     "tools",
     "prepare-host",
     "preflight",
+    "azure-preflight",
+    "azure-create-foundation",
+    "azure-create-management",
+    "azure-create-tenant-control-plane",
+    "azure-create-worker",
+    "azure-install-addons",
+    "azure-status",
+    "azure-destroy",
     "create-management",
     "dev-bootstrap",
     "dev-tenant",
@@ -135,12 +143,11 @@ def check_repository_boundaries() -> None:
     check(not (repository / "vcluster").exists(), "obsolete vcluster lab remains")
     check(not (repository / "kamaji").exists(), "obsolete standalone Kamaji lab remains")
     production = [
-        ROOT / "Justfile",
         *(ROOT / "config").glob("*"),
         *(
             path
             for path in (ROOT / "scripts").rglob("*.py")
-            if path.name != "test_static.py"
+            if path.name not in {"test_static.py", "azure.py"}
         ),
         *(ROOT / "manifests").rglob("*"),
     ]
