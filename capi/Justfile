@@ -19,6 +19,38 @@ prepare-host:
 preflight:
     @python3 scripts/lab.py preflight
 
+# Validate the selected Azure subscription, region, SKUs, image, and Bicep.
+azure-preflight:
+    @python3 scripts/azure.py preflight
+
+# Create the minimal Azure resource group, network, identity, and AKS cluster.
+azure-create-foundation:
+    @python3 scripts/azure.py create-foundation
+
+# Install the pinned CAPI, CAPZ, Kamaji, and bootstrap controller stack on AKS.
+azure-create-management:
+    @python3 scripts/azure.py create-management
+
+# Create one hosted tenant control plane and its externally managed AzureCluster.
+azure-create-tenant-control-plane:
+    @python3 scripts/azure.py create-tenant-control-plane
+
+# Create one VMSS-backed tenant worker and wait for Node registration.
+azure-create-worker:
+    @python3 scripts/azure.py create-worker
+
+# Install Azure cloud initialization and Calico from an AKS-resident Job.
+azure-install-addons:
+    @python3 scripts/azure.py install-addons
+
+# Report the exact recorded Azure foundation state.
+azure-status:
+    @python3 scripts/azure.py status
+
+# Start deletion of the exactly recorded Azure experiment resource group.
+azure-destroy:
+    @python3 scripts/azure.py destroy
+
 # [implemented] Reconcile the management cluster and lifecycle controllers.
 create-management:
     @python3 scripts/lab.py create-management
