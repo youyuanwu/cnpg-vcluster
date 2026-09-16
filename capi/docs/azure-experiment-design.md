@@ -466,6 +466,46 @@ configuration, and sanitized evidence patterns. It should not copy local
 Docker ownership logic into the Azure profile or use Python as an Azure
 resource provider.
 
+## Measured clean redeployment
+
+On 2026-09-15, the first-milestone topology was deleted and rebuilt in
+`westus2` using the tested version matrix and default sizing documented above.
+Cleanup was measured until both the experiment resource group and the
+AKS-managed node resource group no longer existed. Buildout steps were measured
+from invocation through each command's readiness gate.
+
+| Step | Elapsed time |
+|---|---:|
+| Delete the existing Azure resources | 10m 12s |
+| Explicit `azure-preflight` | 6m 03s |
+| Create the Bicep foundation and AKS | 12m 51s |
+| Install the management controllers | 9m 29s |
+| Create the Kamaji tenant control plane | 7m 59s |
+| Create the VMSS worker through its kubeadm join marker | 6m 55s |
+| Install the Azure cloud provider and Calico; wait for Node Ready | 7m 26s |
+| Final `azure-status` | 2.67s |
+| **Reconstructed clean buildout, excluding cleanup and final status** | **50m 42s** |
+
+Each create or install command also runs Azure preflight internally. The
+command-level measurements therefore include repeated subscription, provider,
+quota, tool, and configuration validation; the explicit preflight row is the
+additional operator-invoked preflight at the beginning of the workflow.
+
+The worker command initially reached the kubeadm join marker after 6m 55s but
+continued waiting and eventually timed out after 25m 46s. The readiness check
+incorrectly required `AzureMachinePool.status.provisioningState` to become
+`Succeeded` before the next step installed the cloud provider. CAPZ can remain
+`Updating` until that cloud initialization occurs, so this requirement formed
+a circular gate. Worker registration now uses the expected VMSS instance count
+and each instance's completed kubeadm join marker. The worker manifest also
+uses CAPZ's canonical `template.networkInterfaces` form so the same resource
+can be server-side applied again.
+
+The 50m 42s total is reconstructed from the successful measurements in this
+redeployment after excluding diagnosis and retries; it is not yet a single
+uninterrupted run with the corrected worker gate. The final observed state was
+AKS Running, Kamaji Ready, and one `Standard_B2s` VMSS worker Ready.
+
 ## Lifecycle
 
 ### Management creation

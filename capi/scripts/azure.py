@@ -880,7 +880,8 @@ spec:
       deletePolicy: Oldest
   template:
     vmSize: {config["AZURE_TENANT_NODE_SKU"]}
-    subnetName: {outputs["tenantSubnetName"]}
+    networkInterfaces:
+      - subnetName: {outputs["tenantSubnetName"]}
     osDisk:
       diskSizeGB: 30
       osType: Linux
@@ -947,64 +948,51 @@ def _wait_worker_registered(root: Path, config: dict[str, str]) -> dict[str, obj
         )
         if response.returncode == 0:
             payload = json.loads(response.stdout)
-            infrastructure = _kubectl(
-                root,
-                "-n",
-                tenant,
-                "get",
-                f"azuremachinepool/{pool}",
-                "-o",
-                "json",
-                check=False,
+            instances = _json(
+                [
+                    "az",
+                    "vmss",
+                    "list-instances",
+                    "--resource-group",
+                    names(config)["resourceGroup"],
+                    "--name",
+                    pool,
+                    "--query",
+                    "[].instanceId",
+                    "--output",
+                    "json",
+                ]
             )
-            if infrastructure.returncode == 0:
-                azure_pool = json.loads(infrastructure.stdout)
-                if azure_pool.get("status", {}).get("provisioningState") == "Succeeded":
-                    instances = _json(
-                        [
-                            "az",
-                            "vmss",
-                            "list-instances",
-                            "--resource-group",
-                            names(config)["resourceGroup"],
-                            "--name",
-                            pool,
-                            "--query",
-                            "[].instanceId",
-                            "--output",
-                            "json",
-                        ]
+            if len(instances) == int(config["AZURE_TENANT_NODE_COUNT"]):
+                joined = True
+                for instance in instances:
+                    result = _az(
+                        "vmss",
+                        "run-command",
+                        "invoke",
+                        "--resource-group",
+                        names(config)["resourceGroup"],
+                        "--name",
+                        pool,
+                        "--instance-id",
+                        str(instance),
+                        "--command-id",
+                        "RunShellScript",
+                        "--scripts",
+                        (
+                            "sudo grep -q 'This node has joined the cluster' "
+                            "/var/log/cloud-init-output.log && echo joined"
+                        ),
+                        "--query",
+                        "value[0].message",
+                        "--output",
+                        "tsv",
+                        timeout=180,
+                        check=False,
                     )
-                    if len(instances) == int(config["AZURE_TENANT_NODE_COUNT"]):
-                        joined = True
-                        for instance in instances:
-                            result = _az(
-                                "vmss",
-                                "run-command",
-                                "invoke",
-                                "--resource-group",
-                                names(config)["resourceGroup"],
-                                "--name",
-                                pool,
-                                "--instance-id",
-                                str(instance),
-                                "--command-id",
-                                "RunShellScript",
-                                "--scripts",
-                                (
-                                    "sudo grep -q 'This node has joined the cluster' "
-                                    "/var/log/cloud-init-output.log && echo joined"
-                                ),
-                                "--query",
-                                "value[0].message",
-                                "--output",
-                                "tsv",
-                                timeout=180,
-                                check=False,
-                            )
-                            joined = joined and result.returncode == 0 and "joined" in result.stdout
-                        if joined:
-                            return payload
+                    joined = joined and result.returncode == 0 and "joined" in result.stdout
+                if joined:
+                    return payload
         time.sleep(10)
     raise RuntimeError("Azure VMSS worker did not register with the tenant API")
 

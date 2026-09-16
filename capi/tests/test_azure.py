@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import unittest
 from pathlib import Path
@@ -10,6 +11,7 @@ from scripts.azure import (
     _render_addon_job,
     _render_worker_pool,
     _validate_networks,
+    _wait_worker_registered,
     load_azure_configuration,
     names,
 )
@@ -101,6 +103,7 @@ class AzureConfigurationTests(unittest.TestCase):
         text = _render_worker_pool(root, config, inventory).read_text()
         self.assertIn("kind: KubeadmConfig", text)
         self.assertIn("feature-gates: KubeletCrashLoopBackOffMax=true", text)
+        self.assertIn("networkInterfaces:\n      - subnetName: tenant", text)
         self.assertIn("kind: AzureMachinePool", text)
         self.assertIn("kind: MachinePool", text)
 
@@ -119,6 +122,26 @@ class AzureConfigurationTests(unittest.TestCase):
         )
         self.assertIn("nodeSelector: null", text)
         self.assertIn("crd.projectcalico.org.v1", text)
+
+    def test_worker_registration_does_not_wait_for_capz_status(self):
+        config = {
+            "AZURE_PREFIX": "yy-cv",
+            "AZURE_TENANT_NODE_COUNT": "1",
+            "AZURE_TENANT_TIMEOUT": "1m",
+        }
+        machine_pool = subprocess.CompletedProcess(
+            [],
+            0,
+            stdout='{"metadata":{"name":"yy-cv-tenant-worker"}}',
+        )
+        joined = subprocess.CompletedProcess([], 0, stdout="joined")
+        with (
+            patch("scripts.azure._kubectl", return_value=machine_pool),
+            patch("scripts.azure._json", return_value=["0"]),
+            patch("scripts.azure._az", return_value=joined),
+        ):
+            result = _wait_worker_registered(Path("/tmp"), config)
+        self.assertEqual(result["metadata"]["name"], "yy-cv-tenant-worker")
 
 
 if __name__ == "__main__":
