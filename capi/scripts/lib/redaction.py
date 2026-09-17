@@ -113,7 +113,7 @@ def _redact_value(
 
 def _redact_text(value: str, *, depth: int) -> str:
     if depth > 8:
-        return _redact_patterns(value)
+        return "REDACTED"
     stripped = value.strip()
     if stripped.startswith(("{", "[", '"')):
         try:

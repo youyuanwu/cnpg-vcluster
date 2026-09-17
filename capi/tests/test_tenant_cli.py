@@ -21,6 +21,7 @@ from scripts.lib.tenant_runtime import (
 )
 from scripts.lib.tenant_spec import TenantSpec, TenantSpecError
 from scripts.lib.tenant_status import TenantStatus
+from scripts.lib.tenant_timing import TenantTimings
 from scripts.tenant import execute
 
 
@@ -236,6 +237,56 @@ class TenantCliTests(unittest.TestCase):
                     self.assertNotIn(sensitive, timing_text)
                     self.assertNotIn(sensitive, status_text)
                 runtime.paths.operation.unlink()
+
+    def test_deeply_nested_serialized_errors_fail_closed_for_both_profiles(self) -> None:
+        _, root, _ = self.make_root()
+        sensitive = (
+            "synthetic-password",
+            "synthetic-token",
+            "synthetic-kubeconfig",
+            "00000000-0000-0000-0000-000000000000",
+        )
+        nested = json.dumps(
+            {
+                "password": sensitive[0],
+                "Authorization": sensitive[1],
+                "kubeconfig": sensitive[2],
+                "subscriptionId": sensitive[3],
+            }
+        )
+        for _ in range(12):
+            nested = json.dumps({"message": nested})
+        for profile in ("local", "azure"):
+            with self.subTest(profile=profile):
+                status_text = TenantStatus(
+                    profile=profile,
+                    tenant="tenant-c",
+                    classification="failed",
+                    foundation_healthy=True,
+                    blockers=(nested,),
+                ).to_json()
+                timings = TenantTimings(
+                    root,
+                    profile=profile,
+                    tenant="tenant-c",
+                    operation="create",
+                    operation_id=f"{profile}-deep",
+                )
+                with self.assertRaises(RuntimeError):
+                    with timings.phase("operation"):
+                        raise RuntimeError(nested)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    timings.emit()
+                evidence = timings.persist()
+                combined = (
+                    status_text
+                    + output.getvalue()
+                    + evidence.read_text(encoding="utf-8")
+                )
+                for value in sensitive:
+                    self.assertNotIn(value, combined)
+                self.assertIn("REDACTED", combined)
 
     def test_invalid_spec_and_foundation_failure_emit_failed_timing(self) -> None:
         _, root, spec_path = self.make_root()
