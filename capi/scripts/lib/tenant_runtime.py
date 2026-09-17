@@ -321,6 +321,10 @@ class TenantRuntime:
             isinstance(item, str) and item for item in intended_resources
         ):
             raise TenantRuntimeError("tenant intended resources must not be empty")
+        identity = self.require_compatible_identity(
+            spec,
+            validated_foundation,
+        )
         if self.operation_exists():
             existing = self.load_operation()
             if (
@@ -330,11 +334,25 @@ class TenantRuntime:
                 or tuple(existing.intended_resources) != tuple(intended_resources)
             ):
                 raise TenantRuntimeError("conflicting tenant operation already exists")
+            if identity is None:
+                return existing
+            conflicts = sorted(
+                key
+                for key, value in identity.observed.items()
+                if key in existing.observed and existing.observed[key] != value
+            )
+            if conflicts:
+                raise TenantRuntimeError(
+                    "tenant observed identity changed: " + ", ".join(conflicts)
+                )
+            merged = {**identity.observed, **existing.observed}
+            if merged != dict(existing.observed):
+                existing = replace(existing, observed=merged)
+                write_private_file(
+                    self.paths.operation,
+                    json.dumps(existing.to_mapping(), sort_keys=True) + "\n",
+                )
             return existing
-        identity = self.require_compatible_identity(
-            spec,
-            validated_foundation,
-        )
         journal = OperationJournal(
             operation_id=operation_id or uuid.uuid4().hex,
             operation=operation,
@@ -365,10 +383,19 @@ class TenantRuntime:
             raise TenantRuntimeError("tenant operation identity changed")
         merged = dict(current.observed)
         if observed is not None:
+            identity = self.load_identity() if self.identity_exists() else None
+            durable = {} if identity is None else dict(identity.observed)
             conflicts = sorted(
                 key
                 for key, value in observed.items()
-                if key in merged and merged[key] != value
+                if (
+                    key in merged
+                    and merged[key] != value
+                )
+                or (
+                    key in durable
+                    and durable[key] != value
+                )
             )
             if conflicts:
                 raise TenantRuntimeError(
@@ -435,16 +462,23 @@ class TenantRuntime:
             allow_empty=False,
         )
         conflicts = sorted(
-            key
-            for key, value in validated_observed.items()
-            if (
-                key in current.observed
-                and current.observed[key] != value
-            )
-            or (
-                key in prior_observed
-                and prior_observed[key] != value
-            )
+            {
+                key
+                for key, value in current.observed.items()
+                if key in prior_observed and prior_observed[key] != value
+            }
+            | {
+                key
+                for key, value in validated_observed.items()
+                if (
+                    key in current.observed
+                    and current.observed[key] != value
+                )
+                or (
+                    key in prior_observed
+                    and prior_observed[key] != value
+                )
+            }
         )
         if conflicts:
             raise TenantRuntimeError(

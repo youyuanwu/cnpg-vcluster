@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Mapping, Sequence
 
@@ -68,7 +69,7 @@ SENSITIVE_KEYS = frozenset(
 )
 
 
-def redact(value: str) -> str:
+def _redact_patterns(value: str) -> str:
     result = CLI_SECRET.sub(lambda match: f"{match.group(1)}=REDACTED", value)
     result = SERIALIZED_SECRET.sub(
         lambda match: f"{match.group(1)}\"REDACTED\"",
@@ -83,6 +84,26 @@ def redact(value: str) -> str:
         lambda match: f"{match.group(1)}REDACTED",
         result,
     )
+
+
+def redact(value: str) -> str:
+    stripped = value.strip()
+    if (
+        stripped.startswith(("{", "["))
+        and stripped.endswith(("}", "]"))
+    ):
+        try:
+            parsed = json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+        else:
+            if isinstance(parsed, (dict, list)):
+                return json.dumps(
+                    redact_value(parsed),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+    return _redact_patterns(value)
 
 
 def redact_value(value: object, *, key: str | None = None) -> object:

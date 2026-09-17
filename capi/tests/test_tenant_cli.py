@@ -146,6 +146,45 @@ class TenantCliTests(unittest.TestCase):
         self.assertIn("REDACTED", text)
         self.assertNotIn("super-secret", output.getvalue())
 
+    def test_nested_serialized_failure_is_redacted_in_timing_outputs(self) -> None:
+        _, root, spec_path = self.make_root()
+        adapter = FakeAdapter()
+        secret = "synthetic-password"
+        subscription = "00000000-0000-0000-0000-000000000000"
+        adapter.failure = RuntimeError(
+            json.dumps(
+                {
+                    "message": json.dumps(
+                        {
+                            "password": secret,
+                            "subscriptionId": subscription,
+                        }
+                    ),
+                    "Authorization": "Bearer synthetic-token",
+                    "kubeconfig": "synthetic-kubeconfig",
+                }
+            )
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            with self.assertRaises(RuntimeError):
+                execute(
+                    root,
+                    ["create", "local", str(spec_path)],
+                    adapters={"local": adapter},
+                )
+        runtime = TenantRuntime(root, "local", "tenant-c")
+        evidence = next(runtime.paths.evidence.glob("create-*.json"))
+        combined = output.getvalue() + evidence.read_text(encoding="utf-8")
+        for sensitive in (
+            secret,
+            subscription,
+            "synthetic-token",
+            "synthetic-kubeconfig",
+        ):
+            self.assertNotIn(sensitive, combined)
+        self.assertIn("REDACTED", combined)
+
     def test_invalid_spec_and_foundation_failure_emit_failed_timing(self) -> None:
         _, root, spec_path = self.make_root()
         adapter = FakeAdapter()
@@ -338,7 +377,16 @@ class TenantCliTests(unittest.TestCase):
                 }
             },
             blockers=(
-                "token=abcdef.abcdefghijklmnop",
+                json.dumps(
+                    {
+                        "message": json.dumps(
+                            {
+                                "Authorization": "Bearer nested-token",
+                                "kubeconfig": "nested-kubeconfig",
+                            }
+                        )
+                    }
+                ),
                 "GET /subscriptions/00000000-0000-0000-0000-000000000000",
             ),
         )
@@ -357,6 +405,8 @@ class TenantCliTests(unittest.TestCase):
             )
         self.assertNotIn("super-secret", output.getvalue())
         self.assertNotIn("abcdef.abcdefghijklmnop", output.getvalue())
+        self.assertNotIn("nested-token", output.getvalue())
+        self.assertNotIn("nested-kubeconfig", output.getvalue())
         self.assertNotIn("00000000-0000-0000-0000-000000000000", output.getvalue())
         self.assertIn("REDACTED", output.getvalue())
 
@@ -481,6 +531,61 @@ class TenantCliTests(unittest.TestCase):
         self.assertEqual(
             TenantRuntime(root, "local", "tenant-c").load_identity().observed,
             {"cluster": "cluster-uid"},
+        )
+
+    def test_retained_journal_is_reconciled_with_durable_identity(self) -> None:
+        _, root, spec_path = self.make_root()
+
+        class InitialAdapter(FakeAdapter):
+            def create(self, root, spec, runtime, journal, timings):
+                return {
+                    "cluster": "cluster-uid",
+                    "worker": "original-worker-uid",
+                }
+
+        adapter = InitialAdapter()
+        execute(
+            root,
+            ["create", "local", str(spec_path)],
+            adapters={"local": adapter},
+        )
+        runtime = TenantRuntime(root, "local", "tenant-c")
+        spec = TenantSpec.from_mapping(SPEC)
+        journal = runtime.start_operation(
+            operation="create",
+            spec=spec,
+            foundation_identity={"management": "management-uid"},
+            intended_resources=("Cluster/tenant-c",),
+            operation_id="retained-operation",
+        )
+        incomplete = journal.to_mapping()
+        incomplete["observed"] = {"cluster": "cluster-uid"}
+        write_private_file(
+            runtime.paths.operation,
+            json.dumps(incomplete) + "\n",
+        )
+
+        def replace_worker(root, spec, runtime, journal, timings):
+            runtime.update_operation(
+                journal,
+                phase="workers-ready",
+                observed={"worker": "replacement-worker-uid"},
+            )
+            return {"cluster": "cluster-uid"}
+
+        adapter.create = replace_worker
+        with self.assertRaisesRegex(TenantRuntimeError, "observed identity changed"):
+            execute(
+                root,
+                ["create", "local", str(spec_path)],
+                adapters={"local": adapter},
+            )
+        self.assertEqual(
+            runtime.load_identity().observed,
+            {
+                "cluster": "cluster-uid",
+                "worker": "original-worker-uid",
+            },
         )
 
     def test_create_rejects_changed_or_malformed_existing_identity(self) -> None:
