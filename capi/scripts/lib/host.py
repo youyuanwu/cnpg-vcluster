@@ -291,11 +291,31 @@ def restore_inotify(root: Path, config: dict[str, str]) -> None:
             return
         originals = _read_state_record(host_fd, state_path, config)
 
+        from .files import private_file_exists, read_private_file
+        from .tenant_runtime import recorded_tenant_names
+        from .tenant_spec import validate_tenant_name
+
+        tenant_names = set(recorded_tenant_names(root, "local"))
+        endpoint_path = (
+            root / ".runtime" / "management" / "tenant-endpoints.json"
+        )
+        if private_file_exists(endpoint_path):
+            try:
+                endpoint_payload = json.loads(
+                    read_private_file(endpoint_path).decode()
+                )
+                allocations = endpoint_payload["allocations"]
+                if not isinstance(allocations, dict):
+                    raise ValueError
+                for name in allocations:
+                    validate_tenant_name(name)
+                    tenant_names.add(name)
+            except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
+                raise HostError(
+                    "tenant endpoint allocation record is invalid during host restoration"
+                )
         provider_residue = []
-        for cluster_name in (
-            config["SPIKE_NAME"],
-            *config["TENANT_NAMES"].split(),
-        ):
+        for cluster_name in (config["SPIKE_NAME"], *sorted(tenant_names)):
             provider_residue.extend(
                 run(
                     [
@@ -308,21 +328,19 @@ def restore_inotify(root: Path, config: dict[str, str]) -> None:
                     timeout=30,
                 ).stdout.split()
             )
-            volume_name = (
-                f"{config['LAB_PREFIX']}-{cluster_name}-storage"
-            )
-            volume = run(
-                ["docker", "volume", "inspect", volume_name],
+        provider_residue.extend(
+            run(
+                [
+                    "docker",
+                    "volume",
+                    "ls",
+                    "-q",
+                    "--filter",
+                    f"label={config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
+                ],
                 timeout=30,
-                check=False,
-            )
-            if volume.returncode == 0:
-                provider_residue.append(volume_name)
-            elif "no such volume" not in volume.stderr.lower():
-                raise HostError(
-                    f"unable to inspect tenant storage volume before host "
-                    f"restoration: {volume.stderr}"
-                )
+            ).stdout.split()
+        )
         provider_residue.extend(
             run(
                 [

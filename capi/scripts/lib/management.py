@@ -243,8 +243,6 @@ def _observed_management_network(config: dict[str, str]) -> dict[str, object]:
     if any(address in used or address not in subnet for address in reserved):
         raise RuntimeError("configured management VIP range is not free")
     slots = {
-        "tenant-a": str(reserved[int(config["TENANT_A_API_VIP_SLOT"])]),
-        "tenant-b": str(reserved[int(config["TENANT_B_API_VIP_SLOT"])]),
         "spike": str(reserved[int(config["SPIKE_API_VIP_SLOT"])]),
     }
     record = {
@@ -386,6 +384,23 @@ def allocate_tenant_endpoint(
     allocations[tenant_name] = selected
     _write_tenant_endpoints(root, network, allocations)
     return selected
+
+
+def tenant_endpoint_allocations(
+    root: Path,
+    config: dict[str, str],
+) -> dict[str, str]:
+    network = validate_management_network(root, config)
+    return _load_tenant_endpoints(root, network)
+
+
+def tenant_endpoint_allocation(
+    root: Path,
+    config: dict[str, str],
+    tenant_name: str,
+) -> str | None:
+    validate_tenant_name(tenant_name)
+    return tenant_endpoint_allocations(root, config).get(tenant_name)
 
 
 def release_tenant_endpoint(

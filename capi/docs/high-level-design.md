@@ -12,10 +12,10 @@ The future tenants are not separate AKS clusters. AKS is the shared management
 cluster; each tenant remains a Kamaji hosted control plane with
 CAPZ-managed Azure worker machines.
 
-The design requires two isolated tenant APIs, three exclusive workers per
-tenant, tenant-owned networking and storage, one three-instance PostgreSQL
-cluster per tenant, explicit repair, targeted deletion, and deterministic
-cleanup.
+The design accepts explicit tenant specifications for isolated tenant APIs,
+one to three exclusive workers, tenant-owned networking and storage, one to
+three PostgreSQL instances, idempotent create retry, targeted deletion, and
+deterministic cleanup.
 
 ## As-built topology
 
@@ -133,14 +133,9 @@ tenant isolation.
 
 A separate retained-management development mode binds the current management
 identity to the user, repository root, branch and revision, configuration,
-host, and Docker daemon. `dev-up` validates that binding, immutable inputs,
-host/runtime preflight, management readiness and compatibility, and tenant-A
-health before choosing a path. A fully healthy tenant must retain its recorded
-management-resource, worker, runtime, storage, database, and kubeconfig
-identity; the health check then returns without reconciliation. If management
-is healthy but tenant A is canonically absent or provably owned and
-repairable, only tenant A is reconciled. Missing health evidence or unhealthy
-management uses full reconciliation once, while stale, foreign, unsafe,
+host, and Docker daemon. `dev-bootstrap` validates that management binding;
+tenant selection and reconciliation remain explicit through
+`tenant-create`, `tenant-status`, and `tenant-delete`. Stale, foreign, unsafe,
 partial, and non-authoritative inspection results remain failures.
 
 Active network and SQL-marker checks may create uniquely named transient pods.
@@ -272,14 +267,14 @@ inventory is unchanged.
 
 Fast checks are `just test-unit` and `just test-static`. Targeted lifecycle
 suites prove management ownership, endpoint behavior, networking, Machines,
-storage, persistence, tenant repair/deletion, mutation gates, and break-glass
+storage, persistence, tenant create/delete, mutation gates, and break-glass
 contracts.
 
-The final `just test-e2e` is intentionally bounded: it creates one
-representative tenant, requires one three-instance PostgreSQL cluster and SQL
-marker healthy, then performs complete teardown and host restoration. The
-two-tenant and disruption guarantees remain in their targeted suites instead
-of being repeated in a long mega-test.
+The final `just test-e2e` is intentionally bounded: it creates one explicitly
+selected representative tenant, requires its PostgreSQL cluster and SQL marker
+healthy, then performs complete teardown and host restoration. Multi-survivor
+and disruption guarantees remain in targeted suites instead of being repeated
+in a long mega-test.
 
 `just test-e2e-offline` attempts the same lifecycle while blocking host
 acquisition commands, forcing Docker runs not to pull, and rejecting external

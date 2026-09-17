@@ -3,31 +3,71 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scripts.cnpg import _verify_marker
-from scripts.create import create, stable_tenant_snapshot
+from scripts.create import stable_tenant_snapshot
+from scripts.create_management import create_management
 from scripts.destroy import destroy
-from scripts.destroy_tenant import (
-    destroy_tenant_stack,
-    prepare_tenant_deletion,
-)
-from scripts.lib.files import write_private_file
+from scripts.destroy_tenant import prepare_tenant_deletion
 from scripts.lib.kube import ManagementClient
+from scripts.lib.locking import tools_lock
+from scripts.lib.management import tenant_endpoint_allocation
 from scripts.lib.redaction import redact
-from scripts.lib.tenants import (
-    configured_tenants,
-    inspect_management_resource,
-    storage_record_path,
-)
-from scripts.repair import repair
+from scripts.lib.tenant_runtime import TenantRuntime
+from scripts.lib.tenants import resolve_tenant_storage, tenant_from_spec
+from scripts.tenant import execute
 
 
-def _tenant_map(root: Path, config: dict[str, str]):
-    return {tenant.name: tenant for tenant in configured_tenants(root, config)}
+def _spec_paths(root: Path) -> dict[str, Path]:
+    directory = root / "config" / "tenants" / "tests"
+    return {
+        name: directory / f"{name}.json"
+        for name in ("tenant-a", "tenant-b", "tenant-c")
+    }
 
 
-def _drift_kube_proxy(root: Path, config: dict[str, str], tenant) -> None:
+def _tenant(root: Path, config: dict[str, str], name: str):
+    identity = TenantRuntime(root, "local", name).load_identity()
+    endpoint = tenant_endpoint_allocation(root, config, name)
+    if endpoint is None:
+        raise RuntimeError(f"tenant endpoint allocation is absent: {name}")
+    tenant = tenant_from_spec(root, identity.specification, endpoint)
+    return resolve_tenant_storage(root, config, tenant)
+
+
+def _snapshot(root: Path, config: dict[str, str], name: str):
+    snapshot = stable_tenant_snapshot(
+        root,
+        config,
+        ManagementClient(root, config),
+        _tenant(root, config, name),
+    )
+    if snapshot is None:
+        raise RuntimeError(f"tenant snapshot is incomplete: {name}")
+    return snapshot
+
+
+def _create(root: Path, path: Path) -> None:
+    execute(root, ["create", "local", str(path)])
+
+
+def _delete(root: Path, name: str) -> None:
+    execute(root, ["delete", "local", name, f"local/{name}"])
+
+
+def _require_status(root: Path, name: str, classification: str) -> None:
+    from scripts.local_tenant import LocalTenantAdapter
+
+    status = LocalTenantAdapter().status(root, name)
+    if status.classification != classification:
+        raise RuntimeError(
+            f"unexpected tenant status for {name}: "
+            f"{status.classification}: {status.blockers}"
+        )
+
+
+def _drift_kube_proxy(root: Path, config: dict[str, str], name: str) -> None:
     from scripts.lib.tenants import _tenant_kubectl
 
+    tenant = _tenant(root, config, name)
     _tenant_kubectl(
         root,
         config,
@@ -43,304 +83,68 @@ def _drift_kube_proxy(root: Path, config: dict[str, str], tenant) -> None:
     )
 
 
-def _repair_refuses_missing_identity_record(
-    root: Path,
-    config: dict[str, str],
-    client,
-    tenant,
-    survivor,
-) -> None:
-    record_path = storage_record_path(root, tenant)
-    record = record_path.read_text(encoding="utf-8")
-    survivor_before = stable_tenant_snapshot(root, config, client, survivor)
-    record_path.unlink()
-    try:
-        try:
-            repair(root, config, tenant.name)
-        except RuntimeError:
-            pass
-        else:
-            raise RuntimeError("repair accepted a tenant volume without its identity record")
-    finally:
-        write_private_file(record_path, record)
-    if stable_tenant_snapshot(root, config, client, survivor) != survivor_before:
-        raise RuntimeError("failed repair changed the survivor")
-
-
-def _repair_input_tamper_blocked(
-    root: Path,
-    config: dict[str, str],
-    client,
-    tenant,
-    survivor,
-) -> None:
-    path = (
-        root
-        / "manifests"
-        / "tenants"
-        / "overlays"
-        / tenant.name
-        / "tenant.json"
-    )
-    original = path.read_bytes()
-    tenant_before = stable_tenant_snapshot(root, config, client, tenant)
-    survivor_before = stable_tenant_snapshot(root, config, client, survivor)
-    path.write_bytes(original + b"\n")
-    try:
-        try:
-            repair(root, config, tenant.name)
-        except RuntimeError:
-            pass
-        else:
-            raise RuntimeError("repair accepted a tampered immutable tenant input")
-    finally:
-        path.write_bytes(original)
-    if stable_tenant_snapshot(root, config, client, tenant) != tenant_before:
-        raise RuntimeError("tampered repair changed the target tenant")
-    if stable_tenant_snapshot(root, config, client, survivor) != survivor_before:
-        raise RuntimeError("tampered repair changed the survivor tenant")
-
-
-def _repair_refuses_unowned_cluster(
-    root: Path,
-    config: dict[str, str],
-    client,
-    tenant,
-    survivor,
-) -> None:
-    survivor_before = stable_tenant_snapshot(root, config, client, survivor)
-    client.kubectl(
-        "-n",
-        tenant.namespace,
-        "label",
-        f"cluster/{tenant.name}",
-        f"{config['OWNERSHIP_LABEL']}=foreign",
-        "--overwrite",
-    )
-    try:
-        try:
-            repair(root, config, tenant.name)
-        except RuntimeError:
-            pass
-        else:
-            raise RuntimeError("repair accepted an unowned same-name Cluster")
-    finally:
-        client.kubectl(
-            "-n",
-            tenant.namespace,
-            "label",
-            f"cluster/{tenant.name}",
-            f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
-            "--overwrite",
-        )
-    if stable_tenant_snapshot(root, config, client, survivor) != survivor_before:
-        raise RuntimeError("unowned repair attempt changed the survivor")
-
-
-def _repair_refuses_unowned_machine(
-    root: Path,
-    config: dict[str, str],
-    client,
-    tenant,
-    survivor,
-) -> None:
-    target_before = stable_tenant_snapshot(root, config, client, tenant)
-    survivor_before = stable_tenant_snapshot(root, config, client, survivor)
-    machine_name = sorted(target_before["workers"])[0]
-    machine_uid = target_before["workers"][machine_name]["machineUID"]
-    client.kubectl(
-        "-n",
-        tenant.namespace,
-        "delete",
-        f"kamajicontrolplane/{tenant.name}",
-        "--wait=true",
-        f"--timeout={config['DELETE_TIMEOUT']}",
-    )
-    machine = json.loads(
-        client.kubectl(
-            "-n",
-            tenant.namespace,
-            "get",
-            f"machine/{machine_name}",
-            "-o",
-            "json",
-        ).stdout
-    )
-    machine_set = next(
-        owner["name"]
-        for owner in machine["metadata"].get("ownerReferences") or []
-        if owner.get("kind") == "MachineSet"
-        and owner.get("controller") is True
-    )
-    paused_resources = (
-        f"cluster/{tenant.name}",
-        f"machinedeployment/{tenant.name}-worker",
-        f"machineset/{machine_set}",
-    )
-    for resource in paused_resources:
-        client.kubectl(
-            "-n",
-            tenant.namespace,
-            "annotate",
-            resource,
-            "cluster.x-k8s.io/paused=true",
-            "--overwrite",
-        )
-    client.kubectl(
-        "-n",
-        tenant.namespace,
-        "label",
-        f"machine/{machine_name}",
-        f"{config['OWNERSHIP_LABEL']}=foreign",
-        "--overwrite",
-    )
-    try:
-        observed_label = client.kubectl(
-            "-n",
-            tenant.namespace,
-            "get",
-            f"machine/{machine_name}",
-            "-o",
-            "json",
-        ).stdout
-        observed_label = json.loads(observed_label)["metadata"]["labels"].get(
-            config["OWNERSHIP_LABEL"]
-        )
-        if observed_label != "foreign":
-            raise RuntimeError("foreign Machine ownership fixture did not persist")
-        try:
-            repair(root, config, tenant.name)
-        except RuntimeError:
-            pass
-        else:
-            raise RuntimeError("repair accepted an incorrectly owned Machine")
-        if (
-            inspect_management_resource(
-                client, tenant, f"kamajicontrolplane/{tenant.name}"
-            )
-            is not None
-        ):
-            raise RuntimeError("refused repair recreated the missing control plane")
-        observed_uid = client.kubectl(
-            "-n",
-            tenant.namespace,
-            "get",
-            f"machine/{machine_name}",
-            "-o",
-            "jsonpath={.metadata.uid}",
-        ).stdout
-        if observed_uid != machine_uid:
-            raise RuntimeError("refused Machine changed identity")
-    finally:
-        client.kubectl(
-            "-n",
-            tenant.namespace,
-            "label",
-            f"machine/{machine_name}",
-            f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
-            "--overwrite",
-        )
-        for resource in reversed(paused_resources):
-            client.kubectl(
-                "-n",
-                tenant.namespace,
-                "annotate",
-                resource,
-                "cluster.x-k8s.io/paused-",
-            )
-    if stable_tenant_snapshot(root, config, client, survivor) != survivor_before:
-        raise RuntimeError("unowned Machine repair attempt changed the survivor")
-    repair(root, config, tenant.name)
-    recovered = stable_tenant_snapshot(root, config, client, tenant)
-    if any(
-        worker["machineUID"] == machine_uid
-        for worker in recovered["workers"].values()
-    ):
-        raise RuntimeError("incomplete-KCP repair retained the original Machine")
-    _verify_marker(root, config, tenant)
-
-
-def _interrupt_before_cluster_deletion(
-    root: Path,
-    config: dict[str, str],
-    client,
-    tenant,
-) -> None:
-    cluster = inspect_management_resource(client, tenant, f"cluster/{tenant.name}")
-    if cluster is None:
-        raise RuntimeError("interruption fixture tenant is absent")
-    prepare_tenant_deletion(root, config, client, tenant, cluster)
-    destroy_tenant_stack(root, config, tenant.name)
-
-
-def _interrupt_after_cluster_deletion(
-    root: Path,
-    config: dict[str, str],
-    client,
-    tenant,
-) -> None:
-    cluster = inspect_management_resource(client, tenant, f"cluster/{tenant.name}")
-    if cluster is None:
-        raise RuntimeError("interruption fixture tenant is absent")
-    prepare_tenant_deletion(root, config, client, tenant, cluster)
-    client.kubectl(
-        "-n",
-        tenant.namespace,
-        "delete",
-        f"cluster/{tenant.name}",
-        "--wait=true",
-        f"--timeout={config['DELETE_TIMEOUT']}",
-    )
-    destroy_tenant_stack(root, config, tenant.name)
-
-
 def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
     failure = None
+    specs = _spec_paths(root)
     try:
-        create(root, config)
+        with tools_lock(root, exclusive=True):
+            create_management(root, config)
+        for name in ("tenant-a", "tenant-b", "tenant-c"):
+            _create(root, specs[name])
+            _require_status(root, name, "ready")
+
+        survivors = {
+            name: _snapshot(root, config, name)
+            for name in ("tenant-a", "tenant-b")
+        }
+        _delete(root, "tenant-c")
+        _require_status(root, "tenant-c", "absent")
+        for name, before in survivors.items():
+            if _snapshot(root, config, name) != before:
+                raise RuntimeError(f"targeted deletion changed survivor: {name}")
+
+        _create(root, specs["tenant-c"])
+        target_before = _snapshot(root, config, "tenant-c")
+        _drift_kube_proxy(root, config, "tenant-a")
+        try:
+            _delete(root, "tenant-c")
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("unhealthy survivor did not block deletion")
+        if _snapshot(root, config, "tenant-c") != target_before:
+            raise RuntimeError("refused deletion changed the target")
+        _create(root, specs["tenant-a"])
+
+        tenant_c = _tenant(root, config, "tenant-c")
         client = ManagementClient(root, config)
-        tenants = _tenant_map(root, config)
-        tenant_a = tenants["tenant-a"]
-        tenant_b = tenants["tenant-b"]
+        cluster = json.loads(
+            client.kubectl(
+                "-n",
+                tenant_c.namespace,
+                "get",
+                f"cluster/{tenant_c.name}",
+                "-o",
+                "json",
+            ).stdout
+        )
+        prepare_tenant_deletion(root, config, client, tenant_c, cluster)
+        _delete(root, "tenant-c")
+        _require_status(root, "tenant-c", "absent")
+        _create(root, specs["tenant-c"])
 
-        repair(root, config, tenant_a.name)
-        _drift_kube_proxy(root, config, tenant_a)
-        repair(root, config, tenant_a.name)
-        _verify_marker(root, config, tenant_a)
-        _verify_marker(root, config, tenant_b)
-        _repair_input_tamper_blocked(
-            root, config, client, tenant_a, tenant_b
-        )
-        _repair_refuses_unowned_cluster(
-            root, config, client, tenant_a, tenant_b
-        )
-        _repair_refuses_unowned_machine(
-            root, config, client, tenant_a, tenant_b
-        )
-        _repair_refuses_missing_identity_record(
-            root, config, client, tenant_a, tenant_b
-        )
-
-        _interrupt_before_cluster_deletion(
-            root, config, client, tenant_a
-        )
-        destroy_tenant_stack(root, config, tenant_a.name)
-        _verify_marker(root, config, tenant_b)
-
-        create(root, config)
-        client = ManagementClient(root, config)
-        tenants = _tenant_map(root, config)
-        _interrupt_after_cluster_deletion(
-            root, config, client, tenants["tenant-b"]
-        )
-        destroy_tenant_stack(root, config, "tenant-b")
-        _verify_marker(root, config, tenants["tenant-a"])
+        _delete(root, "tenant-b")
+        _delete(root, "tenant-c")
+        _delete(root, "tenant-a")
+        for name in ("tenant-a", "tenant-b", "tenant-c"):
+            _require_status(root, name, "absent")
         print(
             json.dumps(
                 {
-                    "repaired": "tenant-a",
-                    "deletedBeforeClusterInterruption": "tenant-a",
-                    "deletedAfterClusterInterruption": "tenant-b",
+                    "arbitraryTenant": "tenant-c",
+                    "multipleSurvivors": ["tenant-a", "tenant-b"],
+                    "recreated": "tenant-c",
+                    "soleTenantDeleted": "tenant-a",
                 },
                 sort_keys=True,
             )
@@ -348,7 +152,8 @@ def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
     except BaseException as exc:
         failure = exc
     try:
-        destroy(root, config)
+        with tools_lock(root, exclusive=True):
+            destroy(root, config)
     except BaseException as cleanup:
         if failure is None:
             raise

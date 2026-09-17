@@ -135,6 +135,48 @@ def _storage_status(root: Path, config: dict[str, str], tenant) -> dict[str, obj
     }
 
 
+def ensure_storage_ready(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+) -> dict[str, object]:
+    manifest = _render_storage(root, config, tenant)
+    _tenant_kubectl(root, config, tenant, "apply", "-f", str(manifest))
+    smoke = _wait_smoke(root, config, tenant)
+    _verify_marker(root, config, tenant, smoke["name"])
+    status = _storage_status(root, config, tenant)
+    if not status["ready"]:
+        raise RuntimeError("static hostPath storage is not ready")
+    return status
+
+
+def verify_storage_ready(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+) -> dict[str, object]:
+    pods = json.loads(
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "get",
+            "pods",
+            "-l",
+            "app=storage-smoke",
+            "-o",
+            "json",
+        ).stdout
+    )["items"]
+    if len(pods) != 1:
+        raise RuntimeError("expected exactly one storage smoke Pod")
+    _verify_marker(root, config, tenant, pods[0]["metadata"]["name"])
+    status = _storage_status(root, config, tenant)
+    if not status["ready"]:
+        raise RuntimeError("static hostPath storage is not ready")
+    return status
+
+
 def _delete_storage(root: Path, config: dict[str, str], tenant) -> None:
     for resource in (
         "deployment/storage-smoke",

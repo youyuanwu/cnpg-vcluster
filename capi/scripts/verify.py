@@ -20,23 +20,22 @@ from scripts.cnpg import (
     _verify_filesystem,
     _verify_marker,
 )
-from scripts.create import create, stable_tenant_snapshot
+from scripts.create import stable_tenant_snapshot
 from scripts.endpoint import _verify_bootstrap_secret
 from scripts.lib.addons import verify_network
 from scripts.lib.conditions import condition_true
 from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
-from scripts.lib.redaction import redact
 from scripts.lib.tenants import (
     _tenant_kubectl,
-    configured_tenants,
     inspect_storage_volume,
     storage_volume_name,
     tenant_kubeconfig_path,
     write_storage_marker,
 )
 from scripts.machines import worker_snapshot
+from scripts.storage import verify_storage_ready
 
 
 def _private_file(path: Path) -> None:
@@ -461,97 +460,26 @@ def _management_absence(config: dict[str, str], client, tenants, workers) -> Non
             )
 
 
-def verify(root: Path, config: dict[str, str]) -> dict[str, object]:
-    failure = root / ".runtime" / "evidence" / "verify-failure.txt"
-    success = root / ".runtime" / "evidence" / "verify-success.json"
-    failure.unlink(missing_ok=True)
-    success.unlink(missing_ok=True)
-    try:
-        create(root, config)
-        client = ManagementClient(root, config)
-        tenants = configured_tenants(root, config)
-        identities = {}
-        workers = {}
-        storage = {}
-        passwords = {}
-        for tenant in tenants:
-            identities[tenant.name] = _cluster_identity(
-                root, config, client, tenant
-            )
-            verify_network(root, config, tenant)
-            workers[tenant.name] = worker_snapshot(
-                root, config, client, tenant
-            )
-            _bootstrap_credentials(root, config, client, tenant)
-            if not _cnpg_ready(root, config, tenant):
-                raise RuntimeError(f"CNPG is not ready: {tenant.name}")
-            _verify_marker(root, config, tenant)
-            _verify_filesystem(config, tenant)
-            storage[tenant.name] = _storage_identity(root, config, tenant)
-            passwords[tenant.name] = _database_password(root, config, tenant)
-        for key in (
-            "endpoint",
-            "ca",
-            "podCIDR",
-            "serviceCIDR",
-            "domain",
-            "database",
-        ):
-            values = [identity[key] for identity in identities.values()]
-            if len(values) != len(set(values)):
-                raise RuntimeError(f"tenant identity overlap: {key}")
-        for left, right in combinations(tenants, 2):
-            if set(workers[left.name]) & set(workers[right.name]):
-                raise RuntimeError(
-                    f"tenant worker sets overlap: {left.name}, {right.name}"
-                )
-        if len(set(passwords.values())) != len(passwords):
-            raise RuntimeError("tenant PostgreSQL credentials are identical")
-        _storage_isolation(root, config, tenants, workers)
-        _management_absence(config, client, tenants, workers)
-        for source, target in _ordered_tenant_pairs(tenants):
-            _reject_kubernetes_credential(root, config, source, target)
-            _reject_postgres_credential(
-                root, config, source, target, passwords[source.name]
-            )
-        before_reconcile = {
-            tenant.name: stable_tenant_snapshot(root, config, client, tenant)
-            for tenant in tenants
-        }
-        create(root, config)
-        after_reconcile = {
-            tenant.name: stable_tenant_snapshot(root, config, client, tenant)
-            for tenant in tenants
-        }
-        if before_reconcile != after_reconcile:
-            raise RuntimeError("repeated create replaced healthy tenant workers")
-        for tenant in tenants:
-            before_storage = _storage_identity(root, config, tenant)
-            _replace_machine(root, config, client, tenant)
-            if _storage_identity(root, config, tenant) != before_storage:
-                raise RuntimeError(
-                    f"CNPG storage changed across Machine replacement: {tenant.name}"
-                )
-            _verify_marker(root, config, tenant)
-            _verify_database_disruption(root, config, tenant)
-        final_snapshots = {
-            tenant.name: stable_tenant_snapshot(root, config, client, tenant)
-            for tenant in tenants
-        }
-        if any(snapshot is None for snapshot in final_snapshots.values()):
-            raise RuntimeError("final tenant identity snapshot is incomplete")
-        evidence = {
-            "tenantCompatibilityRevision": config[
-                "TENANT_COMPATIBILITY_REVISION"
-            ],
-            "identities": identities,
-            "tenants": final_snapshots,
-            "storage": storage,
-        }
-        write_private_file(success, json.dumps(evidence, sort_keys=True) + "\n")
-        print(f"{len(tenants)}-tenant isolation checks passed")
-        return evidence
-    except Exception as exc:
-        success.unlink(missing_ok=True)
-        write_private_file(failure, redact(str(exc)) + "\n")
-        raise
+def verify_tenant_functional(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+    tenant,
+) -> dict[str, object]:
+    identity = _cluster_identity(root, config, client, tenant)
+    verify_network(root, config, tenant)
+    workers = worker_snapshot(root, config, client, tenant)
+    _bootstrap_credentials(root, config, client, tenant)
+    if not _cnpg_ready(root, config, tenant):
+        raise RuntimeError(f"CNPG is not ready: {tenant.name}")
+    _verify_marker(root, config, tenant)
+    _verify_filesystem(config, tenant)
+    storage = _storage_identity(root, config, tenant)
+    storage_probe = verify_storage_ready(root, config, tenant)
+    return {
+        "identity": identity,
+        "workers": workers,
+        "storage": {"database": storage, "probe": storage_probe},
+        "network": True,
+        "database": True,
+    }

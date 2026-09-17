@@ -12,7 +12,7 @@ from scripts.lib.tenants import (
     Tenant,
     _tenant_values,
     _render_template,
-    configured_tenants,
+    lifecycle_markers,
     load_local_tenant_spec,
     prepare_storage_directory,
     remove_tenant_storage_volume,
@@ -23,7 +23,7 @@ from scripts.lib.tenants import (
 )
 from scripts.lib.files import IntegrityError
 from scripts.lib.images import WORKER_IMAGE_KEYS
-from scripts.lib.tenant_spec import TenantSpecError
+from scripts.lib.tenant_spec import TenantSpec, TenantSpecError
 
 
 class TenantTests(unittest.TestCase):
@@ -80,14 +80,25 @@ class TenantTests(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaisesRegex(TenantSpecError, "TENANT_A_POD_CIDR"):
+            with self.assertRaisesRegex(TenantSpecError, "existing Pod CIDR"):
                 load_local_tenant_spec(
                     Path(temporary),
                     path,
-                    {
-                        "KUBERNETES_VERSION": "v1.36.4",
-                        "TENANT_A_POD_CIDR": "10.70.0.0/16",
-                    },
+                    {"KUBERNETES_VERSION": "v1.36.4"},
+                    existing_specs=(
+                        TenantSpec.from_mapping(
+                            {
+                                "schema": 1,
+                                "profile": "local",
+                                "name": "existing",
+                                "kubernetesVersion": "1.36.4",
+                                "workers": 1,
+                                "podCIDR": "10.70.0.0/16",
+                                "serviceCIDR": "10.150.0.0/16",
+                                "databaseCount": 1,
+                            }
+                        ),
+                    ),
                 )
 
     def test_local_tenant_spec_rejects_management_subnet_overlap(self) -> None:
@@ -248,67 +259,6 @@ class TenantTests(unittest.TestCase):
                 storage_volume_name({"LAB_PREFIX": "test"}, tenant),
                 "test-spike-storage",
             )
-
-    def test_configured_tenant_overlays_are_distinct(self) -> None:
-        repository = Path(__file__).resolve().parents[1]
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            shutil.copytree(
-                repository / "manifests" / "tenants" / "overlays",
-                root / "manifests" / "tenants" / "overlays",
-            )
-            network = root / ".runtime" / "management" / "network.json"
-            network.parent.mkdir(parents=True)
-            network.write_text(
-                json.dumps(
-                    {
-                        "slots": {
-                            "tenant-a": "172.18.0.10",
-                            "tenant-b": "172.18.0.11",
-                        }
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with patch(
-                "scripts.lib.tenants.inspect_storage_volume",
-                return_value=None,
-            ):
-                tenants = configured_tenants(
-                    root,
-                    {
-                        "LAB_PREFIX": "test",
-                        "OWNERSHIP_LABEL": "example.owner",
-                        "TENANT_NAMES": "tenant-a tenant-b",
-                        "TENANT_A_POD_CIDR": "10.70.0.0/16",
-                        "TENANT_A_SERVICE_CIDR": "10.140.0.0/16",
-                        "TENANT_B_POD_CIDR": "10.71.0.0/16",
-                        "TENANT_B_SERVICE_CIDR": "10.141.0.0/16",
-                        "WORKERS_PER_TENANT": "3",
-                    },
-                )
-        self.assertEqual([tenant.name for tenant in tenants], ["tenant-a", "tenant-b"])
-        self.assertEqual({tenant.workers for tenant in tenants}, {3})
-        for attribute in (
-            "namespace",
-            "vip",
-            "pod_cidr",
-            "service_cidr",
-            "dns_ip",
-            "domain",
-            "cnpg_cluster",
-        ):
-            values = [getattr(tenant, attribute) for tenant in tenants]
-            self.assertEqual(len(values), len(set(values)))
-
-    def test_configured_tenants_require_exact_overlay_set(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            network = root / ".runtime" / "management" / "network.json"
-            network.parent.mkdir(parents=True)
-            network.write_text('{"slots":{}}\n', encoding="utf-8")
-            with self.assertRaises(IntegrityError):
-                configured_tenants(root, {"TENANT_NAMES": "tenant-a"})
 
     def test_absent_volume_removes_valid_orphaned_identity_record(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

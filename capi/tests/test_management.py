@@ -33,8 +33,6 @@ class ManagementTests(unittest.TestCase):
             "pool_end": "172.18.255.225",
             "pool_cidrs": [],
             "slots": {
-                "tenant-a": "172.18.255.220",
-                "tenant-b": "172.18.255.221",
                 "spike": "172.18.255.222",
             },
         }
@@ -45,14 +43,14 @@ class ManagementTests(unittest.TestCase):
                 return_value=network,
             ):
                 first = allocate_tenant_endpoint(root, {}, "tenant-c")
-                self.assertEqual(first, "172.18.255.223")
+                self.assertEqual(first, "172.18.255.220")
                 self.assertEqual(
                     allocate_tenant_endpoint(root, {}, "tenant-c"),
                     first,
                 )
                 self.assertEqual(
                     allocate_tenant_endpoint(root, {}, "tenant-d"),
-                    "172.18.255.224",
+                    "172.18.255.221",
                 )
                 with self.assertRaisesRegex(RuntimeError, "canonical absence"):
                     release_tenant_endpoint(
@@ -69,7 +67,7 @@ class ManagementTests(unittest.TestCase):
                 )
                 self.assertEqual(
                     allocate_tenant_endpoint(root, {}, "tenant-e"),
-                    "172.18.255.223",
+                    "172.18.255.220",
                 )
             record = root / ".runtime" / "management" / "tenant-endpoints.json"
             self.assertEqual(record.stat().st_mode & 0o077, 0)

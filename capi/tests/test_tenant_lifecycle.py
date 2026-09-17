@@ -3,21 +3,36 @@ from __future__ import annotations
 import json
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from unittest.mock import Mock, patch
 
 from scripts.destroy_tenant import (
     _tenant_resource,
-    destroy_tenant_stack,
     prepare_tenant_deletion,
 )
-from scripts.create import require_no_pending_deletions
-from scripts.lib.files import IntegrityError
+from scripts.lib.tenant_runtime import TenantIdentity, TenantRuntime
+from scripts.lib.tenant_spec import TenantSpec
+from scripts.lib.tenant_status import TenantStatus
 from scripts.lib.tenants import (
     inspect_management_resource,
     verify_tenant_management_ownership,
 )
-from scripts.repair import repair
+from scripts.local_tenant import LocalTenantAdapter
+
+
+SPEC = TenantSpec.from_mapping(
+    {
+        "schema": 1,
+        "profile": "local",
+        "name": "tenant-c",
+        "kubernetesVersion": "1.36.4",
+        "workers": 1,
+        "podCIDR": "10.73.0.0/16",
+        "serviceCIDR": "10.143.0.0/16",
+        "databaseCount": 1,
+    }
+)
 
 
 def result(returncode: int, stderr: str = "", stdout: str = ""):
@@ -28,41 +43,47 @@ def result(returncode: int, stderr: str = "", stdout: str = ""):
     )()
 
 
-class TenantLifecycleTests(unittest.TestCase):
-    def test_repair_input_failure_precedes_tenant_mutation(self) -> None:
-        with (
-            patch(
-                "scripts.repair.verify_all_inputs",
-                side_effect=IntegrityError("injected repair input tamper"),
-            ),
-            patch("scripts.repair.select_tenant") as select_tenant,
-            patch("scripts.repair.reconcile_tenant") as reconcile_tenant,
-        ):
-            with self.assertRaises(IntegrityError):
-                repair(Path("."), {}, "tenant-a")
-        select_tenant.assert_not_called()
-        reconcile_tenant.assert_not_called()
+def identity(name: str = "tenant-c") -> TenantIdentity:
+    spec = SPEC
+    if name != SPEC.name:
+        spec = TenantSpec.from_mapping(
+            {**SPEC.to_mapping(), "name": name}
+        )
+    return TenantIdentity(
+        profile="local",
+        tenant=name,
+        specification=spec,
+        specification_sha256=spec.sha256(),
+        foundation_identity={"management": "uid"},
+        observed={
+            "endpoint": "172.18.0.10",
+            "markerOperationId": "create-operation",
+        },
+    )
 
+
+class TenantLifecycleTests(unittest.TestCase):
     def test_management_inspection_distinguishes_not_found_and_failure(self) -> None:
         tenant = type(
-            "Tenant", (), {"namespace": "tenant-a", "name": "tenant-a"}
+            "Tenant", (), {"namespace": "tenant-c", "name": "tenant-c"}
         )()
         client = Mock()
         client.kubectl.return_value = result(
             1,
-            'Error from server (NotFound): clusters.cluster.x-k8s.io "tenant-a" not found',
+            'Error from server (NotFound): clusters.cluster.x-k8s.io "tenant-c" not found',
         )
         self.assertIsNone(
-            inspect_management_resource(client, tenant, "cluster/tenant-a")
+            inspect_management_resource(client, tenant, "cluster/tenant-c")
         )
         client.kubectl.return_value = result(
-            1, "lookup management API: host not found"
+            1,
+            "lookup management API: host not found",
         )
         with self.assertRaisesRegex(RuntimeError, "inspection failed"):
-            inspect_management_resource(client, tenant, "cluster/tenant-a")
+            inspect_management_resource(client, tenant, "cluster/tenant-c")
 
     def test_tenant_api_inspection_distinguishes_not_found_and_failure(self) -> None:
-        tenant = type("Tenant", (), {"name": "tenant-a"})()
+        tenant = type("Tenant", (), {"name": "tenant-c"})()
         with patch(
             "scripts.destroy_tenant._tenant_kubectl",
             return_value=result(
@@ -72,7 +93,11 @@ class TenantLifecycleTests(unittest.TestCase):
         ):
             self.assertIsNone(
                 _tenant_resource(
-                    Path("."), {}, tenant, "get", "deployment/item"
+                    Path("."),
+                    {},
+                    tenant,
+                    "get",
+                    "deployment/item",
                 )
             )
         with patch(
@@ -81,75 +106,61 @@ class TenantLifecycleTests(unittest.TestCase):
         ):
             with self.assertRaisesRegex(RuntimeError, "inspection failed"):
                 _tenant_resource(
-                    Path("."), {}, tenant, "get", "deployment/item"
+                    Path("."),
+                    {},
+                    tenant,
+                    "get",
+                    "deployment/item",
                 )
 
-    def test_management_ownership_rejects_foreign_cluster(self) -> None:
+    def test_management_ownership_rejects_foreign_marker(self) -> None:
         tenant = type(
-            "Tenant", (), {"namespace": "tenant-a", "name": "tenant-a"}
+            "Tenant", (), {"namespace": "tenant-c", "name": "tenant-c"}
         )()
         client = Mock()
-        namespace = {"metadata": {"labels": {"example.owner": "lab"}}}
-        foreign = {"metadata": {"labels": {}}}
+        namespace = {
+            "metadata": {
+                "labels": {"example.owner": "lab"},
+                "annotations": {},
+            }
+        }
         not_found = result(
             1,
             'Error from server (NotFound): resource "item" not found',
         )
         client.kubectl.side_effect = [
             result(0, stdout=json.dumps(namespace)),
-            result(0, stdout=json.dumps(foreign)),
-            *([not_found] * 5),
+            *([not_found] * 7),
         ]
-        with self.assertRaisesRegex(RuntimeError, "ownership mismatch"):
+        with self.assertRaisesRegex(RuntimeError, "marker mismatch"):
             verify_tenant_management_ownership(
                 {"OWNERSHIP_LABEL": "example.owner", "LAB_PREFIX": "lab"},
                 client,
                 tenant,
+                expected_markers={
+                    "tenant": "tenant-c",
+                    "profile": "local",
+                    "specificationSha256": "spec",
+                    "foundationSha256": "foundation",
+                    "operationId": "operation",
+                },
             )
 
-    def test_existing_journal_must_match_live_cluster_uid(self) -> None:
-        tenant = type("Tenant", (), {"name": "tenant-a"})()
+    def test_matching_deletion_journal_skips_repeated_live_cleanup(self) -> None:
+        tenant = type("Tenant", (), {"name": "tenant-c"})()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            journal = root / ".runtime" / "deletions" / "tenant-a.json"
+            journal = root / ".runtime" / "deletions" / "tenant-c.json"
             journal.parent.mkdir(parents=True)
             journal.write_text(
                 json.dumps(
                     {
                         "schema": 1,
-                        "tenant": "tenant-a",
-                        "clusterUID": "old",
-                        "phase": "api-cleanup-complete",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            journal.chmod(0o600)
-            with self.assertRaisesRegex(RuntimeError, "UID mismatch"):
-                prepare_tenant_deletion(
-                    root,
-                    {},
-                    object(),
-                    tenant,
-                    {"metadata": {"uid": "new"}},
-                )
-
-    def test_matching_journal_skips_repeated_live_api_cleanup(self) -> None:
-        tenant = type("Tenant", (), {"name": "tenant-a"})()
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            journal = root / ".runtime" / "deletions" / "tenant-a.json"
-            journal.parent.mkdir(parents=True)
-            journal.write_text(
-                json.dumps(
-                    {
-                        "schema": 1,
-                        "tenant": "tenant-a",
+                        "tenant": "tenant-c",
                         "clusterUID": "same",
                         "phase": "api-cleanup-complete",
                     }
-                ),
-                encoding="utf-8",
+                )
             )
             journal.chmod(0o600)
             with patch(
@@ -164,52 +175,224 @@ class TenantLifecycleTests(unittest.TestCase):
                 )
             cnpg_present.assert_not_called()
 
-    def test_pending_deletion_blocks_reconciliation(self) -> None:
-        tenant = type("Tenant", (), {"name": "tenant-a"})()
+    def test_create_allocates_endpoint_only_after_journal_and_writes_ready_evidence(
+        self,
+    ) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
-            journal = root / ".runtime" / "deletions" / "tenant-a.json"
-            journal.parent.mkdir(parents=True)
-            journal.write_text("{}\n", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "pending tenant deletion"):
-                require_no_pending_deletions(root, [tenant])
+            runtime = TenantRuntime(root, "local", SPEC.name)
+            journal = runtime.start_operation(
+                operation="create",
+                spec=SPEC,
+                foundation_identity={"management": "uid"},
+                intended_resources=("Cluster/tenant-c",),
+                operation_id="operation",
+            )
+            observed = {
+                "endpoint": "172.18.0.10",
+                "markerOperationId": "operation",
+            }
+            adapter = LocalTenantAdapter(clock=lambda: 1000.0)
+            calls = []
 
-    def test_repeated_targeted_deletion_needs_no_journal(self) -> None:
-        tenant = type(
-            "Tenant",
-            (),
-            {"name": "tenant-a", "namespace": "tenant-a"},
-        )()
-        survivor = type("Tenant", (), {"name": "tenant-b"})()
-        snapshot = {"survivor": "stable"}
+            def allocate(*_args):
+                self.assertTrue(runtime.operation_exists())
+                calls.append("allocate")
+                return "172.18.0.10"
+
+            with (
+                patch.object(adapter, "_config", return_value={}),
+                patch(
+                    "scripts.local_tenant.allocate_tenant_endpoint",
+                    side_effect=allocate,
+                ),
+                patch("scripts.local_tenant.resolve_tenant_storage"),
+                patch(
+                    "scripts.local_tenant.reconcile_tenant",
+                    return_value=observed,
+                ),
+                patch(
+                    "scripts.local_tenant.verify_tenant_functional",
+                    return_value={
+                        "network": True,
+                        "database": True,
+                        "workers": {"worker": {}},
+                        "storage": {"pvc": "pv"},
+                    },
+                ),
+                patch("scripts.local_tenant.ManagementClient"),
+            ):
+                returned = adapter.create(
+                    root,
+                    SPEC,
+                    runtime,
+                    journal,
+                    object(),
+                )
+            self.assertEqual(returned, observed)
+            self.assertEqual(calls, ["allocate"])
+            evidence = runtime.load_ready_evidence()
+            self.assertEqual(evidence["verifiedAt"], 1000.0)
+            self.assertEqual(evidence["observed"], observed)
+            self.assertEqual(runtime.paths.ready.stat().st_mode & 0o777, 0o600)
+
+    def test_unhealthy_survivor_refuses_before_target_mutation(self) -> None:
+        adapter = LocalTenantAdapter()
+        survivors = [
+            type("Tenant", (), {"name": "tenant-a"})(),
+            type("Tenant", (), {"name": "tenant-b"})(),
+        ]
+        with (
+            patch.object(adapter, "_config", return_value={}),
+            patch("scripts.local_tenant.ManagementClient"),
+            patch(
+                "scripts.local_tenant.recorded_local_tenants",
+                return_value=survivors,
+            ),
+            patch.object(
+                adapter,
+                "status",
+                side_effect=[
+                    TenantStatus(
+                        "local",
+                        "tenant-a",
+                        "ready",
+                        True,
+                    ),
+                    TenantStatus(
+                        "local",
+                        "tenant-b",
+                        "degraded",
+                        True,
+                        blockers=("stale evidence",),
+                    ),
+                ],
+            ),
+            patch(
+                "scripts.local_tenant.stable_tenant_snapshot",
+                return_value={"identity": "stable"},
+            ),
+            patch("scripts.local_tenant.delete_selected_tenant") as mutate,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "tenant-b"):
+                adapter.validate_delete(Path("."), SPEC, identity())
+        mutate.assert_not_called()
+
+    def test_sole_tenant_delete_releases_endpoint_after_absence(self) -> None:
+        adapter = LocalTenantAdapter()
+        runtime = Mock()
+        journal = Mock()
+        timings = Mock()
+        timings.phase.side_effect = lambda _name: nullcontext()
+        calls = []
+        with (
+            patch.object(adapter, "_config", return_value={}),
+            patch("scripts.local_tenant.resolve_tenant_storage"),
+            patch(
+                "scripts.local_tenant.delete_selected_tenant",
+                side_effect=lambda *_args, **_kwargs: calls.append("delete"),
+            ),
+            patch(
+                "scripts.local_tenant.release_tenant_endpoint",
+                side_effect=lambda *_args, **_kwargs: calls.append("release"),
+            ),
+            patch(
+                "scripts.local_tenant.tenant_endpoint_allocation",
+                return_value=None,
+            ),
+            patch.object(
+                adapter,
+                "_foundation",
+                return_value=({"management": "uid"}, True),
+            ),
+            patch(
+                "scripts.local_tenant.recorded_local_tenants",
+                return_value=[],
+            ),
+            patch("scripts.local_tenant.ManagementClient"),
+        ):
+            adapter.delete(
+                Path("."),
+                SPEC,
+                identity(),
+                runtime,
+                journal,
+                timings,
+            )
+        self.assertEqual(calls, ["delete", "release"])
+
+    def test_local_status_reports_absent_without_writing_state(self) -> None:
+        adapter = LocalTenantAdapter()
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             with (
-                patch("scripts.destroy_tenant.verify_all_inputs"),
+                patch.object(adapter, "_config", return_value={"LAB_PREFIX": "lab"}),
+                patch.object(adapter, "_foundation", return_value=({}, False)),
                 patch(
-                    "scripts.destroy_tenant._selected_tenants",
-                    return_value=(tenant, survivor),
-                ),
-                patch("scripts.destroy_tenant.require_management_ownership"),
-                patch("scripts.destroy_tenant.validate_management_kubeconfig"),
-                patch("scripts.destroy_tenant.ManagementClient"),
-                patch(
-                    "scripts.destroy_tenant.verified_tenant_snapshot",
-                    return_value=snapshot,
-                ),
-                patch(
-                    "scripts.destroy_tenant.verify_tenant_management_ownership",
+                    "scripts.local_tenant.management_status",
                     return_value={},
                 ),
                 patch(
-                    "scripts.destroy_tenant.inspect_storage_volume",
+                    "scripts.local_tenant.run",
+                    return_value=result(0, stdout=""),
+                ),
+                patch(
+                    "scripts.local_tenant.inspect_storage_volume",
                     return_value=None,
                 ),
-                patch("scripts.destroy_tenant._verify_deleted") as verify_deleted,
-                patch(
-                    "scripts.destroy_tenant.finish_prepared_tenant_deletion"
-                ) as finish,
             ):
-                destroy_tenant_stack(root, {"LAB_PREFIX": "lab"}, tenant.name)
-            verify_deleted.assert_called_once()
-            finish.assert_not_called()
+                status = adapter.status(root, "tenant-c")
+            self.assertEqual(status.classification, "absent")
+            self.assertFalse((root / ".runtime").exists())
+
+    def test_local_status_reports_progressing_deleting_and_failed_operations(
+        self,
+    ) -> None:
+        for operation, failed, expected in (
+            ("create", False, "progressing"),
+            ("delete", False, "deleting"),
+            ("create", True, "failed"),
+        ):
+            with self.subTest(operation=operation, failed=failed):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    runtime = TenantRuntime(root, "local", SPEC.name)
+                    journal = runtime.start_operation(
+                        operation=operation,
+                        spec=SPEC,
+                        foundation_identity={"management": "uid"},
+                        intended_resources=("Cluster/tenant-c",),
+                        operation_id=f"{operation}-operation",
+                    )
+                    if failed:
+                        runtime.paths.evidence.mkdir(parents=True, exist_ok=True)
+                        runtime.paths.evidence.chmod(0o700)
+                        timing = (
+                            runtime.paths.evidence
+                            / f"{operation}-{journal.operation_id}.json"
+                        )
+                        timing.write_text(
+                            json.dumps(
+                                {
+                                    "records": [
+                                        {"phase": "operation", "status": "failed"}
+                                    ]
+                                }
+                            )
+                        )
+                        timing.chmod(0o600)
+                    adapter = LocalTenantAdapter()
+                    with (
+                        patch.object(adapter, "_config", return_value={}),
+                        patch.object(
+                            adapter,
+                            "_foundation",
+                            return_value=({"management": "uid"}, True),
+                        ),
+                    ):
+                        status = adapter.status(root, SPEC.name)
+                    self.assertEqual(status.classification, expected)
+
+
+if __name__ == "__main__":
+    unittest.main()

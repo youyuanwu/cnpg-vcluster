@@ -994,11 +994,8 @@ class TenantCliTests(unittest.TestCase):
             env={**os.environ, "PAW_REVIEW_LITERAL": "expanded"},
         )
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(
-            "tenant profile adapter is not implemented: local",
-            result.stderr,
-        )
         self.assertNotIn("unable to read tenant specification", result.stderr)
+        self.assertNotIn("expanded", result.stderr)
 
     def test_lock_order_is_e2e_then_profile_then_tools(self) -> None:
         _, root, spec_path = self.make_root()

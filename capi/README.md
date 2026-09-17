@@ -62,16 +62,18 @@ just cache
 just tools
 just prepare-host
 just preflight
-just create
-just status
-just verify
+just create-management
+just tenant-create local config/tenants/examples/local.json
+just tenant-status local tenant-example
+just tenant-delete local tenant-example local/tenant-example
 just destroy
 ```
 
-`just create` reconciles both tenants. `just verify` performs the expensive
-two-tenant isolation and disruption checks. The bounded final E2E intentionally
-proves only that one representative three-instance PostgreSQL cluster can
-become healthy and that teardown restores a clean host:
+Local tenants are selected only through explicit JSON specifications. Repeating
+`tenant-create` is the public reconcile/retry path. `tenant-status` is
+read-only, and `tenant-delete` requires the exact `profile/name` confirmation
+token. The bounded final E2E proves that one explicitly selected PostgreSQL
+tenant can become healthy and that teardown restores a clean host:
 
 ```bash
 just test-e2e
@@ -115,56 +117,32 @@ just test-tenant-lifecycle
 | `just preflight` | Check tools, inputs, Docker capacity, CIDRs, image digests, ownership collisions, and privileged-container support. |
 | `just create-management` | Reconcile the kind management cluster and lifecycle controllers. |
 | `just dev-bootstrap` | Prepare and bind a retained management context to the current user, host, Docker daemon, branch, revision, configuration, and exact management identity. |
-| `just dev-tenant` | Delete, recreate, and validate tenant A while retaining the bound management cluster. |
-| `just dev-up` | Validate retained management and tenant A health first, return an unchanged healthy stack, or reconcile only the unhealthy layer when ownership permits. |
-| `just dev-test endpoint` | Run one fast non-destructive retained check: `endpoint`, `network`, `machines`, `storage`, or `database`; omit the argument to run all checks. |
 | `just dev-clean` | Run authoritative cleanup for retained tenant, management, runtime, and host state. |
-| `just create` | Reconcile both tenant control planes, workers, networking, storage, and databases. |
-| `just repair tenant-a` | Explicitly repair one owned tenant while proving the other tenant is unchanged. |
-| `just verify` | Verify two-tenant endpoint, credential, worker, storage, and PostgreSQL isolation plus replacement/failover behavior. |
-| `just status` | Print read-only JSON status for management and tenant layers. |
+| `just tenant-create local <spec.json>` | Validate the existing foundation and reconcile exactly the selected local tenant. |
+| `just tenant-status local <name>` | Print the selected tenant's read-only lifecycle envelope. |
+| `just tenant-delete local <name> local/<name>` | Delete exactly the selected tenant after survivor validation and explicit approval. |
 | `just diagnose management` | Print management status, workloads, CRDs, and events without mutation. |
-| `just destroy-tenant tenant-a` | Delete one tenant through its live API and prove the survivor remains healthy. |
-| `just destroy` | Remove both tenants, controllers, the management cluster, runtime state, and restore host settings. |
+| `just destroy` | Remove recorded tenants, controllers, the management cluster, runtime state, and restore host settings. |
 
-All mutating create and repair paths validate the pinned inputs before changing
-surviving state. Generated credentials and identity records are owner-only
-files below ignored `.runtime/`. Commands use explicit kubeconfig paths and do
-not depend on the user's current Kubernetes context.
+All mutating tenant paths validate pinned inputs and recorded tenant networks
+before changing state. Generated credentials, journals, Ready evidence, and
+identity records are owner-only files below ignored `.runtime/`. Commands use
+explicit kubeconfig paths and do not depend on the user's current Kubernetes
+context.
 
 The retained workflow is a development optimization, not a final gate. It
-separates infrastructure provisioning from fast, independently runnable
-checks:
+retains only the explicitly bound management foundation:
 
 ```bash
-just dev-up
-just dev-test endpoint
-just dev-test network
-just dev-test machines
-just dev-test storage
-just dev-test database
-# or run every retained check:
-just dev-test
+just dev-bootstrap
+just tenant-create local config/tenants/examples/local.json
 just dev-clean
 ```
 
-The first `dev-up` pays the management, worker, network, storage, and database
-startup cost. Later `dev-up` calls validate the retained binding, immutable
-inputs, host and runtime, complete management health, tenant-A ownership,
-credentials, endpoints, workers, network, storage, database, and stable
-identity before reconciling. A fully healthy compatible stack returns without
-management or tenant reconciliation. Healthy management with canonically
-absent or safely repairable tenant A reconciles only tenant A; unhealthy
-management uses full reconciliation. Missing migration evidence performs one
-full reconciliation to establish the owner-only health identity record.
-Stale, foreign, unsafe, partial, or non-authoritatively inspected state still
-fails closed.
-
-`dev-test` runs the independently selectable retained suites and normally
-completes each check in seconds. `dev-tenant` remains available when a test
-specifically needs a clean tenant while retaining management. Always run
-`just test-e2e` or `just test-e2e-offline` before treating a change as
-lifecycle-complete.
+`dev-bootstrap` validates the retained binding and management identity.
+Tenant lifecycle remains specification-driven through the generic commands.
+Always run `just test-e2e` or `just test-e2e-offline` before treating a change
+as lifecycle-complete.
 
 ## Local isolation model
 
@@ -227,9 +205,9 @@ code owns only exact kind/CAPD Docker identities, tenant Docker volumes,
 runtime records, and host setting restoration. Same-named objects without the
 expected labels and records are refused rather than adopted or deleted.
 
-## Repair and interruption recovery
+## Retry and interruption recovery
 
-Repair and deletion are fail-closed:
+Create retry and deletion are fail-closed:
 
 - management and tenant kubeconfigs are bound to exact ownership, active
   context, endpoint, CA, and required permissions;
@@ -244,12 +222,12 @@ Repair and deletion are fail-closed:
 
 ## Status, conditions, and exits
 
-`just status` returns `0` only when every observed layer is healthy. It returns
-`1` when the lab is absent, incomplete, drifted, unavailable, or cannot be
-inspected. Mutating commands and test recipes return `0` on success and `1` on
-validation, ownership, admission, reconciliation, timeout, or cleanup failure.
-The settings reserve exit `2` for a possible blocked outcome, but the current
-CAPI implementation does not emit it.
+`just tenant-status <profile> <name>` returns `0` only for Ready or
+authoritatively absent. It returns `1` for progressing, deleting, degraded,
+failed, or ownership-invalid. Mutating commands and test recipes return `0` on
+success and `1` on validation, ownership, admission, reconciliation, timeout,
+or cleanup failure. The settings reserve exit `2` for a possible blocked
+outcome, but the current CAPI implementation does not emit it.
 
 Condition checks require the current resource generation rather than accepting
 a stale `True` condition. A healthy tenant requires:
@@ -274,9 +252,9 @@ failures, not absent or healthy states.
 
 Normal recovery is:
 
-1. run `just status` and `just diagnose management`;
+1. run `just tenant-status <profile> <name>` and `just diagnose management`;
 2. restore the failed controller or dependency;
-3. retry `just repair`, `just destroy-tenant`, or `just destroy`.
+3. retry `just tenant-create`, `just tenant-delete`, or `just destroy`.
 
 Finalizer removal is exceptional and should be used only when controller
 recovery has been exhausted and the exact deleting resource has been
@@ -344,13 +322,8 @@ The enforced-offline gate also prints `CAPI_OFFLINE_EGRESS` records with the
 node and counted reject-rule packets, plus `CAPI_OFFLINE_MIRROR` records for
 each exact digest-qualified image exercised through the local mirror.
 
-Each successful `dev-up` also prints one compact `CAPI_DEV_UP` record with
-`schema`, `path`, `status`, and elapsed `seconds`. `path` is one of
-`bootstrap`, `full-reconcile`, `tenant-reconcile`, or `healthy`. To compare
-warm performance, establish the retained environment once and then collect at
-least three consecutive `just dev-up` samples on the same unchanged host. The
-`healthy` path is the only sample that represents a reconciliation-free warm
-run.
+Generic create and delete operations additionally print redacted
+tenant-specific `TENANT_TIMING` records and persist owner-only timing evidence.
 
 Exact versions, URLs, checksums, source commits, and image digests are in
 [`config/versions.env`](config/versions.env). See
@@ -367,8 +340,8 @@ Exact versions, URLs, checksums, source commits, and image digests are in
 - The offline registry is an ephemeral, unauthenticated service on the private
   disposable kind Docker network only; it has no published host port and is
   removed by authoritative teardown.
-- `just create` reconciles tenants sequentially, favoring deterministic
-  diagnostics over speed.
+- Local tenant mutation is serialized by profile and reconciles one explicit
+  specification at a time.
 - No Azure provider, credentials, resources, commands, or executable manifests
   are included.
 

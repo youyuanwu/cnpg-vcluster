@@ -14,6 +14,7 @@ from scripts.lib.config import load_configuration, load_env_file
 
 
 EXPECTED_RECIPES = {
+    "default",
     "cache",
     "tools",
     "prepare-host",
@@ -31,9 +32,6 @@ EXPECTED_RECIPES = {
     "tenant-delete",
     "create-management",
     "dev-bootstrap",
-    "dev-tenant",
-    "dev-up",
-    "dev-test",
     "dev-clean",
     "test-endpoint",
     "test-endpoint-negative",
@@ -44,12 +42,7 @@ EXPECTED_RECIPES = {
     "test-storage-negative",
     "test-persistence",
     "test-persistence-negative",
-    "create",
-    "repair",
-    "status",
     "diagnose",
-    "verify",
-    "destroy-tenant",
     "destroy",
     "break-glass",
     "test-unit",
@@ -90,7 +83,12 @@ def check_recipes() -> None:
         for line in result.stdout.splitlines()
         if (match := re.match(r"\s{4}([a-zA-Z0-9_-]+)", line))
     }
-    check(EXPECTED_RECIPES <= recipes, f"missing recipes: {sorted(EXPECTED_RECIPES - recipes)}")
+    check(
+        EXPECTED_RECIPES == recipes,
+        "recipe surface changed: "
+        f"missing={sorted(EXPECTED_RECIPES - recipes)} "
+        f"unexpected={sorted(recipes - EXPECTED_RECIPES)}",
+    )
     check("[implemented]" in result.stdout, "task list does not mark implemented recipes")
     check("[phase " not in result.stdout, "task list still marks blocked recipes")
     unavailable = output(
@@ -145,8 +143,6 @@ def check_configuration() -> None:
     for key in (
         "VIP_POOL_START_OFFSET_FROM_BROADCAST",
         "VIP_POOL_END_OFFSET_FROM_BROADCAST",
-        "TENANT_A_API_VIP_SLOT",
-        "TENANT_B_API_VIP_SLOT",
         "SPIKE_API_VIP_SLOT",
     ):
         check(key in config, f"missing VIP configuration {key}")
@@ -236,7 +232,7 @@ def check_documentation() -> None:
         "| Add-ons |",
         "| Verification |",
         "No Azure CLI",
-        "representative tenant, requires one three-instance PostgreSQL",
+        "one explicitly selected representative tenant",
         "future tenants are not separate AKS clusters",
         "Verified acquisition and image distribution",
         "explicit concurrent import and exact-target verification barrier",

@@ -16,17 +16,19 @@ from scripts.lib.management import (
     management_status,
     reconcile_network,
     require_management_ownership,
+    tenant_endpoint_allocations,
     validate_management_kubeconfig,
 )
 from scripts.lib.providers import delete_providers
 from scripts.lib.addons import delete_addons
 from scripts.lib.tenants import (
-    configured_tenants,
     delete_tenant,
     inspect_management_resource,
+    recorded_local_tenants,
     spike_tenant,
     verify_tenant_management_ownership,
 )
+from scripts.lib.tenant_runtime import recorded_tenant_names
 from scripts.lib.process import run
 from scripts.lib.registry import (
     delete_offline_registry,
@@ -37,11 +39,6 @@ from scripts.lib.registry import (
 
 def _validate_runtime_inventory(
     root: Path,
-    tenant_names: tuple[str, ...] = (
-        "capi-worker-spike",
-        "tenant-a",
-        "tenant-b",
-    ),
 ) -> None:
     runtime = root / ".runtime"
     if not runtime.exists():
@@ -63,7 +60,6 @@ def _validate_runtime_inventory(
         "management/kubeconfig",
         "management/offline-registry.json",
         "retained-management.json",
-        "evidence/dev-up-success.json",
         "rendered/cert-manager.yaml",
         "rendered/kind.yaml",
         "rendered/kamaji.yaml",
@@ -74,17 +70,8 @@ def _validate_runtime_inventory(
         "rendered/providers/capd-components.yaml",
         "rendered/providers/kamaji-capi-components.yaml",
     }
-    tenant_pattern = "(?:" + "|".join(
-        re.escape(name) for name in tenant_names
-    ) + ")"
-    tenant_pair_pattern = (
-        "(?:" + "|".join(
-            f"{re.escape(source)}-to-{re.escape(target)}"
-            for source in tenant_names
-            for target in tenant_names
-            if source != target
-        ) + ")"
-    )
+    tenant_pattern = r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?"
+    tenant_pair_pattern = rf"{tenant_pattern}-to-{tenant_pattern}"
     allowed_dynamic = (
         re.compile(
             rf"^rendered/tenants/{tenant_pattern}/"
@@ -134,7 +121,7 @@ def _validate_runtime_inventory(
         re.compile(r"^lifecycle/\.locks/(local|azure)\.lock$"),
         re.compile(
             rf"^lifecycle/local/{tenant_pattern}/"
-            r"(identity|operation)\.json$"
+            r"(identity|operation|ready)\.json$"
         ),
         re.compile(
             rf"^lifecycle/local/{tenant_pattern}/evidence/"
@@ -146,6 +133,8 @@ def _validate_runtime_inventory(
     )
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
+        if relative == "azure" or relative.startswith("azure/"):
+            continue
         if relative == "management/offline-registry-data" or relative.startswith(
             "management/offline-registry-data/"
         ):
@@ -165,6 +154,40 @@ def _validate_runtime_inventory(
             raise RuntimeError(f"runtime file is not an owned regular file: {relative}")
         if details.st_mode & 0o077:
             raise RuntimeError(f"runtime file is not owner-only: {relative}")
+
+
+def _remove_local_runtime(root: Path) -> None:
+    runtime = root / ".runtime"
+    for relative in (
+        "host",
+        "management",
+        "evidence",
+        "rendered",
+        "storage",
+        "tenants",
+        "deletions",
+    ):
+        shutil.rmtree(runtime / relative, ignore_errors=True)
+    for path in (
+        runtime / "retained-management.json",
+        runtime / "lifecycle" / ".locks" / "local.lock",
+    ):
+        path.unlink(missing_ok=True)
+    shutil.rmtree(runtime / "lifecycle" / "local", ignore_errors=True)
+    shutil.rmtree(
+        runtime / "lifecycle" / "rejected" / "local",
+        ignore_errors=True,
+    )
+    for directory in (
+        runtime / "lifecycle" / ".locks",
+        runtime / "lifecycle" / "rejected",
+        runtime / "lifecycle",
+        runtime,
+    ):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _delete_kubernetes_stack(root: Path, config: dict[str, str], client: ManagementClient) -> None:
@@ -250,8 +273,11 @@ def _delete_kubernetes_stack(root: Path, config: dict[str, str], client: Managem
     )
 
 
-def inspect_host_residue(config: dict[str, str]) -> dict[str, list[str]]:
-    clusters = [config["SPIKE_NAME"], *config["TENANT_NAMES"].split()]
+def inspect_host_residue(
+    config: dict[str, str],
+    tenant_names: tuple[str, ...] = (),
+) -> dict[str, list[str]]:
+    clusters = [config["SPIKE_NAME"], *tenant_names]
     containers = []
     for name in clusters:
         containers.extend(
@@ -288,21 +314,17 @@ def inspect_host_residue(config: dict[str, str]) -> dict[str, list[str]]:
         ],
         timeout=30,
     ).stdout.split()
-    volumes = []
-    for name in clusters:
-        volume_name = f"{config['LAB_PREFIX']}-{name}-storage"
-        response = run(
-            ["docker", "volume", "inspect", volume_name],
-            timeout=30,
-            check=False,
-        )
-        if response.returncode == 0:
-            volumes.append(volume_name)
-        elif "no such volume" not in response.stderr.lower():
-            raise RuntimeError(
-                f"Docker volume inspection failed for {volume_name}: "
-                f"{response.stderr}"
-            )
+    volumes = run(
+        [
+            "docker",
+            "volume",
+            "ls",
+            "-q",
+            "--filter",
+            f"label={config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
+        ],
+        timeout=30,
+    ).stdout.split()
     return {
         "containers": sorted(set(containers)),
         "probes": sorted(set(probes)),
@@ -312,19 +334,11 @@ def inspect_host_residue(config: dict[str, str]) -> dict[str, list[str]]:
 
 
 def destroy(root: Path, config: dict[str, str]) -> None:
-    tenant_names = (
-        (
-            config["SPIKE_NAME"],
-            *config["TENANT_NAMES"].split(),
-        )
-        if "SPIKE_NAME" in config and "TENANT_NAMES" in config
-        else (
-            "capi-worker-spike",
-            "tenant-a",
-            "tenant-b",
-        )
-    )
-    _validate_runtime_inventory(root, tenant_names)
+    tenant_names = set(recorded_tenant_names(root, "local"))
+    network_path = root / ".runtime" / "management" / "network.json"
+    if network_path.is_file():
+        tenant_names.update(tenant_endpoint_allocations(root, config))
+    _validate_runtime_inventory(root)
     validate_inotify_state(root, config)
     status = management_status(root, config)
     any_management = any(
@@ -343,7 +357,10 @@ def destroy(root: Path, config: dict[str, str]) -> None:
             check=False,
         )
         if cluster_crd.returncode == 0:
-            tenants = [spike_tenant(root, config), *configured_tenants(root, config)]
+            tenants = [
+                spike_tenant(root, config),
+                *recorded_local_tenants(root, config),
+            ]
         elif re.search(
             r"Error from server \(NotFound\):",
             cluster_crd.stderr,
@@ -355,7 +372,7 @@ def destroy(root: Path, config: dict[str, str]) -> None:
                 f"CAPI Cluster CRD inspection failed during cleanup: "
                 f"{cluster_crd.stderr}"
             )
-        configured_names = set(config["TENANT_NAMES"].split())
+        configured_names = set(tenant_names)
         for tenant in tenants:
             deletion_journal = (
                 root / ".runtime" / "deletions" / f"{tenant.name}.json"
@@ -450,14 +467,12 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         delete_management(root, config)
     else:
         delete_offline_registry(root, config)
-        residue = inspect_host_residue(config)
+        residue = inspect_host_residue(config, tuple(sorted(tenant_names)))
         if any(residue.values()):
             raise RuntimeError(
                 "management state is absent while provider-owned host residue "
                 f"remains; preserving runtime and host settings: {residue}"
             )
     restore_inotify(root, config)
-    runtime = root / ".runtime"
-    if runtime.exists():
-        shutil.rmtree(runtime)
+    _remove_local_runtime(root)
     print("management experiment resources removed")

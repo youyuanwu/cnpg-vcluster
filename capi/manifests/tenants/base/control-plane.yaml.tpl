@@ -4,6 +4,12 @@ metadata:
   name: ${NAMESPACE}
   labels:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+  annotations:
+    lifecycle.cnpg-vcluster.capi/tenant: ${LIFECYCLE_TENANT}
+    lifecycle.cnpg-vcluster.capi/profile: ${LIFECYCLE_PROFILE}
+    lifecycle.cnpg-vcluster.capi/specification-sha256: ${LIFECYCLE_SPECIFICATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/foundation-sha256: ${LIFECYCLE_FOUNDATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/operation-id: ${LIFECYCLE_OPERATION_ID}
 ---
 apiVersion: cluster.x-k8s.io/v1beta2
 kind: Cluster
@@ -13,6 +19,12 @@ metadata:
   labels:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
     cnpg-vcluster.capi/addons: ${ADDON_PROFILE}
+  annotations:
+    lifecycle.cnpg-vcluster.capi/tenant: ${LIFECYCLE_TENANT}
+    lifecycle.cnpg-vcluster.capi/profile: ${LIFECYCLE_PROFILE}
+    lifecycle.cnpg-vcluster.capi/specification-sha256: ${LIFECYCLE_SPECIFICATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/foundation-sha256: ${LIFECYCLE_FOUNDATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/operation-id: ${LIFECYCLE_OPERATION_ID}
 spec:
   controlPlaneEndpoint:
     host: ${API_VIP}
@@ -42,6 +54,12 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+  annotations:
+    lifecycle.cnpg-vcluster.capi/tenant: ${LIFECYCLE_TENANT}
+    lifecycle.cnpg-vcluster.capi/profile: ${LIFECYCLE_PROFILE}
+    lifecycle.cnpg-vcluster.capi/specification-sha256: ${LIFECYCLE_SPECIFICATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/foundation-sha256: ${LIFECYCLE_FOUNDATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/operation-id: ${LIFECYCLE_OPERATION_ID}
 spec:
   controlPlaneEndpoint:
     host: ${API_VIP}
@@ -57,6 +75,12 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+  annotations:
+    lifecycle.cnpg-vcluster.capi/tenant: ${LIFECYCLE_TENANT}
+    lifecycle.cnpg-vcluster.capi/profile: ${LIFECYCLE_PROFILE}
+    lifecycle.cnpg-vcluster.capi/specification-sha256: ${LIFECYCLE_SPECIFICATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/foundation-sha256: ${LIFECYCLE_FOUNDATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/operation-id: ${LIFECYCLE_OPERATION_ID}
 spec:
   version: ${KUBERNETES_VERSION}
   replicas: 1

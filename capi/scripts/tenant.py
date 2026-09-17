@@ -6,6 +6,7 @@ import os
 import sys
 import time
 import uuid
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Mapping, Protocol, Sequence
 
@@ -57,6 +58,13 @@ class TenantAdapter(Protocol):
 
     def status(self, root: Path, tenant: str) -> TenantStatus: ...
 
+    def validate_delete(
+        self,
+        root: Path,
+        spec: TenantSpec,
+        identity: TenantIdentity,
+    ) -> None: ...
+
     def delete(
         self,
         root: Path,
@@ -92,6 +100,12 @@ def _adapter(
 def _persist_timings(timings: TenantTimings) -> None:
     timings.emit()
     timings.persist()
+
+
+def _tenant_e2e_lock(root: Path):
+    if os.environ.get("CAPI_E2E_CHILD") == "1":
+        return nullcontext()
+    return e2e_lock(root, exclusive=False)
 
 
 def _finish_timings(timings: TenantTimings, primary: BaseException | None) -> None:
@@ -138,7 +152,7 @@ def create_tenant(
     spec_path: Path,
     adapters: Mapping[str, TenantAdapter],
 ) -> int:
-    with e2e_lock(root, exclusive=False):
+    with _tenant_e2e_lock(root):
         with profile_lock(
             root,
             profile,
@@ -262,11 +276,16 @@ def status_tenant(
                     status = inspected
             else:
                 try:
-                    with e2e_lock(
-                        root,
-                        exclusive=False,
-                        create=False,
-                    ) as e2e_acquired:
+                    context = (
+                        nullcontext(True)
+                        if os.environ.get("CAPI_E2E_CHILD") == "1"
+                        else e2e_lock(
+                            root,
+                            exclusive=False,
+                            create=False,
+                        )
+                    )
+                    with context as e2e_acquired:
                         if not e2e_acquired:
                             raise RuntimeError("tenant E2E status lock is missing")
                         with profile_lock(
@@ -315,7 +334,7 @@ def delete_tenant(
         )
     adapter = _adapter(profile, adapters)
     operation_id = uuid.uuid4().hex
-    with e2e_lock(root, exclusive=False):
+    with _tenant_e2e_lock(root):
         with profile_lock(
             root,
             profile,
@@ -381,6 +400,9 @@ def delete_tenant(
                             raise TenantRuntimeError(
                                 "tenant foundation binding changed"
                             )
+                    validator = getattr(adapter, "validate_delete", None)
+                    if validator is not None:
+                        validator(root, spec, identity)
                     with timings.phase("journal"):
                         journal = runtime.start_operation(
                             operation="delete",
@@ -414,7 +436,14 @@ def execute(
     *,
     adapters: Mapping[str, TenantAdapter] | None = None,
 ) -> int:
-    available = {} if adapters is None else adapters
+    if adapters is None:
+        from scripts.local_tenant import LocalTenantAdapter
+
+        available: Mapping[str, TenantAdapter] = {
+            "local": LocalTenantAdapter(),
+        }
+    else:
+        available = adapters
     if not arguments:
         raise RuntimeError(
             "usage: tenant.py "

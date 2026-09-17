@@ -7,8 +7,9 @@ import os
 import re
 import shutil
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Mapping
 
 from .conditions import condition_true
 from .config import parse_duration
@@ -27,6 +28,21 @@ from .tenant_spec import (
     load_tenant_spec,
     require_non_overlapping_networks,
 )
+from .tenant_runtime import (
+    OperationJournal,
+    TenantRuntime,
+    foundation_sha256,
+    recorded_tenant_names,
+)
+
+
+LIFECYCLE_MARKERS = {
+    "tenant": "lifecycle.cnpg-vcluster.capi/tenant",
+    "profile": "lifecycle.cnpg-vcluster.capi/profile",
+    "specificationSha256": "lifecycle.cnpg-vcluster.capi/specification-sha256",
+    "foundationSha256": "lifecycle.cnpg-vcluster.capi/foundation-sha256",
+    "operationId": "lifecycle.cnpg-vcluster.capi/operation-id",
+}
 
 
 @dataclass
@@ -43,6 +59,49 @@ class Tenant:
     workers: int
     database_count: int = 3
     specification_sha256: str = ""
+    lifecycle_markers: Mapping[str, str] = field(default_factory=dict)
+
+
+def lifecycle_markers(
+    spec: TenantSpec,
+    journal: OperationJournal,
+) -> dict[str, str]:
+    marker_operation = journal.observed.get(
+        "markerOperationId",
+        journal.operation_id,
+    )
+    return {
+        "tenant": spec.name,
+        "profile": spec.profile,
+        "specificationSha256": spec.sha256(),
+        "foundationSha256": foundation_sha256(journal.foundation_identity),
+        "operationId": marker_operation,
+    }
+
+
+def resource_lifecycle_markers(payload: Mapping[str, object]) -> dict[str, str]:
+    metadata = payload.get("metadata")
+    annotations = (
+        metadata.get("annotations")
+        if isinstance(metadata, dict)
+        else None
+    )
+    values = annotations if isinstance(annotations, dict) else {}
+    return {
+        name: str(values.get(key, ""))
+        for name, key in LIFECYCLE_MARKERS.items()
+    }
+
+
+def _require_resource_markers(
+    payload: Mapping[str, object],
+    expected: Mapping[str, str],
+    description: str,
+) -> None:
+    if resource_lifecycle_markers(payload) != dict(expected):
+        raise RuntimeError(
+            f"tenant lifecycle marker mismatch: {description}"
+        )
 
 
 NOT_FOUND = re.compile(r"Error from server \(NotFound\):", re.IGNORECASE)
@@ -75,6 +134,8 @@ def verify_tenant_management_ownership(
     config: dict[str, str],
     client: ManagementClient,
     tenant: Tenant,
+    *,
+    expected_markers: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, object]]:
     present = {}
     namespace_response = client.kubectl(
@@ -89,6 +150,12 @@ def verify_tenant_management_ownership(
         labels = namespace["metadata"].get("labels") or {}
         if labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]:
             raise RuntimeError(f"tenant namespace ownership mismatch: {tenant.name}")
+        if expected_markers is not None:
+            _require_resource_markers(
+                namespace,
+                expected_markers,
+                f"namespace/{tenant.namespace}",
+            )
         present["namespace"] = namespace
     elif not NOT_FOUND.search(namespace_response.stderr):
         raise RuntimeError(
@@ -110,6 +177,12 @@ def verify_tenant_management_ownership(
         if labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]:
             raise RuntimeError(
                 f"tenant resource ownership mismatch: {kind}/{name}"
+            )
+        if expected_markers is not None:
+            _require_resource_markers(
+                payload,
+                expected_markers,
+                f"{kind}/{name}",
             )
         present[kind] = payload
     machines_response = client.kubectl(
@@ -251,91 +324,41 @@ def spike_tenant(root: Path, config: dict[str, str]) -> Tenant:
     )
 
 
-def configured_tenants(root: Path, config: dict[str, str]) -> list[Tenant]:
-    network_path = root / ".runtime" / "management" / "network.json"
-    network = json.loads(network_path.read_text(encoding="utf-8"))
-    expected_names = config["TENANT_NAMES"].split()
-    if expected_names != ["tenant-a", "tenant-b"]:
-        raise IntegrityError("TENANT_NAMES must be exactly: tenant-a tenant-b")
+def recorded_local_specs(root: Path) -> dict[str, TenantSpec]:
+    specs = {}
+    for name in recorded_tenant_names(root, "local"):
+        runtime = TenantRuntime(root, "local", name)
+        if runtime.identity_exists():
+            spec = runtime.load_identity().specification
+        elif runtime.operation_exists():
+            operation = runtime.load_operation()
+            spec = TenantSpec.from_mapping(operation.specification)
+        else:
+            continue
+        specs[name] = spec
+    return specs
+
+
+def recorded_local_tenants(
+    root: Path,
+    config: dict[str, str],
+) -> list[Tenant]:
+    from .management import tenant_endpoint_allocations
+
+    allocations = tenant_endpoint_allocations(root, config)
     tenants = []
-    for name in expected_names:
-        path = root / "manifests" / "tenants" / "overlays" / name / "tenant.json"
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        required = {
-            "clusterDomain",
-            "cnpgCluster",
-            "dnsServiceIP",
-            "name",
-            "namespace",
-            "podCIDRKey",
-            "serviceCIDRKey",
-            "vipSlot",
-            "workers",
-        }
-        if set(payload) != required or payload["name"] != name:
-            raise IntegrityError(f"invalid tenant overlay: {path}")
-        pod_key = str(payload["podCIDRKey"])
-        service_key = str(payload["serviceCIDRKey"])
-        vip_slot = str(payload["vipSlot"])
-        if pod_key not in config or service_key not in config:
-            raise IntegrityError(f"tenant overlay references unknown CIDR key: {name}")
-        if vip_slot not in network["slots"]:
-            raise IntegrityError(f"tenant overlay references unknown VIP slot: {name}")
-        workers = int(payload["workers"])
-        if workers != int(config["WORKERS_PER_TENANT"]):
-            raise IntegrityError(f"tenant worker count does not match settings: {name}")
-        tenant = Tenant(
-            name=name,
-            namespace=str(payload["namespace"]),
-            vip=str(network["slots"][vip_slot]),
-            pod_cidr=config[pod_key],
-            service_cidr=config[service_key],
-            dns_ip=str(payload["dnsServiceIP"]),
-            domain=str(payload["clusterDomain"]),
-            storage_host_path=root / ".runtime" / "storage" / name,
-            cnpg_cluster=str(payload["cnpgCluster"]),
-            workers=workers,
-        )
-        volume_name = storage_volume_name(config, tenant)
-        volume = inspect_storage_volume(volume_name)
-        if volume is not None:
-            labels = volume.get("Labels") or {}
-            record_path = storage_record_path(root, tenant)
-            expected_record = {
-                "schema": 1,
-                "tenant": tenant.name,
-                "volumeName": volume_name,
-                "createdAt": volume.get("CreatedAt"),
-                "mountpoint": volume.get("Mountpoint"),
-            }
-            if (
-                labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
-                or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
-                or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
-                or not record_path.is_file()
-                or record_path.is_symlink()
-                or record_path.lstat().st_uid != os.getuid()
-                or record_path.lstat().st_mode & 0o077
-                or json.loads(record_path.read_text(encoding="utf-8"))
-                != expected_record
-            ):
-                raise RuntimeError(
-                    f"existing tenant storage identity cannot be proven: {tenant.name}"
-                )
-            tenant.storage_host_path = Path(str(volume["Mountpoint"]))
+    for name, spec in recorded_local_specs(root).items():
+        runtime = TenantRuntime(root, "local", name)
+        endpoint = allocations.get(name)
+        if endpoint is None and runtime.identity_exists():
+            endpoint = runtime.load_identity().observed.get("endpoint")
+        if endpoint is None and runtime.operation_exists():
+            endpoint = runtime.load_operation().observed.get("endpoint")
+        if endpoint is None:
+            continue
+        tenant = tenant_from_spec(root, spec, endpoint)
+        resolve_tenant_storage(root, config, tenant)
         tenants.append(tenant)
-    identities = (
-        [tenant.name for tenant in tenants],
-        [tenant.namespace for tenant in tenants],
-        [tenant.vip for tenant in tenants],
-        [tenant.pod_cidr for tenant in tenants],
-        [tenant.service_cidr for tenant in tenants],
-        [tenant.dns_ip for tenant in tenants],
-        [tenant.domain for tenant in tenants],
-        [tenant.cnpg_cluster for tenant in tenants],
-    )
-    if any(len(values) != len(set(values)) for values in identities):
-        raise IntegrityError("tenant overlays do not define distinct identities")
     return tenants
 
 
@@ -352,6 +375,26 @@ def load_local_tenant_spec(
         expected_profile="local",
         supported_versions={"local": config["KUBERNETES_VERSION"]},
     )
+    validate_local_tenant_spec(
+        root,
+        spec,
+        config,
+        existing_specs=existing_specs,
+        include_management_network=include_management_network,
+    )
+    return spec
+
+
+def validate_local_tenant_spec(
+    root: Path,
+    spec: TenantSpec,
+    config: dict[str, str],
+    *,
+    existing_specs: tuple[TenantSpec, ...] = (),
+    include_management_network: bool = True,
+) -> None:
+    if spec.profile != "local":
+        raise IntegrityError("local tenant validation requires a local specification")
     networks = {}
     for key, value in config.items():
         if key.endswith(("_POD_CIDR", "_SERVICE_CIDR")):
@@ -383,10 +426,15 @@ def load_local_tenant_spec(
         networks[f"{existing.name} Pod CIDR"] = existing.pod_network
         networks[f"{existing.name} Service CIDR"] = existing.service_network
     require_non_overlapping_networks(spec, networks)
-    return spec
 
 
-def tenant_from_spec(root: Path, spec: TenantSpec, vip: str) -> Tenant:
+def tenant_from_spec(
+    root: Path,
+    spec: TenantSpec,
+    vip: str,
+    *,
+    markers: Mapping[str, str] | None = None,
+) -> Tenant:
     if spec.profile != "local" or spec.database_count is None:
         raise IntegrityError("local tenant construction requires a local specification")
     return Tenant(
@@ -402,7 +450,44 @@ def tenant_from_spec(root: Path, spec: TenantSpec, vip: str) -> Tenant:
         workers=spec.workers,
         database_count=spec.database_count,
         specification_sha256=spec.sha256(),
+        lifecycle_markers={} if markers is None else dict(markers),
     )
+
+
+def resolve_tenant_storage(
+    root: Path,
+    config: dict[str, str],
+    tenant: Tenant,
+) -> Tenant:
+    volume_name = storage_volume_name(config, tenant)
+    volume = inspect_storage_volume(volume_name)
+    if volume is None:
+        return tenant
+    labels = volume.get("Labels") or {}
+    record_path = storage_record_path(root, tenant)
+    expected_record = {
+        "schema": 1,
+        "tenant": tenant.name,
+        "volumeName": volume_name,
+        "createdAt": volume.get("CreatedAt"),
+        "mountpoint": volume.get("Mountpoint"),
+    }
+    if (
+        labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
+        or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
+        or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
+        or not record_path.is_file()
+        or record_path.is_symlink()
+        or record_path.lstat().st_uid != os.getuid()
+        or record_path.lstat().st_mode & 0o077
+        or json.loads(record_path.read_text(encoding="utf-8"))
+        != expected_record
+    ):
+        raise RuntimeError(
+            f"existing tenant storage identity cannot be proven: {tenant.name}"
+        )
+    tenant.storage_host_path = Path(str(volume["Mountpoint"]))
+    return tenant
 
 
 def _render_template(
@@ -425,6 +510,15 @@ def _render_template(
 
 def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[str, str]:
     cache_container_path = "/var/lib/capi-image-cache"
+    markers = dict(tenant.lifecycle_markers)
+    if not markers:
+        markers = {
+            "tenant": tenant.name,
+            "profile": "local",
+            "specificationSha256": tenant.specification_sha256 or "internal",
+            "foundationSha256": "internal",
+            "operationId": "internal",
+        }
     return {
         "NAMESPACE": tenant.namespace,
         "CLUSTER_NAME": tenant.name,
@@ -456,6 +550,11 @@ def _tenant_values(root: Path, config: dict[str, str], tenant: Tenant) -> dict[s
         "WORKER_REPLICAS": str(tenant.workers),
         "IMAGE_CACHE_HOST_PATH": str(root / ".tools" / "cache"),
         "IMAGE_CACHE_CONTAINER_PATH": cache_container_path,
+        "LIFECYCLE_TENANT": markers["tenant"],
+        "LIFECYCLE_PROFILE": markers["profile"],
+        "LIFECYCLE_SPECIFICATION_SHA256": markers["specificationSha256"],
+        "LIFECYCLE_FOUNDATION_SHA256": markers["foundationSha256"],
+        "LIFECYCLE_OPERATION_ID": markers["operationId"],
     }
 
 
@@ -531,6 +630,13 @@ def apply_control_plane(
     client: ManagementClient,
     tenant: Tenant,
 ) -> Path:
+    if tenant.lifecycle_markers:
+        verify_tenant_management_ownership(
+            config,
+            client,
+            tenant,
+            expected_markers=tenant.lifecycle_markers,
+        )
     control_plane, _ = render_tenant_manifests(root, config, tenant)
     client.kubectl(
         "apply",
@@ -990,6 +1096,13 @@ def apply_workers(
     client: ManagementClient,
     tenant: Tenant,
 ) -> Path:
+    if tenant.lifecycle_markers:
+        verify_tenant_management_ownership(
+            config,
+            client,
+            tenant,
+            expected_markers=tenant.lifecycle_markers,
+        )
     prepare_storage_directory(root, config, tenant)
     _, workers = render_tenant_manifests(root, config, tenant)
     client.kubectl(

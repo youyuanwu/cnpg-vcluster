@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from scripts.lib.conditions import sanitized_condition_summary, condition_true
@@ -17,9 +18,11 @@ from scripts.lib.process import run
 from scripts.lib.tenants import (
     NOT_FOUND,
     _tenant_kubectl,
-    configured_tenants,
     spike_tenant,
+    verify_tenant_management_ownership,
 )
+from scripts.lib.tenant_runtime import foundation_sha256
+from scripts.lib.tenant_status import TenantStatus
 from scripts.lib.tenants import (
     inspect_storage_volume,
     storage_record_path,
@@ -421,6 +424,171 @@ def collect_tenant_status(
     return result
 
 
+def collect_local_lifecycle_status(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+    identity,
+    ready_evidence: dict[str, object] | None,
+    *,
+    foundation_healthy: bool,
+    now: float | None = None,
+) -> TenantStatus:
+    from scripts.create import (
+        observed_tenant_identities,
+        stable_tenant_snapshot,
+    )
+
+    marker_operation_id = identity.observed.get("markerOperationId")
+    if not marker_operation_id:
+        raise RuntimeError("tenant marker operation identity is absent")
+    expected_markers = {
+        "tenant": identity.tenant,
+        "profile": identity.profile,
+        "specificationSha256": identity.specification_sha256,
+        "foundationSha256": foundation_sha256(identity.foundation_identity),
+        "operationId": marker_operation_id,
+    }
+    resources = verify_tenant_management_ownership(
+        config,
+        ManagementClient(root, config),
+        tenant,
+        expected_markers=expected_markers,
+    )
+    cluster = resources.get("cluster")
+    if cluster is None:
+        return TenantStatus(
+            profile="local",
+            tenant=tenant.name,
+            classification="degraded",
+            foundation_healthy=foundation_healthy,
+            components={"managementResources": sorted(resources)},
+            blockers=("tenant Cluster is absent",),
+        )
+    client = ManagementClient(root, config)
+    try:
+        components = collect_tenant_status(
+            root,
+            config,
+            client,
+            tenant,
+            cluster,
+            strict=True,
+        )
+    except RuntimeError as exc:
+        if not NOT_FOUND.search(str(exc)):
+            raise
+        components = {"ready": False, "reason": "resource-missing"}
+    snapshot = stable_tenant_snapshot(
+        root,
+        config,
+        client,
+        tenant,
+        allow_incomplete=True,
+    )
+    if snapshot is None:
+        return TenantStatus(
+            profile="local",
+            tenant=tenant.name,
+            classification="degraded",
+            foundation_healthy=foundation_healthy,
+            components=components,
+            blockers=("tenant structural identity snapshot is incomplete",),
+        )
+    observed = observed_tenant_identities(
+        snapshot,
+        endpoint=tenant.vip,
+        marker_operation_id=marker_operation_id,
+    )
+    blockers = []
+    if observed != dict(identity.observed):
+        blockers.append("tenant structural identities changed")
+    evidence_valid = False
+    current_time = time.time() if now is None else now
+    if ready_evidence is None:
+        blockers.append("functional Ready evidence is missing")
+    else:
+        verified_at = ready_evidence.get("verifiedAt")
+        if (
+            set(ready_evidence)
+            != {
+                "schema",
+                "profile",
+                "tenant",
+                "specificationSha256",
+                "foundationIdentity",
+                "observed",
+                "verifiedAt",
+                "functional",
+            }
+            or ready_evidence.get("schema") != 1
+            or ready_evidence.get("profile") != "local"
+            or ready_evidence.get("tenant") != tenant.name
+            or ready_evidence.get("specificationSha256")
+            != identity.specification_sha256
+            or ready_evidence.get("foundationIdentity")
+            != dict(identity.foundation_identity)
+            or ready_evidence.get("observed") != observed
+            or isinstance(verified_at, bool)
+            or not isinstance(verified_at, (int, float))
+            or current_time < float(verified_at)
+            or current_time - float(verified_at) > 24 * 60 * 60
+            or ready_evidence.get("functional")
+            != {
+                "controlPlane": True,
+                "workers": True,
+                "network": True,
+                "storage": True,
+                "database": True,
+            }
+        ):
+            blockers.append("functional Ready evidence is stale or mismatched")
+        else:
+            evidence_valid = True
+    def terminal_failure(value: object) -> bool:
+        if isinstance(value, dict):
+            reason = value.get("reason")
+            status = value.get("status")
+            if (
+                status == "False"
+                and isinstance(reason, str)
+                and any(
+                    token in reason.lower()
+                    for token in ("failed", "error", "invalid")
+                )
+            ):
+                return True
+            return any(terminal_failure(item) for item in value.values())
+        if isinstance(value, list):
+            return any(terminal_failure(item) for item in value)
+        return False
+
+    ready = bool(
+        foundation_healthy
+        and components.get("ready")
+        and observed == dict(identity.observed)
+        and evidence_valid
+    )
+    if not foundation_healthy:
+        blockers.append("shared local foundation is unhealthy")
+    if not components.get("ready"):
+        blockers.append("tenant structural readiness is incomplete")
+    return TenantStatus(
+        profile="local",
+        tenant=tenant.name,
+        classification=(
+            "ready"
+            if ready
+            else "failed"
+            if terminal_failure(components)
+            else "degraded"
+        ),
+        foundation_healthy=foundation_healthy,
+        components={**components, "observed": observed},
+        blockers=tuple(dict.fromkeys(blockers)),
+    )
+
+
 def collect_management_status(
     root: Path,
     config: dict[str, str],
@@ -559,37 +727,6 @@ def collect_status(root: Path, config: dict[str, str]) -> dict[str, object]:
                 == 0
             ):
                 result["spikeCNPG"] = _cnpg_layer_status(root, config, spike)
-        result["tenants"] = {}
-        configured_cluster_present = False
-        for tenant in configured_tenants(root, config):
-            cluster = client.kubectl(
-                "-n",
-                tenant.namespace,
-                "get",
-                f"cluster/{tenant.name}",
-                "-o",
-                "json",
-                check=False,
-            )
-            if cluster.returncode != 0:
-                result["tenants"][tenant.name] = {
-                    "ready": False,
-                    "reason": "cluster-missing",
-                }
-                continue
-            configured_cluster_present = True
-            cluster_payload = json.loads(cluster.stdout)
-            result["tenants"][tenant.name] = collect_tenant_status(
-                root,
-                config,
-                client,
-                tenant,
-                cluster_payload,
-            )
-        result["tenantModeExpected"] = (
-            configured_cluster_present
-            or (root / ".runtime" / "evidence" / "create-success.json").is_file()
-        )
         result["tenantIsolationModel"] = {
             "workers": "exclusive CAPD containers",
             "storage": "distinct Docker volumes",
@@ -616,16 +753,6 @@ def status_healthy(result: dict[str, object]) -> bool:
         and (
             "spikeCNPG" not in result
             or result["spikeCNPG"].get("ready")
-        )
-        and (
-            not result.get("tenantModeExpected")
-            or (
-                len(result.get("tenants") or {}) == 2
-                and all(
-                    tenant.get("ready")
-                    for tenant in (result.get("tenants") or {}).values()
-                )
-            )
         )
     )
 

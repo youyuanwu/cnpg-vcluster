@@ -74,6 +74,7 @@ class TenantRuntimePaths:
     directory: Path
     identity: Path
     operation: Path
+    ready: Path
     evidence: Path
 
 
@@ -91,8 +92,42 @@ def tenant_runtime_paths(root: Path, profile: str, tenant: str) -> TenantRuntime
         directory=directory,
         identity=directory / "identity.json",
         operation=directory / "operation.json",
+        ready=directory / "ready.json",
         evidence=directory / "evidence",
     )
+
+
+def recorded_tenant_names(root: Path, profile: str) -> tuple[str, ...]:
+    if profile not in {"local", "azure"}:
+        raise TenantRuntimeError(f"unsupported tenant profile: {profile}")
+    directory = root / ".runtime" / "lifecycle" / profile
+    if not directory.exists():
+        return ()
+    details = directory.lstat()
+    if (
+        directory.is_symlink()
+        or not directory.is_dir()
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise TenantRuntimeError(
+            "tenant lifecycle profile directory is not owner-only"
+        )
+    names = []
+    for candidate in directory.iterdir():
+        details = candidate.lstat()
+        if (
+            candidate.is_symlink()
+            or not candidate.is_dir()
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise TenantRuntimeError(
+                "tenant lifecycle directory is not owner-only"
+            )
+        validate_tenant_name(candidate.name)
+        names.append(candidate.name)
+    return tuple(sorted(names))
 
 
 @dataclass(frozen=True)
@@ -299,6 +334,18 @@ class TenantRuntime:
             raise TenantRuntimeError("tenant operation does not match runtime path")
         return journal
 
+    def load_ready_evidence(self) -> dict[str, object]:
+        return _read_private_json(self.paths.ready)
+
+    def write_ready_evidence(self, payload: Mapping[str, object]) -> None:
+        write_private_file(
+            self.paths.ready,
+            json.dumps(dict(payload), sort_keys=True) + "\n",
+        )
+
+    def remove_ready_evidence(self) -> None:
+        _unlink_private_file(self.paths.ready)
+
     def start_operation(
         self,
         *,
@@ -504,3 +551,4 @@ class TenantRuntime:
             raise TenantRuntimeError("tenant operation identity changed")
         _unlink_private_file(self.paths.operation)
         _unlink_private_file(self.paths.identity)
+        _unlink_private_file(self.paths.ready)
