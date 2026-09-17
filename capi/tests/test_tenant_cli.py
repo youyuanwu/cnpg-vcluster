@@ -185,6 +185,58 @@ class TenantCliTests(unittest.TestCase):
             self.assertNotIn(sensitive, combined)
         self.assertIn("REDACTED", combined)
 
+    def test_double_encoded_and_prefixed_failures_are_redacted_everywhere(self) -> None:
+        _, root, spec_path = self.make_root()
+        secret = "synthetic-password"
+        subscription = "00000000-0000-0000-0000-000000000000"
+        payload = {
+            "password": secret,
+            "Authorization": "Bearer synthetic-token",
+            "kubeconfig": "synthetic-kubeconfig",
+            "subscriptionId": subscription,
+        }
+        failures = (
+            json.dumps({"message": json.dumps(json.dumps(payload))}),
+            "provider request failed: "
+            + json.dumps({"message": json.dumps(payload)}),
+        )
+        for index, failure in enumerate(failures):
+            with self.subTest(index=index):
+                adapter = FakeAdapter()
+                adapter.failure = RuntimeError(failure)
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    with self.assertRaises(RuntimeError):
+                        execute(
+                            root,
+                            ["create", "local", str(spec_path)],
+                            adapters={"local": adapter},
+                        )
+                runtime = TenantRuntime(root, "local", "tenant-c")
+                evidence = max(
+                    runtime.paths.evidence.glob("create-*.json"),
+                    key=lambda path: path.stat().st_mtime_ns,
+                )
+                timing_text = output.getvalue() + evidence.read_text(
+                    encoding="utf-8"
+                )
+                status_text = TenantStatus(
+                    profile="local",
+                    tenant="tenant-c",
+                    classification="failed",
+                    foundation_healthy=True,
+                    blockers=(failure,),
+                ).to_json()
+                for sensitive in (
+                    secret,
+                    subscription,
+                    "synthetic-token",
+                    "synthetic-kubeconfig",
+                ):
+                    self.assertNotIn(sensitive, timing_text)
+                    self.assertNotIn(sensitive, status_text)
+                runtime.paths.operation.unlink()
+
     def test_invalid_spec_and_foundation_failure_emit_failed_timing(self) -> None:
         _, root, spec_path = self.make_root()
         adapter = FakeAdapter()

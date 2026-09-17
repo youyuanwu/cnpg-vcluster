@@ -86,40 +86,76 @@ def _redact_patterns(value: str) -> str:
     )
 
 
-def redact(value: str) -> str:
+def _redact_value(
+    value: object,
+    *,
+    key: str | None = None,
+    depth: int,
+) -> object:
+    normalized = "" if key is None else re.sub(r"[^a-z0-9]", "", key.lower())
+    if normalized in SENSITIVE_KEYS:
+        return "REDACTED"
+    if isinstance(value, str):
+        return _redact_text(value, depth=depth + 1)
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): _redact_value(
+                item,
+                key=str(item_key),
+                depth=depth + 1,
+            )
+            for item_key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_value(item, depth=depth + 1) for item in value]
+    return value
+
+
+def _redact_text(value: str, *, depth: int) -> str:
+    if depth > 8:
+        return _redact_patterns(value)
     stripped = value.strip()
-    if (
-        stripped.startswith(("{", "["))
-        and stripped.endswith(("}", "]"))
-    ):
+    if stripped.startswith(("{", "[", '"')):
         try:
             parsed = json.loads(stripped)
         except json.JSONDecodeError:
             pass
         else:
-            if isinstance(parsed, (dict, list)):
+            if isinstance(parsed, (dict, list, str)):
                 return json.dumps(
-                    redact_value(parsed),
+                    _redact_value(parsed, depth=depth + 1),
                     sort_keys=True,
                     separators=(",", ":"),
                 )
+    decoder = json.JSONDecoder()
+    for index, character in enumerate(value):
+        if character not in "{[":
+            continue
+        try:
+            parsed, length = decoder.raw_decode(value[index:])
+        except json.JSONDecodeError:
+            continue
+        if not isinstance(parsed, (dict, list)):
+            continue
+        sanitized = json.dumps(
+            _redact_value(parsed, depth=depth + 1),
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        return (
+            _redact_patterns(value[:index])
+            + sanitized
+            + _redact_text(value[index + length :], depth=depth + 1)
+        )
     return _redact_patterns(value)
 
 
+def redact(value: str) -> str:
+    return _redact_text(value, depth=0)
+
+
 def redact_value(value: object, *, key: str | None = None) -> object:
-    normalized = "" if key is None else re.sub(r"[^a-z0-9]", "", key.lower())
-    if normalized in SENSITIVE_KEYS:
-        return "REDACTED"
-    if isinstance(value, str):
-        return redact(value)
-    if isinstance(value, Mapping):
-        return {
-            str(item_key): redact_value(item, key=str(item_key))
-            for item_key, item in value.items()
-        }
-    if isinstance(value, (list, tuple)):
-        return [redact_value(item) for item in value]
-    return value
+    return _redact_value(value, key=key, depth=0)
 
 
 def redact_argv(arguments: Sequence[str]) -> str:
