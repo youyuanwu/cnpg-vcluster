@@ -9,11 +9,11 @@ metadata:
   name: ${CNPG_CLUSTER}
   namespace: database
 spec:
-  instances: 3
+  instances: ${CNPG_INSTANCES}
   imageName: ${POSTGRES_IMAGE}
   affinity:
     enablePodAntiAffinity: true
-    podAntiAffinityType: required
+    podAntiAffinityType: ${CNPG_ANTI_AFFINITY_TYPE}
     topologyKey: kubernetes.io/hostname
   bootstrap:
     initdb:

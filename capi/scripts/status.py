@@ -305,12 +305,13 @@ def _cnpg_layer_status(
             for pvc in pvcs
         ),
     }
+    expected = int(getattr(tenant, "database_count", 3))
     result["ready"] = (
         operator_ready
         and result["clusterPhase"] == "Cluster in healthy state"
-        and len(ready_pods) == 3
-        and len(result["nodes"]) == 3
-        and len(pvcs) == 3
+        and len(ready_pods) == expected
+        and len(pvcs) == expected
+        and all(pod["spec"].get("nodeName") for pod in ready_pods)
         and all(pvc["status"].get("phase") == "Bound" for pvc in pvcs)
     )
     return result

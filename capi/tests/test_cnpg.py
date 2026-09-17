@@ -205,6 +205,75 @@ class CnpgTests(unittest.TestCase):
             self.assertIn(f"name: postgres-pv-{ordinal}", rendered)
             self.assertIn(f"name: postgres-{ordinal}", rendered)
 
+    def test_cnpg_rendering_uses_requested_instance_count(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "manifests" / "cnpg"
+            target.mkdir(parents=True)
+            for name in ("cluster.yaml.tpl", "static-pvs.yaml.tpl"):
+                target.joinpath(name).write_text(
+                    repository.joinpath("manifests/cnpg", name).read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
+            tenant = type(
+                "Tenant",
+                (),
+                {
+                    "name": "tenant-c",
+                    "cnpg_cluster": "tenant-c-postgres",
+                    "database_count": 1,
+                    "workers": 1,
+                },
+            )()
+            config = {
+                "POSTGRES_IMAGE": "postgres@sha256:" + "a" * 64,
+                "SPIKE_STORAGE_CLASS": "hostpath",
+                "SPIKE_STORAGE_CONTAINER_PATH": "/shared",
+            }
+            pvs, cluster = _render_cluster(root, config, tenant)
+            pv_text = pvs.read_text(encoding="utf-8")
+            cluster_text = cluster.read_text(encoding="utf-8")
+        self.assertIn("instances: 1", cluster_text)
+        self.assertIn("podAntiAffinityType: required", cluster_text)
+        self.assertIn("tenant-c-postgres-pv-1", pv_text)
+        self.assertNotIn("tenant-c-postgres-pv-2", pv_text)
+
+    def test_cnpg_allows_more_instances_than_workers(self) -> None:
+        repository = Path(__file__).resolve().parents[1]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "manifests" / "cnpg"
+            target.mkdir(parents=True)
+            for name in ("cluster.yaml.tpl", "static-pvs.yaml.tpl"):
+                target.joinpath(name).write_text(
+                    repository.joinpath("manifests/cnpg", name).read_text(
+                        encoding="utf-8"
+                    ),
+                    encoding="utf-8",
+                )
+            tenant = type(
+                "Tenant",
+                (),
+                {
+                    "name": "tenant-c",
+                    "cnpg_cluster": "tenant-c-postgres",
+                    "database_count": 3,
+                    "workers": 1,
+                },
+            )()
+            config = {
+                "POSTGRES_IMAGE": "postgres@sha256:" + "a" * 64,
+                "SPIKE_STORAGE_CLASS": "hostpath",
+                "SPIKE_STORAGE_CONTAINER_PATH": "/shared",
+            }
+            _, cluster = _render_cluster(root, config, tenant)
+            cluster_text = cluster.read_text(encoding="utf-8")
+        self.assertIn("instances: 3", cluster_text)
+        self.assertIn("podAntiAffinityType: preferred", cluster_text)
+
     def test_lower_layer_failure_clears_stale_success_evidence(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

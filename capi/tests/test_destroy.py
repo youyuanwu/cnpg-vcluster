@@ -10,6 +10,41 @@ from scripts.destroy_tenant import prepare_tenant_deletion
 
 
 class DestroyTests(unittest.TestCase):
+    def test_runtime_inventory_accepts_selected_dynamic_tenant(self) -> None:
+        from scripts.destroy import _validate_runtime_inventory
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = (
+                root
+                / ".runtime"
+                / "lifecycle"
+                / "local"
+                / "tenant-c"
+                / "evidence"
+                / "create-operation.json"
+            )
+            evidence.parent.mkdir(parents=True, mode=0o700)
+            for parent in (
+                root / ".runtime",
+                root / ".runtime" / "lifecycle",
+                root / ".runtime" / "lifecycle" / "local",
+                root / ".runtime" / "lifecycle" / "local" / "tenant-c",
+                evidence.parent,
+            ):
+                parent.chmod(0o700)
+            evidence.write_text("{}\n", encoding="utf-8")
+            evidence.chmod(0o600)
+            _validate_runtime_inventory(
+                root,
+                ("capi-worker-spike", "tenant-c"),
+            )
+            with self.assertRaisesRegex(RuntimeError, "unexpected runtime"):
+                _validate_runtime_inventory(
+                    root,
+                    ("capi-worker-spike", "tenant-d"),
+                )
+
     def test_runtime_inventory_accepts_dev_up_success_evidence(self) -> None:
         from scripts.destroy import _validate_runtime_inventory
 

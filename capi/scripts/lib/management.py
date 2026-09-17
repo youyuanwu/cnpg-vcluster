@@ -11,11 +11,18 @@ import tempfile
 from pathlib import Path
 
 from .config import parse_duration
-from .files import IntegrityError, verify_sha256, write_private_file
+from .files import (
+    IntegrityError,
+    private_file_exists,
+    read_private_file,
+    verify_sha256,
+    write_private_file,
+)
 from .kube import ManagementClient, wait_for
 from .ownership import IdentityRecord, OwnershipError
 from .process import run
 from .rendering import replace_known_images
+from .tenant_spec import TenantSpecError, validate_tenant_name
 from .tenants import NOT_FOUND
 
 
@@ -29,6 +36,10 @@ def _identity_path(root: Path) -> Path:
 
 def _network_path(root: Path) -> Path:
     return root / ".runtime" / "management" / "network.json"
+
+
+def _tenant_endpoint_path(root: Path) -> Path:
+    return root / ".runtime" / "management" / "tenant-endpoints.json"
 
 
 def _kubeconfig_path(root: Path) -> Path:
@@ -257,6 +268,116 @@ def reconcile_network(root: Path, config: dict[str, str]) -> dict[str, object]:
     record = _observed_management_network(config)
     write_private_file(path, json.dumps(record, sort_keys=True) + "\n")
     return record
+
+
+def _load_tenant_endpoints(
+    root: Path,
+    network: dict[str, object],
+) -> dict[str, str]:
+    path = _tenant_endpoint_path(root)
+    if not private_file_exists(path):
+        return {}
+    try:
+        payload = json.loads(read_private_file(path).decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError("tenant endpoint allocation record is malformed") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema", "networkId", "allocations"}
+        or payload.get("schema") != 1
+        or payload.get("networkId") != network["network_id"]
+        or not isinstance(payload.get("allocations"), dict)
+    ):
+        raise IntegrityError("tenant endpoint allocation record is invalid")
+    allocations = payload["allocations"]
+    if not all(
+        isinstance(name, str) and isinstance(address, str)
+        for name, address in allocations.items()
+    ):
+        raise IntegrityError("tenant endpoint allocations are invalid")
+    try:
+        for name in allocations:
+            validate_tenant_name(name)
+    except TenantSpecError as exc:
+        raise IntegrityError("tenant endpoint allocation name is invalid") from exc
+    start = ipaddress.ip_address(str(network["pool_start"]))
+    end = ipaddress.ip_address(str(network["pool_end"]))
+    try:
+        addresses = [
+            ipaddress.ip_address(address) for address in allocations.values()
+        ]
+    except ValueError as exc:
+        raise IntegrityError("tenant endpoint allocation address is invalid") from exc
+    if (
+        len(addresses) != len(set(addresses))
+        or any(address < start or address > end for address in addresses)
+        or set(allocations.values()) & set(network["slots"].values())
+    ):
+        raise IntegrityError("tenant endpoint allocation identity changed")
+    return dict(allocations)
+
+
+def _write_tenant_endpoints(
+    root: Path,
+    network: dict[str, object],
+    allocations: dict[str, str],
+) -> None:
+    write_private_file(
+        _tenant_endpoint_path(root),
+        json.dumps(
+            {
+                "schema": 1,
+                "networkId": network["network_id"],
+                "allocations": allocations,
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
+
+
+def allocate_tenant_endpoint(
+    root: Path,
+    config: dict[str, str],
+    tenant_name: str,
+) -> str:
+    validate_tenant_name(tenant_name)
+    network = validate_management_network(root, config)
+    allocations = _load_tenant_endpoints(root, network)
+    if tenant_name in allocations:
+        return allocations[tenant_name]
+    start = ipaddress.ip_address(str(network["pool_start"]))
+    end = ipaddress.ip_address(str(network["pool_end"]))
+    unavailable = set(network["slots"].values()) | set(allocations.values())
+    selected = None
+    for address_value in range(int(start), int(end) + 1):
+        candidate = str(ipaddress.ip_address(address_value))
+        if candidate not in unavailable:
+            selected = candidate
+            break
+    if selected is None:
+        raise RuntimeError("management tenant endpoint pool is exhausted")
+    allocations[tenant_name] = selected
+    _write_tenant_endpoints(root, network, allocations)
+    return selected
+
+
+def release_tenant_endpoint(
+    root: Path,
+    config: dict[str, str],
+    tenant_name: str,
+    *,
+    canonical_absent: bool,
+) -> None:
+    validate_tenant_name(tenant_name)
+    if not canonical_absent:
+        raise RuntimeError("tenant endpoint cannot be released before canonical absence")
+    network = validate_management_network(root, config)
+    allocations = _load_tenant_endpoints(root, network)
+    if tenant_name not in allocations:
+        return
+    allocations.pop(tenant_name)
+    _write_tenant_endpoints(root, network, allocations)
 
 
 def _render_cert_manager(root: Path, config: dict[str, str], client: ManagementClient) -> Path:

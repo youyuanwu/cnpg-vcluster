@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import ipaddress
 import json
 import os
 import re
@@ -15,6 +16,11 @@ from .files import IntegrityError, ensure_private_dir, write_private_file
 from .kube import ManagementClient, wait_for
 from .process import run
 from .images import WORKER_IMAGE_KEYS, verify_container_images
+from .tenant_spec import (
+    TenantSpec,
+    load_tenant_spec,
+    require_non_overlapping_networks,
+)
 
 
 @dataclass
@@ -29,6 +35,8 @@ class Tenant:
     storage_host_path: Path
     cnpg_cluster: str
     workers: int
+    database_count: int = 3
+    specification_sha256: str = ""
 
 
 NOT_FOUND = re.compile(r"Error from server \(NotFound\):", re.IGNORECASE)
@@ -323,6 +331,53 @@ def configured_tenants(root: Path, config: dict[str, str]) -> list[Tenant]:
     if any(len(values) != len(set(values)) for values in identities):
         raise IntegrityError("tenant overlays do not define distinct identities")
     return tenants
+
+
+def load_local_tenant_spec(
+    path: Path,
+    config: dict[str, str],
+    *,
+    existing_specs: tuple[TenantSpec, ...] = (),
+) -> TenantSpec:
+    spec = load_tenant_spec(
+        path,
+        expected_profile="local",
+        supported_versions={"local": config["KUBERNETES_VERSION"]},
+    )
+    networks = {}
+    for key, value in config.items():
+        if key.endswith(("_POD_CIDR", "_SERVICE_CIDR")):
+            networks[key] = ipaddress.ip_network(value)
+    for existing in existing_specs:
+        if existing.name == spec.name:
+            if existing.sha256() != spec.sha256():
+                raise IntegrityError(
+                    f"tenant specification identity changed: {spec.name}"
+                )
+            continue
+        networks[f"{existing.name} Pod CIDR"] = existing.pod_network
+        networks[f"{existing.name} Service CIDR"] = existing.service_network
+    require_non_overlapping_networks(spec, networks)
+    return spec
+
+
+def tenant_from_spec(root: Path, spec: TenantSpec, vip: str) -> Tenant:
+    if spec.profile != "local" or spec.database_count is None:
+        raise IntegrityError("local tenant construction requires a local specification")
+    return Tenant(
+        name=spec.name,
+        namespace=spec.namespace,
+        vip=vip,
+        pod_cidr=str(spec.pod_network),
+        service_cidr=str(spec.service_network),
+        dns_ip=spec.dns_service_ip,
+        domain=spec.cluster_domain,
+        storage_host_path=root / ".runtime" / "storage" / spec.name,
+        cnpg_cluster=spec.database_name or "",
+        workers=spec.workers,
+        database_count=spec.database_count,
+        specification_sha256=spec.sha256(),
+    )
 
 
 def _render_template(

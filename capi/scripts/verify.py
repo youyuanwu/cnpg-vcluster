@@ -419,7 +419,10 @@ def _management_absence(config: dict[str, str], client, tenants, workers) -> Non
         *(
             f"pv/{tenant.cnpg_cluster}-pv-{ordinal}"
             for tenant in tenants
-            for ordinal in (1, 2, 3)
+            for ordinal in range(
+                1,
+                int(getattr(tenant, "database_count", 3)) + 1,
+            )
         ),
     ):
         response = client.kubectl("get", resource, check=False)

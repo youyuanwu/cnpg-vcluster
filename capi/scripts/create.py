@@ -61,7 +61,7 @@ def _incomplete_snapshot_error(exc: RuntimeError) -> bool:
         or "no such object" in message.lower()
         or message.startswith("Machine is not Ready:")
         or message.startswith("DevMachine is not Ready:")
-        or message == "three-worker topology is not exact"
+        or message.endswith("-worker topology is not exact")
         or message
         == "Machine, DevMachine, container, and Node sets do not match"
     )

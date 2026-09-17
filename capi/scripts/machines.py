@@ -124,8 +124,10 @@ def worker_snapshot(
     nodes = json.loads(
         _tenant_kubectl(root, config, tenant, "get", "nodes", "-o", "json").stdout
     )["items"]
-    if len(snapshot) != 3 or len(nodes) != 3:
-        raise RuntimeError("three-worker topology is not exact")
+    if len(snapshot) != tenant.workers or len(nodes) != tenant.workers:
+        raise RuntimeError(
+            f"{tenant.workers}-worker topology is not exact"
+        )
     expected_names = set(snapshot)
     if (
         {item["metadata"]["name"] for item in nodes} != expected_names
@@ -151,6 +153,7 @@ def _scale_three(
         "-p",
         '{"spec":{"replicas":3}}',
     )
+    tenant.workers = 3
     wait_network_ready(root, config, tenant)
     verify_network(root, config, tenant)
 
@@ -194,7 +197,7 @@ def _bootstrap_secrets(
             {"secret": secret["metadata"]["name"], "machine": machine},
         )
         result.add(secret["metadata"]["name"])
-    if len(result) != 3:
+    if len(result) != len(machine_names):
         raise RuntimeError("expected one bootstrap Secret per worker")
     return result
 
@@ -231,7 +234,7 @@ def _replace_machine(
         return snapshot
 
     after = wait_for(
-        "three-worker Machine replacement",
+        f"{tenant.workers}-worker Machine replacement",
         parse_duration(config["WORKER_REGISTRATION_TIMEOUT"]),
         parse_duration(config["WAIT_POLL_INTERVAL"]),
         replaced,
@@ -295,13 +298,13 @@ def _interrupted_machine_deletion(
     observed_status = collect_status(root, config)
     if (
         not status_healthy(observed_status)
-        or len(observed_status["spikeMachines"]["machines"]) != 3
-        or len(observed_status["spikeMachines"]["devMachines"]) != 3
-        or len(observed_status["spikeMachines"]["containers"]) != 3
-        or len(observed_status["spikeMachines"]["nodes"]) != 3
-        or len(observed_status["spikeMachines"]["bootstrapSecrets"]) != 3
+        or len(observed_status["spikeMachines"]["machines"]) != tenant.workers
+        or len(observed_status["spikeMachines"]["devMachines"]) != tenant.workers
+        or len(observed_status["spikeMachines"]["containers"]) != tenant.workers
+        or len(observed_status["spikeMachines"]["nodes"]) != tenant.workers
+        or len(observed_status["spikeMachines"]["bootstrapSecrets"]) != tenant.workers
     ):
-        raise RuntimeError("status does not expose the exact three-worker layers")
+        raise RuntimeError("status does not expose the exact worker layers")
     removed_name = sorted(before)[0]
     client.kubectl(
         "-n",
@@ -374,7 +377,7 @@ def run_machine_gate(root: Path, config: dict[str, str]) -> None:
         bootstrap_secrets |= _bootstrap_secrets(root, config, client, tenant)
         _scale_three(root, config, client, tenant)
         if worker_snapshot(root, config, client, tenant) != before:
-            raise RuntimeError("unchanged three-worker declaration changed identities")
+            raise RuntimeError("unchanged worker declaration changed identities")
         after = _replace_machine(root, config, client, tenant, before)
         bootstrap_secrets |= _bootstrap_secrets(root, config, client, tenant)
         _interrupted_machine_deletion(root, config, client, tenant)

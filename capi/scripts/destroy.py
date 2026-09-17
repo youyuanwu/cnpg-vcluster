@@ -35,7 +35,14 @@ from scripts.lib.registry import (
 )
 
 
-def _validate_runtime_inventory(root: Path) -> None:
+def _validate_runtime_inventory(
+    root: Path,
+    tenant_names: tuple[str, ...] = (
+        "capi-worker-spike",
+        "tenant-a",
+        "tenant-b",
+    ),
+) -> None:
     runtime = root / ".runtime"
     if not runtime.exists():
         return
@@ -52,6 +59,7 @@ def _validate_runtime_inventory(root: Path) -> None:
         "host/.lock",
         "management/identity.json",
         "management/network.json",
+        "management/tenant-endpoints.json",
         "management/kubeconfig",
         "management/offline-registry.json",
         "retained-management.json",
@@ -66,15 +74,26 @@ def _validate_runtime_inventory(root: Path) -> None:
         "rendered/providers/capd-components.yaml",
         "rendered/providers/kamaji-capi-components.yaml",
     }
+    tenant_pattern = "(?:" + "|".join(
+        re.escape(name) for name in tenant_names
+    ) + ")"
+    tenant_pair_pattern = (
+        "(?:" + "|".join(
+            f"{re.escape(source)}-to-{re.escape(target)}"
+            for source in tenant_names
+            for target in tenant_names
+            if source != target
+        ) + ")"
+    )
     allowed_dynamic = (
         re.compile(
-            r"^rendered/tenants/(capi-worker-spike|tenant-a|tenant-b)/"
+            rf"^rendered/tenants/{tenant_pattern}/"
             r"(control-plane|workers|worker-templates|worker-deployment|"
             r"invalid-control-plane|invalid-worker)\.yaml$"
         ),
-        re.compile(r"^tenants/(capi-worker-spike|tenant-a|tenant-b)/kubeconfig$"),
+        re.compile(rf"^tenants/{tenant_pattern}/kubeconfig$"),
         re.compile(
-            r"^storage/(capi-worker-spike|tenant-a|tenant-b)/"
+            rf"^storage/{tenant_pattern}/"
             r"volume\.json$"
         ),
         re.compile(r"^evidence/endpoint-failure\.txt$"),
@@ -84,35 +103,46 @@ def _validate_runtime_inventory(root: Path) -> None:
         ),
         re.compile(r"^evidence/cnpg-(success\.json|failure\.txt)$"),
         re.compile(r"^evidence/(create|verify)-(success\.json|failure\.txt)$"),
-        re.compile(r"^evidence/preload-(capi-worker-spike|tenant-a|tenant-b)\.json$"),
+        re.compile(rf"^evidence/preload-{tenant_pattern}\.json$"),
         re.compile(
             r"^evidence/break-glass-[a-z0-9.-]+-[a-z0-9.-]+-[a-z0-9.-]+"
             r"\.json$"
         ),
-        re.compile(r"^deletions/(tenant-a|tenant-b)\.json$"),
+        re.compile(rf"^deletions/{tenant_pattern}\.json$"),
         re.compile(r"^rendered/negative/foreign-node\.json$"),
         re.compile(
-            r"^rendered/addons/(capi-worker-spike|tenant-a|tenant-b)/"
+            rf"^rendered/addons/{tenant_pattern}/"
             r"(calico|kube-proxy)\.yaml$"
         ),
         re.compile(
-            r"^rendered/addons/(capi-worker-spike|tenant-a|tenant-b)/"
+            rf"^rendered/addons/{tenant_pattern}/"
             r"(resource-set|inventory|repair-[a-z0-9-]+)\.json$"
         ),
         re.compile(
-            r"^rendered/storage/(capi-worker-spike|tenant-a|tenant-b)/"
+            rf"^rendered/storage/{tenant_pattern}/"
             r"smoke\.yaml$"
         ),
         re.compile(
-            r"^rendered/cnpg/(capi-worker-spike|tenant-a|tenant-b)/"
+            rf"^rendered/cnpg/{tenant_pattern}/"
             r"((operator|cluster|static-pvs)\.yaml|cross-db-[a-z0-9-]+\.json)$"
         ),
         re.compile(r"^rendered/registry-hosts-[a-z0-9.-]+\.toml$"),
         re.compile(
-            r"^tenants/cross-(tenant-a-to-tenant-b|tenant-b-to-tenant-a)"
-            r"\.kubeconfig$"
+            rf"^tenants/cross-{tenant_pair_pattern}\.kubeconfig$"
         ),
-        re.compile(r"^tenants/cross-(tenant-a|tenant-b)-postgres\.env$"),
+        re.compile(rf"^tenants/cross-{tenant_pattern}-postgres\.env$"),
+        re.compile(r"^lifecycle/\.locks/(local|azure)\.lock$"),
+        re.compile(
+            rf"^lifecycle/local/{tenant_pattern}/"
+            r"(identity|operation)\.json$"
+        ),
+        re.compile(
+            rf"^lifecycle/local/{tenant_pattern}/evidence/"
+            r"(create|delete)-[a-z0-9-]+\.json$"
+        ),
+        re.compile(
+            r"^lifecycle/rejected/(local|azure)/create-[a-z0-9-]+\.json$"
+        ),
     )
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
@@ -282,7 +312,19 @@ def inspect_host_residue(config: dict[str, str]) -> dict[str, list[str]]:
 
 
 def destroy(root: Path, config: dict[str, str]) -> None:
-    _validate_runtime_inventory(root)
+    tenant_names = (
+        (
+            config["SPIKE_NAME"],
+            *config["TENANT_NAMES"].split(),
+        )
+        if "SPIKE_NAME" in config and "TENANT_NAMES" in config
+        else (
+            "capi-worker-spike",
+            "tenant-a",
+            "tenant-b",
+        )
+    )
+    _validate_runtime_inventory(root, tenant_names)
     validate_inotify_state(root, config)
     status = management_status(root, config)
     any_management = any(

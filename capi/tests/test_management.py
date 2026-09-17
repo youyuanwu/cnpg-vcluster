@@ -9,15 +9,93 @@ from unittest.mock import patch
 
 from scripts.lib.management import (
     _observed_identity,
+    allocate_tenant_endpoint,
     metallb_pool_apply_result,
+    release_tenant_endpoint,
     validate_management_network,
     validate_management_server_version,
 )
 from scripts.lib.providers import PROVIDERS, _feature_gates
+from scripts.lib.files import IntegrityError
 from scripts.create_management import create_management
 
 
 class ManagementTests(unittest.TestCase):
+    def test_tenant_endpoint_allocation_is_stable_and_reusable_after_absence(
+        self,
+    ) -> None:
+        network = {
+            "schema": 1,
+            "network": "kind",
+            "network_id": "network-id",
+            "subnet": "172.18.0.0/16",
+            "pool_start": "172.18.255.220",
+            "pool_end": "172.18.255.225",
+            "pool_cidrs": [],
+            "slots": {
+                "tenant-a": "172.18.255.220",
+                "tenant-b": "172.18.255.221",
+                "spike": "172.18.255.222",
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch(
+                "scripts.lib.management.validate_management_network",
+                return_value=network,
+            ):
+                first = allocate_tenant_endpoint(root, {}, "tenant-c")
+                self.assertEqual(first, "172.18.255.223")
+                self.assertEqual(
+                    allocate_tenant_endpoint(root, {}, "tenant-c"),
+                    first,
+                )
+                self.assertEqual(
+                    allocate_tenant_endpoint(root, {}, "tenant-d"),
+                    "172.18.255.224",
+                )
+                with self.assertRaisesRegex(RuntimeError, "canonical absence"):
+                    release_tenant_endpoint(
+                        root,
+                        {},
+                        "tenant-c",
+                        canonical_absent=False,
+                    )
+                release_tenant_endpoint(
+                    root,
+                    {},
+                    "tenant-c",
+                    canonical_absent=True,
+                )
+                self.assertEqual(
+                    allocate_tenant_endpoint(root, {}, "tenant-e"),
+                    "172.18.255.223",
+                )
+            record = root / ".runtime" / "management" / "tenant-endpoints.json"
+            self.assertEqual(record.stat().st_mode & 0o077, 0)
+
+    def test_tenant_endpoint_allocation_rejects_changed_network_identity(self) -> None:
+        network = {
+            "network_id": "network-id",
+            "pool_start": "172.18.255.220",
+            "pool_end": "172.18.255.223",
+            "slots": {"spike": "172.18.255.220"},
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch(
+                "scripts.lib.management.validate_management_network",
+                return_value=network,
+            ):
+                allocate_tenant_endpoint(root, {}, "tenant-c")
+            changed = dict(network, network_id="changed")
+            with patch(
+                "scripts.lib.management.validate_management_network",
+                return_value=changed,
+            ):
+                with self.assertRaisesRegex(IntegrityError, "invalid"):
+                    allocate_tenant_endpoint(root, {}, "tenant-c")
+
     def test_management_server_version_must_match_exactly(self) -> None:
         client = type(
             "Client",

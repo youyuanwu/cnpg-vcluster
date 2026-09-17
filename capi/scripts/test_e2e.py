@@ -43,14 +43,22 @@ def run_just(
     return result
 
 
-def verify_no_lab_residue(config: dict[str, str]) -> None:
+def verify_no_lab_residue(
+    config: dict[str, str],
+    tenant_names: tuple[str, ...] | None = None,
+) -> None:
     if run(
         ["docker", "inspect", f"{config['KIND_CLUSTER_NAME']}-control-plane"],
         timeout=30,
         check=False,
     ).returncode == 0:
         raise RuntimeError("management container remained after teardown")
-    for name in (*config["TENANT_NAMES"].split(), config["SPIKE_NAME"]):
+    selected_names = (
+        tuple(config["TENANT_NAMES"].split())
+        if tenant_names is None
+        else tenant_names
+    )
+    for name in (*selected_names, config["SPIKE_NAME"]):
         leftovers = run(
             [
                 "docker",
