@@ -188,11 +188,30 @@ class TenantCliTests(unittest.TestCase):
             output.getvalue(),
         )
 
+    def test_invalid_spec_preserves_primary_error_if_evidence_fails(self) -> None:
+        _, root, _ = self.make_root()
+        invalid_path = root / "invalid.json"
+        invalid_path.write_text('{"profile":"local"}', encoding="utf-8")
+        with patch(
+            "scripts.tenant.record_rejected_create",
+            side_effect=RuntimeError("evidence write failure"),
+        ):
+            with self.assertRaises(TenantSpecError) as raised:
+                execute(
+                    root,
+                    ["create", "local", str(invalid_path)],
+                    adapters={"local": FakeAdapter()},
+                )
+        self.assertTrue(
+            any("evidence write failure" in note for note in raised.exception.__notes__)
+        )
+
     def test_adapter_failure_outside_phase_gets_failure_record(self) -> None:
         _, root, spec_path = self.make_root()
         adapter = FakeAdapter()
 
         def fail_create(*args):
+            time.sleep(0.12)
             raise RuntimeError("injected unphased failure")
 
         adapter.create = fail_create
@@ -206,6 +225,12 @@ class TenantCliTests(unittest.TestCase):
                 )
         self.assertIn('"phase":"operation"', output.getvalue())
         self.assertIn('"status":"failed"', output.getvalue())
+        operation = next(
+            json.loads(line.removeprefix("TENANT_TIMING "))
+            for line in output.getvalue().splitlines()
+            if '"phase":"operation"' in line
+        )
+        self.assertGreaterEqual(operation["seconds"], 0.1)
 
     def test_evidence_failure_does_not_mask_provider_failure(self) -> None:
         _, root, spec_path = self.make_root()
@@ -302,7 +327,16 @@ class TenantCliTests(unittest.TestCase):
             tenant="tenant-c",
             classification="failed",
             foundation_healthy=True,
-            components={"probe": {"detail": "password=super-secret"}},
+            components={
+                "probe": {
+                    "detail": json.dumps(
+                        {
+                            "password": "super-secret",
+                            "subscriptionId": "00000000-0000-0000-0000-000000000000",
+                        }
+                    )
+                }
+            },
             blockers=(
                 "token=abcdef.abcdefghijklmnop",
                 "GET /subscriptions/00000000-0000-0000-0000-000000000000",
@@ -365,6 +399,89 @@ class TenantCliTests(unittest.TestCase):
                 journal,
                 markers | {"operationId": "foreign"},
             )
+
+    def test_dispatcher_recovers_resource_created_before_uid_persistence(self) -> None:
+        _, root, spec_path = self.make_root()
+
+        class RecoveringAdapter(FakeAdapter):
+            def __init__(self):
+                super().__init__()
+                self.resource: dict[str, object] | None = None
+
+            def create(self, root, spec, runtime, journal, timings):
+                if self.resource is None:
+                    self.resource = {
+                        "uid": "cluster-uid",
+                        "markers": {
+                            "tenant": journal.tenant,
+                            "profile": journal.profile,
+                            "specificationSha256": journal.specification_sha256,
+                            "operationId": journal.operation_id,
+                            "foundationSha256": foundation_sha256(
+                                journal.foundation_identity
+                            ),
+                        },
+                    }
+                    raise RuntimeError("injected crash before UID persistence")
+                runtime.recover_observed_identity(
+                    journal,
+                    resource="cluster",
+                    identifier=str(self.resource["uid"]),
+                    markers=self.resource["markers"],
+                    phase="control-plane-ready",
+                )
+                return {"cluster": str(self.resource["uid"])}
+
+        adapter = RecoveringAdapter()
+        with self.assertRaisesRegex(RuntimeError, "before UID"):
+            execute(
+                root,
+                ["create", "local", str(spec_path)],
+                adapters={"local": adapter},
+            )
+        runtime = TenantRuntime(root, "local", "tenant-c")
+        operation_id = runtime.load_operation().operation_id
+        self.assertEqual(
+            execute(
+                root,
+                ["create", "local", str(spec_path)],
+                adapters={"local": adapter},
+            ),
+            0,
+        )
+        self.assertEqual(runtime.load_identity().observed["cluster"], "cluster-uid")
+        evidence = list(runtime.paths.evidence.glob("create-*.json"))
+        self.assertEqual(len(evidence), 1)
+        self.assertIn(operation_id, evidence[0].name)
+
+    def test_durable_observed_identity_cannot_change_in_new_operation(self) -> None:
+        _, root, spec_path = self.make_root()
+        adapter = FakeAdapter()
+        execute(
+            root,
+            ["create", "local", str(spec_path)],
+            adapters={"local": adapter},
+        )
+
+        def replace_cluster(root, spec, runtime, journal, timings):
+            runtime.update_operation(
+                journal,
+                phase="control-plane-ready",
+                observed={"cluster": "replacement-uid"},
+            )
+            return {"worker": "worker-uid"}
+
+        adapter.create = replace_cluster
+        with self.assertRaisesRegex(TenantRuntimeError, "observed identity changed"):
+            execute(
+                root,
+                ["create", "local", str(spec_path)],
+                adapters={"local": adapter},
+            )
+        self.assertEqual(
+            TenantRuntime(root, "local", "tenant-c").load_identity().observed,
+            {"cluster": "cluster-uid"},
+        )
 
     def test_create_rejects_changed_or_malformed_existing_identity(self) -> None:
         _, root, spec_path = self.make_root()
@@ -434,6 +551,18 @@ class TenantCliTests(unittest.TestCase):
             )
         self.assertEqual(adapter.calls, [])
         payload["specificationSha256"] = TenantSpec.from_mapping(SPEC).sha256()
+        payload["observed"] = {}
+        write_private_file(
+            runtime.paths.identity,
+            json.dumps(payload) + "\n",
+        )
+        with self.assertRaisesRegex(TenantRuntimeError, "observed"):
+            execute(
+                root,
+                ["delete", "local", "tenant-c", "local/tenant-c"],
+                adapters={"local": adapter},
+            )
+        self.assertEqual(adapter.calls, [])
         payload["observed"] = {"cluster": 42}
         write_private_file(
             runtime.paths.identity,
@@ -529,6 +658,52 @@ class TenantCliTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertEqual(payload["classification"], "ownership-invalid")
         self.assertIn("inspection failure", payload["blockers"][0])
+
+    def test_authoritative_status_fixture_checks_all_sources(self) -> None:
+        _, root, _ = self.make_root()
+
+        class InspectingAdapter(FakeAdapter):
+            def __init__(self, sources):
+                super().__init__()
+                self.sources = sources
+
+            def status(self, root: Path, tenant: str):
+                if any(self.sources.values()):
+                    return TenantStatus(
+                        profile="local",
+                        tenant=tenant,
+                        classification="ownership-invalid",
+                        foundation_healthy=True,
+                        blockers=("authoritative tenant residue remains",),
+                    )
+                return TenantStatus(
+                    profile="local",
+                    tenant=tenant,
+                    classification="absent",
+                    foundation_healthy=True,
+                )
+
+        for source in ("management", "provider", "artifacts", "infrastructure"):
+            with self.subTest(source=source):
+                sources = {
+                    "management": False,
+                    "provider": False,
+                    "artifacts": False,
+                    "infrastructure": False,
+                }
+                sources[source] = True
+                output = io.StringIO()
+                with redirect_stdout(output):
+                    code = execute(
+                        root,
+                        ["status", "local", "tenant-c"],
+                        adapters={"local": InspectingAdapter(sources)},
+                    )
+                self.assertEqual(code, 1)
+                self.assertEqual(
+                    json.loads(output.getvalue())["classification"],
+                    "ownership-invalid",
+                )
 
     def test_status_with_existing_profile_lock_creates_no_other_locks(self) -> None:
         _, root, _ = self.make_root()

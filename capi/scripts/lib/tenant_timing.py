@@ -44,6 +44,7 @@ class TenantTimings:
         self.operation = operation
         self.operation_id = operation_id
         self._records: list[dict[str, object]] = []
+        self._started = time.monotonic()
 
     def bind_operation_id(self, operation_id: str) -> None:
         self.operation_id = operation_id
@@ -105,7 +106,7 @@ class TenantTimings:
                 "schema": 1,
                 "phase": name,
                 "status": "failed",
-                "seconds": 0.0,
+                "seconds": round(time.monotonic() - self._started, 3),
                 "blocker": redact(str(error)),
             }
         )

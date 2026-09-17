@@ -138,7 +138,6 @@ def create_tenant(
     spec_path: Path,
     adapters: Mapping[str, TenantAdapter],
 ) -> int:
-    adapter = _adapter(profile, adapters)
     with e2e_lock(root, exclusive=False):
         with profile_lock(
             root,
@@ -158,14 +157,21 @@ def create_tenant(
                         supported_versions=supported_versions(root),
                     )
                 except BaseException as exc:
-                    record_rejected_create(
-                        root,
-                        profile=profile,
-                        operation_id=operation_id,
-                        seconds=time.monotonic() - validation_started,
-                        error=exc,
-                    )
+                    try:
+                        record_rejected_create(
+                            root,
+                            profile=profile,
+                            operation_id=operation_id,
+                            seconds=time.monotonic() - validation_started,
+                            error=exc,
+                        )
+                    except BaseException as evidence_error:
+                        exc.add_note(
+                            "tenant timing evidence failed: "
+                            + redact(str(evidence_error))
+                        )
                     raise
+                adapter = _adapter(profile, adapters)
                 timings = TenantTimings(
                     root,
                     profile=profile,

@@ -32,6 +32,25 @@ AZURE_SUBSCRIPTION_PATH = re.compile(
     r"(?i)(/subscriptions/)[0-9a-f]{8}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
+SERIALIZED_SECRET = re.compile(
+    r"""(?ix)
+    (
+      ["']?
+      (?:token|password|pgpassword|client[_-]?secret|subscription[_-]?id|
+         client[_-]?key[_-]?data|client[_-]?certificate[_-]?data|
+         certificate[_-]?authority[_-]?data|kubeconfig)
+      ["']?
+      \s*[:=]\s*
+    )
+    (?:
+      "(?:\\.|[^"\\])*"
+      |
+      '(?:\\.|[^'\\])*'
+      |
+      [^,\s}\]]+
+    )
+    """
+)
 SENSITIVE_KEYS = frozenset(
     {
         "authorization",
@@ -51,6 +70,10 @@ SENSITIVE_KEYS = frozenset(
 
 def redact(value: str) -> str:
     result = CLI_SECRET.sub(lambda match: f"{match.group(1)}=REDACTED", value)
+    result = SERIALIZED_SECRET.sub(
+        lambda match: f"{match.group(1)}\"REDACTED\"",
+        result,
+    )
     for pattern in PATTERNS:
         if pattern.groups:
             result = pattern.sub(lambda match: f"{match.group(1)}=REDACTED", result)

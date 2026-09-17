@@ -240,7 +240,11 @@ class TenantIdentity:
                 "foundationIdentity",
                 allow_empty=False,
             ),
-            observed=_string_mapping(payload["observed"], "observed"),
+            observed=_string_mapping(
+                payload["observed"],
+                "observed",
+                allow_empty=False,
+            ),
         )
 
     def to_mapping(self) -> dict[str, object]:
@@ -327,6 +331,10 @@ class TenantRuntime:
             ):
                 raise TenantRuntimeError("conflicting tenant operation already exists")
             return existing
+        identity = self.require_compatible_identity(
+            spec,
+            validated_foundation,
+        )
         journal = OperationJournal(
             operation_id=operation_id or uuid.uuid4().hex,
             operation=operation,
@@ -337,7 +345,7 @@ class TenantRuntime:
             foundation_identity=validated_foundation,
             intended_resources=tuple(intended_resources),
             phase="validated",
-            observed={},
+            observed={} if identity is None else dict(identity.observed),
         )
         write_private_file(
             self.paths.operation,
