@@ -932,7 +932,17 @@ def _get_management_resource(
         check=False,
     )
     if response.returncode != 0:
-        return None
+        if re.search(
+            r"Error from server \(NotFound\):|"
+            r"\bnot found\b",
+            response.stderr,
+            re.IGNORECASE,
+        ):
+            return None
+        raise RuntimeError(
+            f"Azure management resource inspection failed for {resource}: "
+            f"{response.stderr}"
+        )
     payload = json.loads(response.stdout)
     if not isinstance(payload, dict):
         raise RuntimeError(f"invalid Azure management resource: {resource}")
@@ -1802,9 +1812,33 @@ def _reconcile_manifest(
         if not isinstance(item, dict):
             raise RuntimeError(f"invalid Azure tenant manifest item: {path.name}")
         namespace, resource = _resource_ref(item)
+        identity_key = _identity_key(item, spec)
+        recorded_uid = current.observed.get(identity_key)
         existing = _get_management_resource(root, namespace, resource)
         if existing is not None:
             _require_markers(existing, expected, resource)
+            existing_uid = existing.get("metadata", {}).get("uid")
+            if not isinstance(existing_uid, str) or not existing_uid:
+                raise RuntimeError(
+                    f"Azure tenant resource UID is absent: {resource}"
+                )
+            if recorded_uid is not None and recorded_uid != existing_uid:
+                raise RuntimeError(
+                    f"Azure tenant resource identity changed: {resource}"
+                )
+            if recorded_uid is None:
+                current = runtime.recover_observed_identity(
+                    current,
+                    resource=identity_key,
+                    identifier=existing_uid,
+                    markers=resource_lifecycle_markers(existing),
+                    phase=phase,
+                )
+                recorded_uid = existing_uid
+        elif recorded_uid is not None:
+            raise RuntimeError(
+                f"recorded Azure tenant resource is absent: {resource}"
+            )
         _kubectl(
             root,
             "apply",
@@ -1821,11 +1855,16 @@ def _reconcile_manifest(
         uid = observed.get("metadata", {}).get("uid")
         if not isinstance(uid, str) or not uid:
             raise RuntimeError(f"Azure tenant resource UID is absent: {resource}")
-        current = runtime.update_operation(
-            current,
-            phase=phase,
-            observed={_identity_key(item, spec): uid},
-        )
+        if recorded_uid is not None and uid != recorded_uid:
+            raise RuntimeError(
+                f"Azure tenant resource identity changed after apply: {resource}"
+            )
+        if recorded_uid is None:
+            current = runtime.update_operation(
+                current,
+                phase=phase,
+                observed={identity_key: uid},
+            )
     return current
 
 
@@ -2396,6 +2435,13 @@ def classify_azure_owned_resources(
         exact = marker_values == dict(expected_markers)
         parent_owned = bool(owner_uids & parent_uid_set)
         if not (exact or parent_owned):
+            unknown.append(
+                {
+                    "kind": str(kind),
+                    "name": str(metadata.get("name", "")),
+                    "reason": "foreign ASO ownership",
+                }
+            )
             continue
         if kind not in KNOWN_ASO_TENANT_KINDS:
             unknown.append(
@@ -2548,6 +2594,11 @@ def discover_azure_owned_resources(
             nic.setdefault("type", "Microsoft.Network/networkInterfaces")
             resources.append(nic)
             verified_ids.append(nic["id"])
+    parent_uids = [
+        value
+        for key, value in identity.observed.items()
+        if key in {"azureClusterUid", "azureMachinePoolUid"}
+    ]
     aso_resource_types = set()
     for group in ("network.azure.com", "compute.azure.com"):
         response = _kubectl(
@@ -2587,6 +2638,18 @@ def discover_azure_owned_resources(
         for item in items:
             if isinstance(item, dict):
                 aso_objects.append(item)
+                metadata = item.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                owner_uids = {
+                    reference.get("uid")
+                    for reference in metadata.get("ownerReferences", [])
+                    if isinstance(reference, dict)
+                }
+                marker_values = resource_lifecycle_markers(item)
+                exact = marker_values == markers
+                parent_owned = bool(owner_uids & set(parent_uids))
+                if not (exact or parent_owned):
+                    continue
                 status = item.get("status")
                 resource_id = status.get("id") if isinstance(status, dict) else None
                 if isinstance(resource_id, str) and resource_id:
@@ -2610,11 +2673,6 @@ def discover_azure_owned_resources(
                             "Azure Service Operator resource discovery is invalid"
                         )
                     resources.append(resource_payload)
-    parent_uids = [
-        value
-        for key, value in identity.observed.items()
-        if key in {"azureClusterUid", "azureMachinePoolUid"}
-    ]
     return classify_azure_owned_resources(
         resources,
         markers,
@@ -2854,6 +2912,10 @@ class AzureTenantAdapter:
                 "json",
             ]
         )
+        if not isinstance(resources, list):
+            raise RuntimeError(
+                "Azure tenant absence discovery returned invalid resources"
+            )
         tenant_runtime = azure_tenant_runtime_path(root, tenant)
         runtime_residue = (
             sorted(
@@ -2915,12 +2977,21 @@ class AzureTenantAdapter:
                 )
             raise
         if identity is None and operation is None:
-            return self._inspect_absence(
-                root,
-                config,
-                tenant,
-                foundation_healthy=healthy,
-            )
+            try:
+                return self._inspect_absence(
+                    root,
+                    config,
+                    tenant,
+                    foundation_healthy=healthy,
+                )
+            except BaseException as exc:
+                return TenantStatus(
+                    profile="azure",
+                    tenant=tenant,
+                    classification="ownership-invalid",
+                    foundation_healthy=healthy,
+                    blockers=(str(exc),),
+                )
         binding = (
             identity.foundation_identity
             if identity is not None

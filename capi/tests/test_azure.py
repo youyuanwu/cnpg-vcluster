@@ -503,6 +503,54 @@ class AzurePhaseFourTests(unittest.TestCase):
             )
         kubectl.assert_not_called()
 
+    def test_reconcile_refuses_recorded_uid_mismatch_before_apply(self):
+        root = self.make_root()
+        spec = self.spec()
+        runtime, journal = self.start_journal(root, spec)
+        journal = runtime.update_operation(
+            journal,
+            phase="control-plane-resources",
+            observed={"clusterUid": "recorded-uid"},
+        )
+        markers = lifecycle_markers(spec, journal)
+        item = {
+            "apiVersion": "cluster.x-k8s.io/v1beta1",
+            "kind": "Cluster",
+            "metadata": {
+                "name": spec.name,
+                "namespace": spec.namespace,
+                "annotations": {
+                    LIFECYCLE_MARKERS[key]: value
+                    for key, value in markers.items()
+                },
+            },
+        }
+        path = azure_tenant_runtime_path(root, spec.name) / "cluster.json"
+        write_private_file(
+            path,
+            json.dumps({"apiVersion": "v1", "kind": "List", "items": [item]}),
+        )
+        existing = {
+            "metadata": {
+                "uid": "replacement-uid",
+                "annotations": item["metadata"]["annotations"],
+            }
+        }
+        with (
+            patch("scripts.azure._get_management_resource", return_value=existing),
+            patch("scripts.azure._kubectl") as kubectl,
+            self.assertRaisesRegex(RuntimeError, "identity changed"),
+        ):
+            _reconcile_manifest(
+                root,
+                spec,
+                runtime,
+                journal,
+                path,
+                phase="control-plane-resources",
+            )
+        kubectl.assert_not_called()
+
     def test_reconcile_recovers_real_stage_resources_after_uid_write_failure(self):
         cases = (
             ("Cluster", "tenant-c", "clusterUid", "control-plane-resources"),
@@ -953,6 +1001,42 @@ class AzurePhaseFourTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "ownership is unknown"):
             classify_azure_owned_resources(resources, markers)
 
+    def test_foreign_aso_id_cannot_promote_azure_resource(self):
+        markers = {
+            "tenant": "tenant-c",
+            "profile": "azure",
+            "specificationSha256": "spec",
+            "foundationSha256": "foundation",
+            "operationId": "operation",
+        }
+        resource_id = (
+            "/subscriptions/x/resourceGroups/rg/providers/"
+            "Microsoft.Network/publicIPAddresses/foreign"
+        )
+        resources = [
+            {
+                "id": resource_id,
+                "type": "Microsoft.Network/publicIPAddresses",
+                "tags": {},
+            }
+        ]
+        foreign = {
+            "kind": "PublicIPAddress",
+            "metadata": {
+                "name": "foreign",
+                "uid": "foreign-uid",
+                "ownerReferences": [],
+            },
+            "status": {"id": resource_id},
+        }
+        with self.assertRaisesRegex(RuntimeError, "foreign ASO ownership"):
+            classify_azure_owned_resources(
+                resources,
+                markers,
+                aso_objects=(foreign,),
+                verified_ids=(),
+            )
+
     def test_absent_status_is_read_only_and_distinguishes_foundation_health(self):
         root = self.make_root()
         adapter = AzureTenantAdapter()
@@ -994,6 +1078,37 @@ class AzurePhaseFourTests(unittest.TestCase):
             status = adapter.status(root, "missing")
         self.assertEqual(status.classification, "ownership-invalid")
         self.assertIn("endpoint.json", status.components["runtimeResidue"])
+
+    def test_absent_status_fails_closed_on_inspection_error_or_malformed_azure_list(
+        self,
+    ):
+        root = self.make_root()
+        adapter = AzureTenantAdapter()
+        with (
+            patch(
+                "scripts.azure._inspect_foundation",
+                return_value=(FOUNDATION, True, ()),
+            ),
+            patch(
+                "scripts.azure._kubectl",
+                return_value=subprocess.CompletedProcess(
+                    [], 1, stdout="", stderr="Forbidden"
+                ),
+            ),
+            patch("scripts.azure._json", return_value=[]),
+        ):
+            status = adapter.status(root, "missing")
+        self.assertEqual(status.classification, "ownership-invalid")
+        with (
+            patch(
+                "scripts.azure._inspect_foundation",
+                return_value=(FOUNDATION, True, ()),
+            ),
+            patch("scripts.azure._get_management_resource", return_value=None),
+            patch("scripts.azure._json", return_value={"unexpected": True}),
+        ):
+            status = adapter.status(root, "missing")
+        self.assertEqual(status.classification, "ownership-invalid")
 
     def test_ready_status_requires_matching_current_evidence_and_identities(self):
         root = self.make_root()
