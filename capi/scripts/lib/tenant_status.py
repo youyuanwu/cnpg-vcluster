@@ -4,7 +4,7 @@ import json
 from dataclasses import dataclass, field
 from typing import Mapping, Sequence
 
-from .redaction import redact
+from .redaction import redact_value
 
 
 CLASSIFICATIONS = frozenset(
@@ -18,16 +18,6 @@ CLASSIFICATIONS = frozenset(
         "ownership-invalid",
     }
 )
-
-
-def _redact_value(value: object) -> object:
-    if isinstance(value, str):
-        return redact(value)
-    if isinstance(value, Mapping):
-        return {str(key): _redact_value(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_redact_value(item) for item in value]
-    return value
 
 
 @dataclass(frozen=True)
@@ -52,8 +42,8 @@ class TenantStatus:
             "tenant": self.tenant,
             "classification": self.classification,
             "foundationHealthy": self.foundation_healthy,
-            "components": _redact_value(self.components),
-            "blockers": _redact_value(self.blockers),
+            "components": redact_value(self.components),
+            "blockers": redact_value(self.blockers),
         }
 
     def to_json(self) -> str:

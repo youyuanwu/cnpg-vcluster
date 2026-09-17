@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -117,3 +119,15 @@ class FileTests(unittest.TestCase):
                 read_private_file(root / ".runtime" / "secret")
             with self.assertRaises(IntegrityError):
                 private_file_exists(root / ".runtime" / "secret")
+
+    def test_private_read_rejects_fifo_without_blocking(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / ".runtime"
+            runtime.mkdir(mode=0o700)
+            fifo = runtime / "identity.json"
+            os.mkfifo(fifo, mode=0o600)
+            started = time.monotonic()
+            with self.assertRaises(IntegrityError):
+                read_private_file(fifo)
+            self.assertLess(time.monotonic() - started, 1.0)

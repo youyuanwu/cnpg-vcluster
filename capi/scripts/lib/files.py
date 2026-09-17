@@ -192,11 +192,28 @@ def write_private_file(path: Path, content: str | bytes) -> None:
 def read_private_file(path: Path) -> bytes:
     with existing_private_directory(path.parent) as parent_fd:
         try:
+            observed = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.getuid()
+                or observed.st_mode & 0o077
+            ):
+                raise IntegrityError(
+                    f"private file is not an owner-only regular file: {path}"
+                )
             descriptor = os.open(
                 path.name,
-                os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0),
                 dir_fd=parent_fd,
             )
+        except IntegrityError:
+            raise
         except OSError as exc:
             raise IntegrityError(
                 f"unable to open private file without following links: {path}: {exc}"

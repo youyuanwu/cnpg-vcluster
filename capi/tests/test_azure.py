@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import os
 import subprocess
+import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -10,12 +12,14 @@ from unittest.mock import patch
 from scripts.azure import (
     _render_addon_job,
     _render_worker_pool,
+    _run_profile_mutation,
     _validate_networks,
     _wait_worker_registered,
     load_azure_configuration,
     names,
 )
 from scripts.lib.config import ConfigError
+from scripts.lib.locking import profile_lock
 
 
 DEFAULTS = """\
@@ -142,6 +146,32 @@ class AzureConfigurationTests(unittest.TestCase):
         ):
             result = _wait_worker_registered(Path("/tmp"), config)
         self.assertEqual(result["metadata"]["name"], "yy-cv-tenant-worker")
+
+    def test_foundation_mutation_waits_for_azure_profile_lock(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "acquired"
+            script = (
+                "from pathlib import Path; "
+                "from scripts.azure import _run_profile_mutation; "
+                f"root=Path({str(root)!r}); marker=Path({str(marker)!r}); "
+                "_run_profile_mutation(root, {}, "
+                "lambda _root, _config: marker.write_text('yes'))"
+            )
+            with profile_lock(root, "azure", exclusive=True, create=True):
+                process = subprocess.Popen(
+                    [sys.executable, "-c", script],
+                    cwd=Path(__file__).resolve().parents[1],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                time.sleep(0.2)
+                self.assertIsNone(process.poll())
+                self.assertFalse(marker.exists())
+            _, stderr = process.communicate(timeout=5)
+            self.assertEqual(process.returncode, 0, stderr)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "yes")
 
 
 if __name__ == "__main__":

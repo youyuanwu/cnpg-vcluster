@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import re
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 
 CLI_SECRET = re.compile(
@@ -24,6 +24,28 @@ PATTERNS = (
     re.compile(r"(?i)\b(token|password|pgpassword|client-key-data|client-certificate-data)\s*[:=]\s*\S+"),
     re.compile(r"\b[a-z0-9]{6}\.[a-z0-9]{16}\b", re.IGNORECASE),
     re.compile(r"(?i)\bAuthorization:\s*\S+(?:\s+\S+)?"),
+    re.compile(
+        r"(?i)\b(subscription[_-]?id|client[_-]?secret|kubeconfig)\s*[:=]\s*\S+"
+    ),
+)
+AZURE_SUBSCRIPTION_PATH = re.compile(
+    r"(?i)(/subscriptions/)[0-9a-f]{8}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
+SENSITIVE_KEYS = frozenset(
+    {
+        "authorization",
+        "certificateauthoritydata",
+        "clientcertificatedata",
+        "clientkeydata",
+        "clientsecret",
+        "kubeadmtoken",
+        "kubeconfig",
+        "password",
+        "pgpassword",
+        "subscriptionid",
+        "token",
+    }
 )
 
 
@@ -34,7 +56,26 @@ def redact(value: str) -> str:
             result = pattern.sub(lambda match: f"{match.group(1)}=REDACTED", result)
         else:
             result = pattern.sub("REDACTED", result)
-    return result
+    return AZURE_SUBSCRIPTION_PATH.sub(
+        lambda match: f"{match.group(1)}REDACTED",
+        result,
+    )
+
+
+def redact_value(value: object, *, key: str | None = None) -> object:
+    normalized = "" if key is None else re.sub(r"[^a-z0-9]", "", key.lower())
+    if normalized in SENSITIVE_KEYS:
+        return "REDACTED"
+    if isinstance(value, str):
+        return redact(value)
+    if isinstance(value, Mapping):
+        return {
+            str(item_key): redact_value(item, key=str(item_key))
+            for item_key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [redact_value(item) for item in value]
+    return value
 
 
 def redact_argv(arguments: Sequence[str]) -> str:

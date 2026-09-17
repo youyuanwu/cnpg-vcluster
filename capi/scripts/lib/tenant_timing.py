@@ -15,6 +15,7 @@ TENANT_PHASES = frozenset(
     {
         "validation",
         "foundation",
+        "journal",
         "control-plane",
         "workers",
         "add-ons",
@@ -22,6 +23,7 @@ TENANT_PHASES = frozenset(
         "deletion",
         "absence",
         "foundation-verification",
+        "operation",
     }
 )
 
@@ -42,6 +44,9 @@ class TenantTimings:
         self.operation = operation
         self.operation_id = operation_id
         self._records: list[dict[str, object]] = []
+
+    def bind_operation_id(self, operation_id: str) -> None:
+        self.operation_id = operation_id
 
     @contextmanager
     def phase(self, name: str) -> Iterator[None]:
@@ -76,6 +81,35 @@ class TenantTimings:
     def records(self) -> list[dict[str, object]]:
         return [dict(record) for record in self._records]
 
+    def record_passed(self, name: str, seconds: float) -> None:
+        if name not in TENANT_PHASES:
+            raise ValueError(f"unknown tenant lifecycle timing phase: {name}")
+        if any(record["phase"] == name for record in self._records):
+            raise RuntimeError(f"tenant lifecycle timing phase already recorded: {name}")
+        self._records.append(
+            {
+                "schema": 1,
+                "phase": name,
+                "status": "passed",
+                "seconds": round(seconds, 3),
+            }
+        )
+
+    def record_failure(self, name: str, error: BaseException) -> None:
+        if any(record["status"] == "failed" for record in self._records):
+            return
+        if name not in TENANT_PHASES:
+            raise ValueError(f"unknown tenant lifecycle timing phase: {name}")
+        self._records.append(
+            {
+                "schema": 1,
+                "phase": name,
+                "status": "failed",
+                "seconds": 0.0,
+                "blocker": redact(str(error)),
+            }
+        )
+
     def emit(self) -> None:
         for record in self._records:
             payload = {
@@ -105,3 +139,52 @@ class TenantTimings:
         }
         write_private_file(path, json.dumps(payload, sort_keys=True) + "\n")
         return path
+
+
+def record_rejected_create(
+    root: Path,
+    *,
+    profile: str,
+    operation_id: str,
+    seconds: float,
+    error: BaseException,
+) -> None:
+    record = {
+        "schema": 1,
+        "profile": profile,
+        "tenant": None,
+        "operation": "create",
+        "operationId": operation_id,
+        "records": [
+            {
+                "schema": 1,
+                "phase": "validation",
+                "status": "failed",
+                "seconds": round(seconds, 3),
+                "blocker": redact(str(error)),
+            }
+        ],
+    }
+    print(
+        "TENANT_TIMING "
+        + json.dumps(
+            {
+                **record["records"][0],
+                "profile": profile,
+                "tenant": None,
+                "operation": "create",
+                "operationId": operation_id,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+    )
+    write_private_file(
+        root
+        / ".runtime"
+        / "lifecycle"
+        / "rejected"
+        / profile
+        / f"create-{operation_id}.json",
+        json.dumps(record, sort_keys=True) + "\n",
+    )

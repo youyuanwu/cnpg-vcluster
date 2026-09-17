@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import stat
@@ -22,12 +23,22 @@ class TenantRuntimeError(RuntimeError):
     pass
 
 
-def _string_mapping(value: object, field: str) -> dict[str, str]:
+def _string_mapping(
+    value: object,
+    field: str,
+    *,
+    allow_empty: bool = True,
+) -> dict[str, str]:
     if not isinstance(value, dict) or not all(
-        isinstance(key, str) and isinstance(item, str)
+        isinstance(key, str)
+        and bool(key)
+        and isinstance(item, str)
+        and bool(item)
         for key, item in value.items()
     ):
         raise TenantRuntimeError(f"invalid tenant runtime field: {field}")
+    if not allow_empty and not value:
+        raise TenantRuntimeError(f"tenant runtime field must not be empty: {field}")
     return dict(value)
 
 
@@ -66,6 +77,11 @@ class TenantRuntimePaths:
     evidence: Path
 
 
+def foundation_sha256(identity: Mapping[str, str]) -> str:
+    payload = json.dumps(dict(identity), sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def tenant_runtime_paths(root: Path, profile: str, tenant: str) -> TenantRuntimePaths:
     if profile not in {"local", "azure"}:
         raise TenantRuntimeError(f"unsupported tenant profile: {profile}")
@@ -85,6 +101,7 @@ class OperationJournal:
     operation: str
     profile: str
     tenant: str
+    specification: Mapping[str, object]
     specification_sha256: str
     foundation_identity: Mapping[str, str]
     intended_resources: Sequence[str]
@@ -99,13 +116,18 @@ class OperationJournal:
             "operation",
             "profile",
             "tenant",
+            "specification",
             "specificationSha256",
             "foundationIdentity",
             "intendedResources",
             "phase",
             "observed",
         }
-        if set(payload) != expected or payload.get("schema") != 1:
+        if (
+            set(payload) != expected
+            or isinstance(payload.get("schema"), bool)
+            or payload.get("schema") != 1
+        ):
             raise TenantRuntimeError("invalid tenant operation journal schema")
         intended = payload["intendedResources"]
         if not isinstance(intended, list) or not all(
@@ -125,14 +147,28 @@ class OperationJournal:
         }
         if not all(isinstance(value, str) and value for value in strings.values()):
             raise TenantRuntimeError("invalid tenant operation journal value")
+        if strings["operation"] not in {"create", "delete"}:
+            raise TenantRuntimeError("invalid tenant operation")
+        if not isinstance(payload["specification"], dict):
+            raise TenantRuntimeError("invalid tenant operation specification")
+        specification = TenantSpec.from_mapping(payload["specification"])
+        if (
+            specification.profile != strings["profile"]
+            or specification.name != strings["tenant"]
+            or specification.sha256() != strings["specificationSha256"]
+        ):
+            raise TenantRuntimeError("tenant operation specification binding changed")
         return cls(
             operation_id=strings["operationId"],
             operation=strings["operation"],
             profile=strings["profile"],
             tenant=strings["tenant"],
+            specification=specification.to_mapping(),
             specification_sha256=strings["specificationSha256"],
             foundation_identity=_string_mapping(
-                payload["foundationIdentity"], "foundationIdentity"
+                payload["foundationIdentity"],
+                "foundationIdentity",
+                allow_empty=False,
             ),
             intended_resources=tuple(intended),
             phase=strings["phase"],
@@ -146,10 +182,75 @@ class OperationJournal:
             "operation": self.operation,
             "profile": self.profile,
             "tenant": self.tenant,
+            "specification": dict(self.specification),
             "specificationSha256": self.specification_sha256,
             "foundationIdentity": dict(self.foundation_identity),
             "intendedResources": list(self.intended_resources),
             "phase": self.phase,
+            "observed": dict(self.observed),
+        }
+
+
+@dataclass(frozen=True)
+class TenantIdentity:
+    profile: str
+    tenant: str
+    specification: TenantSpec
+    specification_sha256: str
+    foundation_identity: Mapping[str, str]
+    observed: Mapping[str, str]
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, object]) -> "TenantIdentity":
+        expected = {
+            "schema",
+            "profile",
+            "tenant",
+            "specification",
+            "specificationSha256",
+            "foundationIdentity",
+            "observed",
+        }
+        if (
+            set(payload) != expected
+            or isinstance(payload.get("schema"), bool)
+            or payload.get("schema") != 1
+        ):
+            raise TenantRuntimeError("invalid tenant identity schema")
+        if not isinstance(payload["specification"], dict):
+            raise TenantRuntimeError("invalid tenant identity specification")
+        spec = TenantSpec.from_mapping(payload["specification"])
+        specification_sha256 = payload["specificationSha256"]
+        if (
+            not isinstance(specification_sha256, str)
+            or specification_sha256 != spec.sha256()
+        ):
+            raise TenantRuntimeError("tenant identity specification checksum changed")
+        profile = payload["profile"]
+        tenant = payload["tenant"]
+        if profile != spec.profile or tenant != spec.name:
+            raise TenantRuntimeError("tenant identity specification binding changed")
+        return cls(
+            profile=spec.profile,
+            tenant=spec.name,
+            specification=spec,
+            specification_sha256=specification_sha256,
+            foundation_identity=_string_mapping(
+                payload["foundationIdentity"],
+                "foundationIdentity",
+                allow_empty=False,
+            ),
+            observed=_string_mapping(payload["observed"], "observed"),
+        )
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "schema": 1,
+            "profile": self.profile,
+            "tenant": self.tenant,
+            "specification": self.specification.to_mapping(),
+            "specificationSha256": self.specification_sha256,
+            "foundationIdentity": dict(self.foundation_identity),
             "observed": dict(self.observed),
         }
 
@@ -166,13 +267,25 @@ class TenantRuntime:
     def operation_exists(self) -> bool:
         return private_file_exists(self.paths.operation)
 
-    def load_identity(self) -> dict[str, object]:
-        payload = _read_private_json(self.paths.identity)
-        if payload.get("schema") != 1:
-            raise TenantRuntimeError("invalid tenant identity schema")
-        if payload.get("profile") != self.profile or payload.get("tenant") != self.tenant:
+    def load_identity(self) -> TenantIdentity:
+        identity = TenantIdentity.from_mapping(_read_private_json(self.paths.identity))
+        if identity.profile != self.profile or identity.tenant != self.tenant:
             raise TenantRuntimeError("tenant identity does not match runtime path")
-        return payload
+        return identity
+
+    def require_compatible_identity(
+        self,
+        spec: TenantSpec,
+        foundation_identity: Mapping[str, str],
+    ) -> TenantIdentity | None:
+        if not self.identity_exists():
+            return None
+        identity = self.load_identity()
+        if identity.specification_sha256 != spec.sha256():
+            raise TenantRuntimeError("existing tenant specification changed")
+        if dict(identity.foundation_identity) != dict(foundation_identity):
+            raise TenantRuntimeError("existing tenant foundation binding changed")
+        return identity
 
     def load_operation(self) -> OperationJournal:
         journal = OperationJournal.from_mapping(
@@ -195,12 +308,21 @@ class TenantRuntime:
             raise TenantRuntimeError(f"unsupported tenant operation: {operation}")
         if spec.profile != self.profile or spec.name != self.tenant:
             raise TenantRuntimeError("tenant specification does not match runtime path")
+        validated_foundation = _string_mapping(
+            dict(foundation_identity),
+            "foundationIdentity",
+            allow_empty=False,
+        )
+        if not intended_resources or not all(
+            isinstance(item, str) and item for item in intended_resources
+        ):
+            raise TenantRuntimeError("tenant intended resources must not be empty")
         if self.operation_exists():
             existing = self.load_operation()
             if (
                 existing.operation != operation
                 or existing.specification_sha256 != spec.sha256()
-                or dict(existing.foundation_identity) != dict(foundation_identity)
+                or dict(existing.foundation_identity) != validated_foundation
                 or tuple(existing.intended_resources) != tuple(intended_resources)
             ):
                 raise TenantRuntimeError("conflicting tenant operation already exists")
@@ -210,8 +332,9 @@ class TenantRuntime:
             operation=operation,
             profile=self.profile,
             tenant=self.tenant,
+            specification=spec.to_mapping(),
             specification_sha256=spec.sha256(),
-            foundation_identity=dict(foundation_identity),
+            foundation_identity=validated_foundation,
             intended_resources=tuple(intended_resources),
             phase="validated",
             observed={},
@@ -234,6 +357,15 @@ class TenantRuntime:
             raise TenantRuntimeError("tenant operation identity changed")
         merged = dict(current.observed)
         if observed is not None:
+            conflicts = sorted(
+                key
+                for key, value in observed.items()
+                if key in merged and merged[key] != value
+            )
+            if conflicts:
+                raise TenantRuntimeError(
+                    "tenant observed identity changed: " + ", ".join(conflicts)
+                )
             merged.update(observed)
         updated = replace(current, phase=phase, observed=merged)
         write_private_file(
@@ -252,11 +384,28 @@ class TenantRuntime:
             "profile": journal.profile,
             "specificationSha256": journal.specification_sha256,
             "operationId": journal.operation_id,
+            "foundationSha256": foundation_sha256(journal.foundation_identity),
         }
         if dict(markers) != expected:
             raise TenantRuntimeError(
                 "existing resource does not match tenant operation markers"
             )
+
+    def recover_observed_identity(
+        self,
+        journal: OperationJournal,
+        *,
+        resource: str,
+        identifier: str,
+        markers: Mapping[str, str],
+        phase: str,
+    ) -> OperationJournal:
+        self.require_recoverable_markers(journal, markers)
+        return self.update_operation(
+            journal,
+            phase=phase,
+            observed={resource: identifier},
+        )
 
     def complete_create(
         self,
@@ -267,18 +416,43 @@ class TenantRuntime:
         current = self.load_operation()
         if current.operation_id != journal.operation_id:
             raise TenantRuntimeError("tenant operation identity changed")
-        identity = {
-            "schema": 1,
-            "profile": self.profile,
-            "tenant": self.tenant,
-            "specification": spec.to_mapping(),
-            "specificationSha256": spec.sha256(),
-            "foundationIdentity": dict(current.foundation_identity),
-            "observed": dict(observed),
-        }
+        existing = self.require_compatible_identity(
+            spec,
+            current.foundation_identity,
+        )
+        prior_observed = {} if existing is None else dict(existing.observed)
+        validated_observed = _string_mapping(
+            dict(observed),
+            "observed",
+            allow_empty=False,
+        )
+        conflicts = sorted(
+            key
+            for key, value in validated_observed.items()
+            if (
+                key in current.observed
+                and current.observed[key] != value
+            )
+            or (
+                key in prior_observed
+                and prior_observed[key] != value
+            )
+        )
+        if conflicts:
+            raise TenantRuntimeError(
+                "tenant observed identity changed: " + ", ".join(conflicts)
+            )
+        identity = TenantIdentity(
+            profile=self.profile,
+            tenant=self.tenant,
+            specification=spec,
+            specification_sha256=spec.sha256(),
+            foundation_identity=dict(current.foundation_identity),
+            observed={**prior_observed, **current.observed, **validated_observed},
+        )
         write_private_file(
             self.paths.identity,
-            json.dumps(identity, sort_keys=True) + "\n",
+            json.dumps(identity.to_mapping(), sort_keys=True) + "\n",
         )
         _unlink_private_file(self.paths.operation)
 
@@ -286,5 +460,5 @@ class TenantRuntime:
         current = self.load_operation()
         if current.operation_id != journal.operation_id:
             raise TenantRuntimeError("tenant operation identity changed")
-        _unlink_private_file(self.paths.identity)
         _unlink_private_file(self.paths.operation)
+        _unlink_private_file(self.paths.identity)

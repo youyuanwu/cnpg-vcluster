@@ -24,6 +24,7 @@ from scripts.lib.config import (
     require,
 )
 from scripts.lib.files import ensure_private_dir, write_private_file
+from scripts.lib.locking import e2e_lock, profile_lock, tools_lock
 from scripts.lib.management import _prepare_kamaji_chart
 from scripts.lib.process import run
 
@@ -1327,6 +1328,20 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         print(f"Azure resource group deletion started: {resource_group_id}")
 
 
+def _run_profile_mutation(root: Path, config: dict[str, str], mutation) -> None:
+    with e2e_lock(root, exclusive=False):
+        with profile_lock(
+            root,
+            "azure",
+            exclusive=True,
+            create=True,
+        ) as acquired:
+            if not acquired:
+                raise RuntimeError("Azure profile mutation lock is unavailable")
+            with tools_lock(root, exclusive=True):
+                mutation(root, config)
+
+
 def main(arguments: list[str]) -> int:
     os.umask(0o077)
     config = load_azure_configuration(ROOT)
@@ -1339,22 +1354,22 @@ def main(arguments: list[str]) -> int:
     command = arguments[0]
     if command == "preflight":
         preflight(ROOT, config)
-    elif command == "create-foundation":
-        create_foundation(ROOT, config)
-    elif command == "create-management":
-        create_management(ROOT, config)
-    elif command == "create-tenant-control-plane":
-        create_tenant_control_plane(ROOT, config)
-    elif command == "create-worker":
-        create_worker(ROOT, config)
-    elif command == "install-addons":
-        install_addons(ROOT, config)
     elif command == "status":
         return status(ROOT, config)
-    elif command == "destroy":
-        destroy(ROOT, config)
     else:
-        raise RuntimeError(f"unknown Azure command: {command}")
+        mutations = {
+            "create-foundation": create_foundation,
+            "create-management": create_management,
+            "create-tenant-control-plane": create_tenant_control_plane,
+            "create-worker": create_worker,
+            "install-addons": install_addons,
+            "destroy": destroy,
+        }
+        try:
+            mutation = mutations[command]
+        except KeyError as exc:
+            raise RuntimeError(f"unknown Azure command: {command}") from exc
+        _run_profile_mutation(ROOT, config, mutation)
     return 0
 
 

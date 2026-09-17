@@ -53,15 +53,15 @@ azure-destroy:
 
 # Create one tenant from an explicit local or Azure JSON specification.
 tenant-create profile spec:
-    @python3 scripts/tenant.py create "{{profile}}" "{{spec}}"
+    @python3 scripts/tenant.py create {{quote(profile)}} {{quote(spec)}}
 
 # Report one tenant through the provider-neutral status envelope.
 tenant-status profile tenant:
-    @python3 scripts/tenant.py status "{{profile}}" "{{tenant}}"
+    @python3 scripts/tenant.py status {{quote(profile)}} {{quote(tenant)}}
 
 # Delete one tenant after confirming the exact profile/name pair.
 tenant-delete profile tenant confirmation:
-    @python3 scripts/tenant.py delete "{{profile}}" "{{tenant}}" "{{confirmation}}"
+    @python3 scripts/tenant.py delete {{quote(profile)}} {{quote(tenant)}} {{quote(confirmation)}}
 
 # [implemented] Reconcile the management cluster and lifecycle controllers.
 create-management:
