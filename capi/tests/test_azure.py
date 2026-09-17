@@ -18,6 +18,7 @@ from scripts.azure import (
     AzureTenantAdapter,
     FOUNDATION_INVENTORY_SCHEMA,
     _azure_tags,
+    _capture_tenant_kubeconfig,
     _collect_ready_observations,
     _foundation_defaults_checksum,
     _reconcile_manifest,
@@ -29,6 +30,7 @@ from scripts.azure import (
     azure_tenant_runtime_path,
     classify_azure_owned_resources,
     create_foundation,
+    discover_azure_owned_resources,
     load_azure_configuration,
     load_inventory,
     names,
@@ -501,6 +503,152 @@ class AzurePhaseFourTests(unittest.TestCase):
             )
         kubectl.assert_not_called()
 
+    def test_reconcile_recovers_real_stage_resources_after_uid_write_failure(self):
+        cases = (
+            ("Cluster", "tenant-c", "clusterUid", "control-plane-resources"),
+            ("MachinePool", "tenant-c-worker", "machinePoolUid", "worker-resources"),
+            (
+                "ConfigMap",
+                "tenant-c-azure-cloud-provider-values",
+                "cloudValuesConfigMapUid",
+                "addon-resources",
+            ),
+        )
+        for kind, name, key, phase in cases:
+            with self.subTest(kind=kind):
+                root = self.make_root()
+                spec = self.spec()
+                runtime, journal = self.start_journal(root, spec)
+                markers = lifecycle_markers(spec, journal)
+                item = {
+                    "apiVersion": "v1",
+                    "kind": kind,
+                    "metadata": {
+                        "name": name,
+                        "namespace": spec.namespace,
+                        "annotations": {
+                            LIFECYCLE_MARKERS[marker]: value
+                            for marker, value in markers.items()
+                        },
+                    },
+                }
+                path = azure_tenant_runtime_path(root, spec.name) / f"{kind}.json"
+                write_private_file(
+                    path,
+                    json.dumps(
+                        {"apiVersion": "v1", "kind": "List", "items": [item]}
+                    ),
+                )
+                observed = {
+                    "metadata": {
+                        "uid": f"{kind.lower()}-uid",
+                        "annotations": item["metadata"]["annotations"],
+                    }
+                }
+                original_update = runtime.update_operation
+                calls = 0
+
+                def fail_first_update(*args, **kwargs):
+                    nonlocal calls
+                    calls += 1
+                    if calls == 1:
+                        raise RuntimeError("injected UID persistence failure")
+                    return original_update(*args, **kwargs)
+
+                with (
+                    patch(
+                        "scripts.azure._get_management_resource",
+                        side_effect=[None, observed],
+                    ),
+                    patch("scripts.azure._kubectl"),
+                    patch.object(
+                        runtime,
+                        "update_operation",
+                        side_effect=fail_first_update,
+                    ),
+                    self.assertRaisesRegex(RuntimeError, "UID persistence"),
+                ):
+                    _reconcile_manifest(
+                        root,
+                        spec,
+                        runtime,
+                        journal,
+                        path,
+                        phase=phase,
+                    )
+                self.assertNotIn(key, runtime.load_operation().observed)
+                with (
+                    patch(
+                        "scripts.azure._get_management_resource",
+                        side_effect=[observed, observed],
+                    ),
+                    patch("scripts.azure._kubectl"),
+                ):
+                    recovered = _reconcile_manifest(
+                        root,
+                        spec,
+                        runtime,
+                        runtime.load_operation(),
+                        path,
+                        phase=phase,
+                    )
+                self.assertEqual(recovered.observed[key], f"{kind.lower()}-uid")
+
+    def test_tenant_kubeconfig_requires_verified_controller_owner(self):
+        root = self.make_root()
+        spec = self.spec()
+        runtime, journal = self.start_journal(root, spec)
+        journal = runtime.update_operation(
+            journal,
+            phase="control-plane-resources",
+            observed={
+                "clusterUid": "cluster-uid",
+                "kamajiControlPlaneUid": "control-plane-uid",
+            },
+        )
+        encoded = base64.b64encode(b"kubeconfig").decode()
+        for owner_uid, accepted in (
+            ("foreign-uid", False),
+            ("control-plane-uid", True),
+        ):
+            with self.subTest(owner_uid=owner_uid):
+                secret = {
+                    "metadata": {
+                        "uid": "secret-uid",
+                        "ownerReferences": [
+                            {
+                                "controller": True,
+                                "uid": owner_uid,
+                                "kind": "KamajiControlPlane",
+                            }
+                        ],
+                    },
+                    "data": {"value": encoded},
+                }
+                with patch(
+                    "scripts.azure._get_management_resource",
+                    return_value=secret,
+                ):
+                    if accepted:
+                        updated = _capture_tenant_kubeconfig(
+                            root,
+                            spec,
+                            runtime,
+                            journal,
+                        )
+                        self.assertEqual(
+                            updated.observed["tenantKubeconfigSecretUid"],
+                            "secret-uid",
+                        )
+                    else:
+                        with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                            _capture_tenant_kubeconfig(
+                                root,
+                                spec,
+                                runtime,
+                                journal,
+                            )
+
     def test_interrupted_create_retains_journal_at_each_stage(self):
         for failing_phase in ("control-plane", "workers", "add-ons"):
             with self.subTest(phase=failing_phase):
@@ -708,6 +856,91 @@ class AzurePhaseFourTests(unittest.TestCase):
         ]
         with self.assertRaisesRegex(RuntimeError, "ownership is unknown"):
             classify_azure_owned_resources(resources, markers)
+
+    def test_discovery_fails_closed_on_aso_api_failure_and_unknown_kind(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        spec = self.spec()
+        runtime, journal = self.start_journal(root, spec)
+        journal = runtime.update_operation(
+            journal,
+            phase="workers",
+            observed={
+                "markerOperationId": journal.operation_id,
+                "azureClusterUid": "azure-cluster-uid",
+                "azureMachinePoolUid": "azure-pool-uid",
+            },
+        )
+        markers = lifecycle_markers(spec, journal)
+
+        def parent(_root, _namespace, resource):
+            uid = (
+                "azure-cluster-uid"
+                if resource.startswith("azurecluster/")
+                else "azure-pool-uid"
+            )
+            return {
+                "metadata": {
+                    "uid": uid,
+                    "annotations": {
+                        LIFECYCLE_MARKERS[key]: value
+                        for key, value in markers.items()
+                    },
+                }
+            }
+
+        with (
+            patch(
+                "scripts.azure._get_management_resource",
+                side_effect=parent,
+            ),
+            patch("scripts.azure.load_inventory", return_value=self.inventory(root, config)),
+            patch("scripts.azure._json", return_value=[]),
+            patch(
+                "scripts.azure._kubectl",
+                return_value=subprocess.CompletedProcess(
+                    [], 1, stdout="", stderr="forbidden"
+                ),
+            ),
+            self.assertRaisesRegex(RuntimeError, "API discovery failed"),
+        ):
+            discover_azure_owned_resources(root, config, spec, journal)
+
+        unknown = {
+            "kind": "VirtualNetwork",
+            "metadata": {
+                "name": "unknown",
+                "uid": "unknown-uid",
+                "ownerReferences": [{"uid": "azure-cluster-uid"}],
+            },
+            "status": {},
+        }
+        responses = iter(
+            (
+                subprocess.CompletedProcess(
+                    [], 0, stdout="virtualnetworks.network.azure.com\n", stderr=""
+                ),
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps({"items": [unknown]}),
+                    stderr="",
+                ),
+            )
+        )
+        with (
+            patch(
+                "scripts.azure._get_management_resource",
+                side_effect=parent,
+            ),
+            patch("scripts.azure.load_inventory", return_value=self.inventory(root, config)),
+            patch("scripts.azure._json", return_value=[]),
+            patch("scripts.azure._kubectl", side_effect=lambda *_a, **_k: next(responses)),
+            self.assertRaisesRegex(RuntimeError, "ownership is unknown"),
+        ):
+            discover_azure_owned_resources(root, config, spec, journal)
+        tags = _azure_tags(markers)
         foreign = dict(tags)
         foreign["cnpg-vcluster-operation-id"] = "other"
         resources = [
@@ -744,6 +977,23 @@ class AzurePhaseFourTests(unittest.TestCase):
             status = adapter.status(root, "missing")
         self.assertEqual(status.classification, "degraded")
         self.assertFalse(status.foundation_healthy)
+
+    def test_absent_status_rejects_tenant_runtime_residue(self):
+        root = self.make_root()
+        adapter = AzureTenantAdapter()
+        residue = azure_tenant_runtime_path(root, "missing") / "endpoint.json"
+        write_private_file(residue, "{}\n")
+        with (
+            patch(
+                "scripts.azure._inspect_foundation",
+                return_value=(FOUNDATION, True, ()),
+            ),
+            patch("scripts.azure._get_management_resource", return_value=None),
+            patch("scripts.azure._json", return_value=[]),
+        ):
+            status = adapter.status(root, "missing")
+        self.assertEqual(status.classification, "ownership-invalid")
+        self.assertIn("endpoint.json", status.components["runtimeResidue"])
 
     def test_ready_status_requires_matching_current_evidence_and_identities(self):
         root = self.make_root()

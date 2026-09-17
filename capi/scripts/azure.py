@@ -1918,8 +1918,24 @@ def _capture_tenant_kubeconfig(
     if secret is None:
         raise RuntimeError("Azure tenant kubeconfig Secret is absent")
     uid = secret.get("metadata", {}).get("uid")
+    owners = [
+        owner
+        for owner in secret.get("metadata", {}).get("ownerReferences") or []
+        if owner.get("controller") is True
+    ]
+    allowed_owner_uids = {
+        journal.observed.get("clusterUid"),
+        journal.observed.get("kamajiControlPlaneUid"),
+    } - {None}
     encoded = secret.get("data", {}).get("value")
-    if not isinstance(uid, str) or not uid or not isinstance(encoded, str) or not encoded:
+    if (
+        not isinstance(uid, str)
+        or not uid
+        or len(owners) != 1
+        or owners[0].get("uid") not in allowed_owner_uids
+        or not isinstance(encoded, str)
+        or not encoded
+    ):
         raise RuntimeError("Azure tenant kubeconfig Secret is incomplete")
     try:
         content = base64.b64decode(encoded, validate=True)
@@ -2532,10 +2548,24 @@ def discover_azure_owned_resources(
             nic.setdefault("type", "Microsoft.Network/networkInterfaces")
             resources.append(nic)
             verified_ids.append(nic["id"])
-    for resource_name in (
-        "natgateways.network.azure.com",
-        "publicipaddresses.network.azure.com",
-    ):
+    aso_resource_types = set()
+    for group in ("network.azure.com", "compute.azure.com"):
+        response = _kubectl(
+            root,
+            "api-resources",
+            "--api-group",
+            group,
+            "--namespaced=true",
+            "-o",
+            "name",
+            check=False,
+        )
+        if response.returncode != 0:
+            raise RuntimeError(
+                f"Azure Service Operator API discovery failed for {group}"
+            )
+        aso_resource_types.update(response.stdout.split())
+    for resource_name in sorted(aso_resource_types):
         aso_response = _kubectl(
             root,
             "-n",
@@ -2547,7 +2577,9 @@ def discover_azure_owned_resources(
             check=False,
         )
         if aso_response.returncode != 0:
-            continue
+            raise RuntimeError(
+                f"Azure Service Operator discovery failed for {resource_name}"
+            )
         payload = json.loads(aso_response.stdout)
         items = payload.get("items", [])
         if not isinstance(items, list):
@@ -2822,7 +2854,20 @@ class AzureTenantAdapter:
                 "json",
             ]
         )
-        if namespace is not None or (isinstance(resources, list) and resources):
+        tenant_runtime = azure_tenant_runtime_path(root, tenant)
+        runtime_residue = (
+            sorted(
+                str(path.relative_to(tenant_runtime))
+                for path in tenant_runtime.rglob("*")
+            )
+            if tenant_runtime.exists()
+            else []
+        )
+        if (
+            namespace is not None
+            or (isinstance(resources, list) and resources)
+            or runtime_residue
+        ):
             return TenantStatus(
                 profile="azure",
                 tenant=tenant,
@@ -2833,6 +2878,7 @@ class AzureTenantAdapter:
                     "azureResourceCount": len(resources)
                     if isinstance(resources, list)
                     else None,
+                    "runtimeResidue": runtime_residue,
                 },
                 blockers=(
                     "Azure tenant resources exist without an authoritative identity",
