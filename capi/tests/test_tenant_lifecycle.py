@@ -413,17 +413,27 @@ class TenantLifecycleTests(unittest.TestCase):
 
     def test_unhealthy_survivor_refuses_before_target_mutation(self) -> None:
         adapter = LocalTenantAdapter()
-        survivors = [
-            type("Tenant", (), {"name": "tenant-a"})(),
-            type("Tenant", (), {"name": "tenant-b"})(),
-        ]
+        survivor_specs = {
+            "tenant-a": TenantSpec.from_mapping(
+                {**SPEC.to_mapping(), "name": "tenant-a"}
+            ),
+            "tenant-b": TenantSpec.from_mapping(
+                {**SPEC.to_mapping(), "name": "tenant-b"}
+            ),
+        }
         with (
             patch.object(adapter, "_config", return_value={}),
             patch("scripts.local_tenant.ManagementClient"),
             patch(
-                "scripts.local_tenant.recorded_local_tenants",
-                return_value=survivors,
+                "scripts.local_tenant.recorded_local_specs",
+                return_value=survivor_specs,
             ),
+            patch(
+                "scripts.local_tenant.tenant_endpoint_allocation",
+                side_effect=["172.18.0.10", "172.18.0.11"],
+            ),
+            patch("scripts.local_tenant.tenant_from_spec"),
+            patch("scripts.local_tenant.resolve_tenant_storage"),
             patch.object(
                 adapter,
                 "status",

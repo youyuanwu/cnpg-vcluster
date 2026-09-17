@@ -447,6 +447,13 @@ class LocalTenantAdapter:
             now=self.clock(),
         )
 
+    def authoritative_absence(
+        self,
+        root: Path,
+        tenant: str,
+    ) -> TenantStatus:
+        return self._inspect_absence(root, self._config(root), tenant)
+
     def validate_delete(
         self,
         root: Path,
@@ -457,16 +464,33 @@ class LocalTenantAdapter:
         snapshots = {}
         blockers = []
         client = ManagementClient(root, config)
-        for survivor in recorded_local_tenants(root, config):
-            if survivor.name == spec.name:
+        survivor_specs = recorded_local_specs(root)
+        for survivor_name, survivor_spec in survivor_specs.items():
+            if survivor_name == spec.name:
                 continue
-            status = self.status(root, survivor.name)
+            status = self.status(root, survivor_name)
             if status.classification != "ready":
                 blockers.append(
-                    f"{survivor.name}: {status.classification}: "
+                    f"{survivor_name}: {status.classification}: "
                     + "; ".join(status.blockers)
                 )
                 continue
+            endpoint = tenant_endpoint_allocation(
+                root,
+                config,
+                survivor_name,
+            )
+            if endpoint is None:
+                blockers.append(
+                    f"{survivor_name}: endpoint allocation is absent"
+                )
+                continue
+            survivor = tenant_from_spec(
+                root,
+                survivor_spec,
+                endpoint,
+            )
+            resolve_tenant_storage(root, config, survivor)
             snapshot = stable_tenant_snapshot(
                 root,
                 config,
@@ -478,7 +502,7 @@ class LocalTenantAdapter:
                     f"{survivor.name}: structural identity snapshot is incomplete"
                 )
             else:
-                snapshots[survivor.name] = snapshot
+                snapshots[survivor_name] = snapshot
         if blockers:
             raise RuntimeError(
                 "local tenant deletion refused because survivors are not Ready: "
@@ -540,7 +564,24 @@ class LocalTenantAdapter:
             ):
                 raise RuntimeError("local foundation changed during tenant deletion")
             client = ManagementClient(root, config)
-            for survivor in recorded_local_tenants(root, config):
+            survivor_specs = recorded_local_specs(root)
+            for survivor_name in snapshots:
+                survivor_spec = survivor_specs.get(survivor_name)
+                if survivor_spec is None:
+                    raise RuntimeError(
+                        f"survivor lifecycle identity disappeared: {survivor_name}"
+                    )
+                endpoint = tenant_endpoint_allocation(
+                    root,
+                    config,
+                    survivor_name,
+                )
+                if endpoint is None:
+                    raise RuntimeError(
+                        f"survivor endpoint disappeared: {survivor_name}"
+                    )
+                survivor = tenant_from_spec(root, survivor_spec, endpoint)
+                resolve_tenant_storage(root, config, survivor)
                 if survivor.name == spec.name:
                     continue
                 status = self.status(root, survivor.name)

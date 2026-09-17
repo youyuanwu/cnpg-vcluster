@@ -58,6 +58,12 @@ class TenantAdapter(Protocol):
 
     def status(self, root: Path, tenant: str) -> TenantStatus: ...
 
+    def authoritative_absence(
+        self,
+        root: Path,
+        tenant: str,
+    ) -> TenantStatus: ...
+
     def validate_delete(
         self,
         root: Path,
@@ -142,6 +148,26 @@ def _safe_adapter_status(
             profile,
             tenant,
             "tenant adapter returned status for a different identity",
+        )
+    return status
+
+
+def _safe_authoritative_absence(
+    adapter: TenantAdapter,
+    root: Path,
+    profile: str,
+    tenant: str,
+) -> TenantStatus:
+    inspector = getattr(adapter, "authoritative_absence", adapter.status)
+    try:
+        status = inspector(root, tenant)
+    except BaseException as exc:
+        return _ownership_invalid(profile, tenant, exc)
+    if status.profile != profile or status.tenant != tenant:
+        return _ownership_invalid(
+            profile,
+            tenant,
+            "tenant adapter returned absence for a different identity",
         )
     return status
 
@@ -369,7 +395,7 @@ def delete_tenant(
                             timings.bind_operation_id(pending.operation_id)
                     if identity is None:
                         with timings.phase("absence"):
-                            inspected = _safe_adapter_status(
+                            inspected = _safe_authoritative_absence(
                                 adapter,
                                 root,
                                 profile,

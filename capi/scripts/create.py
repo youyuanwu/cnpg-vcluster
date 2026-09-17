@@ -5,6 +5,7 @@ from contextlib import nullcontext
 import hashlib
 import re
 from pathlib import Path
+from collections.abc import Callable
 
 from scripts.cnpg import (
     _cnpg_ready,
@@ -360,6 +361,7 @@ def reconcile_tenant(
     timings=None,
     runtime: TenantRuntime | None = None,
     journal: OperationJournal | None = None,
+    checkpoint: Callable[[str, OperationJournal], None] | None = None,
 ):
     phase = timings.phase if timings is not None else lambda _: nullcontext()
     if (runtime is None) != (journal is None):
@@ -428,6 +430,8 @@ def reconcile_tenant(
                     ).hexdigest(),
                 },
             )
+            if checkpoint is not None:
+                checkpoint("control-plane", current_journal)
     with phase("workers"):
         restore_host_images(root, config, TENANT_HOST_IMAGE_KEYS)
         apply_workers(root, config, client, tenant)
@@ -445,6 +449,8 @@ def reconcile_tenant(
                 resources,
                 phase="workers-applied",
             )
+            if checkpoint is not None:
+                checkpoint("workers", current_journal)
     with phase("add-ons"):
         apply_addons(root, config, client, tenant)
         _repair_addons(root, config, client, tenant)
@@ -479,6 +485,8 @@ def reconcile_tenant(
                     ).hexdigest(),
                 },
             )
+            if checkpoint is not None:
+                checkpoint("network", current_journal)
     with phase("data-services"):
         ensure_storage_ready(root, config, tenant)
         install_cnpg(root, config, tenant)
@@ -503,9 +511,11 @@ def reconcile_tenant(
             marker_operation_id=str(marker_operation_id),
         )
         if runtime is not None and current_journal is not None:
-            runtime.update_operation(
+            current_journal = runtime.update_operation(
                 current_journal,
                 phase="ready",
                 observed=observed,
             )
+            if checkpoint is not None:
+                checkpoint("data-services", current_journal)
         return observed

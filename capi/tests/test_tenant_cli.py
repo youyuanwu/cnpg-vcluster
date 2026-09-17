@@ -830,6 +830,59 @@ class TenantCliTests(unittest.TestCase):
             0,
         )
 
+    def test_delete_recovers_if_final_journal_removal_was_interrupted(self) -> None:
+        _, root, spec_path = self.make_root()
+
+        class AbsenceAdapter(FakeAdapter):
+            def authoritative_absence(self, root: Path, tenant: str):
+                self.calls.append("absence")
+                return TenantStatus(
+                    profile="local",
+                    tenant=tenant,
+                    classification="absent",
+                    foundation_healthy=True,
+                )
+
+        adapter = AbsenceAdapter()
+        execute(
+            root,
+            ["create", "local", str(spec_path)],
+            adapters={"local": adapter},
+        )
+        runtime = TenantRuntime(root, "local", "tenant-c")
+        from scripts.lib import tenant_runtime
+
+        original_unlink = tenant_runtime._unlink_private_file
+
+        def fail_operation(path: Path) -> None:
+            if path == runtime.paths.operation:
+                raise RuntimeError("injected operation unlink failure")
+            original_unlink(path)
+
+        with patch(
+            "scripts.lib.tenant_runtime._unlink_private_file",
+            side_effect=fail_operation,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "operation unlink"):
+                execute(
+                    root,
+                    ["delete", "local", "tenant-c", "local/tenant-c"],
+                    adapters={"local": adapter},
+                )
+        self.assertFalse(runtime.identity_exists())
+        self.assertTrue(runtime.operation_exists())
+        self.assertFalse(runtime.paths.ready.exists())
+        self.assertEqual(
+            execute(
+                root,
+                ["delete", "local", "tenant-c", "local/tenant-c"],
+                adapters={"local": adapter},
+            ),
+            0,
+        )
+        self.assertFalse(runtime.operation_exists())
+        self.assertIn("absence", adapter.calls)
+
     def test_status_rejects_runtime_residue_without_profile_lock(self) -> None:
         _, root, _ = self.make_root()
         runtime = TenantRuntime(root, "local", "tenant-c")
