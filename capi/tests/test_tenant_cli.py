@@ -813,7 +813,7 @@ class TenantCliTests(unittest.TestCase):
                     adapters={"local": adapter},
                 )
         self.assertTrue(runtime.identity_exists())
-        self.assertFalse(runtime.operation_exists())
+        self.assertTrue(runtime.operation_exists())
         execute(
             root,
             ["delete", "local", "tenant-c", "local/tenant-c"],

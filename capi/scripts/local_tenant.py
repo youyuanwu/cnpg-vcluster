@@ -320,6 +320,7 @@ class LocalTenantAdapter:
             if endpoint is not None:
                 present["endpoint"] = endpoint
         paths = (
+            TenantRuntime(root, "local", tenant_name).paths.ready,
             tenant_kubeconfig_path(root, tenant),
             storage_record_path(root, tenant),
             root / ".runtime" / "rendered" / "tenants" / tenant_name,

@@ -549,6 +549,6 @@ class TenantRuntime:
         current = self.load_operation()
         if current.operation_id != journal.operation_id:
             raise TenantRuntimeError("tenant operation identity changed")
-        _unlink_private_file(self.paths.operation)
-        _unlink_private_file(self.paths.identity)
         _unlink_private_file(self.paths.ready)
+        _unlink_private_file(self.paths.identity)
+        _unlink_private_file(self.paths.operation)

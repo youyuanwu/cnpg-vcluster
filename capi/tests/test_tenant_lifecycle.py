@@ -63,6 +63,98 @@ def identity(name: str = "tenant-c") -> TenantIdentity:
 
 
 class TenantLifecycleTests(unittest.TestCase):
+    def test_interrupted_delete_keeps_journal_until_ready_evidence_is_removed(
+        self,
+    ) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = TenantRuntime(root, "local", SPEC.name)
+            journal = runtime.start_operation(
+                operation="create",
+                spec=SPEC,
+                foundation_identity={"management": "uid"},
+                intended_resources=("Cluster/tenant-c",),
+                operation_id="create-operation",
+            )
+            runtime.complete_create(
+                journal,
+                SPEC,
+                {"cluster": "cluster-uid"},
+            )
+            runtime.write_ready_evidence(
+                {
+                    "schema": 1,
+                    "profile": "local",
+                    "tenant": SPEC.name,
+                    "specificationSha256": SPEC.sha256(),
+                    "foundationIdentity": {"management": "uid"},
+                    "observed": {"cluster": "cluster-uid"},
+                    "verifiedAt": 1000.0,
+                    "functional": {
+                        "controlPlane": True,
+                        "workers": True,
+                        "network": True,
+                        "storage": True,
+                        "database": True,
+                    },
+                }
+            )
+            delete = runtime.start_operation(
+                operation="delete",
+                spec=SPEC,
+                foundation_identity={"management": "uid"},
+                intended_resources=("Cluster/tenant-c",),
+                operation_id="delete-operation",
+            )
+            from scripts.lib import tenant_runtime
+
+            original = tenant_runtime._unlink_private_file
+
+            def fail_ready(path: Path) -> None:
+                if path == runtime.paths.ready:
+                    raise RuntimeError("injected ready unlink failure")
+                original(path)
+
+            with patch(
+                "scripts.lib.tenant_runtime._unlink_private_file",
+                side_effect=fail_ready,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "ready unlink"):
+                    runtime.complete_delete(delete)
+            self.assertTrue(runtime.operation_exists())
+            self.assertTrue(runtime.identity_exists())
+            self.assertTrue(runtime.paths.ready.exists())
+
+    def test_orphaned_ready_evidence_is_ownership_invalid(self) -> None:
+        adapter = LocalTenantAdapter()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = TenantRuntime(root, "local", SPEC.name)
+            runtime.write_ready_evidence(
+                {
+                    "schema": 1,
+                    "profile": "local",
+                    "tenant": SPEC.name,
+                    "specificationSha256": SPEC.sha256(),
+                    "foundationIdentity": {"management": "uid"},
+                    "observed": {"cluster": "cluster-uid"},
+                    "verifiedAt": 1000.0,
+                    "functional": {},
+                }
+            )
+            with (
+                patch.object(adapter, "_config", return_value={"LAB_PREFIX": "lab"}),
+                patch.object(adapter, "_foundation", return_value=({}, False)),
+                patch("scripts.local_tenant.management_status", return_value={}),
+                patch("scripts.local_tenant.run", return_value=result(0, stdout="")),
+                patch(
+                    "scripts.local_tenant.inspect_storage_volume",
+                    return_value=None,
+                ),
+            ):
+                status = adapter.status(root, SPEC.name)
+            self.assertEqual(status.classification, "ownership-invalid")
+
     def test_management_inspection_distinguishes_not_found_and_failure(self) -> None:
         tenant = type(
             "Tenant", (), {"namespace": "tenant-c", "name": "tenant-c"}
@@ -235,6 +327,89 @@ class TenantLifecycleTests(unittest.TestCase):
             self.assertEqual(evidence["verifiedAt"], 1000.0)
             self.assertEqual(evidence["observed"], observed)
             self.assertEqual(runtime.paths.ready.stat().st_mode & 0o777, 0o600)
+
+    def test_local_adapter_resumes_interrupted_identity_capture_stages(self) -> None:
+        stages = (
+            ("controlPlane", "control-plane-ready"),
+            ("workers", "workers-ready"),
+            ("database", "data-services-ready"),
+        )
+        for resource, phase in stages:
+            with self.subTest(resource=resource):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    runtime = TenantRuntime(root, "local", SPEC.name)
+                    journal = runtime.start_operation(
+                        operation="create",
+                        spec=SPEC,
+                        foundation_identity={"management": "uid"},
+                        intended_resources=("Cluster/tenant-c",),
+                        operation_id=f"{resource}-operation",
+                    )
+                    adapter = LocalTenantAdapter(clock=lambda: 1000.0)
+                    observed = {
+                        "endpoint": "172.18.0.10",
+                        "markerOperationId": journal.operation_id,
+                        resource: f"{resource}-uid",
+                    }
+                    attempts = 0
+
+                    def reconcile(*_args, **_kwargs):
+                        nonlocal attempts
+                        attempts += 1
+                        current = runtime.load_operation()
+                        if attempts == 1:
+                            runtime.update_operation(
+                                current,
+                                phase=phase,
+                                observed={resource: f"{resource}-uid"},
+                            )
+                            raise RuntimeError(f"injected {resource} interruption")
+                        self.assertEqual(
+                            runtime.load_operation().observed[resource],
+                            f"{resource}-uid",
+                        )
+                        return observed
+
+                    patches = (
+                        patch.object(adapter, "_config", return_value={}),
+                        patch(
+                            "scripts.local_tenant.allocate_tenant_endpoint",
+                            return_value="172.18.0.10",
+                        ),
+                        patch("scripts.local_tenant.resolve_tenant_storage"),
+                        patch(
+                            "scripts.local_tenant.reconcile_tenant",
+                            side_effect=reconcile,
+                        ),
+                        patch(
+                            "scripts.local_tenant.verify_tenant_functional",
+                            return_value={
+                                "network": True,
+                                "database": True,
+                                "workers": {"worker": {}},
+                                "storage": {"pvc": "pv"},
+                            },
+                        ),
+                        patch("scripts.local_tenant.ManagementClient"),
+                    )
+                    with patches[0], patches[1], patches[2], patches[3], patches[4], patches[5]:
+                        with self.assertRaisesRegex(RuntimeError, "interruption"):
+                            adapter.create(
+                                root,
+                                SPEC,
+                                runtime,
+                                journal,
+                                object(),
+                            )
+                        returned = adapter.create(
+                            root,
+                            SPEC,
+                            runtime,
+                            runtime.load_operation(),
+                            object(),
+                        )
+                    self.assertEqual(returned, observed)
 
     def test_unhealthy_survivor_refuses_before_target_mutation(self) -> None:
         adapter = LocalTenantAdapter()

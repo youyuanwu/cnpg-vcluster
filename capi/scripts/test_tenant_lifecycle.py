@@ -105,6 +105,17 @@ def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
 
         _create(root, specs["tenant-c"])
         target_before = _snapshot(root, config, "tenant-c")
+        try:
+            execute(
+                root,
+                ["delete", "local", "tenant-c", "wrong-confirmation"],
+            )
+        except RuntimeError:
+            pass
+        else:
+            raise RuntimeError("invalid deletion confirmation was accepted")
+        if _snapshot(root, config, "tenant-c") != target_before:
+            raise RuntimeError("invalid confirmation changed the target")
         _drift_kube_proxy(root, config, "tenant-a")
         try:
             _delete(root, "tenant-c")

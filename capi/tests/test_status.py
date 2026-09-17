@@ -74,6 +74,18 @@ class StatusTests(unittest.TestCase):
                 1001.0,
                 "degraded",
             ),
+            (
+                "failed-probe",
+                {
+                    **base,
+                    "functional": {
+                        **base["functional"],
+                        "database": False,
+                    },
+                },
+                1001.0,
+                "degraded",
+            ),
         )
         for name, evidence, now, expected in cases:
             with self.subTest(name=name):
