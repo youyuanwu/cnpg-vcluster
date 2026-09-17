@@ -8,6 +8,8 @@ from pathlib import Path
 from scripts.lib.files import (
     IntegrityError,
     has_owner_only_permissions,
+    private_file_exists,
+    read_private_file,
     verify_sha256,
     write_private_file,
 )
@@ -101,3 +103,17 @@ class FileTests(unittest.TestCase):
                     runtime / "evidence" / "secret",
                     "value\n",
                 )
+
+    def test_private_read_and_exists_reject_symlinked_runtime_parent(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            target = root / "target"
+            target.mkdir(mode=0o700)
+            secret = target / "secret"
+            secret.write_text("value\n", encoding="utf-8")
+            secret.chmod(0o600)
+            (root / ".runtime").symlink_to(target, target_is_directory=True)
+            with self.assertRaises(IntegrityError):
+                read_private_file(root / ".runtime" / "secret")
+            with self.assertRaises(IntegrityError):
+                private_file_exists(root / ".runtime" / "secret")

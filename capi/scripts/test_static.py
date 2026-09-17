@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.lib.config import load_configuration
+from scripts.lib.config import load_configuration, load_env_file
 
 
 EXPECTED_RECIPES = {
@@ -26,6 +26,9 @@ EXPECTED_RECIPES = {
     "azure-install-addons",
     "azure-status",
     "azure-destroy",
+    "tenant-create",
+    "tenant-status",
+    "tenant-delete",
     "create-management",
     "dev-bootstrap",
     "dev-tenant",
@@ -118,6 +121,20 @@ def check_configuration() -> None:
         check(f"{prefix}_SHA256" in config, f"{key} lacks SHA-256")
     check(config["CAPI_CONTRACT"] == "v1beta2", "CAPI contract must be v1beta2")
     check(config["KAMAJI_CAPI_CONTRACT"] == "v1beta2", "Kamaji provider contract must be v1beta2")
+    from scripts.lib.tenant_spec import load_tenant_spec
+
+    supported_versions = {
+        "local": config["KUBERNETES_VERSION"],
+        "azure": load_env_file(
+            ROOT / "config" / "azure" / "defaults.env"
+        )["AZURE_TENANT_KUBERNETES_VERSION"],
+    }
+    for profile in ("local", "azure"):
+        load_tenant_spec(
+            ROOT / "config" / "tenants" / "examples" / f"{profile}.json",
+            expected_profile=profile,
+            supported_versions=supported_versions,
+        )
     for key in (
         "VIP_POOL_START_OFFSET_FROM_BROADCAST",
         "VIP_POOL_END_OFFSET_FROM_BROADCAST",
