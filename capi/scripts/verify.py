@@ -8,6 +8,7 @@ import re
 import socket
 import subprocess
 import time
+from itertools import combinations, permutations
 from pathlib import Path
 
 from scripts.cnpg import (
@@ -210,8 +211,13 @@ def _storage_isolation(root: Path, config: dict[str, str], tenants, workers) -> 
     ):
         raise RuntimeError("tenant storage volume identities overlap")
     for tenant in tenants:
-        other = next(item for item in tenants if item.name != tenant.name)
+        peers = [item for item in tenants if item.name != tenant.name]
         for worker in workers[tenant.name]:
+            peer_checks = " ".join(
+                f"test ! -e '{config['SPIKE_STORAGE_CONTAINER_PATH']}/"
+                f"isolation/{peer.name}';"
+                for peer in peers
+            )
             result = run(
                 [
                     "docker",
@@ -221,14 +227,30 @@ def _storage_isolation(root: Path, config: dict[str, str], tenants, workers) -> 
                     "-ec",
                     f"test \"$(cat '{config['SPIKE_STORAGE_CONTAINER_PATH']}/"
                     f"isolation/{tenant.name}')\" = '{tenant.name}'; "
-                    f"test ! -e '{config['SPIKE_STORAGE_CONTAINER_PATH']}/"
-                    f"isolation/{other.name}'",
+                    f"{peer_checks}",
                 ],
                 timeout=30,
                 check=False,
             )
             if result.returncode != 0:
                 raise RuntimeError(f"cross-tenant storage isolation failed: {worker}")
+
+
+def _ordered_tenant_pairs(tenants):
+    return tuple(permutations(tenants, 2))
+
+
+def _verify_database_disruption(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+) -> None:
+    if int(getattr(tenant, "database_count", 3)) < 2:
+        return
+    _replica_restart(root, config, tenant)
+    _verify_marker(root, config, tenant)
+    _primary_failover(root, config, tenant)
+    _verify_marker(root, config, tenant)
 
 
 def _reject_kubernetes_credential(
@@ -478,13 +500,16 @@ def verify(root: Path, config: dict[str, str]) -> dict[str, object]:
             values = [identity[key] for identity in identities.values()]
             if len(values) != len(set(values)):
                 raise RuntimeError(f"tenant identity overlap: {key}")
-        if set(workers[tenants[0].name]) & set(workers[tenants[1].name]):
-            raise RuntimeError("tenant worker sets overlap")
+        for left, right in combinations(tenants, 2):
+            if set(workers[left.name]) & set(workers[right.name]):
+                raise RuntimeError(
+                    f"tenant worker sets overlap: {left.name}, {right.name}"
+                )
         if len(set(passwords.values())) != len(passwords):
             raise RuntimeError("tenant PostgreSQL credentials are identical")
         _storage_isolation(root, config, tenants, workers)
         _management_absence(config, client, tenants, workers)
-        for source, target in ((tenants[0], tenants[1]), (tenants[1], tenants[0])):
+        for source, target in _ordered_tenant_pairs(tenants):
             _reject_kubernetes_credential(root, config, source, target)
             _reject_postgres_credential(
                 root, config, source, target, passwords[source.name]
@@ -508,10 +533,7 @@ def verify(root: Path, config: dict[str, str]) -> dict[str, object]:
                     f"CNPG storage changed across Machine replacement: {tenant.name}"
                 )
             _verify_marker(root, config, tenant)
-            _replica_restart(root, config, tenant)
-            _verify_marker(root, config, tenant)
-            _primary_failover(root, config, tenant)
-            _verify_marker(root, config, tenant)
+            _verify_database_disruption(root, config, tenant)
         final_snapshots = {
             tenant.name: stable_tenant_snapshot(root, config, client, tenant)
             for tenant in tenants
@@ -527,7 +549,7 @@ def verify(root: Path, config: dict[str, str]) -> dict[str, object]:
             "storage": storage,
         }
         write_private_file(success, json.dumps(evidence, sort_keys=True) + "\n")
-        print("two-tenant isolation checks passed")
+        print(f"{len(tenants)}-tenant isolation checks passed")
         return evidence
     except Exception as exc:
         success.unlink(missing_ok=True)

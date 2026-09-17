@@ -141,6 +141,17 @@ class ManagementTests(unittest.TestCase):
                 '"allocations":{}}\n',
                 "invalid",
             ),
+            (
+                '{"schema":1,"networkId":"network-id",'
+                '"allocations":{"tenant-c":"172.18.255.221",'
+                '"tenant-d":"172.18.255.221"}}\n',
+                "identity changed",
+            ),
+            (
+                '{"schema":1,"networkId":"network-id",'
+                '"allocations":{"tenant-c":"172.18.255.220"}}\n',
+                "identity changed",
+            ),
         )
         for content, error in records:
             with self.subTest(error=error):
