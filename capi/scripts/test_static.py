@@ -122,6 +122,7 @@ def check_configuration() -> None:
     check(config["CAPI_CONTRACT"] == "v1beta2", "CAPI contract must be v1beta2")
     check(config["KAMAJI_CAPI_CONTRACT"] == "v1beta2", "Kamaji provider contract must be v1beta2")
     from scripts.lib.tenant_spec import load_tenant_spec
+    from scripts.lib.tenants import load_local_tenant_spec
 
     supported_versions = {
         "local": config["KUBERNETES_VERSION"],
@@ -135,6 +136,12 @@ def check_configuration() -> None:
             expected_profile=profile,
             supported_versions=supported_versions,
         )
+    load_local_tenant_spec(
+        ROOT,
+        ROOT / "config" / "tenants" / "examples" / "local.json",
+        config,
+        include_management_network=False,
+    )
     for key in (
         "VIP_POOL_START_OFFSET_FROM_BROADCAST",
         "VIP_POOL_END_OFFSET_FROM_BROADCAST",

@@ -96,6 +96,76 @@ class ManagementTests(unittest.TestCase):
                 with self.assertRaisesRegex(IntegrityError, "invalid"):
                     allocate_tenant_endpoint(root, {}, "tenant-c")
 
+    def test_tenant_endpoint_allocation_rejects_exhaustion(self) -> None:
+        network = {
+            "network_id": "network-id",
+            "pool_start": "172.18.255.220",
+            "pool_end": "172.18.255.221",
+            "slots": {
+                "spike": "172.18.255.220",
+                "tenant-a": "172.18.255.221",
+            },
+        }
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            with patch(
+                "scripts.lib.management.validate_management_network",
+                return_value=network,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "exhausted"):
+                    allocate_tenant_endpoint(root, {}, "tenant-c")
+
+    def test_tenant_endpoint_record_rejects_duplicates_and_ipv6_unchanged(
+        self,
+    ) -> None:
+        network = {
+            "network_id": "network-id",
+            "pool_start": "172.18.255.220",
+            "pool_end": "172.18.255.225",
+            "slots": {"spike": "172.18.255.220"},
+        }
+        records = (
+            (
+                '{"schema":1,"networkId":"network-id",'
+                '"allocations":{"tenant-c":"172.18.255.221",'
+                '"tenant-c":"172.18.255.222"}}\n',
+                "duplicate",
+            ),
+            (
+                '{"schema":1,"networkId":"network-id",'
+                '"allocations":{"tenant-c":"2001:db8::1"}}\n',
+                "IPv4",
+            ),
+            (
+                '{"schema":true,"networkId":"network-id",'
+                '"allocations":{}}\n',
+                "invalid",
+            ),
+        )
+        for content, error in records:
+            with self.subTest(error=error):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    record = (
+                        root
+                        / ".runtime"
+                        / "management"
+                        / "tenant-endpoints.json"
+                    )
+                    record.parent.mkdir(parents=True)
+                    for parent in (root / ".runtime", record.parent):
+                        parent.chmod(0o700)
+                    record.write_text(content, encoding="utf-8")
+                    record.chmod(0o600)
+                    before = record.read_bytes()
+                    with patch(
+                        "scripts.lib.management.validate_management_network",
+                        return_value=network,
+                    ):
+                        with self.assertRaisesRegex(IntegrityError, error):
+                            allocate_tenant_endpoint(root, {}, "tenant-d")
+                    self.assertEqual(record.read_bytes(), before)
+
     def test_management_server_version_must_match_exactly(self) -> None:
         client = type(
             "Client",

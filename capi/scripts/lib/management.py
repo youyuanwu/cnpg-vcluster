@@ -42,6 +42,27 @@ def _tenant_endpoint_path(root: Path) -> Path:
     return root / ".runtime" / "management" / "tenant-endpoints.json"
 
 
+def _strict_json_object(data: bytes, description: str) -> dict[str, object]:
+    def reject_duplicates(pairs):
+        result = {}
+        for key, value in pairs:
+            if key in result:
+                raise IntegrityError(f"{description} contains duplicate key: {key}")
+            result[key] = value
+        return result
+
+    try:
+        payload = json.loads(
+            data.decode("utf-8"),
+            object_pairs_hook=reject_duplicates,
+        )
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise IntegrityError(f"{description} is malformed") from exc
+    if not isinstance(payload, dict):
+        raise IntegrityError(f"{description} must be a JSON object")
+    return payload
+
+
 def _kubeconfig_path(root: Path) -> Path:
     return root / ".runtime" / "management" / "kubeconfig"
 
@@ -277,13 +298,13 @@ def _load_tenant_endpoints(
     path = _tenant_endpoint_path(root)
     if not private_file_exists(path):
         return {}
-    try:
-        payload = json.loads(read_private_file(path).decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise IntegrityError("tenant endpoint allocation record is malformed") from exc
+    payload = _strict_json_object(
+        read_private_file(path),
+        "tenant endpoint allocation record",
+    )
     if (
-        not isinstance(payload, dict)
-        or set(payload) != {"schema", "networkId", "allocations"}
+        set(payload) != {"schema", "networkId", "allocations"}
+        or isinstance(payload.get("schema"), bool)
         or payload.get("schema") != 1
         or payload.get("networkId") != network["network_id"]
         or not isinstance(payload.get("allocations"), dict)
@@ -308,6 +329,11 @@ def _load_tenant_endpoints(
         ]
     except ValueError as exc:
         raise IntegrityError("tenant endpoint allocation address is invalid") from exc
+    if any(
+        not isinstance(address, ipaddress.IPv4Address)
+        for address in addresses
+    ):
+        raise IntegrityError("tenant endpoint allocations must be IPv4")
     if (
         len(addresses) != len(set(addresses))
         or any(address < start or address > end for address in addresses)

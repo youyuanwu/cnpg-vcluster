@@ -47,6 +47,7 @@ class TenantTests(unittest.TestCase):
                 encoding="utf-8",
             )
             spec = load_local_tenant_spec(
+                root,
                 path,
                 {"KUBERNETES_VERSION": "v1.36.4"},
             )
@@ -81,11 +82,50 @@ class TenantTests(unittest.TestCase):
             )
             with self.assertRaisesRegex(TenantSpecError, "TENANT_A_POD_CIDR"):
                 load_local_tenant_spec(
+                    Path(temporary),
                     path,
                     {
                         "KUBERNETES_VERSION": "v1.36.4",
                         "TENANT_A_POD_CIDR": "10.70.0.0/16",
                     },
+                )
+
+    def test_local_tenant_spec_rejects_management_subnet_overlap(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            path = root / "tenant.json"
+            path.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "profile": "local",
+                        "name": "tenant-c",
+                        "kubernetesVersion": "1.36.4",
+                        "workers": 1,
+                        "podCIDR": "172.18.0.0/16",
+                        "serviceCIDR": "10.143.0.0/16",
+                        "databaseCount": 1,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            network = root / ".runtime" / "management" / "network.json"
+            network.parent.mkdir(parents=True)
+            for parent in (root / ".runtime", network.parent):
+                parent.chmod(0o700)
+            network.write_text(
+                json.dumps({"subnet": "172.18.0.0/16"}),
+                encoding="utf-8",
+            )
+            network.chmod(0o600)
+            with self.assertRaisesRegex(
+                TenantSpecError,
+                "management Docker subnet",
+            ):
+                load_local_tenant_spec(
+                    root,
+                    path,
+                    {"KUBERNETES_VERSION": "v1.36.4"},
                 )
 
     def test_live_worker_templates_match_exact_preload_contract(self) -> None:

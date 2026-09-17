@@ -16,81 +16,87 @@ from scripts.status import (
 
 class StatusTests(unittest.TestCase):
     def test_cnpg_status_uses_requested_database_count(self) -> None:
-        tenant = type(
-            "Tenant",
-            (),
-            {
-                "name": "tenant-c",
-                "cnpg_cluster": "tenant-c-postgres",
-                "database_count": 3,
-            },
-        )()
-
-        def kubectl(*arguments, **_kwargs):
-            command = " ".join(str(item) for item in arguments)
-            if "cluster/tenant-c-postgres" in command:
-                payload = {
-                    "status": {
-                        "phase": "Cluster in healthy state",
-                        "currentPrimary": "tenant-c-postgres-1",
-                    }
-                }
-            elif "deployment/cnpg-controller-manager" in command:
-                payload = {
-                    "spec": {
-                        "replicas": 1,
-                        "template": {
-                            "spec": {
-                                "containers": [{"image": "cnpg@example"}]
-                            }
-                        },
-                    },
-                    "status": {"availableReplicas": 1},
-                }
-            elif " get pods " in f" {command} ":
-                payload = {
-                    "items": [
-                        {
-                            "metadata": {
-                                "name": f"tenant-c-postgres-{ordinal}"
-                            },
-                            "spec": {"nodeName": "worker-a"},
-                            "status": {
-                                "conditions": [
-                                    {"type": "Ready", "status": "True"}
-                                ]
-                            },
-                        }
-                        for ordinal in (1, 2, 3)
-                    ]
-                }
-            else:
-                payload = {
-                    "items": [
-                        {
-                            "metadata": {
-                                "name": f"tenant-c-postgres-{ordinal}"
-                            },
-                            "spec": {"volumeName": f"pv-{ordinal}"},
-                            "status": {"phase": "Bound"},
-                        }
-                        for ordinal in (1, 2, 3)
-                    ]
-                }
-            return CompletedProcess(arguments, 0, stdout=json.dumps(payload))
-
-        with patch("scripts.status._tenant_kubectl", side_effect=kubectl):
-            result = _cnpg_layer_status(
-                Path("."),
+        def collect(expected: int, observed: int):
+            tenant = type(
+                "Tenant",
+                (),
                 {
-                    "DATABASE_NAMESPACE": "database",
-                    "CNPG_NAMESPACE": "cnpg-system",
-                    "CNPG_CONTROLLER_IMAGE": "cnpg@example",
+                    "name": "tenant-c",
+                    "cnpg_cluster": "tenant-c-postgres",
+                    "database_count": expected,
                 },
-                tenant,
-            )
-        self.assertTrue(result["ready"])
-        self.assertEqual(result["nodes"], ["worker-a"])
+            )()
+
+            def kubectl(*arguments, **_kwargs):
+                command = " ".join(str(item) for item in arguments)
+                if "cluster/tenant-c-postgres" in command:
+                    payload = {
+                        "status": {
+                            "phase": "Cluster in healthy state",
+                            "currentPrimary": "tenant-c-postgres-1",
+                        }
+                    }
+                elif "deployment/cnpg-controller-manager" in command:
+                    payload = {
+                        "spec": {
+                            "replicas": 1,
+                            "template": {
+                                "spec": {
+                                    "containers": [{"image": "cnpg@example"}]
+                                }
+                            },
+                        },
+                        "status": {"availableReplicas": 1},
+                    }
+                elif " get pods " in f" {command} ":
+                    payload = {
+                        "items": [
+                            {
+                                "metadata": {
+                                    "name": f"tenant-c-postgres-{ordinal}"
+                                },
+                                "spec": {"nodeName": "worker-a"},
+                                "status": {
+                                    "conditions": [
+                                        {"type": "Ready", "status": "True"}
+                                    ]
+                                },
+                            }
+                            for ordinal in range(1, observed + 1)
+                        ]
+                    }
+                else:
+                    payload = {
+                        "items": [
+                            {
+                                "metadata": {
+                                    "name": f"tenant-c-postgres-{ordinal}"
+                                },
+                                "spec": {"volumeName": f"pv-{ordinal}"},
+                                "status": {"phase": "Bound"},
+                            }
+                            for ordinal in range(1, observed + 1)
+                        ]
+                    }
+                return CompletedProcess(arguments, 0, stdout=json.dumps(payload))
+
+            with patch("scripts.status._tenant_kubectl", side_effect=kubectl):
+                return _cnpg_layer_status(
+                    Path("."),
+                    {
+                        "DATABASE_NAMESPACE": "database",
+                        "CNPG_NAMESPACE": "cnpg-system",
+                        "CNPG_CONTROLLER_IMAGE": "cnpg@example",
+                    },
+                    tenant,
+                )
+
+        one = collect(1, 1)
+        self.assertTrue(one["ready"])
+        three = collect(3, 3)
+        self.assertTrue(three["ready"])
+        self.assertEqual(three["nodes"], ["worker-a"])
+        self.assertFalse(collect(3, 2)["ready"])
 
     def test_management_health_requires_complete_exact_inventory(self) -> None:
         result = {

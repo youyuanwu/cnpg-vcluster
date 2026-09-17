@@ -12,7 +12,13 @@ from pathlib import Path
 
 from .conditions import condition_true
 from .config import parse_duration
-from .files import IntegrityError, ensure_private_dir, write_private_file
+from .files import (
+    IntegrityError,
+    ensure_private_dir,
+    private_file_exists,
+    read_private_file,
+    write_private_file,
+)
 from .kube import ManagementClient, wait_for
 from .process import run
 from .images import WORKER_IMAGE_KEYS, verify_container_images
@@ -334,10 +340,12 @@ def configured_tenants(root: Path, config: dict[str, str]) -> list[Tenant]:
 
 
 def load_local_tenant_spec(
+    root: Path,
     path: Path,
     config: dict[str, str],
     *,
     existing_specs: tuple[TenantSpec, ...] = (),
+    include_management_network: bool = True,
 ) -> TenantSpec:
     spec = load_tenant_spec(
         path,
@@ -348,6 +356,23 @@ def load_local_tenant_spec(
     for key, value in config.items():
         if key.endswith(("_POD_CIDR", "_SERVICE_CIDR")):
             networks[key] = ipaddress.ip_network(value)
+    management_network = root / ".runtime" / "management" / "network.json"
+    if include_management_network and private_file_exists(management_network):
+        try:
+            network_payload = json.loads(
+                read_private_file(management_network).decode("utf-8")
+            )
+            networks["management Docker subnet"] = ipaddress.ip_network(
+                network_payload["subnet"]
+            )
+        except (
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            KeyError,
+            TypeError,
+            ValueError,
+        ) as exc:
+            raise IntegrityError("management network record is invalid") from exc
     for existing in existing_specs:
         if existing.name == spec.name:
             if existing.sha256() != spec.sha256():
