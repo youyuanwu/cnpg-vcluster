@@ -22,10 +22,7 @@ EXPECTED_RECIPES = {
     "azure-preflight",
     "azure-create-foundation",
     "azure-create-management",
-    "azure-create-tenant-control-plane",
-    "azure-create-worker",
-    "azure-install-addons",
-    "azure-status",
+    "azure-foundation-status",
     "azure-destroy",
     "tenant-create",
     "tenant-status",
@@ -126,7 +123,7 @@ def check_configuration() -> None:
         "local": config["KUBERNETES_VERSION"],
         "azure": load_env_file(
             ROOT / "config" / "azure" / "defaults.env"
-        )["AZURE_TENANT_KUBERNETES_VERSION"],
+        )["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
     }
     for profile in ("local", "azure"):
         load_tenant_spec(

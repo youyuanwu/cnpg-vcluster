@@ -17,22 +17,26 @@ The proposed minimal Azure experiment is documented in
 deliberately prioritizes a one-tenant AKS, Kamaji, CAPZ, VMSS, and CNPG proof
 over production infrastructure and operational hardening.
 
-The implemented Azure first milestone uses the ignored owner-only
-`config/azure.local.env` selectors and these commands:
+Azure foundation operations use the ignored owner-only
+`config/azure.local.env` selectors. Tenant creation and status use the same
+explicit tenant specification interface as the local profile:
 
 ```bash
 just azure-preflight
 just azure-create-foundation
 just azure-create-management
-just azure-create-tenant-control-plane
-just azure-create-worker
-just azure-install-addons
-just azure-status
+just azure-foundation-status
+just tenant-create azure config/tenants/examples/azure.json
+just tenant-status azure tenant-example
 ```
 
-This leaves one `Standard_B2s` VMSS worker Ready in the Kamaji tenant. The
-Azure resources remain billable until `just azure-destroy` starts deletion of
-the exact recorded experiment resource group.
+The generic create operation journals and records the tenant control plane,
+CAPZ worker pool, Azure resource identities, add-ons, and Ready evidence under
+owner-only tenant-keyed runtime paths. Pre-cutover Azure foundation inventory
+is rejected and requires a clean redeploy. Targeted Azure tenant deletion is
+implemented and live-validated in the next lifecycle phase. Azure resources
+remain billable until `just azure-destroy` starts deletion of the exact
+recorded experiment resource group.
 
 Kamaji uses the public `26.8.6-edge` source release. The edge channel is
 experimental, but it requires no account, activation key, or paid artifact.

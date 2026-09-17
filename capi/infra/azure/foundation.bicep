@@ -181,3 +181,5 @@ output identityPrincipalId string = identity.properties.principalId
 output tenantId string = identity.properties.tenantId
 output roleAssignmentId string = contributor.id
 output aksRoleAssignmentId string = aksContributor.id
+output capzFederationId string = capzFederation.id
+output asoFederationId string = asoFederation.id

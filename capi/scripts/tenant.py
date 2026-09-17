@@ -87,7 +87,7 @@ def supported_versions(root: Path) -> dict[str, str]:
     azure = load_env_file(root / "config" / "azure" / "defaults.env")
     return {
         "local": local["KUBERNETES_VERSION"],
-        "azure": azure["AZURE_TENANT_KUBERNETES_VERSION"],
+        "azure": azure["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
     }
 
 
@@ -463,10 +463,12 @@ def execute(
     adapters: Mapping[str, TenantAdapter] | None = None,
 ) -> int:
     if adapters is None:
+        from scripts.azure import AzureTenantAdapter
         from scripts.local_tenant import LocalTenantAdapter
 
         available: Mapping[str, TenantAdapter] = {
             "local": LocalTenantAdapter(),
+            "azure": AzureTenantAdapter(),
         }
     else:
         available = adapters

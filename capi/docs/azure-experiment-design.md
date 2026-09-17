@@ -255,10 +255,13 @@ Bicep, Python, or `just` recipes. Configuration is split into:
 
 | File or source | Contents | Tracked |
 |---|---|---|
-| `config/azure/defaults.env` | SKUs, node counts, CIDRs, timeouts, and naming patterns that are safe to share. | Yes |
+| `config/azure/defaults.env` | Foundation sizing/network defaults plus supported tenant version, worker SKU, component versions, and timeouts. | Yes |
 | `config/azure.local.env` | Subscription ID, location, and operator-selected resource prefix. | No |
+| Explicit Azure TenantSpec JSON | Tenant name, Kubernetes version, worker count, Pod CIDR, and Service CIDR. | Yes when stored as a non-secret example |
 | Active `az` login | Tenant identity and authentication tokens. | No |
-| `.runtime/azure/resources.json` | Resolved names, Azure resource IDs, deployment outputs, and configuration checksum. | No |
+| `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, deployment outputs, controller identities, and foundation checksum. | No |
+| `.runtime/azure/tenants/<tenant>/` | Generated tenant manifests, endpoint, and kubeconfig. | No |
+| `.runtime/lifecycle/azure/<tenant>/` | Tenant operation journal, exact identity record, Ready evidence, and timing evidence. | No |
 
 The local file contains only non-secret selectors:
 
@@ -273,14 +276,16 @@ credential store; no client secret or access token is copied into the
 repository. The tenant ID is read from the active `az account` rather than
 duplicated in the local file.
 
-All names are deterministically derived directly from `AZURE_PREFIX`:
+Foundation names are deterministically derived from `AZURE_PREFIX`; tenant
+names are derived from the explicit TenantSpec:
 
 ```text
 resource group: <prefix>-rg
 AKS:            <prefix>-mgmt
 VNet:           <prefix>-vnet
 identity:       <prefix>-identity
-tenant cluster: <prefix>-tenant
+tenant cluster: <spec.name>
+worker pool:    <spec.name>-worker
 ```
 
 Preflight validates the prefix character and length constraints, verifies
@@ -295,13 +300,15 @@ receive an explicit uniqueness component rather than adding a suffix to every
 resource.
 
 After Bicep deployment, its outputs and the exact IDs of the resource group,
-AKS cluster, AKS-managed node resource group, VNet, subnets, identity, and
-role assignment are atomically recorded in `.runtime/azure/resources.json`.
+AKS cluster, AKS-managed node resource group, VNet, subnets, identity, role
+assignments, and federated credentials are atomically recorded in
+`.runtime/azure/resources.json`. Controller UIDs are added after management
+installation.
 Status and cleanup use these exact IDs rather than rediscovering resources by
-a broad name or tag query. A changed subscription, prefix, location,
-defaults checksum, or Bicep deployment identity blocks mutation until the
-operator returns to the recorded configuration or explicitly destroys the
-old experiment.
+a broad name or tag query. The inventory schema and checksum cover only
+foundation-owned inputs. A pre-cutover schema or changed subscription, prefix,
+location, or foundation checksum is rejected and requires a clean foundation
+redeploy; it is never migrated or adopted.
 
 The operator can keep multiple experiments by using separate working copies
 or explicitly selected local parameter files. Commands never infer a
@@ -423,6 +430,12 @@ version-pinned upstream or CAPZ-provided manifests. Their experiment values:
 - set `configureCloudRoutes=false`, because Calico VXLAN provides Pod routing;
 - run cloud-node-manager on the tenant worker.
 
+Tenant creation also installs a marked, tenant-owned status-probe Deployment
+in the management cluster. It keeps the tenant kubeconfig mounted and provides
+an in-VNet `kubectl` execution point, allowing generic status to inspect Nodes
+and add-ons without making the private tenant API public or creating resources
+during a status request.
+
 The Pod, Service, VNet, and AKS address ranges must not overlap. The tenant
 subnet must reach the Kamaji API port, and VMSS workers must be able to
 exchange VXLAN traffic on UDP 4789.
@@ -453,12 +466,15 @@ The proposed interface remains `just`:
 | Command | Purpose |
 |---|---|
 | `just azure-preflight` | Verify Azure CLI login, subscription, required providers, tools, version pins, and configuration. |
-| `just azure-create-management` | Create the resource group, VNet, identity, AKS, and controller stack. |
-| `just azure-create-tenant` | Create one Kamaji control plane and one VMSS-backed worker pool, then install tenant add-ons and CNPG. |
-| `just azure-status` | Report management, control-plane, VMSS, Node, CSI, and CNPG state. |
-| `just azure-verify` | Prove worker readiness, scaling, PostgreSQL health, replacement, and persistence. |
-| `just azure-destroy-tenant` | Delete the CAPI tenant and wait for CAPZ-owned Azure resources to disappear. |
-| `just azure-destroy` | Delete the tenant, management cluster, and final experiment resource group. |
+| `just azure-create-foundation` | Create the resource group, VNet, identity, and AKS foundation. |
+| `just azure-create-management` | Install the CAPI, CAPZ, Kamaji, and ASO controller stack. |
+| `just azure-foundation-status` | Report only shared Azure foundation health. |
+| `just tenant-create azure <spec.json>` | Create the explicitly selected Kamaji control plane and VMSS-backed worker pool, install tenant add-ons, and persist exact tenant identities. |
+| `just tenant-status azure <tenant>` | Report one tenant through the provider-neutral status envelope, separately from foundation health. |
+| `just azure-destroy` | Delete the entire recorded Azure foundation resource group. |
+
+Targeted Azure tenant deletion and its live create-delete-recreate gate are
+added in the next lifecycle phase.
 
 The implementation should reuse the repository's `just` interface, Python
 validation helpers, fail-closed command execution, immutable version
@@ -483,7 +499,7 @@ from invocation through each command's readiness gate.
 | Create the Kamaji tenant control plane | 7m 59s |
 | Create the VMSS worker through its kubeadm join marker | 6m 55s |
 | Install the Azure cloud provider and Calico; wait for Node Ready | 7m 26s |
-| Final `azure-status` | 2.67s |
+| Final pre-refactor `azure-status` | 2.67s |
 | **Reconstructed clean buildout, excluding cleanup and final status** | **50m 42s** |
 
 Each create or install command also runs Azure preflight internally. The

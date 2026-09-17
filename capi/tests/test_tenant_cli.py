@@ -97,7 +97,7 @@ class TenantCliTests(unittest.TestCase):
             encoding="utf-8",
         )
         (root / "config" / "azure" / "defaults.env").write_text(
-            "AZURE_TENANT_KUBERNETES_VERSION=1.32.13\n",
+            "AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION=1.32.13\n",
             encoding="utf-8",
         )
         spec_path = root / "tenant.json"
@@ -1088,6 +1088,23 @@ class TenantCliTests(unittest.TestCase):
             order[-3:],
             ["exit-tools", "exit-profile", "exit-e2e"],
         )
+
+    def test_default_dispatch_includes_azure_adapter(self) -> None:
+        _, root, _ = self.make_root()
+        adapter = FakeAdapter()
+        adapter.status_value = TenantStatus(
+            profile="azure",
+            tenant="tenant-c",
+            classification="absent",
+            foundation_healthy=True,
+        )
+        output = io.StringIO()
+        with (
+            patch("scripts.azure.AzureTenantAdapter", return_value=adapter),
+            redirect_stdout(output),
+        ):
+            self.assertEqual(execute(root, ["status", "azure", "tenant-c"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["profile"], "azure")
 
 
 if __name__ == "__main__":

@@ -64,3 +64,5 @@ output identityPrincipalId string = foundation.outputs.identityPrincipalId
 output tenantId string = foundation.outputs.tenantId
 output roleAssignmentId string = foundation.outputs.roleAssignmentId
 output aksRoleAssignmentId string = foundation.outputs.aksRoleAssignmentId
+output capzFederationId string = foundation.outputs.capzFederationId
+output asoFederationId string = foundation.outputs.asoFederationId
