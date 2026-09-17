@@ -1110,6 +1110,51 @@ class AzurePhaseFourTests(unittest.TestCase):
             status = adapter.status(root, "missing")
         self.assertEqual(status.classification, "ownership-invalid")
 
+    def test_management_get_only_accepts_kubernetes_object_not_found(self):
+        from scripts.azure import _get_management_resource
+
+        failures = (
+            "Unable to connect to the server: getting credentials: "
+            "exec: executable kubelogin not found",
+            "dial tcp: lookup host: no such host",
+            "transport connection failed: host not found",
+            "Error from server (Forbidden): forbidden",
+        )
+        for stderr in failures:
+            with (
+                self.subTest(stderr=stderr),
+                patch(
+                    "scripts.azure._kubectl",
+                    return_value=subprocess.CompletedProcess(
+                        [], 1, stdout="", stderr=stderr
+                    ),
+                ),
+                self.assertRaisesRegex(RuntimeError, "inspection failed"),
+            ):
+                _get_management_resource(
+                    self.make_root(),
+                    "tenant-c",
+                    "cluster/tenant-c",
+                )
+        with patch(
+            "scripts.azure._kubectl",
+            return_value=subprocess.CompletedProcess(
+                [],
+                1,
+                stdout="",
+                stderr=(
+                    'Error from server (NotFound): clusters "tenant-c" not found'
+                ),
+            ),
+        ):
+            self.assertIsNone(
+                _get_management_resource(
+                    self.make_root(),
+                    "tenant-c",
+                    "cluster/tenant-c",
+                )
+            )
+
     def test_ready_status_requires_matching_current_evidence_and_identities(self):
         root = self.make_root()
         config = load_azure_configuration(root)

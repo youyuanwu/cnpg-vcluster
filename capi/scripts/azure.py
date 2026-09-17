@@ -933,8 +933,7 @@ def _get_management_resource(
     )
     if response.returncode != 0:
         if re.search(
-            r"Error from server \(NotFound\):|"
-            r"\bnot found\b",
+            r"Error from server \(NotFound\):",
             response.stderr,
             re.IGNORECASE,
         ):
