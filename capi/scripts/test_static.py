@@ -290,6 +290,11 @@ def check_documentation() -> None:
             token in azure_design_flat,
             f"Azure design lacks documentation assertion: {token}",
         )
+    check(
+        "VMSS-backed tenant workers that run CloudNativePG"
+        not in azure_design_flat,
+        "Azure design claims unimplemented CloudNativePG behavior",
+    )
     for project in (
         "Cluster API",
         "Kamaji CAPI provider",

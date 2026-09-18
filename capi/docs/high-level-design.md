@@ -13,9 +13,10 @@ cluster; each tenant remains a Kamaji hosted control plane with
 CAPZ-managed Azure worker machines.
 
 The design accepts explicit tenant specifications for isolated tenant APIs,
-one to three exclusive workers, tenant-owned networking and storage, one to
-three PostgreSQL instances, idempotent create retry, targeted deletion, and
-deterministic cleanup.
+one to three exclusive workers, tenant-owned networking, idempotent create
+retry, targeted deletion, and deterministic cleanup. The local profile also
+provides tenant-owned storage and one to three PostgreSQL instances; Azure
+storage and CloudNativePG remain future extensions.
 
 ## As-built topology
 

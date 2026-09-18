@@ -4,8 +4,8 @@
 
 This experiment extends the local Cluster API lab to Azure. It proves that an
 AKS management cluster can host Kamaji tenant control planes while Cluster API
-Provider Azure (CAPZ) creates VMSS-backed tenant workers that run
-CloudNativePG.
+Provider Azure (CAPZ) creates VMSS-backed tenant workers with tenant
+networking and cloud-provider integration, targeted deletion, and recreation.
 
 The design optimizes for a small, understandable experiment. It is not a
 production platform design. The lifecycle is tenant-keyed, while the live gate

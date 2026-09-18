@@ -40,8 +40,10 @@ owner-only tenant-keyed runtime paths. Targeted deletion verifies exact
 management UIDs and Azure resource IDs, lets CAPI/CAPZ delete the MachinePool
 and VMSS, proves the shared foundation is unchanged, and then removes tenant
 orchestration state. Pre-cutover Azure foundation inventory is rejected and
-requires a clean redeploy. Azure resources remain billable until targeted
-tenant deletion or `just azure-destroy` completes.
+requires a clean redeploy. Tenant Azure resources remain billable until
+targeted deletion removes the VMSS and related resources. The preserved
+AKS, VNet, identity, and other shared foundation resources remain billable
+until `just azure-destroy` completes.
 
 Kamaji uses the public `26.8.6-edge` source release. The edge channel is
 experimental, but it requires no account, activation key, or paid artifact.
