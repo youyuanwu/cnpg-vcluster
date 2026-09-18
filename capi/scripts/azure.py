@@ -7,6 +7,7 @@ import ipaddress
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
@@ -33,7 +34,7 @@ from scripts.lib.files import (
 from scripts.lib.locking import e2e_lock, profile_lock, profile_lock_exists, tools_lock
 from scripts.lib.management import _prepare_kamaji_chart
 from scripts.lib.process import run
-from scripts.lib.redaction import redact
+from scripts.lib.redaction import redact, redact_value
 from scripts.lib.tenant_runtime import (
     OperationJournal,
     TenantIdentity,
@@ -93,6 +94,52 @@ KNOWN_AZURE_TENANT_TYPES = frozenset(
     }
 )
 KNOWN_ASO_TENANT_KINDS = frozenset({"NatGateway", "PublicIPAddress"})
+KNOWN_CONTROLLER_MANAGEMENT_KINDS = frozenset(
+    {
+        "AzureCluster",
+        "AzureMachinePool",
+        "Certificate",
+        "CertificateRequest",
+        "Cluster",
+        "Endpoints",
+        "Issuer",
+        "KamajiControlPlane",
+        "KubeadmConfig",
+        "Machine",
+        "MachinePool",
+        "MachineSet",
+        "NatGateway",
+        "PublicIPAddress",
+        "PodDisruptionBudget",
+        "PersistentVolumeClaim",
+        "Role",
+        "RoleBinding",
+        "Secret",
+        "Service",
+        "StatefulSet",
+        "TenantControlPlane",
+    }
+)
+KNOWN_ORCHESTRATION_MANAGEMENT_KINDS = frozenset(
+    {
+        "AzureClusterIdentity",
+        "ConfigMap",
+        "Deployment",
+        "Job",
+        "Namespace",
+    }
+)
+KNOWN_NAMESPACE_CHILD_KINDS = frozenset(
+    {
+        "Endpoints",
+        "EndpointSlice",
+        "Event",
+        "Lease",
+        "Pod",
+        "ReplicaSet",
+        "ServiceAccount",
+    }
+)
 REMOVED_TENANT_CONFIG_KEYS = frozenset(
     {
         "AZURE_TENANT_KUBERNETES_VERSION",
@@ -102,6 +149,19 @@ REMOVED_TENANT_CONFIG_KEYS = frozenset(
         "AZURE_TENANT_DNS_SERVICE_IP",
     }
 )
+
+
+class AzureDeletionError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        management: Mapping[str, object],
+        azure: Mapping[str, object],
+    ) -> None:
+        super().__init__(message)
+        self.management = dict(management)
+        self.azure = dict(azure)
 
 
 def load_azure_configuration(root: Path) -> dict[str, str]:
@@ -2377,6 +2437,390 @@ def _tenant_spec_blockers(
     return tuple(blockers)
 
 
+def _expected_tenant_markers(
+    spec: TenantSpec,
+    identity: TenantIdentity | OperationJournal,
+) -> dict[str, str]:
+    marker_operation_id = identity.observed.get("markerOperationId")
+    if not marker_operation_id:
+        raise RuntimeError("Azure tenant marker operation identity is absent")
+    return {
+        "tenant": spec.name,
+        "profile": "azure",
+        "specificationSha256": spec.sha256(),
+        "foundationSha256": foundation_sha256(identity.foundation_identity),
+        "operationId": marker_operation_id,
+    }
+
+
+def _management_resource_specs(
+    spec: TenantSpec,
+) -> tuple[tuple[str, str | None, str, str], ...]:
+    selected = tenant_names(spec)
+    return (
+        ("namespaceUid", None, "Namespace", spec.namespace),
+        (
+            "azureClusterIdentityUid",
+            spec.namespace,
+            "AzureClusterIdentity",
+            selected["azureClusterIdentity"],
+        ),
+        ("clusterUid", spec.namespace, "Cluster", selected["cluster"]),
+        (
+            "azureClusterUid",
+            spec.namespace,
+            "AzureCluster",
+            selected["azureCluster"],
+        ),
+        (
+            "kamajiControlPlaneUid",
+            spec.namespace,
+            "KamajiControlPlane",
+            selected["controlPlane"],
+        ),
+        (
+            "kubeadmConfigUid",
+            spec.namespace,
+            "KubeadmConfig",
+            selected["pool"],
+        ),
+        (
+            "azureMachinePoolUid",
+            spec.namespace,
+            "AzureMachinePool",
+            selected["pool"],
+        ),
+        (
+            "machinePoolUid",
+            spec.namespace,
+            "MachinePool",
+            selected["pool"],
+        ),
+        (
+            "cloudValuesConfigMapUid",
+            spec.namespace,
+            "ConfigMap",
+            selected["cloudValues"],
+        ),
+        (
+            "networkValuesConfigMapUid",
+            spec.namespace,
+            "ConfigMap",
+            selected["networkValues"],
+        ),
+        (
+            "statusProbeDeploymentUid",
+            spec.namespace,
+            "Deployment",
+            selected["statusProbe"],
+        ),
+        ("addonJobUid", spec.namespace, "Job", selected["addonJob"]),
+    )
+
+
+def _management_resource_name(kind: str, name: str) -> str:
+    return f"{kind.lower()}/{name}"
+
+
+def _management_object_summary(payload: Mapping[str, object]) -> dict[str, object]:
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    owner_references = metadata.get("ownerReferences")
+    owner_references = owner_references if isinstance(owner_references, list) else []
+    return {
+        "apiVersion": str(payload.get("apiVersion", "")),
+        "kind": str(payload.get("kind", "")),
+        "name": str(metadata.get("name", "")),
+        "uid": str(metadata.get("uid", "")),
+        "resourceVersion": str(metadata.get("resourceVersion", "")),
+        "ownerUids": sorted(
+            str(reference["uid"])
+            for reference in owner_references
+            if isinstance(reference, dict)
+            and isinstance(reference.get("uid"), str)
+            and reference["uid"]
+        ),
+        "finalizers": sorted(
+            str(value)
+            for value in metadata.get("finalizers", [])
+            if isinstance(value, str)
+        ),
+        "deletionTimestamp": metadata.get("deletionTimestamp"),
+    }
+
+
+def _list_namespaced_management_objects(
+    root: Path,
+    namespace: str,
+) -> list[dict[str, object]]:
+    response = _kubectl(
+        root,
+        "api-resources",
+        "--namespaced=true",
+        "--verbs=list",
+        "-o",
+        "name",
+        check=False,
+    )
+    if response.returncode != 0:
+        raise RuntimeError(
+            "Azure management API discovery failed: " + response.stderr
+        )
+    resource_types = sorted(set(response.stdout.split()))
+    if not resource_types:
+        raise RuntimeError("Azure management API discovery returned no resources")
+    objects: list[dict[str, object]] = []
+    for resource_type in resource_types:
+        listed = _kubectl(
+            root,
+            "-n",
+            namespace,
+            "get",
+            resource_type,
+            "-o",
+            "json",
+            check=False,
+        )
+        if listed.returncode != 0:
+            raise RuntimeError(
+                f"Azure management inventory failed for {resource_type}: "
+                f"{listed.stderr}"
+            )
+        try:
+            payload = json.loads(listed.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Azure management inventory is invalid for {resource_type}"
+            ) from exc
+        items = payload.get("items") if isinstance(payload, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError(
+                f"Azure management inventory is invalid for {resource_type}"
+            )
+        for item in items:
+            if not isinstance(item, dict):
+                raise RuntimeError(
+                    f"Azure management inventory contains an invalid {resource_type}"
+                )
+            objects.append(item)
+    return objects
+
+
+def _classify_management_owned_resources(
+    spec: TenantSpec,
+    identity: TenantIdentity | OperationJournal,
+    namespace: Mapping[str, object] | None,
+    objects: Sequence[Mapping[str, object]],
+    *,
+    require_complete: bool,
+) -> dict[str, object]:
+    markers = _expected_tenant_markers(spec, identity)
+    expected = {
+        (kind, name): (key, namespace_name)
+        for key, namespace_name, kind, name in _management_resource_specs(spec)
+    }
+    records: list[dict[str, object]] = []
+    if namespace is not None:
+        records.append(_management_object_summary(namespace))
+    records.extend(_management_object_summary(item) for item in objects)
+    by_identity = {
+        (str(item["kind"]), str(item["name"])): item
+        for item in records
+        if item["kind"] and item["name"]
+    }
+    unknown = []
+    classified: dict[tuple[str, str], str] = {}
+    owned_uids = {
+        uid
+        for key, uid in identity.observed.items()
+        if key.endswith("Uid") and isinstance(uid, str) and uid
+    }
+    for resource_identity, (key, _) in expected.items():
+        item = by_identity.get(resource_identity)
+        recorded_uid = identity.observed.get(key)
+        if item is None:
+            if require_complete:
+                unknown.append(
+                    {
+                        "kind": resource_identity[0],
+                        "name": resource_identity[1],
+                        "reason": "recorded management resource is absent",
+                    }
+                )
+            continue
+        if not recorded_uid:
+            unknown.append(
+                {
+                    "kind": item["kind"],
+                    "name": item["name"],
+                    "reason": "recorded management UID is absent",
+                }
+            )
+            continue
+        if item["uid"] != recorded_uid:
+            unknown.append(
+                {
+                    "kind": item["kind"],
+                    "name": item["name"],
+                    "reason": "management UID changed",
+                }
+            )
+            continue
+        payload = namespace if resource_identity[0] == "Namespace" else next(
+            (
+                value
+                for value in objects
+                if value.get("kind") == resource_identity[0]
+                and value.get("metadata", {}).get("name") == resource_identity[1]
+            ),
+            None,
+        )
+        if payload is None:
+            raise RuntimeError("Azure management inventory changed during classification")
+        _require_markers(
+            payload,
+            markers,
+            _management_resource_name(resource_identity[0], resource_identity[1]),
+        )
+        classification = (
+            "orchestration"
+            if resource_identity[0] in KNOWN_ORCHESTRATION_MANAGEMENT_KINDS
+            else "controller"
+        )
+        classified[resource_identity] = classification
+        owned_uids.add(str(item["uid"]))
+    changed = True
+    while changed:
+        changed = False
+        for item in records:
+            identity_key = (str(item["kind"]), str(item["name"]))
+            if identity_key in classified:
+                continue
+            owner_uids = set(item["ownerUids"])
+            if owner_uids & owned_uids:
+                kind = str(item["kind"])
+                if kind in (
+                    KNOWN_CONTROLLER_MANAGEMENT_KINDS
+                    | KNOWN_ORCHESTRATION_MANAGEMENT_KINDS
+                    | KNOWN_NAMESPACE_CHILD_KINDS
+                ):
+                    classified[identity_key] = "controller"
+                    if item["uid"]:
+                        owned_uids.add(str(item["uid"]))
+                    changed = True
+    for item in records:
+        identity_key = (str(item["kind"]), str(item["name"]))
+        if identity_key in classified:
+            continue
+        kind = str(item["kind"])
+        name = str(item["name"])
+        payload = namespace if kind == "Namespace" else next(
+            (
+                value
+                for value in objects
+                if value.get("kind") == kind
+                and value.get("metadata", {}).get("name") == name
+            ),
+            None,
+        )
+        observed_markers = (
+            resource_lifecycle_markers(payload)
+            if isinstance(payload, Mapping)
+            else {}
+        )
+        if any(observed_markers.values()):
+            if observed_markers != markers:
+                reason = "foreign lifecycle markers"
+            elif kind not in (
+                KNOWN_CONTROLLER_MANAGEMENT_KINDS
+                | KNOWN_ORCHESTRATION_MANAGEMENT_KINDS
+            ):
+                reason = "unknown marked management kind"
+            else:
+                classified[identity_key] = (
+                    "orchestration"
+                    if kind in KNOWN_ORCHESTRATION_MANAGEMENT_KINDS
+                    else "controller"
+                )
+                continue
+        elif kind in KNOWN_NAMESPACE_CHILD_KINDS or (
+            kind == "ConfigMap" and name == "kube-root-ca.crt"
+        ) or (
+            kind == "Secret" and name.startswith("default-token-")
+        ):
+            classified[identity_key] = "namespace-child"
+            continue
+        else:
+            reason = "unclassifiable namespace resource"
+        unknown.append({"kind": kind, "name": name, "reason": reason})
+    result = {
+        "controller": sorted(
+            (
+                item
+                for item in records
+                if classified.get((str(item["kind"]), str(item["name"])))
+                == "controller"
+            ),
+            key=lambda item: (str(item["kind"]), str(item["name"])),
+        ),
+        "orchestration": sorted(
+            (
+                item
+                for item in records
+                if classified.get((str(item["kind"]), str(item["name"])))
+                == "orchestration"
+            ),
+            key=lambda item: (str(item["kind"]), str(item["name"])),
+        ),
+        "namespaceChildren": sorted(
+            (
+                item
+                for item in records
+                if classified.get((str(item["kind"]), str(item["name"])))
+                == "namespace-child"
+            ),
+            key=lambda item: (str(item["kind"]), str(item["name"])),
+        ),
+        "unknown": sorted(
+            unknown,
+            key=lambda item: json.dumps(item, sort_keys=True),
+        ),
+    }
+    if result["unknown"]:
+        raise RuntimeError(
+            "Azure tenant management ownership is unknown: "
+            + json.dumps(result["unknown"], sort_keys=True)
+        )
+    return result
+
+
+def discover_management_owned_resources(
+    root: Path,
+    spec: TenantSpec,
+    identity: TenantIdentity | OperationJournal,
+    *,
+    require_complete: bool,
+) -> dict[str, object]:
+    namespace = _get_management_resource(root, None, f"namespace/{spec.namespace}")
+    if namespace is None:
+        if require_complete:
+            raise RuntimeError("Azure tenant Namespace is absent")
+        return {
+            "controller": [],
+            "orchestration": [],
+            "namespaceChildren": [],
+            "unknown": [],
+        }
+    objects = _list_namespaced_management_objects(root, spec.namespace)
+    return _classify_management_owned_resources(
+        spec,
+        identity,
+        namespace,
+        objects,
+        require_complete=require_complete,
+    )
+
+
 def classify_azure_owned_resources(
     resources: Sequence[Mapping[str, object]],
     expected_markers: Mapping[str, str],
@@ -2489,17 +2933,12 @@ def discover_azure_owned_resources(
     config: Mapping[str, str],
     spec: TenantSpec,
     identity: TenantIdentity | OperationJournal,
+    *,
+    require_parents: bool = True,
+    require_azure_resources: bool = True,
+    verified_resource_ids: Sequence[str] = (),
 ) -> dict[str, object]:
-    marker_operation_id = identity.observed.get("markerOperationId")
-    if not marker_operation_id:
-        raise RuntimeError("Azure tenant marker operation identity is absent")
-    markers = {
-        "tenant": spec.name,
-        "profile": "azure",
-        "specificationSha256": spec.sha256(),
-        "foundationSha256": foundation_sha256(identity.foundation_identity),
-        "operationId": marker_operation_id,
-    }
+    markers = _expected_tenant_markers(spec, identity)
     selected = tenant_names(spec)
     for key, resource in (
         ("azureClusterUid", f"azurecluster/{selected['azureCluster']}"),
@@ -2507,7 +2946,9 @@ def discover_azure_owned_resources(
     ):
         parent = _get_management_resource(root, spec.namespace, resource)
         if parent is None:
-            raise RuntimeError(f"Azure tenant discovery parent is absent: {resource}")
+            if require_parents:
+                raise RuntimeError(f"Azure tenant discovery parent is absent: {resource}")
+            continue
         _require_markers(parent, markers, resource)
         if parent.get("metadata", {}).get("uid") != identity.observed.get(key):
             raise RuntimeError(f"Azure tenant discovery parent identity changed: {resource}")
@@ -2533,8 +2974,38 @@ def discover_azure_owned_resources(
         for key, value in identity.observed.items()
         if key == "vmssId"
     ]
-    verified_ids: list[str] = []
-    if parent_ids:
+    verified_ids = list(verified_resource_ids)
+    serialized_recorded = identity.observed.get("azureResources")
+    if serialized_recorded:
+        try:
+            recorded_payload = json.loads(serialized_recorded)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                "recorded Azure tenant resource inventory is invalid"
+            ) from exc
+        recorded_azure = (
+            recorded_payload.get("azure")
+            if isinstance(recorded_payload, dict)
+            else None
+        )
+        if not isinstance(recorded_azure, list):
+            raise RuntimeError(
+                "recorded Azure tenant resource inventory is invalid"
+            )
+        for item in recorded_azure:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                raise RuntimeError(
+                    "recorded Azure tenant resource inventory is invalid"
+                )
+            verified_ids.append(item["id"])
+    current_resource_ids = {
+        str(resource.get("id", "")).lower()
+        for resource in resources
+        if isinstance(resource, dict)
+    }
+    if parent_ids and any(
+        parent.lower() in current_resource_ids for parent in parent_ids
+    ):
         instance_response = _az(
             "vmss",
             "list-instances",
@@ -2598,6 +3069,17 @@ def discover_azure_owned_resources(
         for key, value in identity.observed.items()
         if key in {"azureClusterUid", "azureMachinePoolUid"}
     ]
+    namespace = _get_management_resource(root, None, f"namespace/{spec.namespace}")
+    if namespace is None:
+        if require_parents:
+            raise RuntimeError("Azure tenant Namespace is absent during discovery")
+        return classify_azure_owned_resources(
+            resources,
+            markers,
+            parent_ids=parent_ids,
+            parent_uids=parent_uids,
+            verified_ids=verified_ids,
+        )
     aso_resource_types = set()
     for group in ("network.azure.com", "compute.azure.com"):
         response = _kubectl(
@@ -2663,9 +3145,11 @@ def discover_azure_owned_resources(
                         check=False,
                     )
                     if resource_response.returncode != 0:
-                        raise RuntimeError(
-                            "recorded Azure Service Operator resource is absent"
-                        )
+                        if require_azure_resources:
+                            raise RuntimeError(
+                                "recorded Azure Service Operator resource is absent"
+                            )
+                        continue
                     resource_payload = json.loads(resource_response.stdout)
                     if not isinstance(resource_payload, dict):
                         raise RuntimeError(
@@ -2680,6 +3164,375 @@ def discover_azure_owned_resources(
         parent_uids=parent_uids,
         verified_ids=verified_ids,
     )
+
+
+def _merge_owned_discoveries(
+    discoveries: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    azure: dict[str, dict[str, object]] = {}
+    aso: dict[tuple[str, str], dict[str, object]] = {}
+    for discovery in discoveries:
+        unknown = discovery.get("unknown")
+        if unknown:
+            raise RuntimeError(
+                "Azure tenant resource discovery is incomplete: "
+                + json.dumps(unknown, sort_keys=True)
+            )
+        azure_items = discovery.get("azure")
+        aso_items = discovery.get("aso")
+        if not isinstance(azure_items, list) or not isinstance(aso_items, list):
+            raise RuntimeError("Azure tenant resource discovery is invalid")
+        for item in azure_items:
+            if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+                raise RuntimeError("Azure tenant resource discovery is invalid")
+            azure[item["id"].lower()] = dict(item)
+        for item in aso_items:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("kind"), str)
+                or not isinstance(item.get("uid"), str)
+            ):
+                raise RuntimeError("Azure tenant ASO discovery is invalid")
+            aso[(item["kind"], item["uid"])] = dict(item)
+    return {
+        "azure": sorted(azure.values(), key=lambda item: str(item["id"])),
+        "aso": sorted(
+            aso.values(),
+            key=lambda item: (str(item["kind"]), str(item.get("name", ""))),
+        ),
+        "unknown": [],
+    }
+
+
+def _merge_management_discoveries(
+    discoveries: Sequence[Mapping[str, object]],
+) -> dict[str, object]:
+    result: dict[str, object] = {
+        "controller": [],
+        "orchestration": [],
+        "namespaceChildren": [],
+        "unknown": [],
+    }
+    for category in ("controller", "orchestration", "namespaceChildren"):
+        merged = {}
+        for discovery in discoveries:
+            unknown = discovery.get("unknown")
+            if unknown:
+                raise RuntimeError(
+                    "Azure tenant management discovery is incomplete: "
+                    + json.dumps(unknown, sort_keys=True)
+                )
+            items = discovery.get(category)
+            if not isinstance(items, list):
+                raise RuntimeError("Azure tenant management discovery is invalid")
+            for item in items:
+                if (
+                    not isinstance(item, dict)
+                    or not isinstance(item.get("kind"), str)
+                    or not isinstance(item.get("name"), str)
+                ):
+                    raise RuntimeError("Azure tenant management discovery is invalid")
+                key = (
+                    item["kind"],
+                    item["name"],
+                    str(item.get("uid", "")),
+                )
+                merged[key] = dict(item)
+        result[category] = sorted(
+            merged.values(),
+            key=lambda item: (
+                str(item["kind"]),
+                str(item["name"]),
+                str(item.get("uid", "")),
+            ),
+        )
+    return result
+
+
+def _recorded_owned_resources(identity: TenantIdentity) -> dict[str, object]:
+    serialized = identity.observed.get("azureResources")
+    if not serialized:
+        raise RuntimeError("recorded Azure tenant resource inventory is absent")
+    try:
+        payload = json.loads(serialized)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("recorded Azure tenant resource inventory is invalid") from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError("recorded Azure tenant resource inventory is invalid")
+    return _merge_owned_discoveries((payload,))
+
+
+def _require_recorded_resources_present(
+    recorded: Mapping[str, object],
+    discovered: Mapping[str, object],
+) -> None:
+    recorded_azure = {
+        str(item["id"]).lower()
+        for item in recorded["azure"]
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    discovered_azure = {
+        str(item["id"]).lower()
+        for item in discovered["azure"]
+        if isinstance(item, dict) and isinstance(item.get("id"), str)
+    }
+    recorded_aso = {
+        (str(item.get("kind")), str(item.get("uid")))
+        for item in recorded["aso"]
+        if isinstance(item, dict)
+    }
+    discovered_aso = {
+        (str(item.get("kind")), str(item.get("uid")))
+        for item in discovered["aso"]
+        if isinstance(item, dict)
+    }
+    missing = sorted(recorded_azure - discovered_azure)
+    missing_aso = sorted(recorded_aso - discovered_aso)
+    if missing or missing_aso:
+        raise RuntimeError(
+            "recorded Azure tenant resource inventory changed before deletion: "
+            + json.dumps(
+                {"azure": missing, "aso": missing_aso},
+                sort_keys=True,
+            )
+        )
+
+
+def _discover_owned_repeatedly(
+    root: Path,
+    config: Mapping[str, str],
+    spec: TenantSpec,
+    identity: TenantIdentity | OperationJournal,
+    *,
+    passes: int,
+    require_parents: bool,
+    require_azure_resources: bool,
+    verified_resource_ids: Sequence[str] = (),
+) -> dict[str, object]:
+    if passes < 2:
+        raise RuntimeError("Azure tenant discovery must be repeated")
+    discoveries = []
+    verified_ids = list(verified_resource_ids)
+    for _ in range(passes):
+        discovery = discover_azure_owned_resources(
+            root,
+            config,
+            spec,
+            identity,
+            require_parents=require_parents,
+            require_azure_resources=require_azure_resources,
+            verified_resource_ids=verified_ids,
+        )
+        discoveries.append(discovery)
+        verified_ids.extend(
+            str(item["id"])
+            for item in discovery["azure"]
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        )
+    return _merge_owned_discoveries(discoveries)
+
+
+def _exact_delete_management_resource(
+    root: Path,
+    spec: TenantSpec,
+    identity: TenantIdentity | OperationJournal,
+    *,
+    namespace: str | None,
+    resource: str,
+    uid_key: str,
+    cascade: str,
+) -> bool:
+    payload = _get_management_resource(root, namespace, resource)
+    if payload is None:
+        return False
+    _require_markers(payload, _expected_tenant_markers(spec, identity), resource)
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    uid = metadata.get("uid")
+    resource_version = metadata.get("resourceVersion")
+    if uid != identity.observed.get(uid_key):
+        raise RuntimeError(f"Azure tenant management UID changed: {resource}")
+    if not isinstance(resource_version, str) or not resource_version:
+        raise RuntimeError(
+            f"Azure tenant management resourceVersion is absent: {resource}"
+        )
+    arguments = []
+    if namespace is not None:
+        arguments.extend(("-n", namespace))
+    _kubectl(
+        root,
+        *arguments,
+        "delete",
+        resource,
+        f"--cascade={cascade}",
+        "--wait=false",
+    )
+    return True
+
+
+def _deletion_diagnostics(
+    root: Path,
+    spec: TenantSpec,
+    identity: TenantIdentity | OperationJournal,
+    *,
+    management: Mapping[str, object] | None,
+    azure: Mapping[str, object] | None,
+    error: BaseException | str,
+) -> dict[str, object]:
+    selected = tenant_names(spec)
+    conditions = []
+    for resource in (
+        f"cluster/{selected['cluster']}",
+        f"kamajicontrolplane/{selected['controlPlane']}",
+        f"azurecluster/{selected['azureCluster']}",
+        f"kubeadmconfig/{selected['pool']}",
+        f"machinepool/{selected['pool']}",
+        f"azuremachinepool/{selected['pool']}",
+    ):
+        try:
+            payload = _get_management_resource(root, spec.namespace, resource)
+        except BaseException as exc:
+            conditions.append(
+                {"resource": resource, "inspectionError": redact(str(exc))}
+            )
+            continue
+        if payload is None:
+            continue
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        status = payload.get("status")
+        status = status if isinstance(status, dict) else {}
+        conditions.append(
+            {
+                "resource": resource,
+                "uid": metadata.get("uid"),
+                "deletionTimestamp": metadata.get("deletionTimestamp"),
+                "finalizers": metadata.get("finalizers", []),
+                "conditions": status.get("conditions", []),
+                "failureReason": status.get("failureReason"),
+                "failureMessage": status.get("failureMessage"),
+            }
+        )
+    events = []
+    try:
+        response = _kubectl(
+            root,
+            "-n",
+            spec.namespace,
+            "get",
+            "events",
+            "-o",
+            "json",
+            check=False,
+        )
+        if response.returncode == 0:
+            payload = json.loads(response.stdout)
+            for item in payload.get("items", []) if isinstance(payload, dict) else []:
+                if not isinstance(item, dict):
+                    continue
+                involved = item.get("involvedObject")
+                involved = involved if isinstance(involved, dict) else {}
+                events.append(
+                    {
+                        "type": item.get("type"),
+                        "reason": item.get("reason"),
+                        "message": item.get("message"),
+                        "kind": involved.get("kind"),
+                        "name": involved.get("name"),
+                    }
+                )
+    except BaseException as exc:
+        events.append({"inspectionError": redact(str(exc))})
+    return {
+        "schema": 1,
+        "tenant": spec.name,
+        "specificationSha256": spec.sha256(),
+        "foundationSha256": foundation_sha256(identity.foundation_identity),
+        "error": str(error),
+        "management": management or {},
+        "azure": azure or {},
+        "conditions": conditions,
+        "events": events[-100:],
+    }
+
+
+def _write_deletion_diagnostics(
+    runtime: TenantRuntime,
+    journal: OperationJournal,
+    payload: Mapping[str, object],
+) -> Path:
+    path = runtime.paths.evidence / f"delete-diagnostics-{journal.operation_id}.json"
+    write_private_file(
+        path,
+        json.dumps(redact_value(dict(payload)), sort_keys=True) + "\n",
+    )
+    return path
+
+
+def _remove_private_tree(path: Path) -> None:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return
+    if (
+        path.is_symlink()
+        or not stat.S_ISDIR(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise RuntimeError(f"private runtime directory is unsafe: {path}")
+    for child in path.iterdir():
+        details = child.lstat()
+        if stat.S_ISDIR(details.st_mode):
+            _remove_private_tree(child)
+        elif (
+            stat.S_ISREG(details.st_mode)
+            and details.st_uid == os.getuid()
+            and not details.st_mode & 0o077
+        ):
+            child.unlink()
+        else:
+            raise RuntimeError(f"private runtime artifact is unsafe: {child}")
+    path.rmdir()
+
+
+def _tenant_tagged_azure_resources(
+    root: Path,
+    config: Mapping[str, str],
+    tenant: str,
+) -> list[dict[str, object]]:
+    del root
+    resources = _json(
+        [
+            "az",
+            "resource",
+            "list",
+            "--resource-group",
+            names(config)["resourceGroup"],
+            "--output",
+            "json",
+        ]
+    )
+    if not isinstance(resources, list):
+        raise RuntimeError("Azure tenant absence discovery returned invalid resources")
+    residues = []
+    for item in resources:
+        if not isinstance(item, dict):
+            raise RuntimeError("Azure tenant absence discovery returned invalid resources")
+        tags = item.get("tags")
+        tags = tags if isinstance(tags, dict) else {}
+        if tags.get("cnpg-vcluster-tenant") != tenant:
+            continue
+        identifier = item.get("id")
+        if not isinstance(identifier, str) or not identifier:
+            raise RuntimeError("Azure tenant residue has no resource ID")
+        residues.append(
+            {
+                "id": identifier,
+                "type": str(item.get("type", "")).lower(),
+            }
+        )
+    return sorted(residues, key=lambda item: str(item["id"]))
 
 
 def _operation_failed(runtime: TenantRuntime, journal: OperationJournal) -> bool:
@@ -2697,8 +3550,17 @@ def _operation_failed(runtime: TenantRuntime, journal: OperationJournal) -> bool
 
 
 class AzureTenantAdapter:
-    def __init__(self, *, clock=time.time) -> None:
+    def __init__(
+        self,
+        *,
+        clock=time.time,
+        monotonic=time.monotonic,
+        sleep=time.sleep,
+    ) -> None:
         self.clock = clock
+        self.monotonic = monotonic
+        self.sleep = sleep
+        self._delete_snapshots: dict[str, dict[str, object]] = {}
 
     @staticmethod
     def _config(root: Path) -> dict[str, str]:
@@ -2898,23 +3760,15 @@ class AzureTenantAdapter:
         foundation_healthy: bool,
     ) -> TenantStatus:
         namespace = _get_management_resource(root, None, f"namespace/{tenant}")
-        resources = _json(
+        management_residue = (
             [
-                "az",
-                "resource",
-                "list",
-                "--resource-group",
-                names(config)["resourceGroup"],
-                "--tag",
-                f"cnpg-vcluster-tenant={tenant}",
-                "--output",
-                "json",
+                _management_object_summary(item)
+                for item in _list_namespaced_management_objects(root, tenant)
             ]
+            if namespace is not None
+            else []
         )
-        if not isinstance(resources, list):
-            raise RuntimeError(
-                "Azure tenant absence discovery returned invalid resources"
-            )
+        resources = _tenant_tagged_azure_resources(root, config, tenant)
         tenant_runtime = azure_tenant_runtime_path(root, tenant)
         runtime_residue = (
             sorted(
@@ -2926,7 +3780,8 @@ class AzureTenantAdapter:
         )
         if (
             namespace is not None
-            or (isinstance(resources, list) and resources)
+            or management_residue
+            or resources
             or runtime_residue
         ):
             return TenantStatus(
@@ -2936,9 +3791,8 @@ class AzureTenantAdapter:
                 foundation_healthy=foundation_healthy,
                 components={
                     "namespacePresent": namespace is not None,
-                    "azureResourceCount": len(resources)
-                    if isinstance(resources, list)
-                    else None,
+                    "managementResidue": management_residue,
+                    "azureResources": resources,
                     "runtimeResidue": runtime_residue,
                 },
                 blockers=(
@@ -3200,8 +4054,217 @@ class AzureTenantAdapter:
         spec: TenantSpec,
         identity: TenantIdentity,
     ) -> None:
-        del root, spec, identity
-        raise RuntimeError("Azure targeted tenant deletion is implemented in Phase 5")
+        if (
+            identity.profile != "azure"
+            or identity.tenant != spec.name
+            or identity.specification_sha256 != spec.sha256()
+            or identity.specification.to_mapping() != spec.to_mapping()
+        ):
+            raise RuntimeError("Azure tenant deletion specification binding changed")
+        config = self._config(root)
+        _active_subscription(config)
+        foundation, healthy, blockers = _inspect_foundation(
+            root,
+            config,
+            require_healthy=False,
+        )
+        if not healthy:
+            raise RuntimeError(
+                "Azure management foundation is unhealthy: " + "; ".join(blockers)
+            )
+        if foundation != dict(identity.foundation_identity):
+            raise RuntimeError("Azure tenant foundation binding changed")
+        runtime = TenantRuntime(root, "azure", spec.name)
+        pending = runtime.load_operation() if runtime.operation_exists() else None
+        if pending is not None and (
+            pending.operation != "delete"
+            or pending.specification_sha256 != spec.sha256()
+            or dict(pending.foundation_identity) != foundation
+        ):
+            raise RuntimeError("conflicting Azure tenant lifecycle operation exists")
+        require_complete = pending is None
+        management = discover_management_owned_resources(
+            root,
+            spec,
+            identity,
+            require_complete=require_complete,
+        )
+        if require_complete:
+            kubeconfig_secret = next(
+                (
+                    item
+                    for item in management["controller"]
+                    if item["kind"] == "Secret"
+                    and item["name"] == f"{spec.name}-kubeconfig"
+                ),
+                None,
+            )
+            if (
+                kubeconfig_secret is None
+                or kubeconfig_secret["uid"]
+                != identity.observed.get("tenantKubeconfigSecretUid")
+            ):
+                raise RuntimeError("Azure tenant kubeconfig Secret identity changed")
+        azure = _discover_owned_repeatedly(
+            root,
+            config,
+            spec,
+            identity,
+            passes=2,
+            require_parents=require_complete,
+            require_azure_resources=require_complete,
+        )
+        if require_complete:
+            _require_recorded_resources_present(
+                _recorded_owned_resources(identity),
+                azure,
+            )
+        self._delete_snapshots[spec.name] = {
+            "foundation": foundation,
+            "foundationHealth": {
+                "healthy": healthy,
+                "blockers": list(blockers),
+            },
+            "management": management,
+            "azure": azure,
+        }
+
+    def _wait_for_controller_cleanup(
+        self,
+        root: Path,
+        config: Mapping[str, str],
+        spec: TenantSpec,
+        identity: TenantIdentity,
+        initial_management: Mapping[str, object],
+        initial_azure: Mapping[str, object],
+    ) -> tuple[dict[str, object], dict[str, object]]:
+        deadline = self.monotonic() + parse_duration(
+            config["AZURE_TENANT_TIMEOUT"]
+        )
+        accumulated = _merge_owned_discoveries((initial_azure,))
+        management_history = _merge_management_discoveries(
+            (initial_management,)
+        )
+        last_management: dict[str, object] = {}
+        while True:
+            try:
+                last_management = discover_management_owned_resources(
+                    root,
+                    spec,
+                    identity,
+                    require_complete=False,
+                )
+                management_history = _merge_management_discoveries(
+                    (management_history, last_management)
+                )
+                current = _discover_owned_repeatedly(
+                    root,
+                    config,
+                    spec,
+                    identity,
+                    passes=2,
+                    require_parents=False,
+                    require_azure_resources=False,
+                    verified_resource_ids=tuple(
+                        str(item["id"])
+                        for item in accumulated["azure"]
+                        if isinstance(item, dict)
+                        and isinstance(item.get("id"), str)
+                    ),
+                )
+            except BaseException as exc:
+                raise AzureDeletionError(
+                    "Azure tenant controller cleanup discovery failed: "
+                    + str(exc),
+                    management=management_history,
+                    azure=accumulated,
+                ) from exc
+            accumulated = _merge_owned_discoveries((accumulated, current))
+            controller = last_management["controller"]
+            azure_remaining = current["azure"]
+            aso_remaining = current["aso"]
+            if not controller and not azure_remaining and not aso_remaining:
+                return management_history, accumulated
+            if self.monotonic() >= deadline:
+                blockers = {
+                    "management": [
+                        f"{item['kind']}/{item['name']}"
+                        for item in controller
+                    ],
+                    "azureResourceIds": [
+                        item["id"] for item in azure_remaining
+                    ],
+                    "aso": [
+                        f"{item['kind']}/{item['name']}"
+                        for item in aso_remaining
+                    ],
+                }
+                raise AzureDeletionError(
+                    "Azure tenant controller cleanup timed out: "
+                    + json.dumps(blockers, sort_keys=True),
+                    management=management_history,
+                    azure=accumulated,
+                )
+            self.sleep(min(10, max(0, deadline - self.monotonic())))
+
+    def _wait_for_tenant_absence(
+        self,
+        root: Path,
+        config: Mapping[str, str],
+        spec: TenantSpec,
+        identity: TenantIdentity,
+        initial_azure: Mapping[str, object],
+    ) -> dict[str, object]:
+        deadline = self.monotonic() + parse_duration(
+            config["AZURE_TENANT_TIMEOUT"]
+        )
+        accumulated = _merge_owned_discoveries((initial_azure,))
+        while True:
+            namespace = _get_management_resource(
+                root,
+                None,
+                f"namespace/{spec.namespace}",
+            )
+            current = _discover_owned_repeatedly(
+                root,
+                config,
+                spec,
+                identity,
+                passes=2,
+                require_parents=False,
+                require_azure_resources=False,
+                verified_resource_ids=tuple(
+                    str(item["id"])
+                    for item in accumulated["azure"]
+                    if isinstance(item, dict)
+                    and isinstance(item.get("id"), str)
+                ),
+            )
+            accumulated = _merge_owned_discoveries((accumulated, current))
+            if (
+                namespace is None
+                and not current["azure"]
+                and not current["aso"]
+            ):
+                return accumulated
+            if self.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Azure tenant final absence timed out: "
+                    + json.dumps(
+                        {
+                            "namespacePresent": namespace is not None,
+                            "azureResourceIds": [
+                                item["id"] for item in current["azure"]
+                            ],
+                            "aso": [
+                                f"{item['kind']}/{item['name']}"
+                                for item in current["aso"]
+                            ],
+                        },
+                        sort_keys=True,
+                    )
+                )
+            self.sleep(min(10, max(0, deadline - self.monotonic())))
 
     def delete(
         self,
@@ -3212,8 +4275,223 @@ class AzureTenantAdapter:
         journal: OperationJournal,
         timings,
     ) -> None:
-        del root, spec, identity, runtime, journal, timings
-        raise RuntimeError("Azure targeted tenant deletion is implemented in Phase 5")
+        config = self._config(root)
+        snapshot = self._delete_snapshots.pop(spec.name, None)
+        if snapshot is None:
+            self.validate_delete(root, spec, identity)
+            snapshot = self._delete_snapshots.pop(spec.name)
+        current = runtime.load_operation()
+        management = snapshot["management"]
+        azure = snapshot["azure"]
+        foundation_before = snapshot["foundation"]
+        foundation_health_before = snapshot.get(
+            "foundationHealth",
+            {"healthy": True, "blockers": []},
+        )
+        try:
+            initial_records = {
+                "deleteFoundationBefore": json.dumps(
+                    foundation_before,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "deleteFoundationHealthBefore": json.dumps(
+                    foundation_health_before,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "deleteManagementBefore": json.dumps(
+                    management,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                "deleteAzureBefore": json.dumps(
+                    azure,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+            }
+            current = runtime.update_operation(
+                current,
+                phase="delete-inventory-recorded",
+                observed={
+                    key: value
+                    for key, value in initial_records.items()
+                    if key not in current.observed
+                },
+            )
+            with timings.phase("deletion"):
+                _exact_delete_management_resource(
+                    root,
+                    spec,
+                    identity,
+                    namespace=spec.namespace,
+                    resource=f"cluster/{spec.name}",
+                    uid_key="clusterUid",
+                    cascade="foreground",
+                )
+                current = runtime.update_operation(
+                    current,
+                    phase="cluster-deletion-requested",
+                )
+            with timings.phase("controller-cleanup"):
+                management, discovered = self._wait_for_controller_cleanup(
+                    root,
+                    config,
+                    spec,
+                    identity,
+                    management,
+                    azure,
+                )
+                azure = discovered
+                current = runtime.update_operation(
+                    current,
+                    phase="controller-resources-absent",
+                    observed={
+                        "deleteManagementDiscovered": json.dumps(
+                            management,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if "deleteManagementDiscovered" not in current.observed
+                        else current.observed["deleteManagementDiscovered"],
+                        "deleteAzureDiscovered": json.dumps(
+                            discovered,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if "deleteAzureDiscovered" not in current.observed
+                        else current.observed["deleteAzureDiscovered"]
+                    },
+                )
+            selected = tenant_names(spec)
+            with timings.phase("orchestration-cleanup"):
+                for uid_key, resource in (
+                    (
+                        "cloudValuesConfigMapUid",
+                        f"configmap/{selected['cloudValues']}",
+                    ),
+                    (
+                        "networkValuesConfigMapUid",
+                        f"configmap/{selected['networkValues']}",
+                    ),
+                    ("addonJobUid", f"job/{selected['addonJob']}"),
+                    (
+                        "azureClusterIdentityUid",
+                        f"azureclusteridentity/{selected['azureClusterIdentity']}",
+                    ),
+                ):
+                    _exact_delete_management_resource(
+                        root,
+                        spec,
+                        identity,
+                        namespace=spec.namespace,
+                        resource=resource,
+                        uid_key=uid_key,
+                        cascade="foreground",
+                    )
+                _exact_delete_management_resource(
+                    root,
+                    spec,
+                    identity,
+                    namespace=None,
+                    resource=f"namespace/{spec.namespace}",
+                    uid_key="namespaceUid",
+                    cascade="foreground",
+                )
+                current = runtime.update_operation(
+                    current,
+                    phase="orchestration-deletion-requested",
+                )
+            with timings.phase("azure-absence"):
+                azure = self._wait_for_tenant_absence(
+                    root,
+                    config,
+                    spec,
+                    identity,
+                    azure,
+                )
+                current = runtime.update_operation(
+                    current,
+                    phase="tenant-resources-absent",
+                    observed={
+                        "deleteAzureFinalDiscovery": json.dumps(
+                            azure,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if "deleteAzureFinalDiscovery" not in current.observed
+                        else current.observed["deleteAzureFinalDiscovery"]
+                    },
+                )
+            with timings.phase("foundation-verification"):
+                foundation_after, healthy, blockers = _inspect_foundation(
+                    root,
+                    config,
+                    require_healthy=False,
+                )
+                if not healthy:
+                    raise RuntimeError(
+                        "Azure management foundation changed during tenant deletion: "
+                        + "; ".join(blockers)
+                    )
+                if foundation_after != foundation_before:
+                    raise RuntimeError(
+                        "Azure management foundation identity changed during "
+                        "tenant deletion"
+                    )
+                current = runtime.update_operation(
+                    current,
+                    phase="foundation-verified",
+                    observed={
+                        "deleteFoundationHealthAfter": json.dumps(
+                            {"healthy": healthy, "blockers": list(blockers)},
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                        if "deleteFoundationHealthAfter" not in current.observed
+                        else current.observed["deleteFoundationHealthAfter"]
+                    },
+                )
+            with timings.phase("runtime-cleanup"):
+                _remove_private_tree(azure_tenant_runtime_path(root, spec.name))
+                status = self._inspect_absence(
+                    root,
+                    config,
+                    spec.name,
+                    foundation_healthy=True,
+                )
+                if status.classification != "absent":
+                    raise RuntimeError(
+                        "Azure tenant did not reach canonical absence: "
+                        + "; ".join(status.blockers)
+                    )
+                runtime.update_operation(current, phase="canonical-absence")
+        except BaseException as exc:
+            if isinstance(exc, AzureDeletionError):
+                management = exc.management
+                azure = exc.azure
+            try:
+                _write_deletion_diagnostics(
+                    runtime,
+                    runtime.load_operation(),
+                    _deletion_diagnostics(
+                        root,
+                        spec,
+                        identity,
+                        management=management
+                        if isinstance(management, Mapping)
+                        else None,
+                        azure=azure if isinstance(azure, Mapping) else None,
+                        error=exc,
+                    ),
+                )
+            except BaseException as diagnostics_error:
+                exc.add_note(
+                    "Azure deletion diagnostics failed: "
+                    + redact(str(diagnostics_error))
+                )
+            raise
 
 
 def destroy(root: Path, config: Mapping[str, str]) -> None:

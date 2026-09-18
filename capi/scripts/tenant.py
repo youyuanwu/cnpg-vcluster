@@ -428,7 +428,8 @@ def delete_tenant(
                             )
                     validator = getattr(adapter, "validate_delete", None)
                     if validator is not None:
-                        validator(root, spec, identity)
+                        with timings.phase("deletion-validation"):
+                            validator(root, spec, identity)
                     with timings.phase("journal"):
                         journal = runtime.start_operation(
                             operation="delete",

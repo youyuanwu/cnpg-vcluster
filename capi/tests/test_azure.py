@@ -19,8 +19,12 @@ from scripts.azure import (
     FOUNDATION_INVENTORY_SCHEMA,
     _azure_tags,
     _capture_tenant_kubeconfig,
+    _classify_management_owned_resources,
     _collect_ready_observations,
+    _discover_owned_repeatedly,
+    _exact_delete_management_resource,
     _foundation_defaults_checksum,
+    _management_resource_specs,
     _reconcile_manifest,
     _render_addon_job,
     _render_tenant_control_plane,
@@ -42,6 +46,7 @@ from scripts.lib.files import write_private_file
 from scripts.lib.locking import profile_lock
 from scripts.lib.tenant_runtime import TenantRuntime, foundation_sha256
 from scripts.lib.tenant_spec import TenantSpec, TenantSpecError
+from scripts.lib.tenant_status import TenantStatus
 from scripts.lib.tenant_timing import TenantTimings
 from scripts.lib.tenants import LIFECYCLE_MARKERS, lifecycle_markers
 
@@ -1377,6 +1382,631 @@ class AzurePhaseFourTests(unittest.TestCase):
         ).read_text(encoding="utf-8")
         self.assertNotRegex(example, r"[0-9a-f]{8}-[0-9a-f-]{27,}")
         self.assertNotRegex(example.lower(), r"subscription|clientsecret|password")
+
+
+class AzurePhaseFiveTests(unittest.TestCase):
+    make_root = AzurePhaseFourTests.make_root
+    spec = staticmethod(AzurePhaseFourTests.spec)
+    start_journal = AzurePhaseFourTests.start_journal
+    inventory = AzurePhaseFourTests.inventory
+
+    def ready_identity(self, root: Path, spec: TenantSpec):
+        runtime, journal = self.start_journal(root, spec)
+        observed = {
+            "markerOperationId": journal.operation_id,
+            "tenantKubeconfigSecretUid": "tenant-kubeconfig-secret-uid",
+            "tenantKubeconfigSha256": "kubeconfig-sha256",
+            "vmssId": (
+                "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/"
+                "Microsoft.Compute/virtualMachineScaleSets/tenant-c-worker"
+            ),
+            "vmssInstanceIds": "[]",
+            "azureResources": json.dumps(
+                {"azure": [], "aso": [], "unknown": []},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+        for key, _, _, _ in _management_resource_specs(spec):
+            observed[key] = f"{key}-value"
+        runtime.complete_create(runtime.load_operation(), spec, observed)
+        write_private_file(
+            azure_tenant_runtime_path(root, spec.name) / "endpoint.json",
+            "{}\n",
+        )
+        return runtime, runtime.load_identity()
+
+    def management_payloads(self, spec, identity):
+        markers = {
+            "tenant": spec.name,
+            "profile": "azure",
+            "specificationSha256": spec.sha256(),
+            "foundationSha256": foundation_sha256(identity.foundation_identity),
+            "operationId": identity.observed["markerOperationId"],
+        }
+        payloads = []
+        namespace = None
+        for key, namespace_name, kind, name in _management_resource_specs(spec):
+            payload = {
+                "apiVersion": "v1",
+                "kind": kind,
+                "metadata": {
+                    "name": name,
+                    "uid": identity.observed[key],
+                    "resourceVersion": f"{key}-rv",
+                    "annotations": {
+                        LIFECYCLE_MARKERS[marker]: value
+                        for marker, value in markers.items()
+                    },
+                },
+            }
+            if namespace_name is not None:
+                payload["metadata"]["namespace"] = namespace_name
+            if kind == "Namespace":
+                namespace = payload
+            else:
+                payloads.append(payload)
+        payloads.append(
+            {
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": f"{spec.name}-kubeconfig",
+                    "uid": identity.observed["tenantKubeconfigSecretUid"],
+                    "resourceVersion": "secret-rv",
+                    "ownerReferences": [
+                        {
+                            "uid": identity.observed["kamajiControlPlaneUid"],
+                            "controller": True,
+                        }
+                    ],
+                },
+            }
+        )
+        return namespace, payloads
+
+    def test_management_inventory_refuses_unknown_and_foreign_state(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        namespace, payloads = self.management_payloads(spec, identity)
+        payloads.append(
+            {
+                "apiVersion": "unknown.example/v1",
+                "kind": "Mystery",
+                "metadata": {
+                    "name": "late",
+                    "uid": "late-uid",
+                    "resourceVersion": "1",
+                },
+            }
+        )
+        with self.assertRaisesRegex(RuntimeError, "ownership is unknown"):
+            _classify_management_owned_resources(
+                spec,
+                identity,
+                namespace,
+                payloads,
+                require_complete=True,
+            )
+        payloads.pop()
+        payloads[0]["metadata"]["annotations"][
+            LIFECYCLE_MARKERS["tenant"]
+        ] = "foreign"
+        with self.assertRaisesRegex(RuntimeError, "foreign.*markers"):
+            _classify_management_owned_resources(
+                spec,
+                identity,
+                namespace,
+                payloads,
+                require_complete=True,
+            )
+
+    def test_delete_validation_refuses_foundation_and_uid_before_mutation(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        adapter = AzureTenantAdapter()
+        with (
+            patch.object(adapter, "_config", return_value=load_azure_configuration(root)),
+            patch("scripts.azure._active_subscription"),
+            patch(
+                "scripts.azure._inspect_foundation",
+                return_value=({**FOUNDATION, "aksId": "foreign"}, True, ()),
+            ),
+            patch("scripts.azure._exact_delete_management_resource") as mutate,
+            self.assertRaisesRegex(RuntimeError, "foundation binding changed"),
+        ):
+            adapter.validate_delete(root, spec, identity)
+        mutate.assert_not_called()
+
+        namespace, payloads = self.management_payloads(spec, identity)
+        payloads[0]["metadata"]["uid"] = "replacement"
+        with self.assertRaisesRegex(RuntimeError, "UID changed"):
+            _classify_management_owned_resources(
+                spec,
+                identity,
+                namespace,
+                payloads,
+                require_complete=True,
+            )
+
+    def test_exact_delete_validates_uid_resource_version_and_markers(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        markers = {
+            "tenant": spec.name,
+            "profile": "azure",
+            "specificationSha256": spec.sha256(),
+            "foundationSha256": foundation_sha256(identity.foundation_identity),
+            "operationId": identity.observed["markerOperationId"],
+        }
+        payload = {
+            "metadata": {
+                "uid": identity.observed["clusterUid"],
+                "resourceVersion": "42",
+                "annotations": {
+                    LIFECYCLE_MARKERS[key]: value
+                    for key, value in markers.items()
+                },
+            }
+        }
+        with (
+            patch("scripts.azure._get_management_resource", return_value=payload),
+            patch("scripts.azure._kubectl") as kubectl,
+        ):
+            self.assertTrue(
+                _exact_delete_management_resource(
+                    root,
+                    spec,
+                    identity,
+                    namespace=spec.namespace,
+                    resource=f"cluster/{spec.name}",
+                    uid_key="clusterUid",
+                    cascade="foreground",
+                )
+            )
+        arguments = kubectl.call_args.args
+        self.assertIn("--cascade=foreground", arguments)
+        payload["metadata"]["uid"] = "foreign"
+        with (
+            patch("scripts.azure._get_management_resource", return_value=payload),
+            patch("scripts.azure._kubectl") as kubectl,
+            self.assertRaisesRegex(RuntimeError, "UID changed"),
+        ):
+            _exact_delete_management_resource(
+                root,
+                spec,
+                identity,
+                namespace=spec.namespace,
+                resource=f"cluster/{spec.name}",
+                uid_key="clusterUid",
+                cascade="foreground",
+            )
+        kubectl.assert_not_called()
+        namespace, _ = self.management_payloads(spec, identity)
+        with (
+            patch("scripts.azure._get_management_resource", return_value=namespace),
+            patch("scripts.azure._kubectl") as kubectl,
+        ):
+            _exact_delete_management_resource(
+                root,
+                spec,
+                identity,
+                namespace=None,
+                resource=f"namespace/{spec.name}",
+                uid_key="namespaceUid",
+                cascade="foreground",
+            )
+        self.assertIn(f"namespace/{spec.name}", kubectl.call_args.args)
+
+    def test_repeated_discovery_captures_late_resources(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        first = {
+            "azure": [
+                {
+                    "id": "/subscriptions/redacted/resourceGroups/rg/providers/"
+                    "Microsoft.Compute/virtualMachineScaleSets/pool",
+                    "type": "microsoft.compute/virtualmachinescalesets",
+                }
+            ],
+            "aso": [],
+            "unknown": [],
+        }
+        late = {
+            "azure": [
+                {
+                    "id": "/subscriptions/redacted/resourceGroups/rg/providers/"
+                    "Microsoft.Network/publicIPAddresses/late",
+                    "type": "microsoft.network/publicipaddresses",
+                }
+            ],
+            "aso": [],
+            "unknown": [],
+        }
+        with patch(
+            "scripts.azure.discover_azure_owned_resources",
+            side_effect=(first, late),
+        ) as discover:
+            result = _discover_owned_repeatedly(
+                root,
+                load_azure_configuration(root),
+                spec,
+                identity,
+                passes=2,
+                require_parents=False,
+                require_azure_resources=False,
+            )
+        self.assertEqual(discover.call_count, 2)
+        self.assertEqual(len(result["azure"]), 2)
+        self.assertIn(
+            first["azure"][0]["id"],
+            discover.call_args_list[1].kwargs["verified_resource_ids"],
+        )
+
+    def test_delete_orders_controllers_before_orchestration_and_runtime(self):
+        root = self.make_root()
+        spec = self.spec()
+        runtime, identity = self.ready_identity(root, spec)
+        journal = runtime.start_operation(
+            operation="delete",
+            spec=spec,
+            foundation_identity=identity.foundation_identity,
+            intended_resources=AzureTenantAdapter.intended_resources(spec),
+            operation_id="delete-operation",
+        )
+        adapter = AzureTenantAdapter()
+        adapter._delete_snapshots[spec.name] = {
+            "foundation": FOUNDATION,
+            "management": {
+                "controller": [],
+                "orchestration": [],
+                "namespaceChildren": [],
+                "unknown": [],
+            },
+            "azure": {"azure": [], "aso": [], "unknown": []},
+        }
+        calls = []
+
+        def delete_resource(*_args, resource, **_kwargs):
+            calls.append(f"delete:{resource}")
+            return True
+
+        timings = TenantTimings(
+            root,
+            profile="azure",
+            tenant=spec.name,
+            operation="delete",
+            operation_id=journal.operation_id,
+        )
+        with (
+            patch.object(adapter, "_config", return_value=load_azure_configuration(root)),
+            patch(
+                "scripts.azure._exact_delete_management_resource",
+                side_effect=delete_resource,
+            ),
+            patch.object(
+                adapter,
+                "_wait_for_controller_cleanup",
+                side_effect=lambda *_a: (
+                    calls.append("controllers-absent")
+                    or (
+                        {
+                            "controller": [],
+                            "orchestration": [],
+                            "namespaceChildren": [],
+                            "unknown": [],
+                        },
+                        {"azure": [], "aso": [], "unknown": []},
+                    )
+                ),
+            ),
+            patch.object(
+                adapter,
+                "_wait_for_tenant_absence",
+                side_effect=lambda *_a: (
+                    calls.append("tenant-absent")
+                    or {"azure": [], "aso": [], "unknown": []}
+                ),
+            ),
+            patch(
+                "scripts.azure._inspect_foundation",
+                side_effect=lambda *_a, **_k: (
+                    calls.append("foundation-verified")
+                    or (FOUNDATION, True, ())
+                ),
+            ),
+            patch(
+                "scripts.azure._remove_private_tree",
+                side_effect=lambda *_a: calls.append("runtime-removed"),
+            ),
+            patch.object(
+                adapter,
+                "_inspect_absence",
+                return_value=TenantStatus(
+                    profile="azure",
+                    tenant=spec.name,
+                    classification="absent",
+                    foundation_healthy=True,
+                ),
+            ),
+        ):
+            adapter.delete(root, spec, identity, runtime, journal, timings)
+        self.assertEqual(calls[0], f"delete:cluster/{spec.name}")
+        controller_index = calls.index("controllers-absent")
+        namespace_index = calls.index(f"delete:namespace/{spec.name}")
+        self.assertLess(controller_index, namespace_index)
+        self.assertLess(namespace_index, calls.index("tenant-absent"))
+        self.assertLess(
+            calls.index("foundation-verified"),
+            calls.index("runtime-removed"),
+        )
+        phases = [record["phase"] for record in timings.records()]
+        self.assertEqual(
+            phases,
+            [
+                "deletion",
+                "controller-cleanup",
+                "orchestration-cleanup",
+                "azure-absence",
+                "foundation-verification",
+                "runtime-cleanup",
+            ],
+        )
+
+    def test_delete_timeout_retains_state_and_sanitized_diagnostics(self):
+        root = self.make_root()
+        spec = self.spec()
+        runtime, identity = self.ready_identity(root, spec)
+        journal = runtime.start_operation(
+            operation="delete",
+            spec=spec,
+            foundation_identity=identity.foundation_identity,
+            intended_resources=AzureTenantAdapter.intended_resources(spec),
+            operation_id="delete-timeout",
+        )
+        adapter = AzureTenantAdapter()
+        adapter._delete_snapshots[spec.name] = {
+            "foundation": FOUNDATION,
+            "management": {
+                "controller": [],
+                "orchestration": [],
+                "namespaceChildren": [],
+                "unknown": [],
+            },
+            "azure": {"azure": [], "aso": [], "unknown": []},
+        }
+        timings = TenantTimings(
+            root,
+            profile="azure",
+            tenant=spec.name,
+            operation="delete",
+            operation_id=journal.operation_id,
+        )
+        with (
+            patch.object(adapter, "_config", return_value=load_azure_configuration(root)),
+            patch("scripts.azure._exact_delete_management_resource", return_value=True),
+            patch.object(
+                adapter,
+                "_wait_for_controller_cleanup",
+                side_effect=RuntimeError(
+                    "CAPZ panic: finalizer blocked "
+                    "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                    "resourceGroups/rg/providers/Microsoft.Compute/"
+                    "virtualMachineScaleSets/pool"
+                ),
+            ),
+            patch("scripts.azure._get_management_resource", return_value=None),
+            patch(
+                "scripts.azure._kubectl",
+                return_value=completed(json.dumps({"items": []})),
+            ),
+            self.assertRaisesRegex(RuntimeError, "CAPZ panic"),
+        ):
+            adapter.delete(root, spec, identity, runtime, journal, timings)
+        self.assertTrue(runtime.identity_exists())
+        self.assertTrue(runtime.operation_exists())
+        diagnostic = (
+            runtime.paths.evidence
+            / f"delete-diagnostics-{journal.operation_id}.json"
+        )
+        self.assertTrue(diagnostic.is_file())
+        self.assertEqual(diagnostic.stat().st_mode & 0o777, 0o600)
+        text = diagnostic.read_text(encoding="utf-8")
+        self.assertIn("CAPZ panic", text)
+        self.assertNotIn(SUBSCRIPTION, text)
+        self.assertTrue(
+            any(
+                record["phase"] == "controller-cleanup"
+                and record["status"] == "failed"
+                for record in timings.records()
+            )
+        )
+
+    def test_controller_wait_is_bounded_and_reports_exact_residue(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        adapter = AzureTenantAdapter(
+            monotonic=iter((0.0, 1.0)).__next__,
+            sleep=lambda _seconds: None,
+        )
+        management = {
+            "controller": [
+                {"kind": "AzureMachinePool", "name": "tenant-c-worker"}
+            ],
+            "orchestration": [],
+            "namespaceChildren": [],
+            "unknown": [],
+        }
+        azure = {
+            "azure": [
+                {
+                    "id": "/subscriptions/redacted/resourceGroups/rg/providers/"
+                    "Microsoft.Compute/virtualMachineScaleSets/tenant-c-worker",
+                    "type": "microsoft.compute/virtualmachinescalesets",
+                }
+            ],
+            "aso": [
+                {
+                    "kind": "NatGateway",
+                    "name": "tenant-c-nat",
+                    "uid": "nat-uid",
+                    "azureResourceId": "/subscriptions/redacted/nat",
+                }
+            ],
+            "unknown": [],
+        }
+        with (
+            patch("scripts.azure.parse_duration", return_value=0),
+            patch(
+                "scripts.azure.discover_management_owned_resources",
+                return_value=management,
+            ),
+            patch(
+                "scripts.azure._discover_owned_repeatedly",
+                return_value=azure,
+            ),
+            self.assertRaises(RuntimeError) as raised,
+        ):
+            adapter._wait_for_controller_cleanup(
+                root,
+                load_azure_configuration(root),
+                spec,
+                identity,
+                {
+                    "controller": [],
+                    "orchestration": [],
+                    "namespaceChildren": [],
+                    "unknown": [],
+                },
+                {"azure": [], "aso": [], "unknown": []},
+            )
+        message = str(raised.exception)
+        self.assertIn("AzureMachinePool/tenant-c-worker", message)
+        self.assertIn("virtualMachineScaleSets/tenant-c-worker", message)
+        self.assertIn("NatGateway/tenant-c-nat", message)
+
+    def test_foundation_change_fails_before_runtime_cleanup(self):
+        root = self.make_root()
+        spec = self.spec()
+        runtime, identity = self.ready_identity(root, spec)
+        journal = runtime.start_operation(
+            operation="delete",
+            spec=spec,
+            foundation_identity=identity.foundation_identity,
+            intended_resources=AzureTenantAdapter.intended_resources(spec),
+            operation_id="foundation-change",
+        )
+        adapter = AzureTenantAdapter()
+        adapter._delete_snapshots[spec.name] = {
+            "foundation": FOUNDATION,
+            "management": {
+                "controller": [],
+                "orchestration": [],
+                "namespaceChildren": [],
+                "unknown": [],
+            },
+            "azure": {"azure": [], "aso": [], "unknown": []},
+        }
+        timings = TenantTimings(
+            root,
+            profile="azure",
+            tenant=spec.name,
+            operation="delete",
+            operation_id=journal.operation_id,
+        )
+        with (
+            patch.object(adapter, "_config", return_value=load_azure_configuration(root)),
+            patch("scripts.azure._exact_delete_management_resource", return_value=True),
+            patch.object(
+                adapter,
+                "_wait_for_controller_cleanup",
+                return_value=(
+                    {
+                        "controller": [],
+                        "orchestration": [],
+                        "namespaceChildren": [],
+                        "unknown": [],
+                    },
+                    {"azure": [], "aso": [], "unknown": []},
+                ),
+            ),
+            patch.object(
+                adapter,
+                "_wait_for_tenant_absence",
+                return_value={"azure": [], "aso": [], "unknown": []},
+            ),
+            patch(
+                "scripts.azure._inspect_foundation",
+                return_value=({**FOUNDATION, "vnetId": "changed"}, True, ()),
+            ),
+            patch("scripts.azure._remove_private_tree") as remove_runtime,
+            patch("scripts.azure._get_management_resource", return_value=None),
+            patch(
+                "scripts.azure._kubectl",
+                return_value=completed(json.dumps({"items": []})),
+            ),
+            self.assertRaisesRegex(RuntimeError, "foundation identity changed"),
+        ):
+            adapter.delete(root, spec, identity, runtime, journal, timings)
+        remove_runtime.assert_not_called()
+        self.assertTrue(runtime.identity_exists())
+        self.assertTrue(runtime.operation_exists())
+
+    def test_authoritative_absence_ignores_pending_delete_journal(self):
+        root = self.make_root()
+        spec = self.spec()
+        runtime = TenantRuntime(root, "azure", spec.name)
+        runtime.start_operation(
+            operation="delete",
+            spec=spec,
+            foundation_identity=FOUNDATION,
+            intended_resources=AzureTenantAdapter.intended_resources(spec),
+            operation_id="pending-delete",
+        )
+        adapter = AzureTenantAdapter()
+        with (
+            patch.object(adapter, "_config", return_value=load_azure_configuration(root)),
+            patch(
+                "scripts.azure._inspect_foundation",
+                return_value=(FOUNDATION, True, ()),
+            ),
+            patch("scripts.azure._get_management_resource", return_value=None),
+            patch("scripts.azure._json", return_value=[]),
+        ):
+            status = adapter.authoritative_absence(root, spec.name)
+        self.assertEqual(status.classification, "absent")
+        self.assertTrue(runtime.operation_exists())
+
+    def test_source_forbids_direct_vmss_delete_and_provider_finalizer_removal(self):
+        source = (
+            Path(__file__).resolve().parents[1] / "scripts" / "azure.py"
+        ).read_text(encoding="utf-8")
+        self.assertNotRegex(
+            source,
+            r"[\"']vmss[\"']\s*,\s*[\"']delete[\"']",
+        )
+        self.assertNotIn("/metadata/finalizers", source)
+        self.assertNotRegex(
+            source.lower(),
+            r"(azurecluster|azuremachinepool|natgateway).{0,120}finalizers.{0,120}"
+            r"(patch|replace)",
+        )
+
+    def test_live_gate_recipe_exists_but_is_not_invoked_by_tests(self):
+        root = Path(__file__).resolve().parents[1]
+        justfile = (root / "Justfile").read_text(encoding="utf-8")
+        script = (
+            root / "scripts" / "test_azure_tenant_lifecycle.py"
+        ).read_text(encoding="utf-8")
+        self.assertIn("azure-test-tenant-lifecycle", justfile)
+        self.assertIn("destroy-legacy-foundation", script)
+        self.assertIn("targeted-delete-absent", script)
+        self.assertIn('"recreation"', script)
 
 
 if __name__ == "__main__":

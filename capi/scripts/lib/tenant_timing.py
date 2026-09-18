@@ -21,8 +21,14 @@ TENANT_PHASES = frozenset(
         "add-ons",
         "data-services",
         "deletion",
+        "deletion-validation",
+        "controller-cleanup",
+        "orchestration-cleanup",
+        "azure-absence",
+        "runtime-cleanup",
         "absence",
         "foundation-verification",
+        "recreation",
         "operation",
     }
 )

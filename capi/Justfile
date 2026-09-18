@@ -39,6 +39,10 @@ azure-foundation-status:
 azure-destroy:
     @python3 scripts/azure.py destroy
 
+# Destructively run the one clean Azure create-delete-recreate lifecycle gate.
+azure-test-tenant-lifecycle spec="config/tenants/examples/azure.json":
+    @python3 scripts/test_azure_tenant_lifecycle.py {{quote(spec)}}
+
 # Create one tenant from an explicit local or Azure JSON specification.
 tenant-create profile spec:
     @python3 scripts/tenant.py create {{quote(profile)}} {{quote(spec)}}

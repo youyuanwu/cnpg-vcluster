@@ -24,6 +24,7 @@ EXPECTED_RECIPES = {
     "azure-create-management",
     "azure-foundation-status",
     "azure-destroy",
+    "azure-test-tenant-lifecycle",
     "tenant-create",
     "tenant-status",
     "tenant-delete",
@@ -180,6 +181,27 @@ def check_repository_boundaries() -> None:
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             check(token not in text, f"{path.relative_to(ROOT)} contains forbidden token {token!r}")
+    azure_source = (ROOT / "scripts" / "azure.py").read_text(encoding="utf-8")
+    check(
+        not re.search(
+            r"[\"']vmss[\"']\s*,\s*[\"']delete[\"']",
+            azure_source,
+        ),
+        "normal Azure lifecycle directly deletes a VMSS",
+    )
+    check(
+        "/metadata/finalizers" not in azure_source,
+        "normal Azure lifecycle patches Azure provider finalizers",
+    )
+    check(
+        not re.search(
+            r"(?:patch|replace).{0,200}(?:azurecluster|azuremachinepool|natgateway)"
+            r".{0,200}finalizers",
+            azure_source,
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "normal Azure lifecycle removes Azure provider finalizers",
+    )
 
 
 def check_documentation() -> None:
