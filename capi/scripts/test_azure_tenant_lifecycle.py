@@ -27,6 +27,7 @@ from scripts.lib.files import private_file_exists, read_private_file, write_priv
 from scripts.lib.process import run
 from scripts.lib.redaction import redact, redact_value
 from scripts.lib.tenant_spec import load_tenant_spec
+from scripts.lib.tenant_runtime import TenantRuntime
 from scripts.tenant import supported_versions
 
 
@@ -245,6 +246,22 @@ def main(arguments: list[str]) -> int:
                 require_healthy=True,
             )[0],
         )
+        runtime = TenantRuntime(ROOT, "azure", spec.name)
+        if runtime.operation_exists():
+            pending = runtime.load_operation()
+            if pending.operation == "delete":
+                phase(
+                    "resume-pending-delete",
+                    lambda: (
+                        _tenant_command(
+                            "delete",
+                            "azure",
+                            spec.name,
+                            f"azure/{spec.name}",
+                        ),
+                        _require_status(spec.name, "absent"),
+                    ),
+                )
         phase(
             "create-ready",
             lambda: (
@@ -314,6 +331,6 @@ def main(arguments: list[str]) -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main(sys.argv[1:]))
-    except BaseException as exc:
+    except Exception as exc:
         print(redact(str(exc)), file=sys.stderr)
         raise SystemExit(1)

@@ -20,6 +20,7 @@ TENANT_PHASES = frozenset(
         "workers",
         "add-ons",
         "data-services",
+        "worker-deletion",
         "deletion",
         "deletion-validation",
         "controller-cleanup",

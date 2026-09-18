@@ -84,6 +84,8 @@ CONTROLLER_DEPLOYMENTS = (
     ("kamaji-system", "kamaji"),
     ("kamaji-system", "capi-kamaji-controller-manager"),
 )
+CAPZ_EXTERNAL_CONTROL_PLANE_LABEL = "cnpg-vcluster-external-control-plane"
+CAPZ_AZURECLUSTER_WEBHOOK = "default.azurecluster.infrastructure.cluster.x-k8s.io"
 KNOWN_AZURE_TENANT_TYPES = frozenset(
     {
         "microsoft.compute/virtualmachinescalesets",
@@ -94,10 +96,14 @@ KNOWN_AZURE_TENANT_TYPES = frozenset(
     }
 )
 KNOWN_ASO_TENANT_KINDS = frozenset({"NatGateway", "PublicIPAddress"})
+KNOWN_ASO_FOUNDATION_REFERENCE_KINDS = frozenset(
+    {"VirtualNetwork", "VirtualNetworksSubnet"}
+)
 KNOWN_CONTROLLER_MANAGEMENT_KINDS = frozenset(
     {
         "AzureCluster",
         "AzureMachinePool",
+        "AzureMachinePoolMachine",
         "Certificate",
         "CertificateRequest",
         "Cluster",
@@ -110,6 +116,7 @@ KNOWN_CONTROLLER_MANAGEMENT_KINDS = frozenset(
         "MachineSet",
         "NatGateway",
         "PublicIPAddress",
+        "ResourceGroup",
         "PodDisruptionBudget",
         "PersistentVolumeClaim",
         "Role",
@@ -118,6 +125,8 @@ KNOWN_CONTROLLER_MANAGEMENT_KINDS = frozenset(
         "Service",
         "StatefulSet",
         "TenantControlPlane",
+        "VirtualNetwork",
+        "VirtualNetworksSubnet",
     }
 )
 KNOWN_ORCHESTRATION_MANAGEMENT_KINDS = frozenset(
@@ -136,6 +145,7 @@ KNOWN_NAMESPACE_CHILD_KINDS = frozenset(
         "Event",
         "Lease",
         "Pod",
+        "PodMetrics",
         "ReplicaSet",
         "ServiceAccount",
     }
@@ -746,6 +756,7 @@ def _install_capi_capz(
         env=environment,
     )
     _patch_capz_identity(root, config, inventory)
+    _configure_capz_external_control_plane_webhook(root)
     for deployment in (
         "azureserviceoperator-controller-manager",
         "capz-controller-manager",
@@ -759,6 +770,110 @@ def _install_capi_capz(
             f"deployment/{deployment}",
             f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
             timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
+        )
+
+
+def _capz_external_control_plane_webhook_ready(
+    payload: Mapping[str, object],
+) -> bool:
+    webhooks = payload.get("webhooks")
+    if not isinstance(webhooks, list):
+        return False
+    webhook = next(
+        (
+            item
+            for item in webhooks
+            if isinstance(item, dict)
+            and item.get("name") == CAPZ_AZURECLUSTER_WEBHOOK
+        ),
+        None,
+    )
+    if not isinstance(webhook, dict):
+        return False
+    selector = webhook.get("objectSelector")
+    expressions = (
+        selector.get("matchExpressions")
+        if isinstance(selector, dict)
+        else None
+    )
+    return isinstance(expressions, list) and {
+        "key": CAPZ_EXTERNAL_CONTROL_PLANE_LABEL,
+        "operator": "NotIn",
+        "values": ["true"],
+    } in expressions
+
+
+def _configure_capz_external_control_plane_webhook(root: Path) -> None:
+    resource = (
+        "mutatingwebhookconfiguration/"
+        "capz-mutating-webhook-configuration"
+    )
+    payload = _get_management_resource(root, None, resource)
+    if payload is None:
+        raise RuntimeError("CAPZ mutating webhook configuration is absent")
+    if _capz_external_control_plane_webhook_ready(payload):
+        return
+    webhooks = payload.get("webhooks")
+    if not isinstance(webhooks, list):
+        raise RuntimeError("CAPZ mutating webhook configuration is invalid")
+    index = next(
+        (
+            position
+            for position, item in enumerate(webhooks)
+            if isinstance(item, dict)
+            and item.get("name") == CAPZ_AZURECLUSTER_WEBHOOK
+        ),
+        None,
+    )
+    if index is None:
+        raise RuntimeError("CAPZ AzureCluster mutating webhook is absent")
+    webhook = webhooks[index]
+    selector = webhook.get("objectSelector")
+    selector = dict(selector) if isinstance(selector, dict) else {}
+    expressions = selector.get("matchExpressions")
+    expressions = list(expressions) if isinstance(expressions, list) else []
+    conflicting = [
+        item
+        for item in expressions
+        if isinstance(item, dict)
+        and item.get("key") == CAPZ_EXTERNAL_CONTROL_PLANE_LABEL
+    ]
+    if conflicting:
+        raise RuntimeError("CAPZ external control-plane webhook selector changed")
+    expressions.append(
+        {
+            "key": CAPZ_EXTERNAL_CONTROL_PLANE_LABEL,
+            "operator": "NotIn",
+            "values": ["true"],
+        }
+    )
+    selector["matchExpressions"] = expressions
+    _kubectl(
+        root,
+        "patch",
+        resource,
+        "--type=json",
+        "-p",
+        json.dumps(
+            [
+                {
+                    "op": "test",
+                    "path": f"/webhooks/{index}/name",
+                    "value": CAPZ_AZURECLUSTER_WEBHOOK,
+                },
+                {
+                    "op": "replace",
+                    "path": f"/webhooks/{index}/objectSelector",
+                    "value": selector,
+                },
+            ],
+            separators=(",", ":"),
+        ),
+    )
+    updated = _get_management_resource(root, None, resource)
+    if updated is None or not _capz_external_control_plane_webhook_ready(updated):
+        raise RuntimeError(
+            "CAPZ external control-plane webhook selector was not retained"
         )
 
 
@@ -1192,6 +1307,18 @@ def _inspect_foundation(
                 blockers.append(f"management controller identity changed: {deployment}")
             if not _deployment_ready(observed):
                 blockers.append(f"management controller is unavailable: {deployment}")
+        webhook = _get_management_resource(
+            root,
+            None,
+            "mutatingwebhookconfiguration/capz-mutating-webhook-configuration",
+        )
+        if (
+            webhook is None
+            or not _capz_external_control_plane_webhook_ready(webhook)
+        ):
+            blockers.append(
+                "CAPZ external control-plane webhook selector is unavailable"
+            )
     healthy = not blockers
     if require_healthy and not healthy:
         raise RuntimeError("Azure management foundation is unhealthy: " + "; ".join(blockers))
@@ -1247,6 +1374,20 @@ def _metadata(
     }
     if namespace is not None:
         metadata["namespace"] = namespace
+    return metadata
+
+
+def _external_azure_cluster_metadata(
+    name: str,
+    spec: TenantSpec,
+    markers: Mapping[str, str],
+    *,
+    namespace: str,
+) -> dict[str, object]:
+    metadata = _metadata(name, spec, markers, namespace=namespace)
+    labels = metadata["labels"]
+    assert isinstance(labels, dict)
+    labels[CAPZ_EXTERNAL_CONTROL_PLANE_LABEL] = "true"
     return metadata
 
 
@@ -1352,7 +1493,7 @@ def _render_tenant_control_plane(
         {
             "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta1",
             "kind": "AzureCluster",
-            "metadata": _metadata(
+            "metadata": _external_azure_cluster_metadata(
                 selected["azureCluster"],
                 spec,
                 markers,
@@ -1565,6 +1706,7 @@ def _render_worker_pool(
                     "spec": {
                         "clusterName": spec.name,
                         "version": f"v{spec.kubernetes_version}",
+                        "nodeDrainTimeout": "2m",
                         "bootstrap": {
                             "configRef": {
                                 "apiVersion": "bootstrap.cluster.x-k8s.io/v1beta1",
@@ -2004,6 +2146,113 @@ def _wait_tenant_endpoint(
                 return payload
         time.sleep(5)
     raise RuntimeError("Kamaji tenant control plane did not become ready")
+
+
+def _retain_external_control_plane_lb(
+    root: Path,
+    spec: TenantSpec,
+    journal: OperationJournal,
+) -> None:
+    selected = tenant_names(spec)
+    resource = f"azurecluster/{selected['azureCluster']}"
+    payload = _get_management_resource(root, spec.namespace, resource)
+    if payload is None:
+        raise RuntimeError("AzureCluster is absent after reconciliation")
+    _require_markers(payload, _expected_tenant_markers(spec, journal), resource)
+    metadata = payload.get("metadata")
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if metadata.get("uid") != journal.observed.get("azureClusterUid"):
+        raise RuntimeError("AzureCluster identity changed before webhook bypass")
+    labels = metadata.get("labels")
+    labels = labels if isinstance(labels, dict) else {}
+    if labels.get(CAPZ_EXTERNAL_CONTROL_PLANE_LABEL) != "true":
+        _kubectl(
+            root,
+            "-n",
+            spec.namespace,
+            "patch",
+            resource,
+            "--type=merge",
+            "--field-manager=cnpg-vcluster-azure",
+            "-p",
+            json.dumps(
+                {
+                    "metadata": {
+                        "labels": {
+                            CAPZ_EXTERNAL_CONTROL_PLANE_LABEL: "true",
+                        }
+                    },
+                },
+                separators=(",", ":"),
+            ),
+        )
+    labeled = _get_management_resource(root, spec.namespace, resource)
+    if labeled is None:
+        raise RuntimeError("AzureCluster is absent after webhook bypass")
+    labeled_metadata = labeled.get("metadata")
+    labeled_metadata = (
+        labeled_metadata if isinstance(labeled_metadata, dict) else {}
+    )
+    if (
+        labeled_metadata.get("uid") != journal.observed.get("azureClusterUid")
+        or labeled_metadata.get("labels", {}).get(
+            CAPZ_EXTERNAL_CONTROL_PLANE_LABEL
+        )
+        != "true"
+    ):
+        raise RuntimeError("CAPZ external control-plane label was not retained")
+    labeled_spec = labeled.get("spec")
+    labeled_spec = labeled_spec if isinstance(labeled_spec, dict) else {}
+    labeled_network = labeled_spec.get("networkSpec")
+    labeled_network = (
+        labeled_network if isinstance(labeled_network, dict) else {}
+    )
+    labeled_lb = labeled_network.get("apiServerLB")
+    if not isinstance(labeled_lb, dict) or labeled_lb.get("type") != "Public":
+        _kubectl(
+            root,
+            "-n",
+            spec.namespace,
+            "patch",
+            resource,
+            "--type=merge",
+            "--field-manager=cnpg-vcluster-azure",
+            "-p",
+            json.dumps(
+                {
+                    "spec": {
+                        "networkSpec": {
+                            "apiServerLB": {"type": "Public"},
+                        }
+                    },
+                },
+                separators=(",", ":"),
+            ),
+        )
+    updated = _get_management_resource(root, spec.namespace, resource)
+    if updated is None:
+        raise RuntimeError("AzureCluster is absent after load balancer retention")
+    updated_metadata = updated.get("metadata")
+    updated_metadata = (
+        updated_metadata if isinstance(updated_metadata, dict) else {}
+    )
+    updated_spec = updated.get("spec")
+    updated_spec = updated_spec if isinstance(updated_spec, dict) else {}
+    network_spec = updated_spec.get("networkSpec")
+    network_spec = network_spec if isinstance(network_spec, dict) else {}
+    api_server_lb = network_spec.get("apiServerLB")
+    if (
+        updated_metadata.get("uid") != journal.observed.get("azureClusterUid")
+        or updated_metadata.get("labels", {}).get(
+            CAPZ_EXTERNAL_CONTROL_PLANE_LABEL
+        )
+        != "true"
+        or not isinstance(api_server_lb, dict)
+        or api_server_lb.get("type") != "Public"
+    ):
+        raise RuntimeError(
+            "CAPZ external control-plane load balancer placeholder was not retained"
+        )
 
 
 def _capture_tenant_kubeconfig(
@@ -2447,11 +2696,18 @@ def _tenant_spec_blockers(
     if not isinstance(template, dict):
         template = {}
     interfaces = template.get("networkInterfaces", [])
+    interface_ready = (
+        isinstance(interfaces, list)
+        and len(interfaces) == 1
+        and isinstance(interfaces[0], dict)
+        and interfaces[0].get("subnetName") == "tenant"
+        and interfaces[0].get("privateIPConfigs", 1) == 1
+    )
     image = template.get("image", {})
     gallery = image.get("computeGallery", {}) if isinstance(image, dict) else {}
     if (
         template.get("vmSize") != config["AZURE_TENANT_NODE_SKU"]
-        or interfaces != [{"subnetName": "tenant"}]
+        or not interface_ready
         or not isinstance(gallery, dict)
         or gallery.get("version") != spec.kubernetes_version
     ):
@@ -2635,6 +2891,7 @@ def _classify_management_owned_resources(
     objects: Sequence[Mapping[str, object]],
     *,
     require_complete: bool,
+    verified_uids: Sequence[str] = (),
 ) -> dict[str, object]:
     markers = _expected_tenant_markers(spec, identity)
     expected = {
@@ -2652,6 +2909,7 @@ def _classify_management_owned_resources(
     }
     unknown = []
     classified: dict[tuple[str, str], str] = {}
+    verified_uid_set = set(verified_uids)
     owned_uids = {
         uid
         for key, uid in identity.observed.items()
@@ -2726,7 +2984,11 @@ def _classify_management_owned_resources(
                     | KNOWN_ORCHESTRATION_MANAGEMENT_KINDS
                     | KNOWN_NAMESPACE_CHILD_KINDS
                 ):
-                    classified[identity_key] = "controller"
+                    classified[identity_key] = (
+                        "namespace-child"
+                        if kind in KNOWN_NAMESPACE_CHILD_KINDS
+                        else "controller"
+                    )
                     if item["uid"]:
                         owned_uids.add(str(item["uid"]))
                     changed = True
@@ -2750,8 +3012,23 @@ def _classify_management_owned_resources(
             if isinstance(payload, Mapping)
             else {}
         )
-        if any(observed_markers.values()):
-            if observed_markers != markers:
+        resource_spec = (
+            payload.get("spec")
+            if isinstance(payload, Mapping)
+            else None
+        )
+        resource_tags = (
+            resource_spec.get("tags")
+            if isinstance(resource_spec, Mapping)
+            else None
+        )
+        expected_tags = _azure_tags(markers)
+        has_azure_tags = isinstance(resource_tags, dict) and any(
+            key in resource_tags for key in expected_tags
+        )
+        exact_azure_tags = _azure_tags_match(resource_tags, expected_tags)
+        if any(observed_markers.values()) or has_azure_tags:
+            if observed_markers != markers and not exact_azure_tags:
                 reason = "foreign lifecycle markers"
             elif kind not in (
                 KNOWN_CONTROLLER_MANAGEMENT_KINDS
@@ -2765,6 +3042,21 @@ def _classify_management_owned_resources(
                     else "controller"
                 )
                 continue
+        elif item["uid"] in verified_uid_set and kind in (
+            KNOWN_CONTROLLER_MANAGEMENT_KINDS
+            | KNOWN_ORCHESTRATION_MANAGEMENT_KINDS
+            | KNOWN_NAMESPACE_CHILD_KINDS
+        ):
+            classified[identity_key] = (
+                "namespace-child"
+                if kind in KNOWN_NAMESPACE_CHILD_KINDS
+                else (
+                    "orchestration"
+                    if kind in KNOWN_ORCHESTRATION_MANAGEMENT_KINDS
+                    else "controller"
+                )
+            )
+            continue
         elif kind in KNOWN_NAMESPACE_CHILD_KINDS or (
             kind == "ConfigMap" and name == "kube-root-ca.crt"
         ) or (
@@ -2822,6 +3114,7 @@ def discover_management_owned_resources(
     identity: TenantIdentity | OperationJournal,
     *,
     require_complete: bool,
+    verified_uids: Sequence[str] = (),
 ) -> dict[str, object]:
     namespace = _get_management_resource(root, None, f"namespace/{spec.namespace}")
     if namespace is None:
@@ -2840,6 +3133,7 @@ def discover_management_owned_resources(
         namespace,
         objects,
         require_complete=require_complete,
+        verified_uids=verified_uids,
     )
 
 
@@ -3055,10 +3349,10 @@ def discover_azure_owned_resources(
                 raise RuntimeError(
                     "Azure tenant VMSS instance discovery returned an invalid instance"
                 )
-            instance.setdefault(
-                "type",
-                "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
-            )
+            if not instance.get("type"):
+                instance["type"] = (
+                    "Microsoft.Compute/virtualMachineScaleSets/virtualMachines"
+                )
             resources.append(instance)
             verified_ids.append(instance["id"])
         nic_response = _az(
@@ -3083,7 +3377,8 @@ def discover_azure_owned_resources(
         for nic in nics:
             if not isinstance(nic, dict) or not isinstance(nic.get("id"), str):
                 raise RuntimeError("Azure tenant VMSS NIC discovery returned an invalid NIC")
-            nic.setdefault("type", "Microsoft.Network/networkInterfaces")
+            if not nic.get("type"):
+                nic["type"] = "Microsoft.Network/networkInterfaces"
             resources.append(nic)
             verified_ids.append(nic["id"])
     parent_uids = [
@@ -3140,7 +3435,6 @@ def discover_azure_owned_resources(
             raise RuntimeError("Azure Service Operator discovery returned invalid objects")
         for item in items:
             if isinstance(item, dict):
-                aso_objects.append(item)
                 metadata = item.get("metadata")
                 metadata = metadata if isinstance(metadata, dict) else {}
                 owner_uids = {
@@ -3155,6 +3449,30 @@ def discover_azure_owned_resources(
                     continue
                 status = item.get("status")
                 resource_id = status.get("id") if isinstance(status, dict) else None
+                kind = item.get("kind")
+                if kind in KNOWN_ASO_FOUNDATION_REFERENCE_KINDS:
+                    expected_id = (
+                        outputs["vnetId"]
+                        if kind == "VirtualNetwork"
+                        else outputs["tenantSubnetId"]
+                    )
+                    annotations = metadata.get("annotations")
+                    annotations = (
+                        annotations if isinstance(annotations, dict) else {}
+                    )
+                    if (
+                        not isinstance(resource_id, str)
+                        or not _azure_id_equal(resource_id, expected_id)
+                        or annotations.get(
+                            "serviceoperator.azure.com/reconcile-policy"
+                        )
+                        != "skip"
+                    ):
+                        raise RuntimeError(
+                            f"Azure Service Operator foundation reference changed: {kind}"
+                        )
+                    continue
+                aso_objects.append(item)
                 if isinstance(resource_id, str) and resource_id:
                     verified_ids.append(resource_id)
                     resource_response = _az(
@@ -3390,6 +3708,182 @@ def _exact_delete_management_resource(
         "--wait=false",
     )
     return True
+
+
+def _capz_delete_control_plane_cidr(
+    config: Mapping[str, str],
+) -> str:
+    networks = _foundation_networks(config)
+    vnet = networks["AZURE_VNET_CIDR"]
+    used = (
+        networks["AZURE_AKS_SUBNET_CIDR"],
+        networks["AZURE_TENANT_SUBNET_CIDR"],
+    )
+    prefix_length = max(network.prefixlen for network in used)
+    for candidate in vnet.subnets(new_prefix=prefix_length):
+        if not any(candidate.overlaps(network) for network in used):
+            return str(candidate)
+    raise RuntimeError(
+        "Azure VNet has no unused subnet for the CAPZ deletion workaround"
+    )
+
+
+def _enable_capz_external_control_plane_delete(
+    root: Path,
+    config: Mapping[str, str],
+    spec: TenantSpec,
+    identity: TenantIdentity | OperationJournal,
+) -> None:
+    resource = f"azurecluster/{tenant_names(spec)['azureCluster']}"
+    deadline = time.monotonic() + 120
+    while True:
+        payload = _get_management_resource(root, spec.namespace, resource)
+        if payload is None:
+            return
+        _require_markers(payload, _expected_tenant_markers(spec, identity), resource)
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        if metadata.get("uid") != identity.observed.get("azureClusterUid"):
+            raise RuntimeError(f"Azure tenant management UID changed: {resource}")
+        if metadata.get("deletionTimestamp"):
+            break
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                "AzureCluster deletion did not start before the CAPZ workaround"
+            )
+        time.sleep(2)
+
+    azure_cluster_spec = payload.get("spec")
+    azure_cluster_spec = (
+        azure_cluster_spec if isinstance(azure_cluster_spec, dict) else {}
+    )
+    network_spec = azure_cluster_spec.get("networkSpec")
+    network_spec = network_spec if isinstance(network_spec, dict) else {}
+    if isinstance(network_spec.get("apiServerLB"), dict):
+        return
+    if azure_cluster_spec.get("controlPlaneEnabled") is True:
+        return
+    patch = [
+        {
+            "op": "add",
+            "path": "/spec/networkSpec/subnets/-",
+            "value": {
+                "name": "deletion-control-plane",
+                "role": "control-plane",
+                "cidrBlocks": [_capz_delete_control_plane_cidr(config)],
+            },
+        },
+        {
+            "op": "replace",
+            "path": "/spec/controlPlaneEnabled",
+            "value": True,
+        },
+    ]
+    _kubectl(
+        root,
+        "-n",
+        spec.namespace,
+        "patch",
+        resource,
+        "--type=json",
+        "-p",
+        json.dumps(patch, separators=(",", ":")),
+    )
+    updated = _get_management_resource(root, spec.namespace, resource)
+    if updated is None:
+        return
+    updated_metadata = updated.get("metadata")
+    updated_metadata = (
+        updated_metadata if isinstance(updated_metadata, dict) else {}
+    )
+    updated_spec = updated.get("spec")
+    updated_spec = updated_spec if isinstance(updated_spec, dict) else {}
+    network_spec = updated_spec.get("networkSpec")
+    network_spec = network_spec if isinstance(network_spec, dict) else {}
+    if (
+        updated_metadata.get("uid") != identity.observed.get("azureClusterUid")
+        or not updated_metadata.get("deletionTimestamp")
+        or updated_spec.get("controlPlaneEnabled") is not True
+        or not isinstance(network_spec.get("apiServerLB"), dict)
+    ):
+        raise RuntimeError(
+            "CAPZ external control-plane deletion workaround was not retained"
+        )
+
+
+def _exclude_tenant_machines_from_drain(
+    root: Path,
+    spec: TenantSpec,
+    identity: TenantIdentity | OperationJournal,
+) -> None:
+    selected = tenant_names(spec)
+    response = _kubectl(
+        root,
+        "-n",
+        spec.namespace,
+        "get",
+        "machines",
+        "-l",
+        f"cluster.x-k8s.io/cluster-name={spec.name}",
+        "-o",
+        "json",
+    )
+    payload = json.loads(response.stdout)
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("Azure tenant Machine discovery returned invalid objects")
+    expected_markers = _expected_tenant_markers(spec, identity)
+    expected_pool_uid = identity.observed.get("machinePoolUid")
+    for machine in items:
+        if not isinstance(machine, dict):
+            raise RuntimeError("Azure tenant Machine discovery returned an invalid object")
+        metadata = machine.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        name = metadata.get("name")
+        uid = metadata.get("uid")
+        annotations = metadata.get("annotations")
+        owner_uids = {
+            reference.get("uid")
+            for reference in metadata.get("ownerReferences", [])
+            if isinstance(reference, dict)
+        }
+        if (
+            not isinstance(name, str)
+            or not name
+            or not isinstance(uid, str)
+            or not uid
+            or not isinstance(annotations, dict)
+            or expected_pool_uid not in owner_uids
+        ):
+            raise RuntimeError("Azure tenant Machine ownership is invalid")
+        _require_markers(machine, expected_markers, f"machine/{name}")
+        _kubectl(
+            root,
+            "-n",
+            spec.namespace,
+            "patch",
+            f"machine/{name}",
+            "--type=json",
+            "-p",
+            json.dumps(
+                [
+                    {
+                        "op": "test",
+                        "path": "/metadata/uid",
+                        "value": uid,
+                    },
+                    {
+                        "op": "add",
+                        "path": (
+                            "/metadata/annotations/"
+                            "machine.cluster.x-k8s.io~1exclude-node-draining"
+                        ),
+                        "value": "true",
+                    },
+                ],
+                separators=(",", ":"),
+            ),
+        )
 
 
 def _deletion_diagnostics(
@@ -3664,6 +4158,7 @@ class AzureTenantAdapter:
                 manifest,
                 phase="control-plane-resources",
             )
+            _retain_external_control_plane_lb(root, spec, current)
             control_plane = _wait_tenant_endpoint(root, config, spec)
             endpoint = control_plane["spec"]["controlPlaneEndpoint"]
             endpoint_text = f"{endpoint['host']}:{endpoint['port']}"
@@ -4173,6 +4668,18 @@ class AzureTenantAdapter:
                     spec,
                     identity,
                     require_complete=False,
+                    verified_uids=tuple(
+                        str(item["uid"])
+                        for category in (
+                            "controller",
+                            "orchestration",
+                            "namespaceChildren",
+                        )
+                        for item in management_history[category]
+                        if isinstance(item, dict)
+                        and isinstance(item.get("uid"), str)
+                        and item["uid"]
+                    ),
                 )
                 management_history = _merge_management_discoveries(
                     (management_history, last_management)
@@ -4224,6 +4731,58 @@ class AzureTenantAdapter:
                     + json.dumps(blockers, sort_keys=True),
                     management=management_history,
                     azure=accumulated,
+                )
+            self.sleep(min(10, max(0, deadline - self.monotonic())))
+
+    def _wait_for_worker_cleanup(
+        self,
+        root: Path,
+        config: Mapping[str, str],
+        spec: TenantSpec,
+        identity: TenantIdentity,
+    ) -> None:
+        deadline = self.monotonic() + parse_duration(
+            config["AZURE_TENANT_TIMEOUT"]
+        )
+        selected = tenant_names(spec)
+        resources = (
+            (
+                f"machinepool/{selected['pool']}",
+                "machinePoolUid",
+            ),
+            (
+                f"azuremachinepool/{selected['pool']}",
+                "azureMachinePoolUid",
+            ),
+        )
+        while True:
+            remaining = []
+            for resource, uid_key in resources:
+                payload = _get_management_resource(
+                    root,
+                    spec.namespace,
+                    resource,
+                )
+                if payload is None:
+                    continue
+                _require_markers(
+                    payload,
+                    _expected_tenant_markers(spec, identity),
+                    resource,
+                )
+                metadata = payload.get("metadata")
+                metadata = metadata if isinstance(metadata, dict) else {}
+                if metadata.get("uid") != identity.observed.get(uid_key):
+                    raise RuntimeError(
+                        f"Azure tenant management UID changed: {resource}"
+                    )
+                remaining.append(resource)
+            if not remaining:
+                return
+            if self.monotonic() >= deadline:
+                raise RuntimeError(
+                    "Azure tenant worker cleanup timed out: "
+                    + json.dumps(remaining, sort_keys=True)
                 )
             self.sleep(min(10, max(0, deadline - self.monotonic())))
 
@@ -4340,6 +4899,31 @@ class AzureTenantAdapter:
                     if key not in current.observed
                 },
             )
+            with timings.phase("worker-deletion"):
+                _exclude_tenant_machines_from_drain(
+                    root,
+                    spec,
+                    identity,
+                )
+                _exact_delete_management_resource(
+                    root,
+                    spec,
+                    identity,
+                    namespace=spec.namespace,
+                    resource=f"machinepool/{tenant_names(spec)['pool']}",
+                    uid_key="machinePoolUid",
+                    cascade="foreground",
+                )
+                self._wait_for_worker_cleanup(
+                    root,
+                    config,
+                    spec,
+                    identity,
+                )
+                current = runtime.update_operation(
+                    current,
+                    phase="worker-resources-absent",
+                )
             with timings.phase("deletion"):
                 _exact_delete_management_resource(
                     root,
@@ -4349,6 +4933,12 @@ class AzureTenantAdapter:
                     resource=f"cluster/{spec.name}",
                     uid_key="clusterUid",
                     cascade="foreground",
+                )
+                _enable_capz_external_control_plane_delete(
+                    root,
+                    config,
+                    spec,
+                    identity,
                 )
                 current = runtime.update_operation(
                     current,

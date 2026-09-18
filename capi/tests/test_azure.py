@@ -24,6 +24,8 @@ from scripts.azure import (
     _collect_ready_observations,
     _discover_owned_repeatedly,
     _exact_delete_management_resource,
+    _enable_capz_external_control_plane_delete,
+    _exclude_tenant_machines_from_drain,
     _foundation_defaults_checksum,
     _management_resource_specs,
     _reconcile_manifest,
@@ -31,6 +33,7 @@ from scripts.azure import (
     _render_tenant_control_plane,
     _render_worker_pool,
     _run_profile_mutation,
+    _tenant_spec_blockers,
     _wait_ready_observations,
     _validate_networks,
     azure_tenant_runtime_path,
@@ -399,6 +402,13 @@ class AzurePhaseFourTests(unittest.TestCase):
                     {key: annotations[value] for key, value in LIFECYCLE_MARKERS.items()},
                     expected,
                 )
+                if item["kind"] == "AzureCluster":
+                    self.assertEqual(
+                        item["metadata"]["labels"][
+                            "cnpg-vcluster-external-control-plane"
+                        ],
+                        "true",
+                    )
             combined += path.read_text(encoding="utf-8")
         self.assertIn('"replicas": 3', combined)
         self.assertIn("10.72.0.0/16", combined)
@@ -788,6 +798,7 @@ class AzurePhaseFourTests(unittest.TestCase):
                     patch("scripts.azure._render_worker_pool", return_value=Path("worker")),
                     patch("scripts.azure._render_addon_job", return_value=Path("addons")),
                     patch("scripts.azure._reconcile_manifest", side_effect=reconcile),
+                    patch("scripts.azure._retain_external_control_plane_lb"),
                     patch("scripts.azure._wait_tenant_endpoint", return_value=endpoint),
                     patch(
                         "scripts.azure._capture_tenant_kubeconfig",
@@ -877,6 +888,75 @@ class AzurePhaseFourTests(unittest.TestCase):
         ):
             _, blockers = _collect_ready_observations(root, config, spec)
         self.assertTrue(any("outside the tenant subnet" in item for item in blockers))
+
+    def test_tenant_spec_accepts_capz_defaulted_network_interface(self):
+        spec = self.spec()
+        selected = tenant_names(spec)
+        payloads = {
+            "clusterUid": {
+                "spec": {
+                    "clusterNetwork": {
+                        "pods": {"cidrBlocks": [str(spec.pod_network)]},
+                        "services": {"cidrBlocks": [str(spec.service_network)]},
+                        "serviceDomain": spec.cluster_domain,
+                    }
+                }
+            },
+            "kamajiControlPlaneUid": {
+                "spec": {"version": spec.kubernetes_version}
+            },
+            "machinePoolUid": {
+                "spec": {"replicas": spec.workers, "clusterName": spec.name}
+            },
+            "azureMachinePoolUid": {
+                "spec": {
+                    "template": {
+                        "vmSize": "Standard_B2s",
+                        "networkInterfaces": [
+                            {
+                                "subnetName": "tenant",
+                                "privateIPConfigs": 1,
+                            }
+                        ],
+                        "image": {
+                            "computeGallery": {
+                                "version": spec.kubernetes_version
+                            }
+                        },
+                    }
+                }
+            },
+        }
+        self.assertEqual(
+            _tenant_spec_blockers(
+                spec,
+                selected,
+                payloads,
+                {"AZURE_TENANT_NODE_SKU": "Standard_B2s"},
+            ),
+            (),
+        )
+
+    def test_worker_pool_bounds_node_drain(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        spec = self.spec()
+        _, journal = self.start_journal(root, spec)
+        manifest = _render_worker_pool(
+            root,
+            config,
+            self.inventory(root, config),
+            spec,
+            journal,
+        )
+        payload = json.loads(manifest.read_text(encoding="utf-8"))
+        machine_pool = next(
+            item for item in payload["items"] if item["kind"] == "MachinePool"
+        )
+        self.assertEqual(
+            machine_pool["spec"]["template"]["spec"]["nodeDrainTimeout"],
+            "2m",
+        )
 
     def test_discovery_classifies_complete_known_resource_set(self):
         spec = self.spec()
@@ -1002,7 +1082,7 @@ class AzurePhaseFourTests(unittest.TestCase):
             discover_azure_owned_resources(root, config, spec, journal)
 
         unknown = {
-            "kind": "VirtualNetwork",
+            "kind": "PrivateEndpoint",
             "metadata": {
                 "name": "unknown",
                 "uid": "unknown-uid",
@@ -1013,7 +1093,7 @@ class AzurePhaseFourTests(unittest.TestCase):
         responses = iter(
             (
                 subprocess.CompletedProcess(
-                    [], 0, stdout="virtualnetworks.network.azure.com\n", stderr=""
+                    [], 0, stdout="privateendpoints.network.azure.com\n", stderr=""
                 ),
                 subprocess.CompletedProcess([], 0, stdout="", stderr=""),
                 subprocess.CompletedProcess(
@@ -1035,6 +1115,94 @@ class AzurePhaseFourTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "ownership is unknown"),
         ):
             discover_azure_owned_resources(root, config, spec, journal)
+
+    def test_discovery_accepts_exact_skipped_foundation_references(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        spec = self.spec()
+        runtime, journal = self.start_journal(root, spec)
+        journal = runtime.update_operation(
+            journal,
+            phase="workers",
+            observed={
+                "markerOperationId": journal.operation_id,
+                "azureClusterUid": "azure-cluster-uid",
+                "azureMachinePoolUid": "azure-pool-uid",
+            },
+        )
+        markers = lifecycle_markers(spec, journal)
+        inventory = self.inventory(root, config)
+
+        def parent(_root, _namespace, resource):
+            return {
+                "metadata": {
+                    "uid": (
+                        "azure-cluster-uid"
+                        if resource.startswith("azurecluster/")
+                        else "azure-pool-uid"
+                    ),
+                    "annotations": {
+                        LIFECYCLE_MARKERS[key]: value
+                        for key, value in markers.items()
+                    },
+                }
+            }
+
+        references = {
+            "virtualnetworks.network.azure.com": {
+                "kind": "VirtualNetwork",
+                "metadata": {
+                    "name": "vnet",
+                    "ownerReferences": [{"uid": "azure-cluster-uid"}],
+                    "annotations": {
+                        "serviceoperator.azure.com/reconcile-policy": "skip"
+                    },
+                },
+                "status": {"id": inventory["outputs"]["vnetId"]},
+            },
+            "virtualnetworkssubnets.network.azure.com": {
+                "kind": "VirtualNetworksSubnet",
+                "metadata": {
+                    "name": "subnet",
+                    "ownerReferences": [{"uid": "azure-cluster-uid"}],
+                    "annotations": {
+                        "serviceoperator.azure.com/reconcile-policy": "skip"
+                    },
+                },
+                "status": {"id": inventory["outputs"]["tenantSubnetId"]},
+            },
+        }
+
+        def kubectl(_root, *arguments, **_kwargs):
+            if arguments[0] == "api-resources":
+                group = arguments[2]
+                output = (
+                    "\n".join(references) + "\n"
+                    if group == "network.azure.com"
+                    else ""
+                )
+                return subprocess.CompletedProcess([], 0, stdout=output, stderr="")
+            resource = arguments[3]
+            return subprocess.CompletedProcess(
+                [],
+                0,
+                stdout=json.dumps({"items": [references[resource]]}),
+                stderr="",
+            )
+
+        with (
+            patch("scripts.azure._get_management_resource", side_effect=parent),
+            patch("scripts.azure.load_inventory", return_value=inventory),
+            patch("scripts.azure._json", return_value=[]),
+            patch("scripts.azure._kubectl", side_effect=kubectl),
+        ):
+            discovery = discover_azure_owned_resources(
+                root,
+                config,
+                spec,
+                journal,
+            )
+        self.assertEqual(discovery, {"azure": [], "aso": [], "unknown": []})
         tags = _azure_tags(markers)
         foreign = dict(tags)
         foreign["cnpg-vcluster-operation-id"] = "other"
@@ -1544,6 +1712,279 @@ class AzurePhaseFiveTests(unittest.TestCase):
                 require_complete=True,
             )
 
+    def test_management_inventory_accepts_capz_generated_and_shared_references(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        namespace, payloads = self.management_payloads(spec, identity)
+        markers = {
+            LIFECYCLE_MARKERS["tenant"]: spec.name,
+            LIFECYCLE_MARKERS["profile"]: "azure",
+            LIFECYCLE_MARKERS["specificationSha256"]: spec.sha256(),
+            LIFECYCLE_MARKERS["foundationSha256"]: foundation_sha256(
+                identity.foundation_identity
+            ),
+            LIFECYCLE_MARKERS["operationId"]: identity.observed["markerOperationId"],
+        }
+        azure_cluster_uid = identity.observed["azureClusterUid"]
+        payloads.extend(
+            (
+                {
+                    "kind": "AzureMachinePoolMachine",
+                    "metadata": {
+                        "name": f"{spec.name}-worker-0",
+                        "uid": "azure-pool-machine-uid",
+                        "ownerReferences": [
+                            {"uid": identity.observed["azureMachinePoolUid"]}
+                        ],
+                    },
+                },
+                {
+                    "kind": "PodMetrics",
+                    "metadata": {
+                        "name": "status-probe",
+                        "uid": "metrics-uid",
+                    },
+                },
+                {
+                    "kind": "NatGateway",
+                    "metadata": {
+                        "name": f"{spec.name}-node-natgw-1",
+                        "uid": "orphaned-nat-gateway-uid",
+                    },
+                    "spec": {
+                        "tags": {
+                            "cnpg-vcluster-tenant": spec.name,
+                            "cnpg-vcluster-profile": "azure",
+                            "cnpg-vcluster-spec-sha256": spec.sha256(),
+                            "cnpg-vcluster-foundation-sha256": foundation_sha256(
+                                identity.foundation_identity
+                            ),
+                            "cnpg-vcluster-operation-id": identity.observed[
+                                "markerOperationId"
+                            ],
+                        }
+                    },
+                },
+                {
+                    "kind": "ReplicaSet",
+                    "metadata": {
+                        "name": "status-probe",
+                        "uid": "replica-set-uid",
+                        "ownerReferences": [
+                            {"uid": identity.observed["statusProbeDeploymentUid"]}
+                        ],
+                    },
+                },
+                {
+                    "kind": "Pod",
+                    "metadata": {
+                        "name": "status-probe-pod",
+                        "uid": "pod-uid",
+                        "ownerReferences": [{"uid": "replica-set-uid"}],
+                    },
+                },
+                *(
+                    {
+                        "kind": kind,
+                        "metadata": {
+                            "name": name,
+                            "uid": f"{kind}-uid",
+                            "ownerReferences": [{"uid": azure_cluster_uid}],
+                            "annotations": markers,
+                        },
+                    }
+                    for kind, name in (
+                        ("ResourceGroup", "yy-cv-rg"),
+                        ("VirtualNetwork", "yy-cv-vnet"),
+                        ("VirtualNetworksSubnet", "yy-cv-vnet-tenant"),
+                    )
+                ),
+            )
+        )
+        classified = _classify_management_owned_resources(
+            spec,
+            identity,
+            namespace,
+            payloads,
+            require_complete=True,
+        )
+        controller_kinds = {item["kind"] for item in classified["controller"]}
+        self.assertTrue(
+            {
+                "AzureMachinePoolMachine",
+                "NatGateway",
+                "ResourceGroup",
+                "VirtualNetwork",
+                "VirtualNetworksSubnet",
+            }.issubset(controller_kinds)
+        )
+        self.assertIn(
+            "PodMetrics",
+            {item["kind"] for item in classified["namespaceChildren"]},
+        )
+        self.assertTrue(
+            {"Pod", "ReplicaSet"}.issubset(
+                {item["kind"] for item in classified["namespaceChildren"]}
+            )
+        )
+
+    def test_management_cleanup_accepts_only_snapshotted_orphan_uid(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        namespace, payloads = self.management_payloads(spec, identity)
+        orphan = {
+            "kind": "Service",
+            "metadata": {
+                "name": spec.name,
+                "uid": "snapshotted-service-uid",
+                "deletionTimestamp": "2026-01-01T00:00:00Z",
+                "ownerReferences": [{"uid": "deleted-owner-uid"}],
+            },
+        }
+        payloads.append(orphan)
+        with self.assertRaisesRegex(RuntimeError, "ownership is unknown"):
+            _classify_management_owned_resources(
+                spec,
+                identity,
+                namespace,
+                payloads,
+                require_complete=False,
+            )
+        classified = _classify_management_owned_resources(
+            spec,
+            identity,
+            namespace,
+            payloads,
+            require_complete=False,
+            verified_uids=("snapshotted-service-uid",),
+        )
+        self.assertIn(
+            "snapshotted-service-uid",
+            {item["uid"] for item in classified["controller"]},
+        )
+
+    def test_capz_external_control_plane_delete_workaround_is_delete_only(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        markers = {
+            LIFECYCLE_MARKERS["tenant"]: spec.name,
+            LIFECYCLE_MARKERS["profile"]: "azure",
+            LIFECYCLE_MARKERS["specificationSha256"]: spec.sha256(),
+            LIFECYCLE_MARKERS["foundationSha256"]: foundation_sha256(
+                identity.foundation_identity
+            ),
+            LIFECYCLE_MARKERS["operationId"]: identity.observed["markerOperationId"],
+        }
+        payload = {
+            "metadata": {
+                "uid": identity.observed["azureClusterUid"],
+                "deletionTimestamp": "2026-01-01T00:00:00Z",
+                "annotations": markers,
+            },
+            "spec": {
+                "controlPlaneEnabled": False,
+                "networkSpec": {"subnets": [{"name": "tenant", "role": "node"}]},
+            },
+        }
+        updated = {
+            **payload,
+            "spec": {
+                "controlPlaneEnabled": True,
+                "networkSpec": {
+                    "apiServerLB": {"type": "Public"},
+                    "subnets": payload["spec"]["networkSpec"]["subnets"],
+                },
+            },
+        }
+        with (
+            patch("scripts.azure._get_management_resource", side_effect=(payload, updated)),
+            patch("scripts.azure._kubectl") as kubectl,
+        ):
+            _enable_capz_external_control_plane_delete(
+                root,
+                config,
+                spec,
+                identity,
+            )
+        patch_payload = json.loads(kubectl.call_args.args[-1])
+        self.assertEqual(
+            patch_payload[0]["value"]["cidrBlocks"],
+            ["10.220.32.0/20"],
+        )
+        self.assertEqual(patch_payload[1]["value"], True)
+
+        not_deleting = {
+            **payload,
+            "metadata": {
+                **payload["metadata"],
+                "deletionTimestamp": None,
+            },
+        }
+        with (
+            patch(
+                "scripts.azure._get_management_resource",
+                return_value=not_deleting,
+            ),
+            patch("scripts.azure.time.monotonic", side_effect=(0, 121)),
+            patch("scripts.azure.time.sleep"),
+            patch("scripts.azure._kubectl") as kubectl,
+            self.assertRaisesRegex(RuntimeError, "deletion did not start"),
+        ):
+            _enable_capz_external_control_plane_delete(
+                root,
+                config,
+                spec,
+                identity,
+            )
+        kubectl.assert_not_called()
+
+    def test_delete_marks_only_owned_tenant_machines_to_skip_drain(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        markers = {
+            LIFECYCLE_MARKERS["tenant"]: spec.name,
+            LIFECYCLE_MARKERS["profile"]: "azure",
+            LIFECYCLE_MARKERS["specificationSha256"]: spec.sha256(),
+            LIFECYCLE_MARKERS["foundationSha256"]: foundation_sha256(
+                identity.foundation_identity
+            ),
+            LIFECYCLE_MARKERS["operationId"]: identity.observed["markerOperationId"],
+        }
+        machine = {
+            "kind": "Machine",
+            "metadata": {
+                "name": f"{spec.name}-worker-0",
+                "uid": "machine-uid",
+                "annotations": markers,
+                "ownerReferences": [{"uid": identity.observed["machinePoolUid"]}],
+            },
+        }
+        with patch(
+            "scripts.azure._kubectl",
+            side_effect=(
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps({"items": [machine]}),
+                    stderr="",
+                ),
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+            ),
+        ) as kubectl:
+            _exclude_tenant_machines_from_drain(root, spec, identity)
+        patch_arguments = kubectl.call_args_list[1].args
+        patch_payload = json.loads(patch_arguments[-1])
+        self.assertEqual(patch_payload[0]["value"], "machine-uid")
+        self.assertEqual(
+            patch_payload[1]["path"],
+            "/metadata/annotations/machine.cluster.x-k8s.io~1exclude-node-draining",
+        )
+
     def test_delete_validation_refuses_foundation_and_uid_before_mutation(self):
         root = self.make_root()
         spec = self.spec()
@@ -1730,6 +2171,13 @@ class AzurePhaseFiveTests(unittest.TestCase):
                 "scripts.azure._exact_delete_management_resource",
                 side_effect=delete_resource,
             ),
+            patch("scripts.azure._exclude_tenant_machines_from_drain"),
+            patch("scripts.azure._enable_capz_external_control_plane_delete"),
+            patch.object(
+                adapter,
+                "_wait_for_worker_cleanup",
+                side_effect=lambda *_a: calls.append("workers-absent"),
+            ),
             patch.object(
                 adapter,
                 "_wait_for_controller_cleanup",
@@ -1777,7 +2225,9 @@ class AzurePhaseFiveTests(unittest.TestCase):
             ),
         ):
             adapter.delete(root, spec, identity, runtime, journal, timings)
-        self.assertEqual(calls[0], f"delete:cluster/{spec.name}")
+        self.assertEqual(calls[0], f"delete:machinepool/{spec.name}-worker")
+        self.assertEqual(calls[1], "workers-absent")
+        self.assertEqual(calls[2], f"delete:cluster/{spec.name}")
         controller_index = calls.index("controllers-absent")
         namespace_index = calls.index(f"delete:namespace/{spec.name}")
         self.assertLess(controller_index, namespace_index)
@@ -1790,6 +2240,7 @@ class AzurePhaseFiveTests(unittest.TestCase):
         self.assertEqual(
             phases,
             [
+                "worker-deletion",
                 "deletion",
                 "controller-cleanup",
                 "orchestration-cleanup",
