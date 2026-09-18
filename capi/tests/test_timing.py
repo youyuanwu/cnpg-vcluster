@@ -9,10 +9,31 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.lib.timing import PHASES, PhaseTimings
-from scripts.test_e2e import run_e2e
+from scripts.test_e2e import run_e2e, verify_no_local_runtime_residue
 
 
 class TimingTests(unittest.TestCase):
+    def test_e2e_runtime_check_preserves_only_azure_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            azure = root / ".runtime/azure/resources.json"
+            lifecycle = (
+                root
+                / ".runtime/lifecycle/azure/tenant-example/ready.json"
+            )
+            gate = (
+                root
+                / ".runtime/azure-gate/evidence/lifecycle-operation.json"
+            )
+            for path in (azure, lifecycle, gate):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+            verify_no_local_runtime_residue(root)
+            local = root / ".runtime/tenant-endpoints.json"
+            local.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "tenant-endpoints"):
+                verify_no_local_runtime_residue(root)
+
     def test_records_passed_failed_and_skipped_without_error_text(self) -> None:
         values = iter((1.0, 2.25, 3.0, 3.5))
         timings = PhaseTimings()

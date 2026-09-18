@@ -5,10 +5,10 @@
 The experiment evaluates Cluster API as the reusable tenant-cluster lifecycle
 framework for a future service in which an AKS management cluster hosts
 multiple Kamaji control planes and manages tenant-owned CloudNativePG
-databases. The implemented target is local Docker only. Azure remains a design
-constraint, not an executable environment in this repository.
+databases. The implementation includes a local Docker/CAPD profile and an
+Azure AKS/CAPZ profile behind one provider-neutral tenant lifecycle.
 
-The future tenants are not separate AKS clusters. AKS is the shared management
+Azure tenants are not separate AKS clusters. AKS is the shared management
 cluster; each tenant remains a Kamaji hosted control plane with
 CAPZ-managed Azure worker machines.
 
@@ -27,28 +27,22 @@ flowchart TB
   CAPD[CAPD development provider]
   Kamaji[Kamaji and shared etcd datastore]
   KCP[Kamaji CAPI control-plane provider]
-  A[Tenant A hosted API]
-  B[Tenant B hosted API]
-  AW[3 exclusive CAPD workers]
-  BW[3 exclusive CAPD workers]
-  AV[(Tenant A Docker volume)]
-  BV[(Tenant B Docker volume)]
-  APG[(Tenant A CNPG: 3 instances)]
-  BPG[(Tenant B CNPG: 3 instances)]
+  Specs[Explicit tenant specifications]
+  APIs[Arbitrary tenant hosted APIs]
+  Workers[1-3 exclusive CAPD workers per tenant]
+  Volumes[(One Docker volume per tenant)]
+  CNPG[1-3 CNPG instances per tenant]
 
   Host --> Mgmt
+  Specs --> Mgmt
   Mgmt --> CAPI
   Mgmt --> CAPD
   Mgmt --> Kamaji
   Mgmt --> KCP
-  Kamaji --> A
-  Kamaji --> B
-  CAPI --> AW
-  CAPI --> BW
-  CAPD --> AW
-  CAPD --> BW
-  AV --> AW --> APG
-  BV --> BW --> BPG
+  Kamaji --> APIs
+  CAPI --> Workers
+  CAPD --> Workers
+  Volumes --> Workers --> CNPG
 ```
 
 The management kind node mounts `/var/run/docker.sock` because CAPD creates
@@ -84,7 +78,7 @@ Each tenant is represented in the management cluster by:
 - one `KamajiControlPlane`;
 - one `MachineDeployment`, `KubeadmConfigTemplate`, and
   `DevMachineTemplate`;
-- three CAPI Machines and DevMachines;
+- the requested one to three CAPI Machines and DevMachines;
 - one ClusterResourceSet plus verified Calico and kube-proxy source
   ConfigMaps.
 
@@ -92,6 +86,31 @@ The tenant API owns its Nodes, Calico, CoreDNS, Konnectivity, repository-owned
 kube-proxy, CNPG operator, PostgreSQL Cluster, Secrets, PVCs, and PVs.
 Tenant Nodes and database resources are deliberately absent from the
 management API.
+
+## Provider-neutral lifecycle contract
+
+The public tenant surface is specification-driven:
+
+```bash
+just tenant-create <profile> <spec.json>
+just tenant-status <profile> <tenant>
+just tenant-delete <profile> <tenant> <profile>/<tenant>
+```
+
+Specifications use a strict schema with profile, name, Kubernetes version,
+worker count, Pod CIDR, and Service CIDR; local specifications additionally
+select the database count. The canonical specification checksum binds
+operation journals, resource markers, durable identities, Ready evidence, and
+retries. Removed fixed tenant commands and pre-cutover runtime formats are not
+accepted.
+
+Owner-only state is stored below
+`.runtime/lifecycle/<profile>/<tenant>/`. Create is the idempotent reconcile
+and interrupted-create recovery path. Delete requires the exact
+`profile/tenant` confirmation and retains its journal and sanitized discovery
+evidence until authoritative absence. Status is read-only and classifies the
+tenant as `ready`, `absent`, `progressing`, `deleting`, `degraded`, `failed`,
+or `ownership-invalid`; inspection failures are never reported as absence.
 
 ## Authoritative endpoint strategy
 
@@ -185,7 +204,7 @@ cloud attach/detach, fencing, zones, disk snapshots, or regional failure.
 
 ## Isolation and credential checks
 
-Tenant A and Tenant B use distinct:
+Every pair of selected tenants uses distinct:
 
 - namespaces, labels, VIPs, CA certificates, Pod CIDRs, Service CIDRs, and DNS
   domains;
@@ -214,12 +233,41 @@ Targeted deletion is ordered:
 3. write an owner-only journal bound to the exact CAPI Cluster UID;
 4. delete the Cluster and wait for CAPI/provider objects and containers;
 5. remove the exact Docker volume and runtime records;
-6. prove the survivor's control plane, sources, workers, database, and marker
-   remain unchanged.
+6. prove every survivor's control plane, sources, workers, database, and
+   marker remain unchanged.
 
 The journal makes retries safe both before and after Cluster deletion.
 Canonical Kubernetes `NotFound` is absence; connectivity, authorization,
 unknown-resource, and server failures are inspection failures.
+
+The local lifecycle test creates three arbitrary tenants, deletes a target
+with multiple survivors, refuses deletion while any survivor is unhealthy,
+recreates the target, and separately proves sole-tenant deletion. Stable
+endpoint allocations are bound to the exact management network and released
+only after canonical tenant absence.
+
+## Azure ownership and targeted deletion
+
+The Azure resource group, VNet, subnets, AKS cluster, managed identity, role
+assignment, and federated credentials form a shared Bicep-owned foundation.
+Tenant CAPI objects do not own that foundation. CAPZ owns each tenant
+MachinePool, AzureMachinePool, VMSS, VMSS instances, and NICs; ASO reconciles
+the tenant NAT gateway and public IP.
+
+Deletion verifies exact management UIDs, Azure IDs and tags, ASO objects, and
+the recorded foundation before mutation. Exact tenant Machines are marked with
+CAPI's whole-tenant skip-drain annotation, then the MachinePool is deleted and
+Machine, AzureMachinePool, and VMSS absence is required before Cluster
+deletion. Kubernetes deletes carry UID and resourceVersion preconditions.
+Repeated discovery captures late or temporarily parentless children. The
+normal path never directly deletes a VMSS or removes an Azure provider
+finalizer.
+
+CAPZ `v1.21.1` requires a scoped compatibility selector for Kamaji external
+control planes: only labeled tenant AzureClusters bypass the AzureCluster
+mutating webhook so a non-owning API-server load-balancer placeholder remains
+present while `controlPlaneEnabled=false`. Foundation health verifies that the
+selector is exact.
 
 ## Break-glass boundary
 
@@ -235,31 +283,29 @@ inventory is unchanged.
 
 ## Shared intent and environment mapping
 
-| Concern | Shared intent | Local implementation | Future Azure implementation |
+| Concern | Shared intent | Local implementation | Azure implementation |
 |---|---|---|---|
 | Management cluster | Run lifecycle controllers independently of tenants. | One kind cluster. | An independently provisioned AKS cluster; it is not managed by the tenant CAPI objects. |
 | Tenant control plane | Hosted upstream Kubernetes APIs. | Kamaji on kind with MetalLB VIPs. | Kamaji on AKS with Azure load-balancer integration and production datastore design. |
-| Cluster lifecycle | Declarative CAPI ownership and conditions. | CAPI core v1.14.1 with the v1beta2 contract. | The same CAPI intent and higher-level tenant API. |
+| Cluster lifecycle | Declarative CAPI ownership and conditions. | CAPI core v1.14.1 with the v1beta2 contract. | CAPI/CABPK v1.10.7 and CAPZ v1.21.1 using their v1beta1 contracts behind the same tenant API. |
 | Bootstrap | Generate standard kubeadm join data. | CABPK. | CABPK or another compatible bootstrap provider if required by the Azure worker image. |
-| Worker infrastructure | Three tenant-exclusive workers. | CAPD `DevMachine` Docker containers. | CAPZ self-managed `AzureCluster`/`AzureMachine` workers with `AzureCluster.spec.controlPlaneEnabled: false`, because Kamaji supplies the hosted control plane rather than CAPZ-managed control-plane VMs. |
+| Worker infrastructure | One to three tenant-exclusive workers. | CAPD `DevMachine` Docker containers. | CAPZ `MachinePool`/`AzureMachinePool` VMSS workers with `AzureCluster.spec.controlPlaneEnabled: false`, because Kamaji supplies the hosted control plane. |
 | Cloud integration | Tenant Nodes interact with their cloud environment. | No cloud provider. | External Azure cloud provider and required node identities/RBAC. |
 | Networking | Tenant-specific Pod/Service networks and DNS identity. | Calico plus repository-owned kube-proxy. | Azure-compatible CNI selected during Azure design validation; CIDR and DNS separation remain required. |
-| Storage | Tenant-owned durable volumes survive worker replacement. | Shared Docker volume mounted into workers, static hostPath PVs. | Azure CSI volumes with attach/detach, fencing, zone, snapshot, and recovery tests. |
+| Storage | Tenant-owned durable volumes survive worker replacement. | Shared Docker volume mounted into workers, static hostPath PVs. | Azure CSI, CloudNativePG, attach/detach, fencing, zone, snapshot, and recovery remain future extensions. |
 | Credentials | Explicit, scoped, non-cross-tenant access. | Owner-only kubeconfigs and generated PostgreSQL Secrets. | Azure Workload Identity/managed identities and production secret distribution; no credentials are defined here. |
 | Identity | Bind operations to the intended management cluster, tenant, and cloud resources. | Active-context endpoint/CA validation, exact ownership records, labels, and UID chains. | AKS and Azure Workload Identity, scoped managed identities, and Azure resource IDs validated before mutation. |
 | Add-ons | Deliver verified tenant networking and platform components. | ClusterResourceSet bootstrap sources with explicit target drift repair. | A separately selected Azure-compatible CNI and GitOps/add-on controller; integrity and tenant scoping remain mandatory. |
 | Endpoint | One authoritative API endpoint per tenant. | MetalLB VIP, consistently preseeded across CAPI/Kamaji/CABPK. | Azure load-balancer endpoint, consistently represented in the same contracts. |
-| Cleanup | Delete tenant API resources before infrastructure and prove survivor health. | UID journals plus exact Docker ownership. | Provider finalizers plus Azure resource IDs, locks, and deletion evidence. |
-| Verification | Prove observable health, isolation, persistence, repair, and cleanup. | Targeted suites plus a bounded representative PostgreSQL E2E. | Add Azure VM, load-balancer, identity, disk attach/detach, fencing, zone, snapshot, and deletion evidence. |
+| Cleanup | Delete exact tenant resources while preserving shared foundations. | Survivor validation, UID journals, and exact Docker ownership. | Verified Machines skip whole-tenant drain, CAPI/CAPZ remove the worker pool and VMSS, then Cluster deletion and repeated Azure/ASO absence checks complete. |
+| Verification | Prove observable health, isolation, persistence, repair, and cleanup. | Targeted suites plus a bounded representative PostgreSQL E2E. | A destructive create-delete-recreate gate proves Ready, canonical absence, exact foundation preservation, and Ready recreation. |
 
 ## Explicit non-goals
 
-- No AKS, CAPZ, Azure identity, network, storage, DNS, or load-balancer
-  resources are created.
-- No Azure CLI, credentials, subscriptions, resource groups, or executable
-  Azure manifests are included.
-- CAPD behavior is not treated as proof that CAPZ or Azure Disk semantics
-  work.
+- The Azure profile does not provide production isolation, regional
+  resilience, autoscaling, upgrades, or a production database/storage proof.
+- The provider-neutral contract does not hide provider-specific foundation
+  prerequisites or readiness checks.
 - Privileged Docker workers are not presented as a production isolation
   boundary.
 

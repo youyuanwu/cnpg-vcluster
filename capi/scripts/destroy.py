@@ -135,6 +135,12 @@ def _validate_runtime_inventory(
         relative = path.relative_to(runtime).as_posix()
         if relative == "azure" or relative.startswith("azure/"):
             continue
+        if relative == "azure-gate" or relative.startswith("azure-gate/"):
+            continue
+        if relative == "lifecycle/azure" or relative.startswith(
+            "lifecycle/azure/"
+        ):
+            continue
         if relative == "management/offline-registry-data" or relative.startswith(
             "management/offline-registry-data/"
         ):

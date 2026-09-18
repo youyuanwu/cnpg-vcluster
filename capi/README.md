@@ -3,19 +3,21 @@
 This directory is an independent Linux-only experiment for managing hosted
 Kubernetes tenants with Cluster API. One kind management cluster runs Cluster
 API core, kubeadm bootstrap, the Docker development infrastructure provider,
-Kamaji, and the Kamaji control-plane provider. Each tenant receives a hosted
-control plane, three exclusive Docker worker containers, and a tenant-owned
-three-instance CloudNativePG cluster.
+Kamaji, and the Kamaji control-plane provider. Explicit tenant specifications
+select the hosted control plane, one to three exclusive Docker worker
+containers, and one to three CloudNativePG instances.
 
-The local implementation is designed to preserve a future path to an
-independently provisioned AKS management cluster with Kamaji control planes,
-CAPZ-managed Azure worker machines, the external Azure cloud provider, and
-Azure CSI. This repository does not create or configure Azure resources.
+The Azure profile provisions an independently managed AKS foundation with
+Kamaji control planes, CAPZ-managed Azure worker machines, and the external
+Azure cloud provider. Local and Azure tenants share the same strict
+specification, lifecycle classifications, confirmation, identity, recovery,
+and evidence contract.
 
 The proposed minimal Azure experiment is documented in
 [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md). It
-deliberately prioritizes a one-tenant AKS, Kamaji, CAPZ, VMSS, and CNPG proof
-over production infrastructure and operational hardening.
+deliberately prioritizes tenant control-plane, VMSS worker, cloud-provider,
+targeted deletion, and recreation behavior over production infrastructure,
+Azure Disk/CNPG workload validation, and operational hardening.
 
 Azure foundation operations use the ignored owner-only
 `config/azure.local.env` selectors. Tenant creation and status use the same
@@ -28,15 +30,18 @@ just azure-create-management
 just azure-foundation-status
 just tenant-create azure config/tenants/examples/azure.json
 just tenant-status azure tenant-example
+just tenant-delete azure tenant-example azure/tenant-example
+just azure-test-tenant-lifecycle
 ```
 
-The generic create operation journals and records the tenant control plane,
-CAPZ worker pool, Azure resource identities, add-ons, and Ready evidence under
-owner-only tenant-keyed runtime paths. Pre-cutover Azure foundation inventory
-is rejected and requires a clean redeploy. Targeted Azure tenant deletion is
-implemented and live-validated in the next lifecycle phase. Azure resources
-remain billable until `just azure-destroy` starts deletion of the exact
-recorded experiment resource group.
+The generic lifecycle journals and records the tenant control plane, CAPZ
+worker pool, Azure resource identities, add-ons, and Ready evidence under
+owner-only tenant-keyed runtime paths. Targeted deletion verifies exact
+management UIDs and Azure resource IDs, lets CAPI/CAPZ delete the MachinePool
+and VMSS, proves the shared foundation is unchanged, and then removes tenant
+orchestration state. Pre-cutover Azure foundation inventory is rejected and
+requires a clean redeploy. Azure resources remain billable until targeted
+tenant deletion or `just azure-destroy` completes.
 
 Kamaji uses the public `26.8.6-edge` source release. The edge channel is
 experimental, but it requires no account, activation key, or paid artifact.
@@ -83,6 +88,19 @@ tenant can become healthy and that teardown restores a clean host:
 just test-e2e
 ```
 
+## Tenant specifications and clean cutover
+
+Both profiles require schema `1`, profile, name, Kubernetes version, worker
+count, Pod CIDR, and Service CIDR. Local specifications additionally require
+`databaseCount`. Unknown fields, unsupported versions, invalid types, and
+overlapping networks fail before mutation. Safe examples are in
+[`config/tenants/examples/`](config/tenants/examples/).
+
+The lifecycle does not infer a singleton tenant from environment variables.
+Removed fixed tenant commands, old Azure foundation inventories, and legacy
+tenant runtime layouts are not migrated or adopted. Create and delete retries
+must use the same specification and recorded foundation identity.
+
 `just cache` is the explicit online acquisition and provenance-refresh step.
 After it succeeds, `just tools` and `just preflight` verify and use the local
 cache without Git or registry lookups. `just test-e2e-offline` applies the same
@@ -125,6 +143,10 @@ just test-tenant-lifecycle
 | `just tenant-create local <spec.json>` | Validate the existing foundation and reconcile exactly the selected local tenant. |
 | `just tenant-status local <name>` | Print the selected tenant's read-only lifecycle envelope. |
 | `just tenant-delete local <name> local/<name>` | Delete exactly the selected tenant after survivor validation and explicit approval. |
+| `just tenant-create azure <spec.json>` | Reconcile one explicit Azure tenant on the recorded AKS/CAPZ foundation. |
+| `just tenant-status azure <name>` | Inspect one Azure tenant without mutating state. |
+| `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through CAPI/CAPZ and verify foundation preservation. |
+| `just azure-test-tenant-lifecycle` | Destructively prove Azure create, Ready, targeted absence, foundation preservation, and recreation for the example tenant. |
 | `just diagnose management` | Print management status, workloads, CRDs, and events without mutation. |
 | `just destroy` | Remove recorded tenants, controllers, the management cluster, runtime state, and restore host settings. |
 
@@ -344,10 +366,15 @@ Exact versions, URLs, checksums, source commits, and image digests are in
 - The offline registry is an ephemeral, unauthenticated service on the private
   disposable kind Docker network only; it has no published host port and is
   removed by authoritative teardown.
-- Local tenant mutation is serialized by profile and reconciles one explicit
+- Tenant mutation is serialized by profile and reconciles one explicit
   specification at a time.
-- No Azure provider, credentials, resources, commands, or executable manifests
-  are included.
+- The Azure profile is an experiment with a shared resource group, VNet,
+  subnet, and broad resource-group Contributor identity.
+- CAPZ `v1.21.1` requires the narrowly scoped external-control-plane webhook
+  compatibility selector documented in
+  [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md).
 
-See [`docs/high-level-design.md`](docs/high-level-design.md) for the as-built
-architecture and future Azure mapping.
+See [`docs/high-level-design.md`](docs/high-level-design.md) for the shared
+as-built lifecycle architecture and
+[`docs/azure-experiment-design.md`](docs/azure-experiment-design.md) for the
+Azure profile.

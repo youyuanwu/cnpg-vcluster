@@ -56,17 +56,56 @@ class DestroyTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "unexpected runtime"):
                 _validate_runtime_inventory(root)
 
-    def test_local_runtime_cleanup_preserves_azure_inventory(self) -> None:
+    def test_local_runtime_cleanup_preserves_azure_state(self) -> None:
+        from scripts.destroy import _validate_runtime_inventory
+
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             azure = root / ".runtime" / "azure" / "resources.json"
+            azure_ready = (
+                root
+                / ".runtime"
+                / "lifecycle"
+                / "azure"
+                / "tenant-example"
+                / "ready.json"
+            )
+            azure_gate = (
+                root
+                / ".runtime"
+                / "azure-gate"
+                / "evidence"
+                / "lifecycle-operation.json"
+            )
             local = root / ".runtime" / "management" / "identity.json"
             azure.parent.mkdir(parents=True)
+            azure_ready.parent.mkdir(parents=True)
+            azure_gate.parent.mkdir(parents=True)
             local.parent.mkdir(parents=True)
             azure.write_text('{"azure":true}\n')
+            azure_ready.write_text('{"ready":true}\n')
+            azure_gate.write_text('{"gate":true}\n')
             local.write_text('{"local":true}\n')
+            for path in (
+                root / ".runtime",
+                root / ".runtime" / "azure",
+                root / ".runtime" / "lifecycle",
+                root / ".runtime" / "lifecycle" / "azure",
+                azure_ready.parent,
+                root / ".runtime" / "azure-gate",
+                azure_gate.parent,
+                local.parent,
+            ):
+                path.chmod(0o700)
+            azure.chmod(0o600)
+            azure_ready.chmod(0o600)
+            azure_gate.chmod(0o600)
+            local.chmod(0o600)
+            _validate_runtime_inventory(root)
             _remove_local_runtime(root)
             self.assertTrue(azure.is_file())
+            self.assertTrue(azure_ready.is_file())
+            self.assertTrue(azure_gate.is_file())
             self.assertFalse(local.exists())
 
     def test_dangling_deletion_journal_blocks_live_cleanup(self) -> None:

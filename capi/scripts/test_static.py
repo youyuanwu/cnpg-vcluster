@@ -209,18 +209,23 @@ def check_documentation() -> None:
     design = (ROOT / "docs" / "high-level-design.md").read_text(
         encoding="utf-8"
     )
+    azure_design = (ROOT / "docs" / "azure-experiment-design.md").read_text(
+        encoding="utf-8"
+    )
     notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
     root_readme = (ROOT.parent / "README.md").read_text(encoding="utf-8")
     readme_flat = " ".join(readme.split())
     design_flat = " ".join(design.split())
+    azure_design_flat = " ".join(azure_design.split())
     notices_flat = " ".join(notices.split())
     required_readme = (
         "CAPD `DevCluster` and `DevMachine` resources are development-only",
         "sharing the host kernel",
         "900 KiB",
         "Break-glass finalizer removal",
-        "independently provisioned AKS management cluster",
-        "does not create or configure Azure resources",
+        "Local and Azure tenants share the same strict specification",
+        "`just tenant-delete azure <name> azure/<name>`",
+        "lets CAPI/CAPZ delete the MachinePool and VMSS",
         "Status, conditions, and exits",
         "CAPI implementation does not emit it",
         "Cluster in healthy state",
@@ -245,14 +250,16 @@ def check_documentation() -> None:
         "DynamicInfrastructureClusterPatch=false",
         "ClusterResourceSet packages the initial sources",
         "Azure CSI",
-        "CAPZ self-managed `AzureCluster`/`AzureMachine` workers",
+        "CAPZ `MachinePool`/`AzureMachinePool` VMSS workers",
         "AzureCluster.spec.controlPlaneEnabled: false",
         "| Identity |",
         "| Add-ons |",
         "| Verification |",
-        "No Azure CLI",
+        "provider-neutral tenant lifecycle",
+        "profile/tenant",
+        "multiple survivors",
         "one explicitly selected representative tenant",
-        "future tenants are not separate AKS clusters",
+        "Azure tenants are not separate AKS clusters",
         "Verified acquisition and image distribution",
         "explicit concurrent import and exact-target verification barrier",
         "`just test-e2e-offline`",
@@ -267,6 +274,21 @@ def check_documentation() -> None:
         check(
             token in design_flat,
             f"CAPI design lacks documentation assertion: {token}",
+        )
+    required_azure_design = (
+        "`just tenant-delete azure <tenant> azure/<tenant>`",
+        "`just azure-test-tenant-lifecycle`",
+        "CAPZ remains responsible for VMSS deletion.",
+        "Kubernetes UID/resourceVersion preconditions",
+        "cnpg-vcluster-external-control-plane=true",
+        "Foundation status rejects a missing, broadened, or conflicting selector.",
+        "Targeted deletion to canonical absence",
+        "Recreate from the same specification and reach Ready",
+    )
+    for token in required_azure_design:
+        check(
+            token in azure_design_flat,
+            f"Azure design lacks documentation assertion: {token}",
         )
     for project in (
         "Cluster API",
@@ -290,8 +312,8 @@ def check_documentation() -> None:
         "third-party notices omit the direct etcd source URL",
     )
     check(
-        "one local CloudNativePG experiment" in root_readme,
-        "root README does not identify CAPI as the remaining lab",
+        "one Cluster API and CloudNativePG experiment" in root_readme,
+        "root README does not identify the CAPI tenant lifecycle lab",
     )
     check(
         (ROOT / "licenses" / "README.md").is_file(),

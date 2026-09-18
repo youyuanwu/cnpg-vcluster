@@ -88,6 +88,34 @@ def verify_no_lab_residue(
         raise RuntimeError("offline registry container remained after teardown")
 
 
+def verify_no_local_runtime_residue(root: Path) -> None:
+    runtime = root / ".runtime"
+    if not runtime.exists():
+        return
+    allowed = {
+        "lifecycle",
+        "lifecycle/.locks",
+        "lifecycle/.locks/azure.lock",
+        "lifecycle/rejected",
+    }
+    allowed_prefixes = (
+        "azure",
+        "azure-gate",
+        "lifecycle/azure",
+        "lifecycle/rejected/azure",
+    )
+    for path in runtime.rglob("*"):
+        relative = path.relative_to(runtime).as_posix()
+        if relative in allowed or any(
+            relative == prefix or relative.startswith(prefix + "/")
+            for prefix in allowed_prefixes
+        ):
+            continue
+        raise RuntimeError(
+            f"local runtime remained after E2E teardown: {relative}"
+        )
+
+
 def run_e2e() -> int:
     os.umask(0o077)
     config = load_configuration(ROOT)
@@ -118,8 +146,7 @@ def run_e2e() -> int:
         with timings.phase("teardown"):
             run_just(ROOT, config, "destroy")
             verify_no_lab_residue(config, (tenant_name,))
-            if (ROOT / ".runtime").exists():
-                raise RuntimeError("runtime remained after E2E teardown")
+            verify_no_local_runtime_residue(ROOT)
             for name, expected in original_inotify.items():
                 if read_inotify(name) != expected:
                     raise RuntimeError(f"host inotify was not restored: {name}")
