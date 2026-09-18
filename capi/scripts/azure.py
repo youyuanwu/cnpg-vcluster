@@ -12,6 +12,7 @@ import subprocess
 import sys
 import time
 import urllib.request
+import urllib.parse
 from pathlib import Path
 from typing import Mapping, Sequence
 
@@ -86,6 +87,14 @@ CONTROLLER_DEPLOYMENTS = (
 )
 CAPZ_EXTERNAL_CONTROL_PLANE_LABEL = "cnpg-vcluster-external-control-plane"
 CAPZ_AZURECLUSTER_WEBHOOK = "default.azurecluster.infrastructure.cluster.x-k8s.io"
+MANAGEMENT_RESOURCE_PLURALS = {
+    "AzureClusterIdentity": "azureclusteridentities",
+    "Cluster": "clusters",
+    "ConfigMap": "configmaps",
+    "Job": "jobs",
+    "MachinePool": "machinepools",
+    "Namespace": "namespaces",
+}
 KNOWN_AZURE_TENANT_TYPES = frozenset(
     {
         "microsoft.compute/virtualmachinescalesets",
@@ -791,16 +800,15 @@ def _capz_external_control_plane_webhook_ready(
     if not isinstance(webhook, dict):
         return False
     selector = webhook.get("objectSelector")
-    expressions = (
-        selector.get("matchExpressions")
-        if isinstance(selector, dict)
-        else None
-    )
-    return isinstance(expressions, list) and {
-        "key": CAPZ_EXTERNAL_CONTROL_PLANE_LABEL,
-        "operator": "NotIn",
-        "values": ["true"],
-    } in expressions
+    return selector == {
+        "matchExpressions": [
+            {
+                "key": CAPZ_EXTERNAL_CONTROL_PLANE_LABEL,
+                "operator": "NotIn",
+                "values": ["true"],
+            }
+        ]
+    }
 
 
 def _configure_capz_external_control_plane_webhook(root: Path) -> None:
@@ -829,25 +837,17 @@ def _configure_capz_external_control_plane_webhook(root: Path) -> None:
         raise RuntimeError("CAPZ AzureCluster mutating webhook is absent")
     webhook = webhooks[index]
     selector = webhook.get("objectSelector")
-    selector = dict(selector) if isinstance(selector, dict) else {}
-    expressions = selector.get("matchExpressions")
-    expressions = list(expressions) if isinstance(expressions, list) else []
-    conflicting = [
-        item
-        for item in expressions
-        if isinstance(item, dict)
-        and item.get("key") == CAPZ_EXTERNAL_CONTROL_PLANE_LABEL
-    ]
-    if conflicting:
+    if selector not in (None, {}):
         raise RuntimeError("CAPZ external control-plane webhook selector changed")
-    expressions.append(
-        {
-            "key": CAPZ_EXTERNAL_CONTROL_PLANE_LABEL,
-            "operator": "NotIn",
-            "values": ["true"],
-        }
-    )
-    selector["matchExpressions"] = expressions
+    selector = {
+        "matchExpressions": [
+            {
+                "key": CAPZ_EXTERNAL_CONTROL_PLANE_LABEL,
+                "operator": "NotIn",
+                "values": ["true"],
+            }
+        ]
+    }
     _kubectl(
         root,
         "patch",
@@ -3602,6 +3602,26 @@ def _recorded_owned_resources(identity: TenantIdentity) -> dict[str, object]:
     return _merge_owned_discoveries((payload,))
 
 
+def _journal_discovery(
+    journal: OperationJournal,
+    key: str,
+) -> dict[str, object] | None:
+    serialized = journal.observed.get(key)
+    if serialized is None:
+        return None
+    try:
+        payload = json.loads(serialized)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"recorded Azure deletion discovery is invalid: {key}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(
+            f"recorded Azure deletion discovery is invalid: {key}"
+        )
+    return payload
+
+
 def _require_recorded_resources_present(
     recorded: Mapping[str, object],
     discovered: Mapping[str, object],
@@ -3696,16 +3716,68 @@ def _exact_delete_management_resource(
         raise RuntimeError(
             f"Azure tenant management resourceVersion is absent: {resource}"
         )
-    arguments = []
-    if namespace is not None:
-        arguments.extend(("-n", namespace))
+    api_version = payload.get("apiVersion")
+    kind = payload.get("kind")
+    name = metadata.get("name")
+    plural = MANAGEMENT_RESOURCE_PLURALS.get(str(kind))
+    if (
+        not isinstance(api_version, str)
+        or not api_version
+        or not isinstance(name, str)
+        or not name
+        or plural is None
+    ):
+        raise RuntimeError(
+            f"Azure tenant management API identity is invalid: {resource}"
+        )
+    if "/" in api_version:
+        group, version = api_version.split("/", 1)
+        base = (
+            "/apis/"
+            + urllib.parse.quote(group, safe=".")
+            + "/"
+            + urllib.parse.quote(version, safe="")
+        )
+    else:
+        base = "/api/" + urllib.parse.quote(api_version, safe="")
+    if namespace is None:
+        path = (
+            f"{base}/{plural}/"
+            + urllib.parse.quote(name, safe="")
+        )
+    else:
+        path = (
+            f"{base}/namespaces/"
+            + urllib.parse.quote(namespace, safe="")
+            + f"/{plural}/"
+            + urllib.parse.quote(name, safe="")
+        )
+    propagation = {
+        "background": "Background",
+        "foreground": "Foreground",
+        "orphan": "Orphan",
+    }.get(cascade)
+    if propagation is None:
+        raise RuntimeError(f"unsupported Kubernetes deletion propagation: {cascade}")
     _kubectl(
         root,
-        *arguments,
         "delete",
-        resource,
-        f"--cascade={cascade}",
-        "--wait=false",
+        f"--raw={path}",
+        "-f",
+        "-",
+        input_text=json.dumps(
+            {
+                "apiVersion": "v1",
+                "kind": "DeleteOptions",
+                "propagationPolicy": propagation,
+                "preconditions": {
+                    "uid": uid,
+                    "resourceVersion": resource_version,
+                },
+            },
+            separators=(",", ":"),
+        )
+        + "\n",
     )
     return True
 
@@ -3811,12 +3883,11 @@ def _enable_capz_external_control_plane_delete(
         )
 
 
-def _exclude_tenant_machines_from_drain(
+def _owned_tenant_machines(
     root: Path,
     spec: TenantSpec,
     identity: TenantIdentity | OperationJournal,
-) -> None:
-    selected = tenant_names(spec)
+) -> list[Mapping[str, object]]:
     response = _kubectl(
         root,
         "-n",
@@ -3834,6 +3905,7 @@ def _exclude_tenant_machines_from_drain(
         raise RuntimeError("Azure tenant Machine discovery returned invalid objects")
     expected_markers = _expected_tenant_markers(spec, identity)
     expected_pool_uid = identity.observed.get("machinePoolUid")
+    result = []
     for machine in items:
         if not isinstance(machine, dict):
             raise RuntimeError("Azure tenant Machine discovery returned an invalid object")
@@ -3857,6 +3929,20 @@ def _exclude_tenant_machines_from_drain(
         ):
             raise RuntimeError("Azure tenant Machine ownership is invalid")
         _require_markers(machine, expected_markers, f"machine/{name}")
+        result.append(machine)
+    return result
+
+
+def _exclude_tenant_machines_from_drain(
+    root: Path,
+    spec: TenantSpec,
+    identity: TenantIdentity | OperationJournal,
+) -> None:
+    for machine in _owned_tenant_machines(root, spec, identity):
+        metadata = machine["metadata"]
+        assert isinstance(metadata, dict)
+        name = metadata["name"]
+        uid = metadata["uid"]
         _kubectl(
             root,
             "-n",
@@ -4598,11 +4684,45 @@ class AzureTenantAdapter:
         ):
             raise RuntimeError("conflicting Azure tenant lifecycle operation exists")
         require_complete = pending is None
-        management = discover_management_owned_resources(
+        recorded_management = []
+        recorded_azure = []
+        if pending is not None:
+            for key in (
+                "deleteManagementBefore",
+                "deleteManagementDiscovered",
+            ):
+                discovery = _journal_discovery(pending, key)
+                if discovery is not None:
+                    recorded_management.append(discovery)
+            for key in (
+                "deleteAzureBefore",
+                "deleteAzureDiscovered",
+                "deleteAzureFinalDiscovery",
+            ):
+                discovery = _journal_discovery(pending, key)
+                if discovery is not None:
+                    recorded_azure.append(discovery)
+        management_history = _merge_management_discoveries(recorded_management)
+        management_current = discover_management_owned_resources(
             root,
             spec,
             identity,
             require_complete=require_complete,
+            verified_uids=tuple(
+                str(item["uid"])
+                for category in (
+                    "controller",
+                    "orchestration",
+                    "namespaceChildren",
+                )
+                for item in management_history[category]
+                if isinstance(item, dict)
+                and isinstance(item.get("uid"), str)
+                and item["uid"]
+            ),
+        )
+        management = _merge_management_discoveries(
+            (management_history, management_current)
         )
         if require_complete:
             kubeconfig_secret = next(
@@ -4620,7 +4740,8 @@ class AzureTenantAdapter:
                 != identity.observed.get("tenantKubeconfigSecretUid")
             ):
                 raise RuntimeError("Azure tenant kubeconfig Secret identity changed")
-        azure = _discover_owned_repeatedly(
+        azure_history = _merge_owned_discoveries(recorded_azure)
+        azure_current = _discover_owned_repeatedly(
             root,
             config,
             spec,
@@ -4628,7 +4749,14 @@ class AzureTenantAdapter:
             passes=2,
             require_parents=require_complete,
             require_azure_resources=require_complete,
+            verified_resource_ids=tuple(
+                str(item["id"])
+                for item in azure_history["azure"]
+                if isinstance(item, dict)
+                and isinstance(item.get("id"), str)
+            ),
         )
+        azure = _merge_owned_discoveries((azure_history, azure_current))
         if require_complete:
             _require_recorded_resources_present(
                 _recorded_owned_resources(identity),
@@ -4745,6 +4873,19 @@ class AzureTenantAdapter:
             config["AZURE_TENANT_TIMEOUT"]
         )
         selected = tenant_names(spec)
+        inventory = load_inventory(root, config)
+        outputs = inventory.get("outputs")
+        if not isinstance(outputs, dict):
+            raise RuntimeError("Azure foundation inventory outputs are invalid")
+        resource_group = outputs.get("resourceGroupName")
+        vmss_id = identity.observed.get("vmssId")
+        if (
+            not isinstance(resource_group, str)
+            or not resource_group
+            or not isinstance(vmss_id, str)
+            or not vmss_id
+        ):
+            raise RuntimeError("Azure tenant VMSS identity is absent")
         resources = (
             (
                 f"machinepool/{selected['pool']}",
@@ -4777,6 +4918,37 @@ class AzureTenantAdapter:
                         f"Azure tenant management UID changed: {resource}"
                     )
                 remaining.append(resource)
+            remaining.extend(
+                f"machine/{machine['metadata']['name']}"
+                for machine in _owned_tenant_machines(root, spec, identity)
+            )
+            vmss_response = _az(
+                "vmss",
+                "list",
+                "--resource-group",
+                resource_group,
+                "--query",
+                "[].id",
+                "--output",
+                "json",
+                check=False,
+            )
+            if vmss_response.returncode != 0:
+                raise RuntimeError("Azure tenant VMSS absence check failed")
+            try:
+                vmss_ids = json.loads(vmss_response.stdout)
+            except json.JSONDecodeError as exc:
+                raise RuntimeError(
+                    "Azure tenant VMSS absence check returned invalid data"
+                ) from exc
+            if not isinstance(vmss_ids, list) or not all(
+                isinstance(item, str) for item in vmss_ids
+            ):
+                raise RuntimeError(
+                    "Azure tenant VMSS absence check returned invalid data"
+                )
+            if any(_azure_id_equal(item, vmss_id) for item in vmss_ids):
+                remaining.append(f"vmss/{selected['pool']}")
             if not remaining:
                 return
             if self.monotonic() >= deadline:

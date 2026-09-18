@@ -19,6 +19,7 @@ from scripts.azure import (
     FOUNDATION_INVENTORY_SCHEMA,
     _azure_id_equal,
     _azure_tags,
+    _capz_external_control_plane_webhook_ready,
     _capture_tenant_kubeconfig,
     _classify_management_owned_resources,
     _collect_ready_observations,
@@ -1626,6 +1627,41 @@ class AzurePhaseFiveTests(unittest.TestCase):
         )
         return runtime, runtime.load_identity()
 
+    def test_capz_webhook_selector_must_be_exact(self):
+        expected = {
+            "matchExpressions": [
+                {
+                    "key": "cnpg-vcluster-external-control-plane",
+                    "operator": "NotIn",
+                    "values": ["true"],
+                }
+            ]
+        }
+        payload = {
+            "webhooks": [
+                {
+                    "name": "default.azurecluster.infrastructure.cluster.x-k8s.io",
+                    "objectSelector": expected,
+                }
+            ]
+        }
+        self.assertTrue(_capz_external_control_plane_webhook_ready(payload))
+        payload["webhooks"][0]["objectSelector"] = {
+            **expected,
+            "matchLabels": {"other": "value"},
+        }
+        self.assertFalse(_capz_external_control_plane_webhook_ready(payload))
+        payload["webhooks"][0]["objectSelector"] = {
+            "matchExpressions": [
+                *expected["matchExpressions"],
+                {
+                    "key": "cnpg-vcluster-external-control-plane",
+                    "operator": "Exists",
+                },
+            ]
+        }
+        self.assertFalse(_capz_external_control_plane_webhook_ready(payload))
+
     def management_payloads(self, spec, identity):
         markers = {
             "tenant": spec.name,
@@ -1865,6 +1901,94 @@ class AzurePhaseFiveTests(unittest.TestCase):
             {item["uid"] for item in classified["controller"]},
         )
 
+    def test_delete_resume_restores_recorded_discovery_identities(self):
+        root = self.make_root()
+        spec = self.spec()
+        runtime, identity = self.ready_identity(root, spec)
+        journal = runtime.start_operation(
+            operation="delete",
+            spec=spec,
+            foundation_identity=identity.foundation_identity,
+            intended_resources=AzureTenantAdapter.intended_resources(spec),
+            operation_id="delete-resume",
+        )
+        management = {
+            "controller": [
+                {
+                    "kind": "Service",
+                    "name": spec.name,
+                    "uid": "recorded-service-uid",
+                }
+            ],
+            "orchestration": [],
+            "namespaceChildren": [],
+            "unknown": [],
+        }
+        azure = {
+            "azure": [
+                {
+                    "id": (
+                        "/subscriptions/redacted/resourceGroups/yy-cv-rg/"
+                        "providers/Microsoft.Network/publicIPAddresses/recorded"
+                    ),
+                    "type": "microsoft.network/publicipaddresses",
+                }
+            ],
+            "aso": [],
+            "unknown": [],
+        }
+        runtime.update_operation(
+            journal,
+            phase="controller-cleanup",
+            observed={
+                "deleteManagementBefore": json.dumps(management),
+                "deleteAzureBefore": json.dumps(azure),
+            },
+        )
+        empty_management = {
+            "controller": [],
+            "orchestration": [],
+            "namespaceChildren": [],
+            "unknown": [],
+        }
+        empty_azure = {"azure": [], "aso": [], "unknown": []}
+        adapter = AzureTenantAdapter()
+        with (
+            patch.object(
+                adapter,
+                "_config",
+                return_value=load_azure_configuration(root),
+            ),
+            patch("scripts.azure._active_subscription"),
+            patch(
+                "scripts.azure._inspect_foundation",
+                return_value=(FOUNDATION, True, ()),
+            ),
+            patch(
+                "scripts.azure.discover_management_owned_resources",
+                return_value=empty_management,
+            ) as management_discovery,
+            patch(
+                "scripts.azure._discover_owned_repeatedly",
+                return_value=empty_azure,
+            ) as azure_discovery,
+        ):
+            adapter.validate_delete(root, spec, identity)
+        self.assertIn(
+            "recorded-service-uid",
+            management_discovery.call_args.kwargs["verified_uids"],
+        )
+        self.assertIn(
+            azure["azure"][0]["id"],
+            azure_discovery.call_args.kwargs["verified_resource_ids"],
+        )
+        self.assertEqual(
+            adapter._delete_snapshots[spec.name]["management"]["controller"][0][
+                "uid"
+            ],
+            "recorded-service-uid",
+        )
+
     def test_capz_external_control_plane_delete_workaround_is_delete_only(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -1985,6 +2109,53 @@ class AzurePhaseFiveTests(unittest.TestCase):
             "/metadata/annotations/machine.cluster.x-k8s.io~1exclude-node-draining",
         )
 
+    def test_worker_cleanup_waits_for_machines_and_vmss(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        spec = self.spec()
+        _, identity = self.ready_identity(root, spec)
+        adapter = AzureTenantAdapter(
+            monotonic=iter((0, 10_000)).__next__,
+            sleep=lambda _seconds: None,
+        )
+        machine = {
+            "metadata": {
+                "name": f"{spec.name}-worker-0",
+            }
+        }
+        with (
+            patch(
+                "scripts.azure.load_inventory",
+                return_value={
+                    "outputs": {"resourceGroupName": "yy-cv-rg"}
+                },
+            ),
+            patch("scripts.azure._get_management_resource", return_value=None),
+            patch(
+                "scripts.azure._owned_tenant_machines",
+                return_value=[machine],
+            ),
+            patch(
+                "scripts.azure._az",
+                return_value=subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps([identity.observed["vmssId"]]),
+                    stderr="",
+                ),
+            ),
+            self.assertRaisesRegex(
+                RuntimeError,
+                "machine/tenant-c-worker-0.*vmss/tenant-c-worker",
+            ),
+        ):
+            adapter._wait_for_worker_cleanup(
+                root,
+                config,
+                spec,
+                identity,
+            )
+
     def test_delete_validation_refuses_foundation_and_uid_before_mutation(self):
         root = self.make_root()
         spec = self.spec()
@@ -2026,7 +2197,10 @@ class AzurePhaseFiveTests(unittest.TestCase):
             "operationId": identity.observed["markerOperationId"],
         }
         payload = {
+            "apiVersion": "cluster.x-k8s.io/v1beta1",
+            "kind": "Cluster",
             "metadata": {
+                "name": spec.name,
                 "uid": identity.observed["clusterUid"],
                 "resourceVersion": "42",
                 "annotations": {
@@ -2051,7 +2225,22 @@ class AzurePhaseFiveTests(unittest.TestCase):
                 )
             )
         arguments = kubectl.call_args.args
-        self.assertIn("--cascade=foreground", arguments)
+        self.assertIn(
+            (
+                "--raw=/apis/cluster.x-k8s.io/v1beta1/namespaces/"
+                f"{spec.namespace}/clusters/{spec.name}"
+            ),
+            arguments,
+        )
+        options = json.loads(kubectl.call_args.kwargs["input_text"])
+        self.assertEqual(
+            options["preconditions"],
+            {
+                "uid": identity.observed["clusterUid"],
+                "resourceVersion": "42",
+            },
+        )
+        self.assertEqual(options["propagationPolicy"], "Foreground")
         payload["metadata"]["uid"] = "foreign"
         with (
             patch("scripts.azure._get_management_resource", return_value=payload),
@@ -2082,7 +2271,10 @@ class AzurePhaseFiveTests(unittest.TestCase):
                 uid_key="namespaceUid",
                 cascade="foreground",
             )
-        self.assertIn(f"namespace/{spec.name}", kubectl.call_args.args)
+        self.assertIn(
+            f"--raw=/api/v1/namespaces/{spec.name}",
+            kubectl.call_args.args,
+        )
 
     def test_repeated_discovery_captures_late_resources(self):
         root = self.make_root()
@@ -2282,6 +2474,7 @@ class AzurePhaseFiveTests(unittest.TestCase):
         with (
             patch.object(adapter, "_config", return_value=load_azure_configuration(root)),
             patch("scripts.azure._exact_delete_management_resource", return_value=True),
+            patch.object(adapter, "_wait_for_worker_cleanup"),
             patch.object(
                 adapter,
                 "_wait_for_controller_cleanup",
@@ -2415,6 +2608,7 @@ class AzurePhaseFiveTests(unittest.TestCase):
         with (
             patch.object(adapter, "_config", return_value=load_azure_configuration(root)),
             patch("scripts.azure._exact_delete_management_resource", return_value=True),
+            patch.object(adapter, "_wait_for_worker_cleanup"),
             patch.object(
                 adapter,
                 "_wait_for_controller_cleanup",
