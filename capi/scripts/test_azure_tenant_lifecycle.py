@@ -78,10 +78,26 @@ def _recorded_foundation_groups(
             "Azure lifecycle gate managed node resource group is unrecorded"
         )
     return {
+        "schema": str(payload["schema"]),
         "resourceGroupId": outputs["resourceGroupId"],
         "resourceGroupName": outputs["resourceGroupName"],
         "nodeResourceGroupName": node_group,
     }
+
+
+def _healthy_schema_v2_foundation(
+    root: Path,
+    config: dict[str, str],
+) -> dict[str, str] | None:
+    recorded = _recorded_foundation_groups(root, config)
+    if recorded is None or recorded["schema"] != "2":
+        return None
+    foundation, _, _ = _inspect_foundation(
+        root,
+        config,
+        require_healthy=True,
+    )
+    return foundation
 
 
 def _destroy_recorded_foundation(root: Path, config: dict[str, str]) -> None:
@@ -201,22 +217,26 @@ def main(arguments: list[str]) -> int:
 
     primary = None
     try:
-        phase(
-            "destroy-legacy-foundation",
-            lambda: _run_profile_mutation(
-                ROOT,
-                config,
-                _destroy_recorded_foundation,
-            ),
-        )
-        phase(
-            "create-schema-v2-foundation",
-            lambda: _run_profile_mutation(ROOT, config, create_foundation),
-        )
-        phase(
-            "create-management",
-            lambda: _run_profile_mutation(ROOT, config, create_management),
-        )
+        foundation_before = _healthy_schema_v2_foundation(ROOT, config)
+        if foundation_before is None:
+            phase(
+                "destroy-legacy-foundation",
+                lambda: _run_profile_mutation(
+                    ROOT,
+                    config,
+                    _destroy_recorded_foundation,
+                ),
+            )
+            phase(
+                "create-schema-v2-foundation",
+                lambda: _run_profile_mutation(ROOT, config, create_foundation),
+            )
+            phase(
+                "create-management",
+                lambda: _run_profile_mutation(ROOT, config, create_management),
+            )
+        else:
+            phase("reuse-schema-v2-foundation", lambda: foundation_before)
         foundation_before = phase(
             "foundation-snapshot",
             lambda: _inspect_foundation(

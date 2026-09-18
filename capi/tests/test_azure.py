@@ -17,6 +17,7 @@ from unittest.mock import patch
 from scripts.azure import (
     AzureTenantAdapter,
     FOUNDATION_INVENTORY_SCHEMA,
+    _azure_id_equal,
     _azure_tags,
     _capture_tenant_kubeconfig,
     _classify_management_owned_resources,
@@ -30,6 +31,7 @@ from scripts.azure import (
     _render_tenant_control_plane,
     _render_worker_pool,
     _run_profile_mutation,
+    _wait_ready_observations,
     _validate_networks,
     azure_tenant_runtime_path,
     classify_azure_owned_resources,
@@ -102,6 +104,46 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzurePhaseFourTests(unittest.TestCase):
+    def test_ready_wait_retries_until_cloud_and_network_converge(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        spec = self.spec()
+        ready = {"nodes": [{"name": "node-0"}]}
+        with (
+            patch(
+                "scripts.azure._collect_ready_observations",
+                side_effect=[
+                    ({}, ("Node is not Ready",)),
+                    ({}, ("calicoNode is not Ready",)),
+                    (ready, ()),
+                ],
+            ) as collect,
+            patch("scripts.azure.time.sleep"),
+            patch(
+                "scripts.azure.time.monotonic",
+                side_effect=[0, 1, 2, 3],
+            ),
+        ):
+            self.assertEqual(
+                _wait_ready_observations(root, config, spec),
+                ready,
+            )
+        self.assertEqual(collect.call_count, 3)
+
+    def test_azure_resource_ids_are_case_insensitive(self):
+        self.assertTrue(
+            _azure_id_equal(
+                "/subscriptions/x/resourcegroups/rg/providers/example/item",
+                "/subscriptions/x/resourceGroups/rg/providers/example/item",
+            )
+        )
+        self.assertFalse(
+            _azure_id_equal(
+                "/subscriptions/x/resourceGroups/a",
+                "/subscriptions/x/resourceGroups/b",
+            )
+        )
+
     def make_root(self) -> Path:
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)

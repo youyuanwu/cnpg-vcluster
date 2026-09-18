@@ -257,6 +257,10 @@ def _json(command: Sequence[str], timeout: int = 300) -> object:
     return json.loads(result.stdout)
 
 
+def _azure_id_equal(left: object, right: object) -> bool:
+    return str(left or "").lower() == str(right or "").lower()
+
+
 def _foundation_networks(config: Mapping[str, str]) -> dict[str, ipaddress.IPv4Network]:
     try:
         return {
@@ -1058,7 +1062,7 @@ def _inspect_foundation(
         blockers.append("recorded AKS management cluster is absent")
     else:
         payload = json.loads(aks.stdout)
-        if payload.get("id") != outputs["aksId"]:
+        if not _azure_id_equal(payload.get("id"), outputs["aksId"]):
             blockers.append("AKS management identity changed")
         if payload.get("provisioningState") != "Succeeded":
             blockers.append("AKS provisioning is not Succeeded")
@@ -2379,6 +2383,24 @@ def _collect_ready_observations(
     return observations, tuple(blockers)
 
 
+def _wait_ready_observations(
+    root: Path,
+    config: Mapping[str, str],
+    spec: TenantSpec,
+) -> dict[str, object]:
+    deadline = time.monotonic() + parse_duration(config["AZURE_TENANT_TIMEOUT"])
+    last_blockers: tuple[str, ...] = ("tenant readiness has not been observed",)
+    while time.monotonic() < deadline:
+        observations, blockers = _collect_ready_observations(root, config, spec)
+        if not blockers:
+            return observations
+        last_blockers = blockers
+        time.sleep(10)
+    raise RuntimeError(
+        "Azure tenant is not Ready: " + "; ".join(last_blockers)
+    )
+
+
 def _tenant_spec_blockers(
     spec: TenantSpec,
     selected: Mapping[str, str],
@@ -3695,9 +3717,7 @@ class AzureTenantAdapter:
                 phase="addon-resources",
             )
             _wait_addon_job(root, config, spec)
-            observations, blockers = _collect_ready_observations(root, config, spec)
-            if blockers:
-                raise RuntimeError("Azure tenant is not Ready: " + "; ".join(blockers))
+            observations = _wait_ready_observations(root, config, spec)
             component_identities = observations["componentIdentities"]
             if not isinstance(component_identities, dict) or not all(
                 isinstance(value, str) and value
