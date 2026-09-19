@@ -15,6 +15,7 @@ from unittest.mock import patch
 from scripts.lib.files import has_owner_only_permissions, write_private_file
 from scripts.lib.locking import e2e_lock, profile_lock, tools_lock
 from scripts.lib.tenant_runtime import (
+    OperationJournal,
     TenantRuntime,
     TenantRuntimeError,
     foundation_sha256,
@@ -75,6 +76,8 @@ class FakeAdapter:
     def delete(self, root, spec, identity, runtime, journal, timings):
         self.calls.append("delete")
         self.assert_operation_precedes_mutation(runtime, journal)
+        if runtime.paths.ready.exists():
+            raise AssertionError("Ready evidence survived until provider mutation")
         with timings.phase("deletion"):
             if self.failure is not None:
                 raise self.failure
@@ -552,6 +555,19 @@ class TenantCliTests(unittest.TestCase):
                 journal,
                 markers | {"operationId": "foreign"},
             )
+        retried = OperationJournal(
+            operation_id="operation-2",
+            operation="create",
+            profile="local",
+            tenant="tenant-c",
+            specification=spec.to_mapping(),
+            specification_sha256=spec.sha256(),
+            foundation_identity={"management": "management-uid"},
+            intended_resources=("Cluster/tenant-c",),
+            phase="retry",
+            observed={"markerOperationId": "operation-1"},
+        )
+        runtime.require_recoverable_markers(retried, markers)
 
     def test_dispatcher_recovers_resource_created_before_uid_persistence(self) -> None:
         _, root, spec_path = self.make_root()

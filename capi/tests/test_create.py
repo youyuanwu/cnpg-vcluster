@@ -6,7 +6,7 @@ import tempfile
 import unittest
 from contextlib import ExitStack
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.create import (
     _incomplete_snapshot_error,
@@ -20,6 +20,81 @@ from scripts.lib.tenants import LIFECYCLE_MARKERS, Tenant, lifecycle_markers
 
 
 class CreateTests(unittest.TestCase):
+    def test_recorded_management_uid_is_checked_before_create_mutation(self) -> None:
+        spec = TenantSpec.from_mapping(
+            {
+                "schema": 1,
+                "profile": "local",
+                "name": "tenant-c",
+                "kubernetesVersion": "1.36.4",
+                "workers": 1,
+                "podCIDR": "10.73.0.0/16",
+                "serviceCIDR": "10.143.0.0/16",
+                "databaseCount": 1,
+            }
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = TenantRuntime(root, "local", spec.name)
+            journal = runtime.start_operation(
+                operation="create",
+                spec=spec,
+                foundation_identity={"management": "uid"},
+                intended_resources=("Cluster/tenant-c",),
+                operation_id="create-operation",
+            )
+            journal = runtime.update_operation(
+                journal,
+                phase="control-plane",
+                observed={
+                    "markerOperationId": journal.operation_id,
+                    "clusterUID": "recorded-cluster-uid",
+                },
+            )
+            markers = lifecycle_markers(spec, journal)
+            tenant = Tenant(
+                name=spec.name,
+                namespace=spec.namespace,
+                vip="172.18.0.10",
+                pod_cidr=str(spec.pod_network),
+                service_cidr=str(spec.service_network),
+                dns_ip=spec.dns_service_ip,
+                domain=spec.cluster_domain,
+                storage_host_path=root / "storage",
+                cnpg_cluster=spec.database_name or "",
+                workers=1,
+                database_count=1,
+                lifecycle_markers=markers,
+            )
+            resources = {
+                "cluster": {
+                    "metadata": {
+                        "uid": "replacement-cluster-uid",
+                    }
+                }
+            }
+            with (
+                patch("scripts.create.validate_selected_tenant_inputs"),
+                patch(
+                    "scripts.create.verify_tenant_management_ownership",
+                    return_value=resources,
+                ),
+                patch("scripts.create.apply_control_plane") as mutate,
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "tenant management identity changed",
+                ),
+            ):
+                reconcile_tenant(
+                    root,
+                    {},
+                    client=Mock(),
+                    tenant=tenant,
+                    runtime=runtime,
+                    journal=journal,
+                )
+            mutate.assert_not_called()
+
     def test_reconcile_checkpoints_follow_real_identity_capture(self) -> None:
         spec = TenantSpec.from_mapping(
             {

@@ -465,7 +465,10 @@ class TenantRuntime:
             "tenant": journal.tenant,
             "profile": journal.profile,
             "specificationSha256": journal.specification_sha256,
-            "operationId": journal.operation_id,
+            "operationId": journal.observed.get(
+                "markerOperationId",
+                journal.operation_id,
+            ),
             "foundationSha256": foundation_sha256(journal.foundation_identity),
         }
         if dict(markers) != expected:

@@ -105,9 +105,11 @@ KNOWN_AZURE_TENANT_TYPES = frozenset(
     }
 )
 KNOWN_ASO_TENANT_KINDS = frozenset({"NatGateway", "PublicIPAddress"})
-KNOWN_ASO_FOUNDATION_REFERENCE_KINDS = frozenset(
-    {"VirtualNetwork", "VirtualNetworksSubnet"}
-)
+KNOWN_ASO_FOUNDATION_REFERENCE_OUTPUTS = {
+    "ResourceGroup": "resourceGroupId",
+    "VirtualNetwork": "vnetId",
+    "VirtualNetworksSubnet": "tenantSubnetId",
+}
 KNOWN_CONTROLLER_MANAGEMENT_KINDS = frozenset(
     {
         "AzureCluster",
@@ -1825,12 +1827,18 @@ def _render_addon_job(
                                 "args": [
                                     "proxy",
                                     "--kubeconfig=/tenant/value",
-                                    "--address=0.0.0.0",
-                                    "--accept-hosts=.*",
+                                    "--address=127.0.0.1",
+                                    "--accept-hosts=^localhost$",
                                 ],
-                                "ports": [{"name": "proxy", "containerPort": 8001}],
                                 "readinessProbe": {
-                                    "httpGet": {"path": "/readyz", "port": "proxy"},
+                                    "exec": {
+                                        "command": [
+                                            "kubectl",
+                                            "--kubeconfig=/tenant/value",
+                                            "get",
+                                            "--raw=/readyz",
+                                        ]
+                                    },
                                     "periodSeconds": 10,
                                 },
                                 "volumeMounts": [
@@ -3191,7 +3199,12 @@ def classify_azure_owned_resources(
             if isinstance(reference, dict)
         }
         marker_values = resource_lifecycle_markers(payload)
-        exact = marker_values == dict(expected_markers)
+        resource_spec = payload.get("spec")
+        resource_spec = resource_spec if isinstance(resource_spec, dict) else {}
+        exact = (
+            marker_values == dict(expected_markers)
+            or _azure_tags_match(resource_spec.get("tags"), expected_tags)
+        )
         parent_owned = bool(owner_uids & parent_uid_set)
         if not (exact or parent_owned):
             unknown.append(
@@ -3398,7 +3411,11 @@ def discover_azure_owned_resources(
             verified_ids=verified_ids,
         )
     aso_resource_types = set()
-    for group in ("network.azure.com", "compute.azure.com"):
+    for group in (
+        "network.azure.com",
+        "compute.azure.com",
+        "resources.azure.com",
+    ):
         response = _kubectl(
             root,
             "api-resources",
@@ -3437,25 +3454,13 @@ def discover_azure_owned_resources(
             if isinstance(item, dict):
                 metadata = item.get("metadata")
                 metadata = metadata if isinstance(metadata, dict) else {}
-                owner_uids = {
-                    reference.get("uid")
-                    for reference in metadata.get("ownerReferences", [])
-                    if isinstance(reference, dict)
-                }
-                marker_values = resource_lifecycle_markers(item)
-                exact = marker_values == markers
-                parent_owned = bool(owner_uids & set(parent_uids))
-                if not (exact or parent_owned):
-                    continue
                 status = item.get("status")
                 resource_id = status.get("id") if isinstance(status, dict) else None
                 kind = item.get("kind")
-                if kind in KNOWN_ASO_FOUNDATION_REFERENCE_KINDS:
-                    expected_id = (
-                        outputs["vnetId"]
-                        if kind == "VirtualNetwork"
-                        else outputs["tenantSubnetId"]
-                    )
+                if kind in KNOWN_ASO_FOUNDATION_REFERENCE_OUTPUTS:
+                    expected_id = outputs[
+                        KNOWN_ASO_FOUNDATION_REFERENCE_OUTPUTS[str(kind)]
+                    ]
                     annotations = metadata.get("annotations")
                     annotations = (
                         annotations if isinstance(annotations, dict) else {}
@@ -3473,7 +3478,24 @@ def discover_azure_owned_resources(
                         )
                     continue
                 aso_objects.append(item)
-                if isinstance(resource_id, str) and resource_id:
+                owner_uids = {
+                    reference.get("uid")
+                    for reference in metadata.get("ownerReferences", [])
+                    if isinstance(reference, dict)
+                }
+                resource_spec = item.get("spec")
+                resource_spec = (
+                    resource_spec if isinstance(resource_spec, dict) else {}
+                )
+                owned = (
+                    resource_lifecycle_markers(item) == markers
+                    or _azure_tags_match(
+                        resource_spec.get("tags"),
+                        _azure_tags(markers),
+                    )
+                    or bool(owner_uids & set(parent_uids))
+                )
+                if owned and isinstance(resource_id, str) and resource_id:
                     verified_ids.append(resource_id)
                     resource_response = _az(
                         "resource",
@@ -3782,27 +3804,8 @@ def _exact_delete_management_resource(
     return True
 
 
-def _capz_delete_control_plane_cidr(
-    config: Mapping[str, str],
-) -> str:
-    networks = _foundation_networks(config)
-    vnet = networks["AZURE_VNET_CIDR"]
-    used = (
-        networks["AZURE_AKS_SUBNET_CIDR"],
-        networks["AZURE_TENANT_SUBNET_CIDR"],
-    )
-    prefix_length = max(network.prefixlen for network in used)
-    for candidate in vnet.subnets(new_prefix=prefix_length):
-        if not any(candidate.overlaps(network) for network in used):
-            return str(candidate)
-    raise RuntimeError(
-        "Azure VNet has no unused subnet for the CAPZ deletion workaround"
-    )
-
-
 def _enable_capz_external_control_plane_delete(
     root: Path,
-    config: Mapping[str, str],
     spec: TenantSpec,
     identity: TenantIdentity | OperationJournal,
 ) -> None:
@@ -3831,35 +3834,38 @@ def _enable_capz_external_control_plane_delete(
     )
     network_spec = azure_cluster_spec.get("networkSpec")
     network_spec = network_spec if isinstance(network_spec, dict) else {}
-    if isinstance(network_spec.get("apiServerLB"), dict):
+    api_server_lb = network_spec.get("apiServerLB")
+    labels = metadata.get("labels")
+    labels = labels if isinstance(labels, dict) else {}
+    if azure_cluster_spec.get("controlPlaneEnabled") is not False:
+        raise RuntimeError(
+            "CAPZ external control-plane ownership changed during deletion"
+        )
+    if labels.get(CAPZ_EXTERNAL_CONTROL_PLANE_LABEL) != "true":
+        raise RuntimeError(
+            "CAPZ external control-plane label changed during deletion"
+        )
+    if isinstance(api_server_lb, dict) and api_server_lb.get("type") == "Public":
         return
-    if azure_cluster_spec.get("controlPlaneEnabled") is True:
-        return
-    patch = [
-        {
-            "op": "add",
-            "path": "/spec/networkSpec/subnets/-",
-            "value": {
-                "name": "deletion-control-plane",
-                "role": "control-plane",
-                "cidrBlocks": [_capz_delete_control_plane_cidr(config)],
-            },
-        },
-        {
-            "op": "replace",
-            "path": "/spec/controlPlaneEnabled",
-            "value": True,
-        },
-    ]
     _kubectl(
         root,
         "-n",
         spec.namespace,
         "patch",
         resource,
-        "--type=json",
+        "--type=merge",
+        "--field-manager=cnpg-vcluster-azure",
         "-p",
-        json.dumps(patch, separators=(",", ":")),
+        json.dumps(
+            {
+                "spec": {
+                    "networkSpec": {
+                        "apiServerLB": {"type": "Public"},
+                    }
+                }
+            },
+            separators=(",", ":"),
+        ),
     )
     updated = _get_management_resource(root, spec.namespace, resource)
     if updated is None:
@@ -3875,8 +3881,13 @@ def _enable_capz_external_control_plane_delete(
     if (
         updated_metadata.get("uid") != identity.observed.get("azureClusterUid")
         or not updated_metadata.get("deletionTimestamp")
-        or updated_spec.get("controlPlaneEnabled") is not True
+        or updated_spec.get("controlPlaneEnabled") is not False
+        or updated_metadata.get("labels", {}).get(
+            CAPZ_EXTERNAL_CONTROL_PLANE_LABEL
+        )
+        != "true"
         or not isinstance(network_spec.get("apiServerLB"), dict)
+        or network_spec["apiServerLB"].get("type") != "Public"
     ):
         raise RuntimeError(
             "CAPZ external control-plane deletion workaround was not retained"
@@ -5108,7 +5119,6 @@ class AzureTenantAdapter:
                 )
                 _enable_capz_external_control_plane_delete(
                     root,
-                    config,
                     spec,
                     identity,
                 )

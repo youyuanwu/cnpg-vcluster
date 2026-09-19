@@ -542,11 +542,11 @@ the generic tenant commands. It completed successfully on 2026-09-18:
 
 | Phase | Elapsed time |
 |---|---:|
-| Reconcile the existing Ready tenant and verify status | 4m 18s |
-| Targeted deletion to canonical absence | 11m 09s |
-| Compare exact foundation identities | 14.5s |
-| Recreate from the same specification and reach Ready | 9m 40s |
-| **Complete gate** | **25m 47s** |
+| Reconcile the existing Ready tenant and verify status | 4m 12s |
+| Targeted deletion to canonical absence | 9m 21s |
+| Compare exact foundation identities | 17.9s |
+| Recreate from the same specification and reach Ready | 9m 24s |
+| **Complete gate** | **23m 49s** |
 
 The deletion phase included Machine and VMSS absence, Cluster and Kamaji
 cleanup, repeated Azure and ASO discovery, namespace removal, and final
@@ -598,8 +598,8 @@ foundation verification. Evidence is written as owner-only redacted JSON below
    CAPZ-owned VMSS to disappear.
 4. Delete the CAPI `Cluster` with the same preconditions.
 5. Wait for Kamaji, CAPZ, ASO, and every recorded or late-discovered tenant
-   child to disappear. Shared VNet/subnet references are accepted only with
-   exact foundation IDs and ASO `reconcile-policy: skip`.
+   child to disappear. Shared ResourceGroup, VNet, and subnet references are
+   accepted only with exact foundation IDs and ASO `reconcile-policy: skip`.
 6. Delete exact orchestration-owned add-on objects,
    AzureClusterIdentity, and Namespace.
 7. Verify canonical tenant absence and compare the exact resource group, AKS,

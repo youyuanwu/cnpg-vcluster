@@ -439,6 +439,7 @@ def delete_tenant(
                             operation_id=operation_id,
                         )
                         timings.bind_operation_id(journal.operation_id)
+                        runtime.remove_ready_evidence()
                     adapter.delete(
                         root,
                         spec,

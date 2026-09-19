@@ -15,6 +15,8 @@ from scripts.lib.tenant_runtime import TenantIdentity, TenantRuntime
 from scripts.lib.tenant_spec import TenantSpec
 from scripts.lib.tenant_status import TenantStatus
 from scripts.lib.tenants import (
+    Tenant,
+    delete_tenant,
     inspect_management_resource,
     verify_tenant_management_ownership,
 )
@@ -63,6 +65,126 @@ def identity(name: str = "tenant-c") -> TenantIdentity:
 
 
 class TenantLifecycleTests(unittest.TestCase):
+    def test_local_cluster_and_namespace_delete_use_uid_preconditions(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tenant = Tenant(
+                name=SPEC.name,
+                namespace=SPEC.namespace,
+                vip="172.18.0.10",
+                pod_cidr=str(SPEC.pod_network),
+                service_cidr=str(SPEC.service_network),
+                dns_ip=SPEC.dns_service_ip,
+                domain=SPEC.cluster_domain,
+                storage_host_path=root / "storage",
+                cnpg_cluster=SPEC.database_name or "",
+                workers=1,
+                database_count=1,
+            )
+            resources = {
+                "cluster": {
+                    "apiVersion": "cluster.x-k8s.io/v1beta2",
+                    "kind": "Cluster",
+                    "metadata": {
+                        "name": SPEC.name,
+                        "uid": "cluster-uid",
+                        "resourceVersion": "10",
+                    },
+                },
+                "namespace": {
+                    "apiVersion": "v1",
+                    "kind": "Namespace",
+                    "metadata": {
+                        "name": SPEC.namespace,
+                        "uid": "namespace-uid",
+                        "resourceVersion": "20",
+                    },
+                },
+            }
+            client = Mock()
+            client.kubectl.side_effect = (
+                result(0),
+                result(0),
+            )
+            with (
+                patch(
+                    "scripts.lib.tenants.verify_tenant_management_ownership",
+                    return_value=resources,
+                ),
+                patch(
+                    "scripts.lib.tenants.tenant_kubeconfig_path",
+                    return_value=root / "missing-kubeconfig",
+                ),
+                patch("scripts.lib.tenants.wait_for"),
+                patch("scripts.lib.tenants.run", return_value=result(0, stdout="")),
+                patch("scripts.lib.tenants.inspect_storage_volume", return_value=None),
+                patch("scripts.lib.tenants.remove_tenant_storage_volume"),
+            ):
+                delete_tenant(
+                    root,
+                    {
+                        "DELETE_TIMEOUT": "1m",
+                        "WAIT_POLL_INTERVAL": "1s",
+                    },
+                    client,
+                    tenant,
+                    expected_identities={
+                        "clusterUID": "cluster-uid",
+                        "namespaceUID": "namespace-uid",
+                    },
+                )
+            cluster_options = json.loads(
+                client.kubectl.call_args_list[0].kwargs["input_text"]
+            )
+            namespace_options = json.loads(
+                client.kubectl.call_args_list[1].kwargs["input_text"]
+            )
+            self.assertEqual(
+                cluster_options["preconditions"],
+                {"uid": "cluster-uid", "resourceVersion": "10"},
+            )
+            self.assertEqual(
+                namespace_options["preconditions"],
+                {"uid": "namespace-uid", "resourceVersion": "20"},
+            )
+            self.assertEqual(cluster_options["propagationPolicy"], "Background")
+            self.assertEqual(namespace_options["propagationPolicy"], "Background")
+
+    def test_delete_rejects_replaced_recorded_resource_before_survivors(self) -> None:
+        adapter = LocalTenantAdapter()
+        observed = {
+            **identity().observed,
+            "clusterUID": "recorded-cluster-uid",
+        }
+        recorded = TenantIdentity(
+            profile="local",
+            tenant=SPEC.name,
+            specification=SPEC,
+            specification_sha256=SPEC.sha256(),
+            foundation_identity={"management": "uid"},
+            observed=observed,
+        )
+        with (
+            patch.object(adapter, "_config", return_value={}),
+            patch("scripts.local_tenant.ManagementClient", return_value=Mock()),
+            patch("scripts.local_tenant.tenant_from_spec"),
+            patch(
+                "scripts.local_tenant.verify_tenant_management_ownership",
+                return_value={
+                    "cluster": {
+                        "metadata": {"uid": "replacement-cluster-uid"}
+                    }
+                },
+            ),
+            patch("scripts.local_tenant.recorded_local_specs") as survivors,
+            self.assertRaisesRegex(
+                RuntimeError,
+                "tenant management identity changed",
+            ),
+        ):
+            adapter.validate_delete(Path("."), SPEC, recorded)
+        survivors.assert_not_called()
+
     def test_interrupted_delete_keeps_journal_until_ready_evidence_is_removed(
         self,
     ) -> None:
@@ -434,6 +556,10 @@ class TenantLifecycleTests(unittest.TestCase):
             ),
             patch("scripts.local_tenant.tenant_from_spec"),
             patch("scripts.local_tenant.resolve_tenant_storage"),
+            patch(
+                "scripts.local_tenant.verify_tenant_management_ownership",
+                return_value={},
+            ),
             patch.object(
                 adapter,
                 "status",

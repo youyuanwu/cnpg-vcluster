@@ -410,6 +410,15 @@ class AzurePhaseFourTests(unittest.TestCase):
                         ],
                         "true",
                     )
+                if item["kind"] == "Deployment":
+                    container = item["spec"]["template"]["spec"]["containers"][0]
+                    self.assertIn("--address=127.0.0.1", container["args"])
+                    self.assertNotIn("--address=0.0.0.0", container["args"])
+                    self.assertNotIn("ports", container)
+                    self.assertEqual(
+                        container["readinessProbe"]["exec"]["command"][-1],
+                        "--raw=/readyz",
+                    )
             combined += path.read_text(encoding="utf-8")
         self.assertIn('"replicas": 3', combined)
         self.assertIn("10.72.0.0/16", combined)
@@ -1082,6 +1091,52 @@ class AzurePhaseFourTests(unittest.TestCase):
         ):
             discover_azure_owned_resources(root, config, spec, journal)
 
+        parentless = {
+            "kind": "NatGateway",
+            "metadata": {
+                "name": "parentless",
+                "uid": "parentless-uid",
+            },
+            "status": {
+                "id": (
+                    "/subscriptions/redacted/resourceGroups/yy-cv-rg/"
+                    "providers/Microsoft.Network/natGateways/parentless"
+                )
+            },
+        }
+        responses = iter(
+            (
+                subprocess.CompletedProcess(
+                    [], 0, stdout="natgateways.network.azure.com\n", stderr=""
+                ),
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
+                subprocess.CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps({"items": [parentless]}),
+                    stderr="",
+                ),
+            )
+        )
+        with (
+            patch(
+                "scripts.azure._get_management_resource",
+                side_effect=parent,
+            ),
+            patch(
+                "scripts.azure.load_inventory",
+                return_value=self.inventory(root, config),
+            ),
+            patch("scripts.azure._json", return_value=[]),
+            patch(
+                "scripts.azure._kubectl",
+                side_effect=lambda *_a, **_k: next(responses),
+            ),
+            self.assertRaisesRegex(RuntimeError, "foreign ASO ownership"),
+        ):
+            discover_azure_owned_resources(root, config, spec, journal)
+
         unknown = {
             "kind": "PrivateEndpoint",
             "metadata": {
@@ -1096,6 +1151,7 @@ class AzurePhaseFourTests(unittest.TestCase):
                 subprocess.CompletedProcess(
                     [], 0, stdout="privateendpoints.network.azure.com\n", stderr=""
                 ),
+                subprocess.CompletedProcess([], 0, stdout="", stderr=""),
                 subprocess.CompletedProcess([], 0, stdout="", stderr=""),
                 subprocess.CompletedProcess(
                     [],
@@ -1150,6 +1206,16 @@ class AzurePhaseFourTests(unittest.TestCase):
             }
 
         references = {
+            "resourcegroups.resources.azure.com": {
+                "kind": "ResourceGroup",
+                "metadata": {
+                    "name": "resource-group",
+                    "annotations": {
+                        "serviceoperator.azure.com/reconcile-policy": "skip"
+                    },
+                },
+                "status": {"id": inventory["outputs"]["resourceGroupId"]},
+            },
             "virtualnetworks.network.azure.com": {
                 "kind": "VirtualNetwork",
                 "metadata": {
@@ -1177,11 +1243,13 @@ class AzurePhaseFourTests(unittest.TestCase):
         def kubectl(_root, *arguments, **_kwargs):
             if arguments[0] == "api-resources":
                 group = arguments[2]
-                output = (
-                    "\n".join(references) + "\n"
-                    if group == "network.azure.com"
-                    else ""
+                output = "\n".join(
+                    name
+                    for name in references
+                    if name.endswith(group)
                 )
+                if output:
+                    output += "\n"
                 return subprocess.CompletedProcess([], 0, stdout=output, stderr="")
             resource = arguments[3]
             return subprocess.CompletedProcess(
@@ -1204,6 +1272,22 @@ class AzurePhaseFourTests(unittest.TestCase):
                 journal,
             )
         self.assertEqual(discovery, {"azure": [], "aso": [], "unknown": []})
+        references["resourcegroups.resources.azure.com"]["status"]["id"] = (
+            "/subscriptions/redacted/resourceGroups/foreign"
+        )
+        with (
+            patch("scripts.azure._get_management_resource", side_effect=parent),
+            patch("scripts.azure.load_inventory", return_value=inventory),
+            patch("scripts.azure._json", return_value=[]),
+            patch("scripts.azure._kubectl", side_effect=kubectl),
+            self.assertRaisesRegex(RuntimeError, "foundation reference changed"),
+        ):
+            discover_azure_owned_resources(
+                root,
+                config,
+                spec,
+                journal,
+            )
         tags = _azure_tags(markers)
         foreign = dict(tags)
         foreign["cnpg-vcluster-operation-id"] = "other"
@@ -2008,6 +2092,9 @@ class AzurePhaseFiveTests(unittest.TestCase):
                 "uid": identity.observed["azureClusterUid"],
                 "deletionTimestamp": "2026-01-01T00:00:00Z",
                 "annotations": markers,
+                "labels": {
+                    "cnpg-vcluster-external-control-plane": "true",
+                },
             },
             "spec": {
                 "controlPlaneEnabled": False,
@@ -2017,7 +2104,7 @@ class AzurePhaseFiveTests(unittest.TestCase):
         updated = {
             **payload,
             "spec": {
-                "controlPlaneEnabled": True,
+                "controlPlaneEnabled": False,
                 "networkSpec": {
                     "apiServerLB": {"type": "Public"},
                     "subnets": payload["spec"]["networkSpec"]["subnets"],
@@ -2030,16 +2117,14 @@ class AzurePhaseFiveTests(unittest.TestCase):
         ):
             _enable_capz_external_control_plane_delete(
                 root,
-                config,
                 spec,
                 identity,
             )
         patch_payload = json.loads(kubectl.call_args.args[-1])
         self.assertEqual(
-            patch_payload[0]["value"]["cidrBlocks"],
-            ["10.220.32.0/20"],
+            patch_payload,
+            {"spec": {"networkSpec": {"apiServerLB": {"type": "Public"}}}},
         )
-        self.assertEqual(patch_payload[1]["value"], True)
 
         not_deleting = {
             **payload,
@@ -2060,7 +2145,6 @@ class AzurePhaseFiveTests(unittest.TestCase):
         ):
             _enable_capz_external_control_plane_delete(
                 root,
-                config,
                 spec,
                 identity,
             )

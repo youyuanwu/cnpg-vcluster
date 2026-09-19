@@ -33,11 +33,16 @@ AZURE_SUBSCRIPTION_PATH = re.compile(
     r"(?i)(/subscriptions/)[0-9a-f]{8}-[0-9a-f]{4}-"
     r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 )
+AZURE_SUBSCRIPTION_TEXT = re.compile(
+    r"(?i)(\bsubscription(?:\s+id)?\s+)[0-9a-f]{8}-[0-9a-f]{4}-"
+    r"[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
+)
 SERIALIZED_SECRET = re.compile(
     r"""(?ix)
     (
       ["']?
-      (?:token|password|pgpassword|client[_-]?secret|subscription[_-]?id|
+      (?:authorization|token|password|pgpassword|client[_-]?secret|
+         subscription[_-]?id|
          client[_-]?key[_-]?data|client[_-]?certificate[_-]?data|
          certificate[_-]?authority[_-]?data|kubeconfig)
       ["']?
@@ -82,7 +87,10 @@ def _redact_patterns(value: str) -> str:
             result = pattern.sub("REDACTED", result)
     return AZURE_SUBSCRIPTION_PATH.sub(
         lambda match: f"{match.group(1)}REDACTED",
-        result,
+        AZURE_SUBSCRIPTION_TEXT.sub(
+            lambda match: f"{match.group(1)}REDACTED",
+            result,
+        ),
     )
 
 

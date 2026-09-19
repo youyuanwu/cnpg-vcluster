@@ -256,7 +256,9 @@ MachinePool, AzureMachinePool, VMSS, VMSS instances, and NICs; ASO reconciles
 the tenant NAT gateway and public IP.
 
 Deletion verifies exact management UIDs, Azure IDs and tags, ASO objects, and
-the recorded foundation before mutation. Exact tenant Machines are marked with
+the recorded foundation before mutation. Local Cluster and Namespace deletion
+and Azure orchestration deletion use Kubernetes UID/resourceVersion
+preconditions. Exact tenant Machines are marked with
 CAPI's whole-tenant skip-drain annotation, then the MachinePool is deleted and
 Machine, AzureMachinePool, and VMSS absence is required before Cluster
 deletion. Kubernetes deletes carry UID and resourceVersion preconditions.

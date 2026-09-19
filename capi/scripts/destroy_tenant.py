@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import Mapping
 
 from scripts.cnpg import _verify_marker, cnpg_artifacts_present, delete_cnpg
 from scripts.lib.addons import delete_addons, verify_network
@@ -206,10 +207,18 @@ def finish_prepared_tenant_deletion(
     config: dict[str, str],
     client,
     tenant,
+    *,
+    expected_identities: Mapping[str, str] | None = None,
 ) -> None:
     validate_deletion_journal(root, tenant)
     tenant_kubeconfig_path(root, tenant).unlink(missing_ok=True)
-    delete_tenant(root, config, client, tenant)
+    delete_tenant(
+        root,
+        config,
+        client,
+        tenant,
+        expected_identities=expected_identities,
+    )
     for relative in (
         Path("rendered/addons") / tenant.name,
         Path("rendered/storage") / tenant.name,
@@ -230,6 +239,8 @@ def finish_journaled_tenant_deletion(
     config: dict[str, str],
     client,
     tenant,
+    *,
+    expected_identities: Mapping[str, str] | None = None,
 ) -> None:
     verify_tenant_management_ownership(config, client, tenant)
     if inspect_management_resource(
@@ -238,7 +249,13 @@ def finish_journaled_tenant_deletion(
         raise RuntimeError("journal-only cleanup requires an absent Cluster")
     validate_deletion_journal(root, tenant)
     tenant_kubeconfig_path(root, tenant).unlink(missing_ok=True)
-    finish_prepared_tenant_deletion(root, config, client, tenant)
+    finish_prepared_tenant_deletion(
+        root,
+        config,
+        client,
+        tenant,
+        expected_identities=expected_identities,
+    )
 
 
 def delete_selected_tenant(
@@ -248,6 +265,7 @@ def delete_selected_tenant(
     tenant,
     *,
     expected_markers: dict[str, str],
+    expected_identities: Mapping[str, str],
 ) -> None:
     owned = verify_tenant_management_ownership(
         config,
@@ -260,10 +278,22 @@ def delete_selected_tenant(
     if cluster is not None:
         ensure_tenant_kubeconfig(root, config, client, tenant)
         prepare_tenant_deletion(root, config, client, tenant, cluster)
-        finish_prepared_tenant_deletion(root, config, client, tenant)
+        finish_prepared_tenant_deletion(
+            root,
+            config,
+            client,
+            tenant,
+            expected_identities=expected_identities,
+        )
         return
     if journal.exists() or journal.is_symlink():
-        finish_journaled_tenant_deletion(root, config, client, tenant)
+        finish_journaled_tenant_deletion(
+            root,
+            config,
+            client,
+            tenant,
+            expected_identities=expected_identities,
+        )
         return
     for relative in (
         Path("rendered/tenants") / tenant.name,

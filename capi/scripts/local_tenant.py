@@ -35,11 +35,13 @@ from scripts.lib.tenant_spec import TenantSpec
 from scripts.lib.tenant_status import TenantStatus
 from scripts.lib.tenants import (
     Tenant,
+    NOT_FOUND,
     inspect_management_resource,
     inspect_storage_volume,
     lifecycle_markers,
     recorded_local_specs,
     recorded_local_tenants,
+    require_recorded_management_identities,
     resolve_tenant_storage,
     storage_record_path,
     storage_volume_name,
@@ -279,7 +281,7 @@ class LocalTenantAdapter:
             )
             if namespace.returncode == 0:
                 present["namespace"] = tenant_name
-            elif "NotFound" not in namespace.stderr:
+            elif not NOT_FOUND.search(namespace.stderr):
                 raise RuntimeError(
                     "tenant namespace absence inspection failed: "
                     + namespace.stderr
@@ -464,6 +466,29 @@ class LocalTenantAdapter:
         snapshots = {}
         blockers = []
         client = ManagementClient(root, config)
+        endpoint = identity.observed.get("endpoint")
+        marker_operation_id = identity.observed.get("markerOperationId")
+        if not endpoint or not marker_operation_id:
+            raise RuntimeError("tenant deletion identity is incomplete")
+        target = tenant_from_spec(root, spec, endpoint)
+        target.lifecycle_markers = {
+            "tenant": spec.name,
+            "profile": "local",
+            "specificationSha256": spec.sha256(),
+            "foundationSha256": foundation_sha256(identity.foundation_identity),
+            "operationId": marker_operation_id,
+        }
+        target_resources = verify_tenant_management_ownership(
+            config,
+            client,
+            target,
+            expected_markers=target.lifecycle_markers,
+        )
+        require_recorded_management_identities(
+            target_resources,
+            identity.observed,
+            require_present=False,
+        )
         survivor_specs = recorded_local_specs(root)
         for survivor_name, survivor_spec in survivor_specs.items():
             if survivor_name == spec.name:
@@ -542,6 +567,7 @@ class LocalTenantAdapter:
                 ManagementClient(root, config),
                 tenant,
                 expected_markers=expected_markers,
+                expected_identities=identity.observed,
             )
         with timings.phase("absence"):
             release_tenant_endpoint(

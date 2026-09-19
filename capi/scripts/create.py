@@ -37,6 +37,8 @@ from scripts.lib.tenants import (
     export_tenant_kubeconfig,
     inspect_storage_volume,
     lifecycle_markers,
+    management_resource_identities,
+    require_recorded_management_identities,
     render_tenant_manifests,
     resource_lifecycle_markers,
     tenant_kubeconfig_path,
@@ -267,20 +269,7 @@ def observed_tenant_identities(
 
 
 def _management_identities(resources: dict[str, object]) -> dict[str, str]:
-    keys = {
-        "namespace": "namespaceUID",
-        "cluster": "clusterUID",
-        "devcluster": "devClusterUID",
-        "kamajicontrolplane": "controlPlaneUID",
-        "machinedeployment": "machineDeploymentUID",
-        "kubeadmconfigtemplate": "kubeadmTemplateUID",
-        "devmachinetemplate": "devMachineTemplateUID",
-    }
-    return {
-        keys[kind]: str(resources[kind]["metadata"]["uid"])
-        for kind in keys
-        if isinstance(resources.get(kind), dict)
-    }
+    return management_resource_identities(resources)
 
 
 def _record_management_identities(
@@ -371,6 +360,18 @@ def reconcile_tenant(
     with phase("control-plane"):
         if client is None:
             client = ManagementClient(root, config)
+        if current_journal is not None:
+            existing_resources = verify_tenant_management_ownership(
+                config,
+                client,
+                tenant,
+                expected_markers=tenant.lifecycle_markers or None,
+            )
+            require_recorded_management_identities(
+                existing_resources,
+                current_journal.observed,
+                require_present=True,
+            )
         existing_database = None
         if tenant_kubeconfig_path(root, tenant).is_file():
             response = _tenant_kubectl(

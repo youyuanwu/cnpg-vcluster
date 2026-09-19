@@ -7,6 +7,7 @@ import os
 import re
 import shutil
 import time
+import urllib.parse
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -105,6 +106,55 @@ def _require_resource_markers(
 
 
 NOT_FOUND = re.compile(r"Error from server \(NotFound\):", re.IGNORECASE)
+MANAGEMENT_IDENTITY_KEYS = {
+    "namespace": "namespaceUID",
+    "cluster": "clusterUID",
+    "devcluster": "devClusterUID",
+    "kamajicontrolplane": "controlPlaneUID",
+    "machinedeployment": "machineDeploymentUID",
+    "kubeadmconfigtemplate": "kubeadmTemplateUID",
+    "devmachinetemplate": "devMachineTemplateUID",
+}
+
+
+def management_resource_identities(
+    resources: Mapping[str, object],
+) -> dict[str, str]:
+    return {
+        observed_key: str(resources[kind]["metadata"]["uid"])
+        for kind, observed_key in MANAGEMENT_IDENTITY_KEYS.items()
+        if isinstance(resources.get(kind), dict)
+    }
+
+
+def require_recorded_management_identities(
+    resources: Mapping[str, object],
+    observed: Mapping[str, str],
+    *,
+    require_present: bool,
+) -> None:
+    current = management_resource_identities(resources)
+    changed = []
+    absent = []
+    for observed_key in MANAGEMENT_IDENTITY_KEYS.values():
+        recorded = observed.get(observed_key)
+        if recorded is None:
+            continue
+        actual = current.get(observed_key)
+        if actual is None:
+            if require_present:
+                absent.append(observed_key)
+        elif actual != recorded:
+            changed.append(observed_key)
+    if changed:
+        raise RuntimeError(
+            "tenant management identity changed: " + ", ".join(sorted(changed))
+        )
+    if absent:
+        raise RuntimeError(
+            "recorded tenant management resource is absent: "
+            + ", ".join(sorted(absent))
+        )
 
 
 def inspect_management_resource(
@@ -1461,8 +1511,16 @@ def delete_tenant(
     config: dict[str, str],
     client: ManagementClient,
     tenant: Tenant,
+    *,
+    expected_identities: Mapping[str, str] | None = None,
 ) -> None:
-    verify_tenant_management_ownership(config, client, tenant)
+    owned = verify_tenant_management_ownership(config, client, tenant)
+    if expected_identities is not None:
+        require_recorded_management_identities(
+            owned,
+            expected_identities,
+            require_present=False,
+        )
     if tenant_kubeconfig_path(root, tenant).is_file():
         addon = _tenant_kubectl(
             root,
@@ -1562,35 +1620,96 @@ def delete_tenant(
             raise RuntimeError(
                 "tenant CNPG resources must be deleted before Cluster deletion"
             )
-    cluster_delete = client.kubectl(
-        "-n",
-        tenant.namespace,
-        "delete",
-        f"cluster/{tenant.name}",
-        "--ignore-not-found",
-        "--wait=true",
-        f"--timeout={config['DELETE_TIMEOUT']}",
-        check=False,
-    )
-    if cluster_delete.returncode != 0 and not NOT_FOUND.search(
-        cluster_delete.stderr
+    for payload, namespace, plural, description in (
+        (
+            owned.get("cluster"),
+            tenant.namespace,
+            "clusters",
+            "tenant Cluster",
+        ),
+        (
+            owned.get("namespace"),
+            None,
+            "namespaces",
+            "tenant namespace",
+        ),
     ):
-        raise RuntimeError(f"tenant Cluster deletion failed: {cluster_delete.stderr}")
-    namespace_delete = client.kubectl(
-        "delete",
-        "namespace",
-        tenant.namespace,
-        "--ignore-not-found",
-        "--wait=true",
-        f"--timeout={config['DELETE_TIMEOUT']}",
-        check=False,
-    )
-    if namespace_delete.returncode != 0 and not NOT_FOUND.search(
-        namespace_delete.stderr
-    ):
-        raise RuntimeError(
-            f"tenant namespace deletion failed: {namespace_delete.stderr}"
+        if not isinstance(payload, dict):
+            continue
+        metadata = payload.get("metadata")
+        metadata = metadata if isinstance(metadata, dict) else {}
+        api_version = payload.get("apiVersion")
+        name = metadata.get("name")
+        uid = metadata.get("uid")
+        resource_version = metadata.get("resourceVersion")
+        if not all(
+            isinstance(value, str) and value
+            for value in (api_version, name, uid, resource_version)
+        ):
+            raise RuntimeError(f"{description} API identity is incomplete")
+        if "/" in api_version:
+            group, version = api_version.split("/", 1)
+            base = (
+                "/apis/"
+                + urllib.parse.quote(group, safe=".")
+                + "/"
+                + urllib.parse.quote(version, safe="")
+            )
+        else:
+            base = "/api/" + urllib.parse.quote(api_version, safe="")
+        if namespace is None:
+            path = f"{base}/{plural}/{urllib.parse.quote(name, safe='')}"
+        else:
+            path = (
+                f"{base}/namespaces/{urllib.parse.quote(namespace, safe='')}/"
+                f"{plural}/{urllib.parse.quote(name, safe='')}"
+            )
+        deleted = client.kubectl(
+            "delete",
+            f"--raw={path}",
+            "-f",
+            "-",
+            check=False,
+            input_text=json.dumps(
+                {
+                    "apiVersion": "v1",
+                    "kind": "DeleteOptions",
+                    "propagationPolicy": "Background",
+                    "preconditions": {
+                        "uid": uid,
+                        "resourceVersion": resource_version,
+                    },
+                },
+                separators=(",", ":"),
+            )
+            + "\n",
         )
+        if deleted.returncode != 0 and not NOT_FOUND.search(deleted.stderr):
+            raise RuntimeError(f"{description} deletion failed: {deleted.stderr}")
+        if description == "tenant Cluster":
+            def cluster_absent():
+                response = client.kubectl(
+                    "-n",
+                    tenant.namespace,
+                    "get",
+                    f"cluster/{tenant.name}",
+                    check=False,
+                )
+                if response.returncode == 0:
+                    return None
+                if NOT_FOUND.search(response.stderr):
+                    return True
+                raise RuntimeError(
+                    "tenant Cluster deletion inspection failed: "
+                    + response.stderr
+                )
+
+            wait_for(
+                f"Cluster {tenant.name} deletion",
+                parse_duration(config["DELETE_TIMEOUT"]),
+                parse_duration(config["WAIT_POLL_INTERVAL"]),
+                cluster_absent,
+            )
 
     def namespace_absent():
         response = client.kubectl(
