@@ -5,12 +5,46 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-from scripts.destroy import destroy, inspect_host_residue
+from scripts.destroy import _remove_local_runtime, destroy, inspect_host_residue
 from scripts.destroy_tenant import prepare_tenant_deletion
 
 
 class DestroyTests(unittest.TestCase):
-    def test_runtime_inventory_accepts_dev_up_success_evidence(self) -> None:
+    def test_runtime_inventory_accepts_selected_dynamic_tenant(self) -> None:
+        from scripts.destroy import _validate_runtime_inventory
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            evidence = (
+                root
+                / ".runtime"
+                / "lifecycle"
+                / "local"
+                / "tenant-c"
+                / "evidence"
+                / "create-operation.json"
+            )
+            evidence.parent.mkdir(parents=True, mode=0o700)
+            for parent in (
+                root / ".runtime",
+                root / ".runtime" / "lifecycle",
+                root / ".runtime" / "lifecycle" / "local",
+                root / ".runtime" / "lifecycle" / "local" / "tenant-c",
+                evidence.parent,
+            ):
+                parent.chmod(0o700)
+            evidence.write_text("{}\n", encoding="utf-8")
+            evidence.chmod(0o600)
+            _validate_runtime_inventory(root)
+            unexpected = root / ".runtime" / "lifecycle" / "local" / "_invalid"
+            unexpected.mkdir(mode=0o700)
+            invalid_identity = unexpected / "identity.json"
+            invalid_identity.write_text("{}\n")
+            invalid_identity.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "unexpected runtime"):
+                _validate_runtime_inventory(root)
+
+    def test_runtime_inventory_rejects_retired_dev_up_evidence(self) -> None:
         from scripts.destroy import _validate_runtime_inventory
 
         with tempfile.TemporaryDirectory() as temporary:
@@ -19,7 +53,60 @@ class DestroyTests(unittest.TestCase):
             evidence.parent.mkdir(parents=True, mode=0o700)
             evidence.write_text("{}")
             evidence.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "unexpected runtime"):
+                _validate_runtime_inventory(root)
+
+    def test_local_runtime_cleanup_preserves_azure_state(self) -> None:
+        from scripts.destroy import _validate_runtime_inventory
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            azure = root / ".runtime" / "azure" / "resources.json"
+            azure_ready = (
+                root
+                / ".runtime"
+                / "lifecycle"
+                / "azure"
+                / "tenant-example"
+                / "ready.json"
+            )
+            azure_gate = (
+                root
+                / ".runtime"
+                / "azure-gate"
+                / "evidence"
+                / "lifecycle-operation.json"
+            )
+            local = root / ".runtime" / "management" / "identity.json"
+            azure.parent.mkdir(parents=True)
+            azure_ready.parent.mkdir(parents=True)
+            azure_gate.parent.mkdir(parents=True)
+            local.parent.mkdir(parents=True)
+            azure.write_text('{"azure":true}\n')
+            azure_ready.write_text('{"ready":true}\n')
+            azure_gate.write_text('{"gate":true}\n')
+            local.write_text('{"local":true}\n')
+            for path in (
+                root / ".runtime",
+                root / ".runtime" / "azure",
+                root / ".runtime" / "lifecycle",
+                root / ".runtime" / "lifecycle" / "azure",
+                azure_ready.parent,
+                root / ".runtime" / "azure-gate",
+                azure_gate.parent,
+                local.parent,
+            ):
+                path.chmod(0o700)
+            azure.chmod(0o600)
+            azure_ready.chmod(0o600)
+            azure_gate.chmod(0o600)
+            local.chmod(0o600)
             _validate_runtime_inventory(root)
+            _remove_local_runtime(root)
+            self.assertTrue(azure.is_file())
+            self.assertTrue(azure_ready.is_file())
+            self.assertTrue(azure_gate.is_file())
+            self.assertFalse(local.exists())
 
     def test_dangling_deletion_journal_blocks_live_cleanup(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
@@ -50,6 +137,10 @@ class DestroyTests(unittest.TestCase):
             runtime.mkdir(mode=0o700)
             with (
                 patch("scripts.destroy._validate_runtime_inventory"),
+                patch(
+                    "scripts.destroy.recorded_tenant_names",
+                    return_value=("tenant-a", "tenant-b"),
+                ),
                 patch("scripts.destroy.validate_inotify_state"),
                 patch(
                     "scripts.destroy.management_status",
@@ -76,21 +167,18 @@ class DestroyTests(unittest.TestCase):
         responses = [
             Mock(stdout="worker-a\n", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
-            Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="probe-a\n", returncode=0, stderr=""),
             Mock(stdout="registry-a\n", returncode=0, stderr=""),
-            Mock(stdout="", returncode=1, stderr="No such volume"),
-            Mock(stdout="[]", returncode=0, stderr=""),
-            Mock(stdout="", returncode=1, stderr="No such volume"),
+            Mock(stdout="lab-tenant-a-storage\n", returncode=0, stderr=""),
         ]
         with patch("scripts.destroy.run", side_effect=responses):
             residue = inspect_host_residue(
                 {
                     "SPIKE_NAME": "spike",
-                    "TENANT_NAMES": "tenant-a tenant-b",
                     "OWNERSHIP_LABEL": "example.owner",
                     "LAB_PREFIX": "lab",
-                }
+                },
+                ("tenant-a",),
             )
         self.assertEqual(residue["containers"], ["worker-a"])
         self.assertEqual(residue["probes"], ["probe-a"])
@@ -103,18 +191,17 @@ class DestroyTests(unittest.TestCase):
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
             Mock(stdout="", returncode=0, stderr=""),
-            Mock(stdout="", returncode=0, stderr=""),
-            Mock(stdout="", returncode=1, stderr="daemon unavailable"),
+            RuntimeError("Docker volume inspection failed"),
         ]
         with patch("scripts.destroy.run", side_effect=responses):
             with self.assertRaisesRegex(RuntimeError, "inspection failed"):
                 inspect_host_residue(
                     {
                         "SPIKE_NAME": "spike",
-                        "TENANT_NAMES": "tenant-a tenant-b",
                         "OWNERSHIP_LABEL": "example.owner",
                         "LAB_PREFIX": "lab",
-                    }
+                    },
+                    ("tenant-a",),
                 )
 
     def test_global_destroy_resumes_second_tenant_journal_without_survivor(self) -> None:
@@ -132,6 +219,10 @@ class DestroyTests(unittest.TestCase):
             )
             with (
                 patch("scripts.destroy._validate_runtime_inventory"),
+                patch(
+                    "scripts.destroy.recorded_tenant_names",
+                    return_value=("tenant-a", "tenant-b"),
+                ),
                 patch("scripts.destroy.validate_inotify_state"),
                 patch(
                     "scripts.destroy.management_status",
@@ -145,7 +236,7 @@ class DestroyTests(unittest.TestCase):
                 patch("scripts.destroy.ManagementClient", return_value=client),
                 patch("scripts.destroy.spike_tenant", return_value=spike),
                 patch(
-                    "scripts.destroy.configured_tenants",
+                    "scripts.destroy.recorded_local_tenants",
                     return_value=[tenant_a, tenant_b],
                 ),
                 patch(
@@ -163,7 +254,7 @@ class DestroyTests(unittest.TestCase):
             ):
                 destroy(
                     root,
-                    {"TENANT_NAMES": "tenant-a tenant-b"},
+                    {},
                 )
             self.assertEqual(
                 [call.args[3].name for call in delete_tenant.call_args_list],

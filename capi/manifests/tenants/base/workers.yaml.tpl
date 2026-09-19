@@ -5,6 +5,12 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+  annotations:
+    lifecycle.cnpg-vcluster.capi/tenant: ${LIFECYCLE_TENANT}
+    lifecycle.cnpg-vcluster.capi/profile: ${LIFECYCLE_PROFILE}
+    lifecycle.cnpg-vcluster.capi/specification-sha256: ${LIFECYCLE_SPECIFICATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/foundation-sha256: ${LIFECYCLE_FOUNDATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/operation-id: ${LIFECYCLE_OPERATION_ID}
 spec:
   template:
     spec:
@@ -21,6 +27,12 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+  annotations:
+    lifecycle.cnpg-vcluster.capi/tenant: ${LIFECYCLE_TENANT}
+    lifecycle.cnpg-vcluster.capi/profile: ${LIFECYCLE_PROFILE}
+    lifecycle.cnpg-vcluster.capi/specification-sha256: ${LIFECYCLE_SPECIFICATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/foundation-sha256: ${LIFECYCLE_FOUNDATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/operation-id: ${LIFECYCLE_OPERATION_ID}
 spec:
   template:
     spec:
@@ -43,6 +55,12 @@ metadata:
   namespace: ${NAMESPACE}
   labels:
     ${OWNERSHIP_LABEL}: ${LAB_PREFIX}
+  annotations:
+    lifecycle.cnpg-vcluster.capi/tenant: ${LIFECYCLE_TENANT}
+    lifecycle.cnpg-vcluster.capi/profile: ${LIFECYCLE_PROFILE}
+    lifecycle.cnpg-vcluster.capi/specification-sha256: ${LIFECYCLE_SPECIFICATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/foundation-sha256: ${LIFECYCLE_FOUNDATION_SHA256}
+    lifecycle.cnpg-vcluster.capi/operation-id: ${LIFECYCLE_OPERATION_ID}
 spec:
   clusterName: ${CLUSTER_NAME}
   replicas: ${WORKER_REPLICAS}

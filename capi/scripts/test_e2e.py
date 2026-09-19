@@ -2,13 +2,13 @@
 from __future__ import annotations
 
 import os
+import json
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.create import reconcile_tenant
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.locking import e2e_lock
@@ -43,14 +43,17 @@ def run_just(
     return result
 
 
-def verify_no_lab_residue(config: dict[str, str]) -> None:
+def verify_no_lab_residue(
+    config: dict[str, str],
+    tenant_names: tuple[str, ...] = (),
+) -> None:
     if run(
         ["docker", "inspect", f"{config['KIND_CLUSTER_NAME']}-control-plane"],
         timeout=30,
         check=False,
     ).returncode == 0:
         raise RuntimeError("management container remained after teardown")
-    for name in (*config["TENANT_NAMES"].split(), config["SPIKE_NAME"]):
+    for name in (*tenant_names, config["SPIKE_NAME"]):
         leftovers = run(
             [
                 "docker",
@@ -85,6 +88,34 @@ def verify_no_lab_residue(config: dict[str, str]) -> None:
         raise RuntimeError("offline registry container remained after teardown")
 
 
+def verify_no_local_runtime_residue(root: Path) -> None:
+    runtime = root / ".runtime"
+    if not runtime.exists():
+        return
+    allowed = {
+        "lifecycle",
+        "lifecycle/.locks",
+        "lifecycle/.locks/azure.lock",
+        "lifecycle/rejected",
+    }
+    allowed_prefixes = (
+        "azure",
+        "azure-gate",
+        "lifecycle/azure",
+        "lifecycle/rejected/azure",
+    )
+    for path in runtime.rglob("*"):
+        relative = path.relative_to(runtime).as_posix()
+        if relative in allowed or any(
+            relative == prefix or relative.startswith(prefix + "/")
+            for prefix in allowed_prefixes
+        ):
+            continue
+        raise RuntimeError(
+            f"local runtime remained after E2E teardown: {relative}"
+        )
+
+
 def run_e2e() -> int:
     os.umask(0o077)
     config = load_configuration(ROOT)
@@ -94,6 +125,8 @@ def run_e2e() -> int:
     }
     failure = None
     timings = PhaseTimings()
+    spec_path = ROOT / "config" / "tenants" / "examples" / "local.json"
+    tenant_name = json.loads(spec_path.read_text(encoding="utf-8"))["name"]
     try:
         with timings.phase("tools_cache"):
             run_just(ROOT, config, "tools")
@@ -105,16 +138,15 @@ def run_e2e() -> int:
             verify_all_inputs(ROOT, config)
             run_just(ROOT, config, "create-management")
 
-        reconcile_tenant(ROOT, config, timings=timings)
+        run_just(ROOT, config, "tenant-create", "local", str(spec_path))
         print("representative tenant PostgreSQL cluster is healthy")
     except BaseException as exc:
         failure = exc
     try:
         with timings.phase("teardown"):
             run_just(ROOT, config, "destroy")
-            verify_no_lab_residue(config)
-            if (ROOT / ".runtime").exists():
-                raise RuntimeError("runtime remained after E2E teardown")
+            verify_no_lab_residue(config, (tenant_name,))
+            verify_no_local_runtime_residue(ROOT)
             for name, expected in original_inotify.items():
                 if read_inotify(name) != expected:
                     raise RuntimeError(f"host inotify was not restored: {name}")

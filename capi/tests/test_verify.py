@@ -5,6 +5,7 @@ import unittest
 import json
 import base64
 from pathlib import Path
+from subprocess import CompletedProcess
 from unittest.mock import Mock, patch
 
 from scripts.status import _control_plane_layer_status
@@ -12,12 +13,122 @@ from scripts.verify import (
     _cluster_identity,
     _endpoint_matches,
     _management_absence,
+    _ordered_tenant_pairs,
     _reject_kubernetes_credential,
+    _storage_isolation,
+    _verify_database_disruption,
 )
 from scripts.lib.files import ensure_private_dir
 
 
 class VerifyTests(unittest.TestCase):
+    def test_ordered_tenant_pairs_cover_every_peer(self) -> None:
+        tenants = [
+            type("Tenant", (), {"name": name})()
+            for name in ("tenant-a", "tenant-c", "tenant-e")
+        ]
+        self.assertEqual(
+            {
+                (source.name, target.name)
+                for source, target in _ordered_tenant_pairs(tenants)
+            },
+            {
+                ("tenant-a", "tenant-c"),
+                ("tenant-a", "tenant-e"),
+                ("tenant-c", "tenant-a"),
+                ("tenant-c", "tenant-e"),
+                ("tenant-e", "tenant-a"),
+                ("tenant-e", "tenant-c"),
+            },
+        )
+        self.assertEqual(_ordered_tenant_pairs(tenants[:1]), ())
+
+    def test_storage_isolation_checks_every_peer(self) -> None:
+        tenants = [
+            type("Tenant", (), {"name": name})()
+            for name in ("tenant-a", "tenant-c", "tenant-e")
+        ]
+        commands = []
+
+        def volume(name: str):
+            return {
+                "Name": name,
+                "Mountpoint": f"/volumes/{name}",
+            }
+
+        def run(command, **_kwargs):
+            commands.append(command)
+            return CompletedProcess(command, 0, stdout="", stderr="")
+
+        with (
+            patch(
+                "scripts.verify.inspect_storage_volume",
+                side_effect=lambda name: volume(name),
+            ),
+            patch("scripts.verify.write_storage_marker"),
+            patch("scripts.verify.run", side_effect=run),
+        ):
+            _storage_isolation(
+                Path("."),
+                {
+                    "LAB_PREFIX": "lab",
+                    "SPIKE_STORAGE_CONTAINER_PATH": "/storage",
+                },
+                tenants,
+                {
+                    "tenant-a": {"worker-a": {}},
+                    "tenant-c": {"worker-c": {}},
+                    "tenant-e": {"worker-e": {}},
+                },
+            )
+        tenant_a = next(command for command in commands if "worker-a" in command)
+        script = tenant_a[-1]
+        self.assertIn("isolation/tenant-c", script)
+        self.assertIn("isolation/tenant-e", script)
+
+    def test_single_instance_database_skips_replica_disruption(self) -> None:
+        tenant = type(
+            "Tenant",
+            (),
+            {"name": "tenant-c", "database_count": 1},
+        )()
+        with (
+            patch("scripts.verify._replica_restart") as restart,
+            patch("scripts.verify._primary_failover") as failover,
+            patch("scripts.verify._verify_marker") as marker,
+        ):
+            _verify_database_disruption(Path("."), {}, tenant)
+        restart.assert_not_called()
+        failover.assert_not_called()
+        marker.assert_not_called()
+
+    def test_multi_instance_database_runs_replica_disruption(self) -> None:
+        tenant = type(
+            "Tenant",
+            (),
+            {"name": "tenant-c", "database_count": 3},
+        )()
+        calls = []
+        with (
+            patch(
+                "scripts.verify._replica_restart",
+                side_effect=lambda *_: calls.append("replica"),
+            ),
+            patch(
+                "scripts.verify._primary_failover",
+                side_effect=lambda *_: calls.append("primary"),
+            ),
+            patch(
+                "scripts.verify._verify_marker",
+                side_effect=lambda *_: calls.append("marker"),
+            ),
+        ):
+            _verify_database_disruption(Path("."), {}, tenant)
+        self.assertEqual(
+            calls,
+            ["replica", "marker", "primary", "marker"],
+        )
+
     @staticmethod
     def _resource(endpoint: dict[str, object], *, kcp: bool = False):
         resource = {

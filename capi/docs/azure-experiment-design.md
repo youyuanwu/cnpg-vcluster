@@ -4,14 +4,14 @@
 
 This experiment extends the local Cluster API lab to Azure. It proves that an
 AKS management cluster can host Kamaji tenant control planes while Cluster API
-Provider Azure (CAPZ) creates VMSS-backed tenant workers that run
-CloudNativePG.
+Provider Azure (CAPZ) creates VMSS-backed tenant workers with tenant
+networking and cloud-provider integration, targeted deletion, and recreation.
 
 The design optimizes for a small, understandable experiment. It is not a
-production platform design. The initial implementation covers one tenant and
-uses broad resource-group-scoped permissions, one virtual network, one
-management identity, the smallest practical node SKUs, and upstream add-on
-manifests.
+production platform design. The lifecycle is tenant-keyed, while the live gate
+uses one tenant at a time with broad resource-group-scoped permissions, one
+virtual network, one management identity, the smallest practical node SKUs,
+and upstream add-on manifests.
 
 ## Success criteria
 
@@ -22,13 +22,12 @@ The experiment succeeds when:
 2. A CAPI `Cluster` creates one Kamaji tenant control plane and one
    VMSS-backed worker pool.
 3. One worker joins through the Kamaji private API endpoint and becomes Ready.
-4. Scaling the worker pool to three produces three Ready tenant workers.
-5. A three-instance CloudNativePG cluster becomes healthy using Azure Disk
-   CSI volumes.
-6. Removing one VMSS instance results in a replacement worker while
-   PostgreSQL remains healthy and retains a SQL marker.
-7. Deleting the CAPI tenant removes its Azure worker resources.
-8. Final cleanup removes the experiment resource group.
+4. Generic status verifies the control plane, MachinePool, Node identity,
+   Azure cloud provider, and Calico.
+5. Explicitly confirmed tenant deletion removes the CAPZ-owned VMSS and all
+   tenant resources without changing the shared foundation.
+6. Recreating the same tenant specification reaches Ready again.
+7. Final whole-experiment cleanup removes the recorded resource group.
 
 ## Scope
 
@@ -44,13 +43,12 @@ The experiment includes:
 - one VMSS-backed tenant worker pool;
 - Calico VXLAN networking;
 - the external Azure cloud provider components required by the tenant nodes;
-- Azure Disk CSI;
-- one three-instance CloudNativePG cluster;
-- creation, health, replacement, persistence, and cleanup checks.
+- strict tenant-keyed create, status, delete, and recovery state;
+- controller-owned VMSS deletion, foundation preservation, and recreation
+  checks.
 
-The first milestone stops after one worker joins and becomes Ready. VMSS
-scaling, Azure Disk, and CloudNativePG are added only after that path is
-repeatable.
+VMSS scaling, Azure Disk, and CloudNativePG remain later experiment
+extensions after the tenant lifecycle is repeatable.
 
 ## Non-goals
 
@@ -69,6 +67,8 @@ The experiment does not initially provide:
 - GitOps;
 - Key Vault integration;
 - database backup or snapshot workflows;
+- Azure Disk CSI and CloudNativePG workload validation;
+- VMSS instance replacement and persistence validation;
 - production monitoring, alerting, or upgrade automation;
 - hostile-tenant isolation guarantees.
 
@@ -90,10 +90,8 @@ flowchart TB
   Cluster[Cluster and AzureCluster]
   Pool[MachinePool and AzureMachinePool]
   VMSS[Azure VMSS]
-  Workers[Three tenant worker nodes]
-  Addons[Calico, Azure cloud provider, Azure Disk CSI]
-  CNPG[Three-instance CloudNativePG cluster]
-  Disks[Three Azure managed disks]
+  Workers[Tenant worker nodes]
+  Addons[Calico and Azure cloud provider]
 
   Operator --> AzureRG
   AzureRG --> VNet
@@ -111,8 +109,6 @@ flowchart TB
   VMSS --> Workers
   Workers --> TenantAPI
   Workers --> Addons
-  Addons --> CNPG
-  CNPG --> Disks
 ```
 
 AKS is independently provisioned management infrastructure. Tenant CAPI
@@ -225,6 +221,22 @@ The CAPZ reference image requires the kubelet
 Calico v3.32 also requires its separate CRD Helm chart before installing the
 Tigera operator chart.
 
+### External-control-plane compatibility
+
+CAPZ `v1.21.1` correctly accepts
+`AzureCluster.spec.controlPlaneEnabled: false` for a Kamaji control plane, but
+its mutating webhook clears `networkSpec.apiServerLB` while load-balancer
+reconciliation still dereferences that field. The result is a nil-pointer
+panic during normal or delete reconciliation.
+
+Management installation applies an exact object selector only to the CAPZ
+AzureCluster mutating webhook. Tenant AzureClusters carry
+`cnpg-vcluster-external-control-plane=true`, so the webhook leaves a
+non-owning `apiServerLB.type: Public` placeholder in the object.
+`controlPlaneEnabled` remains false, so CAPZ does not create or own an
+API-server load balancer. Foundation status rejects a missing, broadened, or
+conflicting selector.
+
 ## Technology boundaries
 
 | Technology | Responsibility |
@@ -255,10 +267,13 @@ Bicep, Python, or `just` recipes. Configuration is split into:
 
 | File or source | Contents | Tracked |
 |---|---|---|
-| `config/azure/defaults.env` | SKUs, node counts, CIDRs, timeouts, and naming patterns that are safe to share. | Yes |
+| `config/azure/defaults.env` | Foundation sizing/network defaults plus supported tenant version, worker SKU, component versions, and timeouts. | Yes |
 | `config/azure.local.env` | Subscription ID, location, and operator-selected resource prefix. | No |
+| Explicit Azure TenantSpec JSON | Tenant name, Kubernetes version, worker count, Pod CIDR, and Service CIDR. | Yes when stored as a non-secret example |
 | Active `az` login | Tenant identity and authentication tokens. | No |
-| `.runtime/azure/resources.json` | Resolved names, Azure resource IDs, deployment outputs, and configuration checksum. | No |
+| `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, deployment outputs, controller identities, and foundation checksum. | No |
+| `.runtime/azure/tenants/<tenant>/` | Generated tenant manifests, endpoint, and kubeconfig. | No |
+| `.runtime/lifecycle/azure/<tenant>/` | Tenant operation journal, exact identity record, Ready evidence, and timing evidence. | No |
 
 The local file contains only non-secret selectors:
 
@@ -273,14 +288,16 @@ credential store; no client secret or access token is copied into the
 repository. The tenant ID is read from the active `az account` rather than
 duplicated in the local file.
 
-All names are deterministically derived directly from `AZURE_PREFIX`:
+Foundation names are deterministically derived from `AZURE_PREFIX`; tenant
+names are derived from the explicit TenantSpec:
 
 ```text
 resource group: <prefix>-rg
 AKS:            <prefix>-mgmt
 VNet:           <prefix>-vnet
 identity:       <prefix>-identity
-tenant cluster: <prefix>-tenant
+tenant cluster: <spec.name>
+worker pool:    <spec.name>-worker
 ```
 
 Preflight validates the prefix character and length constraints, verifies
@@ -295,13 +312,15 @@ receive an explicit uniqueness component rather than adding a suffix to every
 resource.
 
 After Bicep deployment, its outputs and the exact IDs of the resource group,
-AKS cluster, AKS-managed node resource group, VNet, subnets, identity, and
-role assignment are atomically recorded in `.runtime/azure/resources.json`.
+AKS cluster, AKS-managed node resource group, VNet, subnets, identity, role
+assignments, and federated credentials are atomically recorded in
+`.runtime/azure/resources.json`. Controller UIDs are added after management
+installation.
 Status and cleanup use these exact IDs rather than rediscovering resources by
-a broad name or tag query. A changed subscription, prefix, location,
-defaults checksum, or Bicep deployment identity blocks mutation until the
-operator returns to the recorded configuration or explicitly destroys the
-old experiment.
+a broad name or tag query. The inventory schema and checksum cover only
+foundation-owned inputs. A pre-cutover schema or changed subscription, prefix,
+location, or foundation checksum is rejected and requires a clean foundation
+redeploy; it is never migrated or adopted.
 
 The operator can keep multiple experiments by using separate working copies
 or explicitly selected local parameter files. Commands never infer a
@@ -423,6 +442,12 @@ version-pinned upstream or CAPZ-provided manifests. Their experiment values:
 - set `configureCloudRoutes=false`, because Calico VXLAN provides Pod routing;
 - run cloud-node-manager on the tenant worker.
 
+Tenant creation also installs a marked, tenant-owned status-probe Deployment
+in the management cluster. It keeps the tenant kubeconfig mounted and provides
+an in-VNet `kubectl` execution point, allowing generic status to inspect Nodes
+and add-ons without making the private tenant API public or creating resources
+during a status request.
+
 The Pod, Service, VNet, and AKS address ranges must not overlap. The tenant
 subnet must reach the Kamaji API port, and VMSS workers must be able to
 exchange VXLAN traffic on UDP 4789.
@@ -430,9 +455,10 @@ exchange VXLAN traffic on UDP 4789.
 The experiment does not require tenant `LoadBalancer` Services; the important
 Azure load balancer is the Kamaji API endpoint managed by AKS.
 
-## Storage and CloudNativePG
+## Future storage and CloudNativePG extension
 
-After all three workers are Ready, the tenant receives:
+The current lifecycle gate stops after worker, cloud-provider, and Calico
+readiness. A later extension can scale to three workers and add:
 
 - Azure Disk CSI controller and node components;
 - one simple StorageClass using `disk.csi.azure.com`;
@@ -440,7 +466,8 @@ After all three workers are Ready, the tenant receives:
 - dynamically provisioned managed disks;
 - one three-instance CloudNativePG cluster.
 
-Each PostgreSQL instance receives its own PVC and Azure managed disk.
+In that extension, each PostgreSQL instance receives its own PVC and Azure
+managed disk.
 CloudNativePG pod anti-affinity spreads the instances across the three
 workers. The experiment does not initially require zone-aware storage,
 snapshots, backups, disk encryption customization, or a particular premium
@@ -453,14 +480,16 @@ The proposed interface remains `just`:
 | Command | Purpose |
 |---|---|
 | `just azure-preflight` | Verify Azure CLI login, subscription, required providers, tools, version pins, and configuration. |
-| `just azure-create-management` | Create the resource group, VNet, identity, AKS, and controller stack. |
-| `just azure-create-tenant` | Create one Kamaji control plane and one VMSS-backed worker pool, then install tenant add-ons and CNPG. |
-| `just azure-status` | Report management, control-plane, VMSS, Node, CSI, and CNPG state. |
-| `just azure-verify` | Prove worker readiness, scaling, PostgreSQL health, replacement, and persistence. |
-| `just azure-destroy-tenant` | Delete the CAPI tenant and wait for CAPZ-owned Azure resources to disappear. |
-| `just azure-destroy` | Delete the tenant, management cluster, and final experiment resource group. |
+| `just azure-create-foundation` | Create the resource group, VNet, identity, and AKS foundation. |
+| `just azure-create-management` | Install the CAPI, CAPZ, Kamaji, and ASO controller stack. |
+| `just azure-foundation-status` | Report only shared Azure foundation health. |
+| `just tenant-create azure <spec.json>` | Create the explicitly selected Kamaji control plane and VMSS-backed worker pool, install tenant add-ons, and persist exact tenant identities. |
+| `just tenant-status azure <tenant>` | Report one tenant through the provider-neutral status envelope, separately from foundation health. |
+| `just tenant-delete azure <tenant> azure/<tenant>` | Delete the exact tenant through CAPI/CAPZ after explicit confirmation and verify canonical absence plus foundation preservation. |
+| `just azure-test-tenant-lifecycle` | Destructively prove create, Ready, targeted delete, absence, foundation preservation, and recreation for the example tenant. |
+| `just azure-destroy` | Delete the entire recorded Azure foundation resource group. |
 
-The implementation should reuse the repository's `just` interface, Python
+The implementation reuses the repository's `just` interface, Python
 validation helpers, fail-closed command execution, immutable version
 configuration, and sanitized evidence patterns. It should not copy local
 Docker ownership logic into the Azure profile or use Python as an Azure
@@ -483,7 +512,7 @@ from invocation through each command's readiness gate.
 | Create the Kamaji tenant control plane | 7m 59s |
 | Create the VMSS worker through its kubeadm join marker | 6m 55s |
 | Install the Azure cloud provider and Calico; wait for Node Ready | 7m 26s |
-| Final `azure-status` | 2.67s |
+| Final pre-refactor `azure-status` | 2.67s |
 | **Reconstructed clean buildout, excluding cleanup and final status** | **50m 42s** |
 
 Each create or install command also runs Azure preflight internally. The
@@ -505,6 +534,24 @@ The 50m 42s total is reconstructed from the successful measurements in this
 redeployment after excluding diagnosis and retries; it is not yet a single
 uninterrupted run with the corrected worker gate. The final observed state was
 AKS Running, Kamaji Ready, and one `Standard_B2s` VMSS worker Ready.
+
+## Measured targeted tenant lifecycle
+
+The final Phase 5 gate reused the healthy schema-v2 foundation and exercised
+the generic tenant commands. It completed successfully on 2026-09-18:
+
+| Phase | Elapsed time |
+|---|---:|
+| Reconcile the existing Ready tenant and verify status | 4m 12s |
+| Targeted deletion to canonical absence | 9m 21s |
+| Compare exact foundation identities | 17.9s |
+| Recreate from the same specification and reach Ready | 9m 24s |
+| **Complete gate** | **23m 49s** |
+
+The deletion phase included Machine and VMSS absence, Cluster and Kamaji
+cleanup, repeated Azure and ASO discovery, namespace removal, and final
+foundation verification. Evidence is written as owner-only redacted JSON below
+`.runtime/azure-gate/evidence/`.
 
 ## Lifecycle
 
@@ -528,12 +575,8 @@ AKS Running, Kamaji Ready, and one `Standard_B2s` VMSS worker Ready.
 5. From an AKS-resident Job, install Calico VXLAN, Azure cloud controller
    manager, and cloud-node-manager into the tenant cluster.
 6. Wait for the first Node to become Ready.
-7. Scale the pool to three and wait for all Nodes to become Ready.
-8. Install Azure Disk CSI.
-9. Install CloudNativePG and create the PostgreSQL cluster.
-10. Write and read a SQL marker.
 
-### Replacement verification
+### Future replacement verification
 
 1. Record the VMSS instance IDs, Nodes, PVCs, disks, CNPG primary, and marker.
 2. Delete one non-primary VMSS instance through Azure.
@@ -544,15 +587,28 @@ AKS Running, Kamaji Ready, and one `Standard_B2s` VMSS worker Ready.
 
 ### Cleanup
 
-1. Delete the CAPI `Cluster`.
-2. Wait for CAPZ to remove the VMSS and tenant-owned Azure resources.
-3. Verify the Kamaji control plane and tenant namespace are gone.
-4. Delete the AKS management cluster and resource group.
-5. Confirm no resources remain in the experiment resource group.
+1. Verify the active subscription, exact foundation, tenant specification,
+   management UIDs, Azure IDs/tags, and ASO ownership.
+2. Mark only exact UID- and marker-verified tenant Machines with CAPI's
+   `machine.cluster.x-k8s.io/exclude-node-draining=true` annotation. Whole
+   tenant removal would otherwise deadlock on the single-node Calico
+   disruption budget.
+3. Delete the CAPI `MachinePool` with Kubernetes UID/resourceVersion
+   preconditions and wait for MachinePool, AzureMachinePool, Machines, and the
+   CAPZ-owned VMSS to disappear.
+4. Delete the CAPI `Cluster` with the same preconditions.
+5. Wait for Kamaji, CAPZ, ASO, and every recorded or late-discovered tenant
+   child to disappear. Shared ResourceGroup, VNet, and subnet references are
+   accepted only with exact foundation IDs and ASO `reconcile-policy: skip`.
+6. Delete exact orchestration-owned add-on objects,
+   AzureClusterIdentity, and Namespace.
+7. Verify canonical tenant absence and compare the exact resource group, AKS,
+   VNet, subnets, identity, role/federation, controller, and inventory
+   identities with the pre-delete snapshot.
 
-Deleting the resource group is the final experiment safety net, but CAPI
-deletion is performed first so the experiment still exercises provider
-finalizers and normal lifecycle behavior.
+CAPZ remains responsible for VMSS deletion. The normal path does not issue
+`az vmss delete` or remove Azure provider finalizers. `just azure-destroy` is a
+separate whole-foundation cleanup operation.
 
 ## Verification boundaries
 
@@ -562,13 +618,13 @@ The Azure experiment proves:
   plane hosted on AKS;
 - the private endpoint is used consistently;
 - workers join and recover to desired capacity;
-- Azure Disk CSI supports the CNPG workload;
-- PostgreSQL remains available and persistent through one worker replacement;
-- normal tenant deletion removes CAPZ-owned resources.
+- targeted deletion removes CAPZ-owned resources while preserving the shared
+  foundation;
+- recreation from the same specification returns to Ready.
 
 It does not prove production security isolation, regional resilience,
-availability-zone behavior, disaster recovery, backup correctness, upgrade
-safety, autoscaling, or large tenant counts.
+availability-zone behavior, disaster recovery, backup correctness, production
+Azure Disk/CNPG behavior, upgrade safety, autoscaling, or large tenant counts.
 
 ## Implementation sequence
 

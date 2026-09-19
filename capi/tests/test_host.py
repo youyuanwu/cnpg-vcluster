@@ -116,14 +116,21 @@ class HostTests(unittest.TestCase):
             "LAB_PREFIX": "lab",
             "OWNERSHIP_LABEL": "example.owner",
             "SPIKE_NAME": "spike",
-            "TENANT_NAMES": "tenant-a tenant-b",
             "KIND_CLUSTER_NAME": "management",
+            "COMMAND_TIMEOUT": "30s",
         }
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             host = root / ".runtime" / "host"
             (root / ".runtime").mkdir(mode=0o700)
             host.mkdir(mode=0o700)
+            lifecycle = root / ".runtime" / "lifecycle" / "local" / "tenant-a"
+            lifecycle.mkdir(parents=True, mode=0o700)
+            for parent in (
+                root / ".runtime" / "lifecycle",
+                root / ".runtime" / "lifecycle" / "local",
+            ):
+                parent.chmod(0o700)
             state = host / "inotify.json"
             state.write_text(
                 json.dumps(
@@ -149,14 +156,14 @@ class HostTests(unittest.TestCase):
                         (),
                         {"returncode": 0, "stdout": "tenant-a-lb\n", "stderr": ""},
                     )()
-                if command[:3] == ["docker", "volume", "inspect"]:
+                if command[:3] == ["docker", "volume", "ls"]:
                     return type(
                         "Result",
                         (),
                         {
-                            "returncode": 1,
+                            "returncode": 0,
                             "stdout": "",
-                            "stderr": "No such volume",
+                            "stderr": "",
                         },
                     )()
                 return type(

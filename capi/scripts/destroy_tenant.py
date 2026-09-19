@@ -5,9 +5,9 @@ import os
 import re
 import shutil
 from pathlib import Path
+from typing import Mapping
 
 from scripts.cnpg import _verify_marker, cnpg_artifacts_present, delete_cnpg
-from scripts.create import validate_create_inputs, verified_tenant_snapshot
 from scripts.lib.addons import delete_addons, verify_network
 from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient
@@ -27,20 +27,10 @@ from scripts.lib.tenants import (
     tenant_kubeconfig_path,
     verify_tenant_management_ownership,
 )
-from scripts.machines import worker_snapshot
 from scripts.storage import _delete_storage
-from scripts.tools import verify_all_inputs
 
 
 NOT_FOUND = re.compile(r"Error from server \(NotFound\):", re.IGNORECASE)
-
-
-def _selected_tenants(root: Path, config: dict[str, str], name: str):
-    tenants = validate_create_inputs(root, config)
-    matches = [tenant for tenant in tenants if tenant.name == name]
-    if len(matches) != 1:
-        raise RuntimeError(f"unknown tenant: {name}")
-    return matches[0], next(tenant for tenant in tenants if tenant.name != name)
 
 
 def _tenant_resource(root: Path, config: dict[str, str], tenant, *arguments: str):
@@ -217,10 +207,18 @@ def finish_prepared_tenant_deletion(
     config: dict[str, str],
     client,
     tenant,
+    *,
+    expected_identities: Mapping[str, str] | None = None,
 ) -> None:
     validate_deletion_journal(root, tenant)
     tenant_kubeconfig_path(root, tenant).unlink(missing_ok=True)
-    delete_tenant(root, config, client, tenant)
+    delete_tenant(
+        root,
+        config,
+        client,
+        tenant,
+        expected_identities=expected_identities,
+    )
     for relative in (
         Path("rendered/addons") / tenant.name,
         Path("rendered/storage") / tenant.name,
@@ -241,6 +239,8 @@ def finish_journaled_tenant_deletion(
     config: dict[str, str],
     client,
     tenant,
+    *,
+    expected_identities: Mapping[str, str] | None = None,
 ) -> None:
     verify_tenant_management_ownership(config, client, tenant)
     if inspect_management_resource(
@@ -249,50 +249,57 @@ def finish_journaled_tenant_deletion(
         raise RuntimeError("journal-only cleanup requires an absent Cluster")
     validate_deletion_journal(root, tenant)
     tenant_kubeconfig_path(root, tenant).unlink(missing_ok=True)
-    finish_prepared_tenant_deletion(root, config, client, tenant)
-
-
-def destroy_tenant_stack(root: Path, config: dict[str, str], name: str) -> None:
-    verify_all_inputs(root, config)
-    tenant, survivor = _selected_tenants(root, config, name)
-    require_management_ownership(root, config)
-    validate_management_kubeconfig(root, config)
-    client = ManagementClient(root, config)
-    survivor_before = verified_tenant_snapshot(
-        root, config, client, survivor
+    finish_prepared_tenant_deletion(
+        root,
+        config,
+        client,
+        tenant,
+        expected_identities=expected_identities,
     )
-    owned = verify_tenant_management_ownership(config, client, tenant)
+
+
+def delete_selected_tenant(
+    root: Path,
+    config: dict[str, str],
+    client,
+    tenant,
+    *,
+    expected_markers: dict[str, str],
+    expected_identities: Mapping[str, str],
+) -> None:
+    owned = verify_tenant_management_ownership(
+        config,
+        client,
+        tenant,
+        expected_markers=expected_markers,
+    )
     cluster = owned.get("cluster")
     journal = _journal_path(root, tenant)
-    already_absent = False
     if cluster is not None:
         ensure_tenant_kubeconfig(root, config, client, tenant)
         prepare_tenant_deletion(root, config, client, tenant, cluster)
-    elif (
-        not journal.exists()
-        and not tenant_kubeconfig_path(root, tenant).exists()
-        and inspect_storage_volume(storage_volume_name(config, tenant)) is None
+        finish_prepared_tenant_deletion(
+            root,
+            config,
+            client,
+            tenant,
+            expected_identities=expected_identities,
+        )
+        return
+    if journal.exists() or journal.is_symlink():
+        finish_journaled_tenant_deletion(
+            root,
+            config,
+            client,
+            tenant,
+            expected_identities=expected_identities,
+        )
+        return
+    for relative in (
+        Path("rendered/tenants") / tenant.name,
+        Path("rendered/addons") / tenant.name,
+        Path("rendered/storage") / tenant.name,
+        Path("rendered/cnpg") / tenant.name,
     ):
-        for relative in (
-            Path("rendered/tenants") / tenant.name,
-            Path("rendered/addons") / tenant.name,
-            Path("rendered/storage") / tenant.name,
-            Path("rendered/cnpg") / tenant.name,
-        ):
-            shutil.rmtree(root / ".runtime" / relative, ignore_errors=True)
-        already_absent = True
-    else:
-        record = validate_deletion_journal(root, tenant)
-        if record["tenant"] != tenant.name:
-            raise RuntimeError("tenant deletion journal does not match target")
-        tenant_kubeconfig_path(root, tenant).unlink(missing_ok=True)
-    if already_absent:
-        _verify_deleted(root, config, client, tenant)
-    else:
-        finish_prepared_tenant_deletion(root, config, client, tenant)
-    survivor_after = verified_tenant_snapshot(
-        root, config, client, survivor
-    )
-    if survivor_after != survivor_before:
-        raise RuntimeError(f"targeted deletion changed survivor: {survivor.name}")
-    print(f"tenant deleted; survivor remains healthy: {tenant.name} -> {survivor.name}")
+        shutil.rmtree(root / ".runtime" / relative, ignore_errors=True)
+    _verify_deleted(root, config, client, tenant)
