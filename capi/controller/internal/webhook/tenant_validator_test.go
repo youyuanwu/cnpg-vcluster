@@ -1,6 +1,7 @@
 package webhook
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"testing"
@@ -27,6 +28,34 @@ func TestCreateRejectsUnknownField(t *testing.T) {
 	}})
 	if response.Allowed {
 		t.Fatal("unknown field was allowed")
+	}
+}
+
+func TestCreateRejectsBooleanAndMissingFields(t *testing.T) {
+	handler := &TenantValidator{SupportedVersion: "1.36.4"}
+	for name, document := range map[string][]byte{
+		"boolean": bytes.Replace(
+			tenantJSON("1.36.4", ""),
+			[]byte(`"workers":1`),
+			[]byte(`"workers":true`),
+			1,
+		),
+		"missing": bytes.Replace(
+			tenantJSON("1.36.4", ""),
+			[]byte(`,"databaseCount":1`),
+			nil,
+			1,
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			response := handler.Handle(context.Background(), admission.Request{AdmissionRequest: admissionv1.AdmissionRequest{
+				Operation: admissionv1.Create,
+				Object:    runtimeRaw(document),
+			}})
+			if response.Allowed {
+				t.Fatal("invalid field shape was allowed")
+			}
+		})
 	}
 }
 

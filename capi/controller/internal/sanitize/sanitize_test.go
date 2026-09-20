@@ -1,8 +1,12 @@
 package sanitize
 
 import (
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
+
+	"github.com/go-logr/logr/funcr"
 )
 
 func TestValueRedactsNestedSecrets(t *testing.T) {
@@ -36,9 +40,51 @@ func TestDepthLimitFailsClosed(t *testing.T) {
 		value = []any{value}
 	}
 	sanitized := Value(value)
-	encoded := strings.Repeat("[", 1)
-	_ = encoded
-	if sanitized == nil {
-		t.Fatal("sanitized value is nil")
+	encoded, err := json.Marshal(sanitized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(encoded), "secret") {
+		t.Fatalf("depth-limited secret leaked: %s", encoded)
+	}
+}
+
+func TestTextRedactsKubeconfigAndEmbeddedJSON(t *testing.T) {
+	inputs := []string{
+		"client-key-data: c2VjcmV0",
+		`provider failed: {"authorization":"Bearer abc","nested":{"token":"value"}} trailing`,
+		`"{\"client_secret\":\"double\"}"`,
+	}
+	for _, input := range inputs {
+		output := Text(input)
+		for _, secret := range []string{"c2VjcmV0", "abc", "value", "double"} {
+			if strings.Contains(output, secret) {
+				t.Fatalf("secret %q leaked from %q as %q", secret, input, output)
+			}
+		}
+	}
+}
+
+func TestLoggerSanitizesMessagesErrorsAndValues(t *testing.T) {
+	var output strings.Builder
+	base := funcr.New(
+		func(prefix, args string) {
+			output.WriteString(prefix)
+			output.WriteString(args)
+		},
+		funcr.Options{},
+	)
+	logger := Logger(base)
+	logger.Error(
+		errors.New("Authorization: Bearer abc"),
+		`failed: {"token":"nested"}`,
+		"client_secret",
+		"value",
+	)
+	text := output.String()
+	for _, secret := range []string{"abc", "nested", "value"} {
+		if strings.Contains(text, secret) {
+			t.Fatalf("logger leaked %q in %q", secret, text)
+		}
 	}
 }

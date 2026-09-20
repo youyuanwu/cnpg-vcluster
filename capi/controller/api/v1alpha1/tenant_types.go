@@ -57,6 +57,14 @@ type TeardownStatus struct {
 	Reservation string `json:"reservation,omitempty"`
 }
 
+type SurvivorSnapshot struct {
+	Name             string `json:"name"`
+	UID              string `json:"uid"`
+	SpecHash         string `json:"specHash"`
+	ObservationsHash string `json:"observationsHash"`
+	Endpoint         string `json:"endpoint"`
+}
+
 type TenantStatus struct {
 	ObservedGeneration int64                      `json:"observedGeneration,omitempty"`
 	Phase              TenantPhase                `json:"phase,omitempty"`
@@ -66,6 +74,7 @@ type TenantStatus struct {
 	FoundationHash     string                     `json:"foundationHash,omitempty"`
 	ObservationsHash   string                     `json:"observationsHash,omitempty"`
 	ObservedResources  []ObservedResourceIdentity `json:"observedResources,omitempty"`
+	SurvivorSnapshots  []SurvivorSnapshot          `json:"survivorSnapshots,omitempty"`
 	FunctionalEvidence *FunctionalEvidence        `json:"functionalEvidence,omitempty"`
 	Teardown           *TeardownStatus            `json:"teardown,omitempty"`
 }

@@ -11,8 +11,9 @@ const Redacted = "REDACTED"
 var (
 	sensitiveKey = regexp.MustCompile(`(?i)(authorization|password|token|secret|private.?key|client.?key|client.?certificate|certificate.?authority|kubeconfig|bootstrap.?data|subscription.?id)`)
 	privateKey   = regexp.MustCompile(`(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?-----END [A-Z0-9 ]*PRIVATE KEY-----`)
-	authValue    = regexp.MustCompile(`(?i)(authorization\s*[:=]\s*)([^\s,;]+)`)
+	authValue    = regexp.MustCompile(`(?im)(authorization\s*[:=]\s*)[^\r\n]+`)
 	assignment   = regexp.MustCompile(`(?i)\b(password|token|client[_-]?secret|subscription[_-]?id)\s*[:=]\s*([^\s,;]+)`)
+	sensitiveLine = regexp.MustCompile(`(?im)^([ \t-]*(?:client-key-data|client-certificate-data|certificate-authority-data|password|token|client-secret|subscription-id|authorization)[ \t]*:[ \t]*).*$`)
 )
 
 func Value(value any) any {
@@ -56,6 +57,15 @@ func sanitizeText(value string, depth int) string {
 		return Redacted
 	}
 	trimmed := strings.TrimSpace(value)
+	if strings.HasPrefix(trimmed, `"`) {
+		var decoded string
+		if json.Unmarshal([]byte(trimmed), &decoded) == nil {
+			encoded, err := json.Marshal(sanitizeText(decoded, depth+1))
+			if err == nil {
+				return string(encoded)
+			}
+		}
+	}
 	if strings.HasPrefix(trimmed, "{") || strings.HasPrefix(trimmed, "[") {
 		var decoded any
 		if json.Unmarshal([]byte(trimmed), &decoded) == nil {
@@ -65,8 +75,22 @@ func sanitizeText(value string, depth int) string {
 			}
 		}
 	}
+	if start := strings.IndexAny(value, "[{"); start >= 0 {
+		for end := len(value); end > start; end-- {
+			var decoded any
+			if json.Unmarshal([]byte(value[start:end]), &decoded) != nil {
+				continue
+			}
+			encoded, err := json.Marshal(sanitizeValue(decoded, depth+1))
+			if err == nil {
+				value = value[:start] + string(encoded) + sanitizeText(value[end:], depth+1)
+			}
+			break
+		}
+	}
 	value = privateKey.ReplaceAllString(value, Redacted)
 	value = authValue.ReplaceAllString(value, `${1}`+Redacted)
 	value = assignment.ReplaceAllString(value, `${1}=`+Redacted)
+	value = sensitiveLine.ReplaceAllString(value, `${1}`+Redacted)
 	return value
 }

@@ -1,0 +1,36 @@
+#!/usr/bin/env python3
+from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+from scripts.lib.config import load_configuration
+from scripts.lib.controller_client import apply_tenant
+from scripts.lib.locking import e2e_lock, profile_lock, tools_lock
+from scripts.lib.redaction import redact
+
+
+def main(arguments: list[str]) -> int:
+    if len(arguments) != 2 or arguments[0] != "apply":
+        print("usage: controller_tenant.py apply <manifest>", file=sys.stderr)
+        return 1
+    config = load_configuration(ROOT)
+    manifest = Path(arguments[1]).resolve()
+    with (
+        e2e_lock(ROOT, exclusive=False),
+        profile_lock(ROOT, "local", exclusive=True, create=True),
+        tools_lock(ROOT, exclusive=True),
+    ):
+        apply_tenant(ROOT, config, manifest)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        raise SystemExit(main(sys.argv[1:]))
+    except RuntimeError as exc:
+        print(redact(str(exc)), file=sys.stderr)
+        raise SystemExit(1)

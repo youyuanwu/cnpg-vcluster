@@ -77,7 +77,7 @@ controller-image:
 
 # Internal validation-only apply helper used before the local lifecycle cutover.
 _controller-tenant-apply manifest:
-    @python3 -c 'from pathlib import Path; from scripts.lib.config import load_configuration; from scripts.lib.controller_client import apply_tenant; root=Path.cwd(); apply_tenant(root, load_configuration(root), Path({{quote(manifest)}}))'
+    @python3 scripts/controller_tenant.py apply {{quote(manifest)}}
 
 # Evaluate Tenant status and functional-evidence freshness without mutation.
 controller-tenant-status tenant:

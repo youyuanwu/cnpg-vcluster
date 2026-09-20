@@ -173,6 +173,7 @@ def check_repository_boundaries() -> None:
         "controller/api/v1alpha1/tenant_types.go",
         "controller/cmd/manager/main.go",
         "controller/config/webhook/validating-webhook.yaml",
+        "scripts/controller_tenant.py",
     )
     for relative in required_controller_files:
         check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")

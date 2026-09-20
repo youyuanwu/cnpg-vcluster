@@ -5,12 +5,17 @@ import json
 import os
 import shutil
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from scripts.lib.config import parse_duration
 from scripts.lib.files import ensure_private_dir, write_private_file
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.management import require_management_ownership
 from scripts.lib.process import run
+from scripts.tools import verify_all_inputs
+
+if TYPE_CHECKING:
+    from scripts.cache import VerifiedCache
 
 
 CONTROLLER_NAMESPACE = "tenant-system"
@@ -81,25 +86,39 @@ def test_controller(root: Path, config: dict[str, str]) -> None:
     )
 
 
-def controller_source_digest(root: Path) -> str:
+def controller_source_digest(root: Path, config: dict[str, str]) -> str:
     digest = hashlib.sha256()
     controller = root / "controller"
-    for path in sorted(
-        candidate
-        for candidate in controller.rglob("*")
-        if candidate.is_file()
-    ):
-        digest.update(path.relative_to(controller).as_posix().encode())
+    inputs = [
+        *(
+            candidate
+            for candidate in controller.rglob("*")
+            if candidate.is_file()
+        ),
+        root / "config" / "versions.env",
+        root / ".tools" / "inputs" / "calico.yaml",
+        root / ".tools" / "inputs" / "cnpg.yaml",
+    ]
+    for path in sorted(inputs):
+        relative = (
+            path.relative_to(root).as_posix()
+            if path.is_relative_to(root)
+            else str(path)
+        )
+        digest.update(relative.encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
+    digest.update(config["GO_VERSION"].encode())
+    digest.update(config["CONTROLLER_RUNTIME_VERSION"].encode())
+    digest.update(config["CONTROLLER_TOOLS_VERSION"].encode())
     return digest.hexdigest()
 
 
 def controller_image(root: Path, config: dict[str, str]) -> str:
     return (
         f"{config['TENANT_CONTROLLER_IMAGE_REPOSITORY']}:"
-        f"{controller_source_digest(root)[:16]}"
+        f"{controller_source_digest(root, config)[:16]}"
     )
 
 
@@ -133,6 +152,7 @@ def build_controller_image(
     config: dict[str, str],
 ) -> str:
     binary = build_controller_binary(root, config)
+    verify_all_inputs(root, config)
     build_root = root / ".runtime" / "rendered" / "controller-build"
     shutil.rmtree(build_root, ignore_errors=True)
     ensure_private_dir(build_root)
@@ -177,6 +197,8 @@ def _foundation_payload(
     config: dict[str, str],
     network: dict[str, object],
     image: str,
+    verified_cache: VerifiedCache,
+    registry: dict[str, object] | None,
 ) -> dict[str, object]:
     identity = require_management_ownership(root, config)
     reserved = sorted(
@@ -186,6 +208,26 @@ def _foundation_payload(
             if key.endswith("_CIDR") and "/" in value
         }
     )
+    allowed_subnets = sorted({"127.0.0.0/8", str(network["subnet"]), *reserved})
+    versions = {
+        key: value
+        for key, value in sorted(config.items())
+        if key.endswith("_VERSION")
+        or key in {
+            "CAPI_CONTRACT",
+            "KAMAJI_CAPI_CONTRACT",
+            "CONTROLLER_RUNTIME_VERSION",
+            "CONTROLLER_TOOLS_VERSION",
+            "GO_VERSION",
+        }
+    }
+    archives = [
+        {
+            "key": entry["key"],
+            "sha256": entry["sha256"],
+        }
+        for entry in verified_cache.inventory["imageArchives"]
+    ]
     data = {
         "schema": 1,
         "managementContainerId": identity.identifier,
@@ -194,9 +236,26 @@ def _foundation_payload(
         "poolStart": network["pool_start"],
         "poolEnd": network["pool_end"],
         "reservedCIDRs": reserved,
+        "allowedSubnets": allowed_subnets,
         "kubernetesVersion": config["KUBERNETES_VERSION"],
         "controllerImage": image,
         "mutationEnabled": False,
+        "versions": versions,
+        "cache": {
+            "generation": verified_cache.generation.name,
+            "stateSHA256": verified_cache.state_sha256,
+            "imageArchives": archives,
+        },
+        "registry": (
+            {
+                "address": registry["address"],
+                "port": 5000,
+                "generation": registry["generation"],
+                "identifier": registry["identifier"],
+            }
+            if registry is not None
+            else None
+        ),
     }
     encoded = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return {
@@ -218,6 +277,8 @@ def reconcile_controller(
     config: dict[str, str],
     client: ManagementClient,
     network: dict[str, object],
+    verified_cache: VerifiedCache,
+    registry: dict[str, object] | None,
 ) -> None:
     image = build_controller_image(root, config)
     run(
@@ -250,7 +311,14 @@ def reconcile_controller(
             "-f",
             str(path),
         )
-    foundation = _foundation_payload(root, config, network, image)
+    foundation = _foundation_payload(
+        root,
+        config,
+        network,
+        image,
+        verified_cache,
+        registry,
+    )
     client.kubectl(
         "apply",
         "--server-side",
@@ -328,15 +396,30 @@ def delete_controller(
     config: dict[str, str],
     client: ManagementClient,
 ) -> None:
-    client.kubectl(
-        "delete",
-        "tenants.tenancy.cnpg-vcluster.io",
-        "--all",
-        "--ignore-not-found",
-        "--wait=true",
-        f"--timeout={config['DELETE_TIMEOUT']}",
-        check=False,
-    )
+    crd = client.kubectl("get", f"crd/{TENANT_CRD}", check=False)
+    crd_present = crd.returncode == 0
+    if crd.returncode != 0:
+        output = f"{crd.stdout}{crd.stderr}".lower()
+        if "notfound" not in output and "not found" not in output:
+            raise RuntimeError(f"failed to inspect Tenant CRD before uninstall: {output}")
+    if crd_present:
+        client.kubectl(
+            "delete",
+            "tenants.tenancy.cnpg-vcluster.io",
+            "--all",
+            "--wait=true",
+            f"--timeout={config['DELETE_TIMEOUT']}",
+        )
+        remaining = client.kubectl(
+            "get",
+            "tenants.tenancy.cnpg-vcluster.io",
+            "-o",
+            "name",
+        ).stdout.strip()
+        if remaining:
+            raise RuntimeError(
+                f"Tenant resources remain; refusing controller uninstall: {remaining}"
+            )
     paths = (
         root / "controller" / "config" / "webhook" / "validating-webhook.yaml",
         root / ".runtime" / "rendered" / "controller" / "manager.yaml",

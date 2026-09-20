@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"flag"
 	"os"
 
@@ -15,6 +16,7 @@ import (
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 	tenantcontroller "github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/controller"
+	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/sanitize"
 	tenantwebhook "github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/webhook"
 )
 
@@ -36,7 +38,7 @@ func main() {
 	options := zap.Options{Development: false}
 	options.BindFlags(flag.CommandLine)
 	flag.Parse()
-	ctrl.SetLogger(zap.New(zap.UseFlagOptions(&options)))
+	ctrl.SetLogger(sanitize.Logger(zap.New(zap.UseFlagOptions(&options))))
 
 	scheme := runtime.NewScheme()
 	must(clientgoscheme.AddToScheme(scheme))
@@ -69,7 +71,7 @@ func main() {
 
 func must(err error) {
 	if err != nil {
-		ctrl.Log.Error(err, "fatal controller error")
+		ctrl.Log.Error(errors.New(sanitize.Text(err.Error())), "fatal controller error")
 		os.Exit(1)
 	}
 }

@@ -10,7 +10,9 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/runtime/serializer"
 	"k8s.io/client-go/dynamic"
+	"k8s.io/client-go/rest"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/envtest"
 	metricsserver "sigs.k8s.io/controller-runtime/pkg/metrics/server"
@@ -109,6 +111,42 @@ func TestWebhookRejectsUnknownFieldsAndSemanticUpdates(t *testing.T) {
 	current.Object["spec"].(map[string]any)["workers"] = int64(2)
 	if _, err := tenants.Update(ctx, current, metav1.UpdateOptions{}); err == nil {
 		t.Fatal("semantic update was accepted by live webhook")
+	}
+
+	current, err = tenants.Get(ctx, "tenant-a", metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedField(current.Object, "Progressing", "status", "phase"); err != nil {
+		t.Fatal(err)
+	}
+	updatedStatus, err := tenants.UpdateStatus(ctx, current, metav1.UpdateOptions{})
+	if err != nil {
+		t.Fatalf("status subresource update failed: %v", err)
+	}
+	version, _, err := unstructured.NestedString(updatedStatus.Object, "spec", "kubernetesVersion")
+	if err != nil || version != "1.36.4" {
+		t.Fatalf("status update changed spec: version=%q err=%v", version, err)
+	}
+
+	rawConfig := rest.CopyConfig(restConfig)
+	rawConfig.GroupVersion = &schema.GroupVersion{
+		Group: "tenancy.cnpg-vcluster.io", Version: "v1alpha1",
+	}
+	rawConfig.APIPath = "/apis"
+	rawConfig.NegotiatedSerializer = serializer.NewCodecFactory(scheme).WithoutConversion()
+	rawClient, err := rest.RESTClientFor(rawConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicate := []byte(`{"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha1","kind":"Tenant","metadata":{"name":"tenant-duplicate"},"spec":{"kubernetesVersion":"1.36.4","workers":1,"workers":2,"databaseCount":1,"podCIDR":"10.30.0.0/16","serviceCIDR":"10.31.0.0/16"}}`)
+	if err := rawClient.Post().
+		Resource("tenants").
+		Param("fieldValidation", "Strict").
+		Body(duplicate).
+		Do(ctx).
+		Error(); err == nil {
+		t.Fatal("duplicate JSON field was accepted by strict API request")
 	}
 }
 

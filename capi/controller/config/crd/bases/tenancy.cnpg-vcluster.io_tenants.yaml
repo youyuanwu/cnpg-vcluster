@@ -209,6 +209,27 @@ spec:
                 type: string
               specHash:
                 type: string
+              survivorSnapshots:
+                items:
+                  properties:
+                    endpoint:
+                      type: string
+                    name:
+                      type: string
+                    observationsHash:
+                      type: string
+                    specHash:
+                      type: string
+                    uid:
+                      type: string
+                  required:
+                  - endpoint
+                  - name
+                  - observationsHash
+                  - specHash
+                  - uid
+                  type: object
+                type: array
               teardown:
                 properties:
                   authority:

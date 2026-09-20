@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import json
+import hashlib
+import ipaddress
 import math
 import sys
 import time
@@ -25,25 +27,51 @@ FUNCTIONAL_CATEGORIES = {
 MAX_EVIDENCE_AGE_SECONDS = 24 * 60 * 60
 
 
-def evaluate_tenant(document: dict[str, object], *, now: float | None = None) -> dict[str, object]:
+def evaluate_tenant(
+    document: dict[str, object],
+    *,
+    foundation_hash: str | None,
+    now: float | None = None,
+) -> dict[str, object]:
     current_time = time.time() if now is None else now
     metadata = _mapping(document.get("metadata"))
+    spec = _mapping(document.get("spec"))
     status = _mapping(document.get("status"))
     evidence = _mapping(status.get("functionalEvidence"))
     blockers: list[str] = []
+    if metadata.get("deletionTimestamp"):
+        blockers.append("Tenant is deleting")
     generation = metadata.get("generation")
     observed_generation = status.get("observedGeneration")
     if not isinstance(generation, int) or isinstance(generation, bool):
         blockers.append("metadata.generation is missing or invalid")
     elif observed_generation != generation:
         blockers.append("status does not observe the current generation")
-    for key in ("specHash", "foundationHash", "observationsHash"):
-        status_value = status.get(key)
-        evidence_value = evidence.get(key)
-        if not isinstance(status_value, str) or not status_value:
-            blockers.append(f"status.{key} is missing")
-        elif evidence_value != status_value:
-            blockers.append(f"functional evidence {key} does not match status")
+    try:
+        expected_spec_hash = canonical_spec_hash(spec)
+    except (KeyError, TypeError, ValueError) as exc:
+        blockers.append(f"Tenant spec is invalid: {exc}")
+        expected_spec_hash = None
+    status_spec_hash = status.get("specHash")
+    if expected_spec_hash is None or status_spec_hash != expected_spec_hash:
+        blockers.append("status.specHash does not match the current Tenant spec")
+    if evidence.get("specHash") != expected_spec_hash:
+        blockers.append("functional evidence specHash does not match the current Tenant spec")
+    if not isinstance(foundation_hash, str) or not foundation_hash:
+        blockers.append("authoritative foundation hash is unavailable")
+    elif status.get("foundationHash") != foundation_hash:
+        blockers.append("status.foundationHash does not match the live foundation")
+    if evidence.get("foundationHash") != foundation_hash:
+        blockers.append("functional evidence foundationHash does not match the live foundation")
+    try:
+        expected_observations_hash = observations_hash(status.get("observedResources"))
+    except (TypeError, ValueError) as exc:
+        blockers.append(f"observed resource identities are invalid: {exc}")
+        expected_observations_hash = None
+    if status.get("observationsHash") != expected_observations_hash:
+        blockers.append("status.observationsHash does not match observed resource identities")
+    if evidence.get("observationsHash") != expected_observations_hash:
+        blockers.append("functional evidence observationsHash does not match observed resource identities")
     verified_at = evidence.get("verifiedAt")
     expires_at = evidence.get("expiresAt")
     if (
@@ -76,6 +104,10 @@ def evaluate_tenant(document: dict[str, object], *, now: float | None = None) ->
     ready = _condition(status, "Ready")
     if ready.get("status") != "True":
         blockers.append("stored Ready condition is not true")
+    if ready.get("observedGeneration") != generation:
+        blockers.append("stored Ready condition does not observe the current generation")
+    if status.get("phase") != "Ready":
+        blockers.append("Tenant phase is not Ready")
     classification = "ready" if not blockers else _classification(status)
     return {
         "schema": 1,
@@ -91,6 +123,78 @@ def evaluate_tenant(document: dict[str, object], *, now: float | None = None) ->
 
 def _mapping(value: object) -> dict[str, object]:
     return value if isinstance(value, dict) else {}
+
+
+def canonical_spec_hash(spec: dict[str, object]) -> str:
+    required = {
+        "kubernetesVersion",
+        "workers",
+        "databaseCount",
+        "podCIDR",
+        "serviceCIDR",
+    }
+    if set(spec) != required:
+        raise ValueError("unexpected or missing fields")
+    workers = spec["workers"]
+    databases = spec["databaseCount"]
+    if (
+        isinstance(workers, bool)
+        or not isinstance(workers, int)
+        or not 1 <= workers <= 3
+        or isinstance(databases, bool)
+        or not isinstance(databases, int)
+        or not 1 <= databases <= 3
+    ):
+        raise ValueError("worker and database counts must be integers from 1 through 3")
+    version = spec["kubernetesVersion"]
+    if not isinstance(version, str):
+        raise ValueError("kubernetesVersion must be a string")
+    pod = ipaddress.ip_network(spec["podCIDR"], strict=True)
+    service = ipaddress.ip_network(spec["serviceCIDR"], strict=True)
+    if pod.version != 4 or service.version != 4 or pod.overlaps(service):
+        raise ValueError("Tenant networks must be non-overlapping IPv4 CIDRs")
+    canonical = {
+        "kubernetesVersion": version.removeprefix("v"),
+        "workers": workers,
+        "databaseCount": databases,
+        "podCIDR": str(pod),
+        "serviceCIDR": str(service),
+    }
+    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def observations_hash(value: object) -> str:
+    if not isinstance(value, list) or not value:
+        raise ValueError("observedResources must be a non-empty list")
+    normalized = []
+    for item in value:
+        if not isinstance(item, dict):
+            raise ValueError("observed resource entry must be an object")
+        required = ("apiVersion", "kind", "name", "uid")
+        if any(not isinstance(item.get(key), str) or not item[key] for key in required):
+            raise ValueError("observed resource identity is incomplete")
+        normalized.append(
+            {
+                "apiVersion": item["apiVersion"],
+                "kind": item["kind"],
+                "namespace": item.get("namespace", ""),
+                "name": item["name"],
+                "uid": item["uid"],
+                "previousUIDs": sorted(item.get("previousUIDs", [])),
+            }
+        )
+    normalized.sort(
+        key=lambda item: (
+            item["apiVersion"],
+            item["kind"],
+            item["namespace"],
+            item["name"],
+            item["uid"],
+        )
+    )
+    encoded = json.dumps(normalized, sort_keys=True, separators=(",", ":")).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
 
 def _condition(status: dict[str, object], condition_type: str) -> dict[str, object]:
@@ -125,7 +229,20 @@ def main(arguments: list[str]) -> int:
     result = client.json("get", "tenant", arguments[0])
     if not isinstance(result, dict):
         raise RuntimeError("Tenant API returned an invalid document")
-    envelope = redact_value(evaluate_tenant(result))
+    foundation = client.json(
+        "get",
+        "configmap",
+        "tenant-foundation",
+        "-n",
+        "tenant-system",
+    )
+    foundation_data = _mapping(_mapping(foundation).get("data"))
+    envelope = redact_value(
+        evaluate_tenant(
+            result,
+            foundation_hash=foundation_data.get("foundation.sha256"),
+        )
+    )
     print(json.dumps(envelope, sort_keys=True))
     return 0 if envelope["classification"] == "ready" else 1
 

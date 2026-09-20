@@ -126,6 +126,37 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
             "Tenant webhook accepted an unknown field\n"
             f"{unknown.stdout}{unknown.stderr}"
         )
+    for description, invalid in (
+        (
+            "boolean count",
+            {
+                **manifest(),
+                "spec": {**manifest()["spec"], "workers": True},
+            },
+        ),
+        (
+            "overlapping networks",
+            {
+                **manifest(),
+                "spec": {
+                    **manifest()["spec"],
+                    "serviceCIDR": manifest()["spec"]["podCIDR"],
+                },
+            },
+        ),
+    ):
+        rejected = client.kubectl(
+            "apply",
+            "--server-side",
+            "--validate=strict",
+            "--field-manager=management-test",
+            "-f",
+            "-",
+            input_text=json.dumps(invalid),
+            check=False,
+        )
+        if rejected.returncode == 0:
+            raise RuntimeError(f"Tenant webhook accepted {description}")
 
     client.kubectl(
         "apply",
