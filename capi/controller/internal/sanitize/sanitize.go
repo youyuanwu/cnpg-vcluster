@@ -52,7 +52,7 @@ func sanitizeValue(value any, depth int) any {
 		kind := reflect.TypeOf(value)
 		if kind != nil {
 			switch kind.Kind() {
-			case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
+			case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct, reflect.Pointer, reflect.Interface:
 				data, err := json.Marshal(value)
 				if err == nil {
 					var decoded any

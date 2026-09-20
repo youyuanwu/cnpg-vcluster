@@ -67,6 +67,9 @@ func TestTextRedactsKubeconfigAndEmbeddedJSON(t *testing.T) {
 }
 
 func TestLoggerSanitizesMessagesErrorsAndValues(t *testing.T) {
+	type credentials struct {
+		Token string `json:"token"`
+	}
 	var output strings.Builder
 	base := funcr.New(
 		func(prefix, args string) {
@@ -83,9 +86,11 @@ func TestLoggerSanitizesMessagesErrorsAndValues(t *testing.T) {
 		"value",
 		"typed",
 		map[string]string{"token": "typed-secret"},
+		"pointer",
+		&credentials{Token: "pointer-secret"},
 	)
 	text := output.String()
-	for _, secret := range []string{"abc", "nested", "value", "typed-secret"} {
+	for _, secret := range []string{"abc", "nested", "value", "typed-secret", "pointer-secret"} {
 		if strings.Contains(text, secret) {
 			t.Fatalf("logger leaked %q in %q", secret, text)
 		}
