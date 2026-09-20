@@ -6,12 +6,14 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.lib.files import (
     IntegrityError,
     has_owner_only_permissions,
     private_file_exists,
     read_private_file,
+    unlink_private_file,
     verify_sha256,
     write_private_file,
 )
@@ -25,6 +27,48 @@ class FileTests(unittest.TestCase):
             self.assertEqual(path.read_text(encoding="utf-8"), "value\n")
             self.assertTrue(has_owner_only_permissions(path))
             self.assertEqual(path.parent.stat().st_mode & 0o077, 0)
+
+    def test_private_metadata_changes_are_directory_synced(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "nested" / "secret"
+            events = []
+            real_mkdir = os.mkdir
+            real_replace = os.replace
+            real_unlink = os.unlink
+            real_fsync = os.fsync
+
+            def tracked_mkdir(*args, **kwargs):
+                result = real_mkdir(*args, **kwargs)
+                events.append("mkdir")
+                return result
+
+            def tracked_replace(*args, **kwargs):
+                result = real_replace(*args, **kwargs)
+                events.append("replace")
+                return result
+
+            def tracked_unlink(*args, **kwargs):
+                result = real_unlink(*args, **kwargs)
+                events.append("unlink")
+                return result
+
+            def tracked_fsync(descriptor):
+                result = real_fsync(descriptor)
+                events.append("fsync")
+                return result
+
+            with (
+                patch("scripts.lib.files.os.mkdir", side_effect=tracked_mkdir),
+                patch("scripts.lib.files.os.replace", side_effect=tracked_replace),
+                patch("scripts.lib.files.os.unlink", side_effect=tracked_unlink),
+                patch("scripts.lib.files.os.fsync", side_effect=tracked_fsync),
+            ):
+                write_private_file(path, "value\n")
+                unlink_private_file(path)
+
+            for operation in ("mkdir", "replace", "unlink"):
+                index = events.index(operation)
+                self.assertEqual(events[index + 1], "fsync")
 
     def test_checksum_verification(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

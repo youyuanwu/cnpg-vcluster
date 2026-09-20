@@ -39,10 +39,14 @@ def _private_path(path: Path) -> tuple[Path, tuple[str, ...]]:
 
 
 def _open_private_directory(parent_fd: int, name: str, display: Path) -> int:
+    created = False
     try:
         os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        created = True
     except FileExistsError:
         pass
+    if created:
+        os.fsync(parent_fd)
     try:
         descriptor = os.open(
             name,
@@ -179,14 +183,34 @@ def write_private_file(path: Path, content: str | bytes) -> None:
                 src_dir_fd=parent_fd,
                 dst_dir_fd=parent_fd,
             )
+            os.fsync(parent_fd)
         except BaseException:
             try:
                 os.unlink(temporary, dir_fd=parent_fd)
+                os.fsync(parent_fd)
             except OSError:
                 pass
             raise
         finally:
             os.close(descriptor)
+
+
+def unlink_private_file(path: Path) -> None:
+    with private_directory(path.parent) as parent_fd:
+        try:
+            details = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise IntegrityError(
+                f"private file is not an owner-only regular file: {path}"
+            )
+        os.unlink(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
 
 
 def read_private_file(path: Path) -> bytes:

@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import hashlib
 import json
-import os
-import stat
 import uuid
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -14,6 +12,7 @@ from .files import (
     private_directory,
     private_file_exists,
     read_private_file,
+    unlink_private_file,
     write_private_file,
 )
 from .tenant_spec import TenantSpec, validate_tenant_name
@@ -53,20 +52,7 @@ def _read_private_json(path: Path) -> dict[str, object]:
 
 
 def _unlink_private_file(path: Path) -> None:
-    with private_directory(path.parent) as parent_fd:
-        try:
-            details = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
-        except FileNotFoundError:
-            return
-        if (
-            not stat.S_ISREG(details.st_mode)
-            or details.st_uid != os.getuid()
-            or details.st_mode & 0o077
-        ):
-            raise IntegrityError(
-                f"private file is not an owner-only regular file: {path}"
-            )
-        os.unlink(path.name, dir_fd=parent_fd)
+    unlink_private_file(path)
 
 
 @dataclass(frozen=True)
