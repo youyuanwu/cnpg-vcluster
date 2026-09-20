@@ -35,6 +35,7 @@ from scripts.lib.registry import (
     registry_name,
     validate_registry_state_files,
 )
+from scripts.lib.controller import delete_controller
 
 
 def _validate_runtime_inventory(
@@ -69,6 +70,8 @@ def _validate_runtime_inventory(
         "rendered/providers/capi-core-components.yaml",
         "rendered/providers/capd-components.yaml",
         "rendered/providers/kamaji-capi-components.yaml",
+        "rendered/controller/manager",
+        "rendered/controller/manager.yaml",
     }
     tenant_pattern = r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?"
     tenant_pair_pattern = rf"{tenant_pattern}-to-{tenant_pattern}"
@@ -197,6 +200,7 @@ def _remove_local_runtime(root: Path) -> None:
 
 
 def _delete_kubernetes_stack(root: Path, config: dict[str, str], client: ManagementClient) -> None:
+    delete_controller(root, config, client)
     delete_providers(root, config, client)
 
     client.helm(

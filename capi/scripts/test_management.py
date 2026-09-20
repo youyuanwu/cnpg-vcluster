@@ -17,6 +17,7 @@ from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
 from scripts.status import collect_management_status, management_status_healthy
+from scripts.test_e2e import verify_no_local_runtime_residue
 
 
 def run_just(root: Path, config: dict[str, str], *arguments: str, check: bool = True):
@@ -88,6 +89,102 @@ def require_healthy_management(root: Path, config: dict[str, str]) -> None:
         raise RuntimeError("healthy management status was nonzero")
 
 
+def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
+    client = ManagementClient(root, config)
+
+    def manifest(*, version: str = "v1.36.4", workers: int = 1, unknown: bool = False):
+        spec = {
+            "kubernetesVersion": version,
+            "workers": workers,
+            "databaseCount": 1,
+            "podCIDR": "10.220.0.0/16",
+            "serviceCIDR": "10.221.0.0/16",
+        }
+        if unknown:
+            spec["unknown"] = True
+        return {
+            "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+            "kind": "Tenant",
+            "metadata": {"name": "validation-fixture"},
+            "spec": spec,
+        }
+
+    unknown = client.kubectl(
+        "apply",
+        "--server-side",
+        "--validate=strict",
+        "--field-manager=management-test",
+        "-f",
+        "-",
+        input_text=json.dumps(manifest(unknown=True)),
+        check=False,
+    )
+    if unknown.returncode == 0 or "unknown" not in (
+        unknown.stdout + unknown.stderr
+    ).lower():
+        raise RuntimeError(
+            "Tenant webhook accepted an unknown field\n"
+            f"{unknown.stdout}{unknown.stderr}"
+        )
+
+    client.kubectl(
+        "apply",
+        "--server-side",
+        "--validate=strict",
+        "--field-manager=management-test",
+        "-f",
+        "-",
+        input_text=json.dumps(manifest()),
+    )
+    client.kubectl(
+        "wait",
+        "tenant/validation-fixture",
+        "--for=jsonpath={.status.conditions[?(@.type=='Accepted')].status}=True",
+        f"--timeout={config['CONDITION_TIMEOUT']}",
+    )
+    tenant = client.json("get", "tenant", "validation-fixture")
+    if tenant["metadata"].get("finalizers"):
+        raise RuntimeError("validation-only Tenant unexpectedly received a finalizer")
+    if client.kubectl(
+        "get",
+        "namespace",
+        "validation-fixture",
+        check=False,
+    ).returncode == 0:
+        raise RuntimeError("validation-only Tenant created provider resources")
+
+    client.kubectl(
+        "apply",
+        "--server-side",
+        "--validate=strict",
+        "--field-manager=management-test",
+        "-f",
+        "-",
+        input_text=json.dumps(manifest(version="1.36.4")),
+    )
+    changed = client.kubectl(
+        "apply",
+        "--server-side",
+        "--validate=strict",
+        "--field-manager=management-test",
+        "-f",
+        "-",
+        input_text=json.dumps(manifest(version="1.36.4", workers=2)),
+        check=False,
+    )
+    if changed.returncode == 0 or "immutable" not in (
+        changed.stdout + changed.stderr
+    ).lower():
+        raise RuntimeError("Tenant webhook accepted a semantic specification change")
+    client.kubectl(
+        "delete",
+        "tenant",
+        "validation-fixture",
+        "--wait=true",
+        f"--timeout={config['DELETE_TIMEOUT']}",
+    )
+
+
 def assert_input_tamper_rejected(
     root: Path,
     config: dict[str, str],
@@ -103,7 +200,10 @@ def assert_input_tamper_rejected(
         if rejected.returncode == 0 or "SHA-256 mismatch" not in (
             rejected.stdout + rejected.stderr
         ):
-            raise RuntimeError(f"tampered management input was accepted: {path.name}")
+            raise RuntimeError(
+                f"tampered management input was accepted: {path.name}\n"
+                f"{rejected.stdout}{rejected.stderr}"
+            )
         if fingerprint(root, config) != before:
             raise RuntimeError(f"tampered management input changed live state: {path.name}")
     finally:
@@ -179,6 +279,7 @@ def main() -> int:
         run_just(ROOT, config, "prepare-host")
         run_just(ROOT, config, "preflight")
         run_just(ROOT, config, "create-management")
+        assert_tenant_api_validation(ROOT, config)
         first = fingerprint(ROOT, config)
         restore_live = run_just(ROOT, config, "_restore-host", check=False)
         if restore_live.returncode == 0 or "management state exists" not in (
@@ -401,8 +502,7 @@ def main() -> int:
         for name, original in original_inotify.items():
             if read_inotify(name) != original:
                 raise RuntimeError(f"host inotify {name} was not restored")
-        if (ROOT / ".runtime").exists():
-            raise RuntimeError("runtime directory remained after management lifecycle")
+        verify_no_local_runtime_residue(ROOT)
         print("management lifecycle checks passed")
         return 0
     finally:

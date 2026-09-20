@@ -244,6 +244,10 @@ class ManagementTests(unittest.TestCase):
             patch("scripts.create_management.reconcile_metallb"),
             patch("scripts.create_management.reconcile_kamaji"),
             patch("scripts.create_management.reconcile_providers"),
+            patch(
+                "scripts.create_management.reconcile_controller",
+                side_effect=lambda *_: calls.append("tenant-controller"),
+            ),
         ):
             create_management(Path("."), config)
         self.assertEqual(
@@ -258,6 +262,7 @@ class ManagementTests(unittest.TestCase):
                 "egress",
                 "mirror-pulls",
                 "cert-manager",
+                "tenant-controller",
             ],
         )
 

@@ -55,6 +55,34 @@ tenant-status profile tenant:
 tenant-delete profile tenant confirmation:
     @python3 scripts/tenant.py delete {{quote(profile)}} {{quote(tenant)}} {{quote(confirmation)}}
 
+# Generate Tenant API deep-copy, CRD, and RBAC artifacts from pinned Go modules.
+controller-generate:
+    @python3 scripts/generate_controller.py
+
+# Verify generated Tenant API artifacts are current.
+controller-verify:
+    @python3 scripts/generate_controller.py --verify
+
+# Run Go unit and API tests using the standard Go module cache.
+controller-test:
+    @python3 scripts/test_controller.py
+
+# Build the static Tenant controller manager binary.
+controller-build:
+    @python3 scripts/build_controller.py --binary
+
+# Build the scratch Tenant controller image from verified assets.
+controller-image:
+    @python3 scripts/build_controller.py
+
+# Internal validation-only apply helper used before the local lifecycle cutover.
+_controller-tenant-apply manifest:
+    @python3 -c 'from pathlib import Path; from scripts.lib.config import load_configuration; from scripts.lib.controller_client import apply_tenant; root=Path.cwd(); apply_tenant(root, load_configuration(root), Path({{quote(manifest)}}))'
+
+# Evaluate Tenant status and functional-evidence freshness without mutation.
+controller-tenant-status tenant:
+    @python3 scripts/controller_tenant_status.py {{quote(tenant)}}
+
 # [implemented] Reconcile the management cluster and lifecycle controllers.
 create-management:
     @python3 scripts/lab.py create-management

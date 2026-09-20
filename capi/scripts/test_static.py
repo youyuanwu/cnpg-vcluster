@@ -28,6 +28,12 @@ EXPECTED_RECIPES = {
     "tenant-create",
     "tenant-status",
     "tenant-delete",
+    "controller-generate",
+    "controller-verify",
+    "controller-test",
+    "controller-build",
+    "controller-image",
+    "controller-tenant-status",
     "create-management",
     "dev-bootstrap",
     "dev-clean",
@@ -160,6 +166,20 @@ def check_repository_boundaries() -> None:
     check(not (repository / "Makefile").exists(), "obsolete root Makefile remains")
     check(not (repository / "vcluster").exists(), "obsolete vcluster lab remains")
     check(not (repository / "kamaji").exists(), "obsolete standalone Kamaji lab remains")
+    required_controller_files = (
+        "controller/go.mod",
+        "controller/Dockerfile",
+        "controller/API_COMPATIBILITY.md",
+        "controller/api/v1alpha1/tenant_types.go",
+        "controller/cmd/manager/main.go",
+        "controller/config/webhook/validating-webhook.yaml",
+    )
+    for relative in required_controller_files:
+        check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
+    check(
+        not (ROOT / "controller" / "vendor").exists(),
+        "Go dependencies must use the module cache; controller/vendor is forbidden",
+    )
     production = [
         *(ROOT / "config").glob("*"),
         *(
