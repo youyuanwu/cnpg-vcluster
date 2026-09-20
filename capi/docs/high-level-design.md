@@ -113,6 +113,32 @@ evidence until authoritative absence. Status is read-only and classifies the
 tenant as `ready`, `absent`, `progressing`, `deleting`, `degraded`, `failed`,
 or `ownership-invalid`; inspection failures are never reported as absence.
 
+## Lifecycle orchestration boundary
+
+The as-built Python lifecycle is intentionally a CLI-driven experiment and an
+executable specification of the safety contract, not the implementation of a
+persistent multi-user service. Its filesystem journals, locks, polling loops,
+identity recovery, and Ready evidence make destructive behavior testable
+without first introducing a repository-owned Kubernetes API.
+
+If this experiment becomes a maintained service, the next architecture
+milestone should introduce a versioned `Tenant` CRD and a controller built on
+controller-runtime or an equivalent framework. Kubernetes reconciliation,
+status conditions, watches, work queues, leader election, owner references,
+and finalizers should then replace the generic lifecycle machinery where they
+provide equivalent guarantees. The current provider-specific rules remain
+controller invariants and conformance tests, including strict specification
+validation, immutable durable identities, local survivor protection, exact
+Azure ownership classification, controller-owned worker deletion, foundation
+preservation, and fail-closed recovery.
+
+Bicep should continue to own the independently deployed shared Azure
+foundation. CAPI/CAPD/CAPZ should continue to own worker infrastructure, while
+the future tenant controller owns only tenant orchestration resources and
+coordinates deletion through those providers. This boundary avoids turning
+the current CLI and `azure.py` runtime into a long-lived custom operator while
+preserving the validated domain-specific safety rules.
+
 ## Authoritative endpoint strategy
 
 MetalLB allocates deterministic VIPs from the actual kind Docker subnet. The
