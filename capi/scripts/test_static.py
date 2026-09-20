@@ -10,10 +10,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from scripts.lib.config import load_configuration
+from scripts.lib.config import load_configuration, load_env_file
 
 
 EXPECTED_RECIPES = {
+    "default",
     "cache",
     "tools",
     "prepare-host",
@@ -21,16 +22,14 @@ EXPECTED_RECIPES = {
     "azure-preflight",
     "azure-create-foundation",
     "azure-create-management",
-    "azure-create-tenant-control-plane",
-    "azure-create-worker",
-    "azure-install-addons",
-    "azure-status",
+    "azure-foundation-status",
     "azure-destroy",
+    "azure-test-tenant-lifecycle",
+    "tenant-create",
+    "tenant-status",
+    "tenant-delete",
     "create-management",
     "dev-bootstrap",
-    "dev-tenant",
-    "dev-up",
-    "dev-test",
     "dev-clean",
     "test-endpoint",
     "test-endpoint-negative",
@@ -41,12 +40,7 @@ EXPECTED_RECIPES = {
     "test-storage-negative",
     "test-persistence",
     "test-persistence-negative",
-    "create",
-    "repair",
-    "status",
     "diagnose",
-    "verify",
-    "destroy-tenant",
     "destroy",
     "break-glass",
     "test-unit",
@@ -87,7 +81,12 @@ def check_recipes() -> None:
         for line in result.stdout.splitlines()
         if (match := re.match(r"\s{4}([a-zA-Z0-9_-]+)", line))
     }
-    check(EXPECTED_RECIPES <= recipes, f"missing recipes: {sorted(EXPECTED_RECIPES - recipes)}")
+    check(
+        EXPECTED_RECIPES == recipes,
+        "recipe surface changed: "
+        f"missing={sorted(EXPECTED_RECIPES - recipes)} "
+        f"unexpected={sorted(recipes - EXPECTED_RECIPES)}",
+    )
     check("[implemented]" in result.stdout, "task list does not mark implemented recipes")
     check("[phase " not in result.stdout, "task list still marks blocked recipes")
     unavailable = output(
@@ -118,11 +117,30 @@ def check_configuration() -> None:
         check(f"{prefix}_SHA256" in config, f"{key} lacks SHA-256")
     check(config["CAPI_CONTRACT"] == "v1beta2", "CAPI contract must be v1beta2")
     check(config["KAMAJI_CAPI_CONTRACT"] == "v1beta2", "Kamaji provider contract must be v1beta2")
+    from scripts.lib.tenant_spec import load_tenant_spec
+    from scripts.lib.tenants import load_local_tenant_spec
+
+    supported_versions = {
+        "local": config["KUBERNETES_VERSION"],
+        "azure": load_env_file(
+            ROOT / "config" / "azure" / "defaults.env"
+        )["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
+    }
+    for profile in ("local", "azure"):
+        load_tenant_spec(
+            ROOT / "config" / "tenants" / "examples" / f"{profile}.json",
+            expected_profile=profile,
+            supported_versions=supported_versions,
+        )
+    load_local_tenant_spec(
+        ROOT,
+        ROOT / "config" / "tenants" / "examples" / "local.json",
+        config,
+        include_management_network=False,
+    )
     for key in (
         "VIP_POOL_START_OFFSET_FROM_BROADCAST",
         "VIP_POOL_END_OFFSET_FROM_BROADCAST",
-        "TENANT_A_API_VIP_SLOT",
-        "TENANT_B_API_VIP_SLOT",
         "SPIKE_API_VIP_SLOT",
     ):
         check(key in config, f"missing VIP configuration {key}")
@@ -163,6 +181,27 @@ def check_repository_boundaries() -> None:
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             check(token not in text, f"{path.relative_to(ROOT)} contains forbidden token {token!r}")
+    azure_source = (ROOT / "scripts" / "azure.py").read_text(encoding="utf-8")
+    check(
+        not re.search(
+            r"[\"']vmss[\"']\s*,\s*[\"']delete[\"']",
+            azure_source,
+        ),
+        "normal Azure lifecycle directly deletes a VMSS",
+    )
+    check(
+        "/metadata/finalizers" not in azure_source,
+        "normal Azure lifecycle patches Azure provider finalizers",
+    )
+    check(
+        not re.search(
+            r"(?:patch|replace).{0,200}(?:azurecluster|azuremachinepool|natgateway)"
+            r".{0,200}finalizers",
+            azure_source,
+            re.IGNORECASE | re.DOTALL,
+        ),
+        "normal Azure lifecycle removes Azure provider finalizers",
+    )
 
 
 def check_documentation() -> None:
@@ -170,18 +209,23 @@ def check_documentation() -> None:
     design = (ROOT / "docs" / "high-level-design.md").read_text(
         encoding="utf-8"
     )
+    azure_design = (ROOT / "docs" / "azure-experiment-design.md").read_text(
+        encoding="utf-8"
+    )
     notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
     root_readme = (ROOT.parent / "README.md").read_text(encoding="utf-8")
     readme_flat = " ".join(readme.split())
     design_flat = " ".join(design.split())
+    azure_design_flat = " ".join(azure_design.split())
     notices_flat = " ".join(notices.split())
     required_readme = (
         "CAPD `DevCluster` and `DevMachine` resources are development-only",
         "sharing the host kernel",
         "900 KiB",
         "Break-glass finalizer removal",
-        "independently provisioned AKS management cluster",
-        "does not create or configure Azure resources",
+        "Local and Azure tenants share the same strict specification",
+        "`just tenant-delete azure <name> azure/<name>`",
+        "lets CAPI/CAPZ delete the MachinePool and VMSS",
         "Status, conditions, and exits",
         "CAPI implementation does not emit it",
         "Cluster in healthy state",
@@ -206,14 +250,16 @@ def check_documentation() -> None:
         "DynamicInfrastructureClusterPatch=false",
         "ClusterResourceSet packages the initial sources",
         "Azure CSI",
-        "CAPZ self-managed `AzureCluster`/`AzureMachine` workers",
+        "CAPZ `MachinePool`/`AzureMachinePool` VMSS workers",
         "AzureCluster.spec.controlPlaneEnabled: false",
         "| Identity |",
         "| Add-ons |",
         "| Verification |",
-        "No Azure CLI",
-        "representative tenant, requires one three-instance PostgreSQL",
-        "future tenants are not separate AKS clusters",
+        "provider-neutral tenant lifecycle",
+        "profile/tenant",
+        "multiple survivors",
+        "one explicitly selected representative tenant",
+        "Azure tenants are not separate AKS clusters",
         "Verified acquisition and image distribution",
         "explicit concurrent import and exact-target verification barrier",
         "`just test-e2e-offline`",
@@ -229,6 +275,26 @@ def check_documentation() -> None:
             token in design_flat,
             f"CAPI design lacks documentation assertion: {token}",
         )
+    required_azure_design = (
+        "`just tenant-delete azure <tenant> azure/<tenant>`",
+        "`just azure-test-tenant-lifecycle`",
+        "CAPZ remains responsible for VMSS deletion.",
+        "Kubernetes UID/resourceVersion preconditions",
+        "cnpg-vcluster-external-control-plane=true",
+        "Foundation status rejects a missing, broadened, or conflicting selector.",
+        "Targeted deletion to canonical absence",
+        "Recreate from the same specification and reach Ready",
+    )
+    for token in required_azure_design:
+        check(
+            token in azure_design_flat,
+            f"Azure design lacks documentation assertion: {token}",
+        )
+    check(
+        "VMSS-backed tenant workers that run CloudNativePG"
+        not in azure_design_flat,
+        "Azure design claims unimplemented CloudNativePG behavior",
+    )
     for project in (
         "Cluster API",
         "Kamaji CAPI provider",
@@ -251,8 +317,8 @@ def check_documentation() -> None:
         "third-party notices omit the direct etcd source URL",
     )
     check(
-        "one local CloudNativePG experiment" in root_readme,
-        "root README does not identify CAPI as the remaining lab",
+        "one Cluster API and CloudNativePG experiment" in root_readme,
+        "root README does not identify the CAPI tenant lifecycle lab",
     )
     check(
         (ROOT / "licenses" / "README.md").is_file(),

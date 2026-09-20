@@ -31,25 +31,29 @@ azure-create-foundation:
 azure-create-management:
     @python3 scripts/azure.py create-management
 
-# Create one hosted tenant control plane and its externally managed AzureCluster.
-azure-create-tenant-control-plane:
-    @python3 scripts/azure.py create-tenant-control-plane
-
-# Create one VMSS-backed tenant worker and wait for Node registration.
-azure-create-worker:
-    @python3 scripts/azure.py create-worker
-
-# Install Azure cloud initialization and Calico from an AKS-resident Job.
-azure-install-addons:
-    @python3 scripts/azure.py install-addons
-
-# Report the exact recorded Azure foundation state.
-azure-status:
-    @python3 scripts/azure.py status
+# Report only the exact recorded Azure management foundation state.
+azure-foundation-status:
+    @python3 scripts/azure.py foundation-status
 
 # Start deletion of the exactly recorded Azure experiment resource group.
 azure-destroy:
     @python3 scripts/azure.py destroy
+
+# Destructively run the one clean Azure create-delete-recreate lifecycle gate.
+azure-test-tenant-lifecycle spec="config/tenants/examples/azure.json":
+    @python3 scripts/test_azure_tenant_lifecycle.py {{quote(spec)}}
+
+# Create one tenant from an explicit local or Azure JSON specification.
+tenant-create profile spec:
+    @python3 scripts/tenant.py create {{quote(profile)}} {{quote(spec)}}
+
+# Report one tenant through the provider-neutral status envelope.
+tenant-status profile tenant:
+    @python3 scripts/tenant.py status {{quote(profile)}} {{quote(tenant)}}
+
+# Delete one tenant after confirming the exact profile/name pair.
+tenant-delete profile tenant confirmation:
+    @python3 scripts/tenant.py delete {{quote(profile)}} {{quote(tenant)}} {{quote(confirmation)}}
 
 # [implemented] Reconcile the management cluster and lifecycle controllers.
 create-management:
@@ -58,18 +62,6 @@ create-management:
 # [implemented] Bootstrap and bind a retained management development context.
 dev-bootstrap:
     @python3 scripts/lab.py dev-bootstrap
-
-# [implemented] Recreate and verify tenant A without rebuilding management.
-dev-tenant:
-    @python3 scripts/lab.py dev-tenant
-
-# [implemented] Reconcile retained management and a complete tenant A stack.
-dev-up:
-    @python3 scripts/lab.py dev-up
-
-# [implemented] Run one fast non-destructive check against retained infrastructure.
-dev-test suite="all":
-    @python3 scripts/lab.py dev-test "{{suite}}"
 
 # [implemented] Remove retained tenants, management, runtime state, and host changes.
 dev-clean:
@@ -111,29 +103,9 @@ test-persistence:
 test-persistence-negative:
     @python3 scripts/run_locked.py scripts/test_persistence_negative.py
 
-# [implemented] Reconcile both tenant clusters.
-create:
-    @python3 scripts/lab.py create
-
-# [implemented] Repair one exactly identified tenant.
-repair tenant:
-    @python3 scripts/lab.py repair "{{tenant}}"
-
-# [implemented] Report read-only summarized state.
-status:
-    @python3 scripts/lab.py status
-
 # [implemented] Report read-only scoped diagnostics.
 diagnose scope="all":
     @python3 scripts/lab.py diagnose "{{scope}}"
-
-# [implemented] Verify tenant isolation and database behavior.
-verify:
-    @python3 scripts/lab.py verify
-
-# [implemented] Delete one tenant and verify the survivor.
-destroy-tenant tenant:
-    @python3 scripts/lab.py destroy-tenant "{{tenant}}"
 
 # [implemented through phase 2] Delete exactly owned management resources.
 destroy:

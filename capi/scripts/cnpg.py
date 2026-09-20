@@ -22,6 +22,40 @@ class SQLProbeCleanupError(RuntimeError):
     pass
 
 
+def _database_count(tenant) -> int:
+    return int(getattr(tenant, "database_count", 3))
+
+
+def _anti_affinity_type(tenant) -> str:
+    workers = int(getattr(tenant, "workers", 3))
+    return "required" if _database_count(tenant) <= workers else "preferred"
+
+
+def _static_pv_items(config: dict[str, str], tenant) -> str:
+    items = []
+    for ordinal in range(1, _database_count(tenant) + 1):
+        items.append(
+            f"""\
+  - apiVersion: v1
+    kind: PersistentVolume
+    metadata:
+      name: {tenant.cnpg_cluster}-pv-{ordinal}
+    spec:
+      capacity:
+        storage: 1Gi
+      accessModes: [ReadWriteOnce]
+      persistentVolumeReclaimPolicy: Retain
+      storageClassName: {config["SPIKE_STORAGE_CLASS"]}
+      claimRef:
+        namespace: database
+        name: {tenant.cnpg_cluster}-{ordinal}
+      hostPath:
+        path: {config["SPIKE_STORAGE_CONTAINER_PATH"]}/volumes/cnpg/{ordinal}
+        type: DirectoryOrCreate"""
+        )
+    return "\n".join(items)
+
+
 def _render_operator(root: Path, config: dict[str, str], tenant) -> Path:
     source = root / ".tools" / "inputs" / "cnpg.yaml"
     verify_sha256(source, config["CNPG_MANIFEST_SHA256"])
@@ -41,6 +75,9 @@ def _render_cluster(root: Path, config: dict[str, str], tenant) -> tuple[Path, P
         "${POSTGRES_IMAGE}": config["POSTGRES_IMAGE"],
         "${STORAGE_CLASS}": config["SPIKE_STORAGE_CLASS"],
         "${STORAGE_PATH}": config["SPIKE_STORAGE_CONTAINER_PATH"],
+        "${CNPG_INSTANCES}": str(_database_count(tenant)),
+        "${CNPG_ANTI_AFFINITY_TYPE}": _anti_affinity_type(tenant),
+        "${CNPG_PV_ITEMS}": _static_pv_items(config, tenant),
     }
     rendered = []
     for source_name, destination_name in (
@@ -72,7 +109,7 @@ def _prepare_cnpg_directories(config: dict[str, str], tenant) -> None:
             "sh",
             config["VERIFY_IMAGE"],
             "-ec",
-            "for ordinal in 1 2 3; do "
+            f"for ordinal in $(seq 1 {_database_count(tenant)}); do "
             "mkdir -p /data/volumes/cnpg/$ordinal; "
             "chown 26:26 /data/volumes/cnpg/$ordinal; "
             "chmod 700 /data/volumes/cnpg/$ordinal; "
@@ -158,7 +195,8 @@ def _cnpg_ready(root: Path, config: dict[str, str], tenant) -> bool:
             "json",
         ).stdout
     )["items"]
-    if len(pvcs) != 3 or any(
+    expected = _database_count(tenant)
+    if len(pvcs) != expected or any(
         pvc["status"].get("phase") != "Bound" for pvc in pvcs
     ):
         return False
@@ -190,9 +228,9 @@ def _cnpg_ready(root: Path, config: dict[str, str], tenant) -> bool:
     )
     return (
         cluster.get("status", {}).get("phase") == "Cluster in healthy state"
-        and cluster.get("status", {}).get("readyInstances") == 3
-        and len(ready_pods) == 3
-        and len({pod["spec"]["nodeName"] for pod in ready_pods}) == 3
+        and cluster.get("status", {}).get("readyInstances") == expected
+        and len(ready_pods) == expected
+        and all(pod["spec"].get("nodeName") for pod in ready_pods)
         and all(
             next(
                 container
@@ -433,9 +471,9 @@ def verify_retained_marker(root: Path, config: dict[str, str], tenant) -> None:
 
 
 def _verify_filesystem(config: dict[str, str], tenant) -> None:
-    script = """\
+    script = f"""\
 set -eu
-for ordinal in 1 2 3; do
+for ordinal in $(seq 1 {_database_count(tenant)}); do
   path=/data/volumes/cnpg/$ordinal/pgdata
   test -d "$path"
   echo "instance=$ordinal directory=$(stat -c %u:%g:%a "$path")"
@@ -482,8 +520,8 @@ def _storage_identity(root: Path, config: dict[str, str], tenant) -> dict[str, s
             "json",
         ).stdout
     )["items"]
-    if len(pvcs) != 3:
-        raise RuntimeError("CNPG does not have three PVCs")
+    if len(pvcs) != _database_count(tenant):
+        raise RuntimeError("CNPG PVC count does not match tenant specification")
     return {
         pvc["metadata"]["name"]: f"{pvc['metadata']['uid']}:{pvc['spec']['volumeName']}"
         for pvc in pvcs

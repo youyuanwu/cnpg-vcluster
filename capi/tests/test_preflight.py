@@ -20,10 +20,6 @@ from scripts.lib.process import CommandError
 BASE = {
     "MANAGEMENT_POD_CIDR": "10.210.0.0/16",
     "MANAGEMENT_SERVICE_CIDR": "10.211.0.0/16",
-    "TENANT_A_POD_CIDR": "10.70.0.0/16",
-    "TENANT_A_SERVICE_CIDR": "10.140.0.0/16",
-    "TENANT_B_POD_CIDR": "10.71.0.0/16",
-    "TENANT_B_SERVICE_CIDR": "10.141.0.0/16",
     "SPIKE_POD_CIDR": "10.72.0.0/16",
     "SPIKE_SERVICE_CIDR": "10.142.0.0/16",
 }
@@ -101,11 +97,11 @@ class PreflightTests(unittest.TestCase):
         verify.assert_called_once_with(Path("/tmp/example"), {"TEST": "value"})
 
     def test_accepts_disjoint_networks(self) -> None:
-        self.assertEqual(len(configured_networks(BASE)), 8)
+        self.assertEqual(len(configured_networks(BASE)), 4)
 
     def test_rejects_overlap(self) -> None:
         values = dict(BASE)
-        values["SPIKE_POD_CIDR"] = values["TENANT_A_POD_CIDR"]
+        values["SPIKE_POD_CIDR"] = values["MANAGEMENT_POD_CIDR"]
         with self.assertRaises(PreflightError):
             configured_networks(values)
 

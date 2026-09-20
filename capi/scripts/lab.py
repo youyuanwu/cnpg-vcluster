@@ -14,23 +14,18 @@ from scripts.lib.locking import e2e_lock, tools_lock
 from scripts.lib.redaction import redact
 from scripts.create_management import create_management
 from scripts.break_glass import break_glass
-from scripts.create import create
 from scripts.destroy import destroy
 from scripts.diagnose import diagnose
-from scripts.destroy_tenant import destroy_tenant_stack
 from scripts.endpoint import run_endpoint_gate
 from scripts.network import run_network_gate
 from scripts.machines import run_machine_gate
 from scripts.storage import run_storage_gate
 from scripts.cnpg import run_cnpg_gate
 from scripts.preflight import PreflightError, run_preflight
-from scripts.repair import repair
-from scripts.status import status
 from scripts.tools import prepare_tools
 from scripts.cache import acquire_cache
 from scripts.test_tenant_lifecycle import run_tenant_lifecycle
-from scripts.verify import verify
-from scripts.retained import dev_bootstrap, dev_clean, dev_tenant, dev_test, dev_up
+from scripts.retained import dev_bootstrap, dev_clean
 
 
 def unavailable(arguments: list[str]) -> int:
@@ -54,20 +49,6 @@ def main(arguments: list[str]) -> int:
         with tools_lock(ROOT, exclusive=True):
             dev_bootstrap(ROOT, config)
         return 0
-    if command == "dev-tenant":
-        with tools_lock(ROOT, exclusive=True):
-            dev_tenant(ROOT, config)
-        return 0
-    if command == "dev-up":
-        with tools_lock(ROOT, exclusive=True):
-            dev_up(ROOT, config)
-        return 0
-    if command == "dev-test":
-        if len(rest) != 1:
-            raise RuntimeError("dev-test requires exactly one suite name")
-        with tools_lock(ROOT, exclusive=False):
-            dev_test(ROOT, config, rest[0])
-        return 0
     if command == "dev-clean":
         with tools_lock(ROOT, exclusive=True):
             dev_clean(ROOT, config)
@@ -90,29 +71,6 @@ def main(arguments: list[str]) -> int:
         with tools_lock(ROOT, exclusive=True):
             create_management(ROOT, config)
         return 0
-    if command == "create":
-        with tools_lock(ROOT, exclusive=True):
-            run_preflight(ROOT, config)
-            create(ROOT, config)
-        return 0
-    if command == "verify":
-        with tools_lock(ROOT, exclusive=True):
-            run_preflight(ROOT, config)
-            verify(ROOT, config)
-        return 0
-    if command == "repair":
-        if len(rest) != 1:
-            raise RuntimeError("repair requires exactly one tenant name")
-        with tools_lock(ROOT, exclusive=True):
-            run_preflight(ROOT, config)
-            repair(ROOT, config, rest[0])
-        return 0
-    if command == "destroy-tenant":
-        if len(rest) != 1:
-            raise RuntimeError("destroy-tenant requires exactly one tenant name")
-        with tools_lock(ROOT, exclusive=True):
-            destroy_tenant_stack(ROOT, config, rest[0])
-        return 0
     if command == "break-glass":
         if len(rest) != 4:
             raise RuntimeError(
@@ -122,13 +80,10 @@ def main(arguments: list[str]) -> int:
             break_glass(ROOT, config, *rest)
         return 0
     if command == "test-tenant-lifecycle":
-        with tools_lock(ROOT, exclusive=True):
-            run_preflight(ROOT, config)
-            run_tenant_lifecycle(ROOT, config)
-        return 0
-    if command == "status":
         with tools_lock(ROOT, exclusive=False):
-            return status(ROOT, config)
+            run_preflight(ROOT, config)
+        run_tenant_lifecycle(ROOT, config)
+        return 0
     if command == "diagnose":
         with tools_lock(ROOT, exclusive=False):
             return diagnose(ROOT, config, rest[0] if rest else "all")

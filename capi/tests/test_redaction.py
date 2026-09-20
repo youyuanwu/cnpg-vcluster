@@ -14,6 +14,8 @@ class RedactionTests(unittest.TestCase):
                 "Authorization: Bearer secret",
                 "--token separated-secret",
                 "--password=assigned-secret",
+                "Subscription 00000000-0000-0000-0000-000000000000 is not registered",
+                "provider error: {'Authorization': 'python-mapping-secret'}",
                 "-----BEGIN PRIVATE KEY-----\nprivate\n-----END PRIVATE KEY-----",
             )
         )
@@ -24,6 +26,8 @@ class RedactionTests(unittest.TestCase):
             "Bearer secret",
             "separated-secret",
             "assigned-secret",
+            "00000000-0000-0000-0000-000000000000",
+            "python-mapping-secret",
             "private",
         ):
             self.assertNotIn(secret, result)

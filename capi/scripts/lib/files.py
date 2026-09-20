@@ -39,10 +39,14 @@ def _private_path(path: Path) -> tuple[Path, tuple[str, ...]]:
 
 
 def _open_private_directory(parent_fd: int, name: str, display: Path) -> int:
+    created = False
     try:
         os.mkdir(name, mode=0o700, dir_fd=parent_fd)
+        created = True
     except FileExistsError:
         pass
+    if created:
+        os.fsync(parent_fd)
     try:
         descriptor = os.open(
             name,
@@ -95,6 +99,45 @@ def private_directory(path: Path) -> Iterator[int]:
             os.close(descriptor)
 
 
+@contextmanager
+def existing_private_directory(path: Path) -> Iterator[int]:
+    base, components = _private_path(path)
+    descriptors = []
+    try:
+        descriptor = os.open(
+            base,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        descriptors.append(descriptor)
+        display = base
+        for component in components:
+            display /= component
+            descriptor = os.open(
+                component,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=descriptor,
+            )
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISDIR(details.st_mode)
+                or details.st_uid != os.getuid()
+                or details.st_mode & 0o077
+            ):
+                os.close(descriptor)
+                raise IntegrityError(
+                    f"private directory is not an owner-only directory: {display}"
+                )
+            descriptors.append(descriptor)
+        yield descriptors[-1]
+    except OSError as exc:
+        raise IntegrityError(
+            f"unable to traverse existing private directory safely: {path}: {exc}"
+        ) from exc
+    finally:
+        for descriptor in reversed(descriptors):
+            os.close(descriptor)
+
+
 def ensure_private_dir(path: Path) -> None:
     with private_directory(path):
         pass
@@ -140,14 +183,107 @@ def write_private_file(path: Path, content: str | bytes) -> None:
                 src_dir_fd=parent_fd,
                 dst_dir_fd=parent_fd,
             )
+            os.fsync(parent_fd)
         except BaseException:
             try:
                 os.unlink(temporary, dir_fd=parent_fd)
+                os.fsync(parent_fd)
             except OSError:
                 pass
             raise
         finally:
             os.close(descriptor)
+
+
+def unlink_private_file(path: Path) -> None:
+    with private_directory(path.parent) as parent_fd:
+        try:
+            details = os.stat(path.name, dir_fd=parent_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            return
+        if (
+            not stat.S_ISREG(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise IntegrityError(
+                f"private file is not an owner-only regular file: {path}"
+            )
+        os.unlink(path.name, dir_fd=parent_fd)
+        os.fsync(parent_fd)
+
+
+def read_private_file(path: Path) -> bytes:
+    with existing_private_directory(path.parent) as parent_fd:
+        try:
+            observed = os.stat(
+                path.name,
+                dir_fd=parent_fd,
+                follow_symlinks=False,
+            )
+            if (
+                not stat.S_ISREG(observed.st_mode)
+                or observed.st_uid != os.getuid()
+                or observed.st_mode & 0o077
+            ):
+                raise IntegrityError(
+                    f"private file is not an owner-only regular file: {path}"
+                )
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY
+                | os.O_NONBLOCK
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=parent_fd,
+            )
+        except IntegrityError:
+            raise
+        except OSError as exc:
+            raise IntegrityError(
+                f"unable to open private file without following links: {path}: {exc}"
+            ) from exc
+        try:
+            details = os.fstat(descriptor)
+            if (
+                not stat.S_ISREG(details.st_mode)
+                or details.st_uid != os.getuid()
+                or details.st_mode & 0o077
+            ):
+                raise IntegrityError(
+                    f"private file is not an owner-only regular file: {path}"
+                )
+            chunks = []
+            while chunk := os.read(descriptor, 1024 * 1024):
+                chunks.append(chunk)
+            return b"".join(chunks)
+        finally:
+            os.close(descriptor)
+
+
+def private_file_exists(path: Path) -> bool:
+    try:
+        with existing_private_directory(path.parent) as parent_fd:
+            try:
+                details = os.stat(
+                    path.name,
+                    dir_fd=parent_fd,
+                    follow_symlinks=False,
+                )
+            except FileNotFoundError:
+                return False
+    except IntegrityError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return False
+        raise
+    if (
+        not stat.S_ISREG(details.st_mode)
+        or details.st_uid != os.getuid()
+        or details.st_mode & 0o077
+    ):
+        raise IntegrityError(
+            f"private file is not an owner-only regular file: {path}"
+        )
+    return True
 
 
 def sha256_file(path: Path) -> str:

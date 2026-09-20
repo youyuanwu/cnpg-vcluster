@@ -14,8 +14,8 @@ from scripts.lib.management import (
 from scripts.lib.process import run
 from scripts.lib.tenants import (
     NOT_FOUND,
-    configured_tenants,
     inspect_storage_volume,
+    recorded_local_tenants,
     spike_tenant,
     storage_volume_name,
     verify_tenant_management_ownership,
@@ -56,7 +56,7 @@ APIS = {
 
 
 def _resolve_tenant(root: Path, config: dict[str, str], namespace: str):
-    tenants = [spike_tenant(root, config), *configured_tenants(root, config)]
+    tenants = [spike_tenant(root, config), *recorded_local_tenants(root, config)]
     matches = [tenant for tenant in tenants if tenant.namespace == namespace]
     if len(matches) != 1:
         raise RuntimeError(

@@ -39,7 +39,12 @@ class ManagementClient:
     def helm_path(self) -> Path:
         return self.root / ".tools" / "bin" / "helm"
 
-    def kubectl(self, *arguments: str, check: bool = True):
+    def kubectl(
+        self,
+        *arguments: str,
+        check: bool = True,
+        input_text: str | None = None,
+    ):
         return run(
             [
                 str(self.kubectl_path),
@@ -53,6 +58,7 @@ class ManagementClient:
             ],
             timeout=self.timeout,
             check=check,
+            input_text=input_text,
         )
 
     def helm(self, *arguments: str, check: bool = True):

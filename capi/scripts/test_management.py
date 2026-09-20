@@ -16,6 +16,7 @@ from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
+from scripts.status import collect_management_status, management_status_healthy
 
 
 def run_just(root: Path, config: dict[str, str], *arguments: str, check: bool = True):
@@ -78,6 +79,13 @@ def fingerprint(root: Path, config: dict[str, str]) -> str:
             sort_keys=True,
         ).encode("utf-8")
     ).hexdigest()
+
+
+def require_healthy_management(root: Path, config: dict[str, str]) -> None:
+    if not management_status_healthy(
+        collect_management_status(root, config, strict=True)
+    ):
+        raise RuntimeError("healthy management status was nonzero")
 
 
 def assert_input_tamper_rejected(
@@ -220,8 +228,7 @@ def main() -> int:
                 f"Kamaji chart directories are not owner-only: {broad_chart_directories}"
             )
 
-        if run_just(ROOT, config, "status", check=False).returncode != 0:
-            raise RuntimeError("healthy management status was nonzero")
+        require_healthy_management(ROOT, config)
         before_observers = fingerprint(ROOT, config)
         run_just(ROOT, config, "diagnose", "management")
         if fingerprint(ROOT, config) != before_observers:
@@ -265,8 +272,6 @@ def main() -> int:
                 ]
             ),
         )
-        if run_just(ROOT, config, "status", check=False).returncode == 0:
-            raise RuntimeError("status accepted drifted Kamaji feature gates")
         if (
             run_just(ROOT, config, "diagnose", "management", check=False).returncode
             == 0
@@ -282,8 +287,6 @@ def main() -> int:
             "deployment/capd-controller-manager",
             f"manager={config['VERIFY_IMAGE']}",
         )
-        if run_just(ROOT, config, "status", check=False).returncode == 0:
-            raise RuntimeError("status accepted a drifted provider image")
         if (
             run_just(ROOT, config, "diagnose", "management", check=False).returncode
             == 0
@@ -298,8 +301,6 @@ def main() -> int:
             "deployment/capd-controller-manager",
             "--replicas=0",
         )
-        if run_just(ROOT, config, "status", check=False).returncode == 0:
-            raise RuntimeError("status accepted an unavailable required controller")
         if (
             run_just(ROOT, config, "diagnose", "management", check=False).returncode
             == 0
@@ -328,8 +329,7 @@ def main() -> int:
             "--wait=true",
         )
         run_just(ROOT, config, "create-management")
-        if run_just(ROOT, config, "status", check=False).returncode != 0:
-            raise RuntimeError("management reconciliation did not recover a missing provider")
+        require_healthy_management(ROOT, config)
 
         unexpected.write_text("foreign\n", encoding="utf-8")
         unexpected.chmod(0o600)
