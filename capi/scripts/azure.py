@@ -4627,6 +4627,7 @@ class AzureTenantAdapter:
             or evidence.get("observed") != dict(identity.observed)
             or evidence.get("ready") != observations
             or not isinstance(evidence.get("verifiedAt"), (int, float))
+            or self.clock() < evidence["verifiedAt"]
             or self.clock() - evidence["verifiedAt"] > READY_EVIDENCE_MAX_AGE_SECONDS
         ):
             blockers.append("Azure Ready evidence does not match current identities")

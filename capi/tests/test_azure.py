@@ -1455,7 +1455,7 @@ class AzurePhaseFourTests(unittest.TestCase):
                 )
             )
 
-    def test_ready_status_requires_matching_current_evidence_and_identities(self):
+    def test_ready_status_rejects_future_evidence_and_identity_changes(self):
         root = self.make_root()
         config = load_azure_configuration(root)
         spec = self.spec()
@@ -1601,6 +1601,32 @@ class AzurePhaseFourTests(unittest.TestCase):
         self.assertTrue(status.components["tenantNetworkReady"])
 
         evidence = runtime.load_ready_evidence()
+        evidence["verifiedAt"] = 102
+        runtime.write_ready_evidence(evidence)
+        with (
+            patch.object(adapter, "_config", return_value=config),
+            patch(
+                "scripts.azure._inspect_foundation",
+                return_value=(FOUNDATION, True, ()),
+            ),
+            patch("scripts.azure._get_management_resource", side_effect=resource),
+            patch(
+                "scripts.azure._collect_ready_observations",
+                return_value=(ready, ()),
+            ),
+            patch(
+                "scripts.azure.discover_azure_owned_resources",
+                return_value=discovery,
+            ),
+        ):
+            status = adapter.status(root, spec.name)
+        self.assertEqual(status.classification, "degraded")
+        self.assertIn(
+            "Azure Ready evidence does not match current identities",
+            status.blockers,
+        )
+
+        evidence["verifiedAt"] = 100
         evidence["observed"]["machinePoolUid"] = "foreign"
         runtime.write_ready_evidence(evidence)
         with (
