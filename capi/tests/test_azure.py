@@ -2829,6 +2829,8 @@ class AzurePhaseFiveTests(unittest.TestCase):
         self.assertIn("destroy-legacy-foundation", script)
         self.assertIn("targeted-delete-absent", script)
         self.assertIn('"recreation"', script)
+        self.assertIn('"status", "--porcelain", "--untracked-files=no"', script)
+        self.assertIn('"revision": revision', script)
 
 
 if __name__ == "__main__":

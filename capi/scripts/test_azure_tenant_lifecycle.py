@@ -170,6 +170,20 @@ def _require_status(tenant: str, classification: str) -> dict[str, object]:
 
 def main(arguments: list[str]) -> int:
     os.umask(0o077)
+    revision = run(
+        ["git", "rev-parse", "HEAD"],
+        timeout=30,
+        cwd=ROOT.parent,
+    ).stdout.strip()
+    tracked_changes = run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        timeout=30,
+        cwd=ROOT.parent,
+    ).stdout.strip()
+    if tracked_changes:
+        raise RuntimeError(
+            "Azure lifecycle gate requires a clean committed worktree"
+        )
     spec_path = (
         Path(arguments[0])
         if arguments
@@ -310,6 +324,7 @@ def main(arguments: list[str]) -> int:
             "operationId": operation_id,
             "tenant": spec.name,
             "specificationSha256": spec.sha256(),
+            "revision": revision,
             "records": records,
         }
         try:
