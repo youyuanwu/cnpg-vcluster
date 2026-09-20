@@ -30,6 +30,9 @@ func TestValidateCanonicalizesEquivalentVersion(t *testing.T) {
 	if first != second || firstHash != secondHash {
 		t.Fatalf("canonical forms differ: %#v/%s %#v/%s", first, firstHash, second, secondHash)
 	}
+	if firstHash != "e9afd0733e391c39ea140af4cfbca48afe00d997b350474e41ff118c38e50a15" {
+		t.Fatalf("unexpected cross-language canonical hash: %s", firstHash)
+	}
 }
 
 func TestValidateRejectsInvalidInputs(t *testing.T) {

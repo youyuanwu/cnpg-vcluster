@@ -160,7 +160,7 @@ def canonical_spec_hash(spec: dict[str, object]) -> str:
         "podCIDR": str(pod),
         "serviceCIDR": str(service),
     }
-    encoded = json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    encoded = json.dumps(canonical, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()
 
 

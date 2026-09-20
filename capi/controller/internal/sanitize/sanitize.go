@@ -2,6 +2,7 @@ package sanitize
 
 import (
 	"encoding/json"
+	"reflect"
 	"regexp"
 	"strings"
 )
@@ -48,6 +49,19 @@ func sanitizeValue(value any, depth int) any {
 	case string:
 		return sanitizeText(typed, depth+1)
 	default:
+		kind := reflect.TypeOf(value)
+		if kind != nil {
+			switch kind.Kind() {
+			case reflect.Map, reflect.Slice, reflect.Array, reflect.Struct:
+				data, err := json.Marshal(value)
+				if err == nil {
+					var decoded any
+					if json.Unmarshal(data, &decoded) == nil {
+						return sanitizeValue(decoded, depth+1)
+					}
+				}
+			}
+		}
 		return value
 	}
 }
@@ -75,7 +89,10 @@ func sanitizeText(value string, depth int) string {
 			}
 		}
 	}
-	if start := strings.IndexAny(value, "[{"); start >= 0 {
+	for start, character := range value {
+		if character != '[' && character != '{' {
+			continue
+		}
 		for end := len(value); end > start; end-- {
 			var decoded any
 			if json.Unmarshal([]byte(value[start:end]), &decoded) != nil {

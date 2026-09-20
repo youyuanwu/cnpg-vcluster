@@ -65,6 +65,12 @@ def tenant_document(*, now: float = 10_000.0) -> dict[str, object]:
 
 
 class ControllerTenantStatusTests(unittest.TestCase):
+    def test_canonical_hash_matches_go_contract(self) -> None:
+        self.assertEqual(
+            "e9afd0733e391c39ea140af4cfbca48afe00d997b350474e41ff118c38e50a15",
+            canonical_spec_hash(tenant_document()["spec"]),
+        )
+
     def test_ready_evidence_is_accepted(self) -> None:
         result = evaluate_tenant(
             tenant_document(),

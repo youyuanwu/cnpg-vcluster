@@ -76,6 +76,101 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                     )
             run.assert_not_called()
 
+    def test_build_stages_verified_assets_and_cleans_context(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "manager"
+            binary.write_text("binary", encoding="utf-8")
+            (root / "controller").mkdir()
+            (root / "controller" / "Dockerfile").write_text(
+                "FROM scratch\n", encoding="utf-8"
+            )
+            (root / "controller" / "main.go").write_text(
+                "package main\n", encoding="utf-8"
+            )
+            (root / "config").mkdir()
+            (root / "config" / "versions.env").write_text(
+                "GO_VERSION=1\n", encoding="utf-8"
+            )
+            inputs = root / ".tools" / "inputs"
+            inputs.mkdir(parents=True)
+            (inputs / "calico.yaml").write_text("calico", encoding="utf-8")
+            (inputs / "cnpg.yaml").write_text("cnpg", encoding="utf-8")
+            config = {
+                "TENANT_CONTROLLER_IMAGE_REPOSITORY": "example/controller",
+                "GO_VERSION": "1",
+                "CONTROLLER_RUNTIME_VERSION": "runtime",
+                "CONTROLLER_TOOLS_VERSION": "tools",
+                "COMMAND_TIMEOUT": "1s",
+            }
+
+            def verify_build(command, **_kwargs):
+                build_root = root / ".runtime" / "rendered" / "controller-build"
+                self.assertEqual("docker", command[0])
+                self.assertEqual("binary", (build_root / "manager").read_text())
+                self.assertEqual("calico", (build_root / "assets" / "calico.yaml").read_text())
+                self.assertEqual("cnpg", (build_root / "assets" / "cnpg.yaml").read_text())
+                return CompletedProcess(command, 0, stdout="", stderr="")
+
+            with (
+                patch(
+                    "scripts.lib.controller.build_controller_binary",
+                    return_value=binary,
+                ),
+                patch("scripts.lib.controller.verify_all_inputs") as verify,
+                patch("scripts.lib.controller.run", side_effect=verify_build),
+            ):
+                image = build_controller_image(root, config)
+            verify.assert_called_once_with(root, config)
+            self.assertTrue(image.startswith("example/controller:"))
+            self.assertFalse(
+                (root / ".runtime" / "rendered" / "controller-build").exists()
+            )
+
+    def test_build_cleans_context_after_docker_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            binary = root / "manager"
+            binary.write_text("binary", encoding="utf-8")
+            (root / "controller").mkdir()
+            (root / "controller" / "Dockerfile").write_text(
+                "FROM scratch\n", encoding="utf-8"
+            )
+            (root / "controller" / "main.go").write_text(
+                "package main\n", encoding="utf-8"
+            )
+            (root / "config").mkdir()
+            (root / "config" / "versions.env").write_text(
+                "GO_VERSION=1\n", encoding="utf-8"
+            )
+            inputs = root / ".tools" / "inputs"
+            inputs.mkdir(parents=True)
+            (inputs / "calico.yaml").write_text("calico", encoding="utf-8")
+            (inputs / "cnpg.yaml").write_text("cnpg", encoding="utf-8")
+            config = {
+                "TENANT_CONTROLLER_IMAGE_REPOSITORY": "example/controller",
+                "GO_VERSION": "1",
+                "CONTROLLER_RUNTIME_VERSION": "runtime",
+                "CONTROLLER_TOOLS_VERSION": "tools",
+                "COMMAND_TIMEOUT": "1s",
+            }
+            with (
+                patch(
+                    "scripts.lib.controller.build_controller_binary",
+                    return_value=binary,
+                ),
+                patch("scripts.lib.controller.verify_all_inputs"),
+                patch(
+                    "scripts.lib.controller.run",
+                    side_effect=RuntimeError("docker failed"),
+                ),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "docker failed"):
+                    build_controller_image(root, config)
+            self.assertFalse(
+                (root / ".runtime" / "rendered" / "controller-build").exists()
+            )
+
     def test_controller_digest_includes_assets_and_versions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

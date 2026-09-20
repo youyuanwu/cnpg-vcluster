@@ -53,11 +53,12 @@ func TestTextRedactsKubeconfigAndEmbeddedJSON(t *testing.T) {
 	inputs := []string{
 		"client-key-data: c2VjcmV0",
 		`provider failed: {"authorization":"Bearer abc","nested":{"token":"value"}} trailing`,
+		`[ERROR] provider: {"token":"prefixed"}`,
 		`"{\"client_secret\":\"double\"}"`,
 	}
 	for _, input := range inputs {
 		output := Text(input)
-		for _, secret := range []string{"c2VjcmV0", "abc", "value", "double"} {
+		for _, secret := range []string{"c2VjcmV0", "abc", "value", "prefixed", "double"} {
 			if strings.Contains(output, secret) {
 				t.Fatalf("secret %q leaked from %q as %q", secret, input, output)
 			}
@@ -80,9 +81,11 @@ func TestLoggerSanitizesMessagesErrorsAndValues(t *testing.T) {
 		`failed: {"token":"nested"}`,
 		"client_secret",
 		"value",
+		"typed",
+		map[string]string{"token": "typed-secret"},
 	)
 	text := output.String()
-	for _, secret := range []string{"abc", "nested", "value"} {
+	for _, secret := range []string{"abc", "nested", "value", "typed-secret"} {
 		if strings.Contains(text, secret) {
 			t.Fatalf("logger leaked %q in %q", secret, text)
 		}

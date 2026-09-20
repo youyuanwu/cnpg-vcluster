@@ -148,6 +148,14 @@ func TestWebhookRejectsUnknownFieldsAndSemanticUpdates(t *testing.T) {
 		Error(); err == nil {
 		t.Fatal("duplicate JSON field was accepted by strict API request")
 	}
+	if err := rawClient.Post().
+		Resource("tenants").
+		Param("fieldValidation", "Strict").
+		Body([]byte(`{"apiVersion":`)).
+		Do(ctx).
+		Error(); err == nil {
+		t.Fatal("malformed JSON was accepted by strict API request")
+	}
 }
 
 func tenantObject(name, version string) *unstructured.Unstructured {
