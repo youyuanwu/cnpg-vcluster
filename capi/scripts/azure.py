@@ -5,6 +5,7 @@ import base64
 import hashlib
 import ipaddress
 import json
+import math
 import os
 import re
 import stat
@@ -4619,6 +4620,13 @@ class AzureTenantAdapter:
         ):
             blockers.append("Azure tenant owned-resource inventory changed")
         evidence = runtime.load_ready_evidence()
+        verified_at = evidence.get("verifiedAt")
+        now = self.clock()
+        verified_at_is_valid = (
+            isinstance(verified_at, (int, float))
+            and not isinstance(verified_at, bool)
+            and math.isfinite(verified_at)
+        )
         if (
             evidence.get("profile") != "azure"
             or evidence.get("tenant") != tenant
@@ -4626,9 +4634,9 @@ class AzureTenantAdapter:
             or evidence.get("foundationIdentity") != dict(identity.foundation_identity)
             or evidence.get("observed") != dict(identity.observed)
             or evidence.get("ready") != observations
-            or not isinstance(evidence.get("verifiedAt"), (int, float))
-            or self.clock() < evidence["verifiedAt"]
-            or self.clock() - evidence["verifiedAt"] > READY_EVIDENCE_MAX_AGE_SECONDS
+            or not verified_at_is_valid
+            or now < verified_at
+            or now - verified_at > READY_EVIDENCE_MAX_AGE_SECONDS
         ):
             blockers.append("Azure Ready evidence does not match current identities")
         return TenantStatus(
