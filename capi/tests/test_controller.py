@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from scripts.cache import VerifiedCache
 from scripts.controller_tenant import main as controller_tenant_main
+from scripts.test_controller_phase2 import _restore_after_gate
 from scripts.lib.controller import (
     _foundation_payload,
     build_controller_image,
@@ -202,6 +203,12 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             generation = root / "generation-1"
+            active = root / ".tools" / "cache" / "active.json"
+            active.parent.mkdir(parents=True)
+            active.write_text(
+                '{"generation":"generation-1","schema":1}\n',
+                encoding="utf-8",
+            )
             cache = VerifiedCache(
                 generation=generation,
                 inventory={
@@ -367,4 +374,54 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         self.assertIn(
             "--mutation-enabled=true",
             deployment_patch["spec"]["template"]["spec"]["containers"][0]["args"],
+        )
+
+    def test_gate_cleanup_failure_still_disables_mutation(self) -> None:
+        client = FakeManagementClient(
+            [CompletedProcess([], 1, stdout="", stderr="cleanup blocked")]
+        )
+        primary = RuntimeError("primary failure")
+        with (
+            patch(
+                "scripts.test_controller_phase2._tenant",
+                side_effect=[{"metadata": {"name": "controller-phase2"}}, {"metadata": {"name": "controller-phase2"}}],
+            ),
+            patch(
+                "scripts.test_controller_phase2.set_controller_mutation"
+            ) as mutation,
+        ):
+            _restore_after_gate(
+                {"DELETE_TIMEOUT": "1s"},
+                client,
+                primary,
+            )
+        mutation.assert_called_once_with(
+            {"DELETE_TIMEOUT": "1s"},
+            client,
+            enabled=False,
+        )
+        self.assertTrue(
+            any("cleanup is incomplete" in note for note in primary.__notes__)
+        )
+
+    def test_gate_inspection_failure_still_disables_mutation(self) -> None:
+        client = FakeManagementClient([])
+        primary = RuntimeError("primary failure")
+        with (
+            patch(
+                "scripts.test_controller_phase2._tenant",
+                side_effect=RuntimeError("inspection failed"),
+            ),
+            patch(
+                "scripts.test_controller_phase2.set_controller_mutation"
+            ) as mutation,
+        ):
+            _restore_after_gate(
+                {"DELETE_TIMEOUT": "1s"},
+                client,
+                primary,
+            )
+        mutation.assert_called_once()
+        self.assertTrue(
+            any("inspection failed" in note for note in primary.__notes__)
         )

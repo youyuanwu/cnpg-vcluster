@@ -151,6 +151,45 @@ def _absent(client: ManagementClient) -> bool | None:
     return True if _tenant(client) is None else None
 
 
+def _restore_after_gate(
+    config: dict[str, str],
+    client: ManagementClient,
+    active_error: BaseException | None,
+) -> None:
+    cleanup_error: str | None = None
+    try:
+        tenant = _tenant(client)
+        if tenant is not None:
+            cleanup = client.kubectl(
+                "delete",
+                f"tenant/{TENANT_NAME}",
+                "--wait=true",
+                f"--timeout={config['DELETE_TIMEOUT']}",
+                check=False,
+            )
+            if cleanup.returncode != 0 or _tenant(client) is not None:
+                cleanup_error = (
+                    "Phase 2 cleanup is incomplete; "
+                    "Tenant state remains for the next locked recovery"
+                )
+    except RuntimeError as exc:
+        cleanup_error = f"Phase 2 cleanup inspection failed: {exc}"
+    try:
+        set_controller_mutation(config, client, enabled=False)
+    except RuntimeError as disable_error:
+        if active_error is not None:
+            active_error.add_note(
+                f"failed to restore validation-only mode: {disable_error}"
+            )
+        else:
+            raise
+    if cleanup_error is not None:
+        if active_error is not None:
+            active_error.add_note(cleanup_error)
+        else:
+            raise RuntimeError(cleanup_error)
+
+
 def main() -> None:
     config = load_configuration(ROOT)
     client = ManagementClient(ROOT, config)
@@ -230,29 +269,7 @@ def main() -> None:
             if volume_check.returncode == 0:
                 raise RuntimeError("Phase 2 Docker volume remained after finalization")
         finally:
-            active_error = sys.exc_info()[1]
-            cleanup_incomplete = False
-            tenant = _tenant(client)
-            if tenant is not None:
-                cleanup = client.kubectl(
-                    "delete",
-                    f"tenant/{TENANT_NAME}",
-                    "--wait=true",
-                    f"--timeout={config['DELETE_TIMEOUT']}",
-                    check=False,
-                )
-                if cleanup.returncode != 0 or _tenant(client) is not None:
-                    message = (
-                        "Phase 2 cleanup is incomplete; "
-                        "controller mutation remains enabled"
-                    )
-                    if active_error is not None:
-                        active_error.add_note(message)
-                        cleanup_incomplete = True
-                    else:
-                        raise RuntimeError(message)
-            if not cleanup_incomplete:
-                set_controller_mutation(config, client, enabled=False)
+            _restore_after_gate(config, client, sys.exc_info()[1])
             shutil.rmtree(
                 ROOT / ".runtime" / "rendered" / "controller-phase2",
                 ignore_errors=True,

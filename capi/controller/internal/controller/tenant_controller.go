@@ -27,7 +27,7 @@ const tenantFinalizer = "tenancy.cnpg-vcluster.io/finalizer"
 // +kubebuilder:rbac:groups=tenancy.cnpg-vcluster.io,resources=tenants/finalizers,verbs=update
 // +kubebuilder:rbac:groups="",resources=events,verbs=create;patch;update
 // +kubebuilder:rbac:groups="",resources=namespaces,verbs=get;list;watch;create;delete
-// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch
+// +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;delete
 // +kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch
 // +kubebuilder:rbac:groups=cluster.x-k8s.io,resources=clusters;machinedeployments;machines;machinesets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=devclusters;devmachinetemplates;devmachines,verbs=get;list;watch;create;delete
@@ -37,13 +37,14 @@ const tenantFinalizer = "tenancy.cnpg-vcluster.io/finalizer"
 
 type TenantReconciler struct {
 	client.Client
-	APIReader           client.Reader
-	Docker              DockerClient
-	TenantClients       TenantClientFactory
-	SupportedVersion    string
-	MutationEnabled     bool
-	FoundationNamespace string
-	FoundationName      string
+	APIReader               client.Reader
+	Docker                  DockerClient
+	TenantClients           TenantClientFactory
+	SupportedVersion        string
+	MutationEnabled         bool
+	FoundationNamespace     string
+	FoundationName          string
+	ExpectedControllerImage string
 }
 
 func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -58,15 +59,14 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 	if validationErr != nil {
 		return ctrl.Result{}, reconciler.publishValidation(ctx, &tenant, specHash, validationErr)
 	}
-	if !reconciler.MutationEnabled {
+	managedDeletion := !tenant.DeletionTimestamp.IsZero() &&
+		containsString(tenant.Finalizers, tenantFinalizer)
+	if !reconciler.MutationEnabled && !managedDeletion {
 		return ctrl.Result{}, reconciler.publishMutationDisabled(ctx, &tenant, specHash)
 	}
-	foundation, err := loadFoundation(ctx, reconciler.reader(), reconciler.docker(), reconciler.foundationNamespace(), reconciler.foundationName(), reconciler.SupportedVersion)
+	foundation, err := loadFoundation(ctx, reconciler.reader(), reconciler.docker(), reconciler.foundationNamespace(), reconciler.foundationName(), reconciler.SupportedVersion, reconciler.ExpectedControllerImage)
 	if err != nil {
 		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "FoundationInvalid", err)
-	}
-	if !foundation.MutationEnabled {
-		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "FoundationMutationDisabled", fmt.Errorf("Tenant foundation mutation is disabled"))
 	}
 	if !tenant.DeletionTimestamp.IsZero() {
 		if !containsString(tenant.Finalizers, tenantFinalizer) {
@@ -77,6 +77,9 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 			return result, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseDeleting, "DeletionBlocked", err)
 		}
 		return result, nil
+	}
+	if !foundation.MutationEnabled {
+		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "FoundationMutationDisabled", fmt.Errorf("Tenant foundation mutation is disabled"))
 	}
 	if err := validatePeerNetworks(ctx, reconciler.reader(), &tenant, canonical, foundation, reconciler.SupportedVersion); err != nil {
 		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "NetworkConflict", err)
@@ -173,13 +176,7 @@ func (reconciler *TenantReconciler) failure(ctx context.Context, tenant *tenancy
 }
 
 func (reconciler *TenantReconciler) SetupWithManager(manager ctrl.Manager) error {
-	mapObject := handler.EnqueueRequestsFromMapFunc(func(_ context.Context, object client.Object) []ctrl.Request {
-		name := object.GetAnnotations()[resources.TenantAnnotation]
-		if name == "" {
-			return nil
-		}
-		return []ctrl.Request{{NamespacedName: types.NamespacedName{Name: name}}}
-	})
+	mapObject := handler.EnqueueRequestsFromMapFunc(requestsForTenantObject)
 	builder := ctrl.NewControllerManagedBy(manager).
 		For(&tenancyv1alpha1.Tenant{}).
 		WithOptions(controllerOptions())
@@ -196,7 +193,16 @@ func (reconciler *TenantReconciler) SetupWithManager(manager ctrl.Manager) error
 		object.SetGroupVersionKind(gvk)
 		builder = builder.Watches(object, mapObject)
 	}
+
 	return builder.Complete(reconciler)
+}
+
+func requestsForTenantObject(_ context.Context, object client.Object) []ctrl.Request {
+	name := object.GetAnnotations()[resources.TenantAnnotation]
+	if name == "" {
+		return nil
+	}
+	return []ctrl.Request{{NamespacedName: types.NamespacedName{Name: name}}}
 }
 
 func controllerOptions() controller.Options {

@@ -30,6 +30,7 @@ const (
 	StageMachineTemplateCreated    = "MachineTemplateCreated"
 	StageMachineDeploymentCreated  = "MachineDeploymentCreated"
 	StageWorkersApplied            = "WorkersApplied"
+	StageEndpointReleased          = "EndpointReleased"
 )
 
 type TenantSpec struct {
@@ -75,10 +76,15 @@ type DockerVolumeIdentity struct {
 }
 
 type WorkerContainerEvidence struct {
-	Name            string `json:"name"`
-	ID              string `json:"id"`
-	CacheGeneration string `json:"cacheGeneration"`
-	Prepared        bool   `json:"prepared"`
+	Name               string   `json:"name"`
+	ID                 string   `json:"id"`
+	PreviousIDs        []string `json:"previousIDs,omitempty"`
+	CacheGeneration    string   `json:"cacheGeneration"`
+	ImportedImages     []string `json:"importedImages,omitempty"`
+	MirrorsConfigured  bool     `json:"mirrorsConfigured,omitempty"`
+	EgressVerified     bool     `json:"egressVerified,omitempty"`
+	MirrorPullVerified bool     `json:"mirrorPullVerified,omitempty"`
+	Prepared           bool     `json:"prepared"`
 }
 
 type TeardownStatus struct {

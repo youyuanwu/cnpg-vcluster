@@ -15,11 +15,12 @@ import (
 )
 
 type DockerContainer struct {
-	ID       string
-	Name     string
-	Labels   map[string]string
-	Networks map[string]string
-	State    string
+	ID               string
+	Name             string
+	Labels           map[string]string
+	Networks         map[string]string
+	NetworkAddresses map[string]string
+	State            string
 }
 
 type DockerNetwork struct {
@@ -74,6 +75,7 @@ func (client *socketDockerClient) InspectContainer(ctx context.Context, id strin
 		NetworkSettings struct {
 			Networks map[string]struct {
 				NetworkID string `json:"NetworkID"`
+				IPAddress string `json:"IPAddress"`
 			} `json:"Networks"`
 		} `json:"NetworkSettings"`
 		State struct {
@@ -84,15 +86,18 @@ func (client *socketDockerClient) InspectContainer(ctx context.Context, id strin
 		return DockerContainer{}, err
 	}
 	networks := make(map[string]string, len(payload.NetworkSettings.Networks))
+	addresses := make(map[string]string, len(payload.NetworkSettings.Networks))
 	for name, network := range payload.NetworkSettings.Networks {
 		networks[name] = network.NetworkID
+		addresses[network.NetworkID] = network.IPAddress
 	}
 	return DockerContainer{
-		ID:       payload.ID,
-		Name:     strings.TrimPrefix(payload.Name, "/"),
-		Labels:   payload.Config.Labels,
-		Networks: networks,
-		State:    payload.State.Status,
+		ID:               payload.ID,
+		Name:             strings.TrimPrefix(payload.Name, "/"),
+		Labels:           payload.Config.Labels,
+		Networks:         networks,
+		NetworkAddresses: addresses,
+		State:            payload.State.Status,
 	}, nil
 }
 

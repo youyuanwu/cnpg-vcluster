@@ -78,6 +78,7 @@ class RegistryTests(unittest.TestCase):
         labels = {
             "example.owner": "lab",
             "cnpg-vcluster.capi/role": "offline-registry",
+            "cnpg-vcluster.capi/generation": "g1",
         }
         record = {
             "schema": 1,
@@ -174,7 +175,9 @@ class RegistryTests(unittest.TestCase):
             "labels": {
                 "example.owner": "lab",
                 "cnpg-vcluster.capi/role": "offline-registry",
+                "cnpg-vcluster.capi/generation": "g1",
             },
+            "generation": "g1",
             "network": "kind",
             "address": "172.18.0.3",
         }

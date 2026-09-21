@@ -28,6 +28,7 @@ func main() {
 		probeAddress     string
 		webhookCertDir   string
 		supportedVersion string
+		controllerImage  string
 	)
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election")
 	flag.BoolVar(&mutationEnabled, "mutation-enabled", false, "Enable Tenant provider mutation")
@@ -35,6 +36,7 @@ func main() {
 	flag.StringVar(&probeAddress, "health-probe-bind-address", ":8081", "Health probe bind address")
 	flag.StringVar(&webhookCertDir, "webhook-cert-dir", "/var/run/tenant-controller/tls", "Webhook certificate directory")
 	flag.StringVar(&supportedVersion, "supported-kubernetes-version", "1.36.4", "Supported Tenant Kubernetes version")
+	flag.StringVar(&controllerImage, "controller-image", "", "Exact Tenant controller image identity")
 	options := zap.Options{Development: false}
 	options.BindFlags(flag.CommandLine)
 	flag.Parse()
@@ -56,11 +58,12 @@ func main() {
 	})
 	must(err)
 	must((&tenantcontroller.TenantReconciler{
-		Client:           manager.GetClient(),
-		APIReader:        manager.GetAPIReader(),
-		Docker:           tenantcontroller.NewDockerClient("/var/run/docker.sock"),
-		SupportedVersion: supportedVersion,
-		MutationEnabled:  mutationEnabled,
+		Client:                  manager.GetClient(),
+		APIReader:               manager.GetAPIReader(),
+		Docker:                  tenantcontroller.NewDockerClient("/var/run/docker.sock"),
+		SupportedVersion:        supportedVersion,
+		MutationEnabled:         mutationEnabled,
+		ExpectedControllerImage: controllerImage,
 	}).SetupWithManager(manager))
 	manager.GetWebhookServer().Register(
 		"/validate-tenancy-cnpg-vcluster-io-v1alpha1-tenant",

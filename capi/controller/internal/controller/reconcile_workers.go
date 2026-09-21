@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/url"
 	"path"
+	"regexp"
 	"sort"
 	"strings"
 	"time"
@@ -25,6 +26,10 @@ import (
 var machineGVK = schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "Machine"}
 
 var errWorkerRuntimePending = errors.New("worker runtime is pending")
+
+var importedImageDigest = regexp.MustCompile(`(?m)^[└├]──[^\n]*@(sha256:[0-9a-f]{64})`)
+
+var offlineEgressEvidence = regexp.MustCompile(`(?m)^([0-9]+) ([0-9]+)$`)
 
 func (reconciler *TenantReconciler) reconcileWorkers(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
 	resourceContext := resources.Context{
@@ -87,21 +92,14 @@ func (reconciler *TenantReconciler) reconcileWorkers(ctx context.Context, tenant
 			if evidencePrepared(tenant.Status.WorkerContainers, container.ID, foundation.Cache.Generation) {
 				continue
 			}
-			if err := reconciler.prepareWorker(ctx, container, foundation); err != nil {
+			evidence := workerEvidence(tenant.Status.WorkerContainers, container, foundation.Cache.Generation)
+			evidence, err = reconciler.prepareWorkerStep(ctx, container, foundation, evidence)
+			if err != nil {
 				return ctrl.Result{}, err
 			}
 			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				upsertWorkerEvidence(status, tenancyv1alpha1.WorkerContainerEvidence{
-					Name:            container.Name,
-					ID:              container.ID,
-					CacheGeneration: foundation.Cache.Generation,
-					Prepared:        true,
-				})
-				for _, machine := range machines {
-					if err := upsertIdentity(status, identityFor(machine)); err != nil {
-						return err
-					}
-				}
+				upsertWorkerEvidence(status, evidence)
+				replaceMachineIdentities(status, machines)
 				return nil
 			})
 		}
@@ -228,41 +226,80 @@ func (reconciler *TenantReconciler) observePreCNIWorkers(ctx context.Context, te
 	return machines, containers, nil
 }
 
-func (reconciler *TenantReconciler) prepareWorker(ctx context.Context, container DockerContainer, foundation Foundation) error {
+func (reconciler *TenantReconciler) prepareWorkerStep(ctx context.Context, container DockerContainer, foundation Foundation, evidence tenancyv1alpha1.WorkerContainerEvidence) (tenancyv1alpha1.WorkerContainerEvidence, error) {
+	archives := make([]FoundationArchive, 0)
 	for _, archive := range foundation.Cache.ImageArchives {
-		if !archive.Worker {
-			continue
-		}
-		archivePath := path.Join(foundation.Inputs.CacheContainerPath, "generations", foundation.Cache.Generation, archive.Path)
-		result, err := reconciler.docker().Exec(ctx, container.ID, []string{"sha256sum", archivePath})
-		fields := strings.Fields(result.Output)
-		if err != nil || result.ExitCode != 0 || len(fields) == 0 || fields[0] != archive.SHA256 {
-			return fmt.Errorf("worker cache archive %s checksum mismatch", archive.Key)
-		}
-		for _, command := range [][]string{
-			{"ctr", "--namespace", "k8s.io", "images", "import", "--digests", archivePath},
-			{"ctr", "--namespace", "k8s.io", "images", "tag", "--force", archive.Tagged, archive.Reference},
-			{"ctr", "--namespace", "k8s.io", "images", "inspect", archive.Reference},
-		} {
-			if err := reconciler.execRequired(ctx, container.ID, command); err != nil {
-				return fmt.Errorf("prepare worker image %s: %w", archive.Key, err)
-			}
+		if archive.Worker {
+			archives = append(archives, archive)
 		}
 	}
-	if foundation.OfflineEnforced {
+	sort.Slice(archives, func(left, right int) bool { return archives[left].Key < archives[right].Key })
+	for _, archive := range archives {
+		if containsString(evidence.ImportedImages, archive.Key) {
+			continue
+		}
+		if err := reconciler.prepareWorkerImage(ctx, container.ID, foundation, archive); err != nil {
+			return evidence, err
+		}
+		evidence.ImportedImages = append(evidence.ImportedImages, archive.Key)
+		sort.Strings(evidence.ImportedImages)
+		return evidence, nil
+	}
+	if foundation.OfflineEnforced && !evidence.MirrorsConfigured {
 		if err := reconciler.configureWorkerMirrors(ctx, container.ID, foundation); err != nil {
-			return err
+			return evidence, err
 		}
+		evidence.MirrorsConfigured = true
+		return evidence, nil
+	}
+	if foundation.OfflineEnforced && !evidence.EgressVerified {
 		if err := reconciler.installWorkerEgressRules(ctx, container.ID, foundation); err != nil {
-			return err
+			return evidence, err
 		}
-		for _, archive := range foundation.Cache.ImageArchives {
-			if archive.Key == "CNPG_CONTROLLER_IMAGE" {
-				if err := reconciler.execRequired(ctx, container.ID, []string{"crictl", "pull", archive.Reference}); err != nil {
-					return fmt.Errorf("verify worker mirror pull: %w", err)
-				}
-			}
+		evidence.EgressVerified = true
+		return evidence, nil
+	}
+	if foundation.OfflineEnforced && !evidence.MirrorPullVerified {
+		archive, found := foundationArchive(foundation, "CNPG_CONTROLLER_IMAGE")
+		if !found {
+			return evidence, fmt.Errorf("CNPG controller image is missing from the foundation")
 		}
+		if err := reconciler.execRequired(ctx, container.ID, []string{"crictl", "pull", archive.Reference}); err != nil {
+			return evidence, fmt.Errorf("verify worker mirror pull: %w", err)
+		}
+		evidence.MirrorPullVerified = true
+		return evidence, nil
+	}
+	evidence.Prepared = true
+	return evidence, nil
+}
+
+func (reconciler *TenantReconciler) prepareWorkerImage(ctx context.Context, container string, foundation Foundation, archive FoundationArchive) error {
+	archivePath := path.Join(foundation.Inputs.CacheContainerPath, "generations", foundation.Cache.Generation, archive.Path)
+	result, err := reconciler.exec(ctx, container, []string{"sha256sum", archivePath})
+	if err != nil {
+		return fmt.Errorf("verify worker cache archive %s: %w", archive.Key, err)
+	}
+	fields := strings.Fields(result.Output)
+	if result.ExitCode != 0 || len(fields) == 0 || fields[0] != archive.SHA256 {
+		return fmt.Errorf("worker cache archive %s checksum mismatch", archive.Key)
+	}
+	for _, command := range [][]string{
+		{"ctr", "--namespace", "k8s.io", "images", "import", "--digests", archivePath},
+		{"ctr", "--namespace", "k8s.io", "images", "tag", "--force", archive.Tagged, archive.Reference},
+	} {
+		if err := reconciler.execRequired(ctx, container, command); err != nil {
+			return fmt.Errorf("prepare worker image %s: %w", archive.Key, err)
+		}
+	}
+	inspect, err := reconciler.exec(ctx, container, []string{"ctr", "--namespace", "k8s.io", "images", "inspect", archive.Reference})
+	if err != nil || inspect.ExitCode != 0 {
+		return fmt.Errorf("inspect imported worker image %s", archive.Key)
+	}
+	expectedDigest := archive.Reference[strings.LastIndex(archive.Reference, "@")+1:]
+	match := importedImageDigest.FindStringSubmatch(inspect.Output)
+	if len(match) != 2 || match[1] != expectedDigest {
+		return fmt.Errorf("imported worker image %s digest mismatch", archive.Key)
 	}
 	return nil
 }
@@ -279,6 +316,7 @@ func (reconciler *TenantReconciler) configureWorkerMirrors(ctx context.Context, 
 		names = append(names, registry)
 	}
 	sort.Strings(names)
+	scripts := make([]string, 0, len(names))
 	for _, registry := range names {
 		server := "https://" + registry
 		if registry == "docker.io" {
@@ -287,13 +325,10 @@ func (reconciler *TenantReconciler) configureWorkerMirrors(ctx context.Context, 
 		content := fmt.Sprintf("server = %q\n\n[host.%q]\n  capabilities = [\"pull\", \"resolve\"]\n",
 			server, fmt.Sprintf("http://%s:%d", foundation.Registry.Address, foundation.Registry.Port))
 		directory := "/etc/containerd/certs.d/" + registry
-		script := "umask 077; mkdir -p " + shellQuote(directory) + "; printf %s " +
-			shellQuote(content) + " > " + shellQuote(directory+"/hosts.toml")
-		if err := reconciler.execRequired(ctx, container, []string{"sh", "-ec", script}); err != nil {
-			return fmt.Errorf("configure worker registry mirror for %s: %w", registry, err)
-		}
+		scripts = append(scripts, "umask 077; mkdir -p "+shellQuote(directory)+"; printf %s "+
+			shellQuote(content)+" > "+shellQuote(directory+"/hosts.toml"))
 	}
-	return nil
+	return reconciler.execRequired(ctx, container, []string{"sh", "-ec", strings.Join(scripts, "; ")})
 }
 
 func (reconciler *TenantReconciler) installWorkerEgressRules(ctx context.Context, container string, foundation Foundation) error {
@@ -315,31 +350,60 @@ func (reconciler *TenantReconciler) installWorkerEgressRules(ctx context.Context
 		return err
 	}
 	probe := "iptables -Z CAPI_OFFLINE; " +
-		"timeout 3 bash -c '</dev/tcp/1.1.1.1/443'; rc=$?; " +
+		captureShellExit("timeout 3 bash -c '</dev/tcp/1.1.1.1/443'") + "; " +
 		"hits=$(iptables -L CAPI_OFFLINE -n -v -x | " +
 		"awk '$1 ~ /^[0-9]+$/ && $9 == \"1.1.1.1\" {sum += $1} END {print sum + 0}'); " +
 		"printf '%s %s\\n' \"$rc\" \"$hits\""
-	result, err := reconciler.docker().Exec(ctx, container, []string{"sh", "-ec", probe})
+	result, err := reconciler.exec(ctx, container, []string{"sh", "-ec", probe})
 	if err != nil {
 		return err
 	}
 	var returnCode, hits int
-	if _, err := fmt.Sscanf(strings.TrimSpace(result.Output), "%d %d", &returnCode, &hits); err != nil ||
+	match := offlineEgressEvidence.FindStringSubmatch(result.Output)
+	evidenceValid := len(match) == 3
+	if evidenceValid {
+		_, evidenceErr := fmt.Sscanf(match[0], "%d %d", &returnCode, &hits)
+		evidenceValid = evidenceErr == nil
+	}
+	if !evidenceValid ||
 		result.ExitCode != 0 || returnCode == 0 || hits < 1 || (returnCode != 1 && returnCode != 124) {
-		return fmt.Errorf("offline worker egress rejection was not proven")
+		return fmt.Errorf(
+			"offline worker egress rejection was not proven: exit=%d evidence=%q",
+			result.ExitCode,
+			sanitize.Text(strings.TrimSpace(result.Output)),
+		)
 	}
 	return nil
 }
 
 func (reconciler *TenantReconciler) execRequired(ctx context.Context, container string, command []string) error {
-	result, err := reconciler.docker().Exec(ctx, container, command)
+	result, err := reconciler.exec(ctx, container, command)
 	if err != nil {
 		return err
 	}
+
 	if result.ExitCode != 0 {
 		return fmt.Errorf("container command failed with exit %d: %s", result.ExitCode, sanitize.Text(result.Output))
 	}
 	return nil
+}
+
+func (reconciler *TenantReconciler) exec(ctx context.Context, container string, command []string) (DockerExecResult, error) {
+	bounded := append([]string{"timeout", "90"}, command...)
+	return reconciler.docker().Exec(ctx, container, bounded)
+}
+
+func captureShellExit(command string) string {
+	return "if " + command + "; then rc=0; else rc=$?; fi"
+}
+
+func foundationArchive(foundation Foundation, key string) (FoundationArchive, bool) {
+	for _, archive := range foundation.Cache.ImageArchives {
+		if archive.Key == key {
+			return archive, true
+		}
+	}
+	return FoundationArchive{}, false
 }
 
 func imageRegistry(reference string) string {
@@ -383,6 +447,29 @@ func evidencePrepared(values []tenancyv1alpha1.WorkerContainerEvidence, id, gene
 	return false
 }
 
+func workerEvidence(values []tenancyv1alpha1.WorkerContainerEvidence, container DockerContainer, generation string) tenancyv1alpha1.WorkerContainerEvidence {
+	result := tenancyv1alpha1.WorkerContainerEvidence{
+		Name:            container.Name,
+		ID:              container.ID,
+		CacheGeneration: generation,
+	}
+	for _, value := range values {
+		if value.Name != container.Name {
+			continue
+		}
+		if value.ID == container.ID && value.CacheGeneration == generation {
+			return value
+		}
+		result.PreviousIDs = append(result.PreviousIDs, value.PreviousIDs...)
+		if value.ID != "" && value.ID != container.ID {
+			result.PreviousIDs = append(result.PreviousIDs, value.ID)
+		}
+		sort.Strings(result.PreviousIDs)
+		return result
+	}
+	return result
+}
+
 func upsertWorkerEvidence(status *tenancyv1alpha1.TenantStatus, evidence tenancyv1alpha1.WorkerContainerEvidence) {
 	for index := range status.WorkerContainers {
 		if status.WorkerContainers[index].Name == evidence.Name {
@@ -393,5 +480,37 @@ func upsertWorkerEvidence(status *tenancyv1alpha1.TenantStatus, evidence tenancy
 	status.WorkerContainers = append(status.WorkerContainers, evidence)
 	sort.Slice(status.WorkerContainers, func(left, right int) bool {
 		return status.WorkerContainers[left].Name < status.WorkerContainers[right].Name
+	})
+}
+
+func replaceMachineIdentities(status *tenancyv1alpha1.TenantStatus, machines []*unstructured.Unstructured) {
+	previous := make([]tenancyv1alpha1.ObservedResourceIdentity, 0)
+	retained := make([]tenancyv1alpha1.ObservedResourceIdentity, 0, len(status.ObservedResources))
+	for _, identity := range status.ObservedResources {
+		if identity.Kind == machineGVK.Kind && identity.APIVersion == machineGVK.GroupVersion().String() {
+			previous = append(previous, identity)
+			continue
+		}
+		retained = append(retained, identity)
+	}
+	sort.Slice(previous, func(left, right int) bool { return previous[left].Name < previous[right].Name })
+	current := make([]tenancyv1alpha1.ObservedResourceIdentity, 0, len(machines))
+	for index, machine := range machines {
+		identity := identityFor(machine)
+		if index < len(previous) {
+			identity.PreviousUIDs = append(identity.PreviousUIDs, previous[index].PreviousUIDs...)
+			if previous[index].UID != identity.UID {
+				identity.PreviousUIDs = append(identity.PreviousUIDs, previous[index].UID)
+			}
+			sort.Strings(identity.PreviousUIDs)
+		}
+		current = append(current, identity)
+	}
+	status.ObservedResources = append(retained, current...)
+	sort.Slice(status.ObservedResources, func(left, right int) bool {
+		a := status.ObservedResources[left]
+		b := status.ObservedResources[right]
+		return a.APIVersion+"/"+a.Kind+"/"+a.Namespace+"/"+a.Name <
+			b.APIVersion+"/"+b.Kind+"/"+b.Namespace+"/"+b.Name
 	})
 }

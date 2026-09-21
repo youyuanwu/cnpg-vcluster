@@ -318,6 +318,7 @@ def _validate_container(
     expected_labels = {
         config["OWNERSHIP_LABEL"]: config["LAB_PREFIX"],
         "cnpg-vcluster.capi/role": REGISTRY_ROLE,
+        "cnpg-vcluster.capi/generation": str(record.get("generation", "")),
     }
     observed = {key: labels.get(key, "") for key in expected_labels}
     if (
@@ -561,6 +562,7 @@ def reconcile_offline_registry(
     labels = {
         config["OWNERSHIP_LABEL"]: config["LAB_PREFIX"],
         "cnpg-vcluster.capi/role": REGISTRY_ROLE,
+        "cnpg-vcluster.capi/generation": generation,
     }
     command = [
         "docker",

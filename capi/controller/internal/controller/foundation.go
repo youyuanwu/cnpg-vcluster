@@ -37,6 +37,7 @@ type FoundationArchive struct {
 type FoundationCache struct {
 	Generation    string              `json:"generation"`
 	StateSHA256   string              `json:"stateSHA256"`
+	ActiveSHA256  string              `json:"activeSHA256"`
 	ImageArchives []FoundationArchive `json:"imageArchives"`
 }
 
@@ -81,7 +82,7 @@ type Foundation struct {
 	Hash                  string              `json:"-"`
 }
 
-func loadFoundation(ctx context.Context, reader client.Reader, docker DockerClient, namespace, name, supportedVersion string) (Foundation, error) {
+func loadFoundation(ctx context.Context, reader client.Reader, docker DockerClient, namespace, name, supportedVersion, expectedControllerImage string) (Foundation, error) {
 	var configMap corev1.ConfigMap
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &configMap); err != nil {
 		return Foundation{}, fmt.Errorf("read Tenant foundation: %w", err)
@@ -98,7 +99,7 @@ func loadFoundation(ctx context.Context, reader client.Reader, docker DockerClie
 		return Foundation{}, fmt.Errorf("decode Tenant foundation: %w", err)
 	}
 	foundation.Hash = hash
-	if err := validateFoundation(foundation, supportedVersion); err != nil {
+	if err := validateFoundation(foundation, supportedVersion, expectedControllerImage); err != nil {
 		return Foundation{}, err
 	}
 	container, err := docker.InspectContainer(ctx, foundation.ManagementContainerID)
@@ -127,10 +128,41 @@ func loadFoundation(ctx context.Context, reader client.Reader, docker DockerClie
 	if network.ID != foundation.NetworkID || !contains(network.Subnets, foundation.Subnet) {
 		return Foundation{}, fmt.Errorf("management network identity or subnet mismatch")
 	}
+	active, err := docker.Exec(ctx, foundation.ManagementContainerID, []string{"cat", foundation.Inputs.CacheContainerPath + "/active.json"})
+	if err != nil || active.ExitCode != 0 {
+		return Foundation{}, fmt.Errorf("read active cache generation through management container")
+	}
+	activeDigest := sha256.Sum256([]byte(active.Output))
+	if hex.EncodeToString(activeDigest[:]) != foundation.Cache.ActiveSHA256 {
+		return Foundation{}, fmt.Errorf("active cache pointer checksum mismatch")
+	}
+	var activeRecord struct {
+		Schema     int    `json:"schema"`
+		Generation string `json:"generation"`
+	}
+	if err := json.Unmarshal([]byte(active.Output), &activeRecord); err != nil ||
+		activeRecord.Schema != 1 || activeRecord.Generation != foundation.Cache.Generation {
+		return Foundation{}, fmt.Errorf("active cache generation mismatch")
+	}
+	if foundation.Registry != nil {
+		registry, err := docker.InspectContainer(ctx, foundation.Registry.Identifier)
+		if err != nil {
+			return Foundation{}, fmt.Errorf("inspect offline registry: %w", err)
+		}
+		if registry.ID != foundation.Registry.Identifier || registry.State != "running" ||
+			registry.Labels[foundation.Inputs.OwnershipLabel] != foundation.Inputs.LabPrefix ||
+			registry.Labels["cnpg-vcluster.capi/role"] != "offline-registry" ||
+			registry.Labels["cnpg-vcluster.capi/generation"] != foundation.Registry.Generation {
+			return Foundation{}, fmt.Errorf("offline registry identity mismatch")
+		}
+		if registry.NetworkAddresses[foundation.NetworkID] != foundation.Registry.Address {
+			return Foundation{}, fmt.Errorf("offline registry network address mismatch")
+		}
+	}
 	return foundation, nil
 }
 
-func validateFoundation(foundation Foundation, supportedVersion string) error {
+func validateFoundation(foundation Foundation, supportedVersion, expectedControllerImage string) error {
 	if foundation.Schema != 2 {
 		return fmt.Errorf("unsupported Tenant foundation schema")
 	}
@@ -143,6 +175,9 @@ func validateFoundation(foundation Foundation, supportedVersion string) error {
 	}
 	if strings.TrimPrefix(foundation.KubernetesVersion, "v") != strings.TrimPrefix(supportedVersion, "v") {
 		return fmt.Errorf("Tenant foundation Kubernetes version mismatch")
+	}
+	if expectedControllerImage == "" || foundation.ControllerImage != expectedControllerImage {
+		return fmt.Errorf("Tenant foundation controller image mismatch")
 	}
 	subnet, err := canonicalIPv4Prefix("foundation subnet", foundation.Subnet)
 	if err != nil {
@@ -172,7 +207,8 @@ func validateFoundation(foundation Foundation, supportedVersion string) error {
 		inputs.KonnectivityServerImage == "" || inputs.KonnectivityAgentImage == "" {
 		return fmt.Errorf("Tenant foundation inputs are incomplete")
 	}
-	if foundation.Cache.Generation == "" || !validSHA256(foundation.Cache.StateSHA256) {
+	if foundation.Cache.Generation == "" || !validSHA256(foundation.Cache.StateSHA256) ||
+		!validSHA256(foundation.Cache.ActiveSHA256) {
 		return fmt.Errorf("Tenant foundation cache identity is invalid")
 	}
 	keys := map[string]struct{}{}
@@ -188,6 +224,21 @@ func validateFoundation(foundation Foundation, supportedVersion string) error {
 		}
 		keys[archive.Key] = struct{}{}
 	}
+	requiredWorkerImages := []string{
+		"CALICO_CNI_IMAGE",
+		"CALICO_KUBE_CONTROLLERS_IMAGE",
+		"CALICO_NODE_IMAGE",
+		"KUBE_PROXY_IMAGE",
+		"KONNECTIVITY_AGENT_IMAGE",
+		"CNPG_CONTROLLER_IMAGE",
+		"POSTGRES_IMAGE",
+		"VERIFY_IMAGE",
+	}
+	for _, key := range requiredWorkerImages {
+		if _, present := keys[key]; !present {
+			return fmt.Errorf("Tenant foundation worker image %s is missing", key)
+		}
+	}
 	if foundation.OfflineEnforced {
 		if foundation.Registry == nil || foundation.Registry.Address == "" ||
 			foundation.Registry.Port < 1 || foundation.Registry.Generation == "" ||
@@ -195,17 +246,17 @@ func validateFoundation(foundation Foundation, supportedVersion string) error {
 			return fmt.Errorf("offline Tenant foundation registry is incomplete")
 		}
 	}
-	requiredVersions := []string{
-		"GO_VERSION",
-		"KUBERNETES_VERSION",
-		"CAPI_VERSION",
-		"KAMAJI_CAPI_VERSION",
-		"CONTROLLER_RUNTIME_VERSION",
-		"CONTROLLER_TOOLS_VERSION",
+	requiredVersions := map[string]string{
+		"GO_VERSION":                 "1.27.1",
+		"KUBERNETES_VERSION":         "v" + strings.TrimPrefix(supportedVersion, "v"),
+		"CAPI_VERSION":               "v1.14.1",
+		"KAMAJI_CAPI_VERSION":        "v0.20.0",
+		"CONTROLLER_RUNTIME_VERSION": "v0.24.1",
+		"CONTROLLER_TOOLS_VERSION":   "v0.21.0",
 	}
-	for _, key := range requiredVersions {
-		if foundation.Versions[key] == "" {
-			return fmt.Errorf("Tenant foundation version %s is missing", key)
+	for key, expected := range requiredVersions {
+		if foundation.Versions[key] != expected {
+			return fmt.Errorf("Tenant foundation version %s does not match %s", key, expected)
 		}
 	}
 	return nil

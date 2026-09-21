@@ -21,6 +21,7 @@ spec:
         args:
         - --leader-elect=true
         - --mutation-enabled=false
+        - --controller-image=${TENANT_CONTROLLER_IMAGE}
         - --supported-kubernetes-version=${SUPPORTED_KUBERNETES_VERSION}
         - --webhook-cert-dir=/var/run/tenant-controller/tls
         ports:

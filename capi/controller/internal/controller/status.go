@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 
 	"k8s.io/apimachinery/pkg/api/equality"
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -28,10 +27,11 @@ func (reconciler *TenantReconciler) patchStatus(ctx context.Context, name string
 		if equality.Semantic.DeepEqual(current.Status, updated.Status) {
 			return nil
 		}
-		if err := reconciler.Status().Patch(ctx, updated, client.MergeFrom(&current)); err != nil {
-			return fmt.Errorf("%s", sanitize.Text(err.Error()))
-		}
-		return nil
+		return reconciler.Status().Patch(
+			ctx,
+			updated,
+			client.MergeFromWithOptions(&current, client.MergeFromWithOptimisticLock{}),
+		)
 	})
 }
 

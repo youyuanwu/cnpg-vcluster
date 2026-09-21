@@ -3,6 +3,7 @@ package resources
 import (
 	"testing"
 
+	rbacv1 "k8s.io/api/rbac/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 
@@ -90,6 +91,18 @@ func TestBootstrapRBACMatchesExpectedNamedRules(t *testing.T) {
 	objects := BootstrapRBAC()
 	if len(objects) != 4 {
 		t.Fatalf("unexpected bootstrap object count: %d", len(objects))
+	}
+	for index := 0; index < len(objects); index += 2 {
+		role := objects[index].(*rbacv1.Role)
+		binding := objects[index+1].(*rbacv1.RoleBinding)
+		if role.Namespace != "kube-system" || binding.Namespace != "kube-system" ||
+			role.Name != binding.Name || len(role.Rules) != 1 ||
+			len(role.Rules[0].ResourceNames) != 1 ||
+			role.Rules[0].Verbs[0] != "get" ||
+			binding.RoleRef.Name != role.Name ||
+			len(binding.Subjects) != 2 {
+			t.Fatalf("unexpected bootstrap RBAC contract: %#v %#v", role, binding)
+		}
 	}
 }
 

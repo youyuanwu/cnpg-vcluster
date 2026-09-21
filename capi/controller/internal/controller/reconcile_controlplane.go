@@ -183,6 +183,12 @@ func (reconciler *TenantReconciler) managementObjectsCurrent(ctx context.Context
 		if err := validateRootOwnership(object, tenant, specHash, foundation.Hash, item.resource, foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 			return false, err
 		}
+		if err := validateProviderOwner(object, tenant.Status, item.gvk.Kind != "Cluster"); err != nil {
+			if errors.Is(err, errProviderOwnerPending) {
+				return false, nil
+			}
+			return false, err
+		}
 		if identity := findIdentity(tenant.Status, item.gvk, tenant.Name, tenant.Name); identity == nil || identity.UID != string(object.GetUID()) {
 			return false, fmt.Errorf("%s exact identity is not recorded", item.gvk.Kind)
 		}

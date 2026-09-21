@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 
@@ -14,6 +15,8 @@ import (
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 )
+
+var errProviderOwnerPending = errors.New("provider owner is pending")
 
 func validateRootOwnership(object metav1.Object, tenant *tenancyv1alpha1.Tenant, specHash, foundationHash, resource string, ownershipLabel, labPrefix string) error {
 	if object.GetUID() == "" {
@@ -126,6 +129,10 @@ func validateRecordedResources(ctx context.Context, reader client.Reader, tenant
 	}
 	controlPlane := findIdentity(tenant.Status, controlPlaneGVK, tenant.Name, tenant.Name)
 	for _, identity := range tenant.Status.ObservedResources {
+		if identity.Kind == machineGVK.Kind &&
+			identity.APIVersion == machineGVK.GroupVersion().String() {
+			continue
+		}
 		groupVersion, err := schema.ParseGroupVersion(identity.APIVersion)
 		if err != nil {
 			return fmt.Errorf("parse recorded resource API version: %w", err)
@@ -151,8 +158,53 @@ func validateRecordedResources(ctx context.Context, reader client.Reader, tenant
 		if err := validateRootOwnership(object, tenant, specHash, foundation.Hash, resource, foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 			return err
 		}
+		if err := validateProviderOwner(object, tenant.Status, false); err != nil {
+			return err
+		}
 	}
+
 	return nil
+}
+
+func validateProviderOwner(object *unstructured.Unstructured, status tenancyv1alpha1.TenantStatus, required bool) error {
+	expected := make([]*tenancyv1alpha1.ObservedResourceIdentity, 0, 2)
+	switch object.GetKind() {
+	case "Namespace", "Cluster":
+		if len(object.GetOwnerReferences()) != 0 {
+			return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
+		}
+		return nil
+	case "DevCluster", "KamajiControlPlane", "MachineDeployment":
+		if identity := findIdentity(status, clusterGVK, object.GetNamespace(), object.GetNamespace()); identity != nil {
+			expected = append(expected, identity)
+		}
+	case "KubeadmConfigTemplate", "DevMachineTemplate":
+		if identity := findIdentity(status, clusterGVK, object.GetNamespace(), object.GetNamespace()); identity != nil {
+			expected = append(expected, identity)
+		}
+		if identity := findIdentity(status, machineDeploymentGVK, object.GetNamespace(), object.GetNamespace()+"-worker"); identity != nil {
+			expected = append(expected, identity)
+		}
+	default:
+		return nil
+	}
+	owners := object.GetOwnerReferences()
+	if len(owners) == 0 {
+		if required {
+			return errProviderOwnerPending
+		}
+		return nil
+	}
+	if len(owners) != 1 {
+		return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
+	}
+	for _, identity := range expected {
+		if owners[0].UID == types.UID(identity.UID) &&
+			owners[0].Kind == identity.Kind && owners[0].APIVersion == identity.APIVersion {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
 }
 
 func validateRecordedUID(status tenancyv1alpha1.TenantStatus, object client.Object) error {

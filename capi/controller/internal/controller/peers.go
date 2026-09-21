@@ -14,6 +14,10 @@ import (
 func validatePeerNetworks(ctx context.Context, reader client.Reader, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, foundation Foundation, supportedVersion string) error {
 	pod := netip.MustParsePrefix(canonical.PodCIDR)
 	service := netip.MustParsePrefix(canonical.ServiceCIDR)
+	managementSubnet := netip.MustParsePrefix(foundation.Subnet)
+	if pod.Overlaps(managementSubnet) || service.Overlaps(managementSubnet) {
+		return fmt.Errorf("Tenant networks overlap the management Docker subnet %s", foundation.Subnet)
+	}
 	for _, value := range foundation.ReservedCIDRs {
 		reserved := netip.MustParsePrefix(value)
 		if pod.Overlaps(reserved) || service.Overlaps(reserved) {

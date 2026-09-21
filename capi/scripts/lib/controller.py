@@ -255,6 +255,9 @@ def _foundation_payload(
         "cache": {
             "generation": verified_cache.generation.name,
             "stateSHA256": verified_cache.state_sha256,
+            "activeSHA256": hashlib.sha256(
+                (root / ".tools" / "cache" / "active.json").read_bytes()
+            ).hexdigest(),
             "imageArchives": archives,
         },
         "registry": (

@@ -266,12 +266,26 @@ spec:
                   properties:
                     cacheGeneration:
                       type: string
+                    egressVerified:
+                      type: boolean
                     id:
                       type: string
+                    importedImages:
+                      items:
+                        type: string
+                      type: array
+                    mirrorPullVerified:
+                      type: boolean
+                    mirrorsConfigured:
+                      type: boolean
                     name:
                       type: string
                     prepared:
                       type: boolean
+                    previousIDs:
+                      items:
+                        type: string
+                      type: array
                   required:
                   - cacheGeneration
                   - id
