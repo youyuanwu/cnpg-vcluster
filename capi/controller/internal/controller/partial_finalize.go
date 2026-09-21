@@ -312,11 +312,20 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		return ctrl.Result{}, fmt.Errorf("partial Tenant cleanup authority is invalid")
 	}
 	for _, identity := range tenant.Status.ObservedResources {
-		if identity.Kind != "ConfigMap" || identity.Namespace != tenant.Name {
+		resource := ""
+		switch identity.Kind {
+		case "ConfigMap":
+			if identity.Namespace == tenant.Name {
+				resource = "network-source"
+			}
+		case "ClusterResourceSet":
+			resource = "network-resource-set"
+		}
+		if resource == "" {
 			continue
 		}
 		gvk := schema.FromAPIVersionAndKind(identity.APIVersion, identity.Kind)
-		absent, err := reconciler.deleteExactUnstructured(ctx, tenant, specHash, foundation, gvk, identity.Namespace, identity.Name, "network-source")
+		absent, err := reconciler.deleteExactUnstructured(ctx, tenant, specHash, foundation, gvk, identity.Namespace, identity.Name, resource)
 		if err != nil {
 			return ctrl.Result{}, err
 		}

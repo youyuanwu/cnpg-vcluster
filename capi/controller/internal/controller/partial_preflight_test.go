@@ -10,6 +10,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -176,6 +177,67 @@ func TestTenantDeletePriorityHonorsControllerAndStorageDependencies(t *testing.T
 		if tenantDeletePriority(kinds[index-1]) >= tenantDeletePriority(kinds[index]) {
 			t.Fatalf("delete priority does not order %s before %s", kinds[index-1], kinds[index])
 		}
+	}
+}
+
+func TestPartialFinalizationExactDeletesRecordedClusterResourceSet(t *testing.T) {
+	scheme := testScheme(t)
+	gvk := schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: "v1beta2", Kind: "ClusterResourceSet"}
+	scheme.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+	foundation := testFoundation()
+	foundation.Hash = "foundation-hash"
+	now := metav1.Now()
+	tenant := &tenancyv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              "tenant-a",
+			UID:               "tenant-uid",
+			Finalizers:        []string{tenantFinalizer},
+			DeletionTimestamp: &now,
+		},
+		Status: tenancyv1alpha1.TenantStatus{
+			Stage: tenancyv1alpha1.StageReady,
+			Teardown: &tenancyv1alpha1.TeardownStatus{
+				Authority: "LiveBootstrapRBACCleanupComplete",
+				Phase:     "LiveBootstrapRBACCleanupComplete",
+			},
+		},
+	}
+	resourceSet := &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": gvk.GroupVersion().String(),
+		"kind":       gvk.Kind,
+		"metadata": map[string]any{
+			"name":      "tenant-a-network",
+			"namespace": "tenant-a",
+			"uid":       "resource-set-uid",
+			"labels": map[string]any{
+				foundation.Inputs.OwnershipLabel: foundation.Inputs.LabPrefix,
+			},
+			"annotations": map[string]any{
+				resources.TenantAnnotation:     tenant.Name,
+				resources.TenantUIDAnnotation:  string(tenant.UID),
+				resources.SpecHashAnnotation:   "spec-hash",
+				resources.FoundationAnnotation: foundation.Hash,
+				resources.ResourceAnnotation:   "network-resource-set",
+			},
+		},
+		"spec": map[string]any{"strategy": "ApplyOnce"},
+	}}
+	tenant.Status.ObservedResources = []tenancyv1alpha1.ObservedResourceIdentity{identityFor(resourceSet)}
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, resourceSet).
+		Build()
+	reconciler := &TenantReconciler{Client: kubernetes, APIReader: kubernetes}
+
+	if _, err := reconciler.finalizePartial(context.Background(), tenant, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	var current unstructured.Unstructured
+	current.SetGroupVersionKind(gvk)
+	err := kubernetes.Get(context.Background(), client.ObjectKey{Namespace: "tenant-a", Name: "tenant-a-network"}, &current)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("recorded ClusterResourceSet was not exact-deleted: %v", err)
 	}
 }
 

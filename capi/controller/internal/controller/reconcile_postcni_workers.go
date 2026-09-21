@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
 	"time"
@@ -20,8 +21,9 @@ import (
 )
 
 var (
-	postCNIDevMachineGVK = schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta2", Kind: "DevMachine"}
-	postCNINodeGVK       = schema.GroupVersionKind{Version: "v1", Kind: "Node"}
+	errWorkerOwnershipInvalid = errors.New("worker ownership is invalid")
+	postCNIDevMachineGVK      = schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta2", Kind: "DevMachine"}
+	postCNINodeGVK            = schema.GroupVersionKind{Version: "v1", Kind: "Node"}
 )
 
 type postCNIWorkerState struct {
@@ -100,17 +102,17 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 		item.SetGroupVersionKind(postCNIDevMachineGVK)
 		owners := item.GetOwnerReferences()
 		if len(owners) != 1 {
-			return state, fmt.Errorf("DevMachine %s owner chain is invalid", item.GetName())
+			return state, fmt.Errorf("%w: DevMachine %s owner chain is invalid", errWorkerOwnershipInvalid, item.GetName())
 		}
 		root, present := machineByUID[string(owners[0].UID)]
 		if !present {
-			return state, fmt.Errorf("DevMachine %s owner does not match an exact Machine", item.GetName())
+			return state, fmt.Errorf("%w: DevMachine %s owner does not match an exact Machine", errWorkerOwnershipInvalid, item.GetName())
 		}
 		if item.GetName() != root.Name {
-			return state, fmt.Errorf("DevMachine %s name does not match its exact Machine %s", item.GetName(), root.Name)
+			return state, fmt.Errorf("%w: DevMachine %s name does not match its exact Machine %s", errWorkerOwnershipInvalid, item.GetName(), root.Name)
 		}
 		if err := validateOwnerChain(ctx, reconciler.reader(), item, root); err != nil {
-			return state, err
+			return state, fmt.Errorf("%w: %v", errWorkerOwnershipInvalid, err)
 		}
 		if !tenantObjectReady(item) {
 			devMachinesReady = false
@@ -133,7 +135,7 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	for index := range nodes.Items {
 		nodes.Items[index].SetGroupVersionKind(postCNINodeGVK)
 		if _, expected := machineNames[nodes.Items[index].GetName()]; !expected {
-			return state, fmt.Errorf("Node %s has no exact Machine", nodes.Items[index].GetName())
+			return state, fmt.Errorf("%w: Node %s has no exact Machine", errWorkerOwnershipInvalid, nodes.Items[index].GetName())
 		}
 		if !tenantObjectReady(&nodes.Items[index]) {
 			nodesReady = false

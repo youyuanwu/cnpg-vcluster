@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -259,6 +260,9 @@ func containsString(values []string, expected string) bool {
 }
 
 func isOwnershipError(err error) bool {
+	if errors.Is(err, errWorkerOwnershipInvalid) {
+		return true
+	}
 	value := sanitize.Text(err.Error())
 	return containsAny(value, "ownership", "identity changed", "owner chain", "different endpoint allocation")
 }

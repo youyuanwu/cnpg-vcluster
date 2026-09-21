@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"math"
 	"strings"
 	"testing"
@@ -128,6 +129,13 @@ func TestPostCNIWorkerSnapshotIncludesProviderDescendants(t *testing.T) {
 	second := postCNIWorkerSnapshotHash(state)
 	if first == second {
 		t.Fatal("Node replacement did not invalidate the worker snapshot")
+	}
+}
+
+func TestWorkerTopologyOwnershipErrorsAreClassified(t *testing.T) {
+	err := fmt.Errorf("%w: DevMachine worker-b owner does not match an exact Machine", errWorkerOwnershipInvalid)
+	if !isOwnershipError(err) {
+		t.Fatal("worker topology mismatch was not classified as OwnershipInvalid")
 	}
 }
 

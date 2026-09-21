@@ -7,6 +7,7 @@ import (
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
@@ -34,6 +35,16 @@ func ensureTenantObject(ctx context.Context, tenantClient client.Client, desired
 		annotations[resources.ResourceAnnotation] != desired.GetAnnotations()[resources.ResourceAnnotation] {
 		return tenancyv1alpha1.ObservedResourceIdentity{}, false, fmt.Errorf("tenant resource %s/%s ownership mismatch", current.GetKind(), current.GetName())
 	}
+	if recorded := findTenantIdentity(tenant.Status.TenantResources, desired.GroupVersionKind(), desired.GetNamespace(), desired.GetName()); recorded != nil &&
+		recorded.UID != string(current.GetUID()) {
+		return tenancyv1alpha1.ObservedResourceIdentity{}, false, fmt.Errorf(
+			"tenant %s %s identity changed from %s to %s",
+			current.GetKind(),
+			current.GetName(),
+			recorded.UID,
+			current.GetUID(),
+		)
+	}
 	applied := desired.DeepCopy()
 	if err := tenantClient.Patch(
 		ctx,
@@ -50,6 +61,24 @@ func ensureTenantObject(ctx context.Context, tenantClient client.Client, desired
 		return tenancyv1alpha1.ObservedResourceIdentity{}, false, err
 	}
 	return identityFor(refreshed), false, nil
+}
+
+func findTenantIdentity(
+	values []tenancyv1alpha1.ObservedResourceIdentity,
+	gvk schema.GroupVersionKind,
+	namespace,
+	name string,
+) *tenancyv1alpha1.ObservedResourceIdentity {
+	for index := range values {
+		identity := &values[index]
+		if identity.APIVersion == gvk.GroupVersion().String() &&
+			identity.Kind == gvk.Kind &&
+			identity.Namespace == namespace &&
+			identity.Name == name {
+			return identity
+		}
+	}
+	return nil
 }
 
 func upsertTenantIdentity(status *tenancyv1alpha1.TenantStatus, identity tenancyv1alpha1.ObservedResourceIdentity) error {
