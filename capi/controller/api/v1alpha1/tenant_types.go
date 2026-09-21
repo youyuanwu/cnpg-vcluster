@@ -51,12 +51,13 @@ type TenantSpec struct {
 }
 
 type ObservedResourceIdentity struct {
-	APIVersion   string   `json:"apiVersion"`
-	Kind         string   `json:"kind"`
-	Namespace    string   `json:"namespace,omitempty"`
-	Name         string   `json:"name"`
-	UID          string   `json:"uid"`
-	PreviousUIDs []string `json:"previousUIDs,omitempty"`
+	APIVersion    string   `json:"apiVersion"`
+	Kind          string   `json:"kind"`
+	Namespace     string   `json:"namespace,omitempty"`
+	Name          string   `json:"name"`
+	UID           string   `json:"uid"`
+	ContentSHA256 string   `json:"contentSHA256,omitempty"`
+	PreviousUIDs  []string `json:"previousUIDs,omitempty"`
 }
 
 type FunctionalEvidence struct {

@@ -25,6 +25,17 @@ const (
 	allocationConfigMapName    = "tenant-endpoint-allocations"
 )
 
+var requiredWorkerImageKeys = []string{
+	"CALICO_CNI_IMAGE",
+	"CALICO_KUBE_CONTROLLERS_IMAGE",
+	"CALICO_NODE_IMAGE",
+	"KUBE_PROXY_IMAGE",
+	"KONNECTIVITY_AGENT_IMAGE",
+	"CNPG_CONTROLLER_IMAGE",
+	"POSTGRES_IMAGE",
+	"VERIFY_IMAGE",
+}
+
 type FoundationArchive struct {
 	Key       string `json:"key"`
 	Path      string `json:"path"`
@@ -89,7 +100,16 @@ func loadFoundation(ctx context.Context, reader client.Reader, docker DockerClie
 	}
 	encoded := configMap.Data["foundation.json"]
 	expectedHash := configMap.Data["foundation.sha256"]
-	actualHash := sha256.Sum256([]byte(encoded))
+	var immutable map[string]any
+	if err := json.Unmarshal([]byte(encoded), &immutable); err != nil {
+		return Foundation{}, fmt.Errorf("decode Tenant foundation: %w", err)
+	}
+	delete(immutable, "mutationEnabled")
+	canonical, err := json.Marshal(immutable)
+	if err != nil {
+		return Foundation{}, fmt.Errorf("encode immutable Tenant foundation: %w", err)
+	}
+	actualHash := sha256.Sum256(canonical)
 	hash := hex.EncodeToString(actualHash[:])
 	if expectedHash == "" || expectedHash != hash {
 		return Foundation{}, fmt.Errorf("Tenant foundation checksum mismatch")
@@ -224,21 +244,16 @@ func validateFoundation(foundation Foundation, supportedVersion, expectedControl
 		}
 		keys[archive.Key] = struct{}{}
 	}
-	requiredWorkerImages := []string{
-		"CALICO_CNI_IMAGE",
-		"CALICO_KUBE_CONTROLLERS_IMAGE",
-		"CALICO_NODE_IMAGE",
-		"KUBE_PROXY_IMAGE",
-		"KONNECTIVITY_AGENT_IMAGE",
-		"CNPG_CONTROLLER_IMAGE",
-		"POSTGRES_IMAGE",
-		"VERIFY_IMAGE",
-	}
-	for _, key := range requiredWorkerImages {
-		if _, present := keys[key]; !present {
+	for _, key := range requiredWorkerImageKeys {
+		archive, present := archiveByKey(foundation.Cache.ImageArchives, key)
+		if !present {
 			return fmt.Errorf("Tenant foundation worker image %s is missing", key)
 		}
+		if !archive.Worker {
+			return fmt.Errorf("Tenant foundation worker image %s is not marked for preparation", key)
+		}
 	}
+
 	if foundation.OfflineEnforced {
 		if foundation.Registry == nil || foundation.Registry.Address == "" ||
 			foundation.Registry.Port < 1 || foundation.Registry.Generation == "" ||
@@ -260,6 +275,15 @@ func validateFoundation(foundation Foundation, supportedVersion, expectedControl
 		}
 	}
 	return nil
+}
+
+func archiveByKey(archives []FoundationArchive, key string) (FoundationArchive, bool) {
+	for _, archive := range archives {
+		if archive.Key == key {
+			return archive, true
+		}
+	}
+	return FoundationArchive{}, false
 }
 
 func canonicalIPv4Prefix(description, value string) (netip.Prefix, error) {

@@ -88,28 +88,53 @@ func (reconciler *TenantReconciler) reconcileWorkers(ctx context.Context, tenant
 		if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		for _, container := range containers {
-			if evidencePrepared(tenant.Status.WorkerContainers, container.ID, foundation.Cache.Generation) {
+		evidenceSet := normalizeWorkerEvidence(tenant.Status.WorkerContainers, containers, foundation.Cache.Generation)
+		for index, container := range containers {
+			if evidenceSet[index].Prepared {
 				continue
 			}
-			evidence := workerEvidence(tenant.Status.WorkerContainers, container, foundation.Cache.Generation)
+			evidence := evidenceSet[index]
 			evidence, err = reconciler.prepareWorkerStep(ctx, container, foundation, evidence)
 			if err != nil {
 				return ctrl.Result{}, err
 			}
+			evidenceSet[index] = evidence
 			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				upsertWorkerEvidence(status, evidence)
+				status.WorkerContainers = evidenceSet
 				replaceMachineIdentities(status, machines)
 				return nil
 			})
 		}
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.WorkerContainers = evidenceSet
+			replaceMachineIdentities(status, machines)
 			status.Stage = tenancyv1alpha1.StageWorkersApplied
 			setCondition(status, tenant, "WorkersReady", metav1.ConditionFalse, "PreCNIWorkersApplied", "Pre-CNI worker containers are prepared; Node readiness is not evaluated yet")
 			setCondition(status, tenant, "Ready", metav1.ConditionFalse, "Phase3Pending", "Tenant networking, storage, and database reconciliation are pending")
 			return nil
 		})
 	case tenancyv1alpha1.StageWorkersApplied:
+		machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
+		if err != nil {
+			if errors.Is(err, errWorkerRuntimePending) {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
+		if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		evidenceSet := normalizeWorkerEvidence(tenant.Status.WorkerContainers, containers, foundation.Cache.Generation)
+		if !allWorkerEvidencePrepared(evidenceSet) || !machineInventoryMatches(tenant.Status, machines) {
+			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+				status.WorkerContainers = evidenceSet
+				replaceMachineIdentities(status, machines)
+				status.Stage = tenancyv1alpha1.StageMachineDeploymentCreated
+				setCondition(status, tenant, "WorkersReady", metav1.ConditionFalse, "WorkerReplacement", "A verified worker replacement requires bounded image preparation")
+				setCondition(status, tenant, "Ready", metav1.ConditionFalse, "WorkerReplacement", "Worker replacement preparation is in progress")
+				return nil
+			})
+		}
 		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 	default:
 		return ctrl.Result{}, fmt.Errorf("unsupported Tenant lifecycle stage %q", tenant.Status.Stage)
@@ -228,10 +253,12 @@ func (reconciler *TenantReconciler) observePreCNIWorkers(ctx context.Context, te
 
 func (reconciler *TenantReconciler) prepareWorkerStep(ctx context.Context, container DockerContainer, foundation Foundation, evidence tenancyv1alpha1.WorkerContainerEvidence) (tenancyv1alpha1.WorkerContainerEvidence, error) {
 	archives := make([]FoundationArchive, 0)
-	for _, archive := range foundation.Cache.ImageArchives {
-		if archive.Worker {
-			archives = append(archives, archive)
+	for _, key := range requiredWorkerImageKeys {
+		archive, found := archiveByKey(foundation.Cache.ImageArchives, key)
+		if !found {
+			return evidence, fmt.Errorf("worker image %s is missing from the foundation", key)
 		}
+		archives = append(archives, archive)
 	}
 	sort.Slice(archives, func(left, right int) bool { return archives[left].Key < archives[right].Key })
 	for _, archive := range archives {
@@ -438,15 +465,6 @@ func stringMapEqual(left, right map[string]string) bool {
 	return true
 }
 
-func evidencePrepared(values []tenancyv1alpha1.WorkerContainerEvidence, id, generation string) bool {
-	for _, value := range values {
-		if value.ID == id && value.CacheGeneration == generation && value.Prepared {
-			return true
-		}
-	}
-	return false
-}
-
 func workerEvidence(values []tenancyv1alpha1.WorkerContainerEvidence, container DockerContainer, generation string) tenancyv1alpha1.WorkerContainerEvidence {
 	result := tenancyv1alpha1.WorkerContainerEvidence{
 		Name:            container.Name,
@@ -470,17 +488,50 @@ func workerEvidence(values []tenancyv1alpha1.WorkerContainerEvidence, container 
 	return result
 }
 
-func upsertWorkerEvidence(status *tenancyv1alpha1.TenantStatus, evidence tenancyv1alpha1.WorkerContainerEvidence) {
-	for index := range status.WorkerContainers {
-		if status.WorkerContainers[index].Name == evidence.Name {
-			status.WorkerContainers[index] = evidence
-			return
+func normalizeWorkerEvidence(values []tenancyv1alpha1.WorkerContainerEvidence, containers []DockerContainer, generation string) []tenancyv1alpha1.WorkerContainerEvidence {
+	currentNames := map[string]struct{}{}
+	for _, container := range containers {
+		currentNames[container.Name] = struct{}{}
+	}
+	removed := make([]tenancyv1alpha1.WorkerContainerEvidence, 0)
+	for _, value := range values {
+		if _, present := currentNames[value.Name]; !present {
+			removed = append(removed, value)
 		}
 	}
-	status.WorkerContainers = append(status.WorkerContainers, evidence)
-	sort.Slice(status.WorkerContainers, func(left, right int) bool {
-		return status.WorkerContainers[left].Name < status.WorkerContainers[right].Name
+	sort.Slice(removed, func(left, right int) bool { return removed[left].Name < removed[right].Name })
+	result := make([]tenancyv1alpha1.WorkerContainerEvidence, 0, len(containers))
+	newIndexes := make([]int, 0)
+	for _, container := range containers {
+		evidence := workerEvidence(values, container, generation)
+		if len(evidence.ImportedImages) == 0 && !evidence.Prepared {
+			newIndexes = append(newIndexes, len(result))
+		}
+		result = append(result, evidence)
+	}
+	for index, resultIndex := range newIndexes {
+		if index >= len(removed) {
+			break
+		}
+		result[resultIndex].PreviousIDs = append(result[resultIndex].PreviousIDs, removed[index].PreviousIDs...)
+		if removed[index].ID != "" && removed[index].ID != result[resultIndex].ID {
+			result[resultIndex].PreviousIDs = append(result[resultIndex].PreviousIDs, removed[index].ID)
+		}
+		sort.Strings(result[resultIndex].PreviousIDs)
+	}
+	sort.Slice(result, func(left, right int) bool {
+		return result[left].Name < result[right].Name
 	})
+	return result
+}
+
+func allWorkerEvidencePrepared(values []tenancyv1alpha1.WorkerContainerEvidence) bool {
+	for _, value := range values {
+		if !value.Prepared {
+			return false
+		}
+	}
+	return len(values) != 0
 }
 
 func replaceMachineIdentities(status *tenancyv1alpha1.TenantStatus, machines []*unstructured.Unstructured) {
@@ -494,17 +545,45 @@ func replaceMachineIdentities(status *tenancyv1alpha1.TenantStatus, machines []*
 		retained = append(retained, identity)
 	}
 	sort.Slice(previous, func(left, right int) bool { return previous[left].Name < previous[right].Name })
+	previousByName := map[string]tenancyv1alpha1.ObservedResourceIdentity{}
+	currentNames := map[string]struct{}{}
+	for _, identity := range previous {
+		previousByName[identity.Name] = identity
+	}
+	for _, machine := range machines {
+		currentNames[machine.GetName()] = struct{}{}
+	}
+	removed := make([]tenancyv1alpha1.ObservedResourceIdentity, 0)
+	for _, identity := range previous {
+		if _, present := currentNames[identity.Name]; !present {
+			removed = append(removed, identity)
+		}
+	}
 	current := make([]tenancyv1alpha1.ObservedResourceIdentity, 0, len(machines))
-	for index, machine := range machines {
+	newIndexes := make([]int, 0)
+	for _, machine := range machines {
 		identity := identityFor(machine)
-		if index < len(previous) {
-			identity.PreviousUIDs = append(identity.PreviousUIDs, previous[index].PreviousUIDs...)
-			if previous[index].UID != identity.UID {
-				identity.PreviousUIDs = append(identity.PreviousUIDs, previous[index].UID)
+		if old, present := previousByName[identity.Name]; present {
+			identity.PreviousUIDs = append(identity.PreviousUIDs, old.PreviousUIDs...)
+			if old.UID != identity.UID {
+				identity.PreviousUIDs = append(identity.PreviousUIDs, old.UID)
 			}
 			sort.Strings(identity.PreviousUIDs)
+		} else {
+			newIndexes = append(newIndexes, len(current))
 		}
 		current = append(current, identity)
+	}
+	sort.Slice(removed, func(left, right int) bool { return removed[left].Name < removed[right].Name })
+	for index, currentIndex := range newIndexes {
+		if index >= len(removed) {
+			break
+		}
+		current[currentIndex].PreviousUIDs = append(current[currentIndex].PreviousUIDs, removed[index].PreviousUIDs...)
+		if removed[index].UID != current[currentIndex].UID {
+			current[currentIndex].PreviousUIDs = append(current[currentIndex].PreviousUIDs, removed[index].UID)
+		}
+		sort.Strings(current[currentIndex].PreviousUIDs)
 	}
 	status.ObservedResources = append(retained, current...)
 	sort.Slice(status.ObservedResources, func(left, right int) bool {
@@ -513,4 +592,22 @@ func replaceMachineIdentities(status *tenancyv1alpha1.TenantStatus, machines []*
 		return a.APIVersion+"/"+a.Kind+"/"+a.Namespace+"/"+a.Name <
 			b.APIVersion+"/"+b.Kind+"/"+b.Namespace+"/"+b.Name
 	})
+}
+
+func machineInventoryMatches(status tenancyv1alpha1.TenantStatus, machines []*unstructured.Unstructured) bool {
+	expected := map[string]string{}
+	for _, identity := range status.ObservedResources {
+		if identity.Kind == machineGVK.Kind && identity.APIVersion == machineGVK.GroupVersion().String() {
+			expected[identity.Name] = identity.UID
+		}
+	}
+	if len(expected) != len(machines) {
+		return false
+	}
+	for _, machine := range machines {
+		if expected[machine.GetName()] != string(machine.GetUID()) {
+			return false
+		}
+	}
+	return true
 }

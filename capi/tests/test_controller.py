@@ -13,6 +13,7 @@ from scripts.controller_tenant import main as controller_tenant_main
 from scripts.test_controller_phase2 import _restore_after_gate
 from scripts.lib.controller import (
     _foundation_payload,
+    _foundation_checksum,
     build_controller_image,
     controller_source_digest,
     delete_controller,
@@ -286,6 +287,9 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 data["cache"]["imageArchives"][0]["tagged"],
             )
             self.assertEqual("/var/lib/example", data["inputs"]["storageContainerPath"])
+            original_hash = payload["data"]["foundation.sha256"]
+            data["mutationEnabled"] = not data["mutationEnabled"]
+            self.assertEqual(original_hash, _foundation_checksum(data))
 
     def test_private_apply_uses_all_lifecycle_locks(self) -> None:
         calls = []

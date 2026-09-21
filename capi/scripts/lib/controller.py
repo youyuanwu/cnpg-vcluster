@@ -25,6 +25,13 @@ CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
 
 
+def _foundation_checksum(data: dict[str, object]) -> str:
+    immutable = dict(data)
+    immutable.pop("mutationEnabled", None)
+    encoded = json.dumps(immutable, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(encoded.encode()).hexdigest()
+
+
 def go_environment(root: Path) -> dict[str, str]:
     go_root = root / ".tools" / "go"
     go_binary = root / ".tools" / "bin" / "go"
@@ -293,7 +300,7 @@ def _foundation_payload(
         },
         "data": {
             "foundation.json": encoded,
-            "foundation.sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+            "foundation.sha256": _foundation_checksum(data),
         },
     }
 
@@ -317,7 +324,7 @@ def set_controller_mutation(
     patch = {
         "data": {
             "foundation.json": updated,
-            "foundation.sha256": hashlib.sha256(updated.encode()).hexdigest(),
+            "foundation.sha256": _foundation_checksum(data),
         }
     }
     argument = f"--mutation-enabled={'true' if enabled else 'false'}"

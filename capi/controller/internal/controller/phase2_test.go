@@ -162,13 +162,41 @@ func foundationConfigMap(t *testing.T, foundation Foundation) *corev1.ConfigMap 
 	if err != nil {
 		t.Fatal(err)
 	}
-	digest := sha256.Sum256(encoded)
+
+	var immutable map[string]any
+	if err := json.Unmarshal(encoded, &immutable); err != nil {
+		t.Fatal(err)
+	}
+	delete(immutable, "mutationEnabled")
+	canonical, err := json.Marshal(immutable)
+	if err != nil {
+		t.Fatal(err)
+	}
+	digest := sha256.Sum256(canonical)
 	return &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{Name: defaultFoundationName, Namespace: defaultFoundationNamespace},
 		Data: map[string]string{
 			"foundation.json":   string(encoded),
 			"foundation.sha256": hex.EncodeToString(digest[:]),
 		},
+	}
+}
+
+func endpointConfigMap(t *testing.T, foundation Foundation, tenant *tenancyv1alpha1.Tenant, specHash string) *corev1.ConfigMap {
+	t.Helper()
+	state := newAllocationState(foundation)
+	address, err := claimLowestFree(state, foundation, tenant, specHash)
+	if err != nil {
+		t.Fatal(err)
+	}
+	encoded, err := encodeAllocationState(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tenant.Status.Endpoint = foundation.Endpoint(address)
+	return &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{Name: allocationConfigMapName, Namespace: defaultFoundationNamespace},
+		Data:       map[string]string{"allocations.json": encoded},
 	}
 }
 
@@ -249,6 +277,11 @@ func TestFoundationRejectsMalformedCacheAndCIDRs(t *testing.T) {
 	foundation.Cache.ImageArchives = foundation.Cache.ImageArchives[1:]
 	if err := validateFoundation(foundation, "1.36.4", foundation.ControllerImage); err == nil {
 		t.Fatal("incomplete worker image inventory was accepted")
+	}
+	foundation = testFoundation()
+	foundation.Cache.ImageArchives[0].Worker = false
+	if err := validateFoundation(foundation, "1.36.4", foundation.ControllerImage); err == nil {
+		t.Fatal("required worker image with a false worker flag was accepted")
 	}
 	foundation = testFoundation()
 	foundation.Versions["CAPI_VERSION"] = "v9.9.9"
@@ -714,7 +747,8 @@ func TestPartialFinalizationDeletesUnrecordedExactVolume(t *testing.T) {
 			"tenancy.cnpg-vcluster.io/resource":        "namespace",
 		},
 	}}
-	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tenant).WithObjects(tenant, namespace).Build()
+	allocation := endpointConfigMap(t, foundation, tenant, "spec-hash")
+	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tenant).WithObjects(tenant, namespace, allocation).Build()
 	name := foundation.Inputs.LabPrefix + "-" + tenant.Name + "-storage"
 	labels := map[string]string{
 		foundation.Inputs.OwnershipLabel:           foundation.Inputs.LabPrefix,

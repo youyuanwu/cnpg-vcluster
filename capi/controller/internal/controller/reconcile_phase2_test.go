@@ -105,10 +105,11 @@ func TestDeletionAdoptsClusterApplyBeforeStatus(t *testing.T) {
 		t.Fatal(err)
 	}
 	cluster.SetUID("cluster-uid")
+	allocation := endpointConfigMap(t, foundation, tenant, "spec-hash")
 	kubernetes := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(tenant).
-		WithObjects(tenant, namespace, cluster).
+		WithObjects(tenant, namespace, cluster, allocation).
 		Build()
 	reconciler := &TenantReconciler{
 		Client:    kubernetes,

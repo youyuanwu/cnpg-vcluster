@@ -94,13 +94,21 @@ func allocateEndpoint(ctx context.Context, kubernetes client.Client, reader clie
 }
 
 func validateEndpoint(ctx context.Context, reader client.Reader, namespace string, foundation Foundation, tenant *tenancyv1alpha1.Tenant, specHash string) error {
+	_, _, err := observeEndpoint(ctx, reader, namespace, foundation, tenant, specHash)
+	return err
+}
+
+func observeEndpoint(ctx context.Context, reader client.Reader, namespace string, foundation Foundation, tenant *tenancyv1alpha1.Tenant, specHash string) (string, bool, error) {
 	var configMap corev1.ConfigMap
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: allocationConfigMapName}, &configMap); err != nil {
-		return fmt.Errorf("read Tenant endpoint allocation: %w", err)
+		if apierrors.IsNotFound(err) && tenant.Status.Endpoint == "" {
+			return "", false, nil
+		}
+		return "", false, fmt.Errorf("read Tenant endpoint allocation: %w", err)
 	}
 	state, err := decodeAllocationState(configMap.Data["allocations.json"], foundation)
 	if err != nil {
-		return err
+		return "", false, err
 	}
 	for address, allocation := range state.Allocations {
 		if allocation.TenantUID != string(tenant.UID) {
@@ -108,12 +116,15 @@ func validateEndpoint(ctx context.Context, reader client.Reader, namespace strin
 		}
 		if allocation.TenantName != tenant.Name || allocation.SpecHash != specHash ||
 			allocation.FoundationHash != foundation.Hash ||
-			foundation.Endpoint(address) != tenant.Status.Endpoint {
-			return fmt.Errorf("Tenant endpoint allocation identity mismatch")
+			(tenant.Status.Endpoint != "" && foundation.Endpoint(address) != tenant.Status.Endpoint) {
+			return "", false, fmt.Errorf("Tenant endpoint allocation identity mismatch")
 		}
-		return nil
+		return foundation.Endpoint(address), true, nil
 	}
-	return fmt.Errorf("Tenant endpoint allocation is missing")
+	if tenant.Status.Endpoint != "" {
+		return "", false, fmt.Errorf("Tenant endpoint allocation is missing")
+	}
+	return "", false, nil
 }
 
 func releaseEndpoint(ctx context.Context, kubernetes client.Client, reader client.Reader, namespace string, foundation Foundation, tenant *tenancyv1alpha1.Tenant) error {

@@ -35,6 +35,24 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 	preflightPartialOwnership := func(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
 		adopted := make([]tenancyv1alpha1.ObservedResourceIdentity, 0)
 		observedObjects := make([]*unstructured.Unstructured, 0)
+		endpoint, endpointPresent, err := observeEndpoint(
+			ctx,
+			reconciler.reader(),
+			reconciler.foundationNamespace(),
+			foundation,
+			tenant,
+			specHash,
+		)
+		if err != nil {
+			return false, err
+		}
+		if stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageEndpointAllocated) && !endpointPresent {
+			return false, fmt.Errorf("expected endpoint allocation is absent before deletion")
+		}
+		adoptedEndpoint := ""
+		if endpointPresent && tenant.Status.Endpoint == "" {
+			adoptedEndpoint = endpoint
+		}
 		checkUnstructured := func(gvk schema.GroupVersionKind, namespace, name, resource string, expected bool) error {
 			object := &unstructured.Unstructured{}
 			object.SetGroupVersionKind(gvk)
@@ -64,7 +82,7 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		}
 
 		var namespace corev1.Namespace
-		err := reconciler.reader().Get(ctx, types.NamespacedName{Name: tenant.Name}, &namespace)
+		err = reconciler.reader().Get(ctx, types.NamespacedName{Name: tenant.Name}, &namespace)
 		namespaceExpected := stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageNamespaceCreated)
 		if apierrors.IsNotFound(err) {
 			if namespaceExpected {
@@ -75,6 +93,9 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		} else {
 			if err := validateRootOwnership(&namespace, tenant, specHash, foundation.Hash, "namespace", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 				return false, err
+			}
+			if len(namespace.OwnerReferences) != 0 {
+				return false, fmt.Errorf("Namespace has an unexpected owner before deletion")
 			}
 			namespace.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Namespace"))
 			recorded := findIdentity(tenant.Status, corev1.SchemeGroupVersion.WithKind("Namespace"), "", tenant.Name)
@@ -135,11 +156,15 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			}
 			secret.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
 			recorded := findIdentity(tenant.Status, corev1.SchemeGroupVersion.WithKind("Secret"), tenant.Name, secret.Name)
-			if recorded != nil && recorded.UID != string(secret.UID) {
+			liveIdentity := kubeconfigSecretIdentity(&secret)
+			if recorded != nil &&
+				(recorded.UID != string(secret.UID) ||
+					recorded.ContentSHA256 == "" ||
+					recorded.ContentSHA256 != liveIdentity.ContentSHA256) {
 				return false, fmt.Errorf("Tenant kubeconfig Secret identity changed before deletion")
 			}
 			if recorded == nil {
-				adopted = append(adopted, identityFor(&secret))
+				adopted = append(adopted, liveIdentity)
 			}
 		}
 
@@ -179,7 +204,7 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 				}
 			}
 		}
-		if len(adopted) == 0 && adoptedVolume == nil {
+		if len(adopted) == 0 && adoptedVolume == nil && adoptedEndpoint == "" {
 			return false, nil
 		}
 		if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
@@ -190,6 +215,9 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			}
 			if adoptedVolume != nil {
 				status.DockerVolume = adoptedVolume
+			}
+			if adoptedEndpoint != "" {
+				status.Endpoint = adoptedEndpoint
 			}
 			return nil
 		}); err != nil {

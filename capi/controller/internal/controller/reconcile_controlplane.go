@@ -134,7 +134,7 @@ func (reconciler *TenantReconciler) reconcileControlPlane(ctx context.Context, t
 			return ctrl.Result{}, fmt.Errorf("Tenant kubeconfig Secret owner does not match the exact KamajiControlPlane")
 		}
 		secret.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
-		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageKubeconfigReady, identityFor(secret))
+		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageKubeconfigReady, kubeconfigSecretIdentity(secret))
 	case tenancyv1alpha1.StageKubeconfigReady:
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.Stage = tenancyv1alpha1.StageTenantAPICleanupRequired

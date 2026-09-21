@@ -196,6 +196,8 @@ spec:
                   properties:
                     apiVersion:
                       type: string
+                    contentSHA256:
+                      type: string
                     kind:
                       type: string
                     name:

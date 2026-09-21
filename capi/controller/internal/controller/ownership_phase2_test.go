@@ -47,23 +47,46 @@ func TestProviderOwnerMustMatchRecordedRoot(t *testing.T) {
 }
 
 func TestMachineReplacementRetainsPreviousIdentity(t *testing.T) {
-	status := tenancyv1alpha1.TenantStatus{ObservedResources: []tenancyv1alpha1.ObservedResourceIdentity{{
-		APIVersion: machineGVK.GroupVersion().String(),
-		Kind:       machineGVK.Kind,
-		Namespace:  "tenant-a",
-		Name:       "tenant-a-worker-old",
-		UID:        "old-machine-uid",
-	}}}
+	status := tenancyv1alpha1.TenantStatus{ObservedResources: []tenancyv1alpha1.ObservedResourceIdentity{
+		{APIVersion: machineGVK.GroupVersion().String(), Kind: machineGVK.Kind, Namespace: "tenant-a", Name: "worker-a", UID: "uid-a"},
+		{APIVersion: machineGVK.GroupVersion().String(), Kind: machineGVK.Kind, Namespace: "tenant-a", Name: "worker-b", UID: "uid-b"},
+	}}
+	survivor := &unstructured.Unstructured{}
+	survivor.SetGroupVersionKind(machineGVK)
+	survivor.SetNamespace("tenant-a")
+	survivor.SetName("worker-b")
+	survivor.SetUID(types.UID("uid-b"))
 	replacement := &unstructured.Unstructured{}
 	replacement.SetGroupVersionKind(machineGVK)
 	replacement.SetNamespace("tenant-a")
-	replacement.SetName("tenant-a-worker-new")
-	replacement.SetUID(types.UID("new-machine-uid"))
-	replaceMachineIdentities(&status, []*unstructured.Unstructured{replacement})
-	if len(status.ObservedResources) != 1 ||
-		status.ObservedResources[0].UID != "new-machine-uid" ||
-		len(status.ObservedResources[0].PreviousUIDs) != 1 ||
-		status.ObservedResources[0].PreviousUIDs[0] != "old-machine-uid" {
+	replacement.SetName("worker-c")
+	replacement.SetUID(types.UID("uid-c"))
+	replaceMachineIdentities(&status, []*unstructured.Unstructured{survivor, replacement})
+	if len(status.ObservedResources) != 2 ||
+		status.ObservedResources[0].Name != "worker-b" ||
+		len(status.ObservedResources[0].PreviousUIDs) != 0 ||
+		status.ObservedResources[1].Name != "worker-c" ||
+		len(status.ObservedResources[1].PreviousUIDs) != 1 ||
+		status.ObservedResources[1].PreviousUIDs[0] != "uid-a" {
 		t.Fatalf("replacement history was not retained: %#v", status.ObservedResources)
+	}
+}
+
+func TestWorkerEvidenceReplacementRetiresStaleNames(t *testing.T) {
+	values := []tenancyv1alpha1.WorkerContainerEvidence{
+		{Name: "worker-a", ID: "container-a", CacheGeneration: "generation", Prepared: true},
+		{Name: "worker-b", ID: "container-b", CacheGeneration: "generation", Prepared: true},
+	}
+	containers := []DockerContainer{
+		{Name: "worker-b", ID: "container-b"},
+		{Name: "worker-c", ID: "container-c"},
+	}
+	normalized := normalizeWorkerEvidence(values, containers, "generation")
+	if len(normalized) != 2 || normalized[0].Name != "worker-b" ||
+		normalized[1].Name != "worker-c" ||
+		len(normalized[1].PreviousIDs) != 1 ||
+		normalized[1].PreviousIDs[0] != "container-a" ||
+		normalized[1].Prepared {
+		t.Fatalf("worker replacement evidence is invalid: %#v", normalized)
 	}
 }

@@ -2,10 +2,13 @@ package controller
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"sort"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -49,6 +52,14 @@ func identityFor(object client.Object) tenancyv1alpha1.ObservedResourceIdentity 
 		Name:       object.GetName(),
 		UID:        string(object.GetUID()),
 	}
+
+}
+
+func kubeconfigSecretIdentity(secret *corev1.Secret) tenancyv1alpha1.ObservedResourceIdentity {
+	identity := identityFor(secret)
+	digest := sha256.Sum256(secret.Data["value"])
+	identity.ContentSHA256 = hex.EncodeToString(digest[:])
+	return identity
 }
 
 func upsertIdentity(status *tenancyv1alpha1.TenantStatus, identity tenancyv1alpha1.ObservedResourceIdentity) error {

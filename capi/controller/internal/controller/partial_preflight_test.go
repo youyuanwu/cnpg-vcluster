@@ -104,12 +104,17 @@ func TestDeletionPreflightRejectsForeignVolumeBeforeTenantAPIMutation(t *testing
 		Data: map[string][]byte{"value": []byte("kubeconfig")},
 	}
 	for _, object := range []client.Object{namespace, cluster, devCluster, controlPlane, secret} {
-		tenant.Status.ObservedResources = append(tenant.Status.ObservedResources, identityFor(object))
+		if value, ok := object.(*corev1.Secret); ok {
+			tenant.Status.ObservedResources = append(tenant.Status.ObservedResources, kubeconfigSecretIdentity(value))
+		} else {
+			tenant.Status.ObservedResources = append(tenant.Status.ObservedResources, identityFor(object))
+		}
 	}
+	allocation := endpointConfigMap(t, foundation, tenant, "spec-hash")
 	kubernetes := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(tenant).
-		WithObjects(tenant, namespace, cluster, devCluster, controlPlane, secret).
+		WithObjects(tenant, namespace, cluster, devCluster, controlPlane, secret, allocation).
 		Build()
 	volumeName := foundation.Inputs.LabPrefix + "-" + tenant.Name + "-storage"
 	docker := &fakeDockerClient{volumes: map[string]DockerVolume{
