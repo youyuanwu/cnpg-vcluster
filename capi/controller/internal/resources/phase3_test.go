@@ -26,9 +26,23 @@ func TestNetworkBuilderPinsImagesChunksAndReferencesSources(t *testing.T) {
 	if len(bundle.Sources) == 0 || len(bundle.Inventory) != len(bundle.Sources) {
 		t.Fatalf("unexpected network sources: %#v", bundle)
 	}
+	if len(bundle.Objects) == 0 {
+		t.Fatal("network object inventory is empty")
+	}
+	for _, object := range bundle.Objects {
+		annotations := object.GetAnnotations()
+		if annotations[TenantUIDAnnotation] != string(context.Tenant.UID) ||
+			annotations[ResourceAnnotation] == "" {
+			t.Fatalf("network object ownership markers are incomplete: %s/%s", object.GetKind(), object.GetName())
+		}
+	}
 	references, _, _ := unstructured.NestedSlice(bundle.ResourceSet.Object, "spec", "resources")
 	if len(references) != len(bundle.Sources) {
 		t.Fatalf("resource references do not match sources: %#v", references)
+	}
+	strategy, _, _ := unstructured.NestedString(bundle.ResourceSet.Object, "spec", "strategy")
+	if strategy != "ApplyOnce" {
+		t.Fatalf("network resource set can recreate cleanup targets: %q", strategy)
 	}
 	if !strings.Contains(bundle.Sources[0].Data["addons.yaml"], context.Spec.PodCIDR) {
 		t.Fatal("Calico pool CIDR was not rendered")

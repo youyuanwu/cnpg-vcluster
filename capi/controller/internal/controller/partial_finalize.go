@@ -312,20 +312,11 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		return ctrl.Result{}, fmt.Errorf("partial Tenant cleanup authority is invalid")
 	}
 	for _, identity := range tenant.Status.ObservedResources {
-		resource := ""
-		gvk := schema.FromAPIVersionAndKind(identity.APIVersion, identity.Kind)
-		switch identity.Kind {
-		case "ConfigMap":
-			if identity.Namespace == tenant.Name {
-				resource = "network-source"
-			}
-		case "ClusterResourceSet":
-			resource = "network-resource-set"
-		}
-		if resource == "" {
+		if identity.Kind != "ConfigMap" || identity.Namespace != tenant.Name {
 			continue
 		}
-		absent, err := reconciler.deleteExactUnstructured(ctx, tenant, specHash, foundation, gvk, identity.Namespace, identity.Name, resource)
+		gvk := schema.FromAPIVersionAndKind(identity.APIVersion, identity.Kind)
+		absent, err := reconciler.deleteExactUnstructured(ctx, tenant, specHash, foundation, gvk, identity.Namespace, identity.Name, "network-source")
 		if err != nil {
 			return ctrl.Result{}, err
 		}
@@ -585,7 +576,14 @@ func deleteTenantResources(
 ) (bool, error) {
 	values := append([]tenancyv1alpha1.ObservedResourceIdentity(nil), tenant.Status.TenantResources...)
 	sort.Slice(values, func(left, right int) bool {
-		return tenantDeletePriority(values[left].Kind) < tenantDeletePriority(values[right].Kind)
+		leftPriority := tenantDeletePriority(values[left].Kind)
+		rightPriority := tenantDeletePriority(values[right].Kind)
+		if leftPriority != rightPriority {
+			return leftPriority < rightPriority
+		}
+		leftIdentity := values[left].APIVersion + "/" + values[left].Kind + "/" + values[left].Namespace + "/" + values[left].Name
+		rightIdentity := values[right].APIVersion + "/" + values[right].Kind + "/" + values[right].Namespace + "/" + values[right].Name
+		return leftIdentity < rightIdentity
 	})
 	for _, identity := range values {
 		if identity.Kind == "Node" {
@@ -628,18 +626,24 @@ func deleteTenantResources(
 
 func tenantDeletePriority(kind string) int {
 	switch kind {
-	case "Pod", "Cluster":
+	case "Cluster":
 		return 0
 	case "Deployment", "DaemonSet", "StatefulSet":
 		return 1
-	case "PersistentVolumeClaim", "PersistentVolume", "StorageClass":
+	case "Pod", "PodDisruptionBudget":
 		return 2
-	case "CustomResourceDefinition":
-		return 4
-	case "Namespace":
-		return 5
-	default:
+	case "PersistentVolumeClaim":
 		return 3
+	case "PersistentVolume":
+		return 4
+	case "StorageClass":
+		return 5
+	case "CustomResourceDefinition":
+		return 7
+	case "Namespace":
+		return 8
+	default:
+		return 6
 	}
 }
 

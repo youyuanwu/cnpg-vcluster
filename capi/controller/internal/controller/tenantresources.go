@@ -30,10 +30,26 @@ func ensureTenantObject(ctx context.Context, tenantClient client.Client, desired
 	if annotations[resources.TenantAnnotation] != tenant.Name ||
 		annotations[resources.TenantUIDAnnotation] != string(tenant.UID) ||
 		annotations[resources.SpecHashAnnotation] != specHash ||
-		annotations[resources.FoundationAnnotation] != foundationHash {
+		annotations[resources.FoundationAnnotation] != foundationHash ||
+		annotations[resources.ResourceAnnotation] != desired.GetAnnotations()[resources.ResourceAnnotation] {
 		return tenancyv1alpha1.ObservedResourceIdentity{}, false, fmt.Errorf("tenant resource %s/%s ownership mismatch", current.GetKind(), current.GetName())
 	}
-	return identityFor(current), false, nil
+	applied := desired.DeepCopy()
+	if err := tenantClient.Patch(
+		ctx,
+		applied,
+		client.Apply,
+		client.FieldOwner("cnpg-vcluster-tenant-controller"),
+		client.ForceOwnership,
+	); err != nil {
+		return tenancyv1alpha1.ObservedResourceIdentity{}, false, err
+	}
+	refreshed := &unstructured.Unstructured{}
+	refreshed.SetGroupVersionKind(desired.GroupVersionKind())
+	if err := tenantClient.Get(ctx, client.ObjectKeyFromObject(desired), refreshed); err != nil {
+		return tenancyv1alpha1.ObservedResourceIdentity{}, false, err
+	}
+	return identityFor(refreshed), false, nil
 }
 
 func upsertTenantIdentity(status *tenancyv1alpha1.TenantStatus, identity tenancyv1alpha1.ObservedResourceIdentity) error {

@@ -60,6 +60,17 @@ func (reconciler *TenantReconciler) reconcileNetwork(ctx context.Context, tenant
 		if err != nil {
 			return ctrl.Result{}, err
 		}
+		for _, desired := range bundle.Objects {
+			identity, changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
+			if err != nil {
+				return ctrl.Result{}, err
+			}
+			if changed || !tenantIdentityPresent(tenant.Status.TenantResources, identity) {
+				return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+					return upsertTenantIdentity(status, identity)
+				})
+			}
+		}
 		ready, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
 		if err != nil {
 			return ctrl.Result{}, err

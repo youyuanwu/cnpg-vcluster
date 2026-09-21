@@ -6,6 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 )
 
@@ -70,4 +74,68 @@ func TestFunctionalEvidenceRequiresExactCategories(t *testing.T) {
 	if err := validateFunctionalEvidence(status, now); err == nil {
 		t.Fatal("failed functional category was accepted")
 	}
+}
+
+func TestPostCNIWorkerStateRetainsDescendantReplacementHistory(t *testing.T) {
+	status := tenancyv1alpha1.TenantStatus{
+		ObservedResources: []tenancyv1alpha1.ObservedResourceIdentity{{
+			APIVersion: postCNIDevMachineGVK.GroupVersion().String(),
+			Kind:       postCNIDevMachineGVK.Kind,
+			Namespace:  "tenant-a",
+			Name:       "worker-old",
+			UID:        "devmachine-old",
+		}},
+		TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
+			APIVersion: postCNINodeGVK.GroupVersion().String(),
+			Kind:       postCNINodeGVK.Kind,
+			Name:       "worker-old",
+			UID:        "node-old",
+		}},
+	}
+	devMachine := workerObject(postCNIDevMachineGVK, "tenant-a", "worker-new", "devmachine-new")
+	node := workerObject(postCNINodeGVK, "", "worker-new", "node-new")
+	state := postCNIWorkerState{
+		devMachines:       []*unstructured.Unstructured{devMachine},
+		nodes:             []*unstructured.Unstructured{node},
+		inventoryComplete: true,
+		snapshotHash:      strings.Repeat("b", 64),
+	}
+	recordPostCNIWorkerState(&status, state)
+
+	if len(status.ObservedResources) != 1 ||
+		len(status.ObservedResources[0].PreviousUIDs) != 1 ||
+		status.ObservedResources[0].PreviousUIDs[0] != "devmachine-old" {
+		t.Fatalf("DevMachine replacement history was not retained: %#v", status.ObservedResources)
+	}
+	if len(status.TenantResources) != 1 ||
+		len(status.TenantResources[0].PreviousUIDs) != 1 ||
+		status.TenantResources[0].PreviousUIDs[0] != "node-old" {
+		t.Fatalf("Node replacement history was not retained: %#v", status.TenantResources)
+	}
+}
+
+func TestPostCNIWorkerSnapshotIncludesProviderDescendants(t *testing.T) {
+	state := postCNIWorkerState{
+		devMachines: []*unstructured.Unstructured{
+			workerObject(postCNIDevMachineGVK, "tenant-a", "worker-a", "devmachine-a"),
+		},
+		nodes: []*unstructured.Unstructured{
+			workerObject(postCNINodeGVK, "", "worker-a", "node-a"),
+		},
+	}
+	first := postCNIWorkerSnapshotHash(state)
+	state.nodes[0].SetUID(types.UID("node-b"))
+	second := postCNIWorkerSnapshotHash(state)
+	if first == second {
+		t.Fatal("Node replacement did not invalidate the worker snapshot")
+	}
+}
+
+func workerObject(gvk schema.GroupVersionKind, namespace, name, uid string) *unstructured.Unstructured {
+	object := &unstructured.Unstructured{}
+	object.SetGroupVersionKind(gvk)
+	object.SetNamespace(namespace)
+	object.SetName(name)
+	object.SetUID(types.UID(uid))
+	return object
 }

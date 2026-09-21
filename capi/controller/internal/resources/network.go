@@ -34,6 +34,7 @@ type NetworkBundle struct {
 	Sources     []*corev1.ConfigMap
 	ResourceSet *unstructured.Unstructured
 	Inventory   map[string]string
+	Objects     []*unstructured.Unstructured
 }
 
 func BuildNetwork(context Context, calico []byte, images NetworkImages) (NetworkBundle, error) {
@@ -96,14 +97,19 @@ func BuildNetwork(context Context, calico []byte, images NetworkImages) (Network
 		context.Tenant.Name+"-network",
 		"network-resource-set",
 		map[string]any{
-			"strategy": "Reconcile",
+			"strategy": "ApplyOnce",
 			"clusterSelector": map[string]any{
 				"matchLabels": map[string]any{"cnpg-vcluster.capi/addons": context.Tenant.Name},
 			},
 			"resources": resourceReferences(inventory),
 		},
 	)
-	return NetworkBundle{Sources: sources, ResourceSet: resourceSet, Inventory: inventory}, nil
+	return NetworkBundle{
+		Sources:     sources,
+		ResourceSet: resourceSet,
+		Inventory:   inventory,
+		Objects:     objects,
+	}, nil
 }
 
 func packageNetworkSources(context Context, baseName, content string) ([]*corev1.ConfigMap, map[string]string, error) {

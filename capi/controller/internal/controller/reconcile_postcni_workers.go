@@ -19,113 +19,156 @@ import (
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
 
+var (
+	postCNIDevMachineGVK = schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta2", Kind: "DevMachine"}
+	postCNINodeGVK       = schema.GroupVersionKind{Version: "v1", Kind: "Node"}
+)
+
+type postCNIWorkerState struct {
+	machines          []*unstructured.Unstructured
+	devMachines       []*unstructured.Unstructured
+	nodes             []*unstructured.Unstructured
+	containers        []DockerContainer
+	inventoryComplete bool
+	allReady          bool
+	snapshotHash      string
+}
+
 func (reconciler *TenantReconciler) reconcilePostCNIWorkers(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
 	if tenant.Status.Stage != tenancyv1alpha1.StageNetworkReady {
 		return reconciler.reconcileStorage(ctx, tenant, canonical, specHash, foundation)
 	}
-	machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
-	if err != nil {
-		if err == errWorkerRuntimePending {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		return ctrl.Result{}, err
-	}
-	if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-	for _, machine := range machines {
-		if !tenantObjectReady(machine) {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-	}
-	devMachines := &unstructured.UnstructuredList{}
-	devMachines.SetGroupVersionKind(schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta2", Kind: "DevMachineList"})
-	if err := reconciler.reader().List(ctx, devMachines, client.InNamespace(tenant.Name), client.MatchingLabels{"cluster.x-k8s.io/cluster-name": tenant.Name}); err != nil {
-		return ctrl.Result{}, err
-	}
-	if len(devMachines.Items) != int(canonical.Workers) {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-	machineByUID := map[string]tenancyv1alpha1.ObservedResourceIdentity{}
-	for _, machine := range machines {
-		identity := identityFor(machine)
-		machineByUID[identity.UID] = identity
-	}
-	for index := range devMachines.Items {
-		item := &devMachines.Items[index]
-		owners := item.GetOwnerReferences()
-		if len(owners) != 1 {
-			return ctrl.Result{}, fmt.Errorf("DevMachine %s owner chain is invalid", item.GetName())
-		}
-		root, present := machineByUID[string(owners[0].UID)]
-		if !present {
-			return ctrl.Result{}, fmt.Errorf("DevMachine %s owner does not match an exact Machine", item.GetName())
-		}
-		if err := validateOwnerChain(ctx, reconciler.reader(), item, root); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
+	state, err := reconciler.observePostCNIWorkerState(ctx, tenant, canonical, specHash, foundation)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	nodes := &unstructured.UnstructuredList{}
-	nodes.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "NodeList"})
-	if err := tenantClient.List(ctx, nodes); err != nil {
-		return ctrl.Result{}, err
-	}
-	if len(nodes.Items) != int(canonical.Workers) {
+	if !state.inventoryComplete || !state.allReady {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	for index := range nodes.Items {
-		if !tenantObjectReady(&nodes.Items[index]) {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-	}
-	snapshot := make([]string, 0, len(machines)+len(devMachines.Items)+len(nodes.Items)+len(containers))
-	for _, machine := range machines {
-		snapshot = append(snapshot, "Machine:"+machine.GetName()+":"+string(machine.GetUID()))
-	}
-	for index := range devMachines.Items {
-		item := &devMachines.Items[index]
-		snapshot = append(snapshot, "DevMachine:"+item.GetName()+":"+string(item.GetUID()))
-	}
-	for index := range nodes.Items {
-		item := &nodes.Items[index]
-		snapshot = append(snapshot, "Node:"+item.GetName()+":"+string(item.GetUID()))
-	}
-	for _, container := range containers {
-		snapshot = append(snapshot, "Container:"+container.Name+":"+container.ID)
-	}
-	sort.Strings(snapshot)
-	encoded, _ := json.Marshal(snapshot)
-	digest := sha256.Sum256(encoded)
 	return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		replaceMachineIdentities(status, machines)
-		for index := range devMachines.Items {
-			if err := upsertIdentity(status, identityFor(&devMachines.Items[index])); err != nil {
-				return err
-			}
-		}
-		status.TenantResources = removeTenantKind(status.TenantResources, "Node")
-		for index := range nodes.Items {
-			if err := upsertTenantIdentity(status, identityFor(&nodes.Items[index])); err != nil {
-				return err
-			}
-		}
-		status.WorkerSnapshotHash = hex.EncodeToString(digest[:])
+		recordPostCNIWorkerState(status, state)
 		status.Stage = tenancyv1alpha1.StagePostCNIWorkersReady
 		setCondition(status, tenant, "WorkersReady", metav1.ConditionTrue, "WorkersReady", "Exact post-CNI workers and Nodes are ready")
 		return nil
 	})
 }
 
-func removeTenantKind(values []tenancyv1alpha1.ObservedResourceIdentity, kind string) []tenancyv1alpha1.ObservedResourceIdentity {
-	result := values[:0]
-	for _, value := range values {
-		if value.Kind != kind {
-			result = append(result, value)
+func (reconciler *TenantReconciler) observePostCNIWorkerState(
+	ctx context.Context,
+	tenant *tenancyv1alpha1.Tenant,
+	canonical validation.CanonicalSpec,
+	specHash string,
+	foundation Foundation,
+) (postCNIWorkerState, error) {
+	state := postCNIWorkerState{}
+	machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
+	if err == errWorkerRuntimePending {
+		return state, nil
+	}
+	if err != nil {
+		return state, err
+	}
+	state.machines = machines
+	state.containers = containers
+	if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
+		return state, nil
+	}
+	machinesReady := true
+	for _, machine := range machines {
+		if !tenantObjectReady(machine) {
+			machinesReady = false
 		}
 	}
-	return result
+	devMachines := &unstructured.UnstructuredList{}
+	devMachines.SetGroupVersionKind(postCNIDevMachineGVK.GroupVersion().WithKind("DevMachineList"))
+	if err := reconciler.reader().List(ctx, devMachines, client.InNamespace(tenant.Name), client.MatchingLabels{"cluster.x-k8s.io/cluster-name": tenant.Name}); err != nil {
+		return state, err
+	}
+	if len(devMachines.Items) != int(canonical.Workers) {
+		return state, nil
+	}
+	machineByUID := map[string]tenancyv1alpha1.ObservedResourceIdentity{}
+	machineNames := map[string]struct{}{}
+	for _, machine := range machines {
+		identity := identityFor(machine)
+		machineByUID[identity.UID] = identity
+		machineNames[identity.Name] = struct{}{}
+	}
+	devMachinesReady := true
+	for index := range devMachines.Items {
+		item := &devMachines.Items[index]
+		item.SetGroupVersionKind(postCNIDevMachineGVK)
+		owners := item.GetOwnerReferences()
+		if len(owners) != 1 {
+			return state, fmt.Errorf("DevMachine %s owner chain is invalid", item.GetName())
+		}
+		root, present := machineByUID[string(owners[0].UID)]
+		if !present {
+			return state, fmt.Errorf("DevMachine %s owner does not match an exact Machine", item.GetName())
+		}
+		if item.GetName() != root.Name {
+			return state, fmt.Errorf("DevMachine %s name does not match its exact Machine %s", item.GetName(), root.Name)
+		}
+		if err := validateOwnerChain(ctx, reconciler.reader(), item, root); err != nil {
+			return state, err
+		}
+		if !tenantObjectReady(item) {
+			devMachinesReady = false
+		}
+		state.devMachines = append(state.devMachines, item.DeepCopy())
+	}
+	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
+	if err != nil {
+		return state, err
+	}
+	nodes := &unstructured.UnstructuredList{}
+	nodes.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "NodeList"})
+	if err := tenantClient.List(ctx, nodes); err != nil {
+		return state, err
+	}
+	if len(nodes.Items) != int(canonical.Workers) {
+		return state, nil
+	}
+	nodesReady := true
+	for index := range nodes.Items {
+		nodes.Items[index].SetGroupVersionKind(postCNINodeGVK)
+		if _, expected := machineNames[nodes.Items[index].GetName()]; !expected {
+			return state, fmt.Errorf("Node %s has no exact Machine", nodes.Items[index].GetName())
+		}
+		if !tenantObjectReady(&nodes.Items[index]) {
+			nodesReady = false
+		}
+		state.nodes = append(state.nodes, nodes.Items[index].DeepCopy())
+	}
+	state.inventoryComplete = true
+	state.allReady = machinesReady && devMachinesReady && nodesReady
+	state.snapshotHash = postCNIWorkerSnapshotHash(state)
+	return state, nil
+}
+
+func postCNIWorkerSnapshotHash(state postCNIWorkerState) string {
+	snapshot := make([]string, 0, len(state.machines)+len(state.devMachines)+len(state.nodes)+len(state.containers))
+	for _, machine := range state.machines {
+		snapshot = append(snapshot, "Machine:"+machine.GetName()+":"+string(machine.GetUID()))
+	}
+	for _, devMachine := range state.devMachines {
+		snapshot = append(snapshot, "DevMachine:"+devMachine.GetName()+":"+string(devMachine.GetUID()))
+	}
+	for _, node := range state.nodes {
+		snapshot = append(snapshot, "Node:"+node.GetName()+":"+string(node.GetUID()))
+	}
+	for _, container := range state.containers {
+		snapshot = append(snapshot, "Container:"+container.Name+":"+container.ID)
+	}
+	sort.Strings(snapshot)
+	encoded, _ := json.Marshal(snapshot)
+	digest := sha256.Sum256(encoded)
+	return hex.EncodeToString(digest[:])
+}
+
+func recordPostCNIWorkerState(status *tenancyv1alpha1.TenantStatus, state postCNIWorkerState) {
+	replaceMachineIdentities(status, state.machines)
+	status.ObservedResources = replaceResourceIdentities(status.ObservedResources, postCNIDevMachineGVK, state.devMachines)
+	status.TenantResources = replaceResourceIdentities(status.TenantResources, postCNINodeGVK, state.nodes)
+	status.WorkerSnapshotHash = state.snapshotHash
 }

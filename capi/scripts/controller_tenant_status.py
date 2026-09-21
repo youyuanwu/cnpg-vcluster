@@ -88,7 +88,7 @@ def evaluate_tenant(
         verified = float(verified_at)
         if verified > current_time:
             blockers.append("functional evidence is future-dated")
-        elif current_time - verified > MAX_EVIDENCE_AGE_SECONDS:
+        elif current_time - verified >= MAX_EVIDENCE_AGE_SECONDS:
             blockers.append(
                 f"functional evidence is stale by {current_time - verified - MAX_EVIDENCE_AGE_SECONDS:.0f}s"
             )
@@ -176,9 +176,11 @@ def observations_hash(
     if not isinstance(value, list) or not value:
         raise ValueError("observedResources must be a non-empty list")
     if tenant_value is None:
-        tenant_value = []
-    if not isinstance(tenant_value, list):
-        raise ValueError("tenantResources must be a list")
+        raise ValueError("tenantResources must be a non-empty list")
+    if not isinstance(tenant_value, list) or not tenant_value:
+        raise ValueError("tenantResources must be a non-empty list")
+    if not isinstance(worker_snapshot, str) or not worker_snapshot:
+        raise ValueError("workerSnapshotHash must be a non-empty string")
     normalized = []
     for item in [*value, *tenant_value]:
         if not isinstance(item, dict):
@@ -205,20 +207,17 @@ def observations_hash(
                 ),
             }
         )
-    if worker_snapshot is not None:
-        if not isinstance(worker_snapshot, str) or not worker_snapshot:
-            raise ValueError("workerSnapshotHash must be a non-empty string")
-        normalized.append(
-            {
-                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
-                "kind": "WorkerSnapshot",
-                "namespace": "",
-                "name": "workers",
-                "uid": worker_snapshot,
-                "contentSHA256": "",
-                "previousUIDs": [],
-            }
-        )
+    normalized.append(
+        {
+            "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+            "kind": "WorkerSnapshot",
+            "namespace": "",
+            "name": "workers",
+            "uid": worker_snapshot,
+            "contentSHA256": "",
+            "previousUIDs": [],
+        }
+    )
     normalized.sort(
         key=lambda item: (
             item["apiVersion"],

@@ -160,6 +160,25 @@ func TestTenantResourceCleanupFailsClosedOnTenantAPIErrors(t *testing.T) {
 	}
 }
 
+func TestTenantDeletePriorityHonorsControllerAndStorageDependencies(t *testing.T) {
+	kinds := []string{
+		"Cluster",
+		"Deployment",
+		"Pod",
+		"PersistentVolumeClaim",
+		"PersistentVolume",
+		"StorageClass",
+		"ClusterRole",
+		"CustomResourceDefinition",
+		"Namespace",
+	}
+	for index := 1; index < len(kinds); index++ {
+		if tenantDeletePriority(kinds[index-1]) >= tenantDeletePriority(kinds[index]) {
+			t.Fatalf("delete priority does not order %s before %s", kinds[index-1], kinds[index])
+		}
+	}
+}
+
 func TestDeletionPreflightRejectsForeignVolumeBeforeTenantAPIMutation(t *testing.T) {
 	scheme := testScheme(t)
 	foundation := testFoundation()

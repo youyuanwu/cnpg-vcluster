@@ -38,6 +38,15 @@ def tenant_document(*, now: float = 10_000.0) -> dict[str, object]:
                     "uid": "cluster-uid",
                 }
             ],
+            "tenantResources": [
+                {
+                    "apiVersion": "v1",
+                    "kind": "Node",
+                    "name": "worker-a",
+                    "uid": "node-uid",
+                }
+            ],
+            "workerSnapshotHash": "a" * 64,
             "conditions": [
                 {
                     "type": "Ready",
@@ -56,7 +65,11 @@ def tenant_document(*, now: float = 10_000.0) -> dict[str, object]:
         },
     }
     spec_hash = canonical_spec_hash(document["spec"])
-    observed_hash = observations_hash(document["status"]["observedResources"])
+    observed_hash = observations_hash(
+        document["status"]["observedResources"],
+        document["status"]["tenantResources"],
+        document["status"]["workerSnapshotHash"],
+    )
     document["status"]["specHash"] = spec_hash
     document["status"]["observationsHash"] = observed_hash
     document["status"]["functionalEvidence"]["specHash"] = spec_hash
@@ -81,13 +94,29 @@ class ControllerTenantStatusTests(unittest.TestCase):
         self.assertEqual([], result["blockers"])
 
     def test_stale_evidence_is_rejected_without_controller_mutation(self) -> None:
-        result = evaluate_tenant(
-            tenant_document(),
-            foundation_hash="foundation",
-            now=10_000.0 + MAX_EVIDENCE_AGE_SECONDS + 1,
-        )
-        self.assertEqual("degraded", result["classification"])
-        self.assertTrue(any("stale" in blocker for blocker in result["blockers"]))
+        for age in (MAX_EVIDENCE_AGE_SECONDS, MAX_EVIDENCE_AGE_SECONDS + 1):
+            with self.subTest(age=age):
+                result = evaluate_tenant(
+                    tenant_document(),
+                    foundation_hash="foundation",
+                    now=10_000.0 + age,
+                )
+                self.assertEqual("degraded", result["classification"])
+                self.assertTrue(
+                    any("stale" in blocker for blocker in result["blockers"])
+                )
+
+    def test_phase_three_worker_identities_are_required(self) -> None:
+        for missing in ("tenantResources", "workerSnapshotHash"):
+            with self.subTest(missing=missing):
+                document = tenant_document()
+                document["status"].pop(missing)
+                result = evaluate_tenant(
+                    document,
+                    foundation_hash="foundation",
+                    now=10_001.0,
+                )
+                self.assertNotEqual("ready", result["classification"])
 
     def test_future_non_finite_and_inconsistent_expiry_fail_closed(self) -> None:
         for verified_at, expires_at in (

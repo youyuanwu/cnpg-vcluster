@@ -22,19 +22,26 @@ const functionalEvidenceLifetime = 24 * time.Hour
 func (reconciler *TenantReconciler) reconcileReadiness(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
 	now := time.Now().UTC()
 	if tenant.Status.Stage == tenancyv1alpha1.StageReady {
-		machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
+		state, err := reconciler.observePostCNIWorkerState(ctx, tenant, canonical, specHash, foundation)
 		if err != nil {
-			if err == errWorkerRuntimePending {
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
 			return ctrl.Result{}, err
 		}
-		evidence := normalizeWorkerEvidence(tenant.Status.WorkerContainers, containers, foundation.Cache.Generation)
-		if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) ||
-			!allWorkerEvidencePrepared(evidence) || !machineInventoryMatches(tenant.Status, machines) {
+		evidence := normalizeWorkerEvidence(tenant.Status.WorkerContainers, state.containers, foundation.Cache.Generation)
+		if !state.inventoryComplete || !state.allReady ||
+			state.snapshotHash != tenant.Status.WorkerSnapshotHash ||
+			!allWorkerEvidencePrepared(evidence) {
 			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				status.WorkerContainers = evidence
-				replaceMachineIdentities(status, machines)
+				if len(state.containers) == int(canonical.Workers) {
+					status.WorkerContainers = evidence
+				}
+				if len(state.machines) == int(canonical.Workers) {
+					replaceMachineIdentities(status, state.machines)
+				}
+				if state.inventoryComplete {
+					recordPostCNIWorkerState(status, state)
+				} else {
+					status.WorkerSnapshotHash = ""
+				}
 				status.Stage = tenancyv1alpha1.StageMachineDeploymentCreated
 				status.Phase = tenancyv1alpha1.PhaseProgressing
 				status.FunctionalEvidence = nil

@@ -533,10 +533,18 @@ func allWorkerEvidencePrepared(values []tenancyv1alpha1.WorkerContainerEvidence)
 }
 
 func replaceMachineIdentities(status *tenancyv1alpha1.TenantStatus, machines []*unstructured.Unstructured) {
+	status.ObservedResources = replaceResourceIdentities(status.ObservedResources, machineGVK, machines)
+}
+
+func replaceResourceIdentities(
+	values []tenancyv1alpha1.ObservedResourceIdentity,
+	gvk schema.GroupVersionKind,
+	objects []*unstructured.Unstructured,
+) []tenancyv1alpha1.ObservedResourceIdentity {
 	previous := make([]tenancyv1alpha1.ObservedResourceIdentity, 0)
-	retained := make([]tenancyv1alpha1.ObservedResourceIdentity, 0, len(status.ObservedResources))
-	for _, identity := range status.ObservedResources {
-		if identity.Kind == machineGVK.Kind && identity.APIVersion == machineGVK.GroupVersion().String() {
+	retained := make([]tenancyv1alpha1.ObservedResourceIdentity, 0, len(values))
+	for _, identity := range values {
+		if identity.Kind == gvk.Kind && identity.APIVersion == gvk.GroupVersion().String() {
 			previous = append(previous, identity)
 			continue
 		}
@@ -548,8 +556,8 @@ func replaceMachineIdentities(status *tenancyv1alpha1.TenantStatus, machines []*
 	for _, identity := range previous {
 		previousByName[identity.Name] = identity
 	}
-	for _, machine := range machines {
-		currentNames[machine.GetName()] = struct{}{}
+	for _, object := range objects {
+		currentNames[object.GetName()] = struct{}{}
 	}
 	removed := make([]tenancyv1alpha1.ObservedResourceIdentity, 0)
 	for _, identity := range previous {
@@ -557,10 +565,10 @@ func replaceMachineIdentities(status *tenancyv1alpha1.TenantStatus, machines []*
 			removed = append(removed, identity)
 		}
 	}
-	current := make([]tenancyv1alpha1.ObservedResourceIdentity, 0, len(machines))
+	current := make([]tenancyv1alpha1.ObservedResourceIdentity, 0, len(objects))
 	newIndexes := make([]int, 0)
-	for _, machine := range machines {
-		identity := identityFor(machine)
+	for _, object := range objects {
+		identity := identityFor(object)
 		if old, present := previousByName[identity.Name]; present {
 			identity.PreviousUIDs = append(identity.PreviousUIDs, old.PreviousUIDs...)
 			if old.UID != identity.UID {
@@ -583,29 +591,12 @@ func replaceMachineIdentities(status *tenancyv1alpha1.TenantStatus, machines []*
 		}
 		sort.Strings(current[currentIndex].PreviousUIDs)
 	}
-	status.ObservedResources = append(retained, current...)
-	sort.Slice(status.ObservedResources, func(left, right int) bool {
-		a := status.ObservedResources[left]
-		b := status.ObservedResources[right]
+	result := append(retained, current...)
+	sort.Slice(result, func(left, right int) bool {
+		a := result[left]
+		b := result[right]
 		return a.APIVersion+"/"+a.Kind+"/"+a.Namespace+"/"+a.Name <
 			b.APIVersion+"/"+b.Kind+"/"+b.Namespace+"/"+b.Name
 	})
-}
-
-func machineInventoryMatches(status tenancyv1alpha1.TenantStatus, machines []*unstructured.Unstructured) bool {
-	expected := map[string]string{}
-	for _, identity := range status.ObservedResources {
-		if identity.Kind == machineGVK.Kind && identity.APIVersion == machineGVK.GroupVersion().String() {
-			expected[identity.Name] = identity.UID
-		}
-	}
-	if len(expected) != len(machines) {
-		return false
-	}
-	for _, machine := range machines {
-		if expected[machine.GetName()] != string(machine.GetUID()) {
-			return false
-		}
-	}
-	return true
+	return result
 }
