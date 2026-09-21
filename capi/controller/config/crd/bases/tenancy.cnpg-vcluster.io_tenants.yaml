@@ -140,6 +140,24 @@ spec:
                   - type
                   type: object
                 type: array
+              dockerVolume:
+                properties:
+                  createdAt:
+                    type: string
+                  labels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                  mountpoint:
+                    type: string
+                  name:
+                    type: string
+                required:
+                - createdAt
+                - labels
+                - mountpoint
+                - name
+                type: object
               endpoint:
                 type: string
               foundationHash:
@@ -209,6 +227,8 @@ spec:
                 type: string
               specHash:
                 type: string
+              stage:
+                type: string
               survivorSnapshots:
                 items:
                   properties:
@@ -241,6 +261,24 @@ spec:
                   reservation:
                     type: string
                 type: object
+              workerContainers:
+                items:
+                  properties:
+                    cacheGeneration:
+                      type: string
+                    id:
+                      type: string
+                    name:
+                      type: string
+                    prepared:
+                      type: boolean
+                  required:
+                  - cacheGeneration
+                  - id
+                  - name
+                  - prepared
+                  type: object
+                type: array
             type: object
         required:
         - spec

@@ -15,6 +15,23 @@ const (
 // +kubebuilder:validation:Enum=Pending;Progressing;Ready;Deleting;Degraded;Failed;OwnershipInvalid
 type TenantPhase string
 
+const (
+	StageEndpointAllocated         = "EndpointAllocated"
+	StageNamespaceCreated          = "NamespaceCreated"
+	StageClusterCreationAuthorized = "ClusterCreationAuthorized"
+	StageClusterCreated            = "ClusterCreated"
+	StageDevClusterCreated         = "DevClusterCreated"
+	StageControlPlaneCreated       = "ControlPlaneCreated"
+	StageKubeconfigReady           = "KubeconfigReady"
+	StageTenantAPICleanupRequired  = "TenantAPICleanupRequired"
+	StageBootstrapRBACApplied      = "BootstrapRBACApplied"
+	StageVolumeCreated             = "VolumeCreated"
+	StageKubeadmTemplateCreated    = "KubeadmTemplateCreated"
+	StageMachineTemplateCreated    = "MachineTemplateCreated"
+	StageMachineDeploymentCreated  = "MachineDeploymentCreated"
+	StageWorkersApplied            = "WorkersApplied"
+)
+
 type TenantSpec struct {
 	// +kubebuilder:validation:Pattern=`^v?[0-9]+\.[0-9]+\.[0-9]+$`
 	KubernetesVersion string `json:"kubernetesVersion"`
@@ -50,6 +67,20 @@ type FunctionalEvidence struct {
 	Categories       map[string]bool `json:"categories"`
 }
 
+type DockerVolumeIdentity struct {
+	Name       string            `json:"name"`
+	CreatedAt  string            `json:"createdAt"`
+	Mountpoint string            `json:"mountpoint"`
+	Labels     map[string]string `json:"labels"`
+}
+
+type WorkerContainerEvidence struct {
+	Name            string `json:"name"`
+	ID              string `json:"id"`
+	CacheGeneration string `json:"cacheGeneration"`
+	Prepared        bool   `json:"prepared"`
+}
+
 type TeardownStatus struct {
 	Phase       string `json:"phase,omitempty"`
 	Authority   string `json:"authority,omitempty"`
@@ -68,13 +99,16 @@ type SurvivorSnapshot struct {
 type TenantStatus struct {
 	ObservedGeneration int64                      `json:"observedGeneration,omitempty"`
 	Phase              TenantPhase                `json:"phase,omitempty"`
+	Stage              string                     `json:"stage,omitempty"`
 	Conditions         []metav1.Condition         `json:"conditions,omitempty"`
 	Endpoint           string                     `json:"endpoint,omitempty"`
 	SpecHash           string                     `json:"specHash,omitempty"`
 	FoundationHash     string                     `json:"foundationHash,omitempty"`
 	ObservationsHash   string                     `json:"observationsHash,omitempty"`
 	ObservedResources  []ObservedResourceIdentity `json:"observedResources,omitempty"`
-	SurvivorSnapshots  []SurvivorSnapshot          `json:"survivorSnapshots,omitempty"`
+	DockerVolume       *DockerVolumeIdentity      `json:"dockerVolume,omitempty"`
+	WorkerContainers   []WorkerContainerEvidence  `json:"workerContainers,omitempty"`
+	SurvivorSnapshots  []SurvivorSnapshot         `json:"survivorSnapshots,omitempty"`
 	FunctionalEvidence *FunctionalEvidence        `json:"functionalEvidence,omitempty"`
 	Teardown           *TeardownStatus            `json:"teardown,omitempty"`
 }

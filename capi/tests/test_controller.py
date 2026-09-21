@@ -15,6 +15,7 @@ from scripts.lib.controller import (
     build_controller_image,
     controller_source_digest,
     delete_controller,
+    set_controller_mutation,
 )
 from scripts.lib.ownership import IdentityRecord
 
@@ -30,6 +31,9 @@ class FakeManagementClient:
         if kwargs.get("check", True) and response.returncode != 0:
             raise RuntimeError(response.stderr or response.stdout)
         return response
+
+    def json(self, *arguments):
+        return json.loads(self.kubectl(*arguments, "-o", "json").stdout)
 
 
 class ControllerIntegrationUnitTests(unittest.TestCase):
@@ -202,19 +206,35 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 generation=generation,
                 inventory={
                     "imageArchives": [
-                        {"key": "IMAGE", "sha256": "archive-sha"}
+                        {
+                            "key": "IMAGE",
+                            "path": "images/image.tar",
+                            "sha256": "a" * 64,
+                        }
                     ]
                 },
-                state_sha256="cache-sha",
+                state_sha256="b" * 64,
             )
             config = {
                 "GO_VERSION": "1.27.1",
                 "KUBERNETES_VERSION": "v1.36.4",
+                "CAPI_VERSION": "v1.14.1",
+                "KAMAJI_CAPI_VERSION": "v0.20.0",
                 "CONTROLLER_RUNTIME_VERSION": "v0.24.1",
                 "CONTROLLER_TOOLS_VERSION": "v0.21.0",
                 "CAPI_CONTRACT": "v1beta2",
                 "KAMAJI_CAPI_CONTRACT": "v1beta2",
                 "MANAGEMENT_POD_CIDR": "10.0.0.0/16",
+                "IMAGE": "example/image:v1@sha256:" + "c" * 64,
+                "IMAGE_TAGGED": "example/image:v1",
+                "OWNERSHIP_LABEL": "example.io/owned",
+                "LAB_PREFIX": "example",
+                "SPIKE_API_PORT": "6443",
+                "SPIKE_CLUSTER_DOMAIN": "example.local",
+                "KIND_NODE_IMAGE": "kindest/node:v1@sha256:" + "d" * 64,
+                "SPIKE_STORAGE_CONTAINER_PATH": "/var/lib/example",
+                "KONNECTIVITY_SERVER_IMAGE": "example/server:v1@sha256:" + "e" * 64,
+                "KONNECTIVITY_AGENT_IMAGE": "example/agent:v1@sha256:" + "f" * 64,
             }
             network = {
                 "network_id": "network-id",
@@ -231,7 +251,10 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 kind="container",
                 name="management",
                 identifier="container-id",
-                labels={},
+                labels={
+                    "io.x-k8s.kind.cluster": "management",
+                    "io.x-k8s.kind.role": "control-plane",
+                },
             )
             with patch(
                 "scripts.lib.controller.require_management_ownership",
@@ -250,6 +273,12 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             self.assertEqual("172.18.0.10", data["registry"]["address"])
             self.assertIn("172.18.0.0/16", data["allowedSubnets"])
             self.assertEqual("v0.24.1", data["versions"]["CONTROLLER_RUNTIME_VERSION"])
+            self.assertEqual("images/image.tar", data["cache"]["imageArchives"][0]["path"])
+            self.assertEqual(
+                "docker.io/example/image:v1",
+                data["cache"]["imageArchives"][0]["tagged"],
+            )
+            self.assertEqual("/var/lib/example", data["inputs"]["storageContainerPath"])
 
     def test_private_apply_uses_all_lifecycle_locks(self) -> None:
         calls = []
@@ -279,4 +308,63 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 "exit-e2e",
             ],
             calls,
+        )
+
+    def test_temporary_mutation_updates_foundation_before_manager(self) -> None:
+        foundation = json.dumps(
+            {"schema": 2, "mutationEnabled": False},
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": [
+                                    "--leader-elect=true",
+                                    "--mutation-enabled=false",
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        client = FakeManagementClient(
+            [
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps(
+                        {"data": {"foundation.json": foundation}}
+                    ),
+                    stderr="",
+                ),
+                CompletedProcess([], 0, stdout=json.dumps(deployment), stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+            ]
+        )
+        set_controller_mutation(
+            {
+                "CONDITION_TIMEOUT": "1s",
+                "KUBERNETES_VERSION": "v1.36.4",
+            },
+            client,
+            enabled=True,
+        )
+        arguments = [call[0] for call in client.calls]
+        self.assertIn("configmap/tenant-foundation", arguments[2])
+        self.assertIn("deployment/tenant-controller", arguments[3])
+        deployment_patch = json.loads(
+            client.calls[3][0][client.calls[3][0].index("-p") + 1]
+        )
+        self.assertIn(
+            "--mutation-enabled=true",
+            deployment_patch["spec"]["template"]["spec"]["containers"][0]["args"],
         )

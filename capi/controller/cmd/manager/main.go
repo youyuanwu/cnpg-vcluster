@@ -57,6 +57,8 @@ func main() {
 	must(err)
 	must((&tenantcontroller.TenantReconciler{
 		Client:           manager.GetClient(),
+		APIReader:        manager.GetAPIReader(),
+		Docker:           tenantcontroller.NewDockerClient("/var/run/docker.sock"),
 		SupportedVersion: supportedVersion,
 		MutationEnabled:  mutationEnabled,
 	}).SetupWithManager(manager))

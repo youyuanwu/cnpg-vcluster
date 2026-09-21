@@ -1,0 +1,154 @@
+package controller
+
+import (
+	"bytes"
+	"context"
+	"errors"
+	"fmt"
+	"net/url"
+	"time"
+
+	corev1 "k8s.io/api/core/v1"
+	rbacv1 "k8s.io/api/rbac/v1"
+	"k8s.io/apimachinery/pkg/api/equality"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/client-go/tools/clientcmd"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
+)
+
+var errTenantAdministrativeAccessPending = errors.New("Tenant administrative access is pending")
+
+type TenantClientFactory interface {
+	ClientFor([]byte, string) (client.Client, error)
+}
+
+type tenantClientFactory struct{}
+
+func (tenantClientFactory) ClientFor(kubeconfig []byte, endpoint string) (client.Client, error) {
+	configuration, err := clientcmd.Load(kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("decode Tenant kubeconfig: %w", err)
+	}
+	current := configuration.Contexts[configuration.CurrentContext]
+	if current == nil || current.Cluster == "" || current.AuthInfo == "" {
+		return nil, fmt.Errorf("Tenant kubeconfig current context is incomplete")
+	}
+	cluster := configuration.Clusters[current.Cluster]
+	auth := configuration.AuthInfos[current.AuthInfo]
+	if cluster == nil || auth == nil || len(cluster.CertificateAuthorityData) == 0 {
+		return nil, fmt.Errorf("Tenant kubeconfig cluster or CA data is incomplete")
+	}
+	server, err := url.Parse(cluster.Server)
+	if err != nil || server.Scheme != "https" || server.Host != endpoint || server.Path != "" {
+		return nil, fmt.Errorf("Tenant kubeconfig endpoint does not match the allocated endpoint")
+	}
+	if len(auth.ClientCertificateData) == 0 || len(auth.ClientKeyData) == 0 {
+		return nil, fmt.Errorf("Tenant kubeconfig client credentials are incomplete")
+	}
+	restConfig, err := clientcmd.RESTConfigFromKubeConfig(kubeconfig)
+	if err != nil {
+		return nil, fmt.Errorf("build Tenant REST configuration: %w", err)
+	}
+	restConfig.Timeout = 30 * time.Second
+	scheme := runtime.NewScheme()
+	if err := corev1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	if err := rbacv1.AddToScheme(scheme); err != nil {
+		return nil, err
+	}
+	return client.New(restConfig, client.Options{Scheme: scheme})
+}
+
+func tenantClientFromSecret(ctx context.Context, reader client.Reader, factory TenantClientFactory, namespace, tenantName, endpoint string) (client.Client, *corev1.Secret, error) {
+	var secret corev1.Secret
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: tenantName + "-kubeconfig"}, &secret); err != nil {
+		return nil, nil, err
+	}
+	if secret.Type != corev1.SecretType("cluster.x-k8s.io/secret") {
+		return nil, nil, fmt.Errorf("Tenant kubeconfig Secret type is unexpected")
+	}
+	value := secret.Data["value"]
+	if len(value) == 0 {
+		return nil, nil, fmt.Errorf("Tenant kubeconfig Secret has no value")
+	}
+	tenantClient, err := factory.ClientFor(bytes.Clone(value), endpoint)
+	if err != nil {
+		return nil, nil, err
+	}
+	return tenantClient, &secret, nil
+}
+
+func applyBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
+	for _, raw := range resources.BootstrapRBAC() {
+		object := raw.(client.Object)
+		current := object.DeepCopyObject().(client.Object)
+		key := client.ObjectKeyFromObject(object)
+		err := tenantClient.Get(ctx, key, current)
+		if apierrors.IsForbidden(err) {
+			return errTenantAdministrativeAccessPending
+		}
+		if apierrors.IsNotFound(err) {
+			if err := tenantClient.Create(ctx, object); err != nil {
+				if apierrors.IsForbidden(err) {
+					return errTenantAdministrativeAccessPending
+				}
+				return fmt.Errorf("create Tenant bootstrap %T: %w", object, err)
+			}
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("read Tenant bootstrap %T: %w", object, err)
+		}
+		switch desired := object.(type) {
+		case *rbacv1.Role:
+			existing := current.(*rbacv1.Role)
+			if !equality.Semantic.DeepEqual(existing.Rules, desired.Rules) {
+				desired.ResourceVersion = existing.ResourceVersion
+				if err := tenantClient.Update(ctx, desired); err != nil {
+					if apierrors.IsForbidden(err) {
+						return errTenantAdministrativeAccessPending
+					}
+					return fmt.Errorf("update Tenant bootstrap Role %s: %w", desired.Name, err)
+				}
+			}
+		case *rbacv1.RoleBinding:
+			existing := current.(*rbacv1.RoleBinding)
+			if !equality.Semantic.DeepEqual(existing.RoleRef, desired.RoleRef) ||
+				!equality.Semantic.DeepEqual(existing.Subjects, desired.Subjects) {
+				desired.ResourceVersion = existing.ResourceVersion
+				if err := tenantClient.Update(ctx, desired); err != nil {
+					if apierrors.IsForbidden(err) {
+						return errTenantAdministrativeAccessPending
+					}
+					return fmt.Errorf("update Tenant bootstrap RoleBinding %s: %w", desired.Name, err)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func deleteBootstrapRBAC(ctx context.Context, tenantClient client.Client) (bool, error) {
+	for _, raw := range resources.BootstrapRBAC() {
+		object := raw.(client.Object)
+		key := client.ObjectKeyFromObject(object)
+		current := object.DeepCopyObject().(client.Object)
+		err := tenantClient.Get(ctx, key, current)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return false, fmt.Errorf("inspect Tenant bootstrap RBAC: %w", err)
+		}
+		if err := tenantClient.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+			return false, fmt.Errorf("delete Tenant bootstrap RBAC: %w", err)
+		}
+		return false, nil
+	}
+	return true, nil
+}

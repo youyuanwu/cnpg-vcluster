@@ -7,8 +7,10 @@ import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+from scripts.cache import canonical_tagged
 from scripts.lib.config import parse_duration
 from scripts.lib.files import ensure_private_dir, write_private_file
+from scripts.lib.images import WORKER_IMAGE_KEYS
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.management import require_management_ownership
 from scripts.lib.process import run
@@ -224,13 +226,21 @@ def _foundation_payload(
     archives = [
         {
             "key": entry["key"],
+            "path": entry["path"],
             "sha256": entry["sha256"],
+            "reference": config[entry["key"]],
+            "tagged": canonical_tagged(config[f"{entry['key']}_TAGGED"]),
+            "worker": entry["key"] in WORKER_IMAGE_KEYS,
         }
         for entry in verified_cache.inventory["imageArchives"]
     ]
     data = {
-        "schema": 1,
+        "schema": 2,
         "managementContainerId": identity.identifier,
+        "managementContainerLabels": {
+            **identity.labels,
+            "io.x-k8s.kind.role": "control-plane",
+        },
         "networkId": network["network_id"],
         "subnet": network["subnet"],
         "poolStart": network["pool_start"],
@@ -240,6 +250,7 @@ def _foundation_payload(
         "kubernetesVersion": config["KUBERNETES_VERSION"],
         "controllerImage": image,
         "mutationEnabled": False,
+        "offlineEnforced": os.environ.get("CAPI_OFFLINE_ENFORCED") == "1",
         "versions": versions,
         "cache": {
             "generation": verified_cache.generation.name,
@@ -256,6 +267,18 @@ def _foundation_payload(
             if registry is not None
             else None
         ),
+        "inputs": {
+            "ownershipLabel": config["OWNERSHIP_LABEL"],
+            "labPrefix": config["LAB_PREFIX"],
+            "apiPort": int(config["SPIKE_API_PORT"]),
+            "clusterDomain": config["SPIKE_CLUSTER_DOMAIN"],
+            "nodeImage": config["KIND_NODE_IMAGE"],
+            "cacheHostPath": str(root / ".tools" / "cache"),
+            "cacheContainerPath": "/var/lib/capi-image-cache",
+            "storageContainerPath": config["SPIKE_STORAGE_CONTAINER_PATH"],
+            "konnectivityServerImage": config["KONNECTIVITY_SERVER_IMAGE"],
+            "konnectivityAgentImage": config["KONNECTIVITY_AGENT_IMAGE"],
+        },
     }
     encoded = json.dumps(data, sort_keys=True, separators=(",", ":"))
     return {
@@ -270,6 +293,131 @@ def _foundation_payload(
             "foundation.sha256": hashlib.sha256(encoded.encode()).hexdigest(),
         },
     }
+
+
+def set_controller_mutation(
+    config: dict[str, str],
+    client: ManagementClient,
+    *,
+    enabled: bool,
+) -> None:
+    foundation = client.json(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "get",
+        "configmap/tenant-foundation",
+    )
+    encoded = foundation["data"]["foundation.json"]
+    data = json.loads(encoded)
+    data["mutationEnabled"] = enabled
+    updated = json.dumps(data, sort_keys=True, separators=(",", ":"))
+    patch = {
+        "data": {
+            "foundation.json": updated,
+            "foundation.sha256": hashlib.sha256(updated.encode()).hexdigest(),
+        }
+    }
+    argument = f"--mutation-enabled={'true' if enabled else 'false'}"
+    deployment = client.json(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "get",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+    )
+    containers = deployment["spec"]["template"]["spec"]["containers"]
+    manager = next(
+        (item for item in containers if item.get("name") == "manager"),
+        None,
+    )
+    if manager is None:
+        raise RuntimeError("Tenant controller manager container is missing")
+    args = [
+        argument if value.startswith("--mutation-enabled=") else value
+        for value in manager.get("args", [])
+    ]
+    if not any(value.startswith("--mutation-enabled=") for value in args):
+        raise RuntimeError("Tenant controller mutation argument is missing")
+    deployment_patch = {
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [
+                        {
+                            "name": "manager",
+                            "args": args,
+                        }
+                    ]
+                }
+            }
+        }
+    }
+    if enabled:
+        client.kubectl(
+            "-n",
+            CONTROLLER_NAMESPACE,
+            "patch",
+            "configmap/tenant-foundation",
+            "--type=merge",
+            "-p",
+            json.dumps(patch),
+        )
+    client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "patch",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        "--type=strategic",
+        "-p",
+        json.dumps(deployment_patch),
+    )
+    client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "rollout",
+        "status",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        f"--timeout={config['CONDITION_TIMEOUT']}",
+    )
+    probe = {
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+        "kind": "Tenant",
+        "metadata": {"name": "mutation-ready-probe"},
+        "spec": {
+            "kubernetesVersion": config["KUBERNETES_VERSION"].removeprefix("v"),
+            "workers": 1,
+            "databaseCount": 1,
+            "podCIDR": "10.252.0.0/16",
+            "serviceCIDR": "10.253.0.0/16",
+        },
+    }
+
+    def webhook_ready() -> bool | None:
+        result = client.kubectl(
+            "create",
+            "--dry-run=server",
+            "-f",
+            "-",
+            input_text=json.dumps(probe),
+            check=False,
+        )
+        return True if result.returncode == 0 else None
+
+    wait_for(
+        "Tenant webhook readiness after mutation mode change",
+        parse_duration(config["CONDITION_TIMEOUT"]),
+        2,
+        webhook_ready,
+    )
+    if not enabled:
+        client.kubectl(
+            "-n",
+            CONTROLLER_NAMESPACE,
+            "patch",
+            "configmap/tenant-foundation",
+            "--type=merge",
+            "-p",
+            json.dumps(patch),
+        )
 
 
 def reconcile_controller(
