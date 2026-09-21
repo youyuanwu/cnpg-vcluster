@@ -77,6 +77,7 @@ func TestWorkerEvidenceReplacementRetiresStaleNames(t *testing.T) {
 		{Name: "worker-a", ID: "container-a", CacheGeneration: "generation", Prepared: true},
 		{Name: "worker-b", ID: "container-b", CacheGeneration: "generation", Prepared: true},
 	}
+
 	containers := []DockerContainer{
 		{Name: "worker-b", ID: "container-b"},
 		{Name: "worker-c", ID: "container-c"},
@@ -88,5 +89,25 @@ func TestWorkerEvidenceReplacementRetiresStaleNames(t *testing.T) {
 		normalized[1].PreviousIDs[0] != "container-a" ||
 		normalized[1].Prepared {
 		t.Fatalf("worker replacement evidence is invalid: %#v", normalized)
+	}
+}
+
+func TestWorkerReplacementDoesNotReassignUnpreparedSurvivorHistory(t *testing.T) {
+	values := []tenancyv1alpha1.WorkerContainerEvidence{
+		{Name: "worker-a", ID: "container-a", CacheGeneration: "generation", Prepared: false},
+		{Name: "worker-b", ID: "container-b", CacheGeneration: "generation", Prepared: true},
+	}
+	containers := []DockerContainer{
+		{Name: "worker-a", ID: "container-a"},
+		{Name: "worker-c", ID: "container-c"},
+	}
+	normalized := normalizeWorkerEvidence(values, containers, "generation")
+	if len(normalized) != 2 ||
+		normalized[0].Name != "worker-a" ||
+		len(normalized[0].PreviousIDs) != 0 ||
+		normalized[1].Name != "worker-c" ||
+		len(normalized[1].PreviousIDs) != 1 ||
+		normalized[1].PreviousIDs[0] != "container-b" {
+		t.Fatalf("replacement history was assigned to the wrong worker: %#v", normalized)
 	}
 }

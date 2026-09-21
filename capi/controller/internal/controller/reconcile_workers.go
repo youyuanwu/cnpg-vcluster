@@ -494,7 +494,9 @@ func normalizeWorkerEvidence(values []tenancyv1alpha1.WorkerContainerEvidence, c
 		currentNames[container.Name] = struct{}{}
 	}
 	removed := make([]tenancyv1alpha1.WorkerContainerEvidence, 0)
+	previousNames := map[string]struct{}{}
 	for _, value := range values {
+		previousNames[value.Name] = struct{}{}
 		if _, present := currentNames[value.Name]; !present {
 			removed = append(removed, value)
 		}
@@ -504,7 +506,7 @@ func normalizeWorkerEvidence(values []tenancyv1alpha1.WorkerContainerEvidence, c
 	newIndexes := make([]int, 0)
 	for _, container := range containers {
 		evidence := workerEvidence(values, container, generation)
-		if len(evidence.ImportedImages) == 0 && !evidence.Prepared {
+		if _, existed := previousNames[container.Name]; !existed {
 			newIndexes = append(newIndexes, len(result))
 		}
 		result = append(result, evidence)
