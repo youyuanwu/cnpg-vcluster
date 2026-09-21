@@ -127,7 +127,24 @@ def _workers_applied(client: ManagementClient) -> dict[str, object] | None:
         raise RuntimeError(
             f"Phase 2 Tenant failed: {json.dumps(status, sort_keys=True)}"
         )
-    if status.get("stage") != "WorkersApplied":
+    accepted_stages = {
+        "WorkersApplied",
+        "NetworkSourcesApplied",
+        "NetworkResourceSetApplied",
+        "NetworkProbeCreated",
+        "NetworkReady",
+        "PostCNIWorkersReady",
+        "StorageApplied",
+        "StorageProbeCreated",
+        "StorageReady",
+        "CNPGOperatorApplied",
+        "CNPGStoragePrepared",
+        "CNPGClusterApplied",
+        "DatabaseProbeCreated",
+        "DatabaseReady",
+        "Ready",
+    }
+    if status.get("stage") not in accepted_stages:
         return None
     workers = status.get("workerContainers") or []
     if len(workers) != 1 or not workers[0].get("prepared"):
@@ -142,7 +159,9 @@ def _workers_applied(client: ManagementClient) -> dict[str, object] | None:
         ),
         None,
     )
-    if ready is None or ready.get("status") != "False":
+    if status.get("stage") == "WorkersApplied" and (
+        ready is None or ready.get("status") != "False"
+    ):
         raise RuntimeError("Phase 2 incorrectly reported the Tenant Ready")
     return tenant
 

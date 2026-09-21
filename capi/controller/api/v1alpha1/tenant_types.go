@@ -30,6 +30,21 @@ const (
 	StageMachineTemplateCreated    = "MachineTemplateCreated"
 	StageMachineDeploymentCreated  = "MachineDeploymentCreated"
 	StageWorkersApplied            = "WorkersApplied"
+	StageNetworkSourcesApplied     = "NetworkSourcesApplied"
+	StageNetworkResourceSetApplied = "NetworkResourceSetApplied"
+	StageNetworkProbeCreated       = "NetworkProbeCreated"
+	StageNetworkReady              = "NetworkReady"
+	StagePostCNIWorkersReady       = "PostCNIWorkersReady"
+	StageStorageApplied            = "StorageApplied"
+	StageStorageProbeCreated       = "StorageProbeCreated"
+	StageStorageReady              = "StorageReady"
+	StageCNPGOperatorApplied       = "CNPGOperatorApplied"
+	StageCNPGStoragePrepared       = "CNPGStoragePrepared"
+	StageCNPGClusterApplied        = "CNPGClusterApplied"
+	StageDatabaseProbeCreated      = "DatabaseProbeCreated"
+	StageDatabaseReady             = "DatabaseReady"
+	StageFunctionalVerified        = "FunctionalVerified"
+	StageReady                     = "Ready"
 	StageEndpointReleased          = "EndpointReleased"
 )
 
@@ -113,8 +128,10 @@ type TenantStatus struct {
 	FoundationHash     string                     `json:"foundationHash,omitempty"`
 	ObservationsHash   string                     `json:"observationsHash,omitempty"`
 	ObservedResources  []ObservedResourceIdentity `json:"observedResources,omitempty"`
+	TenantResources    []ObservedResourceIdentity `json:"tenantResources,omitempty"`
 	DockerVolume       *DockerVolumeIdentity      `json:"dockerVolume,omitempty"`
 	WorkerContainers   []WorkerContainerEvidence  `json:"workerContainers,omitempty"`
+	WorkerSnapshotHash string                     `json:"workerSnapshotHash,omitempty"`
 	SurvivorSnapshots  []SurvivorSnapshot         `json:"survivorSnapshots,omitempty"`
 	FunctionalEvidence *FunctionalEvidence        `json:"functionalEvidence,omitempty"`
 	Teardown           *TeardownStatus            `json:"teardown,omitempty"`
@@ -126,6 +143,8 @@ type TenantStatus struct {
 // +kubebuilder:printcolumn:name="Phase",type=string,JSONPath=`.status.phase`
 // +kubebuilder:printcolumn:name="Ready",type=string,JSONPath=`.status.conditions[?(@.type=="Ready")].status`
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
+// +kubebuilder:printcolumn:name="Workers",type=integer,JSONPath=`.spec.workers`
+// +kubebuilder:printcolumn:name="Databases",type=integer,JSONPath=`.spec.databaseCount`
 // +kubebuilder:printcolumn:name="Last Verified",type=number,JSONPath=`.status.functionalEvidence.verifiedAt`
 // +kubebuilder:printcolumn:name="Expires",type=number,JSONPath=`.status.functionalEvidence.expiresAt`
 type Tenant struct {

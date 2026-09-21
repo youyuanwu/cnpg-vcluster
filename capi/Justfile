@@ -79,6 +79,10 @@ controller-image:
 test-controller-phase2:
     @python3 scripts/run_locked.py scripts/test_controller_phase2.py
 
+# Exercise complete temporary controller mutation through Ready and Phase 3 finalization.
+test-controller-phase3:
+    @python3 scripts/run_locked.py scripts/test_controller_phase3.py
+
 # Internal validation-only apply helper used before the local lifecycle cutover.
 _controller-tenant-apply manifest:
     @python3 scripts/controller_tenant.py apply {{quote(manifest)}}

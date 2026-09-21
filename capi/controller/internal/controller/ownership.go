@@ -137,11 +137,17 @@ func validateRecordedResources(ctx context.Context, reader client.Reader, tenant
 		"DevMachineTemplate":    "dev-machine-template",
 		"MachineDeployment":     "machine-deployment",
 		"Machine":               "machine",
+		"ConfigMap":             "network-source",
+		"ClusterResourceSet":    "network-resource-set",
 	}
 	controlPlane := findIdentity(tenant.Status, controlPlaneGVK, tenant.Name, tenant.Name)
 	for _, identity := range tenant.Status.ObservedResources {
 		if identity.Kind == machineGVK.Kind &&
 			identity.APIVersion == machineGVK.GroupVersion().String() {
+			continue
+		}
+		if identity.Kind == "DevMachine" &&
+			identity.APIVersion == "infrastructure.cluster.x-k8s.io/v1beta2" {
 			continue
 		}
 		groupVersion, err := schema.ParseGroupVersion(identity.APIVersion)
@@ -185,6 +191,16 @@ func validateProviderOwner(object *unstructured.Unstructured, status tenancyv1al
 			return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
 		}
 		return nil
+	case "ConfigMap":
+		if identity := findIdentity(status,
+			schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: "v1beta2", Kind: "ClusterResourceSet"},
+			object.GetNamespace(), object.GetNamespace()+"-network"); identity != nil {
+			expected = append(expected, identity)
+		}
+	case "ClusterResourceSet":
+		if identity := findIdentity(status, clusterGVK, object.GetNamespace(), object.GetNamespace()); identity != nil {
+			expected = append(expected, identity)
+		}
 	case "DevCluster", "KamajiControlPlane", "MachineDeployment":
 		if identity := findIdentity(status, clusterGVK, object.GetNamespace(), object.GetNamespace()); identity != nil {
 			expected = append(expected, identity)

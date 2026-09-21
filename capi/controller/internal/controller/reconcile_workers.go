@@ -114,30 +114,9 @@ func (reconciler *TenantReconciler) reconcileWorkers(ctx context.Context, tenant
 			return nil
 		})
 	case tenancyv1alpha1.StageWorkersApplied:
-		machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
-		if err != nil {
-			if errors.Is(err, errWorkerRuntimePending) {
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-			return ctrl.Result{}, err
-		}
-		if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		evidenceSet := normalizeWorkerEvidence(tenant.Status.WorkerContainers, containers, foundation.Cache.Generation)
-		if !allWorkerEvidencePrepared(evidenceSet) || !machineInventoryMatches(tenant.Status, machines) {
-			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				status.WorkerContainers = evidenceSet
-				replaceMachineIdentities(status, machines)
-				status.Stage = tenancyv1alpha1.StageMachineDeploymentCreated
-				setCondition(status, tenant, "WorkersReady", metav1.ConditionFalse, "WorkerReplacement", "A verified worker replacement requires bounded image preparation")
-				setCondition(status, tenant, "Ready", metav1.ConditionFalse, "WorkerReplacement", "Worker replacement preparation is in progress")
-				return nil
-			})
-		}
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
+		return reconciler.reconcileNetwork(ctx, tenant, canonical, specHash, foundation)
 	default:
-		return ctrl.Result{}, fmt.Errorf("unsupported Tenant lifecycle stage %q", tenant.Status.Stage)
+		return reconciler.reconcileNetwork(ctx, tenant, canonical, specHash, foundation)
 	}
 }
 
@@ -314,21 +293,38 @@ func (reconciler *TenantReconciler) prepareWorkerImage(ctx context.Context, cont
 	for _, command := range [][]string{
 		{"ctr", "--namespace", "k8s.io", "images", "import", "--digests", archivePath},
 		{"ctr", "--namespace", "k8s.io", "images", "tag", "--force", archive.Tagged, archive.Reference},
+		{"ctr", "--namespace", "k8s.io", "images", "tag", "--force", archive.Tagged, canonicalExactReference(archive)},
+		{"ctr", "--namespace", "k8s.io", "images", "tag", "--force", archive.Tagged, runtimeDigestReference(archive)},
 	} {
 		if err := reconciler.execRequired(ctx, container, command); err != nil {
 			return fmt.Errorf("prepare worker image %s: %w", archive.Key, err)
 		}
 	}
-	inspect, err := reconciler.exec(ctx, container, []string{"ctr", "--namespace", "k8s.io", "images", "inspect", archive.Reference})
+	inspect, err := reconciler.exec(ctx, container, []string{"ctr", "--namespace", "k8s.io", "images", "inspect", runtimeDigestReference(archive)})
 	if err != nil || inspect.ExitCode != 0 {
 		return fmt.Errorf("inspect imported worker image %s", archive.Key)
 	}
+
 	expectedDigest := archive.Reference[strings.LastIndex(archive.Reference, "@")+1:]
 	match := importedImageDigest.FindStringSubmatch(inspect.Output)
 	if len(match) != 2 || match[1] != expectedDigest {
 		return fmt.Errorf("imported worker image %s digest mismatch", archive.Key)
 	}
 	return nil
+}
+
+func canonicalExactReference(archive FoundationArchive) string {
+	return archive.Tagged + "@" + archive.Reference[strings.LastIndex(archive.Reference, "@")+1:]
+}
+
+func runtimeDigestReference(archive FoundationArchive) string {
+	tagged := archive.Tagged
+	lastSlash := strings.LastIndex(tagged, "/")
+	lastColon := strings.LastIndex(tagged, ":")
+	if lastColon > lastSlash {
+		tagged = tagged[:lastColon]
+	}
+	return tagged + "@" + archive.Reference[strings.LastIndex(archive.Reference, "@")+1:]
 }
 
 func (reconciler *TenantReconciler) configureWorkerMirrors(ctx context.Context, container string, foundation Foundation) error {

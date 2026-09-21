@@ -1,0 +1,81 @@
+package controller
+
+import (
+	"context"
+	"fmt"
+	"sort"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
+	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
+)
+
+func ensureTenantObject(ctx context.Context, tenantClient client.Client, desired *unstructured.Unstructured, tenant *tenancyv1alpha1.Tenant, specHash, foundationHash string) (tenancyv1alpha1.ObservedResourceIdentity, bool, error) {
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(desired.GroupVersionKind())
+	err := tenantClient.Get(ctx, client.ObjectKeyFromObject(desired), current)
+	if apierrors.IsNotFound(err) {
+		if err := tenantClient.Create(ctx, desired); err != nil {
+			return tenancyv1alpha1.ObservedResourceIdentity{}, false, err
+		}
+		return identityFor(desired), true, nil
+	}
+	if err != nil {
+		return tenancyv1alpha1.ObservedResourceIdentity{}, false, err
+	}
+	annotations := current.GetAnnotations()
+	if annotations[resources.TenantAnnotation] != tenant.Name ||
+		annotations[resources.TenantUIDAnnotation] != string(tenant.UID) ||
+		annotations[resources.SpecHashAnnotation] != specHash ||
+		annotations[resources.FoundationAnnotation] != foundationHash {
+		return tenancyv1alpha1.ObservedResourceIdentity{}, false, fmt.Errorf("tenant resource %s/%s ownership mismatch", current.GetKind(), current.GetName())
+	}
+	return identityFor(current), false, nil
+}
+
+func upsertTenantIdentity(status *tenancyv1alpha1.TenantStatus, identity tenancyv1alpha1.ObservedResourceIdentity) error {
+	for index := range status.TenantResources {
+		current := &status.TenantResources[index]
+		if current.APIVersion == identity.APIVersion && current.Kind == identity.Kind &&
+			current.Namespace == identity.Namespace && current.Name == identity.Name {
+			if current.UID != identity.UID {
+				return fmt.Errorf("tenant %s %s identity changed from %s to %s", identity.Kind, identity.Name, current.UID, identity.UID)
+			}
+			return nil
+		}
+	}
+	status.TenantResources = append(status.TenantResources, identity)
+	sort.Slice(status.TenantResources, func(left, right int) bool {
+		a := status.TenantResources[left]
+		b := status.TenantResources[right]
+		return a.APIVersion+"/"+a.Kind+"/"+a.Namespace+"/"+a.Name <
+			b.APIVersion+"/"+b.Kind+"/"+b.Namespace+"/"+b.Name
+	})
+	return nil
+}
+
+func tenantObjectReady(object *unstructured.Unstructured) bool {
+	conditions, _, _ := unstructured.NestedSlice(object.Object, "status", "conditions")
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]any)
+		if ok && condition["type"] == "Ready" && condition["status"] == "True" {
+			return true
+		}
+	}
+	return false
+}
+
+func workloadAvailable(object *unstructured.Unstructured) bool {
+	kind := object.GetKind()
+	if kind == "DaemonSet" {
+		desired, _, _ := unstructured.NestedInt64(object.Object, "status", "desiredNumberScheduled")
+		available, _, _ := unstructured.NestedInt64(object.Object, "status", "numberAvailable")
+		return desired > 0 && desired == available
+	}
+	desired, _, _ := unstructured.NestedInt64(object.Object, "spec", "replicas")
+	available, _, _ := unstructured.NestedInt64(object.Object, "status", "availableReplicas")
+	return desired > 0 && desired == available
+}

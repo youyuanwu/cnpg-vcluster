@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"fmt"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -16,7 +17,10 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
+	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 )
+
+const tenantAPIWorkloadsCleanupComplete = "TenantAPIWorkloadsCleanupComplete"
 
 func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (ctrl.Result, error) {
 	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
@@ -227,6 +231,7 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 	}
 	destructiveStarted := tenant.Status.Teardown != nil &&
 		(tenant.Status.Teardown.Phase == "ManagementDeletionStarted" ||
+			tenant.Status.Teardown.Phase == tenantAPIWorkloadsCleanupComplete ||
 			tenant.Status.Teardown.Authority == "LiveBootstrapRBACCleanupComplete" ||
 			tenant.Status.Teardown.Phase == tenancyv1alpha1.StageEndpointReleased)
 	if !destructiveStarted {
@@ -259,6 +264,31 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		if err != nil {
 			return ctrl.Result{}, fmt.Errorf("live Tenant API cleanup is required before management teardown: %w", err)
 		}
+		workloadsCleanupComplete := tenant.Status.Teardown != nil &&
+			tenant.Status.Teardown.Phase == tenantAPIWorkloadsCleanupComplete
+		tenantResourcesAbsent, err := deleteTenantResources(
+			ctx,
+			tenantClient,
+			tenant,
+			specHash,
+			foundation.Hash,
+			workloadsCleanupComplete,
+		)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !tenantResourcesAbsent {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+		if !workloadsCleanupComplete {
+			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+				if status.Teardown == nil {
+					status.Teardown = &tenancyv1alpha1.TeardownStatus{}
+				}
+				status.Teardown.Phase = tenantAPIWorkloadsCleanupComplete
+				return nil
+			})
+		}
 		complete, err := deleteBootstrapRBAC(ctx, tenantClient)
 		if err != nil {
 			return ctrl.Result{}, err
@@ -280,6 +310,28 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		tenant.Status.Teardown.Authority != "TenantAPINeverAuthorized" &&
 		tenant.Status.Teardown.Authority != "LiveBootstrapRBACCleanupComplete" {
 		return ctrl.Result{}, fmt.Errorf("partial Tenant cleanup authority is invalid")
+	}
+	for _, identity := range tenant.Status.ObservedResources {
+		resource := ""
+		gvk := schema.FromAPIVersionAndKind(identity.APIVersion, identity.Kind)
+		switch identity.Kind {
+		case "ConfigMap":
+			if identity.Namespace == tenant.Name {
+				resource = "network-source"
+			}
+		case "ClusterResourceSet":
+			resource = "network-resource-set"
+		}
+		if resource == "" {
+			continue
+		}
+		absent, err := reconciler.deleteExactUnstructured(ctx, tenant, specHash, foundation, gvk, identity.Namespace, identity.Name, resource)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !absent {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
 	}
 	if !stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageTenantAPICleanupRequired) &&
 		tenant.Status.Teardown != nil && tenant.Status.Teardown.Phase != "ManagementDeletionStarted" {
@@ -523,6 +575,74 @@ func (reconciler *TenantReconciler) deleteExactNamespace(ctx context.Context, te
 	return false, nil
 }
 
+func deleteTenantResources(
+	ctx context.Context,
+	tenantClient client.Client,
+	tenant *tenancyv1alpha1.Tenant,
+	specHash,
+	foundationHash string,
+	workloadsCleanupComplete bool,
+) (bool, error) {
+	values := append([]tenancyv1alpha1.ObservedResourceIdentity(nil), tenant.Status.TenantResources...)
+	sort.Slice(values, func(left, right int) bool {
+		return tenantDeletePriority(values[left].Kind) < tenantDeletePriority(values[right].Kind)
+	})
+	for _, identity := range values {
+		if identity.Kind == "Node" {
+			continue
+		}
+		isDefinitionOrNamespace := identity.Kind == "CustomResourceDefinition" || identity.Kind == "Namespace"
+		if workloadsCleanupComplete != isDefinitionOrNamespace {
+			continue
+		}
+		gvk := schema.FromAPIVersionAndKind(identity.APIVersion, identity.Kind)
+		object := &unstructured.Unstructured{}
+		object.SetGroupVersionKind(gvk)
+		err := tenantClient.Get(ctx, client.ObjectKey{Namespace: identity.Namespace, Name: identity.Name}, object)
+		if apierrors.IsNotFound(err) {
+			continue
+		}
+		if err != nil {
+			return false, err
+		}
+		annotations := object.GetAnnotations()
+		if string(object.GetUID()) != identity.UID ||
+			annotations[resources.TenantUIDAnnotation] != string(tenant.UID) ||
+			annotations[resources.SpecHashAnnotation] != specHash ||
+			annotations[resources.FoundationAnnotation] != foundationHash {
+			return false, fmt.Errorf("tenant resource %s/%s ownership changed before cleanup", identity.Kind, identity.Name)
+		}
+		uid := object.GetUID()
+		resourceVersion := object.GetResourceVersion()
+		propagation := metav1.DeletePropagationBackground
+		if err := tenantClient.Delete(ctx, object, &client.DeleteOptions{
+			Preconditions:     &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+			PropagationPolicy: &propagation,
+		}); err != nil && !apierrors.IsNotFound(err) {
+			return false, err
+		}
+		return false, nil
+	}
+	return true, nil
+}
+
+func tenantDeletePriority(kind string) int {
+	switch kind {
+	case "Pod", "Cluster":
+		return 0
+	case "Deployment", "DaemonSet", "StatefulSet":
+		return 1
+	case "PersistentVolumeClaim", "PersistentVolume", "StorageClass":
+		return 2
+	case "CustomResourceDefinition":
+		return 4
+	case "Namespace":
+		return 5
+	default:
+		return 3
+	}
+}
+
 func stageAtOrAfter(current, boundary string) bool {
 	order := []string{
 		"",
@@ -540,6 +660,20 @@ func stageAtOrAfter(current, boundary string) bool {
 		tenancyv1alpha1.StageMachineTemplateCreated,
 		tenancyv1alpha1.StageMachineDeploymentCreated,
 		tenancyv1alpha1.StageWorkersApplied,
+		tenancyv1alpha1.StageNetworkSourcesApplied,
+		tenancyv1alpha1.StageNetworkResourceSetApplied,
+		tenancyv1alpha1.StageNetworkProbeCreated,
+		tenancyv1alpha1.StageNetworkReady,
+		tenancyv1alpha1.StagePostCNIWorkersReady,
+		tenancyv1alpha1.StageStorageApplied,
+		tenancyv1alpha1.StageStorageProbeCreated,
+		tenancyv1alpha1.StageStorageReady,
+		tenancyv1alpha1.StageCNPGOperatorApplied,
+		tenancyv1alpha1.StageCNPGStoragePrepared,
+		tenancyv1alpha1.StageCNPGClusterApplied,
+		tenancyv1alpha1.StageDatabaseProbeCreated,
+		tenancyv1alpha1.StageDatabaseReady,
+		tenancyv1alpha1.StageReady,
 		tenancyv1alpha1.StageEndpointReleased,
 	}
 	positions := map[string]int{}

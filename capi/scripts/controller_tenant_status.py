@@ -64,7 +64,11 @@ def evaluate_tenant(
     if evidence.get("foundationHash") != foundation_hash:
         blockers.append("functional evidence foundationHash does not match the live foundation")
     try:
-        expected_observations_hash = observations_hash(status.get("observedResources"))
+        expected_observations_hash = observations_hash(
+            status.get("observedResources"),
+            status.get("tenantResources"),
+            status.get("workerSnapshotHash"),
+        )
     except (TypeError, ValueError) as exc:
         blockers.append(f"observed resource identities are invalid: {exc}")
         expected_observations_hash = None
@@ -164,16 +168,30 @@ def canonical_spec_hash(spec: dict[str, object]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def observations_hash(value: object) -> str:
+def observations_hash(
+    value: object,
+    tenant_value: object = None,
+    worker_snapshot: object = None,
+) -> str:
     if not isinstance(value, list) or not value:
         raise ValueError("observedResources must be a non-empty list")
+    if tenant_value is None:
+        tenant_value = []
+    if not isinstance(tenant_value, list):
+        raise ValueError("tenantResources must be a list")
     normalized = []
-    for item in value:
+    for item in [*value, *tenant_value]:
         if not isinstance(item, dict):
             raise ValueError("observed resource entry must be an object")
         required = ("apiVersion", "kind", "name", "uid")
         if any(not isinstance(item.get(key), str) or not item[key] for key in required):
             raise ValueError("observed resource identity is incomplete")
+        previous_uids = item.get("previousUIDs")
+        if previous_uids is not None and (
+            not isinstance(previous_uids, list)
+            or any(not isinstance(uid, str) or not uid for uid in previous_uids)
+        ):
+            raise ValueError("observed resource previousUIDs are invalid")
         normalized.append(
             {
                 "apiVersion": item["apiVersion"],
@@ -181,7 +199,24 @@ def observations_hash(value: object) -> str:
                 "namespace": item.get("namespace", ""),
                 "name": item["name"],
                 "uid": item["uid"],
-                "previousUIDs": sorted(item.get("previousUIDs", [])),
+                "contentSHA256": item.get("contentSHA256", ""),
+                "previousUIDs": (
+                    sorted(previous_uids) if previous_uids is not None else None
+                ),
+            }
+        )
+    if worker_snapshot is not None:
+        if not isinstance(worker_snapshot, str) or not worker_snapshot:
+            raise ValueError("workerSnapshotHash must be a non-empty string")
+        normalized.append(
+            {
+                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+                "kind": "WorkerSnapshot",
+                "namespace": "",
+                "name": "workers",
+                "uid": worker_snapshot,
+                "contentSHA256": "",
+                "previousUIDs": [],
             }
         )
     normalized.sort(

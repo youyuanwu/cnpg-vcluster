@@ -26,6 +26,12 @@ spec:
     - jsonPath: .status.endpoint
       name: Endpoint
       type: string
+    - jsonPath: .spec.workers
+      name: Workers
+      type: integer
+    - jsonPath: .spec.databaseCount
+      name: Databases
+      type: integer
     - jsonPath: .status.functionalEvidence.verifiedAt
       name: Last Verified
       type: number
@@ -263,6 +269,32 @@ spec:
                   reservation:
                     type: string
                 type: object
+              tenantResources:
+                items:
+                  properties:
+                    apiVersion:
+                      type: string
+                    contentSHA256:
+                      type: string
+                    kind:
+                      type: string
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    previousUIDs:
+                      items:
+                        type: string
+                      type: array
+                    uid:
+                      type: string
+                  required:
+                  - apiVersion
+                  - kind
+                  - name
+                  - uid
+                  type: object
+                type: array
               workerContainers:
                 items:
                   properties:
@@ -295,6 +327,8 @@ spec:
                   - prepared
                   type: object
                 type: array
+              workerSnapshotHash:
+                type: string
             type: object
         required:
         - spec

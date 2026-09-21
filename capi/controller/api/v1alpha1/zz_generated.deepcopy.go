@@ -194,6 +194,13 @@ func (in *TenantStatus) DeepCopyInto(out *TenantStatus) {
 			(*in)[i].DeepCopyInto(&(*out)[i])
 		}
 	}
+	if in.TenantResources != nil {
+		in, out := &in.TenantResources, &out.TenantResources
+		*out = make([]ObservedResourceIdentity, len(*in))
+		for i := range *in {
+			(*in)[i].DeepCopyInto(&(*out)[i])
+		}
+	}
 	if in.DockerVolume != nil {
 		in, out := &in.DockerVolume, &out.DockerVolume
 		*out = new(DockerVolumeIdentity)

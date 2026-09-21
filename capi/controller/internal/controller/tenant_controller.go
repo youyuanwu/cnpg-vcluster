@@ -33,6 +33,7 @@ const tenantFinalizer = "tenancy.cnpg-vcluster.io/finalizer"
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=devclusters;devmachinetemplates;devmachines,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kubeadmconfigtemplates,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;create;delete
+// +kubebuilder:rbac:groups=addons.cluster.x-k8s.io,resources=clusterresourcesets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 type TenantReconciler struct {
@@ -108,7 +109,8 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		status.SpecHash = specHash
 		status.FoundationHash = foundation.Hash
 		if status.Phase != tenancyv1alpha1.PhaseFailed &&
-			status.Phase != tenancyv1alpha1.PhaseOwnershipInvalid {
+			status.Phase != tenancyv1alpha1.PhaseOwnershipInvalid &&
+			status.Stage != tenancyv1alpha1.StageReady {
 			status.Phase = tenancyv1alpha1.PhaseProgressing
 		}
 		setCondition(status, &tenant, "Accepted", metav1.ConditionTrue, "Accepted", "Tenant specification is accepted")
@@ -129,7 +131,9 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		return result, reconciler.failure(ctx, &tenant, specHash, phase, reason, err)
 	}
 	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		status.Phase = tenancyv1alpha1.PhaseProgressing
+		if status.Stage != tenancyv1alpha1.StageReady {
+			status.Phase = tenancyv1alpha1.PhaseProgressing
+		}
 		return nil
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -188,6 +192,7 @@ func (reconciler *TenantReconciler) SetupWithManager(manager ctrl.Manager) error
 		devMachineTemplateGVK,
 		machineDeploymentGVK,
 		machineGVK,
+		{Group: "addons.cluster.x-k8s.io", Version: "v1beta2", Kind: "ClusterResourceSet"},
 	} {
 		object := &unstructured.Unstructured{}
 		object.SetGroupVersionKind(gvk)

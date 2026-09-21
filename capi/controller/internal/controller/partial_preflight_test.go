@@ -7,7 +7,10 @@ import (
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
@@ -21,9 +24,140 @@ type recordingTenantFactory struct {
 	called bool
 }
 
+type noMatchTenantClient struct {
+	client.Client
+	gvk schema.GroupVersionKind
+}
+
+type failingTenantClient struct {
+	client.Client
+	err error
+}
+
+func (tenantClient noMatchTenantClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
+	if object.GetObjectKind().GroupVersionKind() == tenantClient.gvk {
+		return &meta.NoKindMatchError{
+			GroupKind:        tenantClient.gvk.GroupKind(),
+			SearchedVersions: []string{tenantClient.gvk.Version},
+		}
+	}
+	return tenantClient.Client.Get(ctx, key, object, options...)
+}
+
+func (tenantClient failingTenantClient) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return tenantClient.err
+}
+
 func (factory *recordingTenantFactory) ClientFor([]byte, string) (client.Client, error) {
 	factory.called = true
 	return nil, errors.New("tenant client must not be constructed")
+}
+
+func TestTenantResourceCleanupCheckpointsBeforeCRDDeletion(t *testing.T) {
+	gvk := schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Cluster"}
+	tenant := &tenancyv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
+		Status: tenancyv1alpha1.TenantStatus{
+			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
+				APIVersion: gvk.GroupVersion().String(),
+				Kind:       gvk.Kind,
+				Namespace:  "database",
+				Name:       "capi-postgres",
+				UID:        "cluster-uid",
+			}},
+		},
+	}
+	tenantClient := noMatchTenantClient{
+		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
+		gvk:    gvk,
+	}
+
+	if _, err := deleteTenantResources(
+		context.Background(),
+		tenantClient,
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+		false,
+	); err == nil || !meta.IsNoMatchError(err) {
+		t.Fatalf("expected discovery failure before the cleanup checkpoint, got %v", err)
+	}
+
+	absent, err := deleteTenantResources(
+		context.Background(),
+		tenantClient,
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+		true,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !absent {
+		t.Fatal("custom resources must not be rediscovered after the cleanup checkpoint")
+	}
+}
+
+func TestTenantResourceCleanupFailsClosedOnTenantAPIErrors(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("ConfigMap")
+	tenant := &tenancyv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
+		Status: tenancyv1alpha1.TenantStatus{
+			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
+				APIVersion: gvk.GroupVersion().String(),
+				Kind:       gvk.Kind,
+				Namespace:  "default",
+				Name:       "tenant-config",
+				UID:        "config-uid",
+			}},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	transportErr := errors.New("tenant API transport unavailable")
+	for name, expected := range map[string]error{
+		"transport": transportErr,
+		"authorization": apierrors.NewForbidden(
+			schema.GroupResource{Resource: "configmaps"},
+			"tenant-config",
+			errors.New("denied"),
+		),
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, err := deleteTenantResources(
+				context.Background(),
+				failingTenantClient{Client: base, err: expected},
+				tenant,
+				"spec-hash",
+				"foundation-hash",
+				false,
+			)
+			if err == nil {
+				t.Fatal("tenant API failure was accepted as absence")
+			}
+			if name == "transport" && !errors.Is(err, transportErr) {
+				t.Fatalf("transport error was not preserved: %v", err)
+			}
+			if name == "authorization" && !apierrors.IsForbidden(err) {
+				t.Fatalf("authorization error was not preserved: %v", err)
+			}
+		})
+	}
+
+	absent, err := deleteTenantResources(
+		context.Background(),
+		base,
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !absent {
+		t.Fatal("authoritative NotFound was not accepted as absence")
+	}
 }
 
 func TestDeletionPreflightRejectsForeignVolumeBeforeTenantAPIMutation(t *testing.T) {
