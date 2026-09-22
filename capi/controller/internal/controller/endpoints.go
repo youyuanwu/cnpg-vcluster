@@ -128,7 +128,7 @@ func observeEndpoint(ctx context.Context, reader client.Reader, namespace string
 }
 
 func releaseEndpoint(ctx context.Context, kubernetes client.Client, reader client.Reader, namespace string, foundation Foundation, tenant *tenancyv1alpha1.Tenant) error {
-	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
+	if err := retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var configMap corev1.ConfigMap
 		key := types.NamespacedName{Namespace: namespace, Name: allocationConfigMapName}
 		if err := reader.Get(ctx, key, &configMap); err != nil {
@@ -161,7 +161,23 @@ func releaseEndpoint(ctx context.Context, kubernetes client.Client, reader clien
 		}
 		configMap.Data["allocations.json"] = encoded
 		return kubernetes.Update(ctx, &configMap)
-	})
+	}); err != nil {
+		return err
+	}
+	var configMap corev1.ConfigMap
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: allocationConfigMapName}, &configMap); err != nil {
+		return fmt.Errorf("verify Tenant endpoint release: %w", err)
+	}
+	state, err := decodeAllocationState(configMap.Data["allocations.json"], foundation)
+	if err != nil {
+		return err
+	}
+	for _, allocation := range state.Allocations {
+		if allocation.TenantUID == string(tenant.UID) {
+			return fmt.Errorf("Tenant endpoint allocation remains after release")
+		}
+	}
+	return nil
 }
 
 func newAllocationState(foundation Foundation) *endpointAllocationState {

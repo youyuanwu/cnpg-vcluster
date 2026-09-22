@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
-from scripts.lib.controller import set_controller_mutation
+from scripts.lib.controller import delete_tenant_resource, set_controller_mutation
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.locking import profile_lock, tools_lock
 from scripts.lib.process import run
@@ -179,11 +179,11 @@ def _restore_after_gate(
     try:
         tenant = _tenant(client)
         if tenant is not None:
-            cleanup = client.kubectl(
-                "delete",
-                f"tenant/{TENANT_NAME}",
-                "--wait=true",
-                f"--timeout={config['DELETE_TIMEOUT']}",
+            cleanup = delete_tenant_resource(
+                client,
+                TENANT_NAME,
+                wait=True,
+                timeout=config["DELETE_TIMEOUT"],
                 check=False,
             )
             if cleanup.returncode != 0 or _tenant(client) is not None:
@@ -266,7 +266,7 @@ def main() -> None:
                 or second["status"]["dockerVolume"]["name"] != volume
             ):
                 raise RuntimeError("Phase 2 idempotent reconcile changed stable identity")
-            client.kubectl("delete", f"tenant/{TENANT_NAME}", "--wait=false")
+            delete_tenant_resource(client, TENANT_NAME, wait=False)
             wait_for(
                 "Tenant Phase 2 finalization",
                 parse_duration(config["DELETE_TIMEOUT"]),

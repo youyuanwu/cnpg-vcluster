@@ -4,6 +4,8 @@ import hashlib
 import json
 import os
 import shutil
+import time
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -23,6 +25,8 @@ if TYPE_CHECKING:
 CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
+DELETION_RESERVATION = "tenant-deletion-reservation"
+FOUNDATION_TEARDOWN_AUTHORIZATION = "tenant-foundation-teardown"
 
 
 def _foundation_checksum(data: dict[str, object]) -> str:
@@ -371,6 +375,7 @@ def set_controller_mutation(
             "-p",
             json.dumps(patch),
         )
+
     client.kubectl(
         "-n",
         CONTROLLER_NAMESPACE,
@@ -428,6 +433,233 @@ def set_controller_mutation(
             "-p",
             json.dumps(patch),
         )
+
+
+def reserve_tenant_deletion(
+    client: ManagementClient,
+    tenant_name: str,
+    *,
+    lifetime_seconds: int = 300,
+) -> str:
+    tenant = client.json("get", f"tenant/{tenant_name}")
+    tenant_uid = tenant["metadata"]["uid"]
+    tenants = client.json("get", TENANT_CRD)
+    if any(
+        item["metadata"]["name"] != tenant_name
+        and item["metadata"].get("deletionTimestamp")
+        for item in tenants.get("items", [])
+    ):
+        raise RuntimeError("another Tenant deletion is active")
+    whoami = client.json("auth", "whoami")
+    requester = (
+        whoami.get("status", {})
+        .get("userInfo", {})
+        .get("username")
+    )
+    if not requester:
+        raise RuntimeError("management requester identity is unavailable")
+    for _ in range(5):
+        current = client.kubectl(
+            "-n",
+            CONTROLLER_NAMESPACE,
+            "get",
+            f"configmap/{DELETION_RESERVATION}",
+            "-o",
+            "json",
+            check=False,
+        )
+        now = time.time()
+        if current.returncode == 0:
+            document = json.loads(current.stdout)
+            try:
+                existing = json.loads(document["data"]["reservation.json"])
+            except (KeyError, TypeError, json.JSONDecodeError) as exc:
+                raise RuntimeError("targeted deletion reservation is invalid") from exc
+            if float(existing.get("expiresAt", 0)) > now:
+                if (
+                    existing.get("tenantName") == tenant_name
+                    and existing.get("tenantUID") == tenant_uid
+                    and existing.get("requester") == requester
+                    and existing.get("nonce")
+                ):
+                    return str(existing["nonce"])
+                raise RuntimeError("another targeted deletion reservation is active")
+            resource_version = document["metadata"]["resourceVersion"]
+            operation = "replace"
+        elif (
+            "not found" in f"{current.stdout}{current.stderr}".lower()
+            or "notfound" in f"{current.stdout}{current.stderr}".lower()
+        ):
+            resource_version = None
+            operation = "create"
+        else:
+            raise RuntimeError(
+                f"failed to inspect targeted deletion reservation: {current.stderr}"
+            )
+        nonce = uuid.uuid4().hex
+        reservation = {
+            "schema": 1,
+            "tenantName": tenant_name,
+            "tenantUID": tenant_uid,
+            "requester": requester,
+            "nonce": nonce,
+            "expiresAt": now + lifetime_seconds,
+        }
+        metadata: dict[str, object] = {
+            "name": DELETION_RESERVATION,
+            "namespace": CONTROLLER_NAMESPACE,
+        }
+        if resource_version is not None:
+            metadata["resourceVersion"] = resource_version
+        manifest = {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": metadata,
+            "data": {
+                "reservation.json": json.dumps(
+                    reservation,
+                    sort_keys=True,
+                    separators=(",", ":"),
+                )
+            },
+        }
+        result = client.kubectl(
+            operation,
+            "-f",
+            "-",
+            input_text=json.dumps(manifest),
+            check=False,
+        )
+        if result.returncode == 0:
+            return nonce
+        output = f"{result.stdout}{result.stderr}".lower()
+        if "alreadyexists" not in output and "the object has been modified" not in output:
+            raise RuntimeError(
+                f"failed to persist targeted deletion reservation: {result.stderr}"
+            )
+    raise RuntimeError("targeted deletion reservation compare-and-swap was exhausted")
+
+
+def delete_tenant_resource(
+    client: ManagementClient,
+    tenant_name: str,
+    *,
+    wait: bool,
+    timeout: str | None = None,
+    check: bool = True,
+):
+    tenant = client.json("get", f"tenant/{tenant_name}")
+    if not tenant["metadata"].get("deletionTimestamp"):
+        reserve_tenant_deletion(client, tenant_name)
+    arguments = [
+        "delete",
+        f"tenant/{tenant_name}",
+        f"--wait={'true' if wait else 'false'}",
+    ]
+    if timeout is not None:
+        arguments.append(f"--timeout={timeout}")
+    return client.kubectl(*arguments, check=check)
+
+
+def authorize_foundation_teardown(client: ManagementClient) -> bool:
+    response = client.kubectl("get", TENANT_CRD, "-o", "json", check=False)
+    if response.returncode != 0:
+        output = f"{response.stdout}{response.stderr}".lower()
+        if "not found" in output or "the server doesn't have a resource type" in output:
+            return False
+        raise RuntimeError(
+            f"failed to inspect controller Tenants for foundation teardown: {response.stderr}"
+        )
+    if not response.stdout.strip():
+        return False
+    tenants = json.loads(response.stdout)
+    items = tenants.get("items", [])
+    if not items:
+        return False
+    foundation = client.json(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "get",
+        "configmap/tenant-foundation",
+    )
+    targets = {
+        item["metadata"]["name"]: item["metadata"]["uid"]
+        for item in items
+    }
+    authorization = {
+        "schema": 1,
+        "foundationHash": foundation["data"]["foundation.sha256"],
+        "nonce": uuid.uuid4().hex,
+        "targets": targets,
+    }
+    manifest = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": FOUNDATION_TEARDOWN_AUTHORIZATION,
+            "namespace": CONTROLLER_NAMESPACE,
+        },
+        "data": {
+            "authorization.json": json.dumps(
+                authorization,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        },
+    }
+    current = client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "get",
+        f"configmap/{FOUNDATION_TEARDOWN_AUTHORIZATION}",
+        "-o",
+        "json",
+        check=False,
+    )
+    if current.returncode == 0:
+        manifest["metadata"]["resourceVersion"] = json.loads(current.stdout)[
+            "metadata"
+        ]["resourceVersion"]
+        operation = "replace"
+    elif (
+        "not found" in f"{current.stdout}{current.stderr}".lower()
+        or "notfound" in f"{current.stdout}{current.stderr}".lower()
+    ):
+        operation = "create"
+    else:
+        raise RuntimeError(
+            f"failed to inspect foundation teardown authorization: {current.stderr}"
+        )
+    client.kubectl(
+        operation,
+        "-f",
+        "-",
+        input_text=json.dumps(manifest),
+    )
+    return True
+
+
+def delete_authorized_controller_tenants(
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    if not authorize_foundation_teardown(client):
+        return
+    tenants = client.json("get", TENANT_CRD)
+    for item in sorted(tenants.get("items", []), key=lambda value: value["metadata"]["name"]):
+        delete_tenant_resource(
+            client,
+            item["metadata"]["name"],
+            wait=True,
+            timeout=config["DELETE_TIMEOUT"],
+        )
+    client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "delete",
+        f"configmap/{FOUNDATION_TEARDOWN_AUTHORIZATION}",
+        "--wait=true",
+    )
 
 
 def reconcile_controller(

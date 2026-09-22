@@ -361,6 +361,9 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         if not status.get("apiReady"):
             raise RuntimeError("owned management API is not reachable; refusing partial cleanup")
         client = ManagementClient(root, config)
+        from scripts.lib.controller import delete_authorized_controller_tenants
+
+        delete_authorized_controller_tenants(config, client)
         cluster_crd = client.kubectl(
             "get",
             "crd/clusters.cluster.x-k8s.io",

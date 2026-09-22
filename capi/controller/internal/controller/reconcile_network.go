@@ -111,6 +111,7 @@ func (reconciler *TenantReconciler) reconcileNetwork(ctx context.Context, tenant
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			removeTenantIdentity(status, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())
 			status.Stage = tenancyv1alpha1.StageNetworkReady
 			setCondition(status, tenant, "NetworkReady", metav1.ConditionTrue, "NetworkReady", "Tenant networking and DNS/API probes are ready")
 			return nil

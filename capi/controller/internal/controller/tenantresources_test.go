@@ -62,6 +62,26 @@ func TestEnsureTenantObjectRejectsRecordedReplacementBeforePatch(t *testing.T) {
 	}
 }
 
+func TestCompletedProbeIdentitiesAreRemovedFromReadyState(t *testing.T) {
+	status := tenancyv1alpha1.TenantStatus{
+		TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{
+			{APIVersion: "v1", Kind: "Pod", Namespace: "default", Name: "tenant-a-network-verify", UID: "network"},
+			{APIVersion: "v1", Kind: "Pod", Namespace: "default", Name: "tenant-a-storage-verify", UID: "storage"},
+			{APIVersion: "v1", Kind: "Pod", Namespace: "database", Name: "tenant-a-sql-verify", UID: "sql"},
+			{APIVersion: "v1", Kind: "Node", Name: "worker-a", UID: "node"},
+		},
+	}
+	if !removeTenantProbeIdentities(&status, "tenant-a") {
+		t.Fatal("completed probe identities were not removed")
+	}
+	if len(status.TenantResources) != 1 || status.TenantResources[0].Kind != "Node" {
+		t.Fatalf("unexpected retained identities: %#v", status.TenantResources)
+	}
+	if removeTenantProbeIdentities(&status, "tenant-a") {
+		t.Fatal("probe identity removal was not idempotent")
+	}
+}
+
 func markedTenantConfigMap(gvk schema.GroupVersionKind, tenant *tenancyv1alpha1.Tenant, value string) *unstructured.Unstructured {
 	object := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": gvk.GroupVersion().String(),

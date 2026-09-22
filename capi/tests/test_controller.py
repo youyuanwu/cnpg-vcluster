@@ -14,9 +14,12 @@ from scripts.test_controller_phase2 import _restore_after_gate
 from scripts.lib.controller import (
     _foundation_payload,
     _foundation_checksum,
+    authorize_foundation_teardown,
     build_controller_image,
     controller_source_digest,
+    delete_tenant_resource,
     delete_controller,
+    reserve_tenant_deletion,
     set_controller_mutation,
 )
 from scripts.lib.ownership import IdentityRecord
@@ -39,6 +42,100 @@ class FakeManagementClient:
 
 
 class ControllerIntegrationUnitTests(unittest.TestCase):
+    def test_foundation_teardown_authorization_binds_complete_tenant_set(self) -> None:
+        client = FakeManagementClient(
+            [
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "items": [
+                                {"metadata": {"name": "tenant-b", "uid": "uid-b"}},
+                                {"metadata": {"name": "tenant-a", "uid": "uid-a"}},
+                            ]
+                        }
+                    ),
+                    stderr="",
+                ),
+                CompletedProcess([], 0, stdout=json.dumps({"data": {"foundation.sha256": "foundation"}}), stderr=""),
+                CompletedProcess([], 1, stdout="", stderr="Error from server (NotFound)"),
+                CompletedProcess([], 0, stdout="", stderr=""),
+            ]
+        )
+        with patch("scripts.lib.controller.uuid.uuid4") as uuid4:
+            uuid4.return_value.hex = "nonce"
+            self.assertTrue(authorize_foundation_teardown(client))
+        manifest = json.loads(client.calls[-1][1]["input_text"])
+        authorization = json.loads(manifest["data"]["authorization.json"])
+        self.assertEqual(
+            {"tenant-a": "uid-a", "tenant-b": "uid-b"},
+            authorization["targets"],
+        )
+        self.assertEqual("foundation", authorization["foundationHash"])
+
+    def test_targeted_delete_reservation_is_compare_and_swap_created(self) -> None:
+        client = FakeManagementClient(
+            [
+                CompletedProcess([], 0, stdout=json.dumps({"metadata": {"uid": "tenant-uid"}}), stderr=""),
+                CompletedProcess([], 0, stdout=json.dumps({"items": []}), stderr=""),
+                CompletedProcess([], 0, stdout=json.dumps({"status": {"userInfo": {"username": "test-user"}}}), stderr=""),
+                CompletedProcess([], 1, stdout="", stderr="Error from server (NotFound)"),
+                CompletedProcess([], 0, stdout="", stderr=""),
+            ]
+        )
+        with (
+            patch("scripts.lib.controller.time.time", return_value=1000.0),
+            patch("scripts.lib.controller.uuid.uuid4") as uuid4,
+        ):
+            uuid4.return_value.hex = "nonce"
+            self.assertEqual("nonce", reserve_tenant_deletion(client, "tenant-a"))
+        create_call = client.calls[-1]
+        self.assertEqual(("create", "-f", "-"), create_call[0])
+        manifest = json.loads(create_call[1]["input_text"])
+        reservation = json.loads(manifest["data"]["reservation.json"])
+        self.assertEqual("tenant-uid", reservation["tenantUID"])
+        self.assertEqual("test-user", reservation["requester"])
+        self.assertEqual(1300.0, reservation["expiresAt"])
+
+    def test_competing_targeted_delete_reservation_is_rejected(self) -> None:
+        existing = {
+            "metadata": {"resourceVersion": "1"},
+            "data": {
+                "reservation.json": json.dumps(
+                    {
+                        "schema": 1,
+                        "tenantName": "tenant-b",
+                        "tenantUID": "other-uid",
+                        "requester": "other-user",
+                        "nonce": "other",
+                        "expiresAt": 2000.0,
+                    }
+                )
+            },
+        }
+        client = FakeManagementClient(
+            [
+                CompletedProcess([], 0, stdout=json.dumps({"metadata": {"uid": "tenant-uid"}}), stderr=""),
+                CompletedProcess([], 0, stdout=json.dumps({"items": []}), stderr=""),
+                CompletedProcess([], 0, stdout=json.dumps({"status": {"userInfo": {"username": "test-user"}}}), stderr=""),
+                CompletedProcess([], 0, stdout=json.dumps(existing), stderr=""),
+            ]
+        )
+        with patch("scripts.lib.controller.time.time", return_value=1000.0):
+            with self.assertRaisesRegex(RuntimeError, "another targeted deletion"):
+                reserve_tenant_deletion(client, "tenant-a")
+
+    def test_already_deleting_tenant_does_not_replace_reservation(self) -> None:
+        client = FakeManagementClient(
+            [
+                CompletedProcess([], 0, stdout=json.dumps({"metadata": {"uid": "tenant-uid", "deletionTimestamp": "now"}}), stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+            ]
+        )
+        delete_tenant_resource(client, "tenant-a", wait=False)
+        self.assertEqual(("delete", "tenant/tenant-a", "--wait=false"), client.calls[-1][0])
+
     def test_delete_controller_refuses_failed_crd_inspection(self) -> None:
         client = FakeManagementClient(
             [CompletedProcess([], 1, stdout="", stderr="Forbidden")]
@@ -393,6 +490,10 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             patch(
                 "scripts.test_controller_phase2.set_controller_mutation"
             ) as mutation,
+            patch(
+                "scripts.test_controller_phase2.delete_tenant_resource",
+                return_value=CompletedProcess([], 1, stdout="", stderr="cleanup blocked"),
+            ),
         ):
             _restore_after_gate(
                 {"DELETE_TIMEOUT": "1s"},

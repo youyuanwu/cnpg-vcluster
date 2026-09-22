@@ -22,6 +22,17 @@ const functionalEvidenceLifetime = 24 * time.Hour
 func (reconciler *TenantReconciler) reconcileReadiness(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
 	now := time.Now().UTC()
 	if tenant.Status.Stage == tenancyv1alpha1.StageReady {
+		if removeTenantProbeIdentities(&tenant.Status, tenant.Name) {
+			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+				removeTenantProbeIdentities(status, tenant.Name)
+				status.FunctionalEvidence = nil
+				status.Stage = tenancyv1alpha1.StageNetworkResourceSetApplied
+				status.Phase = tenancyv1alpha1.PhaseProgressing
+				setCondition(status, tenant, "FunctionalReady", metav1.ConditionFalse, "EvidenceRefresh", "Functional evidence is being refreshed without completed probe identities")
+				setCondition(status, tenant, "Ready", metav1.ConditionFalse, "EvidenceRefresh", "Functional evidence must be refreshed")
+				return nil
+			})
+		}
 		state, err := reconciler.observePostCNIWorkerState(ctx, tenant, canonical, specHash, foundation)
 		if err != nil {
 			return ctrl.Result{}, err

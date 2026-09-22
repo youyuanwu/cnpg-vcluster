@@ -102,6 +102,40 @@ func upsertTenantIdentity(status *tenancyv1alpha1.TenantStatus, identity tenancy
 	return nil
 }
 
+func removeTenantIdentity(
+	status *tenancyv1alpha1.TenantStatus,
+	gvk schema.GroupVersionKind,
+	namespace,
+	name string,
+) {
+	result := status.TenantResources[:0]
+	for _, identity := range status.TenantResources {
+		if identity.APIVersion == gvk.GroupVersion().String() &&
+			identity.Kind == gvk.Kind &&
+			identity.Namespace == namespace &&
+			identity.Name == name {
+			continue
+		}
+		result = append(result, identity)
+	}
+	status.TenantResources = result
+}
+
+func removeTenantProbeIdentities(status *tenancyv1alpha1.TenantStatus, tenantName string) bool {
+	before := len(status.TenantResources)
+	for _, item := range []struct {
+		namespace string
+		name      string
+	}{
+		{"default", tenantName + "-network-verify"},
+		{"default", tenantName + "-storage-verify"},
+		{"database", tenantName + "-sql-verify"},
+	} {
+		removeTenantIdentity(status, schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, item.namespace, item.name)
+	}
+	return len(status.TenantResources) != before
+}
+
 func tenantObjectReady(object *unstructured.Unstructured) bool {
 	conditions, _, _ := unstructured.NestedSlice(object.Object, "status", "conditions")
 	for _, raw := range conditions {

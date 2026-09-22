@@ -104,10 +104,11 @@ type WorkerContainerEvidence struct {
 }
 
 type TeardownStatus struct {
-	Phase       string `json:"phase,omitempty"`
-	Authority   string `json:"authority,omitempty"`
-	ClusterUID  string `json:"clusterUID,omitempty"`
-	Reservation string `json:"reservation,omitempty"`
+	Phase              string `json:"phase,omitempty"`
+	Authority          string `json:"authority,omitempty"`
+	ClusterUID         string `json:"clusterUID,omitempty"`
+	Reservation        string `json:"reservation,omitempty"`
+	FoundationTeardown bool   `json:"foundationTeardown,omitempty"`
 }
 
 type SurvivorSnapshot struct {
@@ -116,6 +117,16 @@ type SurvivorSnapshot struct {
 	SpecHash         string `json:"specHash"`
 	ObservationsHash string `json:"observationsHash"`
 	Endpoint         string `json:"endpoint"`
+}
+
+type FoundationSnapshot struct {
+	FoundationHash        string `json:"foundationHash"`
+	ManagementContainerID string `json:"managementContainerID"`
+	NetworkID             string `json:"networkID"`
+	ControllerImage       string `json:"controllerImage"`
+	ResourceHash          string `json:"resourceHash"`
+	PeerAllocationsHash   string `json:"peerAllocationsHash"`
+	TargetEndpoint        string `json:"targetEndpoint"`
 }
 
 type TenantStatus struct {
@@ -133,6 +144,7 @@ type TenantStatus struct {
 	WorkerContainers   []WorkerContainerEvidence  `json:"workerContainers,omitempty"`
 	WorkerSnapshotHash string                     `json:"workerSnapshotHash,omitempty"`
 	SurvivorSnapshots  []SurvivorSnapshot         `json:"survivorSnapshots,omitempty"`
+	FoundationSnapshot *FoundationSnapshot        `json:"foundationSnapshot,omitempty"`
 	FunctionalEvidence *FunctionalEvidence        `json:"functionalEvidence,omitempty"`
 	Teardown           *TeardownStatus            `json:"teardown,omitempty"`
 }

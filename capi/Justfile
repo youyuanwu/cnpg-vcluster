@@ -83,6 +83,10 @@ test-controller-phase2:
 test-controller-phase3:
     @python3 scripts/run_locked.py scripts/test_controller_phase3.py
 
+# Exercise targeted deletion serialization, snapshots, restart recovery, and foundation teardown.
+test-controller-deletion:
+    @python3 scripts/run_locked.py scripts/test_controller_deletion.py
+
 # Internal validation-only apply helper used before the local lifecycle cutover.
 _controller-tenant-apply manifest:
     @python3 scripts/controller_tenant.py apply {{quote(manifest)}}

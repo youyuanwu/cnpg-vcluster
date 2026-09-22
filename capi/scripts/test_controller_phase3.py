@@ -9,7 +9,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
-from scripts.lib.controller import set_controller_mutation
+from scripts.lib.controller import delete_tenant_resource, set_controller_mutation
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.locking import profile_lock, tools_lock
 from scripts.lib.redaction import redact
@@ -150,7 +150,7 @@ def main() -> None:
                     "independent Phase 3 status evaluation is not Ready: "
                     + json.dumps(evaluation["blockers"], sort_keys=True)
                 )
-            client.kubectl("delete", f"tenant/{TENANT_NAME}", "--wait=false")
+            delete_tenant_resource(client, TENANT_NAME, wait=False)
             wait_for(
                 "Tenant Phase 3 finalization",
                 parse_duration(config["DELETE_TIMEOUT"]),
@@ -163,11 +163,11 @@ def main() -> None:
         finally:
             tenant = _tenant(client)
             if tenant is not None:
-                cleanup = client.kubectl(
-                    "delete",
-                    f"tenant/{TENANT_NAME}",
-                    "--wait=true",
-                    f"--timeout={config['DELETE_TIMEOUT']}",
+                cleanup = delete_tenant_resource(
+                    client,
+                    TENANT_NAME,
+                    wait=True,
+                    timeout=config["DELETE_TIMEOUT"],
                     check=False,
                 )
                 if cleanup.returncode != 0 and primary is not None:

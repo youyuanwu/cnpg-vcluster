@@ -23,6 +23,7 @@ webhooks:
     - v1alpha1
     operations:
     - CREATE
+    - DELETE
     - UPDATE
     resources:
     - tenants

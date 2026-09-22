@@ -146,6 +146,7 @@ func (reconciler *TenantReconciler) reconcileCNPG(ctx context.Context, tenant *t
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			removeTenantIdentity(status, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())
 			status.Stage = tenancyv1alpha1.StageDatabaseReady
 			setCondition(status, tenant, "DatabaseReady", metav1.ConditionTrue, "DatabaseReady", "CNPG instances, SQL marker, and filesystem ownership are ready")
 			return nil

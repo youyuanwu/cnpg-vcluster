@@ -148,7 +148,7 @@ func TestValidationOnlyModeContinuesManagedDeletion(t *testing.T) {
 	tenant.Status.Stage = tenancyv1alpha1.StageEndpointReleased
 	tenant.Status.Teardown = &tenancyv1alpha1.TeardownStatus{
 		Authority: "TenantAPINeverAuthorized",
-		Phase:     tenancyv1alpha1.StageEndpointReleased,
+		Phase:     deletionLockReleased,
 	}
 	kubernetes := fake.NewClientBuilder().
 		WithScheme(scheme).

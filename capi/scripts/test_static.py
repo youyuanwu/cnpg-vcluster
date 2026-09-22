@@ -35,6 +35,7 @@ EXPECTED_RECIPES = {
     "controller-image",
     "test-controller-phase2",
     "test-controller-phase3",
+    "test-controller-deletion",
     "controller-tenant-status",
     "create-management",
     "dev-bootstrap",

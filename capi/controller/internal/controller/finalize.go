@@ -3,7 +3,6 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -17,7 +16,6 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
-	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 )
 
 const tenantAPIWorkloadsCleanupComplete = "TenantAPIWorkloadsCleanupComplete"
@@ -232,6 +230,8 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 	destructiveStarted := tenant.Status.Teardown != nil &&
 		(tenant.Status.Teardown.Phase == "ManagementDeletionStarted" ||
 			tenant.Status.Teardown.Phase == tenantAPIWorkloadsCleanupComplete ||
+			tenant.Status.Teardown.Phase == deletionLockReleaseStarted ||
+			tenant.Status.Teardown.Phase == deletionLockReleased ||
 			tenant.Status.Teardown.Authority == "LiveBootstrapRBACCleanupComplete" ||
 			tenant.Status.Teardown.Phase == tenancyv1alpha1.StageEndpointReleased)
 	if !destructiveStarted {
@@ -381,48 +381,12 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		}
 	}
 
-	containers, err := reconciler.docker().ListWorkerContainers(ctx, tenant.Name)
+	hostAbsent, err := reconciler.deleteTenantHostState(ctx, tenant, specHash, foundation)
 	if err != nil {
-		return ctrl.Result{}, fmt.Errorf("inspect provider-owned worker containers: %w", err)
+		return ctrl.Result{}, err
 	}
-	if len(containers) != 0 {
+	if !hostAbsent {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-
-	volumeName := foundation.Inputs.LabPrefix + "-" + tenant.Name + "-storage"
-	volume, err := reconciler.docker().InspectVolume(ctx, volumeName)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if volume != nil {
-		expected := map[string]string{
-			foundation.Inputs.OwnershipLabel:           foundation.Inputs.LabPrefix,
-			"cnpg-vcluster.capi/role":                  "tenant-storage",
-			"cnpg-vcluster.capi/tenant":                tenant.Name,
-			"tenancy.cnpg-vcluster.io/tenant-uid":      string(tenant.UID),
-			"tenancy.cnpg-vcluster.io/spec-hash":       specHash,
-			"tenancy.cnpg-vcluster.io/foundation-hash": foundation.Hash,
-		}
-		if volume.Name != volumeName || !stringMapEqual(volume.Labels, expected) {
-			return ctrl.Result{}, fmt.Errorf("Docker volume ownership changed before cleanup")
-		}
-		if tenant.Status.DockerVolume != nil &&
-			(volume.CreatedAt != tenant.Status.DockerVolume.CreatedAt ||
-				volume.Mountpoint != tenant.Status.DockerVolume.Mountpoint) {
-			return ctrl.Result{}, fmt.Errorf("Docker volume identity changed before cleanup")
-		}
-		if err := reconciler.docker().RemoveVolume(ctx, volume.Name); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, nil
-	}
-
-	secretAbsent, err := reconciler.deleteKubeconfigSecret(ctx, tenant)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if !secretAbsent {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 	}
 
 	namespaceAbsent, err := reconciler.deleteExactNamespace(ctx, tenant, specHash, foundation)
@@ -448,6 +412,30 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
+	}
+	if tenant.Status.Teardown == nil ||
+		(tenant.Status.Teardown.Phase != deletionLockReleaseStarted &&
+			tenant.Status.Teardown.Phase != deletionLockReleased) {
+		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			if status.Teardown == nil {
+				status.Teardown = &tenancyv1alpha1.TeardownStatus{}
+			}
+			status.Teardown.Phase = deletionLockReleaseStarted
+			return nil
+		})
+	}
+	if tenant.Status.Teardown.Phase == deletionLockReleaseStarted {
+		released, err := reconciler.releaseDeletionLock(ctx, tenant)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !released {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.Teardown.Phase = deletionLockReleased
+			return nil
+		})
 	}
 	if err := reconciler.removeTenantFinalizer(ctx, tenant.Name); err != nil {
 		return ctrl.Result{}, err
@@ -515,145 +503,6 @@ func (reconciler *TenantReconciler) deleteKubeconfigSecret(ctx context.Context, 
 		return false, err
 	}
 	return false, nil
-}
-
-func (reconciler *TenantReconciler) deleteExactUnstructured(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation, gvk schema.GroupVersionKind, namespace, name, resource string) (bool, error) {
-	object := &unstructured.Unstructured{}
-	object.SetGroupVersionKind(gvk)
-	err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, object)
-	if apierrors.IsNotFound(err) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if err := validateRootOwnership(object, tenant, specHash, foundation.Hash, resource, foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-		return false, err
-	}
-	if err := validateRecordedUID(tenant.Status, object); err != nil {
-		return false, err
-	}
-	uid := object.GetUID()
-	resourceVersion := object.GetResourceVersion()
-	propagation := metav1.DeletePropagationBackground
-	err = reconciler.Delete(ctx, object, &client.DeleteOptions{
-		Preconditions:     &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
-		PropagationPolicy: &propagation,
-	})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return false, err
-	}
-	return false, nil
-}
-
-func (reconciler *TenantReconciler) deleteExactNamespace(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
-	var namespace corev1.Namespace
-	err := reconciler.reader().Get(ctx, types.NamespacedName{Name: tenant.Name}, &namespace)
-	if apierrors.IsNotFound(err) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	if err := validateRootOwnership(&namespace, tenant, specHash, foundation.Hash, "namespace", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-		return false, err
-	}
-	namespace.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Namespace"))
-	if err := validateRecordedUID(tenant.Status, &namespace); err != nil {
-		return false, err
-	}
-	uid := namespace.UID
-	resourceVersion := namespace.ResourceVersion
-	propagation := metav1.DeletePropagationBackground
-	err = reconciler.Delete(ctx, &namespace, &client.DeleteOptions{
-		Preconditions:     &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
-		PropagationPolicy: &propagation,
-	})
-	if err != nil && !apierrors.IsNotFound(err) {
-		return false, err
-	}
-	return false, nil
-}
-
-func deleteTenantResources(
-	ctx context.Context,
-	tenantClient client.Client,
-	tenant *tenancyv1alpha1.Tenant,
-	specHash,
-	foundationHash string,
-	workloadsCleanupComplete bool,
-) (bool, error) {
-	values := append([]tenancyv1alpha1.ObservedResourceIdentity(nil), tenant.Status.TenantResources...)
-	sort.Slice(values, func(left, right int) bool {
-		leftPriority := tenantDeletePriority(values[left].Kind)
-		rightPriority := tenantDeletePriority(values[right].Kind)
-		if leftPriority != rightPriority {
-			return leftPriority < rightPriority
-		}
-		leftIdentity := values[left].APIVersion + "/" + values[left].Kind + "/" + values[left].Namespace + "/" + values[left].Name
-		rightIdentity := values[right].APIVersion + "/" + values[right].Kind + "/" + values[right].Namespace + "/" + values[right].Name
-		return leftIdentity < rightIdentity
-	})
-	for _, identity := range values {
-		if identity.Kind == "Node" {
-			continue
-		}
-		isDefinitionOrNamespace := identity.Kind == "CustomResourceDefinition" || identity.Kind == "Namespace"
-		if workloadsCleanupComplete != isDefinitionOrNamespace {
-			continue
-		}
-		gvk := schema.FromAPIVersionAndKind(identity.APIVersion, identity.Kind)
-		object := &unstructured.Unstructured{}
-		object.SetGroupVersionKind(gvk)
-		err := tenantClient.Get(ctx, client.ObjectKey{Namespace: identity.Namespace, Name: identity.Name}, object)
-		if apierrors.IsNotFound(err) {
-			continue
-		}
-		if err != nil {
-			return false, err
-		}
-		annotations := object.GetAnnotations()
-		if string(object.GetUID()) != identity.UID ||
-			annotations[resources.TenantUIDAnnotation] != string(tenant.UID) ||
-			annotations[resources.SpecHashAnnotation] != specHash ||
-			annotations[resources.FoundationAnnotation] != foundationHash {
-			return false, fmt.Errorf("tenant resource %s/%s ownership changed before cleanup", identity.Kind, identity.Name)
-		}
-		uid := object.GetUID()
-		resourceVersion := object.GetResourceVersion()
-		propagation := metav1.DeletePropagationBackground
-		if err := tenantClient.Delete(ctx, object, &client.DeleteOptions{
-			Preconditions:     &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
-			PropagationPolicy: &propagation,
-		}); err != nil && !apierrors.IsNotFound(err) {
-			return false, err
-		}
-		return false, nil
-	}
-	return true, nil
-}
-
-func tenantDeletePriority(kind string) int {
-	switch kind {
-	case "Cluster":
-		return 0
-	case "Deployment", "DaemonSet", "StatefulSet":
-		return 1
-	case "Pod", "PodDisruptionBudget":
-		return 2
-	case "PersistentVolumeClaim":
-		return 3
-	case "PersistentVolume":
-		return 4
-	case "StorageClass":
-		return 5
-	case "CustomResourceDefinition":
-		return 7
-	case "Namespace":
-		return 8
-	default:
-		return 6
-	}
 }
 
 func stageAtOrAfter(current, boundary string) bool {

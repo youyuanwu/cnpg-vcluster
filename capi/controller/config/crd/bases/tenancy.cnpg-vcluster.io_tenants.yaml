@@ -168,6 +168,31 @@ spec:
                 type: string
               foundationHash:
                 type: string
+              foundationSnapshot:
+                properties:
+                  controllerImage:
+                    type: string
+                  foundationHash:
+                    type: string
+                  managementContainerID:
+                    type: string
+                  networkID:
+                    type: string
+                  peerAllocationsHash:
+                    type: string
+                  resourceHash:
+                    type: string
+                  targetEndpoint:
+                    type: string
+                required:
+                - controllerImage
+                - foundationHash
+                - managementContainerID
+                - networkID
+                - peerAllocationsHash
+                - resourceHash
+                - targetEndpoint
+                type: object
               functionalEvidence:
                 properties:
                   categories:
@@ -264,6 +289,8 @@ spec:
                     type: string
                   clusterUID:
                     type: string
+                  foundationTeardown:
+                    type: boolean
                   phase:
                     type: string
                   reservation:

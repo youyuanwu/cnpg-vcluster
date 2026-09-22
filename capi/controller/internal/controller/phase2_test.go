@@ -10,7 +10,9 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -670,8 +672,12 @@ func TestPartialFinalizationReleasesEndpointAfterStatusCrashGap(t *testing.T) {
 			PodCIDR:           "10.20.0.0/16",
 			ServiceCIDR:       "10.21.0.0/16",
 		},
+		Status: tenancyv1alpha1.TenantStatus{
+			Teardown: &tenancyv1alpha1.TeardownStatus{Reservation: "nonce"},
+		},
 	}
-	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tenant).WithObjects(tenant).Build()
+	controls := deletionControlObjects(t, tenant, "nonce")
+	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tenant).WithObjects(append([]client.Object{tenant}, controls...)...).Build()
 	foundation := testFoundation()
 	foundation.Hash = "foundation-hash"
 	if _, err := allocateEndpoint(context.Background(), kubernetes, kubernetes, defaultFoundationNamespace, foundation, tenant, "spec-hash"); err != nil {
@@ -727,7 +733,8 @@ func TestPartialFinalizationDeletesUnrecordedExactVolume(t *testing.T) {
 		Status: tenancyv1alpha1.TenantStatus{
 			Stage: tenancyv1alpha1.StageNamespaceCreated,
 			Teardown: &tenancyv1alpha1.TeardownStatus{
-				Authority: "TenantAPINeverAuthorized",
+				Authority:   "TenantAPINeverAuthorized",
+				Reservation: "nonce",
 			},
 		},
 	}
@@ -748,7 +755,9 @@ func TestPartialFinalizationDeletesUnrecordedExactVolume(t *testing.T) {
 		},
 	}}
 	allocation := endpointConfigMap(t, foundation, tenant, "spec-hash")
-	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tenant).WithObjects(tenant, namespace, allocation).Build()
+	objects := []client.Object{tenant, namespace, allocation}
+	objects = append(objects, deletionControlObjects(t, tenant, "nonce")...)
+	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tenant).WithObjects(objects...).Build()
 	name := foundation.Inputs.LabPrefix + "-" + tenant.Name + "-storage"
 	labels := map[string]string{
 		foundation.Inputs.OwnershipLabel:           foundation.Inputs.LabPrefix,
@@ -807,11 +816,13 @@ func TestPartialFinalizationHonorsPersistedLiveCleanupCheckpoint(t *testing.T) {
 		Status: tenancyv1alpha1.TenantStatus{
 			Stage: tenancyv1alpha1.StageEndpointReleased,
 			Teardown: &tenancyv1alpha1.TeardownStatus{
-				Authority: "LiveBootstrapRBACCleanupComplete",
-				Phase:     "LiveBootstrapRBACCleanupComplete",
+				Authority:   "LiveBootstrapRBACCleanupComplete",
+				Phase:       deletionLockReleased,
+				Reservation: "nonce",
 			},
 		},
 	}
+
 	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tenant).WithObjects(tenant).Build()
 	foundation := testFoundation()
 	foundation.Hash = "foundation-hash"
@@ -830,5 +841,38 @@ func TestPartialFinalizationHonorsPersistedLiveCleanupCheckpoint(t *testing.T) {
 	}
 	if err == nil && containsString(updated.Finalizers, tenantFinalizer) {
 		t.Fatal("persisted live cleanup checkpoint did not permit finalizer removal")
+	}
+}
+
+func deletionControlObjects(t *testing.T, tenant *tenancyv1alpha1.Tenant, nonce string) []client.Object {
+	t.Helper()
+	reservation, err := json.Marshal(DeletionReservation{
+		Schema: 1, TenantName: tenant.Name, TenantUID: string(tenant.UID),
+		Requester: "test-user", Nonce: nonce, ExpiresAt: float64(time.Now().Add(time.Hour).Unix()),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := nonce
+	duration := deletionLeaseSeconds
+	now := metav1.NewMicroTime(time.Now())
+	return []client.Object{
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: DeletionReservationName, Namespace: defaultFoundationNamespace, UID: "reservation-uid"},
+			Data:       map[string]string{deletionReservationKey: string(reservation)},
+		},
+		&coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: DeletionLeaseName, Namespace: defaultFoundationNamespace, UID: "lease-uid",
+				Annotations: map[string]string{
+					"tenancy.cnpg-vcluster.io/tenant":     tenant.Name,
+					"tenancy.cnpg-vcluster.io/tenant-uid": string(tenant.UID),
+				},
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity: &holder, LeaseDurationSeconds: &duration,
+				AcquireTime: &now, RenewTime: &now,
+			},
+		},
 	}
 }

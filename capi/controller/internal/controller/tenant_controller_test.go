@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
@@ -18,6 +19,9 @@ func testScheme(t *testing.T) *runtime.Scheme {
 	t.Helper()
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinationv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenancyv1alpha1.AddToScheme(scheme); err != nil {
