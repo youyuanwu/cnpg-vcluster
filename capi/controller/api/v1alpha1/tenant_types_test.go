@@ -15,13 +15,11 @@ func TestTenantStatusRoundTrip(t *testing.T) {
 			ServiceCIDR:       "10.21.0.0/16",
 		},
 		Status: TenantStatus{
-			Phase:    PhaseProgressing,
-			SpecHash: "hash",
-			FunctionalEvidence: &FunctionalEvidence{
-				VerifiedAt: 1,
-				ExpiresAt:  2,
-				Categories: map[string]bool{"database": true},
-			},
+			Phase: PhaseProgressing,
+			WorkerContainers: []WorkerContainerEvidence{{
+				Name: "worker-a",
+				ID:   "container-a",
+			}},
 		},
 	}
 	data, err := json.Marshal(&tenant)
@@ -32,7 +30,9 @@ func TestTenantStatusRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		t.Fatal(err)
 	}
-	if decoded.Status.Phase != PhaseProgressing || !decoded.Status.FunctionalEvidence.Categories["database"] {
+	if decoded.Status.Phase != PhaseProgressing ||
+		len(decoded.Status.WorkerContainers) != 1 ||
+		decoded.Status.WorkerContainers[0].ID != "container-a" {
 		t.Fatalf("unexpected round trip: %#v", decoded.Status)
 	}
 }

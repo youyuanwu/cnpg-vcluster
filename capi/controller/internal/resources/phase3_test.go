@@ -7,7 +7,7 @@ import (
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
 
-func TestNetworkBuilderPinsImagesChunksAndReferencesSources(t *testing.T) {
+func TestNetworkBuilderPinsImagesAndReturnsDirectObjects(t *testing.T) {
 	context := resourceContext()
 	calico := []byte(strings.Join([]string{
 		"apiVersion: apps/v1\nkind: DaemonSet\nmetadata:\n  name: calico-node\n  namespace: kube-system\nspec:\n  template:\n    spec:\n      containers:\n      - name: calico-node\n        image: calico/node:tag\n        env: []\n      initContainers:\n      - name: install-cni\n        image: calico/cni:tag\n      - name: upgrade-ipam\n        image: calico/cni:tag",
@@ -18,13 +18,10 @@ func TestNetworkBuilderPinsImagesChunksAndReferencesSources(t *testing.T) {
 		CalicoCNI: "calico/cni:exact", CalicoCNITagged: "calico/cni:tag",
 		CalicoNode: "calico/node:exact", CalicoNodeTagged: "calico/node:tag",
 		CalicoControllers: "calico/controllers:exact", CalicoControllersTag: "calico/controllers:tag",
-		KubeProxy: "kube-proxy:exact", Verify: "verify:exact",
+		KubeProxy: "kube-proxy:exact",
 	})
 	if err != nil {
 		t.Fatal(err)
-	}
-	if len(bundle.Sources) == 0 || len(bundle.Inventory) != len(bundle.Sources) {
-		t.Fatalf("unexpected network sources: %#v", bundle)
 	}
 	if len(bundle.Objects) == 0 {
 		t.Fatal("network object inventory is empty")
@@ -36,16 +33,12 @@ func TestNetworkBuilderPinsImagesChunksAndReferencesSources(t *testing.T) {
 			t.Fatalf("network object ownership markers are incomplete: %s/%s", object.GetKind(), object.GetName())
 		}
 	}
-	references, _, _ := unstructured.NestedSlice(bundle.ResourceSet.Object, "spec", "resources")
-	if len(references) != len(bundle.Sources) {
-		t.Fatalf("resource references do not match sources: %#v", references)
+	encoded, err := EncodeDocuments(bundle.Objects)
+	if err != nil {
+		t.Fatal(err)
 	}
-	strategy, _, _ := unstructured.NestedString(bundle.ResourceSet.Object, "spec", "strategy")
-	if strategy != "ApplyOnce" {
-		t.Fatalf("network resource set can recreate cleanup targets: %q", strategy)
-	}
-	if !strings.Contains(bundle.Sources[0].Data["addons.yaml"], context.Spec.PodCIDR) {
-		t.Fatal("Calico pool CIDR was not rendered")
+	if !strings.Contains(encoded, context.Spec.PodCIDR) {
+		t.Fatal("Calico pool CIDR was not rendered in direct objects")
 	}
 }
 
@@ -53,8 +46,8 @@ func TestStorageAndCNPGBuildersPreserveCountsAndAffinity(t *testing.T) {
 	context := resourceContext()
 	context.Spec.DatabaseCount = 3
 	context.Spec.Workers = 1
-	storage := StorageObjects(context, "capi-hostpath", "verify:exact")
-	if len(storage) != 4 {
+	storage := StorageObjects(context, "capi-hostpath")
+	if len(storage) != 1 {
 		t.Fatalf("unexpected storage object count: %d", len(storage))
 	}
 	database := CNPGObjects(context, "capi-hostpath", "postgres:exact")
@@ -78,10 +71,21 @@ func TestStorageAndCNPGBuildersPreserveCountsAndAffinity(t *testing.T) {
 	}
 }
 
-func TestNetworkSourceRejectsOversizedDocument(t *testing.T) {
+func TestWorkerBootstrapCommandsArePassedToKubeadm(t *testing.T) {
 	context := resourceContext()
-	_, _, err := packageNetworkSources(context, "network", strings.Repeat("x", NetworkSourceLimit))
-	if err == nil {
-		t.Fatal("oversized single network document was accepted")
+	context.WorkerBootstrapCommands = []string{"echo first", "echo second"}
+	template := KubeadmConfigTemplate(context)
+	commands, found, err := unstructured.NestedStringSlice(
+		template.Object,
+		"spec",
+		"template",
+		"spec",
+		"preKubeadmCommands",
+	)
+	if err != nil || !found {
+		t.Fatalf("worker bootstrap commands are missing: found=%v err=%v", found, err)
+	}
+	if len(commands) != 2 || commands[0] != "echo first" || commands[1] != "echo second" {
+		t.Fatalf("unexpected worker bootstrap commands: %#v", commands)
 	}
 }

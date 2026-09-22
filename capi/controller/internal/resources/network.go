@@ -1,22 +1,10 @@
 package resources
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"sort"
 	"strings"
 
-	corev1 "k8s.io/api/core/v1"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-)
-
-const (
-	NetworkSourceLimit    = 900 * 1024
-	NetworkReferenceLimit = 100
 )
 
 type NetworkImages struct {
@@ -27,14 +15,10 @@ type NetworkImages struct {
 	CalicoControllers    string
 	CalicoControllersTag string
 	KubeProxy            string
-	Verify               string
 }
 
 type NetworkBundle struct {
-	Sources     []*corev1.ConfigMap
-	ResourceSet *unstructured.Unstructured
-	Inventory   map[string]string
-	Objects     []*unstructured.Unstructured
+	Objects []*unstructured.Unstructured
 }
 
 func BuildNetwork(context Context, calico []byte, images NetworkImages) (NetworkBundle, error) {
@@ -83,101 +67,7 @@ func BuildNetwork(context Context, calico []byte, images NetworkImages) (Network
 	objects = append([]*unstructured.Unstructured{endpoint}, objects...)
 	objects = append(objects, kubeProxyObjects(context, images.KubeProxy)...)
 	SortObjects(objects)
-	content, err := EncodeDocuments(objects)
-	if err != nil {
-		return NetworkBundle{}, err
-	}
-	sources, inventory, err := packageNetworkSources(context, context.Tenant.Name+"-network", content)
-	if err != nil {
-		return NetworkBundle{}, err
-	}
-	resourceSet := object(context,
-		schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: "v1beta2", Kind: "ClusterResourceSet"},
-		context.Tenant.Name,
-		context.Tenant.Name+"-network",
-		"network-resource-set",
-		map[string]any{
-			"strategy": "ApplyOnce",
-			"clusterSelector": map[string]any{
-				"matchLabels": map[string]any{"cnpg-vcluster.capi/addons": context.Tenant.Name},
-			},
-			"resources": resourceReferences(inventory),
-		},
-	)
-	return NetworkBundle{
-		Sources:     sources,
-		ResourceSet: resourceSet,
-		Inventory:   inventory,
-		Objects:     objects,
-	}, nil
-}
-
-func packageNetworkSources(context Context, baseName, content string) ([]*corev1.ConfigMap, map[string]string, error) {
-	documents := strings.Split(content, "\n---\n")
-	chunks := make([]string, 0)
-	current := ""
-	for _, document := range documents {
-		candidate := document
-		if current != "" {
-			candidate = current + "\n---\n" + document
-		}
-		name := fmt.Sprintf("%s-%03d", baseName, len(chunks))
-		candidateMap := networkSource(context, name, candidate)
-		encoded, _ := json.Marshal(candidateMap)
-		if len(encoded) <= NetworkSourceLimit {
-			current = candidate
-			continue
-		}
-		if current == "" {
-			return nil, nil, fmt.Errorf("single network document exceeds source limit")
-		}
-		chunks = append(chunks, current)
-		current = document
-	}
-	if current != "" {
-		chunks = append(chunks, current)
-	}
-	if len(chunks) > NetworkReferenceLimit {
-		return nil, nil, fmt.Errorf("network source reference limit exceeded")
-	}
-	sources := make([]*corev1.ConfigMap, 0, len(chunks))
-	inventory := map[string]string{}
-	for index, chunk := range chunks {
-		name := baseName
-		if len(chunks) != 1 {
-			name = fmt.Sprintf("%s-%03d", baseName, index)
-		}
-		source := networkSource(context, name, chunk)
-		sources = append(sources, source)
-		digest := sha256.Sum256([]byte(chunk))
-		inventory[name] = hex.EncodeToString(digest[:])
-	}
-	return sources, inventory, nil
-}
-
-func networkSource(context Context, name, content string) *corev1.ConfigMap {
-	labels, annotations := markers(context, "network-source")
-	labels["addons.cluster.x-k8s.io/resource-set"] = ""
-	return &corev1.ConfigMap{
-		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "ConfigMap"},
-		ObjectMeta: metav1.ObjectMeta{
-			Name: name, Namespace: context.Tenant.Name, Labels: labels, Annotations: annotations,
-		},
-		Data: map[string]string{"addons.yaml": content},
-	}
-}
-
-func resourceReferences(inventory map[string]string) []any {
-	names := make([]string, 0, len(inventory))
-	for name := range inventory {
-		names = append(names, name)
-	}
-	sort.Strings(names)
-	result := make([]any, 0, len(names))
-	for _, name := range names {
-		result = append(result, map[string]any{"kind": "ConfigMap", "name": name})
-	}
-	return result
+	return NetworkBundle{Objects: objects}, nil
 }
 
 func replaceStrings(value any, replacements map[string]string, counts map[string]int) {

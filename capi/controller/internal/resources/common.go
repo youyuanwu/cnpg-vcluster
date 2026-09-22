@@ -33,13 +33,14 @@ type Inputs struct {
 }
 
 type Context struct {
-	Tenant         *tenancyv1alpha1.Tenant
-	Spec           validation.CanonicalSpec
-	SpecHash       string
-	FoundationHash string
-	Endpoint       string
-	VolumePath     string
-	Inputs         Inputs
+	Tenant                  *tenancyv1alpha1.Tenant
+	Spec                    validation.CanonicalSpec
+	SpecHash                string
+	FoundationHash          string
+	Endpoint                string
+	VolumePath              string
+	WorkerBootstrapCommands []string
+	Inputs                  Inputs
 }
 
 func markers(context Context, resource string) (map[string]string, map[string]string) {

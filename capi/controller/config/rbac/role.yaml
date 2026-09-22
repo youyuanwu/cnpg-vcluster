@@ -44,16 +44,6 @@ rules:
   - list
   - watch
 - apiGroups:
-  - addons.cluster.x-k8s.io
-  resources:
-  - clusterresourcesets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - watch
-- apiGroups:
   - bootstrap.cluster.x-k8s.io
   resources:
   - kubeadmconfigtemplates

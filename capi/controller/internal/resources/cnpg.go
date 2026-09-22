@@ -2,7 +2,6 @@ package resources
 
 import (
 	"fmt"
-	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 )
@@ -67,27 +66,4 @@ func CNPGObjects(context Context, storageClass, postgresImage string) []*unstruc
 		MarkTenantObject(context, value, "cnpg")
 	}
 	return values
-}
-
-func SQLProbe(context Context, postgresImage string) *unstructured.Unstructured {
-	script := strings.Join([]string{
-		"set -eu",
-		"export PGPASSWORD=\"$(cat /secret/password)\"",
-		"psql -X -qAt -v ON_ERROR_STOP=1 -h capi-postgres-rw -U app -d app -c \"CREATE TABLE IF NOT EXISTS verification(marker text PRIMARY KEY); INSERT INTO verification VALUES ('capi-marker') ON CONFLICT DO NOTHING;\"",
-		"test \"$(psql -X -qAt -v ON_ERROR_STOP=1 -h capi-postgres-rw -U app -d app -c \"SELECT marker FROM verification WHERE marker='capi-marker';\")\" = capi-marker",
-	}, "; ")
-	value := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "v1", "kind": "Pod",
-		"metadata": map[string]any{"name": context.Tenant.Name + "-sql-verify", "namespace": "database"},
-		"spec": map[string]any{
-			"restartPolicy": "Never", "automountServiceAccountToken": false,
-			"containers": []any{map[string]any{
-				"name": "psql", "image": postgresImage, "command": []any{"sh", "-ec", script},
-				"volumeMounts": []any{map[string]any{"name": "credentials", "mountPath": "/secret", "readOnly": true}},
-			}},
-			"volumes": []any{map[string]any{"name": "credentials", "secret": map[string]any{"secretName": "capi-postgres-app"}}},
-		},
-	}}
-	MarkTenantObject(context, value, "database-probe")
-	return value
 }

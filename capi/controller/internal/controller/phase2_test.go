@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
-	"os/exec"
 	"strings"
 	"testing"
 
@@ -472,109 +471,27 @@ func TestDockerErrorsArePropagated(t *testing.T) {
 	}
 }
 
-func TestWorkerPreparationVerifiesCacheMirrorEgressAndPull(t *testing.T) {
+func TestWorkerBootstrapCommandsIncludeImagesAndOfflineSetup(t *testing.T) {
 	foundation := testFoundation()
 	foundation.OfflineEnforced = true
 	foundation.Registry = &FoundationRegistry{Address: "172.18.0.10", Port: 5000, Generation: "registry", Identifier: "registry-id"}
-	checksum := foundation.Cache.ImageArchives[0].SHA256
-	docker := &fakeDockerClient{}
-	docker.execFunc = func(command []string) (DockerExecResult, error) {
-		joined := strings.Join(command, " ")
-		switch {
-		case strings.Contains(joined, "sha256sum "):
-			return DockerExecResult{Output: checksum + "  archive\n"}, nil
-		case strings.Contains(joined, "images inspect"):
-			return DockerExecResult{Output: "└── target@sha256:" + strings.Repeat("c", 64)}, nil
-		case strings.Contains(joined, "iptables -Z CAPI_OFFLINE"):
-			return DockerExecResult{Output: "1 1\n"}, nil
-		default:
-			return DockerExecResult{}, nil
-		}
-	}
-	reconciler := &TenantReconciler{Docker: docker}
-	evidence := workerEvidence(nil, DockerContainer{ID: "worker-id", Name: "worker"}, foundation.Cache.Generation)
-	for attempts := 0; !evidence.Prepared && attempts < 20; attempts++ {
-		var err error
-		evidence, err = reconciler.prepareWorkerStep(context.Background(), DockerContainer{ID: "worker-id", Name: "worker"}, foundation, evidence)
-		if err != nil {
-			t.Fatal(err)
-		}
-	}
-	if !evidence.Prepared || len(evidence.ImportedImages) != 8 ||
-		!evidence.MirrorsConfigured || !evidence.EgressVerified || !evidence.MirrorPullVerified {
-		t.Fatalf("worker evidence is incomplete: %#v", evidence)
-	}
-	joined := make([]string, 0, len(docker.commands))
-	for _, command := range docker.commands {
-		joined = append(joined, strings.Join(command, " "))
-	}
-	all := strings.Join(joined, "\n")
-	for _, expected := range []string{"images import --digests", "hosts.toml", "CAPI_OFFLINE", "crictl pull"} {
-		if !strings.Contains(all, expected) {
-			t.Fatalf("worker preparation omitted %q:\n%s", expected, all)
-		}
-	}
-}
-
-func TestWorkerPreparationStopsOnCacheMismatch(t *testing.T) {
-	foundation := testFoundation()
-	docker := &fakeDockerClient{execResult: DockerExecResult{Output: strings.Repeat("0", 64) + "  archive\n"}}
-	reconciler := &TenantReconciler{Docker: docker}
-	evidence := workerEvidence(nil, DockerContainer{ID: "worker-id"}, foundation.Cache.Generation)
-	if _, err := reconciler.prepareWorkerStep(context.Background(), DockerContainer{ID: "worker-id"}, foundation, evidence); err == nil {
-		t.Fatal("cache checksum mismatch was accepted")
-	}
-	if len(docker.commands) != 1 {
-		t.Fatalf("worker mutation continued after checksum mismatch: %#v", docker.commands)
-	}
-}
-
-func TestWorkerPreparationRejectsWrongImportedDigest(t *testing.T) {
-	foundation := testFoundation()
-	checksum := foundation.Cache.ImageArchives[0].SHA256
-	docker := &fakeDockerClient{execFunc: func(command []string) (DockerExecResult, error) {
-		joined := strings.Join(command, " ")
-		if strings.Contains(joined, "sha256sum ") {
-			return DockerExecResult{Output: checksum + "  archive\n"}, nil
-		}
-		if strings.Contains(joined, "images inspect") {
-			return DockerExecResult{Output: "└── target@sha256:" + strings.Repeat("0", 64)}, nil
-		}
-		return DockerExecResult{}, nil
-	}}
-	reconciler := &TenantReconciler{Docker: docker}
-	evidence := workerEvidence(nil, DockerContainer{ID: "worker-id"}, foundation.Cache.Generation)
-	if _, err := reconciler.prepareWorkerStep(context.Background(), DockerContainer{ID: "worker-id"}, foundation, evidence); err == nil {
-		t.Fatal("wrong imported image digest was accepted")
-	}
-}
-
-func TestCaptureShellExitSurvivesErrexit(t *testing.T) {
-	script := captureShellExit("false") + "; printf '%s\\n' \"$rc\""
-	output, err := exec.Command("sh", "-ec", script).CombinedOutput()
+	commands, err := workerBootstrapCommands(foundation)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(string(output)) != "1" {
-		t.Fatalf("unexpected captured status: %q", output)
+	all := strings.Join(commands, "\n")
+	for _, expected := range []string{"sha256sum -c", "images import --digests", "hosts.toml", "CAPI_OFFLINE"} {
+		if !strings.Contains(all, expected) {
+			t.Fatalf("worker bootstrap omitted %q:\n%s", expected, all)
+		}
 	}
 }
 
-func TestWorkerPreparationPropagatesCancellationAndBoundsCommands(t *testing.T) {
+func TestWorkerBootstrapCommandsRequireEveryImage(t *testing.T) {
 	foundation := testFoundation()
-	docker := &fakeDockerClient{err: context.Canceled}
-	reconciler := &TenantReconciler{Docker: docker}
-	evidence := workerEvidence(nil, DockerContainer{ID: "worker-id"}, foundation.Cache.Generation)
-	if _, err := reconciler.prepareWorkerStep(context.Background(), DockerContainer{ID: "worker-id"}, foundation, evidence); !errors.Is(err, context.Canceled) {
-		t.Fatalf("cancellation was not propagated: %v", err)
-	}
-	docker.err = nil
-	docker.execResult = DockerExecResult{Output: foundation.Cache.ImageArchives[0].SHA256 + "  archive\n"}
-	_, _ = reconciler.prepareWorkerStep(context.Background(), DockerContainer{ID: "worker-id"}, foundation, evidence)
-	for _, command := range docker.commands[1:] {
-		if len(command) < 2 || command[0] != "timeout" || command[1] != "90" {
-			t.Fatalf("container command is not bounded: %#v", command)
-		}
+	foundation.Cache.ImageArchives = foundation.Cache.ImageArchives[1:]
+	if _, err := workerBootstrapCommands(foundation); err == nil {
+		t.Fatal("missing worker image was accepted")
 	}
 }
 

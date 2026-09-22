@@ -39,14 +39,10 @@ func networkImages(foundation Foundation) (resources.NetworkImages, error) {
 	if err != nil {
 		return resources.NetworkImages{}, err
 	}
-	verify, err := get("VERIFY_IMAGE")
-	if err != nil {
-		return resources.NetworkImages{}, err
-	}
 	return resources.NetworkImages{
 		CalicoCNI: cni.Reference, CalicoCNITagged: cni.Tagged,
 		CalicoNode: node.Reference, CalicoNodeTagged: node.Tagged,
 		CalicoControllers: controllers.Reference, CalicoControllersTag: controllers.Tagged,
-		KubeProxy: proxy.Reference, Verify: verify.Reference,
+		KubeProxy: proxy.Reference,
 	}, nil
 }

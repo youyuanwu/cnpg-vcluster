@@ -6,7 +6,6 @@ import (
 	"os"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -21,6 +20,9 @@ import (
 )
 
 func (reconciler *TenantReconciler) reconcileNetwork(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
+	if tenant.Status.Stage != tenancyv1alpha1.StageWorkersApplied {
+		return reconciler.reconcilePostCNIWorkers(ctx, tenant, canonical, specHash, foundation)
+	}
 	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
 	calico, err := os.ReadFile("/assets/calico.yaml")
 	if err != nil {
@@ -34,135 +36,33 @@ func (reconciler *TenantReconciler) reconcileNetwork(ctx context.Context, tenant
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	switch tenant.Status.Stage {
-	case tenancyv1alpha1.StageWorkersApplied:
-		for _, source := range bundle.Sources {
-			identity, changed, err := reconciler.ensureNetworkSource(ctx, source, tenant, specHash, foundation)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			if changed || findIdentity(tenant.Status, corev1.SchemeGroupVersion.WithKind("ConfigMap"), source.Namespace, source.Name) == nil {
-				return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageWorkersApplied, identity)
-			}
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageNetworkSourcesApplied
-			return nil
-		})
-	case tenancyv1alpha1.StageNetworkSourcesApplied:
-		identity, err := reconciler.ensureUnstructured(ctx, bundle.ResourceSet, tenant, specHash, foundation, "network-resource-set")
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageNetworkResourceSetApplied, identity)
-	case tenancyv1alpha1.StageNetworkResourceSetApplied:
-		tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		for _, desired := range bundle.Objects {
-			identity, changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			if changed || !tenantIdentityPresent(tenant.Status.TenantResources, identity) {
-				return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-					return upsertTenantIdentity(status, identity)
-				})
-			}
-		}
-		ready, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !ready {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		probe := networkProbe(resourceContext, images.Verify)
-		identity, _, err := ensureTenantObject(ctx, tenantClient, probe, tenant, specHash, foundation.Hash)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			if err := upsertTenantIdentity(status, identity); err != nil {
-				return err
-			}
-			status.Stage = tenancyv1alpha1.StageNetworkProbeCreated
-			return nil
-		})
-	case tenancyv1alpha1.StageNetworkProbeCreated:
-		tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		probe := networkProbe(resourceContext, images.Verify)
-		current := probe.DeepCopy()
-		if err := tenantClient.Get(ctx, client.ObjectKeyFromObject(probe), current); err != nil {
-			return ctrl.Result{}, err
-		}
-		phase, _, _ := unstructured.NestedString(current.Object, "status", "phase")
-		if phase == "Failed" {
-			return ctrl.Result{}, fmt.Errorf("network functional probe failed")
-		}
-		if phase != "Succeeded" {
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-		}
-		if err := validateTenantProbeIdentity(tenant, current, specHash, foundation.Hash, "network-probe"); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageNetworkProbeSucceeded
-			return nil
-		})
-	case tenancyv1alpha1.StageNetworkProbeSucceeded:
-		tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		probe := networkProbe(resourceContext, images.Verify)
-		absent, err := deleteCompletedTenantProbe(ctx, tenantClient, tenant, probe)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !absent {
-			return ctrl.Result{RequeueAfter: time.Second}, nil
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			removeTenantIdentity(status, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())
-			status.Stage = tenancyv1alpha1.StageNetworkReady
-			setCondition(status, tenant, "NetworkReady", metav1.ConditionTrue, "NetworkReady", "Tenant networking and DNS/API probes are ready")
-			return nil
-		})
-	default:
-		return reconciler.reconcilePostCNIWorkers(ctx, tenant, canonical, specHash, foundation)
-	}
-}
-
-func (reconciler *TenantReconciler) ensureNetworkSource(ctx context.Context, desired *corev1.ConfigMap, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (tenancyv1alpha1.ObservedResourceIdentity, bool, error) {
-	var current corev1.ConfigMap
-	err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: desired.Namespace, Name: desired.Name}, &current)
-	if apierrors.IsNotFound(err) {
-		if err := reconciler.Create(ctx, desired); err != nil {
-			return tenancyv1alpha1.ObservedResourceIdentity{}, false, err
-		}
-		desired.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("ConfigMap"))
-		return identityFor(desired), true, nil
-	}
+	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
 	if err != nil {
-		return tenancyv1alpha1.ObservedResourceIdentity{}, false, err
+		return ctrl.Result{}, err
 	}
-	if err := validateRootOwnership(&current, tenant, specHash, foundation.Hash, "network-source", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-		return tenancyv1alpha1.ObservedResourceIdentity{}, false, err
-	}
-	current.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("ConfigMap"))
-	if current.Data["addons.yaml"] != desired.Data["addons.yaml"] {
-		current.Data = desired.Data
-		if err := reconciler.Update(ctx, &current); err != nil {
-			return tenancyv1alpha1.ObservedResourceIdentity{}, false, err
+	for _, desired := range bundle.Objects {
+		identity, changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
+		if err != nil {
+			return ctrl.Result{}, err
 		}
-		return identityFor(&current), true, nil
+		if changed || !tenantIdentityPresent(tenant.Status.TenantResources, identity) {
+			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+				return upsertTenantIdentity(status, identity)
+			})
+		}
 	}
-	return identityFor(&current), false, nil
+	ready, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !ready {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		status.Stage = tenancyv1alpha1.StageNetworkReady
+		setCondition(status, tenant, "NetworkReady", metav1.ConditionTrue, "NetworkReady", "Tenant networking workloads are ready")
+		return nil
+	})
 }
 
 func networkStructurallyReady(ctx context.Context, tenantClient client.Client, workers int64) (bool, error) {
@@ -201,20 +101,4 @@ func networkStructurallyReady(ctx context.Context, tenantClient client.Client, w
 		}
 	}
 	return true, nil
-}
-
-func networkProbe(context resources.Context, image string) *unstructured.Unstructured {
-	value := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "v1", "kind": "Pod",
-		"metadata": map[string]any{"name": context.Tenant.Name + "-network-verify", "namespace": "default"},
-		"spec": map[string]any{
-			"restartPolicy": "Never", "automountServiceAccountToken": false,
-			"containers": []any{map[string]any{
-				"name": "verify", "image": image,
-				"command": []any{"sh", "-ec", fmt.Sprintf("nslookup kubernetes.default.svc.%s && wget -qO- --timeout=5 https://kubernetes.default.svc.%s/version --no-check-certificate >/dev/null", context.Inputs.ClusterDomain, context.Inputs.ClusterDomain)},
-			}},
-		},
-	}}
-	resources.MarkTenantObject(context, value, "network-probe")
-	return value
 }

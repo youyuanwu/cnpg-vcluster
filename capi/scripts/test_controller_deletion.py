@@ -151,8 +151,8 @@ def main() -> None:
                 "observedResources": (survivor_before.get("status") or {}).get(
                     "observedResources"
                 ),
-                "workerSnapshotHash": (survivor_before.get("status") or {}).get(
-                    "workerSnapshotHash"
+                "workerContainers": (survivor_before.get("status") or {}).get(
+                    "workerContainers"
                 ),
             }
 
@@ -236,8 +236,8 @@ def main() -> None:
                 "observedResources": (survivor_after.get("status") or {}).get(
                     "observedResources"
                 ),
-                "workerSnapshotHash": (survivor_after.get("status") or {}).get(
-                    "workerSnapshotHash"
+                "workerContainers": (survivor_after.get("status") or {}).get(
+                    "workerContainers"
                 ),
             }
             if current_identity != survivor_identity:

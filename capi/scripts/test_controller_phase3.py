@@ -42,16 +42,17 @@ def _ready(client: ManagementClient) -> dict[str, object] | None:
         )
     if status.get("stage") != "Ready" or status.get("phase") != "Ready":
         return None
-    evidence = status.get("functionalEvidence") or {}
-    if evidence.get("categories") != {
-        "clusterAccess": True,
-        "workers": True,
-        "network": True,
-        "storage": True,
-        "database": True,
-    }:
-        raise RuntimeError("Phase 3 functional evidence is incomplete")
-    if not status.get("workerSnapshotHash") or not status.get("tenantResources"):
+    ready = next(
+        (
+            condition
+            for condition in status.get("conditions", [])
+            if condition.get("type") == "Ready"
+        ),
+        {},
+    )
+    if ready.get("status") != "True":
+        raise RuntimeError("Phase 3 Ready condition is not true")
+    if not status.get("tenantResources"):
         raise RuntimeError("Phase 3 exact tenant identities are incomplete")
     return tenant
 

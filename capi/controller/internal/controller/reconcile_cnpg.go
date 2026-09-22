@@ -22,9 +22,7 @@ func (reconciler *TenantReconciler) reconcileCNPG(ctx context.Context, tenant *t
 	if tenant.Status.Stage != tenancyv1alpha1.StageStorageReady &&
 		tenant.Status.Stage != tenancyv1alpha1.StageCNPGOperatorApplied &&
 		tenant.Status.Stage != tenancyv1alpha1.StageCNPGStoragePrepared &&
-		tenant.Status.Stage != tenancyv1alpha1.StageCNPGClusterApplied &&
-		tenant.Status.Stage != tenancyv1alpha1.StageDatabaseProbeCreated &&
-		tenant.Status.Stage != tenancyv1alpha1.StageDatabaseProbeSucceeded {
+		tenant.Status.Stage != tenancyv1alpha1.StageCNPGClusterApplied {
 		return reconciler.reconcileReadiness(ctx, tenant, canonical, specHash, foundation)
 	}
 	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
@@ -113,56 +111,9 @@ func (reconciler *TenantReconciler) reconcileCNPG(ctx context.Context, tenant *t
 		if !ready {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		probe := resources.SQLProbe(resourceContext, postgresImage.Reference)
-		identity, _, err := ensureTenantObject(ctx, tenantClient, probe, tenant, specHash, foundation.Hash)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			if err := upsertTenantIdentity(status, identity); err != nil {
-				return err
-			}
-			status.Stage = tenancyv1alpha1.StageDatabaseProbeCreated
-			return nil
-		})
-	case tenancyv1alpha1.StageDatabaseProbeCreated:
-		probe := resources.SQLProbe(resourceContext, postgresImage.Reference)
-		current := probe.DeepCopy()
-		if err := tenantClient.Get(ctx, client.ObjectKeyFromObject(probe), current); err != nil {
-			return ctrl.Result{}, err
-		}
-		phase, _, _ := unstructured.NestedString(current.Object, "status", "phase")
-		if phase == "Failed" {
-			return ctrl.Result{}, fmt.Errorf("database SQL marker probe failed")
-		}
-		if phase != "Succeeded" {
-			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
-		}
-		if err := validateTenantProbeIdentity(tenant, current, specHash, foundation.Hash, "database-probe"); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageDatabaseProbeSucceeded
-			return nil
-		})
-	case tenancyv1alpha1.StageDatabaseProbeSucceeded:
-		probe := resources.SQLProbe(resourceContext, postgresImage.Reference)
-		absent, err := deleteCompletedTenantProbe(ctx, tenantClient, tenant, probe)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !absent {
-			return ctrl.Result{RequeueAfter: time.Second}, nil
-		}
-		check := fmt.Sprintf("for ordinal in $(seq 1 %d); do path=%s/volumes/cnpg/$ordinal/pgdata; test -d \"$path\"; test \"$(stat -c %%u:%%g \"$path\")\" = 26:26; test \"$(stat -c %%a \"$path\")\" = 700; test -f \"$path/global/pg_control\"; test \"$(stat -c %%u:%%g:%%a \"$path/global/pg_control\")\" = 26:26:600; done",
-			canonical.DatabaseCount, foundation.Inputs.StorageContainerPath)
-		if err := reconciler.execRequired(ctx, tenant.Status.WorkerContainers[0].ID, []string{"sh", "-ec", check}); err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			removeTenantIdentity(status, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())
 			status.Stage = tenancyv1alpha1.StageDatabaseReady
-			setCondition(status, tenant, "DatabaseReady", metav1.ConditionTrue, "DatabaseReady", "CNPG instances, SQL marker, and filesystem ownership are ready")
+			setCondition(status, tenant, "DatabaseReady", metav1.ConditionTrue, "DatabaseReady", "CNPG instances and persistent volumes are ready")
 			return nil
 		})
 	}

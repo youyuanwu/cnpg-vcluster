@@ -102,6 +102,19 @@ func upsertTenantIdentity(status *tenancyv1alpha1.TenantStatus, identity tenancy
 	return nil
 }
 
+func tenantIdentityPresent(values []tenancyv1alpha1.ObservedResourceIdentity, expected tenancyv1alpha1.ObservedResourceIdentity) bool {
+	for _, value := range values {
+		if value.APIVersion == expected.APIVersion &&
+			value.Kind == expected.Kind &&
+			value.Namespace == expected.Namespace &&
+			value.Name == expected.Name &&
+			value.UID == expected.UID {
+			return true
+		}
+	}
+	return false
+}
+
 func removeTenantIdentity(
 	status *tenancyv1alpha1.TenantStatus,
 	gvk schema.GroupVersionKind,
@@ -119,67 +132,6 @@ func removeTenantIdentity(
 		result = append(result, identity)
 	}
 	status.TenantResources = result
-}
-
-func removeTenantProbeIdentities(status *tenancyv1alpha1.TenantStatus, tenantName string) bool {
-	before := len(status.TenantResources)
-	for _, item := range []struct {
-		namespace string
-		name      string
-	}{
-		{"default", tenantName + "-network-verify"},
-		{"default", tenantName + "-storage-verify"},
-		{"database", tenantName + "-sql-verify"},
-	} {
-		removeTenantIdentity(status, schema.GroupVersionKind{Version: "v1", Kind: "Pod"}, item.namespace, item.name)
-	}
-	return len(status.TenantResources) != before
-}
-
-func deleteCompletedTenantProbe(
-	ctx context.Context,
-	tenantClient client.Client,
-	tenant *tenancyv1alpha1.Tenant,
-	probe *unstructured.Unstructured,
-) (bool, error) {
-	current := probe.DeepCopy()
-	err := tenantClient.Get(ctx, client.ObjectKeyFromObject(probe), current)
-	if apierrors.IsNotFound(err) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	recorded := findTenantIdentity(tenant.Status.TenantResources, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())
-	if recorded == nil || recorded.UID != string(current.GetUID()) {
-		return false, fmt.Errorf("%s probe identity changed before cleanup", probe.GetName())
-	}
-	if err := tenantClient.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
-		return false, err
-	}
-	return false, nil
-}
-
-func validateTenantProbeIdentity(
-	tenant *tenancyv1alpha1.Tenant,
-	probe *unstructured.Unstructured,
-	specHash,
-	foundationHash,
-	expectedResource string,
-) error {
-	recorded := findTenantIdentity(tenant.Status.TenantResources, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())
-	if recorded == nil || recorded.UID != string(probe.GetUID()) {
-		return fmt.Errorf("%s probe identity changed before success checkpoint", probe.GetName())
-	}
-	annotations := probe.GetAnnotations()
-	if annotations[resources.TenantAnnotation] != tenant.Name ||
-		annotations[resources.TenantUIDAnnotation] != string(tenant.UID) ||
-		annotations[resources.SpecHashAnnotation] != specHash ||
-		annotations[resources.FoundationAnnotation] != foundationHash ||
-		annotations[resources.ResourceAnnotation] != expectedResource {
-		return fmt.Errorf("%s probe ownership changed before success checkpoint", probe.GetName())
-	}
-	return nil
 }
 
 func tenantObjectReady(object *unstructured.Unstructured) bool {

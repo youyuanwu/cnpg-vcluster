@@ -34,7 +34,6 @@ const tenantFinalizer = "tenancy.cnpg-vcluster.io/finalizer"
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=devclusters;devmachinetemplates;devmachines,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kubeadmconfigtemplates,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;create;delete
-// +kubebuilder:rbac:groups=addons.cluster.x-k8s.io,resources=clusterresourcesets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 type TenantReconciler struct {
@@ -66,7 +65,19 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 	if !reconciler.MutationEnabled && !managedDeletion {
 		return ctrl.Result{}, reconciler.publishMutationDisabled(ctx, &tenant, specHash)
 	}
-	foundation, err := loadFoundation(ctx, reconciler.reader(), reconciler.docker(), reconciler.foundationNamespace(), reconciler.foundationName(), reconciler.SupportedVersion, reconciler.ExpectedControllerImage)
+	var foundation Foundation
+	var err error
+	if managedDeletion {
+		foundation, err = loadFoundationForDeletion(
+			ctx,
+			reconciler.reader(),
+			reconciler.foundationNamespace(),
+			reconciler.foundationName(),
+			tenant.Status.FoundationHash,
+		)
+	} else {
+		foundation, err = loadFoundation(ctx, reconciler.reader(), reconciler.docker(), reconciler.foundationNamespace(), reconciler.foundationName(), reconciler.SupportedVersion, reconciler.ExpectedControllerImage)
+	}
 	if err != nil {
 		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "FoundationInvalid", err)
 	}
@@ -193,7 +204,6 @@ func (reconciler *TenantReconciler) SetupWithManager(manager ctrl.Manager) error
 		devMachineTemplateGVK,
 		machineDeploymentGVK,
 		machineGVK,
-		{Group: "addons.cluster.x-k8s.io", Version: "v1beta2", Kind: "ClusterResourceSet"},
 	} {
 		object := &unstructured.Unstructured{}
 		object.SetGroupVersionKind(gvk)

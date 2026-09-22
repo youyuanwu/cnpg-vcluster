@@ -129,26 +129,21 @@ def _workers_applied(client: ManagementClient) -> dict[str, object] | None:
         )
     accepted_stages = {
         "WorkersApplied",
-        "NetworkSourcesApplied",
-        "NetworkResourceSetApplied",
-        "NetworkProbeCreated",
         "NetworkReady",
         "PostCNIWorkersReady",
         "StorageApplied",
-        "StorageProbeCreated",
         "StorageReady",
         "CNPGOperatorApplied",
         "CNPGStoragePrepared",
         "CNPGClusterApplied",
-        "DatabaseProbeCreated",
         "DatabaseReady",
         "Ready",
     }
     if status.get("stage") not in accepted_stages:
         return None
     workers = status.get("workerContainers") or []
-    if len(workers) != 1 or not workers[0].get("prepared"):
-        raise RuntimeError("Phase 2 worker preparation evidence is incomplete")
+    if len(workers) != 1 or not workers[0].get("id"):
+        raise RuntimeError("Phase 2 worker container reference is incomplete")
     if not status.get("dockerVolume") or not status.get("endpoint"):
         raise RuntimeError("Phase 2 endpoint or Docker volume identity is missing")
     ready = next(

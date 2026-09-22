@@ -30,23 +30,14 @@ const (
 	StageMachineTemplateCreated    = "MachineTemplateCreated"
 	StageMachineDeploymentCreated  = "MachineDeploymentCreated"
 	StageWorkersApplied            = "WorkersApplied"
-	StageNetworkSourcesApplied     = "NetworkSourcesApplied"
-	StageNetworkResourceSetApplied = "NetworkResourceSetApplied"
-	StageNetworkProbeCreated       = "NetworkProbeCreated"
-	StageNetworkProbeSucceeded     = "NetworkProbeSucceeded"
 	StageNetworkReady              = "NetworkReady"
 	StagePostCNIWorkersReady       = "PostCNIWorkersReady"
 	StageStorageApplied            = "StorageApplied"
-	StageStorageProbeCreated       = "StorageProbeCreated"
-	StageStorageProbeSucceeded     = "StorageProbeSucceeded"
 	StageStorageReady              = "StorageReady"
 	StageCNPGOperatorApplied       = "CNPGOperatorApplied"
 	StageCNPGStoragePrepared       = "CNPGStoragePrepared"
 	StageCNPGClusterApplied        = "CNPGClusterApplied"
-	StageDatabaseProbeCreated      = "DatabaseProbeCreated"
-	StageDatabaseProbeSucceeded    = "DatabaseProbeSucceeded"
 	StageDatabaseReady             = "DatabaseReady"
-	StageFunctionalVerified        = "FunctionalVerified"
 	StageReady                     = "Ready"
 	StageEndpointReleased          = "EndpointReleased"
 )
@@ -69,22 +60,12 @@ type TenantSpec struct {
 }
 
 type ObservedResourceIdentity struct {
-	APIVersion    string   `json:"apiVersion"`
-	Kind          string   `json:"kind"`
-	Namespace     string   `json:"namespace,omitempty"`
-	Name          string   `json:"name"`
-	UID           string   `json:"uid"`
-	ContentSHA256 string   `json:"contentSHA256,omitempty"`
-	PreviousUIDs  []string `json:"previousUIDs,omitempty"`
-}
-
-type FunctionalEvidence struct {
-	VerifiedAt       float64         `json:"verifiedAt"`
-	ExpiresAt        float64         `json:"expiresAt"`
-	SpecHash         string          `json:"specHash"`
-	FoundationHash   string          `json:"foundationHash"`
-	ObservationsHash string          `json:"observationsHash"`
-	Categories       map[string]bool `json:"categories"`
+	APIVersion    string `json:"apiVersion"`
+	Kind          string `json:"kind"`
+	Namespace     string `json:"namespace,omitempty"`
+	Name          string `json:"name"`
+	UID           string `json:"uid"`
+	ContentSHA256 string `json:"contentSHA256,omitempty"`
 }
 
 type DockerVolumeIdentity struct {
@@ -95,15 +76,8 @@ type DockerVolumeIdentity struct {
 }
 
 type WorkerContainerEvidence struct {
-	Name               string   `json:"name"`
-	ID                 string   `json:"id"`
-	PreviousIDs        []string `json:"previousIDs,omitempty"`
-	CacheGeneration    string   `json:"cacheGeneration"`
-	ImportedImages     []string `json:"importedImages,omitempty"`
-	MirrorsConfigured  bool     `json:"mirrorsConfigured,omitempty"`
-	EgressVerified     bool     `json:"egressVerified,omitempty"`
-	MirrorPullVerified bool     `json:"mirrorPullVerified,omitempty"`
-	Prepared           bool     `json:"prepared"`
+	Name string `json:"name"`
+	ID   string `json:"id"`
 }
 
 type TeardownStatus struct {
@@ -120,13 +94,10 @@ type TenantStatus struct {
 	Endpoint           string                     `json:"endpoint,omitempty"`
 	SpecHash           string                     `json:"specHash,omitempty"`
 	FoundationHash     string                     `json:"foundationHash,omitempty"`
-	ObservationsHash   string                     `json:"observationsHash,omitempty"`
 	ObservedResources  []ObservedResourceIdentity `json:"observedResources,omitempty"`
 	TenantResources    []ObservedResourceIdentity `json:"tenantResources,omitempty"`
 	DockerVolume       *DockerVolumeIdentity      `json:"dockerVolume,omitempty"`
 	WorkerContainers   []WorkerContainerEvidence  `json:"workerContainers,omitempty"`
-	WorkerSnapshotHash string                     `json:"workerSnapshotHash,omitempty"`
-	FunctionalEvidence *FunctionalEvidence        `json:"functionalEvidence,omitempty"`
 	Teardown           *TeardownStatus            `json:"teardown,omitempty"`
 }
 
@@ -138,8 +109,6 @@ type TenantStatus struct {
 // +kubebuilder:printcolumn:name="Endpoint",type=string,JSONPath=`.status.endpoint`
 // +kubebuilder:printcolumn:name="Workers",type=integer,JSONPath=`.spec.workers`
 // +kubebuilder:printcolumn:name="Databases",type=integer,JSONPath=`.spec.databaseCount`
-// +kubebuilder:printcolumn:name="Last Verified",type=number,JSONPath=`.status.functionalEvidence.verifiedAt`
-// +kubebuilder:printcolumn:name="Expires",type=number,JSONPath=`.status.functionalEvidence.expiresAt`
 type Tenant struct {
 	metav1.TypeMeta   `json:",inline"`
 	metav1.ObjectMeta `json:"metadata,omitempty"`

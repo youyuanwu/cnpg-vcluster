@@ -2,164 +2,102 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"fmt"
-	"math"
-	"sort"
 	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
 
-const functionalEvidenceLifetime = 24 * time.Hour
+const readyObservationInterval = 30 * time.Second
 
 func (reconciler *TenantReconciler) reconcileReadiness(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
-	now := time.Now().UTC()
-	if tenant.Status.Stage == tenancyv1alpha1.StageReady {
-		if removeTenantProbeIdentities(&tenant.Status, tenant.Name) {
-			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				removeTenantProbeIdentities(status, tenant.Name)
-				status.FunctionalEvidence = nil
-				status.Stage = tenancyv1alpha1.StageNetworkResourceSetApplied
-				status.Phase = tenancyv1alpha1.PhaseProgressing
-				setCondition(status, tenant, "FunctionalReady", metav1.ConditionFalse, "EvidenceRefresh", "Functional evidence is being refreshed without completed probe identities")
-				setCondition(status, tenant, "Ready", metav1.ConditionFalse, "EvidenceRefresh", "Functional evidence must be refreshed")
-				return nil
-			})
-		}
-		state, err := reconciler.observePostCNIWorkerState(ctx, tenant, canonical, specHash, foundation)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		evidence := normalizeWorkerEvidence(tenant.Status.WorkerContainers, state.containers, foundation.Cache.Generation)
-		if !state.inventoryComplete || !state.allReady ||
-			state.snapshotHash != tenant.Status.WorkerSnapshotHash ||
-			!allWorkerEvidencePrepared(evidence) {
-			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				if len(state.containers) == int(canonical.Workers) {
-					status.WorkerContainers = evidence
-				}
-				if len(state.machines) == int(canonical.Workers) {
-					replaceMachineIdentities(status, state.machines)
-				}
-				if state.inventoryComplete {
-					recordPostCNIWorkerState(status, state)
-				} else {
-					status.WorkerSnapshotHash = ""
-				}
-				status.Stage = tenancyv1alpha1.StageMachineDeploymentCreated
-				status.Phase = tenancyv1alpha1.PhaseProgressing
-				status.FunctionalEvidence = nil
-				setCondition(status, tenant, "WorkersReady", metav1.ConditionFalse, "WorkerReplacement", "Worker replacement preparation is required")
-				setCondition(status, tenant, "Ready", metav1.ConditionFalse, "WorkerReplacement", "Worker replacement invalidated Ready evidence")
-				return nil
-			})
-		}
-		if err := validateFunctionalEvidence(tenant.Status, now); err != nil {
-			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				status.Phase = tenancyv1alpha1.PhaseDegraded
-				status.Stage = tenancyv1alpha1.StageNetworkResourceSetApplied
-				status.FunctionalEvidence = nil
-				setCondition(status, tenant, "FunctionalReady", metav1.ConditionFalse, "EvidenceExpired", err.Error())
-				setCondition(status, tenant, "Ready", metav1.ConditionFalse, "EvidenceExpired", "Functional evidence must be refreshed")
-				return nil
-			})
-		}
-		if tenant.Status.Phase != tenancyv1alpha1.PhaseReady {
-			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				status.Phase = tenancyv1alpha1.PhaseReady
-				setCondition(status, tenant, "Ready", metav1.ConditionTrue, "Ready", "Tenant is structurally and functionally ready")
-				return nil
-			})
-		}
-		remaining := time.Until(time.Unix(int64(tenant.Status.FunctionalEvidence.ExpiresAt), 0))
-		if remaining < time.Minute {
-			remaining = time.Minute
-		}
-		return ctrl.Result{RequeueAfter: remaining / 2}, nil
-	}
-	if tenant.Status.Stage != tenancyv1alpha1.StageDatabaseReady {
+	if tenant.Status.Stage != tenancyv1alpha1.StageDatabaseReady &&
+		tenant.Status.Stage != tenancyv1alpha1.StageReady {
 		return ctrl.Result{}, fmt.Errorf("unsupported readiness stage %q", tenant.Status.Stage)
 	}
-	observations := observationsHash(tenant.Status)
-	verified := float64(now.Unix())
-	evidence := &tenancyv1alpha1.FunctionalEvidence{
-		VerifiedAt: verified, ExpiresAt: verified + functionalEvidenceLifetime.Seconds(),
-		SpecHash: tenant.Status.SpecHash, FoundationHash: tenant.Status.FoundationHash,
-		ObservationsHash: observations,
-		Categories: map[string]bool{
-			"clusterAccess": true, "workers": true, "network": true, "storage": true, "database": true,
-		},
+	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	return ctrl.Result{RequeueAfter: functionalEvidenceLifetime / 2}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		status.ObservationsHash = observations
-		status.FunctionalEvidence = evidence
+	workers, err := reconciler.observePostCNIWorkerState(ctx, tenant, canonical, specHash, foundation)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	networkReady, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	storageReady, err := storageClassReady(ctx, tenantClient)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	postgresImage, found := archiveByKey(foundation.Cache.ImageArchives, "POSTGRES_IMAGE")
+	if !found {
+		return ctrl.Result{}, fmt.Errorf("POSTGRES_IMAGE is missing")
+	}
+	databaseReady, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount, postgresImage.Reference)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	workersReady := workers.inventoryComplete && workers.allReady
+	ready := workersReady && networkReady && storageReady && databaseReady
+	if !ready {
+		return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.Phase = tenancyv1alpha1.PhaseDegraded
+			setReadyObservationConditions(status, tenant, workersReady, networkReady, storageReady, databaseReady)
+			setCondition(status, tenant, "Ready", metav1.ConditionFalse, "ComponentsNotReady", "One or more Tenant components are not ready")
+			return nil
+		})
+	}
+	return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		recordPostCNIWorkerState(status, workers)
 		status.Stage = tenancyv1alpha1.StageReady
 		status.Phase = tenancyv1alpha1.PhaseReady
-		setCondition(status, tenant, "FunctionalReady", metav1.ConditionTrue, "FunctionalReady", "All five functional categories are current")
-		setCondition(status, tenant, "Ready", metav1.ConditionTrue, "Ready", "Tenant is structurally and functionally ready")
+		setReadyObservationConditions(status, tenant, true, true, true, true)
+		setCondition(status, tenant, "Ready", metav1.ConditionTrue, "Ready", "Tenant components are ready")
 		return nil
 	})
 }
 
-func observationsHash(status tenancyv1alpha1.TenantStatus) string {
-	values := make([]map[string]any, 0, len(status.ObservedResources)+len(status.TenantResources)+1)
-	for _, identity := range append(append([]tenancyv1alpha1.ObservedResourceIdentity{}, status.ObservedResources...), status.TenantResources...) {
-		values = append(values, map[string]any{
-			"apiVersion": identity.APIVersion, "kind": identity.Kind, "namespace": identity.Namespace,
-			"name": identity.Name, "uid": identity.UID, "contentSHA256": identity.ContentSHA256,
-			"previousUIDs": append([]string(nil), identity.PreviousUIDs...),
-		})
+func setReadyObservationConditions(status *tenancyv1alpha1.TenantStatus, tenant *tenancyv1alpha1.Tenant, workers, network, storage, database bool) {
+	for _, value := range []struct {
+		condition string
+		ready     bool
+	}{
+		{"WorkersReady", workers},
+		{"NetworkReady", network},
+		{"StorageReady", storage},
+		{"DatabaseReady", database},
+	} {
+		conditionStatus := metav1.ConditionFalse
+		reason := "NotReady"
+		message := value.condition + " is false"
+		if value.ready {
+			conditionStatus = metav1.ConditionTrue
+			reason = value.condition
+			message = value.condition + " is true"
+		}
+		setCondition(status, tenant, value.condition, conditionStatus, reason, message)
 	}
-	values = append(values, map[string]any{
-		"apiVersion": tenancyv1alpha1.GroupVersion.String(), "kind": "WorkerSnapshot", "namespace": "",
-		"name": "workers", "uid": status.WorkerSnapshotHash, "contentSHA256": "", "previousUIDs": []string{},
-	})
-	sort.Slice(values, func(left, right int) bool {
-		a, b := values[left], values[right]
-		return fmt.Sprint(a["apiVersion"], "/", a["kind"], "/", a["namespace"], "/", a["name"], "/", a["uid"]) <
-			fmt.Sprint(b["apiVersion"], "/", b["kind"], "/", b["namespace"], "/", b["name"], "/", b["uid"])
-	})
-	for _, value := range values {
-		sort.Strings(value["previousUIDs"].([]string))
-	}
-	encoded, _ := json.Marshal(values)
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:])
 }
 
-func validateFunctionalEvidence(status tenancyv1alpha1.TenantStatus, now time.Time) error {
-	evidence := status.FunctionalEvidence
-	if evidence == nil {
-		return fmt.Errorf("functional evidence is missing")
-	}
-	if math.IsNaN(evidence.VerifiedAt) || math.IsInf(evidence.VerifiedAt, 0) ||
-		math.IsNaN(evidence.ExpiresAt) || math.IsInf(evidence.ExpiresAt, 0) {
-		return fmt.Errorf("functional evidence time is non-finite")
-	}
-	current := float64(now.Unix())
-	if evidence.VerifiedAt > current || evidence.ExpiresAt <= current ||
-		evidence.ExpiresAt != evidence.VerifiedAt+functionalEvidenceLifetime.Seconds() {
-		return fmt.Errorf("functional evidence is stale or future-dated")
-	}
-	if evidence.SpecHash != status.SpecHash || evidence.FoundationHash != status.FoundationHash ||
-		evidence.ObservationsHash != observationsHash(status) {
-		return fmt.Errorf("functional evidence identity is mismatched")
-	}
-	expected := []string{"clusterAccess", "workers", "network", "storage", "database"}
-	if len(evidence.Categories) != len(expected) {
-		return fmt.Errorf("functional evidence categories are incomplete")
-	}
-	for _, category := range expected {
-		if !evidence.Categories[category] {
-			return fmt.Errorf("functional evidence category %s is incomplete", category)
+func storageClassReady(ctx context.Context, tenantClient client.Client) (bool, error) {
+	storageClass := &unstructured.Unstructured{}
+	storageClass.SetGroupVersionKind(schema.GroupVersionKind{Group: "storage.k8s.io", Version: "v1", Kind: "StorageClass"})
+	if err := tenantClient.Get(ctx, client.ObjectKey{Name: tenantStorageClass}, storageClass); err != nil {
+		if apierrors.IsNotFound(err) {
+			return false, nil
 		}
+		return false, err
 	}
-	return nil
+	provisioner, _, _ := unstructured.NestedString(storageClass.Object, "provisioner")
+	return provisioner == "kubernetes.io/no-provisioner", nil
 }

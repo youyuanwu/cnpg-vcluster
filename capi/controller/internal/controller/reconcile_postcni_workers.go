@@ -2,12 +2,8 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -33,7 +29,6 @@ type postCNIWorkerState struct {
 	containers        []DockerContainer
 	inventoryComplete bool
 	allReady          bool
-	snapshotHash      string
 }
 
 func (reconciler *TenantReconciler) reconcilePostCNIWorkers(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
@@ -144,33 +139,12 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	}
 	state.inventoryComplete = true
 	state.allReady = machinesReady && devMachinesReady && nodesReady
-	state.snapshotHash = postCNIWorkerSnapshotHash(state)
 	return state, nil
-}
-
-func postCNIWorkerSnapshotHash(state postCNIWorkerState) string {
-	snapshot := make([]string, 0, len(state.machines)+len(state.devMachines)+len(state.nodes)+len(state.containers))
-	for _, machine := range state.machines {
-		snapshot = append(snapshot, "Machine:"+machine.GetName()+":"+string(machine.GetUID()))
-	}
-	for _, devMachine := range state.devMachines {
-		snapshot = append(snapshot, "DevMachine:"+devMachine.GetName()+":"+string(devMachine.GetUID()))
-	}
-	for _, node := range state.nodes {
-		snapshot = append(snapshot, "Node:"+node.GetName()+":"+string(node.GetUID()))
-	}
-	for _, container := range state.containers {
-		snapshot = append(snapshot, "Container:"+container.Name+":"+container.ID)
-	}
-	sort.Strings(snapshot)
-	encoded, _ := json.Marshal(snapshot)
-	digest := sha256.Sum256(encoded)
-	return hex.EncodeToString(digest[:])
 }
 
 func recordPostCNIWorkerState(status *tenancyv1alpha1.TenantStatus, state postCNIWorkerState) {
 	replaceMachineIdentities(status, state.machines)
 	status.ObservedResources = replaceResourceIdentities(status.ObservedResources, postCNIDevMachineGVK, state.devMachines)
 	status.TenantResources = replaceResourceIdentities(status.TenantResources, postCNINodeGVK, state.nodes)
-	status.WorkerSnapshotHash = state.snapshotHash
+	status.WorkerContainers = workerContainerReferences(state.containers)
 }

@@ -12,7 +12,7 @@ var (
 )
 
 func KubeadmConfigTemplate(context Context) *unstructured.Unstructured {
-	return object(context, kubeadmTemplateGVK, context.Tenant.Name, context.Tenant.Name+"-worker", "kubeadm-config-template", map[string]any{
+	spec := map[string]any{
 		"template": map[string]any{
 			"spec": map[string]any{
 				"joinConfiguration": map[string]any{
@@ -27,7 +27,15 @@ func KubeadmConfigTemplate(context Context) *unstructured.Unstructured {
 				},
 			},
 		},
-	})
+	}
+	if len(context.WorkerBootstrapCommands) != 0 {
+		commands := make([]any, 0, len(context.WorkerBootstrapCommands))
+		for _, command := range context.WorkerBootstrapCommands {
+			commands = append(commands, command)
+		}
+		spec["template"].(map[string]any)["spec"].(map[string]any)["preKubeadmCommands"] = commands
+	}
+	return object(context, kubeadmTemplateGVK, context.Tenant.Name, context.Tenant.Name+"-worker", "kubeadm-config-template", spec)
 }
 
 func DevMachineTemplate(context Context) *unstructured.Unstructured {

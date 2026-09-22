@@ -32,12 +32,6 @@ spec:
     - jsonPath: .spec.databaseCount
       name: Databases
       type: integer
-    - jsonPath: .status.functionalEvidence.verifiedAt
-      name: Last Verified
-      type: number
-    - jsonPath: .status.functionalEvidence.expiresAt
-      name: Expires
-      type: number
     name: v1alpha1
     schema:
       openAPIV3Schema:
@@ -168,32 +162,6 @@ spec:
                 type: string
               foundationHash:
                 type: string
-              functionalEvidence:
-                properties:
-                  categories:
-                    additionalProperties:
-                      type: boolean
-                    type: object
-                  expiresAt:
-                    type: number
-                  foundationHash:
-                    type: string
-                  observationsHash:
-                    type: string
-                  specHash:
-                    type: string
-                  verifiedAt:
-                    type: number
-                required:
-                - categories
-                - expiresAt
-                - foundationHash
-                - observationsHash
-                - specHash
-                - verifiedAt
-                type: object
-              observationsHash:
-                type: string
               observedGeneration:
                 format: int64
                 type: integer
@@ -210,10 +178,6 @@ spec:
                       type: string
                     namespace:
                       type: string
-                    previousUIDs:
-                      items:
-                        type: string
-                      type: array
                     uid:
                       type: string
                   required:
@@ -259,10 +223,6 @@ spec:
                       type: string
                     namespace:
                       type: string
-                    previousUIDs:
-                      items:
-                        type: string
-                      type: array
                     uid:
                       type: string
                   required:
@@ -275,37 +235,15 @@ spec:
               workerContainers:
                 items:
                   properties:
-                    cacheGeneration:
-                      type: string
-                    egressVerified:
-                      type: boolean
                     id:
                       type: string
-                    importedImages:
-                      items:
-                        type: string
-                      type: array
-                    mirrorPullVerified:
-                      type: boolean
-                    mirrorsConfigured:
-                      type: boolean
                     name:
                       type: string
-                    prepared:
-                      type: boolean
-                    previousIDs:
-                      items:
-                        type: string
-                      type: array
                   required:
-                  - cacheGeneration
                   - id
                   - name
-                  - prepared
                   type: object
                 type: array
-              workerSnapshotHash:
-                type: string
             type: object
         required:
         - spec

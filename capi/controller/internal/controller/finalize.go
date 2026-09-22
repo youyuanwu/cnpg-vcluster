@@ -330,28 +330,6 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		tenant.Status.Teardown.Authority != tenantAPICleanupUnavailable {
 		return ctrl.Result{}, fmt.Errorf("partial Tenant cleanup authority is invalid")
 	}
-	for _, identity := range tenant.Status.ObservedResources {
-		resource := ""
-		switch identity.Kind {
-		case "ConfigMap":
-			if identity.Namespace == tenant.Name {
-				resource = "network-source"
-			}
-		case "ClusterResourceSet":
-			resource = "network-resource-set"
-		}
-		if resource == "" {
-			continue
-		}
-		gvk := schema.FromAPIVersionAndKind(identity.APIVersion, identity.Kind)
-		absent, err := reconciler.deleteExactUnstructured(ctx, tenant, specHash, foundation, gvk, identity.Namespace, identity.Name, resource)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !absent {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-	}
 	if !stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageTenantAPICleanupRequired) &&
 		tenant.Status.Teardown != nil && tenant.Status.Teardown.Phase != "ManagementDeletionStarted" {
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
@@ -558,21 +536,13 @@ func stageAtOrAfter(current, boundary string) bool {
 		tenancyv1alpha1.StageMachineTemplateCreated,
 		tenancyv1alpha1.StageMachineDeploymentCreated,
 		tenancyv1alpha1.StageWorkersApplied,
-		tenancyv1alpha1.StageNetworkSourcesApplied,
-		tenancyv1alpha1.StageNetworkResourceSetApplied,
-		tenancyv1alpha1.StageNetworkProbeCreated,
-		tenancyv1alpha1.StageNetworkProbeSucceeded,
 		tenancyv1alpha1.StageNetworkReady,
 		tenancyv1alpha1.StagePostCNIWorkersReady,
 		tenancyv1alpha1.StageStorageApplied,
-		tenancyv1alpha1.StageStorageProbeCreated,
-		tenancyv1alpha1.StageStorageProbeSucceeded,
 		tenancyv1alpha1.StageStorageReady,
 		tenancyv1alpha1.StageCNPGOperatorApplied,
 		tenancyv1alpha1.StageCNPGStoragePrepared,
 		tenancyv1alpha1.StageCNPGClusterApplied,
-		tenancyv1alpha1.StageDatabaseProbeCreated,
-		tenancyv1alpha1.StageDatabaseProbeSucceeded,
 		tenancyv1alpha1.StageDatabaseReady,
 		tenancyv1alpha1.StageReady,
 		tenancyv1alpha1.StageEndpointReleased,

@@ -33,7 +33,6 @@ var requiredWorkerImageKeys = []string{
 	"KONNECTIVITY_AGENT_IMAGE",
 	"CNPG_CONTROLLER_IMAGE",
 	"POSTGRES_IMAGE",
-	"VERIFY_IMAGE",
 }
 
 type FoundationArchive struct {
@@ -94,31 +93,10 @@ type Foundation struct {
 }
 
 func loadFoundation(ctx context.Context, reader client.Reader, docker DockerClient, namespace, name, supportedVersion, expectedControllerImage string) (Foundation, error) {
-	var configMap corev1.ConfigMap
-	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &configMap); err != nil {
-		return Foundation{}, fmt.Errorf("read Tenant foundation: %w", err)
-	}
-	encoded := configMap.Data["foundation.json"]
-	expectedHash := configMap.Data["foundation.sha256"]
-	var immutable map[string]any
-	if err := json.Unmarshal([]byte(encoded), &immutable); err != nil {
-		return Foundation{}, fmt.Errorf("decode Tenant foundation: %w", err)
-	}
-	delete(immutable, "mutationEnabled")
-	canonical, err := json.Marshal(immutable)
+	foundation, err := readFoundation(ctx, reader, namespace, name)
 	if err != nil {
-		return Foundation{}, fmt.Errorf("encode immutable Tenant foundation: %w", err)
+		return Foundation{}, err
 	}
-	actualHash := sha256.Sum256(canonical)
-	hash := hex.EncodeToString(actualHash[:])
-	if expectedHash == "" || expectedHash != hash {
-		return Foundation{}, fmt.Errorf("Tenant foundation checksum mismatch")
-	}
-	var foundation Foundation
-	if err := json.Unmarshal([]byte(encoded), &foundation); err != nil {
-		return Foundation{}, fmt.Errorf("decode Tenant foundation: %w", err)
-	}
-	foundation.Hash = hash
 	if err := validateFoundation(foundation, supportedVersion, expectedControllerImage); err != nil {
 		return Foundation{}, err
 	}
@@ -179,6 +157,55 @@ func loadFoundation(ctx context.Context, reader client.Reader, docker DockerClie
 			return Foundation{}, fmt.Errorf("offline registry network address mismatch")
 		}
 	}
+	return foundation, nil
+}
+
+func loadFoundationForDeletion(ctx context.Context, reader client.Reader, namespace, name, lifecycleHash string) (Foundation, error) {
+	foundation, err := readFoundation(ctx, reader, namespace, name)
+	if err != nil {
+		return Foundation{}, err
+	}
+	if lifecycleHash != "" {
+		foundation.Hash = lifecycleHash
+	}
+	if foundation.Schema != 2 ||
+		foundation.NetworkID == "" ||
+		foundation.PoolStart == "" ||
+		foundation.PoolEnd == "" ||
+		foundation.Inputs.OwnershipLabel == "" ||
+		foundation.Inputs.LabPrefix == "" ||
+		foundation.Inputs.StorageContainerPath == "" {
+		return Foundation{}, fmt.Errorf("Tenant deletion foundation identity is incomplete")
+	}
+	return foundation, nil
+}
+
+func readFoundation(ctx context.Context, reader client.Reader, namespace, name string) (Foundation, error) {
+	var configMap corev1.ConfigMap
+	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, &configMap); err != nil {
+		return Foundation{}, fmt.Errorf("read Tenant foundation: %w", err)
+	}
+	encoded := configMap.Data["foundation.json"]
+	expectedHash := configMap.Data["foundation.sha256"]
+	var immutable map[string]any
+	if err := json.Unmarshal([]byte(encoded), &immutable); err != nil {
+		return Foundation{}, fmt.Errorf("decode Tenant foundation: %w", err)
+	}
+	delete(immutable, "mutationEnabled")
+	canonical, err := json.Marshal(immutable)
+	if err != nil {
+		return Foundation{}, fmt.Errorf("encode immutable Tenant foundation: %w", err)
+	}
+	actualHash := sha256.Sum256(canonical)
+	hash := hex.EncodeToString(actualHash[:])
+	if expectedHash == "" || expectedHash != hash {
+		return Foundation{}, fmt.Errorf("Tenant foundation checksum mismatch")
+	}
+	var foundation Foundation
+	if err := json.Unmarshal([]byte(encoded), &foundation); err != nil {
+		return Foundation{}, fmt.Errorf("decode Tenant foundation: %w", err)
+	}
+	foundation.Hash = hash
 	return foundation, nil
 }
 

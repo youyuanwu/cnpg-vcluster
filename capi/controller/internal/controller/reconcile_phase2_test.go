@@ -77,6 +77,9 @@ func TestFinalizerOnlyDeletionCompletesWithoutAllocationState(t *testing.T) {
 	scheme := testScheme(t)
 	foundation := testFoundation()
 	foundation.MutationEnabled = false
+	foundation.ControllerImage = "stale-controller-image"
+	foundation.Cache.ActiveSHA256 = ""
+	foundation.Registry = &FoundationRegistry{}
 	now := metav1.Now()
 	tenant := validTenant("tenant-a")
 	tenant.DeletionTimestamp = &now
@@ -86,21 +89,10 @@ func TestFinalizerOnlyDeletionCompletesWithoutAllocationState(t *testing.T) {
 		WithStatusSubresource(tenant).
 		WithObjects(tenant, foundationConfigMap(t, foundation)).
 		Build()
-	docker := &fakeDockerClient{
-		container: DockerContainer{
-			ID:       foundation.ManagementContainerID,
-			State:    "running",
-			Labels:   foundation.ManagementLabels,
-			Networks: map[string]string{"kind": foundation.NetworkID},
-		},
-		network:    DockerNetwork{ID: foundation.NetworkID, Subnets: []string{foundation.Subnet}},
-		execResult: DockerExecResult{Output: "{\"generation\":\"generation\",\"schema\":1}\n"},
-		volumes:    map[string]DockerVolume{},
-	}
 	reconciler := &TenantReconciler{
 		Client:                  kubernetes,
 		APIReader:               kubernetes,
-		Docker:                  docker,
+		Docker:                  &fakeDockerClient{volumes: map[string]DockerVolume{}},
 		SupportedVersion:        "1.36.4",
 		MutationEnabled:         false,
 		ExpectedControllerImage: foundation.ControllerImage,
@@ -221,24 +213,13 @@ func TestValidationOnlyModeContinuesManagedDeletionWithUnhealthyPeer(t *testing.
 		WithStatusSubresource(tenant).
 		WithObjects(objects...).
 		Build()
-	docker := &fakeDockerClient{
-		container: DockerContainer{
-			ID:       foundation.ManagementContainerID,
-			State:    "running",
-			Labels:   foundation.ManagementLabels,
-			Networks: map[string]string{"kind": foundation.NetworkID},
-		},
-		network:    DockerNetwork{ID: foundation.NetworkID, Subnets: []string{foundation.Subnet}},
-		execResult: DockerExecResult{Output: "{\"generation\":\"generation\",\"schema\":1}\n"},
-		volumes:    map[string]DockerVolume{},
-	}
 	reconciler := &TenantReconciler{
 		Client:                  kubernetes,
 		APIReader:               kubernetes,
-		Docker:                  docker,
+		Docker:                  &fakeDockerClient{volumes: map[string]DockerVolume{}},
 		SupportedVersion:        "1.36.4",
 		MutationEnabled:         false,
-		ExpectedControllerImage: foundation.ControllerImage,
+		ExpectedControllerImage: "different-controller-image",
 	}
 	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: tenant.Name}}); err != nil {
 		t.Fatal(err)
