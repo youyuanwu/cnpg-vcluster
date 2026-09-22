@@ -112,12 +112,14 @@ func TestProbeSuccessCheckpointRejectsReplacementIdentity(t *testing.T) {
 	probe.SetName("tenant-a-network-verify")
 	probe.SetUID(types.UID("replacement-uid"))
 	probe.SetAnnotations(map[string]string{
+		resources.TenantAnnotation:     "tenant-a",
 		resources.TenantUIDAnnotation:  "tenant-uid",
 		resources.SpecHashAnnotation:   "spec-hash",
 		resources.FoundationAnnotation: "foundation-hash",
+		resources.ResourceAnnotation:   "network-probe",
 	})
 	tenant := &tenancyv1alpha1.Tenant{
-		ObjectMeta: metav1.ObjectMeta{UID: "tenant-uid"},
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
 		Status: tenancyv1alpha1.TenantStatus{
 			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
 				APIVersion: "v1", Kind: "Pod", Namespace: "default",
@@ -125,8 +127,23 @@ func TestProbeSuccessCheckpointRejectsReplacementIdentity(t *testing.T) {
 			}},
 		},
 	}
-	if err := validateTenantProbeIdentity(tenant, probe, "spec-hash", "foundation-hash"); err == nil {
+	if err := validateTenantProbeIdentity(tenant, probe, "spec-hash", "foundation-hash", "network-probe"); err == nil {
 		t.Fatal("replacement probe established the success checkpoint")
+	}
+	probe.SetUID(types.UID("recorded-uid"))
+	for annotation, value := range map[string]string{
+		resources.TenantAnnotation:   "tenant-b",
+		resources.ResourceAnnotation: "storage-probe",
+	} {
+		annotations := probe.GetAnnotations()
+		original := annotations[annotation]
+		annotations[annotation] = value
+		probe.SetAnnotations(annotations)
+		if err := validateTenantProbeIdentity(tenant, probe, "spec-hash", "foundation-hash", "network-probe"); err == nil {
+			t.Fatalf("tampered %s established the success checkpoint", annotation)
+		}
+		annotations[annotation] = original
+		probe.SetAnnotations(annotations)
 	}
 }
 

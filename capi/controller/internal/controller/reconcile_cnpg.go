@@ -138,7 +138,7 @@ func (reconciler *TenantReconciler) reconcileCNPG(ctx context.Context, tenant *t
 		if phase != "Succeeded" {
 			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 		}
-		if err := validateTenantProbeIdentity(tenant, current, specHash, foundation.Hash); err != nil {
+		if err := validateTenantProbeIdentity(tenant, current, specHash, foundation.Hash, "database-probe"); err != nil {
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
