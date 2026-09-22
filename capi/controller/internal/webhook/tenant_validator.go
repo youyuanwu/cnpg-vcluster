@@ -5,14 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
-	"time"
 
 	admissionv1 "k8s.io/api/admission/v1"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
-	tenantcontroller "github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/controller"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/sanitize"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
@@ -27,10 +24,6 @@ var allowedSpecFields = map[string]struct{}{
 
 type TenantValidator struct {
 	SupportedVersion string
-	Reader           client.Reader
-	Client           client.Client
-	Namespace        string
-	Now              func() time.Time
 }
 
 type rawTenant struct {
@@ -42,11 +35,8 @@ type rawTenant struct {
 	Spec json.RawMessage `json:"spec"`
 }
 
-// +kubebuilder:webhook:path=/validate-tenancy-cnpg-vcluster-io-v1alpha1-tenant,mutating=false,failurePolicy=fail,sideEffects=NoneOnDryRun,groups=tenancy.cnpg-vcluster.io,resources=tenants,verbs=create;update;delete,versions=v1alpha1,name=vtenant.tenancy.cnpg-vcluster.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-tenancy-cnpg-vcluster-io-v1alpha1-tenant,mutating=false,failurePolicy=fail,sideEffects=None,groups=tenancy.cnpg-vcluster.io,resources=tenants,verbs=create;update,versions=v1alpha1,name=vtenant.tenancy.cnpg-vcluster.io,admissionReviewVersions=v1
 func (validator *TenantValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
-	if request.Operation == admissionv1.Delete {
-		return validator.validateDelete(ctx, request)
-	}
 	if request.Operation != admissionv1.Create && request.Operation != admissionv1.Update {
 		return admission.Allowed("operation does not mutate Tenant spec")
 	}
@@ -64,63 +54,6 @@ func (validator *TenantValidator) Handle(ctx context.Context, request admission.
 		}
 	}
 	return admission.Allowed(fmt.Sprintf("accepted Tenant %s", current.Metadata.Name))
-}
-
-func (validator *TenantValidator) validateDelete(ctx context.Context, request admission.Request) admission.Response {
-	if validator.Reader == nil {
-		return admission.Denied("targeted deletion reservation reader is unavailable")
-	}
-	current, _, err := validator.decodeAndValidate(request.OldObject.Raw)
-	if err != nil {
-		return admission.Denied("stored Tenant is invalid")
-	}
-	if current.Metadata.DeletionTimestamp != "" {
-		return admission.Allowed(fmt.Sprintf("Tenant %s deletion is already persisted", current.Metadata.Name))
-	}
-	var tenants tenancyv1alpha1.TenantList
-	if err := validator.Reader.List(ctx, &tenants); err != nil {
-		return admission.Denied("active Tenant deletion inspection failed")
-	}
-	for index := range tenants.Items {
-		tenant := &tenants.Items[index]
-		if tenant.Name != current.Metadata.Name && !tenant.DeletionTimestamp.IsZero() {
-			return admission.Denied("another Tenant deletion is already active")
-		}
-	}
-	namespace := validator.Namespace
-	if namespace == "" {
-		namespace = "tenant-system"
-	}
-	now := time.Now().UTC()
-	if validator.Now != nil {
-		now = validator.Now().UTC()
-	}
-	reservation, _, err := tenantcontroller.ReadDeletionReservation(ctx, validator.Reader, namespace, now)
-	if err != nil {
-		return admission.Denied(sanitize.Text(err.Error()))
-	}
-	requester := request.UserInfo.Username
-	if reservation.TenantName != current.Metadata.Name ||
-		reservation.TenantUID != current.Metadata.UID ||
-		reservation.Requester != requester {
-		return admission.Denied("targeted deletion reservation does not match Tenant UID and requester")
-	}
-	if request.DryRun == nil || !*request.DryRun {
-		if validator.Client == nil {
-			return admission.Denied("targeted deletion admission Lease writer is unavailable")
-		}
-		if err := tenantcontroller.AcquireDeletionAdmissionLease(
-			ctx,
-			validator.Client,
-			namespace,
-			reservation,
-			string(request.UID),
-			now,
-		); err != nil {
-			return admission.Denied(sanitize.Text(err.Error()))
-		}
-	}
-	return admission.Allowed(fmt.Sprintf("accepted reserved deletion for Tenant %s", current.Metadata.Name))
 }
 
 func (validator *TenantValidator) decodeAndValidate(data []byte) (rawTenant, string, error) {

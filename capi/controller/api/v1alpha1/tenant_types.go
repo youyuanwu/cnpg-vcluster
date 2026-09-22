@@ -107,47 +107,9 @@ type WorkerContainerEvidence struct {
 }
 
 type TeardownStatus struct {
-	Phase              string `json:"phase,omitempty"`
-	Authority          string `json:"authority,omitempty"`
-	ClusterUID         string `json:"clusterUID,omitempty"`
-	Reservation        string `json:"reservation,omitempty"`
-	FoundationTeardown bool   `json:"foundationTeardown,omitempty"`
-}
-
-type SurvivorSnapshot struct {
-	Name             string `json:"name"`
-	UID              string `json:"uid"`
-	SpecHash         string `json:"specHash"`
-	ObservationsHash string `json:"observationsHash"`
-	Endpoint         string `json:"endpoint"`
-}
-
-type FoundationSnapshot struct {
-	FoundationHash        string                                `json:"foundationHash"`
-	ManagementContainerID string                                `json:"managementContainerID"`
-	NetworkID             string                                `json:"networkID"`
-	ControllerImage       string                                `json:"controllerImage"`
-	ResourceHash          string                                `json:"resourceHash"`
-	PeerAllocationsHash   string                                `json:"peerAllocationsHash"`
-	TargetEndpoint        string                                `json:"targetEndpoint"`
-	Resources             []FoundationResourceIdentity          `json:"resources"`
-	PeerAllocations       map[string]EndpointAllocationIdentity `json:"peerAllocations"`
-}
-
-type FoundationResourceIdentity struct {
-	APIVersion string `json:"apiVersion"`
-	Kind       string `json:"kind"`
-	Namespace  string `json:"namespace"`
-	Name       string `json:"name"`
-	UID        string `json:"uid"`
-	Image      string `json:"image,omitempty"`
-}
-
-type EndpointAllocationIdentity struct {
-	TenantName     string `json:"tenantName"`
-	TenantUID      string `json:"tenantUID"`
-	SpecHash       string `json:"specHash"`
-	FoundationHash string `json:"foundationHash"`
+	Phase      string `json:"phase,omitempty"`
+	Authority  string `json:"authority,omitempty"`
+	ClusterUID string `json:"clusterUID,omitempty"`
 }
 
 type TenantStatus struct {
@@ -164,8 +126,6 @@ type TenantStatus struct {
 	DockerVolume       *DockerVolumeIdentity      `json:"dockerVolume,omitempty"`
 	WorkerContainers   []WorkerContainerEvidence  `json:"workerContainers,omitempty"`
 	WorkerSnapshotHash string                     `json:"workerSnapshotHash,omitempty"`
-	SurvivorSnapshots  []SurvivorSnapshot         `json:"survivorSnapshots,omitempty"`
-	FoundationSnapshot *FoundationSnapshot        `json:"foundationSnapshot,omitempty"`
 	FunctionalEvidence *FunctionalEvidence        `json:"functionalEvidence,omitempty"`
 	Teardown           *TeardownStatus            `json:"teardown,omitempty"`
 }

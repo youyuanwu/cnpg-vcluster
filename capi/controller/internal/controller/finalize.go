@@ -230,10 +230,9 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 	destructiveStarted := tenant.Status.Teardown != nil &&
 		(tenant.Status.Teardown.Phase == "ManagementDeletionStarted" ||
 			tenant.Status.Teardown.Phase == tenantAPIWorkloadsCleanupComplete ||
-			tenant.Status.Teardown.Phase == deletionLockReleaseStarted ||
-			tenant.Status.Teardown.Phase == deletionLockReleased ||
 			tenant.Status.Teardown.Authority == "LiveBootstrapRBACCleanupComplete" ||
-			tenant.Status.Teardown.Phase == tenancyv1alpha1.StageEndpointReleased)
+			tenant.Status.Teardown.Phase == tenancyv1alpha1.StageEndpointReleased) ||
+		tenant.Status.Stage == tenancyv1alpha1.StageEndpointReleased
 	if !destructiveStarted {
 		adopted, err := preflightPartialOwnership(ctx, tenant, specHash, foundation)
 		if err != nil {
@@ -426,30 +425,6 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			return ctrl.Result{}, err
 		}
 		return ctrl.Result{Requeue: true}, nil
-	}
-	if tenant.Status.Teardown == nil ||
-		(tenant.Status.Teardown.Phase != deletionLockReleaseStarted &&
-			tenant.Status.Teardown.Phase != deletionLockReleased) {
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			if status.Teardown == nil {
-				status.Teardown = &tenancyv1alpha1.TeardownStatus{}
-			}
-			status.Teardown.Phase = deletionLockReleaseStarted
-			return nil
-		})
-	}
-	if tenant.Status.Teardown.Phase == deletionLockReleaseStarted {
-		released, err := reconciler.releaseDeletionLock(ctx, tenant)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !released {
-			return ctrl.Result{RequeueAfter: time.Second}, nil
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Teardown.Phase = deletionLockReleased
-			return nil
-		})
 	}
 	if err := reconciler.removeTenantFinalizer(ctx, tenant.Name); err != nil {
 		return ctrl.Result{}, err

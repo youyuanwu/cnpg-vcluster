@@ -23,10 +23,9 @@ webhooks:
     - v1alpha1
     operations:
     - CREATE
-    - DELETE
     - UPDATE
     resources:
     - tenants
     scope: Cluster
-  sideEffects: NoneOnDryRun
+  sideEffects: None
   timeoutSeconds: 10

@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -37,9 +36,6 @@ const tenantFinalizer = "tenancy.cnpg-vcluster.io/finalizer"
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=addons.cluster.x-k8s.io,resources=clusterresourcesets,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
-// +kubebuilder:rbac:groups=apps,resources=deployments,verbs=get;list;watch
-// +kubebuilder:rbac:groups=apiextensions.k8s.io,resources=customresourcedefinitions,verbs=get;list;watch
-// +kubebuilder:rbac:groups=admissionregistration.k8s.io,resources=validatingwebhookconfigurations,verbs=get;list;watch
 
 type TenantReconciler struct {
 	client.Client
@@ -70,15 +66,6 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 	if !reconciler.MutationEnabled && !managedDeletion {
 		return ctrl.Result{}, reconciler.publishMutationDisabled(ctx, &tenant, specHash)
 	}
-	if !managedDeletion {
-		blocked, err := reconciler.deletionMutationBlocked(ctx, tenant.Name, time.Now().UTC())
-		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("inspect active Tenant deletion: %s", sanitize.Text(err.Error()))
-		}
-		if blocked {
-			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-		}
-	}
 	foundation, err := loadFoundation(ctx, reconciler.reader(), reconciler.docker(), reconciler.foundationNamespace(), reconciler.foundationName(), reconciler.SupportedVersion, reconciler.ExpectedControllerImage)
 	if err != nil {
 		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "FoundationInvalid", err)
@@ -86,25 +73,6 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 	if !tenant.DeletionTimestamp.IsZero() {
 		if !containsString(tenant.Finalizers, tenantFinalizer) {
 			return ctrl.Result{}, nil
-		}
-		releasingLock := tenant.Status.Teardown != nil &&
-			(tenant.Status.Teardown.Phase == deletionLockReleaseStarted ||
-				tenant.Status.Teardown.Phase == deletionLockReleased)
-		if !releasingLock {
-			locked, err := reconciler.ensureDeletionLock(ctx, &tenant)
-			if err != nil {
-				return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseDeleting, "DeletionReservationInvalid", err)
-			}
-			if !locked {
-				return ctrl.Result{RequeueAfter: time.Second}, nil
-			}
-		}
-		snapshotsReady, err := reconciler.ensureDeletionSnapshots(ctx, &tenant, foundation)
-		if err != nil {
-			return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseDeleting, "DeletionSnapshotInvalid", err)
-		}
-		if !snapshotsReady {
-			return ctrl.Result{Requeue: true}, nil
 		}
 		result, err := reconciler.finalizePartial(ctx, &tenant, specHash, foundation)
 		if err != nil {
@@ -216,7 +184,6 @@ func (reconciler *TenantReconciler) SetupWithManager(manager ctrl.Manager) error
 	mapObject := handler.EnqueueRequestsFromMapFunc(requestsForTenantObject)
 	builder := ctrl.NewControllerManagedBy(manager).
 		For(&tenancyv1alpha1.Tenant{}).
-		Watches(&tenancyv1alpha1.Tenant{}, handler.EnqueueRequestsFromMapFunc(reconciler.requestsForPeerTenant)).
 		WithOptions(controllerOptions())
 	for _, gvk := range []schema.GroupVersionKind{
 		clusterGVK,
@@ -234,21 +201,6 @@ func (reconciler *TenantReconciler) SetupWithManager(manager ctrl.Manager) error
 	}
 
 	return builder.Complete(reconciler)
-}
-
-func (reconciler *TenantReconciler) requestsForPeerTenant(ctx context.Context, _ client.Object) []ctrl.Request {
-	var tenants tenancyv1alpha1.TenantList
-	if err := reconciler.reader().List(ctx, &tenants); err != nil {
-		return nil
-	}
-	requests := make([]ctrl.Request, 0)
-	for index := range tenants.Items {
-		tenant := &tenants.Items[index]
-		if !tenant.DeletionTimestamp.IsZero() && containsString(tenant.Finalizers, tenantFinalizer) {
-			requests = append(requests, ctrl.Request{NamespacedName: types.NamespacedName{Name: tenant.Name}})
-		}
-	}
-	return requests
 }
 
 func requestsForTenantObject(_ context.Context, object client.Object) []ctrl.Request {

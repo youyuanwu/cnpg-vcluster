@@ -168,74 +168,6 @@ spec:
                 type: string
               foundationHash:
                 type: string
-              foundationSnapshot:
-                properties:
-                  controllerImage:
-                    type: string
-                  foundationHash:
-                    type: string
-                  managementContainerID:
-                    type: string
-                  networkID:
-                    type: string
-                  peerAllocations:
-                    additionalProperties:
-                      properties:
-                        foundationHash:
-                          type: string
-                        specHash:
-                          type: string
-                        tenantName:
-                          type: string
-                        tenantUID:
-                          type: string
-                      required:
-                      - foundationHash
-                      - specHash
-                      - tenantName
-                      - tenantUID
-                      type: object
-                    type: object
-                  peerAllocationsHash:
-                    type: string
-                  resourceHash:
-                    type: string
-                  resources:
-                    items:
-                      properties:
-                        apiVersion:
-                          type: string
-                        image:
-                          type: string
-                        kind:
-                          type: string
-                        name:
-                          type: string
-                        namespace:
-                          type: string
-                        uid:
-                          type: string
-                      required:
-                      - apiVersion
-                      - kind
-                      - name
-                      - namespace
-                      - uid
-                      type: object
-                    type: array
-                  targetEndpoint:
-                    type: string
-                required:
-                - controllerImage
-                - foundationHash
-                - managementContainerID
-                - networkID
-                - peerAllocations
-                - peerAllocationsHash
-                - resourceHash
-                - resources
-                - targetEndpoint
-                type: object
               functionalEvidence:
                 properties:
                   categories:
@@ -305,38 +237,13 @@ spec:
                 type: string
               stage:
                 type: string
-              survivorSnapshots:
-                items:
-                  properties:
-                    endpoint:
-                      type: string
-                    name:
-                      type: string
-                    observationsHash:
-                      type: string
-                    specHash:
-                      type: string
-                    uid:
-                      type: string
-                  required:
-                  - endpoint
-                  - name
-                  - observationsHash
-                  - specHash
-                  - uid
-                  type: object
-                type: array
               teardown:
                 properties:
                   authority:
                     type: string
                   clusterUID:
                     type: string
-                  foundationTeardown:
-                    type: boolean
                   phase:
-                    type: string
-                  reservation:
                     type: string
                 type: object
               tenantResources:

@@ -10,9 +10,8 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.controller import (
-    delete_authorized_controller_tenants,
+    delete_controller_tenants,
     delete_tenant_resource,
-    reserve_tenant_deletion,
     set_controller_mutation,
 )
 from scripts.lib.kube import ManagementClient, wait_for
@@ -135,34 +134,23 @@ def main() -> None:
                 + parse_duration(config["WORKER_REGISTRATION_TIMEOUT"])
                 + parse_duration(config["CNPG_TIMEOUT"])
             )
-            ready = {
-                name: wait_for(
+            for name in TENANTS:
+                wait_for(
                     f"Tenant {name} Ready",
                     timeout,
                     parse_duration(config["WAIT_POLL_INTERVAL"]),
                     lambda name=name: _ready(client, name),
                 )
-                for name in TENANTS
-            }
-            denied = client.kubectl(
-                "delete",
-                "tenant/controller-delete-a",
-                "--wait=false",
-                check=False,
-            )
-            if denied.returncode == 0 or _tenant(client, "controller-delete-a")["metadata"].get("deletionTimestamp"):
-                raise RuntimeError("unreserved Tenant deletion was admitted")
 
             delete_tenant_resource(client, "controller-delete-a", wait=False)
             wait_for(
-                "target deletion snapshots",
+                "first ordinary Tenant deletion timestamp",
                 parse_duration(config["CONDITION_TIMEOUT"]),
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: (
                     tenant
                     if (tenant := _tenant(client, "controller-delete-a"))
-                    and (tenant.get("status") or {}).get("foundationSnapshot")
-                    and len((tenant.get("status") or {}).get("survivorSnapshots") or []) == 1
+                    and tenant["metadata"].get("deletionTimestamp")
                     else None
                 ),
             )
@@ -174,18 +162,19 @@ def main() -> None:
                     raise RuntimeError(
                         "Tenant deletion cascaded management resources before controller barriers"
                     )
-            try:
-                reserve_tenant_deletion(client, "controller-delete-b")
-            except RuntimeError as exc:
-                if (
-                    "another targeted deletion" not in str(exc)
-                    and "another Tenant deletion is active" not in str(exc)
-                ):
-                    raise
-            else:
-                raise RuntimeError("competing targeted deletion reservation succeeded")
-            if _tenant(client, "controller-delete-b")["metadata"].get("deletionTimestamp"):
-                raise RuntimeError("competing Tenant received a deletion timestamp")
+            delete_tenant_resource(client, "controller-delete-b", wait=False)
+            wait_for(
+                "second ordinary Tenant deletion timestamp",
+                parse_duration(config["CONDITION_TIMEOUT"]),
+                parse_duration(config["WAIT_POLL_INTERVAL"]),
+                lambda: (
+                    {"absent": True}
+                    if (tenant := _tenant(client, "controller-delete-b")) is None
+                    else tenant
+                    if tenant["metadata"].get("deletionTimestamp")
+                    else None
+                ),
+            )
 
             checkpoint = wait_for(
                 "live Tenant API cleanup checkpoint",
@@ -213,23 +202,23 @@ def main() -> None:
                     f"--timeout={config['CONDITION_TIMEOUT']}",
                 )
             wait_for(
-                "first reserved Tenant absence",
+                "first Tenant absence",
                 parse_duration(config["DELETE_TIMEOUT"]),
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: True if _tenant(client, "controller-delete-a") is None else None,
             )
-            survivor = _ready(client, "controller-delete-b")
-            if survivor is None:
-                raise RuntimeError("survivor Tenant lost Ready")
-            if survivor["metadata"]["uid"] != ready["controller-delete-b"]["metadata"]["uid"]:
-                raise RuntimeError("survivor Tenant identity changed")
-            delete_authorized_controller_tenants(config, client)
+            wait_for(
+                "second Tenant absence",
+                parse_duration(config["DELETE_TIMEOUT"]),
+                parse_duration(config["WAIT_POLL_INTERVAL"]),
+                lambda: True if _tenant(client, "controller-delete-b") is None else None,
+            )
             if any(_tenant(client, name) is not None for name in TENANTS):
-                raise RuntimeError("authorized foundation teardown left Tenant resources")
+                raise RuntimeError("ordinary Tenant deletion left Tenant resources")
         finally:
             remaining = client.kubectl("get", "tenants.tenancy.cnpg-vcluster.io", "-o", "name", check=False)
             if remaining.returncode == 0 and remaining.stdout.strip():
-                delete_authorized_controller_tenants(config, client)
+                delete_controller_tenants(config, client)
             set_controller_mutation(config, client, enabled=False)
 
 

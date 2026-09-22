@@ -69,9 +69,6 @@ func main() {
 		"/validate-tenancy-cnpg-vcluster-io-v1alpha1-tenant",
 		&admission.Webhook{Handler: &tenantwebhook.TenantValidator{
 			SupportedVersion: supportedVersion,
-			Reader:           manager.GetAPIReader(),
-			Client:           manager.GetClient(),
-			Namespace:        "tenant-system",
 		}},
 	)
 	must(manager.AddHealthzCheck("healthz", healthz.Ping))

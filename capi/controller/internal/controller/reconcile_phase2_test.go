@@ -137,7 +137,7 @@ func TestDeletionAdoptsClusterApplyBeforeStatus(t *testing.T) {
 	}
 }
 
-func TestValidationOnlyModeContinuesManagedDeletion(t *testing.T) {
+func TestValidationOnlyModeContinuesManagedDeletionWithUnhealthyPeer(t *testing.T) {
 	scheme := testScheme(t)
 	foundation := testFoundation()
 	foundation.MutationEnabled = false
@@ -148,24 +148,25 @@ func TestValidationOnlyModeContinuesManagedDeletion(t *testing.T) {
 	tenant.Status.Stage = tenancyv1alpha1.StageEndpointReleased
 	tenant.Status.Teardown = &tenancyv1alpha1.TeardownStatus{
 		Authority: "TenantAPINeverAuthorized",
-		Phase:     deletionLockReleased,
 	}
+	peer := validTenant("tenant-b")
+	peer.Status.Phase = tenancyv1alpha1.PhaseDegraded
 	foundationObject := foundationConfigMap(t, foundation)
 	foundation.Hash = foundationObject.Data["foundation.sha256"]
-	objects := foundationSnapshotObjects(t, scheme)
 	allocationState := newAllocationState(foundation)
 	encodedAllocations, err := encodeAllocationState(allocationState)
 	if err != nil {
 		t.Fatal(err)
 	}
-	objects = append(objects,
+	objects := []client.Object{
 		tenant,
+		peer,
 		foundationObject,
 		&corev1.ConfigMap{
 			ObjectMeta: metav1.ObjectMeta{Name: allocationConfigMapName, Namespace: defaultFoundationNamespace},
 			Data:       map[string]string{"allocations.json": encodedAllocations},
 		},
-	)
+	}
 	kubernetes := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(tenant).
@@ -190,27 +191,6 @@ func TestValidationOnlyModeContinuesManagedDeletion(t *testing.T) {
 		MutationEnabled:         false,
 		ExpectedControllerImage: foundation.ControllerImage,
 	}
-	resourceIdentities, resourceHash, err := reconciler.foundationResourceSnapshot(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
-	peerHash, err := hashJSON(map[string]tenancyv1alpha1.EndpointAllocationIdentity{})
-	if err != nil {
-		t.Fatal(err)
-	}
-	var snapshotted tenancyv1alpha1.Tenant
-	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &snapshotted); err != nil {
-		t.Fatal(err)
-	}
-	snapshotted.Status.FoundationSnapshot = &tenancyv1alpha1.FoundationSnapshot{
-		FoundationHash: foundation.Hash, ManagementContainerID: foundation.ManagementContainerID,
-		NetworkID: foundation.NetworkID, ControllerImage: foundation.ControllerImage,
-		ResourceHash: resourceHash, PeerAllocationsHash: peerHash,
-		Resources: resourceIdentities, PeerAllocations: map[string]tenancyv1alpha1.EndpointAllocationIdentity{},
-	}
-	if err := kubernetes.Status().Update(context.Background(), &snapshotted); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: tenant.Name}}); err != nil {
 		t.Fatal(err)
 	}
@@ -221,5 +201,12 @@ func TestValidationOnlyModeContinuesManagedDeletion(t *testing.T) {
 	}
 	if err == nil && containsString(updated.Finalizers, tenantFinalizer) {
 		t.Fatal("validation-only mode stranded an existing managed deletion")
+	}
+	var unchangedPeer tenancyv1alpha1.Tenant
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: peer.Name}, &unchangedPeer); err != nil {
+		t.Fatal(err)
+	}
+	if unchangedPeer.Status.Phase != tenancyv1alpha1.PhaseDegraded {
+		t.Fatalf("target deletion changed unhealthy peer status: %q", unchangedPeer.Status.Phase)
 	}
 }
