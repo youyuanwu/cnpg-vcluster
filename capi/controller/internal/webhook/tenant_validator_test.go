@@ -9,14 +9,16 @@ import (
 
 	admissionv1 "k8s.io/api/admission/v1"
 	authenticationv1 "k8s.io/api/authentication/v1"
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 	"sigs.k8s.io/controller-runtime/pkg/webhook/admission"
 
-	tenantcontroller "github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/controller"
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
+	tenantcontroller "github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/controller"
 )
 
 func tenantJSON(version string, extra string) []byte {
@@ -39,6 +41,9 @@ func TestDeleteRequiresExactLiveReservation(t *testing.T) {
 	if err := corev1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+	if err := coordinationv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
 	if err := tenancyv1alpha1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
@@ -50,6 +55,7 @@ func TestDeleteRequiresExactLiveReservation(t *testing.T) {
 	handler := &TenantValidator{
 		SupportedVersion: "1.36.4",
 		Reader:           kubernetes,
+		Client:           kubernetes,
 		Namespace:        "tenant-system",
 		Now:              func() time.Time { return now },
 	}
@@ -76,11 +82,13 @@ func TestDeleteRequiresExactLiveReservation(t *testing.T) {
 		WithScheme(scheme).
 		WithObjects(reservationConfigMap.DeepCopy(), active).
 		Build()
+	handler.Client = handler.Reader.(client.Client)
 	request.UserInfo.Username = "test-user"
 	if response := handler.Handle(context.Background(), request); response.Allowed {
 		t.Fatal("second overlapping deletion was allowed")
 	}
 	handler.Reader = kubernetes
+	handler.Client = kubernetes
 	handler.Now = func() time.Time { return now.Add(2 * time.Minute) }
 	if response := handler.Handle(context.Background(), request); response.Allowed {
 		t.Fatal("expired reservation was allowed")
@@ -92,6 +100,9 @@ func TestDeleteWithoutReservationIsDenied(t *testing.T) {
 	document = bytes.Replace(document, []byte(`"name":"tenant-a"`), []byte(`"name":"tenant-a","uid":"tenant-uid"`), 1)
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	if err := coordinationv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
 	if err := tenancyv1alpha1.AddToScheme(scheme); err != nil {

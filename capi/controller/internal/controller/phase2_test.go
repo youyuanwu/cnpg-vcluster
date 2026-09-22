@@ -819,7 +819,12 @@ func TestPartialFinalizationHonorsPersistedLiveCleanupCheckpoint(t *testing.T) {
 				Authority:   "LiveBootstrapRBACCleanupComplete",
 				Phase:       deletionLockReleased,
 				Reservation: "nonce",
+				ClusterUID:  "cluster-uid",
 			},
+			ObservedResources: []tenancyv1alpha1.ObservedResourceIdentity{{
+				APIVersion: clusterGVK.GroupVersion().String(), Kind: clusterGVK.Kind,
+				Namespace: "tenant-a", Name: "tenant-a", UID: "cluster-uid",
+			}},
 		},
 	}
 

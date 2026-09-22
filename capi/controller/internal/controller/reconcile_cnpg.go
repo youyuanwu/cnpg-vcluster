@@ -23,7 +23,8 @@ func (reconciler *TenantReconciler) reconcileCNPG(ctx context.Context, tenant *t
 		tenant.Status.Stage != tenancyv1alpha1.StageCNPGOperatorApplied &&
 		tenant.Status.Stage != tenancyv1alpha1.StageCNPGStoragePrepared &&
 		tenant.Status.Stage != tenancyv1alpha1.StageCNPGClusterApplied &&
-		tenant.Status.Stage != tenancyv1alpha1.StageDatabaseProbeCreated {
+		tenant.Status.Stage != tenancyv1alpha1.StageDatabaseProbeCreated &&
+		tenant.Status.Stage != tenancyv1alpha1.StageDatabaseProbeSucceeded {
 		return reconciler.reconcileReadiness(ctx, tenant, canonical, specHash, foundation)
 	}
 	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
@@ -137,8 +138,18 @@ func (reconciler *TenantReconciler) reconcileCNPG(ctx context.Context, tenant *t
 		if phase != "Succeeded" {
 			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 		}
-		if err := tenantClient.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.Stage = tenancyv1alpha1.StageDatabaseProbeSucceeded
+			return nil
+		})
+	case tenancyv1alpha1.StageDatabaseProbeSucceeded:
+		probe := resources.SQLProbe(resourceContext, postgresImage.Reference)
+		absent, err := deleteCompletedTenantProbe(ctx, tenantClient, tenant, probe)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		if !absent {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		check := fmt.Sprintf("for ordinal in $(seq 1 %d); do path=%s/volumes/cnpg/$ordinal/pgdata; test -d \"$path\"; test \"$(stat -c %%u:%%g \"$path\")\" = 26:26; test \"$(stat -c %%a \"$path\")\" = 700; test -f \"$path/global/pg_control\"; test \"$(stat -c %%u:%%g:%%a \"$path/global/pg_control\")\" = 26:26:600; done",
 			canonical.DatabaseCount, foundation.Inputs.StorageContainerPath)

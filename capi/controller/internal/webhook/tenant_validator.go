@@ -28,6 +28,7 @@ var allowedSpecFields = map[string]struct{}{
 type TenantValidator struct {
 	SupportedVersion string
 	Reader           client.Reader
+	Client           client.Client
 	Namespace        string
 	Now              func() time.Time
 }
@@ -41,7 +42,7 @@ type rawTenant struct {
 	Spec json.RawMessage `json:"spec"`
 }
 
-// +kubebuilder:webhook:path=/validate-tenancy-cnpg-vcluster-io-v1alpha1-tenant,mutating=false,failurePolicy=fail,sideEffects=None,groups=tenancy.cnpg-vcluster.io,resources=tenants,verbs=create;update;delete,versions=v1alpha1,name=vtenant.tenancy.cnpg-vcluster.io,admissionReviewVersions=v1
+// +kubebuilder:webhook:path=/validate-tenancy-cnpg-vcluster-io-v1alpha1-tenant,mutating=false,failurePolicy=fail,sideEffects=NoneOnDryRun,groups=tenancy.cnpg-vcluster.io,resources=tenants,verbs=create;update;delete,versions=v1alpha1,name=vtenant.tenancy.cnpg-vcluster.io,admissionReviewVersions=v1
 func (validator *TenantValidator) Handle(ctx context.Context, request admission.Request) admission.Response {
 	if request.Operation == admissionv1.Delete {
 		return validator.validateDelete(ctx, request)
@@ -103,6 +104,21 @@ func (validator *TenantValidator) validateDelete(ctx context.Context, request ad
 		reservation.TenantUID != current.Metadata.UID ||
 		reservation.Requester != requester {
 		return admission.Denied("targeted deletion reservation does not match Tenant UID and requester")
+	}
+	if request.DryRun == nil || !*request.DryRun {
+		if validator.Client == nil {
+			return admission.Denied("targeted deletion admission Lease writer is unavailable")
+		}
+		if err := tenantcontroller.AcquireDeletionAdmissionLease(
+			ctx,
+			validator.Client,
+			namespace,
+			reservation,
+			string(request.UID),
+			now,
+		); err != nil {
+			return admission.Denied(sanitize.Text(err.Error()))
+		}
 	}
 	return admission.Allowed(fmt.Sprintf("accepted reserved deletion for Tenant %s", current.Metadata.Name))
 }

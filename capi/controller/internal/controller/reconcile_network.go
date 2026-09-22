@@ -107,8 +107,22 @@ func (reconciler *TenantReconciler) reconcileNetwork(ctx context.Context, tenant
 		if phase != "Succeeded" {
 			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 		}
-		if err := tenantClient.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.Stage = tenancyv1alpha1.StageNetworkProbeSucceeded
+			return nil
+		})
+	case tenancyv1alpha1.StageNetworkProbeSucceeded:
+		tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		probe := networkProbe(resourceContext, images.Verify)
+		absent, err := deleteCompletedTenantProbe(ctx, tenantClient, tenant, probe)
+		if err != nil {
+			return ctrl.Result{}, err
+		}
+		if !absent {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			removeTenantIdentity(status, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())

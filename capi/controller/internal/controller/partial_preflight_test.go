@@ -180,6 +180,35 @@ func TestTenantDeletePriorityHonorsControllerAndStorageDependencies(t *testing.T
 	}
 }
 
+func TestLiveCleanupCheckpointRequiresExactClusterUID(t *testing.T) {
+	tenant := &tenancyv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a"},
+		Status: tenancyv1alpha1.TenantStatus{
+			ObservedResources: []tenancyv1alpha1.ObservedResourceIdentity{{
+				APIVersion: clusterGVK.GroupVersion().String(), Kind: clusterGVK.Kind,
+				Namespace: "tenant-a", Name: "tenant-a", UID: "cluster-uid",
+			}},
+			Teardown: &tenancyv1alpha1.TeardownStatus{},
+		},
+	}
+	for name, clusterUID := range map[string]string{
+		"missing": "",
+		"stale":   "other-uid",
+		"exact":   "cluster-uid",
+	} {
+		t.Run(name, func(t *testing.T) {
+			tenant.Status.Teardown.ClusterUID = clusterUID
+			err := validateLiveCleanupCheckpoint(tenant)
+			if name == "exact" && err != nil {
+				t.Fatal(err)
+			}
+			if name != "exact" && err == nil {
+				t.Fatal("invalid cleanup checkpoint was accepted")
+			}
+		})
+	}
+}
+
 func TestPartialFinalizationExactDeletesRecordedClusterResourceSet(t *testing.T) {
 	scheme := testScheme(t)
 	gvk := schema.GroupVersionKind{Group: "addons.cluster.x-k8s.io", Version: "v1beta2", Kind: "ClusterResourceSet"}
@@ -197,8 +226,9 @@ func TestPartialFinalizationExactDeletesRecordedClusterResourceSet(t *testing.T)
 		Status: tenancyv1alpha1.TenantStatus{
 			Stage: tenancyv1alpha1.StageReady,
 			Teardown: &tenancyv1alpha1.TeardownStatus{
-				Authority: "LiveBootstrapRBACCleanupComplete",
-				Phase:     "LiveBootstrapRBACCleanupComplete",
+				Authority:  "LiveBootstrapRBACCleanupComplete",
+				Phase:      "LiveBootstrapRBACCleanupComplete",
+				ClusterUID: "cluster-uid",
 			},
 		},
 	}
@@ -222,7 +252,13 @@ func TestPartialFinalizationExactDeletesRecordedClusterResourceSet(t *testing.T)
 		},
 		"spec": map[string]any{"strategy": "ApplyOnce"},
 	}}
-	tenant.Status.ObservedResources = []tenancyv1alpha1.ObservedResourceIdentity{identityFor(resourceSet)}
+	tenant.Status.ObservedResources = []tenancyv1alpha1.ObservedResourceIdentity{
+		{
+			APIVersion: clusterGVK.GroupVersion().String(), Kind: clusterGVK.Kind,
+			Namespace: tenant.Name, Name: tenant.Name, UID: "cluster-uid",
+		},
+		identityFor(resourceSet),
+	}
 	kubernetes := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(tenant).

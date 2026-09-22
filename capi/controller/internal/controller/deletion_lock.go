@@ -35,6 +35,59 @@ type DeletionReservation struct {
 	ExpiresAt  float64 `json:"expiresAt"`
 }
 
+func AcquireDeletionAdmissionLease(
+	ctx context.Context,
+	kubernetes client.Client,
+	namespace string,
+	reservation DeletionReservation,
+	requestUID string,
+	now time.Time,
+) error {
+	key := types.NamespacedName{Namespace: namespace, Name: DeletionLeaseName}
+	var lease coordinationv1.Lease
+	err := kubernetes.Get(ctx, key, &lease)
+	holder := reservation.Nonce
+	renew := metav1.NewMicroTime(now.UTC())
+	annotations := map[string]string{
+		"tenancy.cnpg-vcluster.io/tenant":        reservation.TenantName,
+		"tenancy.cnpg-vcluster.io/tenant-uid":    reservation.TenantUID,
+		"tenancy.cnpg-vcluster.io/requester":     reservation.Requester,
+		"tenancy.cnpg-vcluster.io/admission-uid": requestUID,
+	}
+	if apierrors.IsNotFound(err) {
+		return kubernetes.Create(ctx, &coordinationv1.Lease{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: key.Name, Namespace: key.Namespace, Annotations: annotations,
+			},
+			Spec: coordinationv1.LeaseSpec{
+				HolderIdentity: &holder, LeaseDurationSeconds: pointer(deletionLeaseSeconds),
+				AcquireTime: &renew, RenewTime: &renew,
+			},
+		})
+	}
+	if err != nil {
+		return err
+	}
+	currentHolder := ""
+	if lease.Spec.HolderIdentity != nil {
+		currentHolder = *lease.Spec.HolderIdentity
+	}
+	if currentHolder == reservation.Nonce &&
+		lease.Annotations["tenancy.cnpg-vcluster.io/tenant-uid"] == reservation.TenantUID &&
+		lease.Annotations["tenancy.cnpg-vcluster.io/requester"] == reservation.Requester {
+		return nil
+	}
+	if !deletionLeaseExpired(lease, now) {
+		return fmt.Errorf("another targeted deletion holds the admission Lease")
+	}
+	lease.SetAnnotations(annotations)
+	lease.Spec.HolderIdentity = &holder
+	lease.Spec.LeaseDurationSeconds = pointer(deletionLeaseSeconds)
+	lease.Spec.AcquireTime = &renew
+	lease.Spec.RenewTime = &renew
+	return kubernetes.Update(ctx, &lease)
+}
+
 func ReadDeletionReservation(
 	ctx context.Context,
 	reader client.Reader,

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"reflect"
 	"sort"
 	"strings"
 
@@ -18,25 +19,16 @@ import (
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 )
 
-type foundationResourceIdentity struct {
-	APIVersion string `json:"apiVersion"`
-	Kind       string `json:"kind"`
-	Namespace  string `json:"namespace"`
-	Name       string `json:"name"`
-	UID        string `json:"uid"`
-	Image      string `json:"image,omitempty"`
-}
-
 func (reconciler *TenantReconciler) captureFoundationSnapshot(
 	ctx context.Context,
 	tenant *tenancyv1alpha1.Tenant,
 	foundation Foundation,
 ) (*tenancyv1alpha1.FoundationSnapshot, error) {
-	resourceHash, err := reconciler.foundationResourceHash(ctx)
+	resourceIdentities, resourceHash, err := reconciler.foundationResourceSnapshot(ctx)
 	if err != nil {
 		return nil, err
 	}
-	peerHash, targetPresent, err := reconciler.allocationSnapshot(ctx, tenant, foundation)
+	peerAllocations, peerHash, targetPresent, err := reconciler.allocationSnapshot(ctx, tenant, foundation)
 	if err != nil {
 		return nil, err
 	}
@@ -51,6 +43,8 @@ func (reconciler *TenantReconciler) captureFoundationSnapshot(
 		ResourceHash:          resourceHash,
 		PeerAllocationsHash:   peerHash,
 		TargetEndpoint:        tenant.Status.Endpoint,
+		Resources:             resourceIdentities,
+		PeerAllocations:       peerAllocations,
 	}, nil
 }
 
@@ -70,18 +64,18 @@ func (reconciler *TenantReconciler) verifyFoundationSnapshot(
 		snapshot.ControllerImage != foundation.ControllerImage {
 		return fmt.Errorf("foundation identity changed during deletion")
 	}
-	resourceHash, err := reconciler.foundationResourceHash(ctx)
+	resourceIdentities, resourceHash, err := reconciler.foundationResourceSnapshot(ctx)
 	if err != nil {
 		return err
 	}
-	if resourceHash != snapshot.ResourceHash {
+	if resourceHash != snapshot.ResourceHash || !reflect.DeepEqual(resourceIdentities, snapshot.Resources) {
 		return fmt.Errorf("foundation Kubernetes resource identity changed during deletion")
 	}
-	peerHash, targetPresent, err := reconciler.allocationSnapshot(ctx, tenant, foundation)
+	peerAllocations, peerHash, targetPresent, err := reconciler.allocationSnapshot(ctx, tenant, foundation)
 	if err != nil {
 		return err
 	}
-	if peerHash != snapshot.PeerAllocationsHash {
+	if peerHash != snapshot.PeerAllocationsHash || !reflect.DeepEqual(peerAllocations, snapshot.PeerAllocations) {
 		return fmt.Errorf("peer endpoint allocations changed during deletion")
 	}
 	if endpointReleased && targetPresent {
@@ -93,7 +87,7 @@ func (reconciler *TenantReconciler) verifyFoundationSnapshot(
 	return nil
 }
 
-func (reconciler *TenantReconciler) foundationResourceHash(ctx context.Context) (string, error) {
+func (reconciler *TenantReconciler) foundationResourceSnapshot(ctx context.Context) ([]tenancyv1alpha1.FoundationResourceIdentity, string, error) {
 	keys := []struct {
 		gvk       schema.GroupVersionKind
 		namespace string
@@ -107,21 +101,28 @@ func (reconciler *TenantReconciler) foundationResourceHash(ctx context.Context) 
 		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, "capi-kamaji-system", "kamaji"},
 		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "tenants.tenancy.cnpg-vcluster.io"},
 		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "clusters.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "machinedeployments.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "machinesets.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "machines.cluster.x-k8s.io"},
 		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "devclusters.infrastructure.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "devmachinetemplates.infrastructure.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "devmachines.infrastructure.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io"},
 		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "kamajicontrolplanes.controlplane.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "clusterresourcesets.addons.cluster.x-k8s.io"},
 		{schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingWebhookConfiguration"}, "", "tenant-controller-validating-webhook"},
 	}
-	values := make([]foundationResourceIdentity, 0, len(keys))
+	values := make([]tenancyv1alpha1.FoundationResourceIdentity, 0, len(keys))
 	for _, key := range keys {
 		object := &unstructured.Unstructured{}
 		object.SetGroupVersionKind(key.gvk)
 		if err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: key.namespace, Name: key.name}, object); err != nil {
-			return "", fmt.Errorf("read foundation %s %s: %w", key.gvk.Kind, key.name, err)
+			return nil, "", fmt.Errorf("read foundation %s %s: %w", key.gvk.Kind, key.name, err)
 		}
 		if object.GetUID() == "" {
-			return "", fmt.Errorf("foundation %s %s has no UID", key.gvk.Kind, key.name)
+			return nil, "", fmt.Errorf("foundation %s %s has no UID", key.gvk.Kind, key.name)
 		}
-		identity := foundationResourceIdentity{
+		identity := tenancyv1alpha1.FoundationResourceIdentity{
 			APIVersion: key.gvk.GroupVersion().String(),
 			Kind:       key.gvk.Kind, Namespace: key.namespace, Name: key.name, UID: string(object.GetUID()),
 		}
@@ -129,7 +130,7 @@ func (reconciler *TenantReconciler) foundationResourceHash(ctx context.Context) 
 			desired, _, _ := unstructured.NestedInt64(object.Object, "spec", "replicas")
 			available, _, _ := unstructured.NestedInt64(object.Object, "status", "availableReplicas")
 			if desired < 1 || available != desired {
-				return "", fmt.Errorf("foundation controller Deployment is not available")
+				return nil, "", fmt.Errorf("foundation controller Deployment is not available")
 			}
 			containers, _, _ := unstructured.NestedSlice(object.Object, "spec", "template", "spec", "containers")
 			images := make([]string, 0, len(containers))
@@ -144,7 +145,7 @@ func (reconciler *TenantReconciler) foundationResourceHash(ctx context.Context) 
 			sort.Strings(images)
 			identity.Image = strings.Join(images, ",")
 			if len(images) == 0 {
-				return "", fmt.Errorf("foundation controller image is missing")
+				return nil, "", fmt.Errorf("foundation controller image is missing")
 			}
 		}
 		if key.gvk.Kind == "CustomResourceDefinition" {
@@ -155,7 +156,7 @@ func (reconciler *TenantReconciler) foundationResourceHash(ctx context.Context) 
 				established = established || ok && condition["type"] == "Established" && condition["status"] == "True"
 			}
 			if !established {
-				return "", fmt.Errorf("foundation CRD %s is not Established", key.name)
+				return nil, "", fmt.Errorf("foundation CRD %s is not Established", key.name)
 			}
 		}
 		if key.gvk.Kind == "ValidatingWebhookConfiguration" {
@@ -170,7 +171,7 @@ func (reconciler *TenantReconciler) foundationResourceHash(ctx context.Context) 
 					service["namespace"] == "tenant-system"
 			}
 			if !healthy {
-				return "", fmt.Errorf("foundation validating webhook is not healthy")
+				return nil, "", fmt.Errorf("foundation validating webhook is not healthy")
 			}
 		}
 		values = append(values, identity)
@@ -179,51 +180,55 @@ func (reconciler *TenantReconciler) foundationResourceHash(ctx context.Context) 
 		return values[left].APIVersion+"/"+values[left].Kind+"/"+values[left].Namespace+"/"+values[left].Name <
 			values[right].APIVersion+"/"+values[right].Kind+"/"+values[right].Namespace+"/"+values[right].Name
 	})
-	return hashJSON(values)
+	hash, err := hashJSON(values)
+	return values, hash, err
 }
 
 func (reconciler *TenantReconciler) allocationSnapshot(
 	ctx context.Context,
 	tenant *tenancyv1alpha1.Tenant,
 	foundation Foundation,
-) (string, bool, error) {
+) (map[string]tenancyv1alpha1.EndpointAllocationIdentity, string, bool, error) {
 	var configMap corev1.ConfigMap
 	if err := reconciler.reader().Get(ctx, types.NamespacedName{
 		Namespace: reconciler.foundationNamespace(),
 		Name:      allocationConfigMapName,
 	}, &configMap); err != nil {
-		return "", false, fmt.Errorf("read endpoint allocations for foundation snapshot: %w", err)
+		return nil, "", false, fmt.Errorf("read endpoint allocations for foundation snapshot: %w", err)
 	}
 	state, err := decodeAllocationState(configMap.Data["allocations.json"], foundation)
 	if err != nil {
-		return "", false, err
+		return nil, "", false, err
 	}
 	targetAddress := ""
 	if tenant.Status.Endpoint != "" {
 		targetAddress, _, err = net.SplitHostPort(tenant.Status.Endpoint)
 		if err != nil {
-			return "", false, fmt.Errorf("parse target endpoint: %w", err)
+			return nil, "", false, fmt.Errorf("parse target endpoint: %w", err)
 		}
 	} else if tenant.Status.FoundationSnapshot != nil && tenant.Status.FoundationSnapshot.TargetEndpoint != "" {
 		targetAddress, _, err = net.SplitHostPort(tenant.Status.FoundationSnapshot.TargetEndpoint)
 		if err != nil {
-			return "", false, fmt.Errorf("parse snapshotted target endpoint: %w", err)
+			return nil, "", false, fmt.Errorf("parse snapshotted target endpoint: %w", err)
 		}
 	}
 	targetPresent := false
-	peers := make(map[string]endpointAllocation, len(state.Allocations))
+	peers := make(map[string]tenancyv1alpha1.EndpointAllocationIdentity, len(state.Allocations))
 	for address, allocation := range state.Allocations {
 		if allocation.TenantUID == string(tenant.UID) {
 			if targetAddress == "" || address != targetAddress || allocation.TenantName != tenant.Name {
-				return "", false, fmt.Errorf("target endpoint allocation identity changed")
+				return nil, "", false, fmt.Errorf("target endpoint allocation identity changed")
 			}
 			targetPresent = true
 			continue
 		}
-		peers[address] = allocation
+		peers[address] = tenancyv1alpha1.EndpointAllocationIdentity{
+			TenantName: allocation.TenantName, TenantUID: allocation.TenantUID,
+			SpecHash: allocation.SpecHash, FoundationHash: allocation.FoundationHash,
+		}
 	}
 	hash, err := hashJSON(peers)
-	return hash, targetPresent, err
+	return peers, hash, targetPresent, err
 }
 
 func hashJSON(value any) (string, error) {

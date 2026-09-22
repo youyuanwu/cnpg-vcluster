@@ -89,13 +89,13 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 			if !locked {
 				return ctrl.Result{RequeueAfter: time.Second}, nil
 			}
-			snapshotsReady, err := reconciler.ensureDeletionSnapshots(ctx, &tenant, foundation)
-			if err != nil {
-				return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseDeleting, "DeletionSnapshotInvalid", err)
-			}
-			if !snapshotsReady {
-				return ctrl.Result{Requeue: true}, nil
-			}
+		}
+		snapshotsReady, err := reconciler.ensureDeletionSnapshots(ctx, &tenant, foundation)
+		if err != nil {
+			return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseDeleting, "DeletionSnapshotInvalid", err)
+		}
+		if !snapshotsReady {
+			return ctrl.Result{Requeue: true}, nil
 		}
 		result, err := reconciler.finalizePartial(ctx, &tenant, specHash, foundation)
 		if err != nil {

@@ -70,6 +70,7 @@ func main() {
 		&admission.Webhook{Handler: &tenantwebhook.TenantValidator{
 			SupportedVersion: supportedVersion,
 			Reader:           manager.GetAPIReader(),
+			Client:           manager.GetClient(),
 			Namespace:        "tenant-system",
 		}},
 	)

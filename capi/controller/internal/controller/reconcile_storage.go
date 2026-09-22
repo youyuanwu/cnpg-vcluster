@@ -22,7 +22,8 @@ const tenantStorageClass = "capi-hostpath"
 func (reconciler *TenantReconciler) reconcileStorage(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
 	if tenant.Status.Stage != tenancyv1alpha1.StagePostCNIWorkersReady &&
 		tenant.Status.Stage != tenancyv1alpha1.StageStorageApplied &&
-		tenant.Status.Stage != tenancyv1alpha1.StageStorageProbeCreated {
+		tenant.Status.Stage != tenancyv1alpha1.StageStorageProbeCreated &&
+		tenant.Status.Stage != tenancyv1alpha1.StageStorageProbeSucceeded {
 		return reconciler.reconcileCNPG(ctx, tenant, canonical, specHash, foundation)
 	}
 	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
@@ -84,8 +85,18 @@ func (reconciler *TenantReconciler) reconcileStorage(ctx context.Context, tenant
 		if phase != "Succeeded" {
 			return ctrl.Result{RequeueAfter: 3 * time.Second}, nil
 		}
-		if err := tenantClient.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.Stage = tenancyv1alpha1.StageStorageProbeSucceeded
+			return nil
+		})
+	case tenancyv1alpha1.StageStorageProbeSucceeded:
+		probe := resources.StorageProbe(resourceContext, verify.Reference)
+		absent, err := deleteCompletedTenantProbe(ctx, tenantClient, tenant, probe)
+		if err != nil {
 			return ctrl.Result{}, err
+		}
+		if !absent {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
 		}
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			removeTenantIdentity(status, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())

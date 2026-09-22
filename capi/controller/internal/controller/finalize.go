@@ -257,6 +257,11 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 	}
 	liveCleanupComplete := tenant.Status.Teardown != nil &&
 		tenant.Status.Teardown.Authority == "LiveBootstrapRBACCleanupComplete"
+	if liveCleanupComplete {
+		if err := validateLiveCleanupCheckpoint(tenant); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	if tenant.Status.Stage != tenancyv1alpha1.StageEndpointReleased &&
 		stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageTenantAPICleanupRequired) &&
 		!liveCleanupComplete {
@@ -296,12 +301,20 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		if !complete {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
+		if !clusterPresent {
+			return ctrl.Result{}, fmt.Errorf("live Tenant API cleanup checkpoint requires the exact hosted Cluster")
+		}
+		recordedCluster := findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name)
+		if recordedCluster == nil || recordedCluster.UID != clusterIdentity.UID {
+			return ctrl.Result{}, fmt.Errorf("live Tenant API cleanup checkpoint Cluster identity is not recorded")
+		}
 		if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			if status.Teardown == nil {
 				status.Teardown = &tenancyv1alpha1.TeardownStatus{}
 			}
 			status.Teardown.Phase = "LiveBootstrapRBACCleanupComplete"
 			status.Teardown.Authority = "LiveBootstrapRBACCleanupComplete"
+			status.Teardown.ClusterUID = clusterIdentity.UID
 			return nil
 		}); err != nil {
 			return ctrl.Result{}, err
@@ -340,11 +353,12 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			return nil
 		})
 	}
-	if clusterPresent && findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name) == nil {
+	if !liveCleanupComplete && clusterPresent && findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name) == nil {
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			if err := upsertIdentity(status, clusterIdentity); err != nil {
 				return err
 			}
+
 			if status.Teardown == nil {
 				status.Teardown = &tenancyv1alpha1.TeardownStatus{}
 			}
@@ -444,6 +458,17 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 	return ctrl.Result{}, nil
 }
 
+func validateLiveCleanupCheckpoint(tenant *tenancyv1alpha1.Tenant) error {
+	if tenant.Status.Teardown == nil || tenant.Status.Teardown.ClusterUID == "" {
+		return fmt.Errorf("live Tenant API cleanup checkpoint Cluster UID is missing")
+	}
+	cluster := findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name)
+	if cluster == nil || cluster.UID != tenant.Status.Teardown.ClusterUID {
+		return fmt.Errorf("live Tenant API cleanup checkpoint Cluster UID is stale or mismatched")
+	}
+	return nil
+}
+
 func (reconciler *TenantReconciler) removeTenantFinalizer(ctx context.Context, name string) error {
 	return retry.RetryOnConflict(retry.DefaultRetry, func() error {
 		var current tenancyv1alpha1.Tenant
@@ -525,15 +550,18 @@ func stageAtOrAfter(current, boundary string) bool {
 		tenancyv1alpha1.StageNetworkSourcesApplied,
 		tenancyv1alpha1.StageNetworkResourceSetApplied,
 		tenancyv1alpha1.StageNetworkProbeCreated,
+		tenancyv1alpha1.StageNetworkProbeSucceeded,
 		tenancyv1alpha1.StageNetworkReady,
 		tenancyv1alpha1.StagePostCNIWorkersReady,
 		tenancyv1alpha1.StageStorageApplied,
 		tenancyv1alpha1.StageStorageProbeCreated,
+		tenancyv1alpha1.StageStorageProbeSucceeded,
 		tenancyv1alpha1.StageStorageReady,
 		tenancyv1alpha1.StageCNPGOperatorApplied,
 		tenancyv1alpha1.StageCNPGStoragePrepared,
 		tenancyv1alpha1.StageCNPGClusterApplied,
 		tenancyv1alpha1.StageDatabaseProbeCreated,
+		tenancyv1alpha1.StageDatabaseProbeSucceeded,
 		tenancyv1alpha1.StageDatabaseReady,
 		tenancyv1alpha1.StageReady,
 		tenancyv1alpha1.StageEndpointReleased,

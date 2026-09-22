@@ -82,6 +82,29 @@ func TestCompletedProbeIdentitiesAreRemovedFromReadyState(t *testing.T) {
 	}
 }
 
+func TestCompletedProbeDeletionResumesAfterAuthoritativeNotFound(t *testing.T) {
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "Pod"}
+	probe := &unstructured.Unstructured{}
+	probe.SetGroupVersionKind(gvk)
+	probe.SetNamespace("default")
+	probe.SetName("tenant-a-network-verify")
+	probe.SetUID(types.UID("probe-uid"))
+	tenant := &tenancyv1alpha1.Tenant{
+		Status: tenancyv1alpha1.TenantStatus{
+			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{identityFor(probe)},
+		},
+	}
+	kubernetes := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(probe).Build()
+	absent, err := deleteCompletedTenantProbe(context.Background(), kubernetes, tenant, probe.DeepCopy())
+	if err != nil || absent {
+		t.Fatalf("probe delete was not initiated: absent=%v err=%v", absent, err)
+	}
+	absent, err = deleteCompletedTenantProbe(context.Background(), kubernetes, tenant, probe.DeepCopy())
+	if err != nil || !absent {
+		t.Fatalf("probe NotFound was not accepted after success checkpoint: absent=%v err=%v", absent, err)
+	}
+}
+
 func markedTenantConfigMap(gvk schema.GroupVersionKind, tenant *tenancyv1alpha1.Tenant, value string) *unstructured.Unstructured {
 	object := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": gvk.GroupVersion().String(),

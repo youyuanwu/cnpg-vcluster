@@ -136,6 +136,30 @@ func removeTenantProbeIdentities(status *tenancyv1alpha1.TenantStatus, tenantNam
 	return len(status.TenantResources) != before
 }
 
+func deleteCompletedTenantProbe(
+	ctx context.Context,
+	tenantClient client.Client,
+	tenant *tenancyv1alpha1.Tenant,
+	probe *unstructured.Unstructured,
+) (bool, error) {
+	current := probe.DeepCopy()
+	err := tenantClient.Get(ctx, client.ObjectKeyFromObject(probe), current)
+	if apierrors.IsNotFound(err) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	recorded := findTenantIdentity(tenant.Status.TenantResources, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())
+	if recorded == nil || recorded.UID != string(current.GetUID()) {
+		return false, fmt.Errorf("%s probe identity changed before cleanup", probe.GetName())
+	}
+	if err := tenantClient.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+		return false, err
+	}
+	return false, nil
+}
+
 func tenantObjectReady(object *unstructured.Unstructured) bool {
 	conditions, _, _ := unstructured.NestedSlice(object.Object, "status", "conditions")
 	for _, raw := range conditions {

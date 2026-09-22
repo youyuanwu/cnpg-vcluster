@@ -154,8 +154,15 @@ func foundationSnapshotObjects(t *testing.T, scheme *runtime.Scheme) []client.Ob
 		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, "capi-kamaji-system", "kamaji"},
 		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "tenants.tenancy.cnpg-vcluster.io"},
 		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "clusters.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "machinedeployments.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "machinesets.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "machines.cluster.x-k8s.io"},
 		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "devclusters.infrastructure.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "devmachinetemplates.infrastructure.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "devmachines.infrastructure.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io"},
 		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "kamajicontrolplanes.controlplane.cluster.x-k8s.io"},
+		{schema.GroupVersionKind{Group: "apiextensions.k8s.io", Version: "v1", Kind: "CustomResourceDefinition"}, "", "clusterresourcesets.addons.cluster.x-k8s.io"},
 		{schema.GroupVersionKind{Group: "admissionregistration.k8s.io", Version: "v1", Kind: "ValidatingWebhookConfiguration"}, "", "tenant-controller-validating-webhook"},
 	}
 

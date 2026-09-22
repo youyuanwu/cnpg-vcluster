@@ -25,6 +25,7 @@ func TestDeletionReservationBecomesRenewableLeaseAndReleasesLast(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+
 	configMap := &corev1.ConfigMap{
 		ObjectMeta: metav1.ObjectMeta{
 			Name: DeletionReservationName, Namespace: defaultFoundationNamespace, UID: "reservation-uid",
@@ -70,5 +71,27 @@ func TestDeletionReservationBecomesRenewableLeaseAndReleasesLast(t *testing.T) {
 		if attempt == 2 && !released {
 			t.Fatal("deletion control state remained after exact release")
 		}
+	}
+}
+
+func TestAdmissionLeaseSerializesOverlappingReservations(t *testing.T) {
+	kubernetes := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	now := time.Unix(2_000_000_000, 0)
+	first := DeletionReservation{
+		Schema: 1, TenantName: "tenant-a", TenantUID: "uid-a",
+		Requester: "user-a", Nonce: "nonce-a", ExpiresAt: float64(now.Add(time.Minute).Unix()),
+	}
+	second := DeletionReservation{
+		Schema: 1, TenantName: "tenant-b", TenantUID: "uid-b",
+		Requester: "user-b", Nonce: "nonce-b", ExpiresAt: float64(now.Add(time.Minute).Unix()),
+	}
+	if err := AcquireDeletionAdmissionLease(context.Background(), kubernetes, defaultFoundationNamespace, first, "request-a", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := AcquireDeletionAdmissionLease(context.Background(), kubernetes, defaultFoundationNamespace, second, "request-b", now); err == nil {
+		t.Fatal("overlapping reservation acquired the admission Lease")
+	}
+	if err := AcquireDeletionAdmissionLease(context.Background(), kubernetes, defaultFoundationNamespace, second, "request-b", now.Add(61*time.Second)); err != nil {
+		t.Fatalf("expired admission Lease was not recoverable: %v", err)
 	}
 }

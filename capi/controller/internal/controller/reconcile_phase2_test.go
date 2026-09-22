@@ -150,10 +150,26 @@ func TestValidationOnlyModeContinuesManagedDeletion(t *testing.T) {
 		Authority: "TenantAPINeverAuthorized",
 		Phase:     deletionLockReleased,
 	}
+	foundationObject := foundationConfigMap(t, foundation)
+	foundation.Hash = foundationObject.Data["foundation.sha256"]
+	objects := foundationSnapshotObjects(t, scheme)
+	allocationState := newAllocationState(foundation)
+	encodedAllocations, err := encodeAllocationState(allocationState)
+	if err != nil {
+		t.Fatal(err)
+	}
+	objects = append(objects,
+		tenant,
+		foundationObject,
+		&corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: allocationConfigMapName, Namespace: defaultFoundationNamespace},
+			Data:       map[string]string{"allocations.json": encodedAllocations},
+		},
+	)
 	kubernetes := fake.NewClientBuilder().
 		WithScheme(scheme).
 		WithStatusSubresource(tenant).
-		WithObjects(tenant, foundationConfigMap(t, foundation)).
+		WithObjects(objects...).
 		Build()
 	docker := &fakeDockerClient{
 		container: DockerContainer{
@@ -174,11 +190,32 @@ func TestValidationOnlyModeContinuesManagedDeletion(t *testing.T) {
 		MutationEnabled:         false,
 		ExpectedControllerImage: foundation.ControllerImage,
 	}
+	resourceIdentities, resourceHash, err := reconciler.foundationResourceSnapshot(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	peerHash, err := hashJSON(map[string]tenancyv1alpha1.EndpointAllocationIdentity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var snapshotted tenancyv1alpha1.Tenant
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &snapshotted); err != nil {
+		t.Fatal(err)
+	}
+	snapshotted.Status.FoundationSnapshot = &tenancyv1alpha1.FoundationSnapshot{
+		FoundationHash: foundation.Hash, ManagementContainerID: foundation.ManagementContainerID,
+		NetworkID: foundation.NetworkID, ControllerImage: foundation.ControllerImage,
+		ResourceHash: resourceHash, PeerAllocationsHash: peerHash,
+		Resources: resourceIdentities, PeerAllocations: map[string]tenancyv1alpha1.EndpointAllocationIdentity{},
+	}
+	if err := kubernetes.Status().Update(context.Background(), &snapshotted); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: tenant.Name}}); err != nil {
 		t.Fatal(err)
 	}
 	var updated tenancyv1alpha1.Tenant
-	err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &updated)
+	err = kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &updated)
 	if client.IgnoreNotFound(err) != nil {
 		t.Fatal(err)
 	}

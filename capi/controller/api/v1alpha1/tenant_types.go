@@ -33,15 +33,18 @@ const (
 	StageNetworkSourcesApplied     = "NetworkSourcesApplied"
 	StageNetworkResourceSetApplied = "NetworkResourceSetApplied"
 	StageNetworkProbeCreated       = "NetworkProbeCreated"
+	StageNetworkProbeSucceeded     = "NetworkProbeSucceeded"
 	StageNetworkReady              = "NetworkReady"
 	StagePostCNIWorkersReady       = "PostCNIWorkersReady"
 	StageStorageApplied            = "StorageApplied"
 	StageStorageProbeCreated       = "StorageProbeCreated"
+	StageStorageProbeSucceeded     = "StorageProbeSucceeded"
 	StageStorageReady              = "StorageReady"
 	StageCNPGOperatorApplied       = "CNPGOperatorApplied"
 	StageCNPGStoragePrepared       = "CNPGStoragePrepared"
 	StageCNPGClusterApplied        = "CNPGClusterApplied"
 	StageDatabaseProbeCreated      = "DatabaseProbeCreated"
+	StageDatabaseProbeSucceeded    = "DatabaseProbeSucceeded"
 	StageDatabaseReady             = "DatabaseReady"
 	StageFunctionalVerified        = "FunctionalVerified"
 	StageReady                     = "Ready"
@@ -120,13 +123,31 @@ type SurvivorSnapshot struct {
 }
 
 type FoundationSnapshot struct {
-	FoundationHash        string `json:"foundationHash"`
-	ManagementContainerID string `json:"managementContainerID"`
-	NetworkID             string `json:"networkID"`
-	ControllerImage       string `json:"controllerImage"`
-	ResourceHash          string `json:"resourceHash"`
-	PeerAllocationsHash   string `json:"peerAllocationsHash"`
-	TargetEndpoint        string `json:"targetEndpoint"`
+	FoundationHash        string                                `json:"foundationHash"`
+	ManagementContainerID string                                `json:"managementContainerID"`
+	NetworkID             string                                `json:"networkID"`
+	ControllerImage       string                                `json:"controllerImage"`
+	ResourceHash          string                                `json:"resourceHash"`
+	PeerAllocationsHash   string                                `json:"peerAllocationsHash"`
+	TargetEndpoint        string                                `json:"targetEndpoint"`
+	Resources             []FoundationResourceIdentity          `json:"resources"`
+	PeerAllocations       map[string]EndpointAllocationIdentity `json:"peerAllocations"`
+}
+
+type FoundationResourceIdentity struct {
+	APIVersion string `json:"apiVersion"`
+	Kind       string `json:"kind"`
+	Namespace  string `json:"namespace"`
+	Name       string `json:"name"`
+	UID        string `json:"uid"`
+	Image      string `json:"image,omitempty"`
+}
+
+type EndpointAllocationIdentity struct {
+	TenantName     string `json:"tenantName"`
+	TenantUID      string `json:"tenantUID"`
+	SpecHash       string `json:"specHash"`
+	FoundationHash string `json:"foundationHash"`
 }
 
 type TenantStatus struct {

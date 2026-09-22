@@ -178,10 +178,51 @@ spec:
                     type: string
                   networkID:
                     type: string
+                  peerAllocations:
+                    additionalProperties:
+                      properties:
+                        foundationHash:
+                          type: string
+                        specHash:
+                          type: string
+                        tenantName:
+                          type: string
+                        tenantUID:
+                          type: string
+                      required:
+                      - foundationHash
+                      - specHash
+                      - tenantName
+                      - tenantUID
+                      type: object
+                    type: object
                   peerAllocationsHash:
                     type: string
                   resourceHash:
                     type: string
+                  resources:
+                    items:
+                      properties:
+                        apiVersion:
+                          type: string
+                        image:
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          type: string
+                        uid:
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      - namespace
+                      - uid
+                      type: object
+                    type: array
                   targetEndpoint:
                     type: string
                 required:
@@ -189,8 +230,10 @@ spec:
                 - foundationHash
                 - managementContainerID
                 - networkID
+                - peerAllocations
                 - peerAllocationsHash
                 - resourceHash
+                - resources
                 - targetEndpoint
                 type: object
               functionalEvidence:
