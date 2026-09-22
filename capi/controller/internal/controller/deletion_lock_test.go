@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	coordinationv1 "k8s.io/api/coordination/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -81,6 +82,7 @@ func TestAdmissionLeaseSerializesOverlappingReservations(t *testing.T) {
 		Schema: 1, TenantName: "tenant-a", TenantUID: "uid-a",
 		Requester: "user-a", Nonce: "nonce-a", ExpiresAt: float64(now.Add(time.Minute).Unix()),
 	}
+
 	second := DeletionReservation{
 		Schema: 1, TenantName: "tenant-b", TenantUID: "uid-b",
 		Requester: "user-b", Nonce: "nonce-b", ExpiresAt: float64(now.Add(time.Minute).Unix()),
@@ -93,5 +95,59 @@ func TestAdmissionLeaseSerializesOverlappingReservations(t *testing.T) {
 	}
 	if err := AcquireDeletionAdmissionLease(context.Background(), kubernetes, defaultFoundationNamespace, second, "request-b", now.Add(61*time.Second)); err != nil {
 		t.Fatalf("expired admission Lease was not recoverable: %v", err)
+	}
+}
+
+func TestExpiredAdmittedReservationIsAdoptedAfterControllerOutage(t *testing.T) {
+	now := time.Now().UTC()
+	tenant := validTenant("tenant-a")
+	tenant.UID = "tenant-uid"
+	reservation := DeletionReservation{
+		Schema: 1, TenantName: tenant.Name, TenantUID: string(tenant.UID),
+		Requester: "test-user", Nonce: "nonce", ExpiresAt: float64(now.Add(-time.Minute).Unix()),
+	}
+	encoded, err := json.Marshal(reservation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	holder := reservation.Nonce
+	duration := deletionLeaseSeconds
+	renew := metav1.NewMicroTime(now.Add(-2 * time.Minute))
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(
+			tenant,
+			&corev1.ConfigMap{
+				ObjectMeta: metav1.ObjectMeta{Name: DeletionReservationName, Namespace: defaultFoundationNamespace},
+				Data:       map[string]string{deletionReservationKey: string(encoded)},
+			},
+			&coordinationv1.Lease{
+				ObjectMeta: metav1.ObjectMeta{
+					Name: DeletionLeaseName, Namespace: defaultFoundationNamespace,
+					Annotations: map[string]string{
+						"tenancy.cnpg-vcluster.io/tenant":     tenant.Name,
+						"tenancy.cnpg-vcluster.io/tenant-uid": string(tenant.UID),
+						"tenancy.cnpg-vcluster.io/requester":  reservation.Requester,
+					},
+				},
+				Spec: coordinationv1.LeaseSpec{
+					HolderIdentity: &holder, LeaseDurationSeconds: &duration,
+					AcquireTime: &renew, RenewTime: &renew,
+				},
+			},
+		).
+		Build()
+	reconciler := &TenantReconciler{Client: kubernetes, APIReader: kubernetes}
+	locked, err := reconciler.ensureDeletionLock(context.Background(), tenant)
+	if err != nil || locked {
+		t.Fatalf("expired admitted reservation was not adopted: locked=%v err=%v", locked, err)
+	}
+	var current tenancyv1alpha1.Tenant
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Teardown == nil || current.Status.Teardown.Reservation != reservation.Nonce {
+		t.Fatalf("admitted reservation nonce was not persisted: %#v", current.Status.Teardown)
 	}
 }

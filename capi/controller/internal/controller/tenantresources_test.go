@@ -105,6 +105,31 @@ func TestCompletedProbeDeletionResumesAfterAuthoritativeNotFound(t *testing.T) {
 	}
 }
 
+func TestProbeSuccessCheckpointRejectsReplacementIdentity(t *testing.T) {
+	probe := &unstructured.Unstructured{}
+	probe.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "Pod"})
+	probe.SetNamespace("default")
+	probe.SetName("tenant-a-network-verify")
+	probe.SetUID(types.UID("replacement-uid"))
+	probe.SetAnnotations(map[string]string{
+		resources.TenantUIDAnnotation:  "tenant-uid",
+		resources.SpecHashAnnotation:   "spec-hash",
+		resources.FoundationAnnotation: "foundation-hash",
+	})
+	tenant := &tenancyv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{UID: "tenant-uid"},
+		Status: tenancyv1alpha1.TenantStatus{
+			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
+				APIVersion: "v1", Kind: "Pod", Namespace: "default",
+				Name: probe.GetName(), UID: "recorded-uid",
+			}},
+		},
+	}
+	if err := validateTenantProbeIdentity(tenant, probe, "spec-hash", "foundation-hash"); err == nil {
+		t.Fatal("replacement probe established the success checkpoint")
+	}
+}
+
 func markedTenantConfigMap(gvk schema.GroupVersionKind, tenant *tenancyv1alpha1.Tenant, value string) *unstructured.Unstructured {
 	object := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": gvk.GroupVersion().String(),

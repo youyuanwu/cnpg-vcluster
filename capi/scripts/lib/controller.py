@@ -459,6 +459,7 @@ def reserve_tenant_deletion(
     if not requester:
         raise RuntimeError("management requester identity is unavailable")
     for _ in range(5):
+        existing_nonce: str | None = None
         current = client.kubectl(
             "-n",
             CONTROLLER_NAMESPACE,
@@ -482,8 +483,11 @@ def reserve_tenant_deletion(
                     and existing.get("requester") == requester
                     and existing.get("nonce")
                 ):
-                    return str(existing["nonce"])
-                raise RuntimeError("another targeted deletion reservation is active")
+                    if float(existing["expiresAt"]) >= now + 120:
+                        return str(existing["nonce"])
+                    existing_nonce = str(existing["nonce"])
+                else:
+                    raise RuntimeError("another targeted deletion reservation is active")
             resource_version = document["metadata"]["resourceVersion"]
             operation = "replace"
         elif (
@@ -496,7 +500,7 @@ def reserve_tenant_deletion(
             raise RuntimeError(
                 f"failed to inspect targeted deletion reservation: {current.stderr}"
             )
-        nonce = uuid.uuid4().hex
+        nonce = existing_nonce or uuid.uuid4().hex
         reservation = {
             "schema": 1,
             "tenantName": tenant_name,

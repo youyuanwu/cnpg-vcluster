@@ -138,12 +138,22 @@ func (reconciler *TenantReconciler) ensureDeletionLock(
 	}
 	if tenant.Status.Teardown == nil || tenant.Status.Teardown.Reservation == "" {
 		if reservation.ExpiresAt <= float64(now.Unix()) {
-			return false, fmt.Errorf("targeted deletion reservation expired before Lease acquisition")
+			var admitted coordinationv1.Lease
+			if err := reconciler.reader().Get(ctx, types.NamespacedName{
+				Namespace: reconciler.foundationNamespace(),
+				Name:      DeletionLeaseName,
+			}, &admitted); err != nil {
+				return false, fmt.Errorf("targeted deletion reservation expired before Lease acquisition")
+			}
+			if !deletionLeaseMatches(admitted, reservation, tenant) {
+				return false, fmt.Errorf("expired targeted deletion reservation has no matching admission Lease")
+			}
 		}
 		return false, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			if status.Teardown == nil {
 				status.Teardown = &tenancyv1alpha1.TeardownStatus{}
 			}
+
 			status.Teardown.Reservation = reservation.Nonce
 			return nil
 		})
@@ -176,6 +186,7 @@ func (reconciler *TenantReconciler) ensureDeletionLock(
 				Annotations: map[string]string{
 					"tenancy.cnpg-vcluster.io/tenant":     tenant.Name,
 					"tenancy.cnpg-vcluster.io/tenant-uid": string(tenant.UID),
+					"tenancy.cnpg-vcluster.io/requester":  reservation.Requester,
 				},
 			},
 			Spec: coordinationv1.LeaseSpec{
@@ -219,12 +230,58 @@ func (reconciler *TenantReconciler) ensureDeletionLock(
 		lease.SetAnnotations(map[string]string{
 			"tenancy.cnpg-vcluster.io/tenant":     tenant.Name,
 			"tenancy.cnpg-vcluster.io/tenant-uid": string(tenant.UID),
+			"tenancy.cnpg-vcluster.io/requester":  reservation.Requester,
 		})
 	}
 	if err := reconciler.Update(ctx, &lease); err != nil {
 		return false, err
 	}
 	return true, nil
+}
+
+func (reconciler *TenantReconciler) deletionMutationBlocked(
+	ctx context.Context,
+	currentName string,
+	now time.Time,
+) (bool, error) {
+	var tenants tenancyv1alpha1.TenantList
+	if err := reconciler.reader().List(ctx, &tenants); err != nil {
+		return false, err
+	}
+	for index := range tenants.Items {
+		tenant := &tenants.Items[index]
+		if tenant.Name != currentName && !tenant.DeletionTimestamp.IsZero() {
+			return true, nil
+		}
+	}
+	if _, _, err := ReadDeletionReservation(ctx, reconciler.reader(), reconciler.foundationNamespace(), now); err == nil {
+		return true, nil
+	} else if !apierrors.IsNotFound(err) && !containsAny(err.Error(), "invalid or expired") {
+		return false, err
+	}
+	var lease coordinationv1.Lease
+	err := reconciler.reader().Get(ctx, types.NamespacedName{
+		Namespace: reconciler.foundationNamespace(), Name: DeletionLeaseName,
+	}, &lease)
+	if apierrors.IsNotFound(err) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return !deletionLeaseExpired(lease, now), nil
+}
+
+func deletionLeaseMatches(
+	lease coordinationv1.Lease,
+	reservation DeletionReservation,
+	tenant *tenancyv1alpha1.Tenant,
+) bool {
+	return lease.Spec.HolderIdentity != nil &&
+		*lease.Spec.HolderIdentity == reservation.Nonce &&
+		lease.Annotations["tenancy.cnpg-vcluster.io/tenant"] == tenant.Name &&
+		lease.Annotations["tenancy.cnpg-vcluster.io/tenant-uid"] == string(tenant.UID) &&
+		lease.Annotations["tenancy.cnpg-vcluster.io/requester"] == reservation.Requester
 }
 
 func (reconciler *TenantReconciler) releaseDeletionLock(

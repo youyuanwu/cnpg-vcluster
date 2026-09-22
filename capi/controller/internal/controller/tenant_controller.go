@@ -70,6 +70,15 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 	if !reconciler.MutationEnabled && !managedDeletion {
 		return ctrl.Result{}, reconciler.publishMutationDisabled(ctx, &tenant, specHash)
 	}
+	if !managedDeletion {
+		blocked, err := reconciler.deletionMutationBlocked(ctx, tenant.Name, time.Now().UTC())
+		if err != nil {
+			return ctrl.Result{}, fmt.Errorf("inspect active Tenant deletion: %s", sanitize.Text(err.Error()))
+		}
+		if blocked {
+			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
+		}
+	}
 	foundation, err := loadFoundation(ctx, reconciler.reader(), reconciler.docker(), reconciler.foundationNamespace(), reconciler.foundationName(), reconciler.SupportedVersion, reconciler.ExpectedControllerImage)
 	if err != nil {
 		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "FoundationInvalid", err)

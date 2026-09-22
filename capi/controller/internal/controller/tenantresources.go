@@ -160,6 +160,25 @@ func deleteCompletedTenantProbe(
 	return false, nil
 }
 
+func validateTenantProbeIdentity(
+	tenant *tenancyv1alpha1.Tenant,
+	probe *unstructured.Unstructured,
+	specHash,
+	foundationHash string,
+) error {
+	recorded := findTenantIdentity(tenant.Status.TenantResources, probe.GroupVersionKind(), probe.GetNamespace(), probe.GetName())
+	if recorded == nil || recorded.UID != string(probe.GetUID()) {
+		return fmt.Errorf("%s probe identity changed before success checkpoint", probe.GetName())
+	}
+	annotations := probe.GetAnnotations()
+	if annotations[resources.TenantUIDAnnotation] != string(tenant.UID) ||
+		annotations[resources.SpecHashAnnotation] != specHash ||
+		annotations[resources.FoundationAnnotation] != foundationHash {
+		return fmt.Errorf("%s probe ownership changed before success checkpoint", probe.GetName())
+	}
+	return nil
+}
+
 func tenantObjectReady(object *unstructured.Unstructured) bool {
 	conditions, _, _ := unstructured.NestedSlice(object.Object, "status", "conditions")
 	for _, raw := range conditions {
