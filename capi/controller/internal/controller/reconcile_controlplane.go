@@ -203,24 +203,44 @@ func (reconciler *TenantReconciler) managementObjectsCurrent(ctx context.Context
 		if err != nil {
 			return false, fmt.Errorf("read %s conditions: %w", item.gvk.Kind, err)
 		}
-		if !found {
-			continue
+		if !found || len(conditions) == 0 {
+			return false, nil
 		}
+		readinessFound := false
 		for _, raw := range conditions {
 			condition, ok := raw.(map[string]any)
-			if !ok || condition["status"] != "False" {
+			if !ok {
 				continue
 			}
 			conditionType, _ := condition["type"].(string)
-			reason, _ := condition["reason"].(string)
-			severity, _ := condition["severity"].(string)
-			if (conditionType == "Ready" || conditionType == "Available" || conditionType == "ControlPlaneReady") &&
-				(severity == "Error" || containsAny(reason, "failed", "invalid", "error")) {
+			if conditionType != "Ready" && conditionType != "Available" && conditionType != "ControlPlaneReady" {
+				continue
+			}
+			readinessFound = true
+			if condition["status"] != "True" {
+				return false, nil
+			}
+			conditionGeneration, found, err := unstructured.NestedInt64(condition, "observedGeneration")
+			if err != nil {
+				return false, fmt.Errorf("read %s %s observedGeneration: %w", item.gvk.Kind, conditionType, err)
+			}
+			if found && conditionGeneration < object.GetGeneration() {
+				return false, nil
+			}
+			if !found && !observedGenerationIsCurrent(object) {
 				return false, nil
 			}
 		}
+		if !readinessFound {
+			return false, nil
+		}
 	}
 	return true, nil
+}
+
+func observedGenerationIsCurrent(object *unstructured.Unstructured) bool {
+	observedGeneration, found, err := unstructured.NestedInt64(object.Object, "status", "observedGeneration")
+	return err == nil && found && observedGeneration >= object.GetGeneration()
 }
 
 func (reconciler *TenantReconciler) ensureNamespace(ctx context.Context, desired *corev1.Namespace, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (tenancyv1alpha1.ObservedResourceIdentity, error) {

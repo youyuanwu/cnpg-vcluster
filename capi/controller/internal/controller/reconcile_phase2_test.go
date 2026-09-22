@@ -98,12 +98,16 @@ func TestManagementObjectsCurrentReportsProviderFailureAsNotReady(t *testing.T) 
 		t.Fatal(err)
 	}
 	cluster.SetUID("cluster-uid")
+	cluster.SetGeneration(1)
+	setProviderReadiness(t, cluster, "Available", "True", "Available", 1)
 	devCluster, err := resources.DevCluster(resourceContext)
 	if err != nil {
 		t.Fatal(err)
 	}
 	devCluster.SetUID("dev-cluster-uid")
 	devCluster.SetOwnerReferences([]metav1.OwnerReference{providerOwner(cluster)})
+	devCluster.SetGeneration(1)
+	setProviderReadiness(t, devCluster, "Ready", "True", "Ready", 1)
 	controlPlane, err := resources.KamajiControlPlane(resourceContext)
 	if err != nil {
 		t.Fatal(err)
@@ -111,16 +115,7 @@ func TestManagementObjectsCurrentReportsProviderFailureAsNotReady(t *testing.T) 
 	controlPlane.SetUID("control-plane-uid")
 	controlPlane.SetOwnerReferences([]metav1.OwnerReference{providerOwner(cluster)})
 	controlPlane.SetGeneration(2)
-	if err := unstructured.SetNestedField(controlPlane.Object, int64(2), "status", "observedGeneration"); err != nil {
-		t.Fatal(err)
-	}
-	if err := unstructured.SetNestedSlice(controlPlane.Object, []any{
-		map[string]any{
-			"type": "Ready", "status": "False", "severity": "Error", "reason": "ProviderFailed",
-		},
-	}, "status", "conditions"); err != nil {
-		t.Fatal(err)
-	}
+	setProviderReadiness(t, controlPlane, "Ready", "False", "NotAvailable", 2)
 	tenant.Status.ObservedResources = []tenancyv1alpha1.ObservedResourceIdentity{
 		identityFor(cluster),
 		identityFor(devCluster),
@@ -137,6 +132,64 @@ func TestManagementObjectsCurrentReportsProviderFailureAsNotReady(t *testing.T) 
 	}
 	if current {
 		t.Fatal("current provider failure was reported ready")
+	}
+	for name, condition := range map[string]struct {
+		status     string
+		reason     string
+		generation int64
+		expected   bool
+	}{
+		"unknown": {"Unknown", "Reconciling", 2, false},
+		"stale":   {"True", "Ready", 1, false},
+		"current": {"True", "Ready", 2, true},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var currentControlPlane unstructured.Unstructured
+			currentControlPlane.SetGroupVersionKind(controlPlaneGVK)
+			if err := kubernetes.Get(context.Background(), client.ObjectKey{
+				Namespace: tenant.Name,
+				Name:      tenant.Name,
+			}, &currentControlPlane); err != nil {
+				t.Fatal(err)
+			}
+			setProviderReadiness(t, &currentControlPlane, "Ready", condition.status, condition.reason, condition.generation)
+			if err := kubernetes.Update(context.Background(), &currentControlPlane); err != nil {
+				t.Fatal(err)
+			}
+			ready, err := reconciler.managementObjectsCurrent(context.Background(), tenant, "spec-hash", foundation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if ready != condition.expected {
+				t.Fatalf("unexpected readiness for %s condition: %v", name, ready)
+			}
+		})
+	}
+	var currentControlPlane unstructured.Unstructured
+	currentControlPlane.SetGroupVersionKind(controlPlaneGVK)
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{
+		Namespace: tenant.Name,
+		Name:      tenant.Name,
+	}, &currentControlPlane); err != nil {
+		t.Fatal(err)
+	}
+	unstructured.RemoveNestedField(currentControlPlane.Object, "status", "conditions")
+	if err := kubernetes.Update(context.Background(), &currentControlPlane); err != nil {
+		t.Fatal(err)
+	}
+	if ready, err := reconciler.managementObjectsCurrent(context.Background(), tenant, "spec-hash", foundation); err != nil || ready {
+		t.Fatalf("missing provider readiness was accepted: ready=%v err=%v", ready, err)
+	}
+}
+
+func setProviderReadiness(t *testing.T, object *unstructured.Unstructured, conditionType, status, reason string, generation int64) {
+	t.Helper()
+	if err := unstructured.SetNestedSlice(object.Object, []any{
+		map[string]any{
+			"type": conditionType, "status": status, "reason": reason, "observedGeneration": generation,
+		},
+	}, "status", "conditions"); err != nil {
+		t.Fatal(err)
 	}
 }
 
