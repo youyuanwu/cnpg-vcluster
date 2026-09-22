@@ -6,6 +6,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -70,6 +71,72 @@ func TestMutationReconcileAddsFinalizerBeforeEndpoint(t *testing.T) {
 	if afterEndpoint.Status.Stage != tenancyv1alpha1.StageEndpointAllocated ||
 		afterEndpoint.Status.Endpoint == "" {
 		t.Fatalf("endpoint stage did not persist: %#v", afterEndpoint.Status)
+	}
+}
+
+func TestManagementObjectsCurrentReportsProviderFailureAsNotReady(t *testing.T) {
+	foundation := testFoundation()
+	foundation.Hash = "foundation-hash"
+	tenant := validTenant("tenant-a")
+	tenant.UID = "tenant-uid"
+	resourceContext := resources.Context{
+		Tenant: tenant,
+		Spec: validation.CanonicalSpec{
+			KubernetesVersion: "1.36.4",
+			Workers:           1,
+			DatabaseCount:     1,
+			PodCIDR:           "10.20.0.0/16",
+			ServiceCIDR:       "10.21.0.0/16",
+		},
+		SpecHash:       "spec-hash",
+		FoundationHash: foundation.Hash,
+		Endpoint:       foundation.Endpoint(foundation.PoolStart),
+		Inputs:         foundation.ResourceInputs(),
+	}
+	cluster, err := resources.Cluster(resourceContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster.SetUID("cluster-uid")
+	devCluster, err := resources.DevCluster(resourceContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devCluster.SetUID("dev-cluster-uid")
+	devCluster.SetOwnerReferences([]metav1.OwnerReference{providerOwner(cluster)})
+	controlPlane, err := resources.KamajiControlPlane(resourceContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlPlane.SetUID("control-plane-uid")
+	controlPlane.SetOwnerReferences([]metav1.OwnerReference{providerOwner(cluster)})
+	controlPlane.SetGeneration(2)
+	if err := unstructured.SetNestedField(controlPlane.Object, int64(2), "status", "observedGeneration"); err != nil {
+		t.Fatal(err)
+	}
+	if err := unstructured.SetNestedSlice(controlPlane.Object, []any{
+		map[string]any{
+			"type": "Ready", "status": "False", "severity": "Error", "reason": "ProviderFailed",
+		},
+	}, "status", "conditions"); err != nil {
+		t.Fatal(err)
+	}
+	tenant.Status.ObservedResources = []tenancyv1alpha1.ObservedResourceIdentity{
+		identityFor(cluster),
+		identityFor(devCluster),
+		identityFor(controlPlane),
+	}
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithObjects(cluster, devCluster, controlPlane).
+		Build()
+	reconciler := &TenantReconciler{Client: kubernetes, APIReader: kubernetes}
+	current, err := reconciler.managementObjectsCurrent(context.Background(), tenant, "spec-hash", foundation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if current {
+		t.Fatal("current provider failure was reported ready")
 	}
 }
 

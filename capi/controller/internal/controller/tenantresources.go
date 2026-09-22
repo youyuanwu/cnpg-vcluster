@@ -115,6 +115,35 @@ func tenantIdentityPresent(values []tenancyv1alpha1.ObservedResourceIdentity, ex
 	return false
 }
 
+func validateTenantResourceOwnership(
+	ctx context.Context,
+	tenantClient client.Client,
+	tenant *tenancyv1alpha1.Tenant,
+	specHash,
+	foundationHash string,
+) error {
+	for _, identity := range tenant.Status.TenantResources {
+		if identity.Kind == "Node" {
+			continue
+		}
+		gvk := schema.FromAPIVersionAndKind(identity.APIVersion, identity.Kind)
+		current := &unstructured.Unstructured{}
+		current.SetGroupVersionKind(gvk)
+		if err := tenantClient.Get(ctx, client.ObjectKey{Namespace: identity.Namespace, Name: identity.Name}, current); err != nil {
+			return fmt.Errorf("tenant resource ownership inspection failed for %s/%s: %w", identity.Kind, identity.Name, err)
+		}
+		annotations := current.GetAnnotations()
+		if string(current.GetUID()) != identity.UID ||
+			annotations[resources.TenantAnnotation] != tenant.Name ||
+			annotations[resources.TenantUIDAnnotation] != string(tenant.UID) ||
+			annotations[resources.SpecHashAnnotation] != specHash ||
+			annotations[resources.FoundationAnnotation] != foundationHash {
+			return fmt.Errorf("tenant resource ownership changed for %s/%s", identity.Kind, identity.Name)
+		}
+	}
+	return nil
+}
+
 func removeTenantIdentity(
 	status *tenancyv1alpha1.TenantStatus,
 	gvk schema.GroupVersionKind,

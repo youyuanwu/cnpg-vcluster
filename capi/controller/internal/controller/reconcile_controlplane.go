@@ -216,7 +216,7 @@ func (reconciler *TenantReconciler) managementObjectsCurrent(ctx context.Context
 			severity, _ := condition["severity"].(string)
 			if (conditionType == "Ready" || conditionType == "Available" || conditionType == "ControlPlaneReady") &&
 				(severity == "Error" || containsAny(reason, "failed", "invalid", "error")) {
-				return false, fmt.Errorf("%s reports current failure condition %s: %s", item.gvk.Kind, conditionType, reason)
+				return false, nil
 			}
 		}
 	}

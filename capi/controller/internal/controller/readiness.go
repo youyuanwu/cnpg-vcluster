@@ -27,6 +27,13 @@ func (reconciler *TenantReconciler) reconcileReadiness(ctx context.Context, tena
 	if err != nil {
 		return ctrl.Result{}, err
 	}
+	if err := validateTenantResourceOwnership(ctx, tenantClient, tenant, specHash, foundation.Hash); err != nil {
+		return ctrl.Result{}, err
+	}
+	controlPlaneReady, err := reconciler.managementObjectsCurrent(ctx, tenant, specHash, foundation)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
 	workers, err := reconciler.observePostCNIWorkerState(ctx, tenant, canonical, specHash, foundation)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -48,11 +55,11 @@ func (reconciler *TenantReconciler) reconcileReadiness(ctx context.Context, tena
 		return ctrl.Result{}, err
 	}
 	workersReady := workers.inventoryComplete && workers.allReady
-	ready := workersReady && networkReady && storageReady && databaseReady
+	ready := controlPlaneReady && workersReady && networkReady && storageReady && databaseReady
 	if !ready {
 		return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.Phase = tenancyv1alpha1.PhaseDegraded
-			setReadyObservationConditions(status, tenant, workersReady, networkReady, storageReady, databaseReady)
+			setReadyObservationConditions(status, tenant, controlPlaneReady, workersReady, networkReady, storageReady, databaseReady)
 			setCondition(status, tenant, "Ready", metav1.ConditionFalse, "ComponentsNotReady", "One or more Tenant components are not ready")
 			return nil
 		})
@@ -61,17 +68,18 @@ func (reconciler *TenantReconciler) reconcileReadiness(ctx context.Context, tena
 		recordPostCNIWorkerState(status, workers)
 		status.Stage = tenancyv1alpha1.StageReady
 		status.Phase = tenancyv1alpha1.PhaseReady
-		setReadyObservationConditions(status, tenant, true, true, true, true)
+		setReadyObservationConditions(status, tenant, true, true, true, true, true)
 		setCondition(status, tenant, "Ready", metav1.ConditionTrue, "Ready", "Tenant components are ready")
 		return nil
 	})
 }
 
-func setReadyObservationConditions(status *tenancyv1alpha1.TenantStatus, tenant *tenancyv1alpha1.Tenant, workers, network, storage, database bool) {
+func setReadyObservationConditions(status *tenancyv1alpha1.TenantStatus, tenant *tenancyv1alpha1.Tenant, controlPlane, workers, network, storage, database bool) {
 	for _, value := range []struct {
 		condition string
 		ready     bool
 	}{
+		{"ControlPlaneReady", controlPlane},
 		{"WorkersReady", workers},
 		{"NetworkReady", network},
 		{"StorageReady", storage},

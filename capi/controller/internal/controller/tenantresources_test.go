@@ -62,6 +62,41 @@ func TestEnsureTenantObjectRejectsRecordedReplacementBeforePatch(t *testing.T) {
 	}
 }
 
+func TestValidateTenantResourceOwnershipRejectsReplacement(t *testing.T) {
+	gvk := schema.GroupVersionKind{Group: "storage.k8s.io", Version: "v1", Kind: "StorageClass"}
+	tenant := &tenancyv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
+		Status: tenancyv1alpha1.TenantStatus{
+			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
+				APIVersion: gvk.GroupVersion().String(),
+				Kind:       gvk.Kind,
+				Name:       tenantStorageClass,
+				UID:        "recorded-uid",
+			}},
+		},
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(gvk)
+	current.SetName(tenantStorageClass)
+	current.SetUID("replacement-uid")
+	current.SetAnnotations(map[string]string{
+		resources.TenantAnnotation:     tenant.Name,
+		resources.TenantUIDAnnotation:  string(tenant.UID),
+		resources.SpecHashAnnotation:   "spec-hash",
+		resources.FoundationAnnotation: "foundation-hash",
+	})
+	kubernetes := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build()
+	if err := validateTenantResourceOwnership(
+		context.Background(),
+		kubernetes,
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+	); err == nil || !strings.Contains(err.Error(), "ownership changed") {
+		t.Fatalf("same-name Tenant resource replacement was accepted: %v", err)
+	}
+}
+
 func markedTenantConfigMap(gvk schema.GroupVersionKind, tenant *tenancyv1alpha1.Tenant, value string) *unstructured.Unstructured {
 	object := &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": gvk.GroupVersion().String(),

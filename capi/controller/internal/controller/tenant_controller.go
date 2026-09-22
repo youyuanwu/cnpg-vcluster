@@ -117,17 +117,7 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseOwnershipInvalid, "VolumeOwnershipInvalid", err)
 	}
 	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		status.ObservedGeneration = tenant.Generation
-		status.SpecHash = specHash
-		status.FoundationHash = foundation.Hash
-		if status.Phase != tenancyv1alpha1.PhaseFailed &&
-			status.Phase != tenancyv1alpha1.PhaseOwnershipInvalid &&
-			status.Stage != tenancyv1alpha1.StageReady {
-			status.Phase = tenancyv1alpha1.PhaseProgressing
-		}
-		setCondition(status, &tenant, "Accepted", metav1.ConditionTrue, "Accepted", "Tenant specification is accepted")
-		setCondition(status, &tenant, "FoundationReady", metav1.ConditionTrue, "FoundationReady", "Tenant foundation identity is current")
-		setCondition(status, &tenant, "OwnershipValid", metav1.ConditionTrue, "OwnershipValid", "Observed Tenant root ownership is valid")
+		initializeReconcileStatus(status, &tenant, specHash, foundation.Hash)
 		return nil
 	}); err != nil {
 		return ctrl.Result{}, err
@@ -142,15 +132,19 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		}
 		return result, reconciler.failure(ctx, &tenant, specHash, phase, reason, err)
 	}
-	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		if status.Stage != tenancyv1alpha1.StageReady {
-			status.Phase = tenancyv1alpha1.PhaseProgressing
-		}
-		return nil
-	}); err != nil {
-		return ctrl.Result{}, err
-	}
 	return result, nil
+}
+
+func initializeReconcileStatus(status *tenancyv1alpha1.TenantStatus, tenant *tenancyv1alpha1.Tenant, specHash, foundationHash string) {
+	status.ObservedGeneration = tenant.Generation
+	status.SpecHash = specHash
+	status.FoundationHash = foundationHash
+	if status.Phase == "" || status.Phase == tenancyv1alpha1.PhasePending {
+		status.Phase = tenancyv1alpha1.PhaseProgressing
+	}
+	setCondition(status, tenant, "Accepted", metav1.ConditionTrue, "Accepted", "Tenant specification is accepted")
+	setCondition(status, tenant, "FoundationReady", metav1.ConditionTrue, "FoundationReady", "Tenant foundation identity is current")
+	setCondition(status, tenant, "OwnershipValid", metav1.ConditionTrue, "OwnershipValid", "Observed Tenant root ownership is valid")
 }
 
 func (reconciler *TenantReconciler) publishValidation(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, validationErr error) error {

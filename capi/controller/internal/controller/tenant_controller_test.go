@@ -56,6 +56,22 @@ func TestValidTenantStaysMutationDisabledWithoutFinalizer(t *testing.T) {
 	}
 }
 
+func TestReconcileMetadataPreservesDegradedReadinessPhase(t *testing.T) {
+	tenant := validTenant("tenant-a")
+	tenant.Generation = 4
+	status := tenancyv1alpha1.TenantStatus{
+		Stage: tenancyv1alpha1.StageDatabaseReady,
+		Phase: tenancyv1alpha1.PhaseDegraded,
+	}
+	initializeReconcileStatus(&status, tenant, "spec-hash", "foundation-hash")
+	if status.Phase != tenancyv1alpha1.PhaseDegraded {
+		t.Fatalf("readiness degradation was overwritten: %q", status.Phase)
+	}
+	if status.ObservedGeneration != tenant.Generation {
+		t.Fatalf("observed generation was not refreshed: %d", status.ObservedGeneration)
+	}
+}
+
 func TestInvalidTenantFailsWithoutFinalizer(t *testing.T) {
 	scheme := testScheme(t)
 	tenant := &tenancyv1alpha1.Tenant{
