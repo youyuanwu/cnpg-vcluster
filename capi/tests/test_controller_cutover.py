@@ -67,6 +67,42 @@ class ControllerCutoverTests(unittest.TestCase):
                 )
             self.assertEqual([], client.calls)
 
+    def test_legacy_credentials_and_endpoint_allocations_block(self) -> None:
+        for relative, content, expected in (
+            (
+                ".runtime/tenants/tenant-a/kubeconfig",
+                "credentials",
+                "legacy local lifecycle",
+            ),
+            (
+                ".runtime/management/tenant-endpoints.json",
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "networkId": "network-id",
+                        "allocations": {"tenant-a": "172.18.255.1"},
+                    }
+                ),
+                "endpoint allocations",
+            ),
+        ):
+            with self.subTest(relative=relative):
+                with tempfile.TemporaryDirectory() as temporary:
+                    root = Path(temporary)
+                    path = root / relative
+                    path.parent.mkdir(parents=True)
+                    path.write_text(content, encoding="utf-8")
+                    with self.assertRaisesRegex(RuntimeError, expected):
+                        require_clean_controller_cutover(
+                            root,
+                            {
+                                "OWNERSHIP_LABEL": "example.io/owned",
+                                "LAB_PREFIX": "lab",
+                                "KIND_CLUSTER_NAME": "management",
+                            },
+                            FakeManagementClient([]),
+                        )
+
     def test_clean_cutover_accepts_empty_kubernetes_and_docker_state(self) -> None:
         responses = [
             CompletedProcess([], 0, stdout="", stderr=""),
@@ -90,11 +126,66 @@ class ControllerCutoverTests(unittest.TestCase):
                 return_value=CompletedProcess([], 0, stdout="", stderr=""),
             ),
         ):
+            root = Path(temporary)
+            ledger = root / ".runtime" / "management" / "tenant-endpoints.json"
+            ledger.parent.mkdir(parents=True)
+            ledger.write_text(
+                json.dumps(
+                    {
+                        "schema": 1,
+                        "networkId": "network-id",
+                        "allocations": {},
+                    }
+                ),
+                encoding="utf-8",
+            )
             require_clean_controller_cutover(
-                Path(temporary),
-                {"OWNERSHIP_LABEL": "example.io/owned", "LAB_PREFIX": "lab"},
+                root,
+                {
+                    "OWNERSHIP_LABEL": "example.io/owned",
+                    "LAB_PREFIX": "lab",
+                    "KIND_CLUSTER_NAME": "management",
+                },
                 client,
             )
+
+    def test_orphan_capd_container_blocks_activation(self) -> None:
+        responses = [
+            CompletedProcess([], 0, stdout="", stderr=""),
+            CompletedProcess([], 0, stdout='{"items":[]}', stderr=""),
+            *[
+                CompletedProcess([], 0, stdout="", stderr="")
+                for _ in range(6)
+            ],
+            CompletedProcess(
+                [],
+                1,
+                stdout="",
+                stderr="Error from server (NotFound)",
+            ),
+        ]
+        client = FakeManagementClient(responses)
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch(
+                "scripts.lib.controller_cutover.run",
+                side_effect=[
+                    CompletedProcess([], 0, stdout="", stderr=""),
+                    CompletedProcess([], 0, stdout="container-id\n", stderr=""),
+                    CompletedProcess([], 0, stdout="tenant-a\n", stderr=""),
+                ],
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "CAPD tenant containers"):
+                require_clean_controller_cutover(
+                    Path(temporary),
+                    {
+                        "OWNERSHIP_LABEL": "example.io/owned",
+                        "LAB_PREFIX": "lab",
+                        "KIND_CLUSTER_NAME": "management",
+                    },
+                    client,
+                )
 
 
 if __name__ == "__main__":
