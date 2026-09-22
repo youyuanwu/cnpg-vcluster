@@ -73,6 +73,55 @@ func TestMutationReconcileAddsFinalizerBeforeEndpoint(t *testing.T) {
 	}
 }
 
+func TestFinalizerOnlyDeletionCompletesWithoutAllocationState(t *testing.T) {
+	scheme := testScheme(t)
+	foundation := testFoundation()
+	foundation.MutationEnabled = false
+	now := metav1.Now()
+	tenant := validTenant("tenant-a")
+	tenant.DeletionTimestamp = &now
+	tenant.Finalizers = []string{tenantFinalizer}
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, foundationConfigMap(t, foundation)).
+		Build()
+	docker := &fakeDockerClient{
+		container: DockerContainer{
+			ID:       foundation.ManagementContainerID,
+			State:    "running",
+			Labels:   foundation.ManagementLabels,
+			Networks: map[string]string{"kind": foundation.NetworkID},
+		},
+		network:    DockerNetwork{ID: foundation.NetworkID, Subnets: []string{foundation.Subnet}},
+		execResult: DockerExecResult{Output: "{\"generation\":\"generation\",\"schema\":1}\n"},
+		volumes:    map[string]DockerVolume{},
+	}
+	reconciler := &TenantReconciler{
+		Client:                  kubernetes,
+		APIReader:               kubernetes,
+		Docker:                  docker,
+		SupportedVersion:        "1.36.4",
+		MutationEnabled:         false,
+		ExpectedControllerImage: foundation.ControllerImage,
+	}
+	request := ctrl.Request{NamespacedName: types.NamespacedName{Name: tenant.Name}}
+	for attempt := 0; attempt < 5; attempt++ {
+		if _, err := reconciler.Reconcile(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+		var current tenancyv1alpha1.Tenant
+		err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &current)
+		if client.IgnoreNotFound(err) != nil {
+			t.Fatal(err)
+		}
+		if err != nil {
+			return
+		}
+	}
+	t.Fatal("finalizer-only Tenant remained after deletion")
+}
+
 func TestDeletionAdoptsClusterApplyBeforeStatus(t *testing.T) {
 	scheme := testScheme(t)
 	foundation := testFoundation()

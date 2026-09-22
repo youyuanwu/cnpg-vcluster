@@ -19,6 +19,7 @@ import (
 )
 
 const tenantAPIWorkloadsCleanupComplete = "TenantAPIWorkloadsCleanupComplete"
+const tenantAPICleanupUnavailable = "TenantAPICleanupUnavailable"
 
 func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (ctrl.Result, error) {
 	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
@@ -254,19 +255,20 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			})
 		}
 	}
-	liveCleanupComplete := tenant.Status.Teardown != nil &&
-		tenant.Status.Teardown.Authority == "LiveBootstrapRBACCleanupComplete"
-	if liveCleanupComplete {
-		if err := validateLiveCleanupCheckpoint(tenant); err != nil {
+	managementCleanupAuthorized := tenant.Status.Teardown != nil &&
+		(tenant.Status.Teardown.Authority == "LiveBootstrapRBACCleanupComplete" ||
+			tenant.Status.Teardown.Authority == tenantAPICleanupUnavailable)
+	if managementCleanupAuthorized {
+		if err := validateManagementCleanupCheckpoint(tenant); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 	if tenant.Status.Stage != tenancyv1alpha1.StageEndpointReleased &&
 		stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageTenantAPICleanupRequired) &&
-		!liveCleanupComplete {
+		!managementCleanupAuthorized {
 		tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
 		if err != nil {
-			return ctrl.Result{}, fmt.Errorf("live Tenant API cleanup is required before management teardown: %w", err)
+			return reconciler.checkpointTenantAPICleanupUnavailable(ctx, tenant, clusterIdentity, clusterPresent, err)
 		}
 		workloadsCleanupComplete := tenant.Status.Teardown != nil &&
 			tenant.Status.Teardown.Phase == tenantAPIWorkloadsCleanupComplete
@@ -279,7 +281,10 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			workloadsCleanupComplete,
 		)
 		if err != nil {
-			return ctrl.Result{}, err
+			if isOwnershipError(err) {
+				return ctrl.Result{}, err
+			}
+			return reconciler.checkpointTenantAPICleanupUnavailable(ctx, tenant, clusterIdentity, clusterPresent, err)
 		}
 		if !tenantResourcesAbsent {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
@@ -295,7 +300,7 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		}
 		complete, err := deleteBootstrapRBAC(ctx, tenantClient)
 		if err != nil {
-			return ctrl.Result{}, err
+			return reconciler.checkpointTenantAPICleanupUnavailable(ctx, tenant, clusterIdentity, clusterPresent, err)
 		}
 		if !complete {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
@@ -320,7 +325,8 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		}
 	} else if tenant.Status.Teardown != nil && tenant.Status.Teardown.Authority != "" &&
 		tenant.Status.Teardown.Authority != "TenantAPINeverAuthorized" &&
-		tenant.Status.Teardown.Authority != "LiveBootstrapRBACCleanupComplete" {
+		tenant.Status.Teardown.Authority != "LiveBootstrapRBACCleanupComplete" &&
+		tenant.Status.Teardown.Authority != tenantAPICleanupUnavailable {
 		return ctrl.Result{}, fmt.Errorf("partial Tenant cleanup authority is invalid")
 	}
 	for _, identity := range tenant.Status.ObservedResources {
@@ -352,7 +358,7 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			return nil
 		})
 	}
-	if !liveCleanupComplete && clusterPresent && findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name) == nil {
+	if !managementCleanupAuthorized && clusterPresent && findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name) == nil {
 		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			if err := upsertIdentity(status, clusterIdentity); err != nil {
 				return err
@@ -433,15 +439,44 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 	return ctrl.Result{}, nil
 }
 
-func validateLiveCleanupCheckpoint(tenant *tenancyv1alpha1.Tenant) error {
+func validateManagementCleanupCheckpoint(tenant *tenancyv1alpha1.Tenant) error {
 	if tenant.Status.Teardown == nil || tenant.Status.Teardown.ClusterUID == "" {
-		return fmt.Errorf("live Tenant API cleanup checkpoint Cluster UID is missing")
+		return fmt.Errorf("Tenant management cleanup checkpoint Cluster UID is missing")
 	}
 	cluster := findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name)
 	if cluster == nil || cluster.UID != tenant.Status.Teardown.ClusterUID {
-		return fmt.Errorf("live Tenant API cleanup checkpoint Cluster UID is stale or mismatched")
+		return fmt.Errorf("Tenant management cleanup checkpoint Cluster UID is stale or mismatched")
 	}
 	return nil
+}
+
+func (reconciler *TenantReconciler) checkpointTenantAPICleanupUnavailable(
+	ctx context.Context,
+	tenant *tenancyv1alpha1.Tenant,
+	clusterIdentity tenancyv1alpha1.ObservedResourceIdentity,
+	clusterPresent bool,
+	cause error,
+) (ctrl.Result, error) {
+	if !clusterPresent {
+		return ctrl.Result{}, fmt.Errorf("Tenant API cleanup is unavailable and the exact hosted Cluster is absent: %w", cause)
+	}
+	recordedCluster := findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name)
+	if recordedCluster == nil || recordedCluster.UID != clusterIdentity.UID {
+		return ctrl.Result{}, fmt.Errorf("Tenant API cleanup fallback Cluster identity is not recorded")
+	}
+	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		if status.Teardown == nil {
+			status.Teardown = &tenancyv1alpha1.TeardownStatus{}
+		}
+		status.Teardown.Phase = tenantAPICleanupUnavailable
+		status.Teardown.Authority = tenantAPICleanupUnavailable
+		status.Teardown.ClusterUID = clusterIdentity.UID
+		setCondition(status, tenant, "Deleting", metav1.ConditionTrue, tenantAPICleanupUnavailable, "Tenant API cleanup is unavailable; continuing disposable local cluster teardown")
+		return nil
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	return ctrl.Result{Requeue: true}, nil
 }
 
 func (reconciler *TenantReconciler) removeTenantFinalizer(ctx context.Context, name string) error {

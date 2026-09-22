@@ -443,6 +443,7 @@ def delete_tenant_resource(
     arguments = [
         "delete",
         f"tenant/{tenant_name}",
+        "--ignore-not-found=true",
         f"--wait={'true' if wait else 'false'}",
     ]
     if timeout is not None:

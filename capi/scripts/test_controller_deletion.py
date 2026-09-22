@@ -23,6 +23,7 @@ from scripts.test_controller_phase2 import _require_clean_cutover
 TENANTS = {
     "controller-delete-a": ("10.75.0.0/16", "10.145.0.0/16"),
     "controller-delete-b": ("10.76.0.0/16", "10.146.0.0/16"),
+    "controller-delete-c": ("10.77.0.0/16", "10.147.0.0/16"),
 }
 
 
@@ -141,6 +142,19 @@ def main() -> None:
                     parse_duration(config["WAIT_POLL_INTERVAL"]),
                     lambda name=name: _ready(client, name),
                 )
+            survivor_before = _ready(client, "controller-delete-c")
+            if survivor_before is None:
+                raise RuntimeError("survivor Tenant was not Ready before deletion")
+            survivor_identity = {
+                "uid": survivor_before["metadata"]["uid"],
+                "endpoint": (survivor_before.get("status") or {}).get("endpoint"),
+                "observedResources": (survivor_before.get("status") or {}).get(
+                    "observedResources"
+                ),
+                "workerSnapshotHash": (survivor_before.get("status") or {}).get(
+                    "workerSnapshotHash"
+                ),
+            }
 
             delete_tenant_resource(client, "controller-delete-a", wait=False)
             wait_for(
@@ -213,8 +227,24 @@ def main() -> None:
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: True if _tenant(client, "controller-delete-b") is None else None,
             )
+            survivor_after = _ready(client, "controller-delete-c")
+            if survivor_after is None:
+                raise RuntimeError("survivor Tenant lost Ready")
+            current_identity = {
+                "uid": survivor_after["metadata"]["uid"],
+                "endpoint": (survivor_after.get("status") or {}).get("endpoint"),
+                "observedResources": (survivor_after.get("status") or {}).get(
+                    "observedResources"
+                ),
+                "workerSnapshotHash": (survivor_after.get("status") or {}).get(
+                    "workerSnapshotHash"
+                ),
+            }
+            if current_identity != survivor_identity:
+                raise RuntimeError("survivor Tenant identity changed during deletion")
+            delete_controller_tenants(config, client)
             if any(_tenant(client, name) is not None for name in TENANTS):
-                raise RuntimeError("ordinary Tenant deletion left Tenant resources")
+                raise RuntimeError("ordinary whole-lab Tenant deletion left resources")
         finally:
             remaining = client.kubectl("get", "tenants.tenancy.cnpg-vcluster.io", "-o", "name", check=False)
             if remaining.returncode == 0 and remaining.stdout.strip():

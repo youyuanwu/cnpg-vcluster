@@ -198,7 +198,7 @@ func TestLiveCleanupCheckpointRequiresExactClusterUID(t *testing.T) {
 	} {
 		t.Run(name, func(t *testing.T) {
 			tenant.Status.Teardown.ClusterUID = clusterUID
-			err := validateLiveCleanupCheckpoint(tenant)
+			err := validateManagementCleanupCheckpoint(tenant)
 			if name == "exact" && err != nil {
 				t.Fatal(err)
 			}
@@ -389,6 +389,138 @@ func TestDeletionPreflightRejectsForeignVolumeBeforeTenantAPIMutation(t *testing
 	}
 	if factory.called {
 		t.Fatal("tenant API client was constructed before ownership preflight completed")
+	}
+}
+
+func TestUnavailableTenantAPICheckpointsAndContinuesManagementCleanup(t *testing.T) {
+	scheme := testScheme(t)
+	foundation := testFoundation()
+	foundation.Hash = "foundation-hash"
+	now := metav1.Now()
+	tenant := validTenant("tenant-a")
+	tenant.UID = "tenant-uid"
+	tenant.DeletionTimestamp = &now
+	tenant.Finalizers = []string{tenantFinalizer}
+	tenant.Status.Endpoint = "172.18.255.1:6443"
+	tenant.Status.Stage = tenancyv1alpha1.StageTenantAPICleanupRequired
+	tenant.Status.Teardown = &tenancyv1alpha1.TeardownStatus{Phase: "OwnershipPreflightComplete"}
+	tenant.Status.TenantResources = []tenancyv1alpha1.ObservedResourceIdentity{{
+		APIVersion: "v1", Kind: "ConfigMap", Namespace: "default",
+		Name: "optional", UID: "optional-uid",
+	}}
+	resourceContext := resources.Context{
+		Tenant: tenant,
+		Spec: validation.CanonicalSpec{
+			KubernetesVersion: "1.36.4",
+			Workers:           1,
+			DatabaseCount:     1,
+			PodCIDR:           "10.20.0.0/16",
+			ServiceCIDR:       "10.21.0.0/16",
+		},
+		SpecHash:       "spec-hash",
+		FoundationHash: foundation.Hash,
+		Endpoint:       tenant.Status.Endpoint,
+		Inputs:         foundation.ResourceInputs(),
+	}
+	namespace := resources.Namespace(resourceContext)
+	namespace.UID = "namespace-uid"
+	cluster, err := resources.Cluster(resourceContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cluster.SetUID("cluster-uid")
+	devCluster, err := resources.DevCluster(resourceContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	devCluster.SetUID("dev-cluster-uid")
+	devCluster.SetOwnerReferences([]metav1.OwnerReference{providerOwner(cluster)})
+	controlPlane, err := resources.KamajiControlPlane(resourceContext)
+	if err != nil {
+		t.Fatal(err)
+	}
+	controlPlane.SetUID("control-plane-uid")
+	controlPlane.SetOwnerReferences([]metav1.OwnerReference{providerOwner(cluster)})
+	secret := &corev1.Secret{
+		TypeMeta: metav1.TypeMeta{APIVersion: "v1", Kind: "Secret"},
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tenant.Name + "-kubeconfig",
+			Namespace: tenant.Name,
+			UID:       "secret-uid",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: controlPlaneGVK.GroupVersion().String(),
+				Kind:       controlPlaneGVK.Kind,
+				Name:       tenant.Name,
+				UID:        controlPlane.GetUID(),
+			}},
+		},
+		Type: corev1.SecretType("cluster.x-k8s.io/secret"),
+		Data: map[string][]byte{"value": []byte("kubeconfig")},
+	}
+	for _, object := range []client.Object{namespace, cluster, devCluster, controlPlane, secret} {
+		if value, ok := object.(*corev1.Secret); ok {
+			tenant.Status.ObservedResources = append(tenant.Status.ObservedResources, kubeconfigSecretIdentity(value))
+		} else {
+			tenant.Status.ObservedResources = append(tenant.Status.ObservedResources, identityFor(object))
+		}
+	}
+	allocation := endpointConfigMap(t, foundation, tenant, "spec-hash")
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, namespace, cluster, devCluster, controlPlane, secret, allocation).
+		Build()
+	tenantClient := failingTenantClient{
+		Client: fake.NewClientBuilder().WithScheme(scheme).Build(),
+		err:    errors.New("connection refused"),
+	}
+	reconciler := &TenantReconciler{
+		Client:        kubernetes,
+		APIReader:     kubernetes,
+		Docker:        &fakeDockerClient{volumes: map[string]DockerVolume{}},
+		TenantClients: staticTenantFactory{client: tenantClient},
+	}
+	if _, err := reconciler.finalizePartial(context.Background(), tenant, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	var checkpointed tenancyv1alpha1.Tenant
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &checkpointed); err != nil {
+		t.Fatal(err)
+	}
+	if checkpointed.Status.Teardown == nil ||
+		checkpointed.Status.Teardown.Authority != tenantAPICleanupUnavailable ||
+		checkpointed.Status.Teardown.ClusterUID != "cluster-uid" {
+		t.Fatalf("Tenant API unavailability was not checkpointed: %#v", checkpointed.Status.Teardown)
+	}
+	var remainingCluster unstructured.Unstructured
+	remainingCluster.SetGroupVersionKind(clusterGVK)
+	managementCleanupStarted := false
+	currentTenant := &checkpointed
+	for attempt := 0; attempt < 5; attempt++ {
+		if _, err := reconciler.finalizePartial(context.Background(), currentTenant, "spec-hash", foundation); err != nil {
+			t.Fatal(err)
+		}
+		err = kubernetes.Get(context.Background(), client.ObjectKey{Namespace: tenant.Name, Name: tenant.Name}, &remainingCluster)
+		if apierrors.IsNotFound(err) || err == nil && !remainingCluster.GetDeletionTimestamp().IsZero() {
+			managementCleanupStarted = true
+			break
+		}
+		if err != nil {
+			t.Fatalf("inspect hosted Cluster after Tenant API fallback: %v", err)
+		}
+		if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, currentTenant); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if !managementCleanupStarted {
+		t.Fatal("management cleanup did not continue after Tenant API fallback")
+	}
+	var remainingTenant tenancyv1alpha1.Tenant
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &remainingTenant); err != nil {
+		t.Fatal(err)
+	}
+	if !containsString(remainingTenant.Finalizers, tenantFinalizer) {
+		t.Fatal("Tenant finalizer was removed before provider and host cleanup")
 	}
 }
 

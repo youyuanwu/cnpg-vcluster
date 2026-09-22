@@ -47,7 +47,15 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             ]
         )
         delete_tenant_resource(client, "tenant-a", wait=False)
-        self.assertEqual(("delete", "tenant/tenant-a", "--wait=false"), client.calls[-1][0])
+        self.assertEqual(
+            (
+                "delete",
+                "tenant/tenant-a",
+                "--ignore-not-found=true",
+                "--wait=false",
+            ),
+            client.calls[-1][0],
+        )
 
     def test_delete_controller_refuses_failed_crd_inspection(self) -> None:
         client = FakeManagementClient(

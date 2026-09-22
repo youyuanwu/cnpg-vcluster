@@ -166,6 +166,9 @@ func releaseEndpoint(ctx context.Context, kubernetes client.Client, reader clien
 	}
 	var configMap corev1.ConfigMap
 	if err := reader.Get(ctx, types.NamespacedName{Namespace: namespace, Name: allocationConfigMapName}, &configMap); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
 		return fmt.Errorf("verify Tenant endpoint release: %w", err)
 	}
 	state, err := decodeAllocationState(configMap.Data["allocations.json"], foundation)
