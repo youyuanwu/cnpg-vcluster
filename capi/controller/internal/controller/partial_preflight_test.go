@@ -522,6 +522,42 @@ func TestUnavailableTenantAPICheckpointsAndContinuesManagementCleanup(t *testing
 	if !containsString(remainingTenant.Finalizers, tenantFinalizer) {
 		t.Fatal("Tenant finalizer was removed before provider and host cleanup")
 	}
+	if err == nil && !remainingCluster.GetDeletionTimestamp().IsZero() {
+		remainingCluster.SetFinalizers(nil)
+		if err := kubernetes.Update(context.Background(), &remainingCluster); err != nil && !apierrors.IsNotFound(err) {
+			t.Fatal(err)
+		}
+	}
+	for attempt := 0; attempt < 20; attempt++ {
+		var deletingTenant tenancyv1alpha1.Tenant
+		err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &deletingTenant)
+		if apierrors.IsNotFound(err) {
+			var allocations corev1.ConfigMap
+			if err := kubernetes.Get(context.Background(), client.ObjectKey{
+				Namespace: defaultFoundationNamespace,
+				Name:      allocationConfigMapName,
+			}, &allocations); err != nil {
+				t.Fatal(err)
+			}
+			state, err := decodeAllocationState(allocations.Data["allocations.json"], foundation)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, allocation := range state.Allocations {
+				if allocation.TenantUID == string(tenant.UID) {
+					t.Fatal("endpoint allocation remained after fallback finalization")
+				}
+			}
+			return
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := reconciler.finalizePartial(context.Background(), &deletingTenant, "spec-hash", foundation); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Fatal("Tenant API fallback did not complete finalization")
 }
 
 func providerOwner(object client.Object) metav1.OwnerReference {

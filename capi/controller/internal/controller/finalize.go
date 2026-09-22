@@ -232,6 +232,7 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		(tenant.Status.Teardown.Phase == "ManagementDeletionStarted" ||
 			tenant.Status.Teardown.Phase == tenantAPIWorkloadsCleanupComplete ||
 			tenant.Status.Teardown.Authority == "LiveBootstrapRBACCleanupComplete" ||
+			tenant.Status.Teardown.Authority == tenantAPICleanupUnavailable ||
 			tenant.Status.Teardown.Phase == tenancyv1alpha1.StageEndpointReleased) ||
 		tenant.Status.Stage == tenancyv1alpha1.StageEndpointReleased
 	if !destructiveStarted {
