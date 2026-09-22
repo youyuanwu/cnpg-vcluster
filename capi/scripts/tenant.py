@@ -466,10 +466,8 @@ def execute(
 ) -> int:
     if adapters is None:
         from scripts.azure import AzureTenantAdapter
-        from scripts.local_tenant import LocalTenantAdapter
 
         available: Mapping[str, TenantAdapter] = {
-            "local": LocalTenantAdapter(),
             "azure": AzureTenantAdapter(),
         }
     else:
@@ -483,16 +481,28 @@ def execute(
     command = arguments[0]
     if command == "create" and len(arguments) == 3:
         profile = arguments[1]
+        if adapters is None and profile == "local":
+            raise TenantSpecError(
+                "local tenant mutation moved to `just local-tenant-apply <manifest.yaml>`"
+            )
         if profile not in PROFILES:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
         return create_tenant(root, profile, Path(arguments[2]), available)
     if command == "status" and len(arguments) == 3:
         profile = arguments[1]
+        if adapters is None and profile == "local":
+            raise TenantSpecError(
+                "local tenant status moved to `just local-tenant-status <name>`"
+            )
         if profile not in PROFILES:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
         return status_tenant(root, profile, arguments[2], available)
     if command == "delete" and len(arguments) == 4:
         profile = arguments[1]
+        if adapters is None and profile == "local":
+            raise TenantSpecError(
+                "local tenant deletion moved to `just local-tenant-delete <name>`"
+            )
         if profile not in PROFILES:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
         return delete_tenant(

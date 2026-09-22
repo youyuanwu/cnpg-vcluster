@@ -11,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.controller import delete_tenant_resource, set_controller_mutation
+from scripts.lib.controller_cutover import require_clean_controller_cutover
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.locking import profile_lock, tools_lock
 from scripts.lib.process import run
@@ -25,66 +26,7 @@ def _require_clean_cutover(
     config: dict[str, str],
     client: ManagementClient,
 ) -> None:
-    for relative in (
-        ".runtime/lifecycle/local",
-        ".runtime/rendered/tenants",
-        ".runtime/storage",
-        ".runtime/kubeconfigs",
-    ):
-        legacy = root / relative
-        if legacy.exists() and any(legacy.rglob("*")):
-            raise RuntimeError(
-                f"legacy local lifecycle state blocks controller mutation: {relative}"
-            )
-    tenants = client.kubectl(
-        "get",
-        "tenants.tenancy.cnpg-vcluster.io",
-        "-o",
-        "name",
-    ).stdout.strip()
-    if tenants:
-        raise RuntimeError(f"existing Tenant resources block Phase 2 gate: {tenants}")
-    clusters = client.json("get", "clusters.cluster.x-k8s.io", "-A")
-    if clusters.get("items"):
-        raise RuntimeError("existing CAPI Clusters block Phase 2 gate")
-    selector = f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}"
-    for resource in (
-        "namespaces",
-        "devclusters.infrastructure.cluster.x-k8s.io",
-        "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
-        "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io",
-        "devmachinetemplates.infrastructure.cluster.x-k8s.io",
-        "machinedeployments.cluster.x-k8s.io",
-    ):
-        response = client.kubectl(
-            "get",
-            resource,
-            "-A",
-            "-l",
-            selector,
-            "-o",
-            "name",
-            check=False,
-        )
-        if response.returncode != 0:
-            raise RuntimeError(f"failed to inspect clean-cutover resource {resource}")
-        if response.stdout.strip():
-            raise RuntimeError(
-                f"owned provider state blocks Phase 2 gate: {response.stdout.strip()}"
-            )
-    volumes = run(
-        [
-            "docker",
-            "volume",
-            "ls",
-            "-q",
-            "--filter",
-            "label=cnpg-vcluster.capi/role=tenant-storage",
-        ],
-        timeout=30,
-    ).stdout.split()
-    if volumes:
-        raise RuntimeError(f"controller-owned Docker volumes block Phase 2 gate: {volumes}")
+    require_clean_controller_cutover(root, config, client)
 
 
 def _tenant_manifest(config: dict[str, str]) -> dict[str, object]:

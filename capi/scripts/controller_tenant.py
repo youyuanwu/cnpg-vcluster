@@ -8,23 +8,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration
-from scripts.lib.controller_client import apply_tenant
+from scripts.lib.controller_client import apply_tenant, delete_tenant
 from scripts.lib.locking import e2e_lock, profile_lock, tools_lock
 from scripts.lib.redaction import redact
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 2 or arguments[0] != "apply":
-        print("usage: controller_tenant.py apply <manifest>", file=sys.stderr)
+    if len(arguments) != 2 or arguments[0] not in {"apply", "delete"}:
+        print(
+            "usage: controller_tenant.py <apply MANIFEST|delete TENANT>",
+            file=sys.stderr,
+        )
         return 1
     config = load_configuration(ROOT)
-    manifest = Path(arguments[1]).resolve()
     with (
         e2e_lock(ROOT, exclusive=False),
         profile_lock(ROOT, "local", exclusive=True, create=True),
         tools_lock(ROOT, exclusive=True),
     ):
-        apply_tenant(ROOT, config, manifest)
+        if arguments[0] == "apply":
+            apply_tenant(ROOT, config, Path(arguments[1]).resolve())
+        else:
+            delete_tenant(ROOT, config, arguments[1])
     return 0
 
 

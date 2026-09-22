@@ -1122,6 +1122,20 @@ class TenantCliTests(unittest.TestCase):
             self.assertEqual(execute(root, ["status", "azure", "tenant-c"]), 0)
         self.assertEqual(json.loads(output.getvalue())["profile"], "azure")
 
+    def test_default_dispatch_rejects_legacy_local_commands(self) -> None:
+        _, root, spec_path = self.make_root()
+        for arguments, expected in (
+            (["create", "local", str(spec_path)], "local-tenant-apply"),
+            (["status", "local", "tenant-c"], "local-tenant-status"),
+            (
+                ["delete", "local", "tenant-c", "local/tenant-c"],
+                "local-tenant-delete",
+            ),
+        ):
+            with self.subTest(arguments=arguments):
+                with self.assertRaisesRegex(TenantSpecError, expected):
+                    execute(root, arguments)
+
 
 if __name__ == "__main__":
     unittest.main()

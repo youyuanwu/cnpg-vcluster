@@ -55,6 +55,18 @@ tenant-status profile tenant:
 tenant-delete profile tenant confirmation:
     @python3 scripts/tenant.py delete {{quote(profile)}} {{quote(tenant)}} {{quote(confirmation)}}
 
+# Apply one local Tenant manifest through strict server-side validation.
+local-tenant-apply manifest="config/tenants/examples/local.yaml":
+    @python3 scripts/controller_tenant.py apply {{quote(manifest)}}
+
+# Report one local Tenant from generation-aware Kubernetes conditions.
+local-tenant-status tenant="tenant-example":
+    @python3 scripts/controller_tenant_status.py {{quote(tenant)}}
+
+# Delete one local Tenant through ordinary Kubernetes deletion and finalization.
+local-tenant-delete tenant="tenant-example":
+    @python3 scripts/controller_tenant.py delete {{quote(tenant)}}
+
 # Generate Tenant API deep-copy, CRD, and RBAC artifacts from pinned Go modules.
 controller-generate:
     @python3 scripts/generate_controller.py
@@ -87,11 +99,7 @@ test-controller-phase3:
 test-controller-deletion:
     @python3 scripts/run_locked.py scripts/test_controller_deletion.py
 
-# Internal validation-only apply helper used before the local lifecycle cutover.
-_controller-tenant-apply manifest:
-    @python3 scripts/controller_tenant.py apply {{quote(manifest)}}
-
-# Evaluate Tenant status and functional-evidence freshness without mutation.
+# Evaluate Tenant status from generation-aware Kubernetes conditions.
 controller-tenant-status tenant:
     @python3 scripts/controller_tenant_status.py {{quote(tenant)}}
 

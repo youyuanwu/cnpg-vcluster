@@ -74,17 +74,19 @@ just tools
 just prepare-host
 just preflight
 just create-management
-just tenant-create local config/tenants/examples/local.json
-just tenant-status local tenant-example
-just tenant-delete local tenant-example local/tenant-example
+just local-tenant-apply config/tenants/examples/local.yaml
+just local-tenant-status tenant-example
+just local-tenant-delete tenant-example
 just destroy
 ```
 
-Local tenants are selected only through explicit JSON specifications. Repeating
-`tenant-create` is the public reconcile/retry path. `tenant-status` is
-read-only, and `tenant-delete` requires the exact `profile/name` confirmation
-token. The bounded final E2E proves that one explicitly selected PostgreSQL
-tenant can become healthy and that teardown restores a clean host:
+Local tenants are declared through versioned YAML resources. Reapplying a
+manifest is the reconcile/retry path, status reads generation-aware Kubernetes
+conditions, and ordinary deletion is completed by the controller finalizer.
+Tenant specifications are immutable; delete and recreate to change capacity,
+versions, or networks. The bounded final E2E proves that one explicitly
+selected PostgreSQL tenant can become healthy and that teardown restores a
+clean host:
 
 ```bash
 just test-e2e
@@ -92,10 +94,10 @@ just test-e2e
 
 ## Tenant specifications and clean cutover
 
-Both profiles require schema `1`, profile, name, Kubernetes version, worker
-count, Pod CIDR, and Service CIDR. Local specifications additionally require
-`databaseCount`. Unknown fields, unsupported versions, invalid types, and
-overlapping networks fail before mutation. Safe examples are in
+The local Tenant API requires a name, Kubernetes version, worker count,
+database count, Pod CIDR, and Service CIDR. Unknown fields, unsupported
+versions, invalid types, and overlapping networks fail before mutation. Azure
+continues to use schema `1` JSON specifications. Safe examples are in
 [`config/tenants/examples/`](config/tenants/examples/).
 
 The lifecycle does not infer a singleton tenant from environment variables.
@@ -142,9 +144,9 @@ just test-tenant-lifecycle
 | `just create-management` | Reconcile the kind management cluster and lifecycle controllers. |
 | `just dev-bootstrap` | Prepare and bind a retained management context to the current user, host, Docker daemon, branch, revision, configuration, and exact management identity. |
 | `just dev-clean` | Run authoritative cleanup for retained tenant, management, runtime, and host state. |
-| `just tenant-create local <spec.json>` | Validate the existing foundation and reconcile exactly the selected local tenant. |
-| `just tenant-status local <name>` | Print the selected tenant's read-only lifecycle envelope. |
-| `just tenant-delete local <name> local/<name>` | Delete exactly the selected tenant after survivor validation and explicit approval. |
+| `just local-tenant-apply <manifest.yaml>` | Strictly apply one declarative local Tenant. |
+| `just local-tenant-status <name>` | Print generation-aware local Tenant conditions. |
+| `just local-tenant-delete <name>` | Delete one local Tenant and wait for finalization. |
 | `just tenant-create azure <spec.json>` | Reconcile one explicit Azure tenant on the recorded AKS/CAPZ foundation. |
 | `just tenant-status azure <name>` | Inspect one Azure tenant without mutating state. |
 | `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through CAPI/CAPZ and verify foundation preservation. |
@@ -163,12 +165,12 @@ retains only the explicitly bound management foundation:
 
 ```bash
 just dev-bootstrap
-just tenant-create local config/tenants/examples/local.json
+just local-tenant-apply config/tenants/examples/local.yaml
 just dev-clean
 ```
 
 `dev-bootstrap` validates the retained binding and management identity.
-Tenant lifecycle remains specification-driven through the generic commands.
+Local Tenant lifecycle remains declarative through the Tenant API.
 Always run `just test-e2e` or `just test-e2e-offline` before treating a change
 as lifecycle-complete.
 

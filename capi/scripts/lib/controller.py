@@ -10,6 +10,10 @@ from typing import TYPE_CHECKING
 
 from scripts.cache import canonical_tagged
 from scripts.lib.config import parse_duration
+from scripts.lib.controller_cutover import (
+    controller_mutation_enabled,
+    require_clean_controller_cutover,
+)
 from scripts.lib.files import ensure_private_dir, write_private_file
 from scripts.lib.images import WORKER_IMAGE_KEYS
 from scripts.lib.kube import ManagementClient, wait_for
@@ -257,7 +261,7 @@ def _foundation_payload(
         "allowedSubnets": allowed_subnets,
         "kubernetesVersion": config["KUBERNETES_VERSION"],
         "controllerImage": image,
-        "mutationEnabled": False,
+        "mutationEnabled": True,
         "offlineEnforced": os.environ.get("CAPI_OFFLINE_ENFORCED") == "1",
         "versions": versions,
         "cache": {
@@ -483,6 +487,8 @@ def reconcile_controller(
     verified_cache: VerifiedCache,
     registry: dict[str, object] | None,
 ) -> None:
+    if not controller_mutation_enabled(client):
+        require_clean_controller_cutover(root, config, client)
     image = build_controller_image(root, config)
     run(
         [

@@ -28,6 +28,9 @@ EXPECTED_RECIPES = {
     "tenant-create",
     "tenant-status",
     "tenant-delete",
+    "local-tenant-apply",
+    "local-tenant-status",
+    "local-tenant-delete",
     "controller-generate",
     "controller-verify",
     "controller-test",
@@ -176,7 +179,12 @@ def check_repository_boundaries() -> None:
         "controller/api/v1alpha1/tenant_types.go",
         "controller/cmd/manager/main.go",
         "controller/config/webhook/validating-webhook.yaml",
+        "config/tenants/examples/local.yaml",
+        "config/tenants/tests/tenant-a.yaml",
+        "config/tenants/tests/tenant-b.yaml",
+        "config/tenants/tests/tenant-c.yaml",
         "scripts/controller_tenant.py",
+        "scripts/lib/controller_cutover.py",
     )
     for relative in required_controller_files:
         check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
@@ -184,6 +192,32 @@ def check_repository_boundaries() -> None:
         not (ROOT / "controller" / "vendor").exists(),
         "Go dependencies must use the module cache; controller/vendor is forbidden",
     )
+    manager = (
+        ROOT / "controller" / "config" / "manager" / "manager.yaml.tpl"
+    ).read_text(encoding="utf-8")
+    check(
+        "--mutation-enabled=true" in manager
+        and "--mutation-enabled=false" not in manager,
+        "normal Tenant controller mutation is not enabled",
+    )
+    tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
+    check(
+        "from scripts.local_tenant import" not in tenant_dispatch,
+        "public tenant dispatch still imports the legacy local mutator",
+    )
+    for relative, expected_name in (
+        ("config/tenants/examples/local.yaml", "tenant-example"),
+        ("config/tenants/tests/tenant-a.yaml", "tenant-a"),
+        ("config/tenants/tests/tenant-b.yaml", "tenant-b"),
+        ("config/tenants/tests/tenant-c.yaml", "tenant-c"),
+    ):
+        manifest = (ROOT / relative).read_text(encoding="utf-8")
+        check(
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha1" in manifest
+            and "kind: Tenant" in manifest
+            and f"name: {expected_name}" in manifest,
+            f"invalid local Tenant manifest {relative}",
+        )
     production = [
         *(ROOT / "config").glob("*"),
         *(

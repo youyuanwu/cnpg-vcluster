@@ -20,7 +20,7 @@ spec:
         imagePullPolicy: Never
         args:
         - --leader-elect=true
-        - --mutation-enabled=false
+        - --mutation-enabled=true
         - --controller-image=${TENANT_CONTROLLER_IMAGE}
         - --supported-kubernetes-version=${SUPPORTED_KUBERNETES_VERSION}
         - --webhook-cert-dir=/var/run/tenant-controller/tls
