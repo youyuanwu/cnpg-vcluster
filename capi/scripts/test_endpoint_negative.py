@@ -17,6 +17,7 @@ from scripts.lib.controller_scenarios import (
     tenant_document,
     tenant_manifest,
 )
+from scripts.lib.host import prepare_inotify
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.process import run
 
@@ -90,10 +91,18 @@ def foreign_volume_rejected(
 ) -> None:
     name = "tenant-example"
     volume = f"{config['LAB_PREFIX']}-{name}-storage"
+    if run(
+        ["docker", "volume", "inspect", volume],
+        timeout=30,
+        check=False,
+    ).returncode == 0:
+        raise RuntimeError("foreign volume fixture requires an absent volume")
+    created = False
     identifier = run(
         ["docker", "volume", "create", "--label", "foreign=true", volume],
         timeout=30,
     ).stdout.strip()
+    created = True
     try:
         apply_tenant(root, config, tenant_manifest(root, name))
         _wait_ownership_invalid(root, config, name)
@@ -103,13 +112,15 @@ def foreign_volume_rejected(
         if payload["Name"] != identifier or payload.get("Labels") != {"foreign": "true"}:
             raise RuntimeError("foreign volume was replaced or adopted")
     finally:
-        run(["docker", "volume", "rm", volume], timeout=30, check=False)
+        if created:
+            run(["docker", "volume", "rm", volume], timeout=30, check=False)
         delete_controller_tenant(root, config, name)
 
 
 def main() -> int:
     os.umask(0o077)
     config = load_configuration(ROOT)
+    prepare_inotify(ROOT, config)
     create_management(ROOT, config)
     client = ManagementClient(ROOT, config)
     delete_controller_tenant(ROOT, config, "tenant-example")

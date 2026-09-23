@@ -17,6 +17,7 @@ from scripts.lib.controller_scenarios import (
     tenant_manifest,
 )
 from scripts.lib.kube import ManagementClient, wait_for
+from scripts.lib.host import prepare_inotify
 from scripts.lib.process import run
 
 
@@ -25,9 +26,18 @@ def main() -> int:
     config = load_configuration(ROOT)
     name = "tenant-c"
     volume = f"{config['LAB_PREFIX']}-{name}-storage"
+    prepare_inotify(ROOT, config)
     create_management(ROOT, config)
     delete_controller_tenant(ROOT, config, name)
+    if run(
+        ["docker", "volume", "inspect", volume],
+        timeout=30,
+        check=False,
+    ).returncode == 0:
+        raise RuntimeError("storage negative fixture requires an absent volume")
+    created = False
     run(["docker", "volume", "create", "--label", "foreign=true", volume], timeout=30)
+    created = True
     try:
         apply_tenant(ROOT, config, tenant_manifest(ROOT, name))
         client = ManagementClient(ROOT, config)
@@ -62,7 +72,8 @@ def main() -> int:
         if labels != '{"foreign":"true"}':
             raise RuntimeError("foreign tenant storage volume was changed")
     finally:
-        run(["docker", "volume", "rm", volume], timeout=30, check=False)
+        if created:
+            run(["docker", "volume", "rm", volume], timeout=30, check=False)
         delete_controller_tenant(ROOT, config, name)
     print("storage ownership negative check passed")
     return 0

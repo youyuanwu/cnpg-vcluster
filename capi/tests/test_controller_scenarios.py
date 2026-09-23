@@ -3,7 +3,9 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
+from scripts.endpoint import run_endpoint_gate
 from scripts.lib.controller_scenarios import (
     manifest_tenant_name,
     tenant_from_document,
@@ -88,3 +90,28 @@ class ControllerScenarioTests(unittest.TestCase):
             ],
             snapshot["workerContainers"],
         )
+
+    def test_endpoint_gate_cleans_partially_applied_tenant(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "tenant.yaml"
+            manifest.write_text(
+                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha1\n"
+                "kind: Tenant\nmetadata:\n  name: tenant-a\n",
+                encoding="utf-8",
+            )
+            with (
+                patch(
+                    "scripts.endpoint.management_status",
+                    return_value={"apiReady": False},
+                ),
+                patch("scripts.endpoint.create_management"),
+                patch(
+                    "scripts.endpoint.apply_controller_tenant",
+                    side_effect=RuntimeError("readiness failed"),
+                ),
+                patch("scripts.endpoint.delete_controller_tenant") as delete,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "readiness failed"):
+                    run_endpoint_gate(root, {}, manifest=manifest)
+            delete.assert_called_once_with(root, {}, "tenant-a")

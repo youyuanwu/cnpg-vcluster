@@ -70,42 +70,43 @@ def main() -> None:
             first_uid = first["metadata"]["uid"]
 
             client.kubectl(
+                "-n",
+                "tenant-system",
+                "scale",
+                "deployment/tenant-controller",
+                "--replicas=0",
+            )
+            client.kubectl(
                 "delete",
                 f"tenant/{NAME}",
                 "--wait=false",
             )
-
-            checkpoint = wait_for(
-                "live Tenant cleanup checkpoint",
-                parse_duration(config["DELETE_TIMEOUT"]),
+            wait_for(
+                "pending Tenant deletion before controller restart",
+                parse_duration(config["CONDITION_TIMEOUT"]),
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: (
-                    {"absent": True}
-                    if (tenant := tenant_document(client, NAME)) is None
-                    else tenant
-                    if ((tenant.get("status") or {}).get("teardown") or {}).get(
-                        "authority"
-                    )
-                    == "LiveBootstrapRBACCleanupComplete"
+                    tenant
+                    if (tenant := tenant_document(client, NAME)) is not None
+                    and tenant["metadata"].get("deletionTimestamp")
                     else None
                 ),
             )
-            if not checkpoint.get("absent"):
-                client.kubectl(
-                    "-n",
-                    "tenant-system",
-                    "rollout",
-                    "restart",
-                    "deployment/tenant-controller",
-                )
-                client.kubectl(
-                    "-n",
-                    "tenant-system",
-                    "rollout",
-                    "status",
-                    "deployment/tenant-controller",
-                    f"--timeout={config['CONDITION_TIMEOUT']}",
-                )
+            client.kubectl(
+                "-n",
+                "tenant-system",
+                "scale",
+                "deployment/tenant-controller",
+                "--replicas=1",
+            )
+            client.kubectl(
+                "-n",
+                "tenant-system",
+                "rollout",
+                "status",
+                "deployment/tenant-controller",
+                f"--timeout={config['CONDITION_TIMEOUT']}",
+            )
             wait_tenant_absent(ROOT, config, NAME)
 
             _apply(client, config)

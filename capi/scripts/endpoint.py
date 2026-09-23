@@ -219,8 +219,10 @@ def run_endpoint_gate(
     bootstrap_secret_names: list[str] = []
     client = None
     tenant = None
+    application_attempted = False
     succeeded = False
     try:
+        application_attempted = True
         client, tenant, _ = apply_controller_tenant(
             root, config, selected_manifest
         )
@@ -363,8 +365,12 @@ def run_endpoint_gate(
         write_private_file(evidence, redact(str(exc)) + "\n")
         raise
     finally:
-        if (cleanup or not succeeded) and tenant is not None:
-            delete_controller_tenant(root, config, tenant)
+        if cleanup or not succeeded:
+            cleanup_target = tenant if tenant is not None else (
+                selected_name if application_attempted else None
+            )
+            if cleanup_target is not None:
+                delete_controller_tenant(root, config, cleanup_target)
             if client is not None:
                 for secret_name in bootstrap_secret_names:
                     if (
