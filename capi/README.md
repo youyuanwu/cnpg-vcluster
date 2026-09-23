@@ -248,9 +248,10 @@ Reconciliation and deletion are fail-closed:
   Machine-to-MachineSet-to-MachineDeployment ownership chain;
 - inspection distinguishes present, canonical Kubernetes `NotFound`, and
   inspection failure;
-- one finalizer removes tenant-API resources before deleting the CAPI Cluster
-  and Namespace, waits for CAPD containers, removes only the exact owned
-  volume, releases the endpoint, and removes the finalizer last;
+- one finalizer removes tenant-API resources, deletes the CAPI Cluster, waits
+  for provider objects and CAPD containers, removes the exact owned volume and
+  credentials, deletes the Namespace, releases the endpoint, and removes the
+  finalizer last;
 - an identity-bound teardown checkpoint permits restart recovery if the
   hosted API disappears after live cleanup; generic transport failures never
   prove ownership or absence.
@@ -267,17 +268,14 @@ ownership, admission, reconciliation, timeout, or cleanup failure.
 Condition checks require the current resource generation rather than accepting
 a stale `True` condition. A healthy local Tenant requires:
 
-- management API readiness, four available CAPI providers, required
-  controller workloads, ready webhooks, Kamaji, and its datastore;
 - current affirmative provider conditions for the CAPI `Cluster`, CAPD
   `DevCluster`, and `KamajiControlPlane`, plus an initialized, unpaused control
   plane and matching endpoints;
-- exact Ready Machine, DevMachine, Docker container, Node, and bootstrap
-  Secret inventories;
-- Ready Calico, CoreDNS, Konnectivity, and repository-owned kube-proxy;
+- exact Ready Machine, DevMachine, Docker container, and Node inventories;
+- available Calico, CoreDNS, and repository-owned kube-proxy workloads;
 - the expected static StorageClass and exact owned Docker volume;
-- digest-pinned CNPG operator, a healthy CNPG Cluster, the requested one to
-  three Ready PostgreSQL Pods, and the same number of Bound PVCs.
+- a healthy CNPG Cluster using the pinned PostgreSQL image, the requested one
+  to three Ready PostgreSQL Pods, and the same number of Bound PVCs.
 
 Canonical Kubernetes `Error from server (NotFound):` is the only accepted
 absence proof in fail-closed lifecycle inspections. Other API errors are
@@ -287,9 +285,14 @@ failures, not absent or healthy states.
 
 Normal recovery is:
 
-1. run `just tenant-status <profile> <name>` and `just diagnose management`;
+1. for local, run `just local-tenant-status <name>` and
+   `just diagnose management`; for Azure, run
+   `just tenant-status azure <name>`;
 2. restore the failed controller or dependency;
-3. retry `just tenant-create`, `just tenant-delete`, or `just destroy`.
+3. retry local reconciliation with
+   `just local-tenant-apply <manifest.yaml>`, retry deletion with
+   `just local-tenant-delete <name>`, or run `just destroy`; Azure keeps
+   `tenant-create` and `tenant-delete`.
 
 Finalizer removal is exceptional and should be used only when controller
 recovery has been exhausted and the exact deleting resource has been

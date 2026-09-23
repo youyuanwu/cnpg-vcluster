@@ -84,10 +84,11 @@ Creation proceeds through these responsibilities:
    KamajiControlPlane;
 5. validate and use the exact Kamaji kubeconfig Secret;
 6. create the exact Docker volume and worker templates;
-7. wait for the requested worker topology and Ready Nodes;
+7. wait for the requested pre-CNI worker containers and registered Nodes;
 8. directly apply tenant networking through the tenant client;
-9. create the static StorageClass, CNPG operator, static PVs, and CNPG Cluster;
-10. set Ready only after current live observations pass.
+9. wait for the requested post-CNI Ready worker and Node topology;
+10. create the static StorageClass, CNPG operator, static PVs, and CNPG Cluster;
+11. set Ready only after current live observations pass.
 
 Objects applied by the Tenant controller have deterministic names and exact
 Tenant UID, specification hash, foundation hash, and resource-role markers.
@@ -110,7 +111,7 @@ The controller periodically requires:
   KamajiControlPlane;
 - the exact requested Machine, DevMachine, worker container, and Ready Node
   topology;
-- available Calico, CoreDNS, Konnectivity, and `capi-kube-proxy`;
+- available Calico, CoreDNS, and `capi-kube-proxy` workloads;
 - the expected static StorageClass;
 - a healthy CNPG Cluster with the requested Ready Pods and Bound PVCs;
 - unchanged exact identities and ownership markers for every recorded direct
@@ -175,12 +176,13 @@ Finalization is ordered:
 2. delete controller-applied CNPG, storage, networking, and bootstrap resources
    through the live tenant API;
 3. persist the exact Cluster-UID-bound live-cleanup checkpoint;
-4. delete the CAPI Cluster, then the Namespace, with UID/resourceVersion
-   preconditions and Background propagation;
-5. wait for authoritative Kubernetes absence and CAPD container absence;
-6. delete only the exact owned Docker volume;
-7. release only the target endpoint;
-8. remove the finalizer last.
+4. delete the CAPI Cluster with UID/resourceVersion preconditions and
+   Background propagation;
+5. wait for authoritative Cluster/provider absence and CAPD container absence;
+6. delete only the exact owned Docker volume and controller-used credentials;
+7. delete the Namespace with UID/resourceVersion preconditions;
+8. release only the target endpoint;
+9. remove the finalizer last.
 
 If the tenant API becomes unavailable after exact management ownership
 preflight, a local disposable-cluster checkpoint can authorize provider

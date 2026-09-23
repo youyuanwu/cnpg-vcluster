@@ -14,6 +14,7 @@ isolated Docker-backed storage, and tenant-owned CloudNativePG clusters:
 
 ```sh
 cd capi
+just cache
 just tools
 just prepare-host
 just preflight

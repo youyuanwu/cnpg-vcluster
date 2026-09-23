@@ -325,7 +325,7 @@ def check_documentation() -> None:
         "This is a local persistence proof only.",
         "The Tenant controller is the single networking writer.",
         "Worker image delivery is bootstrap-owned",
-        "one finalizer removes tenant-API resources before deleting the CAPI Cluster",
+        "one finalizer removes tenant-API resources, deletes the CAPI Cluster",
         "while retaining its PVC, PV, and bytes.",
         "`just cache` is the explicit online acquisition",
         "The retained workflow is a development optimization, not a final gate",
