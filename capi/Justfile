@@ -95,7 +95,7 @@ test-controller-phase2:
 test-controller-phase3:
     @python3 scripts/run_locked.py scripts/test_controller_phase3.py
 
-# Exercise targeted deletion serialization, snapshots, restart recovery, and foundation teardown.
+# Exercise ordinary Tenant deletion, restart recovery, and same-name recreation.
 test-controller-deletion:
     @python3 scripts/run_locked.py scripts/test_controller_deletion.py
 

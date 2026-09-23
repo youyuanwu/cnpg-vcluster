@@ -130,25 +130,15 @@ def check_configuration() -> None:
     check(config["CAPI_CONTRACT"] == "v1beta2", "CAPI contract must be v1beta2")
     check(config["KAMAJI_CAPI_CONTRACT"] == "v1beta2", "Kamaji provider contract must be v1beta2")
     from scripts.lib.tenant_spec import load_tenant_spec
-    from scripts.lib.tenants import load_local_tenant_spec
 
-    supported_versions = {
-        "local": config["KUBERNETES_VERSION"],
-        "azure": load_env_file(
-            ROOT / "config" / "azure" / "defaults.env"
-        )["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
-    }
-    for profile in ("local", "azure"):
-        load_tenant_spec(
-            ROOT / "config" / "tenants" / "examples" / f"{profile}.json",
-            expected_profile=profile,
-            supported_versions=supported_versions,
-        )
-    load_local_tenant_spec(
-        ROOT,
-        ROOT / "config" / "tenants" / "examples" / "local.json",
-        config,
-        include_management_network=False,
+    load_tenant_spec(
+        ROOT / "config" / "tenants" / "examples" / "azure.json",
+        expected_profile="azure",
+        supported_versions={
+            "azure": load_env_file(
+                ROOT / "config" / "azure" / "defaults.env"
+            )["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
+        },
     )
     for key in (
         "VIP_POOL_START_OFFSET_FROM_BROADCAST",
@@ -204,6 +194,50 @@ def check_repository_boundaries() -> None:
     check(
         "from scripts.local_tenant import" not in tenant_dispatch,
         "public tenant dispatch still imports the legacy local mutator",
+    )
+    for relative in (
+        "scripts/local_tenant.py",
+        "scripts/create.py",
+        "scripts/destroy_tenant.py",
+        "scripts/verify.py",
+        "config/tenants/examples/local.json",
+        "config/tenants/tests/tenant-a.json",
+        "config/tenants/tests/tenant-b.json",
+        "config/tenants/tests/tenant-c.json",
+    ):
+        check(
+            not (ROOT / relative).exists(),
+            f"obsolete local mutation artifact remains: {relative}",
+        )
+    production_python = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "scripts").rglob("*.py")
+        if path.name != "test_static.py"
+    )
+    for token in (
+        "from scripts.create import",
+        "from scripts.destroy_tenant import",
+        "from scripts.local_tenant import",
+        "from scripts.verify import",
+        "def apply_control_plane(",
+        "def apply_workers(",
+        "def apply_addons(",
+        "def delete_addons(",
+        "def install_cnpg(",
+        "def delete_cnpg(",
+        "def preload_worker_images(",
+        "def recorded_local_tenants(",
+        "def load_local_tenant_spec(",
+    ):
+        check(
+            token not in production_python,
+            f"obsolete callable local mutator remains: {token}",
+        )
+    check(
+        "def delete_tenant(" not in (
+            ROOT / "scripts" / "lib" / "tenants.py"
+        ).read_text(encoding="utf-8"),
+        "legacy imperative tenant deletion helper remains",
     )
     for relative, expected_name in (
         ("config/tenants/examples/local.yaml", "tenant-example"),

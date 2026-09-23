@@ -1,9 +1,10 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
@@ -369,6 +370,20 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             ],
             calls,
         )
+
+    def test_e2e_child_reuses_parent_lock(self) -> None:
+        with (
+            patch.dict(os.environ, {"CAPI_E2E_CHILD": "1"}),
+            patch("scripts.controller_tenant.load_configuration", return_value={}),
+            patch("scripts.controller_tenant.e2e_lock") as e2e,
+            patch("scripts.controller_tenant.profile_lock") as profile,
+            patch("scripts.controller_tenant.tools_lock") as tools,
+            patch("scripts.controller_tenant.apply_tenant"),
+        ):
+            profile.return_value = nullcontext()
+            tools.return_value = nullcontext()
+            self.assertEqual(0, controller_tenant_main(["apply", "fixture.yaml"]))
+        e2e.assert_not_called()
 
     def test_temporary_mutation_updates_foundation_before_manager(self) -> None:
         foundation = json.dumps(

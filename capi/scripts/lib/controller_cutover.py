@@ -169,30 +169,29 @@ def require_clean_controller_cutover(
         raise RuntimeError(
             f"controller-owned Docker volumes block controller activation: {volumes}"
         )
-    kind_containers = run(
+    owned_containers = run(
         [
             "docker",
             "ps",
             "-aq",
             "--filter",
+            f"label={config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
+            "--filter",
             "label=io.x-k8s.kind.cluster",
         ],
         timeout=30,
     ).stdout.split()
-    tenant_containers: list[str] = []
-    for container_id in kind_containers:
-        cluster_name = run(
-            [
-                "docker",
-                "inspect",
-                "--format",
-                '{{ index .Config.Labels "io.x-k8s.kind.cluster" }}',
-                container_id,
-            ],
-            timeout=30,
-        ).stdout.strip()
-        if cluster_name != config["KIND_CLUSTER_NAME"]:
-            tenant_containers.append(container_id)
+    load_balancers = run(
+        [
+            "docker",
+            "ps",
+            "-aq",
+            "--filter",
+            "label=io.x-k8s.kind.role=external-load-balancer",
+        ],
+        timeout=30,
+    ).stdout.split()
+    tenant_containers = sorted(set(owned_containers) | set(load_balancers))
     if tenant_containers:
         raise RuntimeError(
             "CAPD tenant containers block controller activation: "

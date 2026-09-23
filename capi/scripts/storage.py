@@ -3,19 +3,22 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scripts.lib.addons import delete_addons, wait_network_ready
+from scripts.lib.addons import wait_network_ready
+from scripts.lib.controller_scenarios import (
+    delete_controller_tenant,
+    tenant_manifest,
+    wait_tenant_ready,
+)
 from scripts.lib.files import IntegrityError, write_private_file
 from scripts.lib.process import run
 from scripts.lib.tenants import (
     NOT_FOUND,
     _tenant_kubectl,
-    delete_tenant,
     inspect_storage_volume,
     storage_volume_name,
 )
-from scripts.machines import _scale_three, worker_snapshot
+from scripts.machines import worker_snapshot
 from scripts.network import run_network_gate
-from scripts.status import collect_status, status_healthy
 
 
 def _volume_identity(config: dict[str, str], tenant) -> dict[str, object]:
@@ -182,7 +185,6 @@ def _delete_storage(root: Path, config: dict[str, str], tenant) -> None:
         "deployment/storage-smoke",
         "pvc/storage-smoke",
         f"pv/{tenant.name}-storage-smoke",
-        f"storageclass/{config['SPIKE_STORAGE_CLASS']}",
     ):
         _tenant_kubectl(
             root,
@@ -217,10 +219,14 @@ def run_storage_gate(
     *,
     cleanup: bool = True,
 ):
-    client, tenant = run_network_gate(root, config, cleanup=False)
+    client, tenant = run_network_gate(
+        root,
+        config,
+        cleanup=False,
+        manifest=tenant_manifest(root, "tenant-c"),
+    )
     succeeded = False
     try:
-        _scale_three(root, config, client, tenant)
         before_workers = worker_snapshot(root, config, client, tenant)
         before_volume = _volume_identity(config, tenant)
         manifest = _render_storage(root, config, tenant)
@@ -230,14 +236,6 @@ def run_storage_gate(
         initial_storage = _storage_status(root, config, tenant)
         if not initial_storage["ready"]:
             raise RuntimeError("static hostPath storage is not ready")
-        observed = collect_status(root, config)
-        if (
-            not status_healthy(observed)
-            or observed["spikeStorage"]["pvc"]["phase"] != "Bound"
-            or observed["spikeStorage"]["pv"]["nodeAffinity"] is not False
-        ):
-            raise RuntimeError("status does not expose healthy static storage")
-
         client.kubectl(
             "-n",
             tenant.namespace,
@@ -259,6 +257,7 @@ def run_storage_gate(
         )
         wait_network_ready(root, config, tenant)
         after_workers = worker_snapshot(root, config, client, tenant)
+        wait_tenant_ready(root, config, tenant.name)
         replacement = _wait_smoke(root, config, tenant)
         if replacement["uid"] == smoke["uid"]:
             raise RuntimeError("storage workload did not reschedule after Machine replacement")
@@ -271,8 +270,6 @@ def run_storage_gate(
             raise RuntimeError("tenant Docker volume identity changed")
         if _storage_status(root, config, tenant) != initial_storage:
             raise RuntimeError("PVC/PV identity changed across Machine replacement")
-        if not status_healthy(collect_status(root, config)):
-            raise RuntimeError("status is unhealthy after storage Machine replacement")
         if set(before_workers) == set(after_workers):
             raise RuntimeError("Machine replacement did not change worker identity")
         print("Docker-volume-backed hostPath storage checks passed")
@@ -281,5 +278,4 @@ def run_storage_gate(
     finally:
         if cleanup or not succeeded:
             _delete_storage(root, config, tenant)
-            delete_addons(root, config, client, tenant)
-            delete_tenant(root, config, client, tenant)
+            delete_controller_tenant(root, config, tenant)

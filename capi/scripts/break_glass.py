@@ -12,11 +12,13 @@ from scripts.lib.management import (
     validate_management_kubeconfig,
 )
 from scripts.lib.process import run
+from scripts.lib.controller_scenarios import (
+    tenant_document,
+    tenant_from_document,
+)
 from scripts.lib.tenants import (
     NOT_FOUND,
     inspect_storage_volume,
-    recorded_local_tenants,
-    spike_tenant,
     storage_volume_name,
     verify_tenant_management_ownership,
 )
@@ -56,13 +58,10 @@ APIS = {
 
 
 def _resolve_tenant(root: Path, config: dict[str, str], namespace: str):
-    tenants = [spike_tenant(root, config), *recorded_local_tenants(root, config)]
-    matches = [tenant for tenant in tenants if tenant.namespace == namespace]
-    if len(matches) != 1:
-        raise RuntimeError(
-            "break-glass namespace is not an exact configured tenant"
-        )
-    return matches[0]
+    document = tenant_document(ManagementClient(root, config), namespace)
+    if document is None:
+        raise RuntimeError("break-glass namespace is not an exact Tenant")
+    return tenant_from_document(root, config, document)
 
 
 def _verify_resource_graph(

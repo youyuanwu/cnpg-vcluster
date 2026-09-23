@@ -172,7 +172,7 @@ class ControllerCutoverTests(unittest.TestCase):
                 side_effect=[
                     CompletedProcess([], 0, stdout="", stderr=""),
                     CompletedProcess([], 0, stdout="container-id\n", stderr=""),
-                    CompletedProcess([], 0, stdout="tenant-a\n", stderr=""),
+                    CompletedProcess([], 0, stdout="", stderr=""),
                 ],
             ),
         ):

@@ -38,8 +38,6 @@ def main() -> int:
     os.umask(0o077)
     config = load_configuration(ROOT)
     reject(ROOT / ".tools" / "inputs" / "cnpg.yaml", config)
-    reject(ROOT / "manifests" / "cnpg" / "cluster.yaml.tpl", config)
-    reject(ROOT / "manifests" / "cnpg" / "static-pvs.yaml.tpl", config)
     print("CNPG input tamper checks passed")
     return 0
 

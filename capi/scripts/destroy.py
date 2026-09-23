@@ -16,19 +16,9 @@ from scripts.lib.management import (
     management_status,
     reconcile_network,
     require_management_ownership,
-    tenant_endpoint_allocations,
     validate_management_kubeconfig,
 )
 from scripts.lib.providers import delete_providers
-from scripts.lib.addons import delete_addons
-from scripts.lib.tenants import (
-    delete_tenant,
-    inspect_management_resource,
-    recorded_local_tenants,
-    spike_tenant,
-    verify_tenant_management_ownership,
-)
-from scripts.lib.tenant_runtime import recorded_tenant_names
 from scripts.lib.process import run
 from scripts.lib.registry import (
     delete_offline_registry,
@@ -344,10 +334,7 @@ def inspect_host_residue(
 
 
 def destroy(root: Path, config: dict[str, str]) -> None:
-    tenant_names = set(recorded_tenant_names(root, "local"))
-    network_path = root / ".runtime" / "management" / "network.json"
-    if network_path.is_file():
-        tenant_names.update(tenant_endpoint_allocations(root, config))
+    tenant_names: set[str] = set()
     _validate_runtime_inventory(root)
     validate_inotify_state(root, config)
     status = management_status(root, config)
@@ -363,118 +350,24 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         client = ManagementClient(root, config)
         from scripts.lib.controller import delete_controller_tenants
 
-        delete_controller_tenants(config, client)
-        cluster_crd = client.kubectl(
+        tenant_response = client.kubectl(
             "get",
-            "crd/clusters.cluster.x-k8s.io",
+            "tenants",
+            "-o",
+            "jsonpath={range .items[*]}{.metadata.name}{'\\n'}{end}",
             check=False,
         )
-        if cluster_crd.returncode == 0:
-            tenants = [
-                spike_tenant(root, config),
-                *recorded_local_tenants(root, config),
-            ]
-        elif re.search(
-            r"Error from server \(NotFound\):",
-            cluster_crd.stderr,
-            re.IGNORECASE,
+        if tenant_response.returncode == 0:
+            tenant_names.update(tenant_response.stdout.split())
+        elif (
+            "NotFound" not in tenant_response.stderr
+            and "doesn't have a resource type" not in tenant_response.stderr
         ):
-            tenants = []
-        else:
             raise RuntimeError(
-                f"CAPI Cluster CRD inspection failed during cleanup: "
-                f"{cluster_crd.stderr}"
+                f"Tenant inventory failed during cleanup: "
+                f"{tenant_response.stderr}"
             )
-        configured_names = set(tenant_names)
-        for tenant in tenants:
-            deletion_journal = (
-                root / ".runtime" / "deletions" / f"{tenant.name}.json"
-            )
-            cluster = inspect_management_resource(
-                client, tenant, f"cluster/{tenant.name}"
-            )
-            if tenant.name in configured_names and cluster is not None:
-                from scripts.destroy_tenant import (
-                    finish_prepared_tenant_deletion,
-                    prepare_tenant_deletion,
-                )
-                from scripts.lib.tenants import ensure_tenant_kubeconfig
-
-                owned = verify_tenant_management_ownership(config, client, tenant)
-                kubeconfig_path = (
-                    root / ".runtime" / "tenants" / tenant.name / "kubeconfig"
-                )
-                kcp = owned.get("kamajicontrolplane", {})
-                initialized = (
-                    kcp.get("status", {})
-                    .get("initialization", {})
-                    .get("controlPlaneInitialized")
-                    is True
-                )
-                if not kubeconfig_path.is_file() and not initialized:
-                    delete_tenant(root, config, client, tenant)
-                    continue
-                ensure_tenant_kubeconfig(root, config, client, tenant)
-                prepare_tenant_deletion(
-                    root, config, client, tenant, cluster
-                )
-                finish_prepared_tenant_deletion(
-                    root, config, client, tenant
-                )
-                continue
-            if cluster is not None and deletion_journal.is_file():
-                from scripts.destroy_tenant import validate_deletion_journal
-
-                validate_deletion_journal(
-                    root, tenant, str(cluster["metadata"]["uid"])
-                )
-            if cluster is None and deletion_journal.is_file():
-                from scripts.destroy_tenant import finish_journaled_tenant_deletion
-
-                finish_journaled_tenant_deletion(
-                    root, config, client, tenant
-                )
-                continue
-            if not (
-                root / ".runtime" / "tenants" / tenant.name / "kubeconfig"
-            ).is_file():
-                delete_tenant(root, config, client, tenant)
-                continue
-            from scripts.lib.tenants import _tenant_kubectl
-            from scripts.cnpg import cnpg_artifacts_present, delete_cnpg
-            from scripts.storage import _delete_storage
-
-            if cnpg_artifacts_present(root, config, tenant):
-                delete_cnpg(root, config, tenant)
-            storage_present = False
-            for resource in (
-                "pvc/storage-smoke",
-                f"pv/{tenant.name}-storage-smoke",
-                f"storageclass/{config['SPIKE_STORAGE_CLASS']}",
-            ):
-                response = _tenant_kubectl(
-                    root,
-                    config,
-                    tenant,
-                    "get",
-                    resource,
-                    check=False,
-                )
-                if response.returncode == 0:
-                    storage_present = True
-                elif not re.search(
-                    r"Error from server \(NotFound\):",
-                    response.stderr,
-                    re.IGNORECASE,
-                ):
-                    raise RuntimeError(
-                        f"storage cleanup inspection failed for {resource}: "
-                        f"{response.stderr}"
-                    )
-            if storage_present:
-                _delete_storage(root, config, tenant)
-            delete_addons(root, config, client, tenant)
-            delete_tenant(root, config, client, tenant)
+        delete_controller_tenants(config, client)
         delete_offline_registry(root, config)
         _delete_kubernetes_stack(root, config, client)
         delete_management(root, config)

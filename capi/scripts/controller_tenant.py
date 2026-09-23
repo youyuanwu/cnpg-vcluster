@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import os
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +24,11 @@ def main(arguments: list[str]) -> int:
         return 1
     config = load_configuration(ROOT)
     with (
-        e2e_lock(ROOT, exclusive=False),
+        (
+            nullcontext()
+            if os.environ.get("CAPI_E2E_CHILD") == "1"
+            else e2e_lock(ROOT, exclusive=False)
+        ),
         profile_lock(ROOT, "local", exclusive=True, create=True),
         tools_lock(ROOT, exclusive=True),
     ):
