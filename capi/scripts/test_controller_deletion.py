@@ -27,6 +27,17 @@ from scripts.preflight import run_preflight
 NAME = "controller-delete-a"
 
 
+def _controller_pods(client: ManagementClient) -> list[dict[str, object]]:
+    return client.json(
+        "-n",
+        "tenant-system",
+        "get",
+        "pods",
+        "-l",
+        "app.kubernetes.io/name=tenant-controller",
+    ).get("items", [])
+
+
 def _apply(client: ManagementClient, config: dict[str, str]) -> None:
     client.kubectl(
         "apply",
@@ -68,6 +79,11 @@ def main() -> None:
             _apply(client, config)
             first = wait_tenant_ready(ROOT, config, NAME)
             first_uid = first["metadata"]["uid"]
+            old_controller_uids = {
+                pod["metadata"]["uid"] for pod in _controller_pods(client)
+            }
+            if not old_controller_uids:
+                raise RuntimeError("Tenant controller Pod is absent before restart")
 
             client.kubectl(
                 "-n",
@@ -75,6 +91,12 @@ def main() -> None:
                 "scale",
                 "deployment/tenant-controller",
                 "--replicas=0",
+            )
+            wait_for(
+                "old Tenant controller Pod absence",
+                parse_duration(config["CONDITION_TIMEOUT"]),
+                parse_duration(config["WAIT_POLL_INTERVAL"]),
+                lambda: True if not _controller_pods(client) else None,
             )
             client.kubectl(
                 "delete",
@@ -106,6 +128,33 @@ def main() -> None:
                 "status",
                 "deployment/tenant-controller",
                 f"--timeout={config['CONDITION_TIMEOUT']}",
+            )
+            wait_for(
+                "replacement Tenant controller Pod",
+                parse_duration(config["CONDITION_TIMEOUT"]),
+                parse_duration(config["WAIT_POLL_INTERVAL"]),
+                lambda: (
+                    pods
+                    if (pods := _controller_pods(client))
+                    and old_controller_uids.isdisjoint(
+                        pod["metadata"]["uid"] for pod in pods
+                    )
+                    and all(
+                        next(
+                            (
+                                condition
+                                for condition in pod.get("status", {}).get(
+                                    "conditions", []
+                                )
+                                if condition.get("type") == "Ready"
+                            ),
+                            {},
+                        ).get("status")
+                        == "True"
+                        for pod in pods
+                    )
+                    else None
+                ),
             )
             wait_tenant_absent(ROOT, config, NAME)
 
