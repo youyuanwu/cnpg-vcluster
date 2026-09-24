@@ -193,6 +193,37 @@ func TestEndpointReleaseCrashWindowCompletes(t *testing.T) {
 	}
 }
 
+func TestEndpointReleaseCrashWindowCompletesWithoutAllocationConfigMap(t *testing.T) {
+	tenant := deletingTenant("tenant-a")
+	tenant.Status.FoundationHash = "foundation-hash"
+	tenant.Status.Endpoint = "172.18.255.1:6443"
+	tenant.Status.ClusterUID = "cluster-uid"
+	tenant.Status.TenantAPICreationAuthorized = true
+	tenant.Status.TenantCleanupClusterUID = tenant.Status.ClusterUID
+	foundation := testFoundation()
+	foundation.Hash = tenant.Status.FoundationHash
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(simplifiedFinalizerScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant).
+		Build()
+	reconciler := &TenantReconciler{
+		Client:    kubernetes,
+		APIReader: kubernetes,
+		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	var refreshed tenancyv1alpha1.Tenant
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &refreshed); err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Status.Endpoint != "" {
+		t.Fatalf("released endpoint was not cleared: %q", refreshed.Status.Endpoint)
+	}
+}
+
 func TestKubeconfigIsDeletedBeforeManagementRoots(t *testing.T) {
 	tenant := deletingTenant("tenant-a")
 	tenant.Status.FoundationHash = "foundation-hash"

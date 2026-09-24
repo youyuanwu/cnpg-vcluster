@@ -2,9 +2,9 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
-	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -227,7 +227,7 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 	present := false
 	endpointMissing := false
 	if _, endpointPresent, err := observeEndpoint(ctx, reconciler.reader(), reconciler.foundationNamespace(), foundation, tenant, specHash); err != nil {
-		if tenant.Status.Endpoint == "" || !strings.Contains(err.Error(), "endpoint allocation is missing") {
+		if tenant.Status.Endpoint == "" || !errors.Is(err, errEndpointAllocationMissing) {
 			return false, err
 		}
 		endpointMissing = true

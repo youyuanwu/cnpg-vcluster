@@ -54,9 +54,9 @@ func TestBootstrapRBACDeletionRefusesForeignReplacement(t *testing.T) {
 			ResourceVersion: "7",
 		},
 		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{"*"},
-			Resources: []string{"*"},
-			Verbs:     []string{"*"},
+			APIGroups: []string{""},
+			Resources: []string{"configmaps"},
+			Verbs:     []string{"get"},
 		}},
 	}
 	tenantClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign).Build()

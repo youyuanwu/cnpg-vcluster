@@ -87,9 +87,12 @@ func tenantClientFromSecret(ctx context.Context, reader client.Reader, factory T
 func applyBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
 	for _, raw := range resources.BootstrapRBAC() {
 		object := raw.(client.Object)
-		current := object.DeepCopyObject().(client.Object)
+		current, err := emptyBootstrapObject(object)
+		if err != nil {
+			return err
+		}
 		key := client.ObjectKeyFromObject(object)
-		err := tenantClient.Get(ctx, key, current)
+		err = tenantClient.Get(ctx, key, current)
 		if apierrors.IsForbidden(err) {
 			return errTenantAdministrativeAccessPending
 		}
@@ -138,8 +141,11 @@ func deleteBootstrapRBAC(ctx context.Context, tenantClient client.Client) (bool,
 	for _, raw := range resources.BootstrapRBAC() {
 		desired := raw.(client.Object)
 		key := client.ObjectKeyFromObject(desired)
-		current := desired.DeepCopyObject().(client.Object)
-		err := tenantClient.Get(ctx, key, current)
+		current, err := emptyBootstrapObject(desired)
+		if err != nil {
+			return false, err
+		}
+		err = tenantClient.Get(ctx, key, current)
 		if apierrors.IsNotFound(err) {
 			continue
 		}
@@ -174,4 +180,15 @@ func deleteBootstrapRBAC(ctx context.Context, tenantClient client.Client) (bool,
 		return false, nil
 	}
 	return true, nil
+}
+
+func emptyBootstrapObject(object client.Object) (client.Object, error) {
+	switch object.(type) {
+	case *rbacv1.Role:
+		return &rbacv1.Role{}, nil
+	case *rbacv1.RoleBinding:
+		return &rbacv1.RoleBinding{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported Tenant bootstrap object %T", object)
+	}
 }
