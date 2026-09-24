@@ -193,6 +193,57 @@ func TestEndpointReleaseCrashWindowCompletes(t *testing.T) {
 	}
 }
 
+func TestKubeconfigIsDeletedBeforeManagementRoots(t *testing.T) {
+	tenant := deletingTenant("tenant-a")
+	tenant.Status.FoundationHash = "foundation-hash"
+	tenant.Status.ClusterUID = "cluster-uid"
+	tenant.Status.TenantAPICreationAuthorized = true
+	tenant.Status.TenantCleanupClusterUID = tenant.Status.ClusterUID
+	foundation := testFoundation()
+	foundation.Hash = tenant.Status.FoundationHash
+	cluster := markedManagementObject(clusterGVK, tenant, foundation, "cluster", tenant.Name, "cluster-uid")
+	controlPlane := markedManagementObject(controlPlaneGVK, tenant, foundation, "kamaji-control-plane", tenant.Name, "control-plane-uid")
+	secret := &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      tenant.Name + "-kubeconfig",
+			Namespace: tenant.Name,
+			UID:       "secret-uid",
+			OwnerReferences: []metav1.OwnerReference{{
+				APIVersion: controlPlaneGVK.GroupVersion().String(),
+				Kind:       controlPlaneGVK.Kind,
+				Name:       controlPlane.GetName(),
+				UID:        controlPlane.GetUID(),
+			}},
+		},
+		Type: corev1.SecretType("cluster.x-k8s.io/secret"),
+		Data: map[string][]byte{"value": []byte("kubeconfig")},
+	}
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(simplifiedFinalizerScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, cluster, controlPlane, secret).
+		Build()
+	reconciler := &TenantReconciler{
+		Client:    kubernetes,
+		APIReader: kubernetes,
+		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	var currentSecret corev1.Secret
+	if err := kubernetes.Get(context.Background(), client.ObjectKeyFromObject(secret), &currentSecret); !apierrors.IsNotFound(err) {
+		t.Fatalf("kubeconfig Secret remained: %v", err)
+	}
+	for _, object := range []*unstructured.Unstructured{cluster, controlPlane} {
+		current := &unstructured.Unstructured{}
+		current.SetGroupVersionKind(object.GroupVersionKind())
+		if err := kubernetes.Get(context.Background(), client.ObjectKeyFromObject(object), current); err != nil {
+			t.Fatalf("%s was deleted before kubeconfig Secret: %v", object.GetKind(), err)
+		}
+	}
+}
+
 func deletingTenant(name string) *tenancyv1alpha1.Tenant {
 	now := metav1.Now()
 	tenant := validTenant(name)
