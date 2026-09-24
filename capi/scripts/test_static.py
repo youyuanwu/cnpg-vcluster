@@ -34,6 +34,7 @@ EXPECTED_RECIPES = {
     "controller-generate",
     "controller-verify",
     "controller-test",
+    "controller-vet",
     "controller-build",
     "controller-image",
     "test-controller-phase2",
@@ -186,9 +187,8 @@ def check_repository_boundaries() -> None:
         ROOT / "controller" / "config" / "manager" / "manager.yaml.tpl"
     ).read_text(encoding="utf-8")
     check(
-        "--mutation-enabled=true" in manager
-        and "--mutation-enabled=false" not in manager,
-        "normal Tenant controller mutation is not enabled",
+        "--mutation-enabled=${CONTROLLER_MUTATION_ENABLED}" in manager,
+        "Tenant controller mutation template placeholder is missing",
     )
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
     check(

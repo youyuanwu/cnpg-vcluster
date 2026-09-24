@@ -79,6 +79,10 @@ controller-verify:
 controller-test:
     @python3 scripts/test_controller.py
 
+# Run Go vet using the pinned Go toolchain and module cache.
+controller-vet:
+    @python3 scripts/vet_controller.py
+
 # Build the static Tenant controller manager binary.
 controller-build:
     @python3 scripts/build_controller.py --binary

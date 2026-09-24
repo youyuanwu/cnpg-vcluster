@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: tenant-controller
   namespace: tenant-system
+  annotations:
+    tenancy.cnpg-vcluster.io/lifecycle-epoch: ${CONTROLLER_LIFECYCLE_EPOCH}
 spec:
   replicas: 1
   selector:
@@ -12,6 +14,8 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: tenant-controller
+      annotations:
+        tenancy.cnpg-vcluster.io/lifecycle-epoch: ${CONTROLLER_LIFECYCLE_EPOCH}
     spec:
       serviceAccountName: tenant-controller
       containers:
@@ -20,7 +24,8 @@ spec:
         imagePullPolicy: Never
         args:
         - --leader-elect=true
-        - --mutation-enabled=true
+        - --mutation-enabled=${CONTROLLER_MUTATION_ENABLED}
+        - --lifecycle-epoch=${CONTROLLER_LIFECYCLE_EPOCH}
         - --controller-image=${TENANT_CONTROLLER_IMAGE}
         - --supported-kubernetes-version=${SUPPORTED_KUBERNETES_VERSION}
         - --webhook-cert-dir=/var/run/tenant-controller/tls

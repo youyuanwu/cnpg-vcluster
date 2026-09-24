@@ -13,6 +13,7 @@ from scripts.cache import VerifiedCache
 from scripts.controller_tenant import main as controller_tenant_main
 from scripts.test_controller_phase2 import _restore_after_gate
 from scripts.lib.controller import (
+    CONTROLLER_LIFECYCLE_EPOCH,
     _foundation_payload,
     _foundation_checksum,
     build_controller_image,
@@ -20,7 +21,10 @@ from scripts.lib.controller import (
     delete_controller_tenants,
     delete_tenant_resource,
     delete_controller,
+    render_controller_manager,
     set_controller_mutation,
+    stop_controller_for_cutover,
+    verify_running_controller_epoch,
 )
 from scripts.lib.ownership import IdentityRecord
 
@@ -42,6 +46,94 @@ class FakeManagementClient:
 
 
 class ControllerIntegrationUnitTests(unittest.TestCase):
+    def test_rendered_manager_contains_epoch_and_mutation_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            template = root / "controller" / "config" / "manager"
+            template.mkdir(parents=True)
+            (template / "manager.yaml.tpl").write_text(
+                "image: ${TENANT_CONTROLLER_IMAGE}\n"
+                "version: ${SUPPORTED_KUBERNETES_VERSION}\n"
+                "epoch: ${CONTROLLER_LIFECYCLE_EPOCH}\n"
+                "mutation: ${CONTROLLER_MUTATION_ENABLED}\n",
+                encoding="utf-8",
+            )
+            rendered = render_controller_manager(
+                root,
+                {"KUBERNETES_VERSION": "v1.36.4"},
+                "example/controller:test",
+                mutation_enabled=False,
+            )
+            content = rendered.read_text(encoding="utf-8")
+            self.assertIn(f"epoch: {CONTROLLER_LIFECYCLE_EPOCH}", content)
+            self.assertIn("mutation: false", content)
+
+    def test_cutover_stops_old_controller_before_returning(self) -> None:
+        client = FakeManagementClient(
+            [
+                CompletedProcess([], 0, stdout="deployment", stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+                CompletedProcess([], 0, stdout='{"items":[]}', stderr=""),
+            ]
+        )
+        stop_controller_for_cutover(
+            {"CONDITION_TIMEOUT": "1s"},
+            client,
+        )
+        arguments = [call[0] for call in client.calls]
+        self.assertEqual(
+            (
+                "-n",
+                "tenant-system",
+                "scale",
+                "deployment/tenant-controller",
+                "--replicas=0",
+            ),
+            arguments[1],
+        )
+
+    def test_running_controller_epoch_checks_deployment_and_pod(self) -> None:
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": [
+                                    f"--lifecycle-epoch={CONTROLLER_LIFECYCLE_EPOCH}"
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        pods = {
+            "items": [
+                {
+                    "metadata": {"name": "tenant-controller-1"},
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": [
+                                    f"--lifecycle-epoch={CONTROLLER_LIFECYCLE_EPOCH}"
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        client = FakeManagementClient(
+            [
+                CompletedProcess([], 0, stdout=json.dumps(deployment), stderr=""),
+                CompletedProcess([], 0, stdout=json.dumps(pods), stderr=""),
+            ]
+        )
+        verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
+
     def test_delete_tenant_resource_uses_ordinary_kubernetes_delete(self) -> None:
         client = FakeManagementClient(
             [

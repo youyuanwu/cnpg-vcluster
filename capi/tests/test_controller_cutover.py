@@ -8,6 +8,7 @@ from subprocess import CompletedProcess
 from unittest.mock import patch
 
 from scripts.lib.controller_cutover import (
+    controller_lifecycle_epoch,
     controller_mutation_enabled,
     require_clean_controller_cutover,
 )
@@ -51,6 +52,52 @@ class ControllerCutoverTests(unittest.TestCase):
             ]
         )
         self.assertTrue(controller_mutation_enabled(client))
+
+    def test_lifecycle_epoch_reads_manager_arguments(self) -> None:
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": [
+                                    "--mutation-enabled=true",
+                                    "--lifecycle-epoch=legacy-status-v1",
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        client = FakeManagementClient(
+            [CompletedProcess([], 0, stdout=json.dumps(deployment), stderr="")]
+        )
+        self.assertEqual(
+            "legacy-status-v1",
+            controller_lifecycle_epoch(client),
+        )
+
+    def test_legacy_controller_has_no_lifecycle_epoch(self) -> None:
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": ["--mutation-enabled=true"],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        client = FakeManagementClient(
+            [CompletedProcess([], 0, stdout=json.dumps(deployment), stderr="")]
+        )
+        self.assertIsNone(controller_lifecycle_epoch(client))
 
     def test_legacy_runtime_residue_blocks_before_cluster_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
