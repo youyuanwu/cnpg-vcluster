@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -31,27 +30,27 @@ type postCNIWorkerState struct {
 	allReady          bool
 }
 
-func (reconciler *TenantReconciler) reconcilePostCNIWorkers(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
-	if tenant.Status.Stage != tenancyv1alpha1.StageNetworkReady {
-		return reconciler.reconcileStorage(ctx, tenant, canonical, specHash, foundation)
-	}
-	state, err := reconciler.observePostCNIWorkerState(ctx, tenant, canonical, specHash, foundation)
+func (reconciler *TenantReconciler) reconcilePostCNIWorkers(
+	ctx context.Context,
+	tenantClient client.Client,
+	tenant *tenancyv1alpha1.Tenant,
+	canonical validation.CanonicalSpec,
+	specHash string,
+	foundation Foundation,
+) (ctrl.Result, error) {
+	state, err := reconciler.observePostCNIWorkerState(ctx, tenantClient, tenant, canonical, specHash, foundation)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if !state.inventoryComplete || !state.allReady {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		recordPostCNIWorkerState(status, state)
-		status.Stage = tenancyv1alpha1.StagePostCNIWorkersReady
-		setCondition(status, tenant, "WorkersReady", metav1.ConditionTrue, "WorkersReady", "Exact post-CNI workers and Nodes are ready")
-		return nil
-	})
+	return reconciler.reconcileStorage(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 
 func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	ctx context.Context,
+	tenantClient client.Client,
 	tenant *tenancyv1alpha1.Tenant,
 	canonical validation.CanonicalSpec,
 	specHash string,
@@ -84,12 +83,11 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	if len(devMachines.Items) != int(canonical.Workers) {
 		return state, nil
 	}
-	machineByUID := map[string]tenancyv1alpha1.ObservedResourceIdentity{}
+	machineByUID := map[string]*unstructured.Unstructured{}
 	machineNames := map[string]struct{}{}
 	for _, machine := range machines {
-		identity := identityFor(machine)
-		machineByUID[identity.UID] = identity
-		machineNames[identity.Name] = struct{}{}
+		machineByUID[string(machine.GetUID())] = machine
+		machineNames[machine.GetName()] = struct{}{}
 	}
 	devMachinesReady := true
 	for index := range devMachines.Items {
@@ -103,20 +101,16 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 		if !present {
 			return state, fmt.Errorf("%w: DevMachine %s owner does not match an exact Machine", errWorkerOwnershipInvalid, item.GetName())
 		}
-		if item.GetName() != root.Name {
-			return state, fmt.Errorf("%w: DevMachine %s name does not match its exact Machine %s", errWorkerOwnershipInvalid, item.GetName(), root.Name)
+		if item.GetName() != root.GetName() {
+			return state, fmt.Errorf("%w: DevMachine %s name does not match its exact Machine %s", errWorkerOwnershipInvalid, item.GetName(), root.GetName())
 		}
-		if err := validateOwnerChain(ctx, reconciler.reader(), item, root); err != nil {
+		if err := validateOwnerChain(ctx, reconciler.reader(), item, root.GetUID()); err != nil {
 			return state, fmt.Errorf("%w: %v", errWorkerOwnershipInvalid, err)
 		}
 		if !tenantObjectReady(item) {
 			devMachinesReady = false
 		}
 		state.devMachines = append(state.devMachines, item.DeepCopy())
-	}
-	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
-	if err != nil {
-		return state, err
 	}
 	nodes := &unstructured.UnstructuredList{}
 	nodes.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "NodeList"})
@@ -140,11 +134,4 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	state.inventoryComplete = true
 	state.allReady = machinesReady && devMachinesReady && nodesReady
 	return state, nil
-}
-
-func recordPostCNIWorkerState(status *tenancyv1alpha1.TenantStatus, state postCNIWorkerState) {
-	replaceMachineIdentities(status, state.machines)
-	status.ObservedResources = replaceResourceIdentities(status.ObservedResources, postCNIDevMachineGVK, state.devMachines)
-	status.TenantResources = replaceResourceIdentities(status.TenantResources, postCNINodeGVK, state.nodes)
-	status.WorkerContainers = workerContainerReferences(state.containers)
 }

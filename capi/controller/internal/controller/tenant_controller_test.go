@@ -60,10 +60,9 @@ func TestReconcileMetadataPreservesDegradedReadinessPhase(t *testing.T) {
 	tenant := validTenant("tenant-a")
 	tenant.Generation = 4
 	status := tenancyv1alpha1.TenantStatus{
-		Stage: tenancyv1alpha1.StageDatabaseReady,
 		Phase: tenancyv1alpha1.PhaseDegraded,
 	}
-	initializeReconcileStatus(&status, tenant, "spec-hash", "foundation-hash")
+	initializeReconcileStatus(&status, tenant)
 	if status.Phase != tenancyv1alpha1.PhaseDegraded {
 		t.Fatalf("readiness degradation was overwritten: %q", status.Phase)
 	}

@@ -1,0 +1,184 @@
+package controller
+
+import (
+	"context"
+	"testing"
+
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
+
+	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
+	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
+)
+
+func TestFinalizerOnlyDeletionCompletesWithoutFoundationStatus(t *testing.T) {
+	tenant := deletingTenant("tenant-a")
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(simplifiedFinalizerScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant).
+		Build()
+	reconciler := &TenantReconciler{
+		Client:    kubernetes,
+		APIReader: kubernetes,
+		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+	}
+	foundation := testFoundation()
+	foundation.Hash = "foundation-hash"
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	var current tenancyv1alpha1.Tenant
+	err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &current)
+	if err == nil && containsString(current.Finalizers, tenantFinalizer) {
+		t.Fatal("finalizer-only Tenant remained blocked")
+	}
+	if client.IgnoreNotFound(err) != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTenantAPIFailureBlocksClusterDeletionBeforeCleanup(t *testing.T) {
+	tenant := deletingTenant("tenant-a")
+	tenant.Status.FoundationHash = "foundation-hash"
+	tenant.Status.ClusterUID = "cluster-uid"
+	tenant.Status.TenantAPICreationAuthorized = true
+	foundation := testFoundation()
+	foundation.Hash = tenant.Status.FoundationHash
+	cluster := markedManagementObject(clusterGVK, tenant, foundation, "cluster", tenant.Name, "cluster-uid")
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(simplifiedFinalizerScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, cluster).
+		Build()
+	reconciler := &TenantReconciler{
+		Client:    kubernetes,
+		APIReader: kubernetes,
+		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err == nil {
+		t.Fatal("tenant API failure did not block finalization")
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(clusterGVK)
+	if err := kubernetes.Get(context.Background(), client.ObjectKeyFromObject(cluster), current); err != nil {
+		t.Fatalf("Cluster was deleted before tenant cleanup: %v", err)
+	}
+}
+
+func TestCleanupCheckpointPermitsClusterDeletionWithoutTenantAPI(t *testing.T) {
+	tenant := deletingTenant("tenant-a")
+	tenant.Status.FoundationHash = "foundation-hash"
+	tenant.Status.ClusterUID = "cluster-uid"
+	tenant.Status.TenantAPICreationAuthorized = true
+	tenant.Status.TenantCleanupClusterUID = tenant.Status.ClusterUID
+	foundation := testFoundation()
+	foundation.Hash = tenant.Status.FoundationHash
+	cluster := markedManagementObject(clusterGVK, tenant, foundation, "cluster", tenant.Name, "cluster-uid")
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(simplifiedFinalizerScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, cluster).
+		Build()
+	reconciler := &TenantReconciler{
+		Client:    kubernetes,
+		APIReader: kubernetes,
+		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(clusterGVK)
+	err := kubernetes.Get(context.Background(), client.ObjectKeyFromObject(cluster), current)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("Cluster remained after successful cleanup checkpoint: %v", err)
+	}
+}
+
+func TestClusterOnlyPartialCreationIsDeletedWithoutTenantAPI(t *testing.T) {
+	tenant := deletingTenant("tenant-a")
+	tenant.Status.FoundationHash = "foundation-hash"
+	foundation := testFoundation()
+	foundation.Hash = tenant.Status.FoundationHash
+	cluster := markedManagementObject(clusterGVK, tenant, foundation, "cluster", tenant.Name, "cluster-uid")
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(simplifiedFinalizerScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, cluster).
+		Build()
+	reconciler := &TenantReconciler{
+		Client:    kubernetes,
+		APIReader: kubernetes,
+		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	var refreshed tenancyv1alpha1.Tenant
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &refreshed); err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Status.ClusterUID != "cluster-uid" {
+		t.Fatalf("Cluster UID was not recovered: %q", refreshed.Status.ClusterUID)
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), &refreshed, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(clusterGVK)
+	err := kubernetes.Get(context.Background(), client.ObjectKeyFromObject(cluster), current)
+	if !apierrors.IsNotFound(err) {
+		t.Fatalf("Cluster-only partial creation remained: %v", err)
+	}
+}
+
+func deletingTenant(name string) *tenancyv1alpha1.Tenant {
+	now := metav1.Now()
+	tenant := validTenant(name)
+	tenant.UID = "tenant-uid"
+	tenant.Finalizers = []string{tenantFinalizer}
+	tenant.DeletionTimestamp = &now
+	return tenant
+}
+
+func simplifiedFinalizerScheme(t *testing.T) *runtime.Scheme {
+	t.Helper()
+	scheme := testScheme(t)
+	for _, gvk := range []schema.GroupVersionKind{
+		clusterGVK,
+		devClusterGVK,
+		controlPlaneGVK,
+		kubeadmTemplateGVK,
+		devMachineTemplateGVK,
+		machineDeploymentGVK,
+	} {
+		scheme.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+	}
+	return scheme
+}
+
+func markedManagementObject(gvk schema.GroupVersionKind, tenant *tenancyv1alpha1.Tenant, foundation Foundation, resource, name, uid string) *unstructured.Unstructured {
+	object := &unstructured.Unstructured{}
+	object.SetGroupVersionKind(gvk)
+	object.SetNamespace(tenant.Name)
+	object.SetName(name)
+	object.SetUID(types.UID(uid))
+	object.SetLabels(map[string]string{
+		foundation.Inputs.OwnershipLabel: foundation.Inputs.LabPrefix,
+	})
+	object.SetAnnotations(map[string]string{
+		resources.TenantAnnotation:     tenant.Name,
+		resources.TenantUIDAnnotation:  string(tenant.UID),
+		resources.SpecHashAnnotation:   "spec-hash",
+		resources.FoundationAnnotation: foundation.Hash,
+		resources.ResourceAnnotation:   resource,
+	})
+	return object
+}

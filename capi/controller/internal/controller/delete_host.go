@@ -37,19 +37,10 @@ func (reconciler *TenantReconciler) deleteTenantHostState(
 		if volume.Name != volumeName || !stringMapEqual(volume.Labels, expected) {
 			return false, fmt.Errorf("Docker volume ownership changed before cleanup")
 		}
-		if tenant.Status.DockerVolume != nil &&
-			(volume.CreatedAt != tenant.Status.DockerVolume.CreatedAt ||
-				volume.Mountpoint != tenant.Status.DockerVolume.Mountpoint) {
-			return false, fmt.Errorf("Docker volume identity changed before cleanup")
-		}
 		if err := reconciler.docker().RemoveVolume(ctx, volume.Name); err != nil {
 			return false, err
 		}
 		return false, nil
 	}
-	secretAbsent, err := reconciler.deleteKubeconfigSecret(ctx, tenant)
-	if err != nil {
-		return false, err
-	}
-	return secretAbsent, nil
+	return true, nil
 }

@@ -27,8 +27,10 @@ func (reconciler *TenantReconciler) deleteExactUnstructured(ctx context.Context,
 	if err := validateRootOwnership(object, tenant, specHash, foundation.Hash, resource, foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 		return false, err
 	}
-	if err := validateRecordedUID(tenant.Status, object); err != nil {
-		return false, err
+	if gvk == clusterGVK {
+		if err := validateClusterUID(tenant, object); err != nil {
+			return false, err
+		}
 	}
 	if !object.GetDeletionTimestamp().IsZero() {
 		return false, nil
@@ -59,9 +61,6 @@ func (reconciler *TenantReconciler) deleteExactNamespace(ctx context.Context, te
 		return false, err
 	}
 	namespace.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Namespace"))
-	if err := validateRecordedUID(tenant.Status, &namespace); err != nil {
-		return false, err
-	}
 	if namespace.DeletionTimestamp != nil {
 		return false, nil
 	}

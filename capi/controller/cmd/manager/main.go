@@ -38,7 +38,7 @@ func main() {
 	flag.StringVar(&webhookCertDir, "webhook-cert-dir", "/var/run/tenant-controller/tls", "Webhook certificate directory")
 	flag.StringVar(&supportedVersion, "supported-kubernetes-version", "1.36.4", "Supported Tenant Kubernetes version")
 	flag.StringVar(&controllerImage, "controller-image", "", "Exact Tenant controller image identity")
-	flag.StringVar(&lifecycleEpoch, "lifecycle-epoch", "legacy-status-v1", "Tenant lifecycle compatibility epoch")
+	flag.StringVar(&lifecycleEpoch, "lifecycle-epoch", "desired-state-v2", "Tenant lifecycle compatibility epoch")
 	options := zap.Options{Development: false}
 	options.BindFlags(flag.CommandLine)
 	flag.Parse()

@@ -2,12 +2,12 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -18,17 +18,14 @@ import (
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
 
-func (reconciler *TenantReconciler) reconcileCNPG(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
-	if tenant.Status.Stage != tenancyv1alpha1.StageStorageReady &&
-		tenant.Status.Stage != tenancyv1alpha1.StageCNPGOperatorApplied &&
-		tenant.Status.Stage != tenancyv1alpha1.StageCNPGStoragePrepared &&
-		tenant.Status.Stage != tenancyv1alpha1.StageCNPGClusterApplied {
-		return reconciler.reconcileReadiness(ctx, tenant, canonical, specHash, foundation)
-	}
-	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
+func (reconciler *TenantReconciler) reconcileCNPG(
+	ctx context.Context,
+	tenantClient client.Client,
+	tenant *tenancyv1alpha1.Tenant,
+	canonical validation.CanonicalSpec,
+	specHash string,
+	foundation Foundation,
+) (ctrl.Result, error) {
 	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
 	controllerImage, ok := archiveByKey(foundation.Cache.ImageArchives, "CNPG_CONTROLLER_IMAGE")
 	if !ok {
@@ -38,86 +35,75 @@ func (reconciler *TenantReconciler) reconcileCNPG(ctx context.Context, tenant *t
 	if !ok {
 		return ctrl.Result{}, fmt.Errorf("POSTGRES_IMAGE is missing")
 	}
-	switch tenant.Status.Stage {
-	case tenancyv1alpha1.StageStorageReady:
-		asset, err := os.ReadFile("/assets/cnpg.yaml")
+	asset, err := os.ReadFile("/assets/cnpg.yaml")
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	objects, err := resources.CNPGOperator(resourceContext, asset, controllerImage.Tagged, controllerImage.Reference)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	for _, desired := range objects {
+		changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		objects, err := resources.CNPGOperator(resourceContext, asset, controllerImage.Tagged, controllerImage.Reference)
-		if err != nil {
-			return ctrl.Result{}, err
+		if changed {
+			return ctrl.Result{Requeue: true}, nil
 		}
-		for _, desired := range objects {
-			identity, changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			if changed || !tenantIdentityPresent(tenant.Status.TenantResources, identity) {
-				return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-					return upsertTenantIdentity(status, identity)
-				})
-			}
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageCNPGOperatorApplied
-			return nil
-		})
-	case tenancyv1alpha1.StageCNPGOperatorApplied:
-		deployment := &unstructured.Unstructured{}
-		deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
-		if err := tenantClient.Get(ctx, client.ObjectKey{Namespace: "cnpg-system", Name: "cnpg-controller-manager"}, deployment); err != nil {
-			if apierrors.IsNotFound(err) {
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-			return ctrl.Result{}, err
-		}
-		if !workloadAvailable(deployment) {
+	}
+	deployment := &unstructured.Unstructured{}
+	deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
+	if err := tenantClient.Get(ctx, client.ObjectKey{Namespace: "cnpg-system", Name: "cnpg-controller-manager"}, deployment); err != nil {
+		if apierrors.IsNotFound(err) {
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		if len(tenant.Status.WorkerContainers) == 0 {
-			return ctrl.Result{}, fmt.Errorf("worker container evidence is missing")
+		return ctrl.Result{}, err
+	}
+	if !workloadAvailable(deployment) {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	_, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
+	if err != nil {
+		if errors.Is(err, errWorkerRuntimePending) {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
+		return ctrl.Result{}, err
+	}
+	if len(containers) == 0 {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	probe := fmt.Sprintf("for ordinal in $(seq 1 %d); do path=%s/volumes/cnpg/$ordinal; test -d \"$path\" && test \"$(stat -c '%%u:%%g:%%a' \"$path\")\" = '26:26:700' || exit 1; done",
+		canonical.DatabaseCount, foundation.Inputs.StorageContainerPath)
+	result, err := reconciler.exec(ctx, containers[0].ID, []string{"sh", "-ec", probe})
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if result.ExitCode != 0 {
 		command := fmt.Sprintf("for ordinal in $(seq 1 %d); do mkdir -p %s/volumes/cnpg/$ordinal; chown 26:26 %s/volumes/cnpg/$ordinal; chmod 700 %s/volumes/cnpg/$ordinal; done",
 			canonical.DatabaseCount, foundation.Inputs.StorageContainerPath, foundation.Inputs.StorageContainerPath, foundation.Inputs.StorageContainerPath)
-		if err := reconciler.execRequired(ctx, tenant.Status.WorkerContainers[0].ID, []string{"sh", "-ec", command}); err != nil {
+		if err := reconciler.execRequired(ctx, containers[0].ID, []string{"sh", "-ec", command}); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageCNPGStoragePrepared
-			return nil
-		})
-	case tenancyv1alpha1.StageCNPGStoragePrepared:
-		for _, desired := range resources.CNPGObjects(resourceContext, tenantStorageClass, postgresImage.Reference) {
-			identity, changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
-			if err != nil {
-				return ctrl.Result{}, err
-			}
-			if changed || !tenantIdentityPresent(tenant.Status.TenantResources, identity) {
-				return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-					return upsertTenantIdentity(status, identity)
-				})
-			}
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageCNPGClusterApplied
-			return nil
-		})
-	case tenancyv1alpha1.StageCNPGClusterApplied:
-		ready, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount, postgresImage.Reference)
+		return ctrl.Result{Requeue: true}, nil
+	}
+	for _, desired := range resources.CNPGObjects(resourceContext, tenantStorageClass, postgresImage.Reference) {
+		changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if !ready {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		if changed {
+			return ctrl.Result{Requeue: true}, nil
 		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageDatabaseReady
-			setCondition(status, tenant, "DatabaseReady", metav1.ConditionTrue, "DatabaseReady", "CNPG instances and persistent volumes are ready")
-			return nil
-		})
 	}
-	return ctrl.Result{}, nil
+	ready, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount, postgresImage.Reference)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !ready {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	return reconciler.reconcileReadiness(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 
 func databaseStructurallyReady(ctx context.Context, tenantClient client.Client, count int32, postgresImage string) (bool, error) {

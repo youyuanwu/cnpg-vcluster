@@ -11,21 +11,11 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
-	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
-
-type staticTenantFactory struct {
-	client client.Client
-}
-
-func (factory staticTenantFactory) ClientFor([]byte, string) (client.Client, error) {
-	return factory.client, nil
-}
 
 func TestObservePostCNIWorkerStateValidatesExactTopologyAndReadiness(t *testing.T) {
 	state, err := observePostCNIFixture(t, "worker-a", "worker-a", true)
@@ -70,6 +60,16 @@ func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeRe
 		managementScheme.AddKnownTypeWithName(gvk.GroupVersion().WithKind(gvk.Kind+"List"), &unstructured.UnstructuredList{})
 	}
 	machineDeployment := topologyObject(machineDeploymentGVK, tenant.Name, tenant.Name+"-worker", "deployment-uid", true)
+	machineDeployment.SetLabels(map[string]string{
+		foundation.Inputs.OwnershipLabel: foundation.Inputs.LabPrefix,
+	})
+	machineDeployment.SetAnnotations(map[string]string{
+		resources.TenantAnnotation:     tenant.Name,
+		resources.TenantUIDAnnotation:  string(tenant.UID),
+		resources.SpecHashAnnotation:   "spec-hash",
+		resources.FoundationAnnotation: foundation.Hash,
+		resources.ResourceAnnotation:   "machine-deployment",
+	})
 	machineSet := topologyObject(machineSetGVK, tenant.Name, tenant.Name+"-set", "set-uid", true)
 	machineSet.SetOwnerReferences([]metav1.OwnerReference{topologyOwner(machineDeployment)})
 	machine := topologyObject(machineGVK, tenant.Name, "worker-a", "machine-uid", true)
@@ -88,15 +88,9 @@ func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeRe
 	devMachine := topologyObject(postCNIDevMachineGVK, tenant.Name, devMachineName, "devmachine-uid", true)
 	devMachine.SetLabels(map[string]string{"cluster.x-k8s.io/cluster-name": tenant.Name})
 	devMachine.SetOwnerReferences([]metav1.OwnerReference{topologyOwner(machine)})
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{Name: tenant.Name + "-kubeconfig", Namespace: tenant.Name},
-		Type:       corev1.SecretType("cluster.x-k8s.io/secret"),
-		Data:       map[string][]byte{"value": []byte("kubeconfig")},
-	}
-	tenant.Status.ObservedResources = []tenancyv1alpha1.ObservedResourceIdentity{identityFor(machineDeployment)}
 	management := fake.NewClientBuilder().
 		WithScheme(managementScheme).
-		WithObjects(machineDeployment, machineSet, machine, devMachine, secret).
+		WithObjects(machineDeployment, machineSet, machine, devMachine).
 		Build()
 
 	tenantScheme := runtime.NewScheme()
@@ -114,10 +108,10 @@ func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeRe
 				Networks: map[string]string{"kind": foundation.NetworkID},
 			}},
 		},
-		TenantClients: staticTenantFactory{client: tenantClient},
 	}
 	return reconciler.observePostCNIWorkerState(
 		context.Background(),
+		tenantClient,
 		tenant,
 		validation.CanonicalSpec{Workers: 1},
 		"spec-hash",

@@ -7,7 +7,6 @@ import (
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
@@ -19,10 +18,14 @@ import (
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
 
-func (reconciler *TenantReconciler) reconcileNetwork(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
-	if tenant.Status.Stage != tenancyv1alpha1.StageWorkersApplied {
-		return reconciler.reconcilePostCNIWorkers(ctx, tenant, canonical, specHash, foundation)
-	}
+func (reconciler *TenantReconciler) reconcileNetwork(
+	ctx context.Context,
+	tenantClient client.Client,
+	tenant *tenancyv1alpha1.Tenant,
+	canonical validation.CanonicalSpec,
+	specHash string,
+	foundation Foundation,
+) (ctrl.Result, error) {
 	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
 	calico, err := os.ReadFile("/assets/calico.yaml")
 	if err != nil {
@@ -36,19 +39,13 @@ func (reconciler *TenantReconciler) reconcileNetwork(ctx context.Context, tenant
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
 	for _, desired := range bundle.Objects {
-		identity, changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
+		changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		if changed || !tenantIdentityPresent(tenant.Status.TenantResources, identity) {
-			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				return upsertTenantIdentity(status, identity)
-			})
+		if changed {
+			return ctrl.Result{Requeue: true}, nil
 		}
 	}
 	ready, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
@@ -58,11 +55,7 @@ func (reconciler *TenantReconciler) reconcileNetwork(ctx context.Context, tenant
 	if !ready {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		status.Stage = tenancyv1alpha1.StageNetworkReady
-		setCondition(status, tenant, "NetworkReady", metav1.ConditionTrue, "NetworkReady", "Tenant networking workloads are ready")
-		return nil
-	})
+	return reconciler.reconcilePostCNIWorkers(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 
 func networkStructurallyReady(ctx context.Context, tenantClient client.Client, workers int64) (bool, error) {

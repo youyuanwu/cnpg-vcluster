@@ -27,143 +27,86 @@ var (
 	kubeadmTemplateGVK    = schema.GroupVersionKind{Group: "bootstrap.cluster.x-k8s.io", Version: "v1beta2", Kind: "KubeadmConfigTemplate"}
 	devMachineTemplateGVK = schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta2", Kind: "DevMachineTemplate"}
 	machineDeploymentGVK  = schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "MachineDeployment"}
+	errRootClusterMissing = errors.New("recorded root Cluster is missing")
 )
 
-func (reconciler *TenantReconciler) reconcileControlPlane(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
-	resourceContext := resources.Context{
-		Tenant:         tenant,
-		Spec:           canonical,
-		SpecHash:       specHash,
-		FoundationHash: foundation.Hash,
-		Endpoint:       tenant.Status.Endpoint,
-		Inputs:         foundation.ResourceInputs(),
-	}
-	switch tenant.Status.Stage {
-	case "":
+func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
+	if tenant.Status.Endpoint == "" {
 		endpoint, err := allocateEndpoint(ctx, reconciler.Client, reconciler.reader(), reconciler.foundationNamespace(), foundation, tenant, specHash)
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		err = reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.Endpoint = endpoint
-			status.FoundationHash = foundation.Hash
-			status.Stage = tenancyv1alpha1.StageEndpointAllocated
-			status.Teardown = &tenancyv1alpha1.TeardownStatus{
-				Phase:     "EndpointAllocated",
-				Authority: "TenantAPINeverAuthorized",
-			}
 			return nil
 		})
-		return ctrl.Result{Requeue: true}, err
-	case tenancyv1alpha1.StageEndpointAllocated:
-		namespace := resources.Namespace(resourceContext)
-		identity, err := reconciler.ensureNamespace(ctx, namespace, tenant, specHash, foundation)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageNamespaceCreated, identity)
-	case tenancyv1alpha1.StageNamespaceCreated:
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageClusterCreationAuthorized
-			status.Teardown = &tenancyv1alpha1.TeardownStatus{
-				Phase:     "ClusterCreationAuthorized",
-				Authority: "TenantAPINeverAuthorized",
-			}
-			return nil
-		})
-	case tenancyv1alpha1.StageClusterCreationAuthorized:
-		object, err := resources.Cluster(resourceContext)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		identity, err := reconciler.ensureUnstructured(ctx, object, tenant, specHash, foundation, "cluster")
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			if err := upsertIdentity(status, identity); err != nil {
-				return err
-			}
-			status.Stage = tenancyv1alpha1.StageClusterCreated
-			status.Teardown = &tenancyv1alpha1.TeardownStatus{
-				Phase:      "TenantAPINeverAuthorized",
-				Authority:  "TenantAPINeverAuthorized",
-				ClusterUID: identity.UID,
-			}
-			return nil
-		})
-	case tenancyv1alpha1.StageClusterCreated:
-		object, err := resources.DevCluster(resourceContext)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		identity, err := reconciler.ensureUnstructured(ctx, object, tenant, specHash, foundation, "dev-cluster")
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageDevClusterCreated, identity)
-	case tenancyv1alpha1.StageDevClusterCreated:
-		object, err := resources.KamajiControlPlane(resourceContext)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		identity, err := reconciler.ensureUnstructured(ctx, object, tenant, specHash, foundation, "kamaji-control-plane")
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageControlPlaneCreated, identity)
-	case tenancyv1alpha1.StageControlPlaneCreated:
-		current, err := reconciler.managementObjectsCurrent(ctx, tenant, specHash, foundation)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if !current {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		_, secret, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
-		if apierrors.IsNotFound(err) {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-
-		controlPlaneIdentity := findIdentity(tenant.Status, controlPlaneGVK, tenant.Name, tenant.Name)
-		if controlPlaneIdentity == nil || !hasOwnerUID(secret.OwnerReferences, types.UID(controlPlaneIdentity.UID)) {
-			return ctrl.Result{}, fmt.Errorf("Tenant kubeconfig Secret owner does not match the exact KamajiControlPlane")
-		}
-		secret.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Secret"))
-		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageKubeconfigReady, kubeconfigSecretIdentity(secret))
-	case tenancyv1alpha1.StageKubeconfigReady:
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageTenantAPICleanupRequired
-			if status.Teardown == nil {
-				status.Teardown = &tenancyv1alpha1.TeardownStatus{}
-			}
-			status.Teardown.Phase = "TenantAPICleanupRequired"
-			status.Teardown.Authority = "TenantAPICleanupRequired"
-			return nil
-		})
-	case tenancyv1alpha1.StageTenantAPICleanupRequired:
-		tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if err := applyBootstrapRBAC(ctx, tenantClient); err != nil {
-			if errors.Is(err, errTenantAdministrativeAccessPending) {
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.Stage = tenancyv1alpha1.StageBootstrapRBACApplied
-			setCondition(status, tenant, "ControlPlaneReady", metav1.ConditionTrue, "ControlPlaneReady", "Hosted control plane and bootstrap access are ready")
-			return nil
-		})
-	default:
-		return reconciler.reconcileWorkers(ctx, tenant, canonical, specHash, foundation)
 	}
+
+	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
+	changed, err := reconciler.ensureNamespace(ctx, resources.Namespace(resourceContext), tenant, specHash, foundation)
+	if err != nil || changed {
+		return ctrl.Result{Requeue: changed}, err
+	}
+	cluster, err := resources.Cluster(resourceContext)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	currentCluster, changed, err := reconciler.ensureManagementObject(ctx, cluster, tenant, specHash, foundation, "cluster")
+	if err != nil || changed {
+		return ctrl.Result{Requeue: changed}, err
+	}
+	if tenant.Status.ClusterUID == "" {
+		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.ClusterUID = string(currentCluster.GetUID())
+			return nil
+		})
+	}
+
+	devCluster, err := resources.DevCluster(resourceContext)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if _, changed, err := reconciler.ensureManagementObject(ctx, devCluster, tenant, specHash, foundation, "dev-cluster"); err != nil || changed {
+		return ctrl.Result{Requeue: changed}, err
+	}
+	if !tenant.Status.TenantAPICreationAuthorized {
+		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.TenantAPICreationAuthorized = true
+			return nil
+		})
+	}
+	controlPlane, err := resources.KamajiControlPlane(resourceContext)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	currentControlPlane, changed, err := reconciler.ensureManagementObject(ctx, controlPlane, tenant, specHash, foundation, "kamaji-control-plane")
+	if err != nil || changed {
+		return ctrl.Result{Requeue: changed}, err
+	}
+	current, err := reconciler.managementObjectsCurrent(ctx, tenant, specHash, foundation)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !current {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	tenantClient, secret, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
+	if apierrors.IsNotFound(err) {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := validateKubeconfigSecret(secret, currentControlPlane); err != nil {
+		return ctrl.Result{}, err
+	}
+	if err := applyBootstrapRBAC(ctx, tenantClient); err != nil {
+		if errors.Is(err, errTenantAdministrativeAccessPending) {
+			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+		}
+		return ctrl.Result{}, err
+	}
+	return reconciler.reconcileWorkers(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 
 func (reconciler *TenantReconciler) managementObjectsCurrent(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
@@ -178,19 +121,24 @@ func (reconciler *TenantReconciler) managementObjectsCurrent(ctx context.Context
 		object := &unstructured.Unstructured{}
 		object.SetGroupVersionKind(item.gvk)
 		if err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name}, object); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
 			return false, err
 		}
 		if err := validateRootOwnership(object, tenant, specHash, foundation.Hash, item.resource, foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 			return false, err
 		}
-		if err := validateProviderOwner(object, tenant.Status, item.gvk.Kind != "Cluster"); err != nil {
+		if item.gvk == clusterGVK {
+			if err := validateClusterUID(tenant, object); err != nil {
+				return false, err
+			}
+		}
+		if err := validateProviderOwner(ctx, reconciler.reader(), object, tenant.Name, item.gvk.Kind != "Cluster"); err != nil {
 			if errors.Is(err, errProviderOwnerPending) {
 				return false, nil
 			}
 			return false, err
-		}
-		if identity := findIdentity(tenant.Status, item.gvk, tenant.Name, tenant.Name); identity == nil || identity.UID != string(object.GetUID()) {
-			return false, fmt.Errorf("%s exact identity is not recorded", item.gvk.Kind)
 		}
 		observedGeneration, found, err := unstructured.NestedInt64(object.Object, "status", "observedGeneration")
 		if err != nil {
@@ -243,52 +191,98 @@ func observedGenerationIsCurrent(object *unstructured.Unstructured) bool {
 	return err == nil && found && observedGeneration >= object.GetGeneration()
 }
 
-func (reconciler *TenantReconciler) ensureNamespace(ctx context.Context, desired *corev1.Namespace, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (tenancyv1alpha1.ObservedResourceIdentity, error) {
+func (reconciler *TenantReconciler) ensureNamespace(ctx context.Context, desired *corev1.Namespace, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
 	var current corev1.Namespace
 	err := reconciler.reader().Get(ctx, types.NamespacedName{Name: desired.Name}, &current)
 	if apierrors.IsNotFound(err) {
 		if err := reconciler.Create(ctx, desired); err != nil {
-			return tenancyv1alpha1.ObservedResourceIdentity{}, err
+			if !apierrors.IsAlreadyExists(err) {
+				return false, err
+			}
+			if err := reconciler.reader().Get(ctx, types.NamespacedName{Name: desired.Name}, &current); err != nil {
+				return false, err
+			}
+		} else {
+			return true, nil
 		}
-		current = *desired
-		current.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Namespace"))
 	} else if err != nil {
-		return tenancyv1alpha1.ObservedResourceIdentity{}, err
+		return false, err
 	}
 	if err := validateRootOwnership(&current, tenant, specHash, foundation.Hash, "namespace", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-		return tenancyv1alpha1.ObservedResourceIdentity{}, err
+		return false, err
 	}
-	current.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Namespace"))
-	return identityFor(&current), nil
+	return false, nil
 }
 
-func (reconciler *TenantReconciler) ensureUnstructured(ctx context.Context, desired *unstructured.Unstructured, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation, resource string) (tenancyv1alpha1.ObservedResourceIdentity, error) {
+func (reconciler *TenantReconciler) ensureManagementObject(
+	ctx context.Context,
+	desired *unstructured.Unstructured,
+	tenant *tenancyv1alpha1.Tenant,
+	specHash string,
+	foundation Foundation,
+	resource string,
+) (*unstructured.Unstructured, bool, error) {
 	current := &unstructured.Unstructured{}
 	current.SetGroupVersionKind(desired.GroupVersionKind())
-	key := client.ObjectKeyFromObject(desired)
-	err := reconciler.reader().Get(ctx, key, current)
+	err := reconciler.reader().Get(ctx, client.ObjectKeyFromObject(desired), current)
 	if apierrors.IsNotFound(err) {
-		if err := reconciler.Create(ctx, desired); err != nil {
-			return tenancyv1alpha1.ObservedResourceIdentity{}, err
+		if desired.GroupVersionKind() == clusterGVK && tenant.Status.ClusterUID != "" {
+			return nil, false, errRootClusterMissing
 		}
-		current = desired
+		if err := reconciler.Create(ctx, desired); err != nil {
+			if !apierrors.IsAlreadyExists(err) {
+				return nil, false, err
+			}
+			if err := reconciler.reader().Get(ctx, client.ObjectKeyFromObject(desired), current); err != nil {
+				return nil, false, err
+			}
+		} else {
+			return desired, true, nil
+		}
 	} else if err != nil {
-		return tenancyv1alpha1.ObservedResourceIdentity{}, err
+		return nil, false, err
 	}
 	if err := validateRootOwnership(current, tenant, specHash, foundation.Hash, resource, foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-		return tenancyv1alpha1.ObservedResourceIdentity{}, err
+		return nil, false, err
 	}
-	return identityFor(current), nil
-}
-
-func (reconciler *TenantReconciler) advanceWithIdentity(ctx context.Context, tenant *tenancyv1alpha1.Tenant, stage string, identity tenancyv1alpha1.ObservedResourceIdentity) error {
-	return reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		if err := upsertIdentity(status, identity); err != nil {
-			return err
+	if desired.GroupVersionKind() == clusterGVK {
+		if err := validateClusterUID(tenant, current); err != nil {
+			return nil, false, err
 		}
-		status.Stage = stage
-		return nil
-	})
+	}
+	if err := validateProviderOwner(ctx, reconciler.reader(), current, tenant.Name, false); err != nil {
+		return nil, false, err
+	}
+	if desiredMatchesCurrent(desired, current) {
+		return current, false, nil
+	}
+	applied := desired.DeepCopy()
+	applied.SetUID(current.GetUID())
+	applied.SetResourceVersion(current.GetResourceVersion())
+	if err := reconciler.Patch(
+		ctx,
+		applied,
+		client.Apply,
+		client.FieldOwner("cnpg-vcluster-tenant-controller"),
+		client.ForceOwnership,
+	); err != nil {
+		if apierrors.IsConflict(err) {
+			return nil, false, fmt.Errorf("%w: %v", errStableApplyConflict, err)
+		}
+		if apierrors.IsInvalid(err) {
+			return nil, false, fmt.Errorf("%w: %v", errImmutableDrift, err)
+		}
+		return nil, false, err
+	}
+	refreshed := &unstructured.Unstructured{}
+	refreshed.SetGroupVersionKind(desired.GroupVersionKind())
+	if err := reconciler.reader().Get(ctx, client.ObjectKeyFromObject(desired), refreshed); err != nil {
+		return nil, false, err
+	}
+	if refreshed.GetUID() != current.GetUID() {
+		return nil, false, fmt.Errorf("%s %s identity changed during apply", refreshed.GetKind(), refreshed.GetName())
+	}
+	return refreshed, true, nil
 }
 
 func hasOwnerUID(owners []metav1.OwnerReference, uid types.UID) bool {

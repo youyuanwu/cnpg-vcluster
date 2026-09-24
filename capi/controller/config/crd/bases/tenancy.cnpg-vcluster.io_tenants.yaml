@@ -84,6 +84,8 @@ spec:
             x-kubernetes-preserve-unknown-fields: true
           status:
             properties:
+              clusterUID:
+                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -140,24 +142,6 @@ spec:
                   - type
                   type: object
                 type: array
-              dockerVolume:
-                properties:
-                  createdAt:
-                    type: string
-                  labels:
-                    additionalProperties:
-                      type: string
-                    type: object
-                  mountpoint:
-                    type: string
-                  name:
-                    type: string
-                required:
-                - createdAt
-                - labels
-                - mountpoint
-                - name
-                type: object
               endpoint:
                 type: string
               foundationHash:
@@ -165,28 +149,6 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
-              observedResources:
-                items:
-                  properties:
-                    apiVersion:
-                      type: string
-                    contentSHA256:
-                      type: string
-                    kind:
-                      type: string
-                    name:
-                      type: string
-                    namespace:
-                      type: string
-                    uid:
-                      type: string
-                  required:
-                  - apiVersion
-                  - kind
-                  - name
-                  - uid
-                  type: object
-                type: array
               phase:
                 enum:
                 - Pending
@@ -197,53 +159,10 @@ spec:
                 - Failed
                 - OwnershipInvalid
                 type: string
-              specHash:
+              tenantAPICreationAuthorized:
+                type: boolean
+              tenantCleanupClusterUID:
                 type: string
-              stage:
-                type: string
-              teardown:
-                properties:
-                  authority:
-                    type: string
-                  clusterUID:
-                    type: string
-                  phase:
-                    type: string
-                type: object
-              tenantResources:
-                items:
-                  properties:
-                    apiVersion:
-                      type: string
-                    contentSHA256:
-                      type: string
-                    kind:
-                      type: string
-                    name:
-                      type: string
-                    namespace:
-                      type: string
-                    uid:
-                      type: string
-                  required:
-                  - apiVersion
-                  - kind
-                  - name
-                  - uid
-                  type: object
-                type: array
-              workerContainers:
-                items:
-                  properties:
-                    id:
-                      type: string
-                    name:
-                      type: string
-                  required:
-                  - id
-                  - name
-                  type: object
-                type: array
             type: object
         required:
         - spec

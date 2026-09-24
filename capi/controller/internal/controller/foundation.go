@@ -165,8 +165,8 @@ func loadFoundationForDeletion(ctx context.Context, reader client.Reader, namesp
 	if err != nil {
 		return Foundation{}, err
 	}
-	if lifecycleHash != "" {
-		foundation.Hash = lifecycleHash
+	if lifecycleHash != "" && foundation.Hash != lifecycleHash {
+		return Foundation{}, fmt.Errorf("Tenant foundation identity changed")
 	}
 	if foundation.Schema != 2 ||
 		foundation.NetworkID == "" ||

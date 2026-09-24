@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
-CONTROLLER_LIFECYCLE_EPOCH = "legacy-status-v1"
+CONTROLLER_LIFECYCLE_EPOCH = "desired-state-v2"
 
 
 def _foundation_checksum(data: dict[str, object]) -> str:
