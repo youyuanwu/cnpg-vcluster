@@ -197,6 +197,43 @@ def _drift_kube_proxy_and_wait_for_repair(
     )
 
 
+def _drift_machine_deployment_and_wait_for_repair(
+    client,
+    config: dict[str, str],
+    tenant,
+) -> None:
+    client.kubectl(
+        "-n",
+        tenant.namespace,
+        "patch",
+        f"machinedeployment/{tenant.name}-worker",
+        "--type=merge",
+        "-p",
+        json.dumps({"spec": {"replicas": tenant.workers + 1}}),
+    )
+    wait_for(
+        "controller MachineDeployment drift repair",
+        parse_duration(config["WORKER_REGISTRATION_TIMEOUT"]),
+        parse_duration(config["WAIT_POLL_INTERVAL"]),
+        lambda: (
+            True
+            if int(
+                client.kubectl(
+                    "-n",
+                    tenant.namespace,
+                    "get",
+                    f"machinedeployment/{tenant.name}-worker",
+                    "-o",
+                    "jsonpath={.spec.replicas}",
+                ).stdout
+            )
+            == tenant.workers
+            else None
+        ),
+    )
+    wait_tenant_ready(client.root, config, tenant.name)
+
+
 def run_network_gate(
     root: Path,
     config: dict[str, str],
@@ -219,6 +256,7 @@ def run_network_gate(
         wait_tenant_ready(root, config, tenant.name)
         verify_network(root, config, tenant)
         _drift_kube_proxy_and_wait_for_repair(root, config, tenant)
+        _drift_machine_deployment_and_wait_for_repair(client, config, tenant)
         _restart_controller(client, config, tenant)
         verify_network(root, config, tenant)
         _verify_control_plane_active(client, config, tenant)

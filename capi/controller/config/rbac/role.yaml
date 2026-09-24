@@ -52,12 +52,23 @@ rules:
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - cluster.x-k8s.io
   resources:
   - clusters
   - machinedeployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
   - machines
   - machinesets
   verbs:
@@ -75,6 +86,7 @@ rules:
   - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - coordination.k8s.io
@@ -92,8 +104,18 @@ rules:
   - infrastructure.cluster.x-k8s.io
   resources:
   - devclusters
-  - devmachines
   - devmachinetemplates
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - devmachines
   verbs:
   - create
   - delete
