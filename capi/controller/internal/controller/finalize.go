@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -224,8 +225,12 @@ func (reconciler *TenantReconciler) validateTenantAPINotCreated(ctx context.Cont
 
 func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
 	present := false
+	endpointMissing := false
 	if _, endpointPresent, err := observeEndpoint(ctx, reconciler.reader(), reconciler.foundationNamespace(), foundation, tenant, specHash); err != nil {
-		return false, err
+		if tenant.Status.Endpoint == "" || !strings.Contains(err.Error(), "endpoint allocation is missing") {
+			return false, err
+		}
+		endpointMissing = true
 	} else if endpointPresent {
 		present = true
 	}
@@ -304,6 +309,9 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 		if volume.Name != volumeName || !stringMapEqual(volume.Labels, expected) {
 			return false, fmt.Errorf("Docker volume ownership cannot be proven before deletion")
 		}
+	}
+	if endpointMissing && present {
+		return false, fmt.Errorf("Tenant endpoint allocation is missing before terminal cleanup")
 	}
 	return present, nil
 }

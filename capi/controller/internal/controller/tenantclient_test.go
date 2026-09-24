@@ -16,6 +16,7 @@ func TestBootstrapRBACConvergesPreexistingRoleBinding(t *testing.T) {
 	if err := rbacv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+
 	existing := &rbacv1.RoleBinding{
 		ObjectMeta: metav1.ObjectMeta{Name: "kubeadm:kubelet-config", Namespace: "kube-system"},
 		RoleRef: rbacv1.RoleRef{
@@ -37,5 +38,33 @@ func TestBootstrapRBACConvergesPreexistingRoleBinding(t *testing.T) {
 		updated.Subjects[0].Name != "system:bootstrappers:kubeadm:default-node-token" ||
 		updated.Subjects[1].Name != "system:nodes" {
 		t.Fatalf("bootstrap RoleBinding did not converge: %#v", updated.Subjects)
+	}
+}
+
+func TestBootstrapRBACDeletionRefusesForeignReplacement(t *testing.T) {
+	scheme := runtime.NewScheme()
+	if err := rbacv1.AddToScheme(scheme); err != nil {
+		t.Fatal(err)
+	}
+	foreign := &rbacv1.Role{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:            "kubeadm:nodes-kubeadm-config",
+			Namespace:       "kube-system",
+			UID:             "foreign-uid",
+			ResourceVersion: "7",
+		},
+		Rules: []rbacv1.PolicyRule{{
+			APIGroups: []string{"*"},
+			Resources: []string{"*"},
+			Verbs:     []string{"*"},
+		}},
+	}
+	tenantClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign).Build()
+	if _, err := deleteBootstrapRBAC(context.Background(), tenantClient); err == nil {
+		t.Fatal("foreign bootstrap Role was deleted")
+	}
+	var current rbacv1.Role
+	if err := tenantClient.Get(context.Background(), client.ObjectKeyFromObject(foreign), &current); err != nil {
+		t.Fatalf("foreign bootstrap Role was not preserved: %v", err)
 	}
 }

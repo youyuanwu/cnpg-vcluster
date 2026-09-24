@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -136,6 +137,59 @@ func TestClusterOnlyPartialCreationIsDeletedWithoutTenantAPI(t *testing.T) {
 	err := kubernetes.Get(context.Background(), client.ObjectKeyFromObject(cluster), current)
 	if !apierrors.IsNotFound(err) {
 		t.Fatalf("Cluster-only partial creation remained: %v", err)
+	}
+}
+
+func TestEndpointReleaseCrashWindowCompletes(t *testing.T) {
+	tenant := deletingTenant("tenant-a")
+	tenant.Status.FoundationHash = "foundation-hash"
+	tenant.Status.Endpoint = "172.18.255.1:6443"
+	tenant.Status.ClusterUID = "cluster-uid"
+	tenant.Status.TenantAPICreationAuthorized = true
+	tenant.Status.TenantCleanupClusterUID = tenant.Status.ClusterUID
+	foundation := testFoundation()
+	foundation.Hash = tenant.Status.FoundationHash
+	state := newAllocationState(foundation)
+	encoded, err := encodeAllocationState(state)
+	if err != nil {
+		t.Fatal(err)
+	}
+	allocations := &corev1.ConfigMap{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      allocationConfigMapName,
+			Namespace: defaultFoundationNamespace,
+		},
+		Data: map[string]string{"allocations.json": encoded},
+	}
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(simplifiedFinalizerScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, allocations).
+		Build()
+	reconciler := &TenantReconciler{
+		Client:    kubernetes,
+		APIReader: kubernetes,
+		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	var refreshed tenancyv1alpha1.Tenant
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &refreshed); err != nil {
+		t.Fatal(err)
+	}
+	if refreshed.Status.Endpoint != "" {
+		t.Fatalf("released endpoint was not cleared: %q", refreshed.Status.Endpoint)
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), &refreshed, "spec-hash", foundation); err != nil {
+		t.Fatal(err)
+	}
+	err = kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &refreshed)
+	if err == nil && containsString(refreshed.Finalizers, tenantFinalizer) {
+		t.Fatal("endpoint crash-window Tenant remained blocked")
+	}
+	if client.IgnoreNotFound(err) != nil {
+		t.Fatal(err)
 	}
 }
 
