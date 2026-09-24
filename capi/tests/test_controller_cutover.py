@@ -114,6 +114,25 @@ class ControllerCutoverTests(unittest.TestCase):
                 )
             self.assertEqual([], client.calls)
 
+    def test_existing_deleting_tenant_blocks_epoch_cutover(self) -> None:
+        client = FakeManagementClient(
+            [
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout="tenant.tenancy.cnpg-vcluster.io/deleting\n",
+                    stderr="",
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(RuntimeError, "existing Tenant resources"):
+                require_clean_controller_cutover(
+                    Path(temporary),
+                    {"OWNERSHIP_LABEL": "example.io/owned", "LAB_PREFIX": "lab"},
+                    client,
+                )
+
     def test_legacy_credentials_and_endpoint_allocations_block(self) -> None:
         for relative, content, expected in (
             (

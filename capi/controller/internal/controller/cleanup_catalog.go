@@ -1,14 +1,23 @@
 package controller
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"sort"
+	"strings"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 )
+
+const cleanupCatalogEpoch = "desired-state-v2"
+
+var cleanupCatalogCompatibilityDigests = map[string]string{
+	cleanupCatalogEpoch: "fdbb67764767289a8dc521a0ab54ae0af03949adb19525dd1ef847d9dc1e84c2",
+}
 
 type cleanupCoordinate struct {
 	GVK       schema.GroupVersionKind
@@ -98,6 +107,7 @@ func cleanupNetworkExtras() []*unstructured.Unstructured {
 		value.SetNamespace(namespace)
 		return value
 	}
+
 	return []*unstructured.Unstructured{
 		object("v1", "ConfigMap", "kube-system", "kubernetes-services-endpoint", "network-endpoint"),
 		object("v1", "ServiceAccount", "kube-system", "capi-kube-proxy", "kube-proxy"),
@@ -105,4 +115,21 @@ func cleanupNetworkExtras() []*unstructured.Unstructured {
 		object("v1", "ConfigMap", "kube-system", "capi-kube-proxy", "kube-proxy"),
 		object("apps/v1", "DaemonSet", "kube-system", "capi-kube-proxy", "kube-proxy"),
 	}
+}
+
+func cleanupCatalogDigest(values []cleanupCoordinate) string {
+	lines := make([]string, 0, len(values))
+	for _, value := range values {
+		lines = append(lines, fmt.Sprintf(
+			"%s|%s|%s|%s|%d",
+			value.GVK.String(),
+			value.Namespace,
+			value.Name,
+			value.Resource,
+			value.Priority,
+		))
+	}
+	sort.Strings(lines)
+	digest := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return hex.EncodeToString(digest[:])
 }

@@ -190,6 +190,32 @@ def check_repository_boundaries() -> None:
         "--mutation-enabled=${CONTROLLER_MUTATION_ENABLED}" in manager,
         "Tenant controller mutation template placeholder is missing",
     )
+    lifecycle_epoch = "desired-state-v2"
+    check(
+        f'CONTROLLER_LIFECYCLE_EPOCH = "{lifecycle_epoch}"'
+        in (ROOT / "scripts" / "lib" / "controller.py").read_text(
+            encoding="utf-8"
+        ),
+        "controller installer lifecycle epoch is inconsistent",
+    )
+    check(
+        f'"lifecycle-epoch", "{lifecycle_epoch}"'
+        in (ROOT / "controller" / "cmd" / "manager" / "main.go").read_text(
+            encoding="utf-8"
+        ),
+        "controller manager lifecycle epoch is inconsistent",
+    )
+    check(
+        f'cleanupCatalogEpoch = "{lifecycle_epoch}"'
+        in (
+            ROOT
+            / "controller"
+            / "internal"
+            / "controller"
+            / "cleanup_catalog.go"
+        ).read_text(encoding="utf-8"),
+        "cleanup catalog lifecycle epoch is inconsistent",
+    )
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
     check(
         "from scripts.local_tenant import" not in tenant_dispatch,

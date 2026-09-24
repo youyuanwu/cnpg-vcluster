@@ -9,6 +9,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -19,6 +20,8 @@ import (
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 )
+
+var errTenantCleanupBlocked = errors.New("Tenant API cleanup is blocked")
 
 func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (ctrl.Result, error) {
 	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
@@ -71,12 +74,12 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 				tenant.Status.Endpoint,
 			)
 			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("Tenant API cleanup is blocked: %w", err)
+				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
 			}
 			controlPlane := &unstructured.Unstructured{}
 			controlPlane.SetGroupVersionKind(controlPlaneGVK)
 			if err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name}, controlPlane); err != nil {
-				return ctrl.Result{}, fmt.Errorf("read KamajiControlPlane before Tenant API cleanup: %w", err)
+				return ctrl.Result{}, fmt.Errorf("%w: read KamajiControlPlane: %v", errTenantCleanupBlocked, err)
 			}
 			if err := validateRootOwnership(controlPlane, tenant, specHash, foundation.Hash, "kamaji-control-plane", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 				return ctrl.Result{}, err
@@ -94,7 +97,10 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 			}
 			catalog, err := tenantCleanupCatalog(calico, cnpg, tenant.Spec.DatabaseCount)
 			if err != nil {
-				return ctrl.Result{}, err
+				if isOwnershipError(err) {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
 			}
 			absent, err := deleteTenantResources(
 				ctx,
@@ -105,14 +111,20 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 				catalog,
 			)
 			if err != nil {
-				return ctrl.Result{}, err
+				if isOwnershipError(err) {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
 			}
 			if !absent {
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
 			complete, err := deleteBootstrapRBAC(ctx, tenantClient)
 			if err != nil {
-				return ctrl.Result{}, err
+				if isOwnershipError(err) {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
 			}
 			if !complete {
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
@@ -140,9 +152,9 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 		name     string
 		resource string
 	}{
-		{machineDeploymentGVK, tenant.Name + "-worker", "machine-deployment"},
-		{devMachineTemplateGVK, tenant.Name + "-worker", "dev-machine-template"},
 		{kubeadmTemplateGVK, tenant.Name + "-worker", "kubeadm-config-template"},
+		{devMachineTemplateGVK, tenant.Name + "-worker", "dev-machine-template"},
+		{machineDeploymentGVK, tenant.Name + "-worker", "machine-deployment"},
 		{controlPlaneGVK, tenant.Name, "kamaji-control-plane"},
 		{devClusterGVK, tenant.Name, "dev-cluster"},
 	} {
@@ -279,10 +291,58 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 			if err := validateClusterUID(tenant, object); err != nil {
 				return false, err
 			}
+		} else if err := validateProviderOwner(ctx, reconciler.reader(), object, tenant.Name, false); err != nil {
+			return false, err
 		}
 		if item.gvk == controlPlaneGVK {
 			controlPlane = object
 		}
+	}
+	machineNames := map[string]types.UID{}
+	machines := &unstructured.UnstructuredList{}
+	machines.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
+	if err := reconciler.reader().List(ctx, machines, client.InNamespace(tenant.Name), client.MatchingLabels{"cluster.x-k8s.io/cluster-name": tenant.Name}); err != nil {
+		if !meta.IsNoMatchError(err) {
+			return false, err
+		}
+	} else {
+		for index := range machines.Items {
+			machine := &machines.Items[index]
+			if err := validateRootOwnership(machine, tenant, specHash, foundation.Hash, "machine", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
+				return false, err
+			}
+			present = true
+			machineNames[machine.GetName()] = machine.GetUID()
+		}
+	}
+	devMachines := &unstructured.UnstructuredList{}
+	devMachines.SetGroupVersionKind(postCNIDevMachineGVK.GroupVersion().WithKind("DevMachineList"))
+	if err := reconciler.reader().List(ctx, devMachines, client.InNamespace(tenant.Name), client.MatchingLabels{"cluster.x-k8s.io/cluster-name": tenant.Name}); err != nil {
+		if !meta.IsNoMatchError(err) {
+			return false, err
+		}
+	} else {
+		for index := range devMachines.Items {
+			devMachine := &devMachines.Items[index]
+			if err := validateRootOwnership(devMachine, tenant, specHash, foundation.Hash, "machine", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
+				return false, err
+			}
+			owners := devMachine.GetOwnerReferences()
+			if len(owners) != 1 || machineNames[owners[0].Name] != owners[0].UID {
+				return false, fmt.Errorf("DevMachine %s ownership cannot be proven before deletion", devMachine.GetName())
+			}
+			present = true
+		}
+	}
+	containers, err := reconciler.docker().ListWorkerContainers(ctx, tenant.Name)
+	if err != nil {
+		return false, fmt.Errorf("inspect provider-owned worker containers: %w", err)
+	}
+	for _, container := range containers {
+		if _, expected := machineNames[container.Name]; !expected {
+			return false, fmt.Errorf("worker container %s ownership cannot be proven before deletion", container.Name)
+		}
+		present = true
 	}
 	var secret corev1.Secret
 	err = reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name + "-kubeconfig"}, &secret)

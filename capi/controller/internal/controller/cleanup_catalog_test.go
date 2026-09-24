@@ -3,6 +3,8 @@ package controller
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"k8s.io/apimachinery/pkg/api/meta"
@@ -199,5 +201,31 @@ func TestTenantCleanupTreatsRemovedCRDAsAuthoritativeAbsence(t *testing.T) {
 	)
 	if err != nil || !absent {
 		t.Fatalf("removed CRD was not treated as absence: absent=%v err=%v", absent, err)
+	}
+}
+
+func TestCleanupCatalogCompatibilityDigestMatchesLifecycleEpoch(t *testing.T) {
+	inputs := filepath.Join("..", "..", "..", ".tools", "inputs")
+	calico, err := os.ReadFile(filepath.Join(inputs, "calico.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cnpg, err := os.ReadFile(filepath.Join(inputs, "cnpg.yaml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	catalog, err := tenantCleanupCatalog(calico, cnpg, 3)
+	if err != nil {
+		t.Fatal(err)
+	}
+	actual := cleanupCatalogDigest(catalog)
+	expected := cleanupCatalogCompatibilityDigests[cleanupCatalogEpoch]
+	if actual != expected {
+		t.Fatalf(
+			"cleanup catalog changed within lifecycle epoch %s: got %s want %s",
+			cleanupCatalogEpoch,
+			actual,
+			expected,
+		)
 	}
 }

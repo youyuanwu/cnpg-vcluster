@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"path"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 )
+
+var errFoundationMismatch = errors.New("Tenant foundation identity changed")
 
 const (
 	defaultFoundationNamespace = "tenant-system"
@@ -166,7 +169,7 @@ func loadFoundationForDeletion(ctx context.Context, reader client.Reader, namesp
 		return Foundation{}, err
 	}
 	if lifecycleHash != "" && foundation.Hash != lifecycleHash {
-		return Foundation{}, fmt.Errorf("Tenant foundation identity changed")
+		return Foundation{}, errFoundationMismatch
 	}
 	if foundation.Schema != 2 ||
 		foundation.NetworkID == "" ||

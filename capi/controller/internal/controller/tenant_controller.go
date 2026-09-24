@@ -87,7 +87,8 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		foundation, err = loadFoundation(ctx, reconciler.reader(), reconciler.docker(), reconciler.foundationNamespace(), reconciler.foundationName(), reconciler.SupportedVersion, reconciler.ExpectedControllerImage)
 	}
 	if err != nil {
-		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "FoundationInvalid", err)
+		phase, reason := classifyFoundationFailure(managedDeletion, err)
+		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, phase, reason, err)
 	}
 	if !tenant.DeletionTimestamp.IsZero() {
 		if !containsString(tenant.Finalizers, tenantFinalizer) {
@@ -95,7 +96,8 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		}
 		result, err := reconciler.finalizeTenant(ctx, &tenant, specHash, foundation)
 		if err != nil {
-			return result, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseDeleting, "DeletionBlocked", err)
+			phase, reason := classifyDeletionFailure(err)
+			return result, reconciler.failure(ctx, &tenant, specHash, phase, reason, err)
 		}
 		return result, nil
 	}
@@ -320,4 +322,25 @@ func containsAny(value string, needles ...string) bool {
 		}
 	}
 	return false
+}
+
+func classifyFoundationFailure(managedDeletion bool, err error) (tenancyv1alpha1.TenantPhase, string) {
+	phase := tenancyv1alpha1.PhaseFailed
+	if managedDeletion {
+		phase = tenancyv1alpha1.PhaseDeleting
+	}
+	if errors.Is(err, errFoundationMismatch) {
+		return phase, "FoundationMismatch"
+	}
+	return phase, "FoundationInvalid"
+}
+
+func classifyDeletionFailure(err error) (tenancyv1alpha1.TenantPhase, string) {
+	if errors.Is(err, errTenantCleanupBlocked) {
+		return tenancyv1alpha1.PhaseDeleting, "TenantCleanupBlocked"
+	}
+	if isOwnershipError(err) {
+		return tenancyv1alpha1.PhaseOwnershipInvalid, "OwnershipInvalid"
+	}
+	return tenancyv1alpha1.PhaseDeleting, "DeletionBlocked"
 }

@@ -139,6 +139,47 @@ func validateProviderOwner(ctx context.Context, reader client.Reader, object *un
 	return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
 }
 
+func validateProviderOwnerForDeletion(ctx context.Context, reader client.Reader, object *unstructured.Unstructured, tenant *tenancyv1alpha1.Tenant) error {
+	owners := object.GetOwnerReferences()
+	if len(owners) == 0 {
+		return nil
+	}
+	if len(owners) != 1 {
+		return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
+	}
+	owner := owners[0]
+	clusterOwner := owner.APIVersion == clusterGVK.GroupVersion().String() &&
+		owner.Kind == clusterGVK.Kind &&
+		owner.Name == tenant.Name &&
+		tenant.Status.ClusterUID != "" &&
+		owner.UID == types.UID(tenant.Status.ClusterUID)
+	switch object.GetKind() {
+	case "DevCluster", "KamajiControlPlane", "MachineDeployment":
+		if clusterOwner {
+			return nil
+		}
+	case "KubeadmConfigTemplate", "DevMachineTemplate":
+		if clusterOwner {
+			return nil
+		}
+		if owner.APIVersion == machineDeploymentGVK.GroupVersion().String() &&
+			owner.Kind == machineDeploymentGVK.Kind &&
+			owner.Name == tenant.Name+"-worker" {
+			machineDeployment := &unstructured.Unstructured{}
+			machineDeployment.SetGroupVersionKind(machineDeploymentGVK)
+			if err := reader.Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: owner.Name}, machineDeployment); err != nil {
+				return fmt.Errorf("read template provider owner %s: %w", owner.Name, err)
+			}
+			if machineDeployment.GetUID() == owner.UID {
+				return nil
+			}
+		}
+	default:
+		return nil
+	}
+	return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
+}
+
 func validateClusterUID(tenant *tenancyv1alpha1.Tenant, object metav1.Object) error {
 	if tenant.Status.ClusterUID != "" && tenant.Status.ClusterUID != string(object.GetUID()) {
 		return fmt.Errorf(

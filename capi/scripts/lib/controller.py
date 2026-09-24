@@ -31,6 +31,10 @@ TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
 CONTROLLER_LIFECYCLE_EPOCH = "desired-state-v2"
 
 
+def controller_requires_cutover(installed_epoch: str | None) -> bool:
+    return installed_epoch != CONTROLLER_LIFECYCLE_EPOCH
+
+
 def _foundation_checksum(data: dict[str, object]) -> str:
     immutable = dict(data)
     immutable.pop("mutationEnabled", None)
@@ -610,7 +614,7 @@ def reconcile_controller(
     registry: dict[str, object] | None,
 ) -> None:
     installed_epoch = controller_lifecycle_epoch(client)
-    requires_cutover = installed_epoch != CONTROLLER_LIFECYCLE_EPOCH
+    requires_cutover = controller_requires_cutover(installed_epoch)
     image = build_controller_image(root, config)
     if requires_cutover:
         stop_controller_for_cutover(config, client)

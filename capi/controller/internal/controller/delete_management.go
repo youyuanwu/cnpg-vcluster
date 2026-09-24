@@ -31,6 +31,8 @@ func (reconciler *TenantReconciler) deleteExactUnstructured(ctx context.Context,
 		if err := validateClusterUID(tenant, object); err != nil {
 			return false, err
 		}
+	} else if err := validateProviderOwnerForDeletion(ctx, reconciler.reader(), object, tenant); err != nil {
+		return false, err
 	}
 	if !object.GetDeletionTimestamp().IsZero() {
 		return false, nil

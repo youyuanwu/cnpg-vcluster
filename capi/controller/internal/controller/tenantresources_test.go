@@ -27,6 +27,21 @@ type recordingPatchClient struct {
 	patchErr        error
 }
 
+type createRaceClient struct {
+	client.Client
+	foreign client.Object
+}
+
+func (value *createRaceClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
+	if err := value.Client.Create(ctx, value.foreign); err != nil {
+		return err
+	}
+	return apierrors.NewAlreadyExists(
+		schema.GroupResource{Group: object.GetObjectKind().GroupVersionKind().Group, Resource: "objects"},
+		object.GetName(),
+	)
+}
+
 func (tenantClient *recordingPatchClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
 	tenantClient.patched = true
 	tenantClient.patchUID = object.GetUID()
@@ -82,8 +97,66 @@ func TestEnsureTenantObjectRefusesForeignSameName(t *testing.T) {
 	if err == nil {
 		t.Fatal("foreign same-name child was accepted")
 	}
+
 	if tenantClient.patched {
 		t.Fatal("foreign same-name child was mutated")
+	}
+}
+
+func TestEnsureTenantObjectRefusesForeignCreateRace(t *testing.T) {
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	tenant := testTenant()
+	foreign := markedTenantConfigMap(gvk, tenant, "foreign")
+	foreign.SetAnnotations(map[string]string{resources.TenantAnnotation: "other"})
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	tenantClient := &createRaceClient{Client: base, foreign: foreign}
+	if _, err := ensureTenantObject(
+		context.Background(),
+		tenantClient,
+		markedTenantConfigMap(gvk, tenant, "desired"),
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+	); err == nil {
+		t.Fatal("foreign create race was accepted")
+	}
+	var current unstructured.Unstructured
+	current.SetGroupVersionKind(gvk)
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(foreign), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.GetAnnotations()[resources.TenantAnnotation] != "other" {
+		t.Fatal("foreign create-race object was modified")
+	}
+}
+
+func TestEnsureManagementObjectRefusesForeignCreateRace(t *testing.T) {
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	tenant := testTenant()
+	foundation := testFoundation()
+	foundation.Hash = "foundation-hash"
+	desired := markedTenantConfigMap(gvk, tenant, "desired")
+	desired.SetAnnotations(map[string]string{
+		resources.TenantAnnotation:     tenant.Name,
+		resources.TenantUIDAnnotation:  string(tenant.UID),
+		resources.SpecHashAnnotation:   "spec-hash",
+		resources.FoundationAnnotation: foundation.Hash,
+		resources.ResourceAnnotation:   "management-test",
+	})
+	foreign := desired.DeepCopy()
+	foreign.SetAnnotations(map[string]string{resources.TenantAnnotation: "other"})
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	race := &createRaceClient{Client: base, foreign: foreign}
+	reconciler := &TenantReconciler{Client: race, APIReader: race}
+	if _, _, err := reconciler.ensureManagementObject(
+		context.Background(),
+		desired,
+		tenant,
+		"spec-hash",
+		foundation,
+		"management-test",
+	); err == nil {
+		t.Fatal("foreign management create race was accepted")
 	}
 }
 
@@ -127,6 +200,7 @@ func TestEnsureTenantObjectReturnsRetryableApplyConflict(t *testing.T) {
 			fmt.Errorf("changed"),
 		),
 	}
+
 	_, err := ensureTenantObject(
 		context.Background(),
 		tenantClient,
@@ -137,6 +211,31 @@ func TestEnsureTenantObjectReturnsRetryableApplyConflict(t *testing.T) {
 	)
 	if !errors.Is(err, errStableApplyConflict) {
 		t.Fatalf("apply conflict was not marked retryable: %v", err)
+	}
+}
+
+func TestEnsureTenantObjectClassifiesImmutableApplyFailure(t *testing.T) {
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	tenant := testTenant()
+	current := markedTenantConfigMap(gvk, tenant, "drifted")
+	tenantClient := &recordingPatchClient{
+		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build(),
+		patchErr: apierrors.NewInvalid(
+			schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind},
+			current.GetName(),
+			nil,
+		),
+	}
+	_, err := ensureTenantObject(
+		context.Background(),
+		tenantClient,
+		markedTenantConfigMap(gvk, tenant, "desired"),
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+	)
+	if !errors.Is(err, errImmutableDrift) {
+		t.Fatalf("invalid apply was not classified as immutable drift: %v", err)
 	}
 }
 

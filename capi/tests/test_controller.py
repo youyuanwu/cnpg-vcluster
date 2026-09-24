@@ -17,6 +17,7 @@ from scripts.lib.controller import (
     _foundation_payload,
     _foundation_checksum,
     build_controller_image,
+    controller_requires_cutover,
     controller_source_digest,
     delete_controller_tenants,
     delete_tenant_resource,
@@ -46,6 +47,11 @@ class FakeManagementClient:
 
 
 class ControllerIntegrationUnitTests(unittest.TestCase):
+    def test_lifecycle_epoch_decides_cutover(self) -> None:
+        self.assertFalse(controller_requires_cutover(CONTROLLER_LIFECYCLE_EPOCH))
+        self.assertTrue(controller_requires_cutover(None))
+        self.assertTrue(controller_requires_cutover("legacy-status-v1"))
+
     def test_rendered_manager_contains_epoch_and_mutation_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -133,6 +139,47 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             ]
         )
         verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
+
+    def test_running_controller_epoch_rejects_partial_rollout(self) -> None:
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": [
+                                    f"--lifecycle-epoch={CONTROLLER_LIFECYCLE_EPOCH}"
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        pods = {
+            "items": [
+                {
+                    "metadata": {"name": "tenant-controller-old"},
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": ["--lifecycle-epoch=legacy-status-v1"],
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        client = FakeManagementClient(
+            [
+                CompletedProcess([], 0, stdout=json.dumps(deployment), stderr=""),
+                CompletedProcess([], 0, stdout=json.dumps(pods), stderr=""),
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "Pod .* lifecycle epoch mismatch"):
+            verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
 
     def test_delete_tenant_resource_uses_ordinary_kubernetes_delete(self) -> None:
         client = FakeManagementClient(

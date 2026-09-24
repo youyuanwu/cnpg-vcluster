@@ -3,6 +3,7 @@ package controller
 import (
 	"fmt"
 	"testing"
+	"time"
 )
 
 func TestWorkerTopologyOwnershipErrorsAreClassified(t *testing.T) {
@@ -18,8 +19,15 @@ func TestManagementReadinessSeparatesControlPlaneFromWorkers(t *testing.T) {
 		containsString(controlPlane, "Available") {
 		t.Fatalf("unexpected control-plane readiness conditions: %v", controlPlane)
 	}
+
 	full := managementReadinessConditionTypes("Cluster", true)
 	if len(full) != 1 || full[0] != "Available" {
 		t.Fatalf("unexpected full Cluster readiness conditions: %v", full)
+	}
+}
+
+func TestReadyAndDegradedTenantsUseBoundedResync(t *testing.T) {
+	if readyObservationInterval != 30*time.Second {
+		t.Fatalf("unexpected readiness resync interval: %s", readyObservationInterval)
 	}
 }
