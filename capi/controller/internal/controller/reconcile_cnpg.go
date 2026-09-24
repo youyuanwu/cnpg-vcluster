@@ -131,7 +131,8 @@ func databaseStructurallyReady(ctx context.Context, tenantClient client.Client, 
 	}
 	phase, _, _ := unstructured.NestedString(cluster.Object, "status", "phase")
 	readyInstances, _, _ := unstructured.NestedInt64(cluster.Object, "status", "readyInstances")
-	if phase != "Cluster in healthy state" || readyInstances != int64(count) {
+	if phase != "Cluster in healthy state" ||
+		readyInstances != int64(count) {
 		return false, nil
 	}
 	pods := &unstructured.UnstructuredList{}

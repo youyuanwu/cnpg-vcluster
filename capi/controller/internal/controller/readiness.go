@@ -27,8 +27,19 @@ func (reconciler *TenantReconciler) reconcileReadiness(ctx context.Context, tena
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := validateTenantResourceOwnership(ctx, tenantClient, tenant, specHash, foundation.Hash); err != nil {
+	changed, err := reconciler.reconcileStableDesiredObjects(
+		ctx,
+		tenantClient,
+		tenant,
+		canonical,
+		specHash,
+		foundation,
+	)
+	if err != nil {
 		return ctrl.Result{}, err
+	}
+	if changed {
+		return ctrl.Result{Requeue: true}, nil
 	}
 	controlPlaneReady, err := reconciler.managementObjectsCurrent(ctx, tenant, specHash, foundation)
 	if err != nil {

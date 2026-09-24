@@ -38,7 +38,13 @@ def evaluate_tenant(
         blockers.append("Ready condition does not observe the current generation")
     if status.get("phase") != "Ready":
         blockers.append("Tenant phase is not Ready")
-    classification = "ready" if not blockers else _classification(status)
+    classification = (
+        "deleting"
+        if metadata.get("deletionTimestamp")
+        else "ready"
+        if not blockers
+        else _classification(status)
+    )
     return {
         "schema": 1,
         "tenant": metadata.get("name", ""),

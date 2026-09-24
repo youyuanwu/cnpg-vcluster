@@ -8,7 +8,11 @@ from unittest.mock import patch
 
 from scripts.lib.process import CommandError
 from scripts.lib.tenants import inspect_storage_volume
-from scripts.storage import _delete_storage, _render_storage
+from scripts.storage import (
+    _cleanup_storage_and_tenant,
+    _delete_storage,
+    _render_storage,
+)
 
 
 class StorageTests(unittest.TestCase):
@@ -80,3 +84,16 @@ class StorageTests(unittest.TestCase):
                     },
                     tenant,
                 )
+
+    def test_tenant_delete_is_attempted_after_smoke_cleanup_failure(self) -> None:
+        tenant = type("Tenant", (), {"name": "tenant-a"})()
+        with (
+            patch(
+                "scripts.storage._delete_storage",
+                side_effect=RuntimeError("smoke cleanup failed"),
+            ),
+            patch("scripts.storage.delete_controller_tenant") as delete,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "smoke cleanup failed"):
+                _cleanup_storage_and_tenant(Path("."), {}, tenant)
+        delete.assert_called_once_with(Path("."), {}, tenant)

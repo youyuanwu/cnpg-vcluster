@@ -17,6 +17,7 @@ from scripts.lib.controller import (
     _foundation_checksum,
     build_controller_image,
     controller_source_digest,
+    delete_controller_tenants,
     delete_tenant_resource,
     delete_controller,
     set_controller_mutation,
@@ -56,6 +57,47 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 "--wait=false",
             ),
             client.calls[-1][0],
+        )
+
+    def test_whole_lab_requests_all_deletes_before_waiting(self) -> None:
+        client = FakeManagementClient(
+            [
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps(
+                        {
+                            "items": [
+                                {"metadata": {"name": "tenant-b"}},
+                                {"metadata": {"name": "tenant-a"}},
+                            ]
+                        }
+                    ),
+                    stderr="",
+                ),
+                CompletedProcess([], 0, stdout="", stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+            ]
+        )
+        delete_controller_tenants({"DELETE_TIMEOUT": "1s"}, client)
+        arguments = [call[0] for call in client.calls]
+        self.assertEqual(
+            ("delete", "tenant/tenant-a", "--ignore-not-found=true", "--wait=false"),
+            arguments[1],
+        )
+        self.assertEqual(
+            ("delete", "tenant/tenant-b", "--ignore-not-found=true", "--wait=false"),
+            arguments[2],
+        )
+        self.assertEqual(
+            ("wait", "--for=delete", "tenant/tenant-a", "--timeout=1s"),
+            arguments[3],
+        )
+        self.assertEqual(
+            ("wait", "--for=delete", "tenant/tenant-b", "--timeout=1s"),
+            arguments[4],
         )
 
     def test_delete_controller_refuses_failed_crd_inspection(self) -> None:

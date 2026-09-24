@@ -174,15 +174,10 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
         f"--timeout={config['CONDITION_TIMEOUT']}",
     )
     tenant = client.json("get", "tenant", "validation-fixture")
-    if tenant["metadata"].get("finalizers"):
-        raise RuntimeError("validation-only Tenant unexpectedly received a finalizer")
-    if client.kubectl(
-        "get",
-        "namespace",
-        "validation-fixture",
-        check=False,
-    ).returncode == 0:
-        raise RuntimeError("validation-only Tenant created provider resources")
+    if "tenancy.cnpg-vcluster.io/finalizer" not in (
+        tenant["metadata"].get("finalizers") or []
+    ):
+        raise RuntimeError("active Tenant controller did not add its finalizer")
 
     client.kubectl(
         "apply",

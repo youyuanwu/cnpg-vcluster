@@ -30,6 +30,9 @@ func (reconciler *TenantReconciler) deleteExactUnstructured(ctx context.Context,
 	if err := validateRecordedUID(tenant.Status, object); err != nil {
 		return false, err
 	}
+	if !object.GetDeletionTimestamp().IsZero() {
+		return false, nil
+	}
 	uid := object.GetUID()
 	resourceVersion := object.GetResourceVersion()
 	propagation := metav1.DeletePropagationBackground
@@ -37,7 +40,7 @@ func (reconciler *TenantReconciler) deleteExactUnstructured(ctx context.Context,
 		Preconditions:     &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
 		PropagationPolicy: &propagation,
 	})
-	if err != nil && !apierrors.IsNotFound(err) {
+	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 		return false, err
 	}
 	return false, nil
@@ -59,6 +62,9 @@ func (reconciler *TenantReconciler) deleteExactNamespace(ctx context.Context, te
 	if err := validateRecordedUID(tenant.Status, &namespace); err != nil {
 		return false, err
 	}
+	if namespace.DeletionTimestamp != nil {
+		return false, nil
+	}
 	uid := namespace.UID
 	resourceVersion := namespace.ResourceVersion
 	propagation := metav1.DeletePropagationBackground
@@ -66,7 +72,7 @@ func (reconciler *TenantReconciler) deleteExactNamespace(ctx context.Context, te
 		Preconditions:     &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
 		PropagationPolicy: &propagation,
 	})
-	if err != nil && !apierrors.IsNotFound(err) {
+	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 		return false, err
 	}
 	return false, nil

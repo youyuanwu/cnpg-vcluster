@@ -86,12 +86,28 @@ def wait_tenant_absent(
     name: str,
 ) -> None:
     client = ManagementClient(root, config)
-    wait_for(
-        f"Tenant {name} absence",
-        parse_duration(config["DELETE_TIMEOUT"]),
-        parse_duration(config["WAIT_POLL_INTERVAL"]),
-        lambda: True if tenant_document(client, name) is None else None,
-    )
+    last_status: dict[str, object] = {}
+
+    def absent():
+        nonlocal last_status
+        document = tenant_document(client, name)
+        if document is None:
+            return True
+        status = document.get("status")
+        last_status = status if isinstance(status, dict) else {}
+        return None
+
+    try:
+        wait_for(
+            f"Tenant {name} absence",
+            parse_duration(config["DELETE_TIMEOUT"]),
+            parse_duration(config["WAIT_POLL_INTERVAL"]),
+            absent,
+        )
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"{exc}: {json.dumps(last_status, sort_keys=True)}"
+        ) from exc
 
 
 def tenant_from_document(
@@ -157,7 +173,7 @@ def delete_controller_tenant(
     wait: bool = True,
 ) -> None:
     name = tenant if isinstance(tenant, str) else tenant.name
-    delete_tenant(root, config, name, wait=wait)
+    delete_tenant(root, config, name, wait=False)
     if wait:
         wait_tenant_absent(root, config, name)
     if wait:

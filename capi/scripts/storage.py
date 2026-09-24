@@ -213,6 +213,26 @@ def _delete_storage(root: Path, config: dict[str, str], tenant) -> None:
             )
 
 
+def _cleanup_storage_and_tenant(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+) -> None:
+    cleanup_error = None
+    try:
+        _delete_storage(root, config, tenant)
+    except Exception as exc:
+        cleanup_error = exc
+    try:
+        delete_controller_tenant(root, config, tenant)
+    except Exception as exc:
+        if cleanup_error is None:
+            raise
+        cleanup_error.add_note(f"Tenant deletion also failed: {exc}")
+    if cleanup_error is not None:
+        raise cleanup_error
+
+
 def run_storage_gate(
     root: Path,
     config: dict[str, str],
@@ -277,5 +297,4 @@ def run_storage_gate(
         return client, tenant, after_workers
     finally:
         if cleanup or not succeeded:
-            _delete_storage(root, config, tenant)
-            delete_controller_tenant(root, config, tenant)
+            _cleanup_storage_and_tenant(root, config, tenant)

@@ -124,6 +124,14 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 	}
 	result, err := reconciler.reconcileControlPlane(ctx, &tenant, canonical, specHash, foundation)
 	if err != nil {
+		if errors.Is(err, errStableApplyConflict) {
+			ctrl.LoggerFrom(ctx).Info(
+				"retrying stable apply after optimistic-lock conflict",
+				"error",
+				sanitize.Text(err.Error()),
+			)
+			return ctrl.Result{Requeue: true}, nil
+		}
 		phase := tenancyv1alpha1.PhaseFailed
 		reason := "ReconcileFailed"
 		if isOwnershipError(err) {

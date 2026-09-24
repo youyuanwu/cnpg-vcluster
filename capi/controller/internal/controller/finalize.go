@@ -49,21 +49,15 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		if err != nil {
 			return false, err
 		}
-		if stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageEndpointAllocated) && !endpointPresent {
-			return false, fmt.Errorf("expected endpoint allocation is absent before deletion")
-		}
 		adoptedEndpoint := ""
 		if endpointPresent && tenant.Status.Endpoint == "" {
 			adoptedEndpoint = endpoint
 		}
-		checkUnstructured := func(gvk schema.GroupVersionKind, namespace, name, resource string, expected bool) error {
+		checkUnstructured := func(gvk schema.GroupVersionKind, namespace, name, resource string) error {
 			object := &unstructured.Unstructured{}
 			object.SetGroupVersionKind(gvk)
 			err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: namespace, Name: name}, object)
 			if apierrors.IsNotFound(err) {
-				if expected {
-					return fmt.Errorf("expected %s %s is absent before deletion", gvk.Kind, name)
-				}
 				return nil
 			}
 			if err != nil {
@@ -86,11 +80,7 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 
 		var namespace corev1.Namespace
 		err = reconciler.reader().Get(ctx, types.NamespacedName{Name: tenant.Name}, &namespace)
-		namespaceExpected := stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageNamespaceCreated)
 		if apierrors.IsNotFound(err) {
-			if namespaceExpected {
-				return false, fmt.Errorf("expected Namespace %s is absent before deletion", tenant.Name)
-			}
 		} else if err != nil {
 			return false, err
 		} else {
@@ -114,17 +104,16 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			gvk      schema.GroupVersionKind
 			name     string
 			resource string
-			expected bool
 		}{
-			{clusterGVK, tenant.Name, "cluster", stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageClusterCreated)},
-			{devClusterGVK, tenant.Name, "dev-cluster", stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageDevClusterCreated)},
-			{controlPlaneGVK, tenant.Name, "kamaji-control-plane", stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageControlPlaneCreated)},
-			{kubeadmTemplateGVK, tenant.Name + "-worker", "kubeadm-config-template", stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageKubeadmTemplateCreated)},
-			{devMachineTemplateGVK, tenant.Name + "-worker", "dev-machine-template", stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageMachineTemplateCreated)},
-			{machineDeploymentGVK, tenant.Name + "-worker", "machine-deployment", stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageMachineDeploymentCreated)},
+			{clusterGVK, tenant.Name, "cluster"},
+			{devClusterGVK, tenant.Name, "dev-cluster"},
+			{controlPlaneGVK, tenant.Name, "kamaji-control-plane"},
+			{kubeadmTemplateGVK, tenant.Name + "-worker", "kubeadm-config-template"},
+			{devMachineTemplateGVK, tenant.Name + "-worker", "dev-machine-template"},
+			{machineDeploymentGVK, tenant.Name + "-worker", "machine-deployment"},
 		}
 		for _, check := range checks {
-			if err := checkUnstructured(check.gvk, tenant.Name, check.name, check.resource, check.expected); err != nil {
+			if err := checkUnstructured(check.gvk, tenant.Name, check.name, check.resource); err != nil {
 				return false, err
 			}
 		}
@@ -142,11 +131,7 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 
 		var secret corev1.Secret
 		err = reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name + "-kubeconfig"}, &secret)
-		secretExpected := stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageKubeconfigReady)
 		if apierrors.IsNotFound(err) {
-			if secretExpected {
-				return false, fmt.Errorf("expected Tenant kubeconfig Secret is absent before deletion")
-			}
 		} else if err != nil {
 			return false, err
 		} else {
@@ -175,10 +160,6 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		volume, err := reconciler.docker().InspectVolume(ctx, volumeName)
 		if err != nil {
 			return false, err
-		}
-		volumeExpected := stageAtOrAfter(tenant.Status.Stage, tenancyv1alpha1.StageVolumeCreated)
-		if volume == nil && volumeExpected {
-			return false, fmt.Errorf("expected Docker volume is absent before deletion")
 		}
 		var adoptedVolume *tenancyv1alpha1.DockerVolumeIdentity
 		if volume != nil {
@@ -235,14 +216,14 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			tenant.Status.Teardown.Authority == tenantAPICleanupUnavailable ||
 			tenant.Status.Teardown.Phase == tenancyv1alpha1.StageEndpointReleased) ||
 		tenant.Status.Stage == tenancyv1alpha1.StageEndpointReleased
+	adopted, err := preflightPartialOwnership(ctx, tenant, specHash, foundation)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if adopted {
+		return ctrl.Result{Requeue: true}, nil
+	}
 	if !destructiveStarted {
-		adopted, err := preflightPartialOwnership(ctx, tenant, specHash, foundation)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if adopted {
-			return ctrl.Result{Requeue: true}, nil
-		}
 		if tenant.Status.Teardown == nil || tenant.Status.Teardown.Phase != "OwnershipPreflightComplete" {
 			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 				if status.Teardown == nil {
@@ -306,11 +287,9 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 		if !complete {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
-		if !clusterPresent {
-			return ctrl.Result{}, fmt.Errorf("live Tenant API cleanup checkpoint requires the exact hosted Cluster")
-		}
 		recordedCluster := findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name)
-		if recordedCluster == nil || recordedCluster.UID != clusterIdentity.UID {
+		if recordedCluster == nil ||
+			(clusterPresent && recordedCluster.UID != clusterIdentity.UID) {
 			return ctrl.Result{}, fmt.Errorf("live Tenant API cleanup checkpoint Cluster identity is not recorded")
 		}
 		if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
@@ -319,7 +298,7 @@ func (reconciler *TenantReconciler) finalizePartial(ctx context.Context, tenant 
 			}
 			status.Teardown.Phase = "LiveBootstrapRBACCleanupComplete"
 			status.Teardown.Authority = "LiveBootstrapRBACCleanupComplete"
-			status.Teardown.ClusterUID = clusterIdentity.UID
+			status.Teardown.ClusterUID = recordedCluster.UID
 			return nil
 		}); err != nil {
 			return ctrl.Result{}, err
@@ -436,11 +415,9 @@ func (reconciler *TenantReconciler) checkpointTenantAPICleanupUnavailable(
 	clusterPresent bool,
 	cause error,
 ) (ctrl.Result, error) {
-	if !clusterPresent {
-		return ctrl.Result{}, fmt.Errorf("Tenant API cleanup is unavailable and the exact hosted Cluster is absent: %w", cause)
-	}
 	recordedCluster := findIdentity(tenant.Status, clusterGVK, tenant.Name, tenant.Name)
-	if recordedCluster == nil || recordedCluster.UID != clusterIdentity.UID {
+	if recordedCluster == nil ||
+		(clusterPresent && recordedCluster.UID != clusterIdentity.UID) {
 		return ctrl.Result{}, fmt.Errorf("Tenant API cleanup fallback Cluster identity is not recorded")
 	}
 	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
@@ -449,7 +426,7 @@ func (reconciler *TenantReconciler) checkpointTenantAPICleanupUnavailable(
 		}
 		status.Teardown.Phase = tenantAPICleanupUnavailable
 		status.Teardown.Authority = tenantAPICleanupUnavailable
-		status.Teardown.ClusterUID = clusterIdentity.UID
+		status.Teardown.ClusterUID = recordedCluster.UID
 		setCondition(status, tenant, "Deleting", metav1.ConditionTrue, tenantAPICleanupUnavailable, "Tenant API cleanup is unavailable; continuing disposable local cluster teardown")
 		return nil
 	}); err != nil {

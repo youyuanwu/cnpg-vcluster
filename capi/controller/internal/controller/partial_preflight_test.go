@@ -35,6 +35,11 @@ type failingTenantClient struct {
 	err error
 }
 
+type recordingDeleteClient struct {
+	client.Client
+	deleteCalls int
+}
+
 func (tenantClient noMatchTenantClient) Get(ctx context.Context, key client.ObjectKey, object client.Object, options ...client.GetOption) error {
 	if object.GetObjectKind().GroupVersionKind() == tenantClient.gvk {
 		return &meta.NoKindMatchError{
@@ -47,6 +52,11 @@ func (tenantClient noMatchTenantClient) Get(ctx context.Context, key client.Obje
 
 func (tenantClient failingTenantClient) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
 	return tenantClient.err
+}
+
+func (tenantClient *recordingDeleteClient) Delete(ctx context.Context, object client.Object, options ...client.DeleteOption) error {
+	tenantClient.deleteCalls++
+	return tenantClient.Client.Delete(ctx, object, options...)
 }
 
 func (factory *recordingTenantFactory) ClientFor([]byte, string) (client.Client, error) {
@@ -161,6 +171,48 @@ func TestTenantResourceCleanupFailsClosedOnTenantAPIErrors(t *testing.T) {
 	}
 }
 
+func TestTenantResourceCleanupWaitsForAlreadyTerminatingObject(t *testing.T) {
+	gvk := corev1.SchemeGroupVersion.WithKind("ConfigMap")
+	now := metav1.Now()
+	object := markedTenantConfigMap(gvk, &tenancyv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
+	}, "value")
+	object.SetUID("config-uid")
+	object.SetDeletionTimestamp(&now)
+	object.SetFinalizers([]string{"example/finalizer"})
+	tenant := &tenancyv1alpha1.Tenant{
+		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
+		Status: tenancyv1alpha1.TenantStatus{
+			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
+				APIVersion: gvk.GroupVersion().String(),
+				Kind:       gvk.Kind,
+				Namespace:  object.GetNamespace(),
+				Name:       object.GetName(),
+				UID:        string(object.GetUID()),
+			}},
+		},
+	}
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(object).Build()
+	tenantClient := &recordingDeleteClient{Client: base}
+	absent, err := deleteTenantResources(
+		context.Background(),
+		tenantClient,
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+		false,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if absent {
+		t.Fatal("terminating object was reported absent")
+	}
+	if tenantClient.deleteCalls != 0 {
+		t.Fatal("terminating object received a redundant delete")
+	}
+}
+
 func TestTenantDeletePriorityHonorsControllerAndStorageDependencies(t *testing.T) {
 	kinds := []string{
 		"Cluster",
@@ -206,6 +258,42 @@ func TestLiveCleanupCheckpointRequiresExactClusterUID(t *testing.T) {
 				t.Fatal("invalid cleanup checkpoint was accepted")
 			}
 		})
+	}
+}
+
+func TestUnavailableTenantAPICheckpointAcceptsAuthoritativeClusterAbsence(t *testing.T) {
+	scheme := testScheme(t)
+	tenant := validTenant("tenant-a")
+	tenant.Status.ObservedResources = []tenancyv1alpha1.ObservedResourceIdentity{{
+		APIVersion: clusterGVK.GroupVersion().String(),
+		Kind:       clusterGVK.Kind,
+		Namespace:  tenant.Name,
+		Name:       tenant.Name,
+		UID:        "cluster-uid",
+	}}
+	kubernetes := fake.NewClientBuilder().
+		WithScheme(scheme).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant).
+		Build()
+	reconciler := &TenantReconciler{Client: kubernetes, APIReader: kubernetes}
+	if _, err := reconciler.checkpointTenantAPICleanupUnavailable(
+		context.Background(),
+		tenant,
+		tenancyv1alpha1.ObservedResourceIdentity{},
+		false,
+		errors.New("tenant API unavailable"),
+	); err != nil {
+		t.Fatal(err)
+	}
+	var current tenancyv1alpha1.Tenant
+	if err := kubernetes.Get(context.Background(), client.ObjectKey{Name: tenant.Name}, &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.Status.Teardown == nil ||
+		current.Status.Teardown.Authority != tenantAPICleanupUnavailable ||
+		current.Status.Teardown.ClusterUID != "cluster-uid" {
+		t.Fatalf("authoritative Cluster absence was not checkpointed: %#v", current.Status.Teardown)
 	}
 }
 

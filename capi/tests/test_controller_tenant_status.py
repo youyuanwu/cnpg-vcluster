@@ -59,7 +59,7 @@ class ControllerTenantStatusTests(unittest.TestCase):
         document["metadata"]["deletionTimestamp"] = "2026-09-22T00:00:00Z"
         result = evaluate_tenant(document)
         self.assertEqual("ready", result["phase"].lower())
-        self.assertEqual("degraded", result["classification"])
+        self.assertEqual("deleting", result["classification"])
         self.assertIn("Tenant is deleting", result["blockers"])
 
     def test_failure_phase_maps_to_failed(self) -> None:

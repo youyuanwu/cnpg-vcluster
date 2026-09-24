@@ -59,13 +59,16 @@ func deleteTenantResources(
 			annotations[resources.FoundationAnnotation] != foundationHash {
 			return false, fmt.Errorf("tenant resource %s/%s ownership changed before cleanup", identity.Kind, identity.Name)
 		}
+		if !object.GetDeletionTimestamp().IsZero() {
+			return false, nil
+		}
 		uid := object.GetUID()
 		resourceVersion := object.GetResourceVersion()
 		propagation := metav1.DeletePropagationBackground
 		if err := tenantClient.Delete(ctx, object, &client.DeleteOptions{
 			Preconditions:     &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
 			PropagationPolicy: &propagation,
-		}); err != nil && !apierrors.IsNotFound(err) {
+		}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 			return false, err
 		}
 		return false, nil

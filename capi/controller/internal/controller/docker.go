@@ -187,6 +187,9 @@ func (client *socketDockerClient) ListWorkerContainers(ctx context.Context, tena
 	for _, item := range payload {
 		container, err := client.InspectContainer(ctx, item.ID)
 		if err != nil {
+			if dockerStatus(err) == http.StatusNotFound {
+				continue
+			}
 			return nil, err
 		}
 		result = append(result, container)

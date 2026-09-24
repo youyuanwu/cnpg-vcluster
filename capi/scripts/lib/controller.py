@@ -470,12 +470,21 @@ def delete_controller_tenants(
     if not response.stdout.strip():
         return
     tenants = json.loads(response.stdout)
-    for item in sorted(tenants.get("items", []), key=lambda value: value["metadata"]["name"]):
+    names = sorted(
+        item["metadata"]["name"] for item in tenants.get("items", [])
+    )
+    for name in names:
         delete_tenant_resource(
             client,
-            item["metadata"]["name"],
-            wait=True,
-            timeout=config["DELETE_TIMEOUT"],
+            name,
+            wait=False,
+        )
+    for name in names:
+        client.kubectl(
+            "wait",
+            "--for=delete",
+            f"tenant/{name}",
+            f"--timeout={config['DELETE_TIMEOUT']}",
         )
 
 

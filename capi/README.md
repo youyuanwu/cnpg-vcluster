@@ -253,8 +253,10 @@ Reconciliation and deletion are fail-closed:
   credentials, deletes the Namespace, releases the endpoint, and removes the
   finalizer last;
 - an identity-bound teardown checkpoint permits restart recovery if the
-  hosted API disappears after live cleanup; generic transport failures never
-  prove ownership or absence.
+  hosted API is unavailable after exact management ownership preflight. In
+  this disposable local experiment, tenant-API cleanup may be skipped before
+  provider teardown; ownership conflicts and management inspection failures
+  still block.
 
 ## Status, conditions, and exits
 

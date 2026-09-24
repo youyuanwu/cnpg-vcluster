@@ -157,6 +157,46 @@ def _restart_controller(client, config, tenant) -> None:
     wait_tenant_ready(client.root, config, tenant.name)
 
 
+def _drift_kube_proxy_and_wait_for_repair(
+    root: Path,
+    config: dict[str, str],
+    tenant,
+) -> None:
+    _tenant_kubectl(
+        root,
+        config,
+        tenant,
+        "-n",
+        "kube-system",
+        "patch",
+        "configmap/capi-kube-proxy",
+        "--type=merge",
+        "-p",
+        '{"data":{"config.conf":"apiVersion: kubeproxy.config.k8s.io/v1alpha1\\n'
+        'kind: KubeProxyConfiguration\\nconntrack:\\n  maxPerCore: 1\\n"}}',
+    )
+    try:
+        verify_network(root, config, tenant)
+    except RuntimeError:
+        pass
+    else:
+        raise RuntimeError("kube-proxy drift was not detected")
+
+    def repaired():
+        try:
+            verify_network(root, config, tenant)
+            return True
+        except RuntimeError:
+            return None
+
+    wait_for(
+        "controller kube-proxy drift repair",
+        parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"]),
+        parse_duration(config["WAIT_POLL_INTERVAL"]),
+        repaired,
+    )
+
+
 def run_network_gate(
     root: Path,
     config: dict[str, str],
@@ -178,6 +218,7 @@ def run_network_gate(
         _restart_kube_proxy(root, config, tenant)
         wait_tenant_ready(root, config, tenant.name)
         verify_network(root, config, tenant)
+        _drift_kube_proxy_and_wait_for_repair(root, config, tenant)
         _restart_controller(client, config, tenant)
         verify_network(root, config, tenant)
         _verify_control_plane_active(client, config, tenant)

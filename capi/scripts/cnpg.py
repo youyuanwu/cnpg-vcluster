@@ -13,10 +13,9 @@ from scripts.lib.redaction import redact
 from scripts.lib.tenants import NOT_FOUND, _tenant_kubectl
 from scripts.lib.tenants import storage_volume_name
 from scripts.lib.controller_scenarios import (
-    delete_controller_tenant,
     wait_tenant_ready,
 )
-from scripts.storage import _delete_storage, run_storage_gate
+from scripts.storage import _cleanup_storage_and_tenant, run_storage_gate
 from scripts.lib.config import parse_duration
 
 
@@ -687,8 +686,7 @@ def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
     finally:
         if client is not None and tenant is not None:
             try:
-                _delete_storage(root, config, tenant)
-                delete_controller_tenant(root, config, tenant)
+                _cleanup_storage_and_tenant(root, config, tenant)
             except Exception as exc:
                 success.unlink(missing_ok=True)
                 write_private_file(failure, redact(str(exc)) + "\n")
