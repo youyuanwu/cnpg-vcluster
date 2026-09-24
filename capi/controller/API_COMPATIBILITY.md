@@ -13,7 +13,9 @@ webhook. Canonically equivalent Kubernetes versions, with or without a leading
 Status is controller-owned and may add optional observational fields without
 changing spec semantics. Clients must use `metadata.generation`,
 `status.observedGeneration`, and the Ready condition's `observedGeneration`
-rather than depending on condition order or a particular reconciliation stage.
+rather than depending on condition order or internal reconciliation progress.
+The status currently exposes the endpoint, foundation hash, exact root Cluster
+UID, tenant API creation authorization, and successful-cleanup Cluster UID.
 The supported local status command is the compatibility surface for exit
 classification.
 
@@ -21,8 +23,10 @@ Deletion is ordinary Kubernetes DELETE guarded by the
 `tenancy.cnpg-vcluster.io/finalizer`. Clients must not depend on preparatory
 reservations, Leases, filesystem journals, force deletion, or provider
 finalizer removal. A newer controller must continue to understand every
-teardown checkpoint it may encounter in stored `v1alpha1` status, or provide an
-explicit migration before rollout.
+cleanup checkpoint it may encounter in stored `v1alpha1` status, or require an
+explicit clean cutover before rollout. Lifecycle epoch changes scale the old
+controller to zero and reject existing Tenant/provider/host residue; status
+from older epochs is not silently migrated.
 
 A second served version must not be added until conversion behavior, storage
 version migration, downgrade behavior, and removal criteria are documented and
