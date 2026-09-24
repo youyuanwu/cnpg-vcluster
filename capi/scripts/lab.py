@@ -81,6 +81,7 @@ def main(arguments: list[str]) -> int:
         return 0
     if command == "test-tenant-lifecycle":
         with tools_lock(ROOT, exclusive=False):
+            prepare_inotify(ROOT, config)
             run_preflight(ROOT, config)
         run_tenant_lifecycle(ROOT, config)
         return 0
@@ -93,26 +94,31 @@ def main(arguments: list[str]) -> int:
         return 0
     if command == "test-endpoint":
         with tools_lock(ROOT, exclusive=True):
+            prepare_inotify(ROOT, config)
             run_preflight(ROOT, config)
             run_endpoint_gate(ROOT, config)
         return 0
     if command == "test-spike":
         with tools_lock(ROOT, exclusive=True):
+            prepare_inotify(ROOT, config)
             run_preflight(ROOT, config)
             run_network_gate(ROOT, config)
         return 0
     if command == "test-machines":
         with tools_lock(ROOT, exclusive=True):
+            prepare_inotify(ROOT, config)
             run_preflight(ROOT, config)
             run_machine_gate(ROOT, config)
         return 0
     if command == "test-storage":
         with tools_lock(ROOT, exclusive=True):
+            prepare_inotify(ROOT, config)
             run_preflight(ROOT, config)
             run_storage_gate(ROOT, config)
         return 0
     if command == "test-persistence":
         with tools_lock(ROOT, exclusive=True):
+            prepare_inotify(ROOT, config)
             run_preflight(ROOT, config)
             run_cnpg_gate(ROOT, config)
         return 0

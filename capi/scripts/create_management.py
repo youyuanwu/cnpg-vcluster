@@ -22,6 +22,7 @@ from scripts.lib.registry import (
     reconcile_offline_registry,
     verify_offline_registry_pulls,
 )
+from scripts.lib.controller import reconcile_controller
 
 
 def create_management(root: Path, config: dict[str, str]) -> None:
@@ -40,7 +41,7 @@ def create_management(root: Path, config: dict[str, str]) -> None:
         MANAGEMENT_IMAGE_KEYS,
     )
     network = reconcile_network(root, config)
-    reconcile_offline_registry(
+    registry = reconcile_offline_registry(
         root,
         config,
         f"{config['KIND_CLUSTER_NAME']}-control-plane",
@@ -59,4 +60,12 @@ def create_management(root: Path, config: dict[str, str]) -> None:
     reconcile_metallb(root, config, client, network)
     reconcile_kamaji(root, config, client)
     reconcile_providers(root, config, client)
+    reconcile_controller(
+        root,
+        config,
+        client,
+        network,
+        verified_cache,
+        registry,
+    )
     print("management cluster and lifecycle controllers are ready")

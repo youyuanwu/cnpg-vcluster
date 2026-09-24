@@ -254,6 +254,14 @@ Bicep owns the management foundation, while CAPZ owns the tenant VMSS. This
 keeps retry and deletion semantics in the controllers designed for those
 resources.
 
+The local `tenancy.cnpg-vcluster.io/v1alpha1` CRD and Go controller are not the
+Azure lifecycle API in this experiment. Azure continues to use explicit JSON
+TenantSpec files, the Python adapter, and Azure-specific identity/evidence
+records. Local condition names, endpoint allocations, Docker ownership, image
+bootstrap, and finalizer checkpoints must not be copied into Azure without a
+separate CAPZ design and migration plan. Conversely, local deletion never
+uses Azure foundation snapshots, ASO discovery, or VMSS operations.
+
 Terraform/OpenTofu, Pulumi, Ansible, Crossplane, and Azure Developer CLI are
 not required for the first experiment. Terraform/OpenTofu would introduce a
 second state model, Ansible would make cloud lifecycle imperative, and

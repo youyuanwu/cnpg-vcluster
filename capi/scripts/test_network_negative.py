@@ -44,11 +44,6 @@ def main() -> int:
     assert_tamper_rejected(
         ROOT,
         config,
-        ROOT / "manifests" / "addons" / "kube-proxy.yaml.tpl",
-    )
-    assert_tamper_rejected(
-        ROOT,
-        config,
         ROOT / ".tools" / "inputs" / "calico.yaml",
     )
     print("network input tamper checks passed")

@@ -28,6 +28,18 @@ EXPECTED_RECIPES = {
     "tenant-create",
     "tenant-status",
     "tenant-delete",
+    "local-tenant-apply",
+    "local-tenant-status",
+    "local-tenant-delete",
+    "controller-generate",
+    "controller-verify",
+    "controller-test",
+    "controller-build",
+    "controller-image",
+    "test-controller-phase2",
+    "test-controller-phase3",
+    "test-controller-deletion",
+    "controller-tenant-status",
     "create-management",
     "dev-bootstrap",
     "dev-clean",
@@ -118,25 +130,15 @@ def check_configuration() -> None:
     check(config["CAPI_CONTRACT"] == "v1beta2", "CAPI contract must be v1beta2")
     check(config["KAMAJI_CAPI_CONTRACT"] == "v1beta2", "Kamaji provider contract must be v1beta2")
     from scripts.lib.tenant_spec import load_tenant_spec
-    from scripts.lib.tenants import load_local_tenant_spec
 
-    supported_versions = {
-        "local": config["KUBERNETES_VERSION"],
-        "azure": load_env_file(
-            ROOT / "config" / "azure" / "defaults.env"
-        )["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
-    }
-    for profile in ("local", "azure"):
-        load_tenant_spec(
-            ROOT / "config" / "tenants" / "examples" / f"{profile}.json",
-            expected_profile=profile,
-            supported_versions=supported_versions,
-        )
-    load_local_tenant_spec(
-        ROOT,
-        ROOT / "config" / "tenants" / "examples" / "local.json",
-        config,
-        include_management_network=False,
+    load_tenant_spec(
+        ROOT / "config" / "tenants" / "examples" / "azure.json",
+        expected_profile="azure",
+        supported_versions={
+            "azure": load_env_file(
+                ROOT / "config" / "azure" / "defaults.env"
+            )["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
+        },
     )
     for key in (
         "VIP_POOL_START_OFFSET_FROM_BROADCAST",
@@ -160,6 +162,96 @@ def check_repository_boundaries() -> None:
     check(not (repository / "Makefile").exists(), "obsolete root Makefile remains")
     check(not (repository / "vcluster").exists(), "obsolete vcluster lab remains")
     check(not (repository / "kamaji").exists(), "obsolete standalone Kamaji lab remains")
+    required_controller_files = (
+        "controller/go.mod",
+        "controller/Dockerfile",
+        "controller/API_COMPATIBILITY.md",
+        "controller/api/v1alpha1/tenant_types.go",
+        "controller/cmd/manager/main.go",
+        "controller/config/webhook/validating-webhook.yaml",
+        "config/tenants/examples/local.yaml",
+        "config/tenants/tests/tenant-a.yaml",
+        "config/tenants/tests/tenant-b.yaml",
+        "config/tenants/tests/tenant-c.yaml",
+        "scripts/controller_tenant.py",
+        "scripts/lib/controller_cutover.py",
+    )
+    for relative in required_controller_files:
+        check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
+    check(
+        not (ROOT / "controller" / "vendor").exists(),
+        "Go dependencies must use the module cache; controller/vendor is forbidden",
+    )
+    manager = (
+        ROOT / "controller" / "config" / "manager" / "manager.yaml.tpl"
+    ).read_text(encoding="utf-8")
+    check(
+        "--mutation-enabled=true" in manager
+        and "--mutation-enabled=false" not in manager,
+        "normal Tenant controller mutation is not enabled",
+    )
+    tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
+    check(
+        "from scripts.local_tenant import" not in tenant_dispatch,
+        "public tenant dispatch still imports the legacy local mutator",
+    )
+    for relative in (
+        "scripts/local_tenant.py",
+        "scripts/create.py",
+        "scripts/destroy_tenant.py",
+        "scripts/verify.py",
+        "config/tenants/examples/local.json",
+        "config/tenants/tests/tenant-a.json",
+        "config/tenants/tests/tenant-b.json",
+        "config/tenants/tests/tenant-c.json",
+    ):
+        check(
+            not (ROOT / relative).exists(),
+            f"obsolete local mutation artifact remains: {relative}",
+        )
+    production_python = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "scripts").rglob("*.py")
+        if path.name != "test_static.py"
+    )
+    for token in (
+        "from scripts.create import",
+        "from scripts.destroy_tenant import",
+        "from scripts.local_tenant import",
+        "from scripts.verify import",
+        "def apply_control_plane(",
+        "def apply_workers(",
+        "def apply_addons(",
+        "def delete_addons(",
+        "def install_cnpg(",
+        "def delete_cnpg(",
+        "def preload_worker_images(",
+        "def recorded_local_tenants(",
+        "def load_local_tenant_spec(",
+    ):
+        check(
+            token not in production_python,
+            f"obsolete callable local mutator remains: {token}",
+        )
+    check(
+        "def delete_tenant(" not in (
+            ROOT / "scripts" / "lib" / "tenants.py"
+        ).read_text(encoding="utf-8"),
+        "legacy imperative tenant deletion helper remains",
+    )
+    for relative, expected_name in (
+        ("config/tenants/examples/local.yaml", "tenant-example"),
+        ("config/tenants/tests/tenant-a.yaml", "tenant-a"),
+        ("config/tenants/tests/tenant-b.yaml", "tenant-b"),
+        ("config/tenants/tests/tenant-c.yaml", "tenant-c"),
+    ):
+        manifest = (ROOT / relative).read_text(encoding="utf-8")
+        check(
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha1" in manifest
+            and "kind: Tenant" in manifest
+            and f"name: {expected_name}" in manifest,
+            f"invalid local Tenant manifest {relative}",
+        )
     production = [
         *(ROOT / "config").glob("*"),
         *(
@@ -221,22 +313,19 @@ def check_documentation() -> None:
     required_readme = (
         "CAPD `DevCluster` and `DevMachine` resources are development-only",
         "sharing the host kernel",
-        "900 KiB",
         "Break-glass finalizer removal",
-        "Local and Azure tenants share the same strict specification",
+        "Local tenants are Kubernetes `Tenant` resources",
+        "Azure tenants retain the JSON specification and Python lifecycle",
         "`just tenant-delete azure <name> azure/<name>`",
-        "lets CAPI/CAPZ delete the MachinePool and VMSS",
         "Status, conditions, and exits",
-        "CAPI implementation does not emit it",
-        "Cluster in healthy state",
         "26.8.6-edge",
-        "capped at 100 references",
         "HAProxy container remains required",
         "authoritative tenant endpoint",
         "Prebound static hostPath PVs have no node affinity",
         "This is a local persistence proof only.",
-        "Kubernetes controllers own CAPI and provider resource reconciliation.",
-        "Host code owns only exact kind/CAPD Docker identities, tenant Docker volumes, runtime records, and host setting restoration.",
+        "The Tenant controller is the single networking writer.",
+        "Worker image delivery is bootstrap-owned",
+        "one finalizer removes tenant-API resources, deletes the CAPI Cluster",
         "while retaining its PVC, PV, and bytes.",
         "`just cache` is the explicit online acquisition",
         "The retained workflow is a development optimization, not a final gate",
@@ -246,24 +335,18 @@ def check_documentation() -> None:
         "only on the private kind Docker network",
     )
     required_design = (
-        "SkipInfraClusterPatch=true",
-        "DynamicInfrastructureClusterPatch=false",
-        "ClusterResourceSet packages the initial sources",
-        "Azure CSI",
-        "CAPZ `MachinePool`/`AzureMachinePool` VMSS workers",
-        "AzureCluster.spec.controlPlaneEnabled: false",
-        "| Identity |",
-        "| Add-ons |",
-        "| Verification |",
-        "provider-neutral tenant lifecycle",
-        "profile/tenant",
-        "multiple survivors",
-        "one explicitly selected representative tenant",
+        "`tenancy.cnpg-vcluster.io/v1alpha1`",
+        "Ordinary Kubernetes DELETE is accepted",
+        "There is no ClusterResourceSet",
+        "`preKubeadmCommands`",
+        "remove the finalizer last",
+        "old controller Pod is proved absent",
+        "multiple deleting Tenants do not acquire a shared destructive lock",
+        "The legacy local JSON adapter",
+        "CAPZ owns tenant MachinePools",
         "Azure tenants are not separate AKS clusters",
-        "Verified acquisition and image distribution",
-        "explicit concurrent import and exact-target verification barrier",
         "`just test-e2e-offline`",
-        "Distribution storage tree exclusively from the verified active cache",
+        "materialized from the verified active cache",
     )
     for token in required_readme:
         check(
@@ -284,6 +367,7 @@ def check_documentation() -> None:
         "Foundation status rejects a missing, broadened, or conflicting selector.",
         "Targeted deletion to canonical absence",
         "Recreate from the same specification and reach Ready",
+        "The local `tenancy.cnpg-vcluster.io/v1alpha1` CRD and Go controller are not the Azure lifecycle API",
     )
     for token in required_azure_design:
         check(

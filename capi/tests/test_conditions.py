@@ -10,7 +10,32 @@ from scripts.lib.conditions import (
     condition_true,
     sanitized_condition_summary,
 )
-from scripts.test_endpoint_negative import _write_condition_evidence
+from scripts.lib.files import write_private_file
+
+
+def _write_condition_evidence(root: Path, resource: dict[str, object]) -> None:
+    metadata = resource["metadata"]
+    path = (
+        root
+        / ".runtime"
+        / "evidence"
+        / f"negative-condition-{resource['kind'].lower()}-{metadata['name']}.json"
+    )
+    write_private_file(
+        path,
+        json.dumps(
+            {
+                "apiVersion": resource["apiVersion"],
+                "kind": resource["kind"],
+                "namespace": metadata["namespace"],
+                "name": metadata["name"],
+                "uid": metadata["uid"],
+                "conditions": sanitized_condition_summary(resource),
+            },
+            sort_keys=True,
+        )
+        + "\n",
+    )
 
 
 class ConditionTests(unittest.TestCase):

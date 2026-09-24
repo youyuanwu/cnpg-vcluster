@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import os
-import json
 import sys
 from pathlib import Path
 
@@ -17,6 +16,7 @@ from scripts.lib.redaction import redact
 from scripts.tools import verify_all_inputs
 from scripts.lib.timing import PhaseTimings
 from scripts.lib.registry import registry_name
+from scripts.lib.controller_scenarios import wait_tenant_ready
 
 
 def run_just(
@@ -125,8 +125,8 @@ def run_e2e() -> int:
     }
     failure = None
     timings = PhaseTimings()
-    spec_path = ROOT / "config" / "tenants" / "examples" / "local.json"
-    tenant_name = json.loads(spec_path.read_text(encoding="utf-8"))["name"]
+    manifest = ROOT / "config" / "tenants" / "examples" / "local.yaml"
+    tenant_name = "tenant-example"
     try:
         with timings.phase("tools_cache"):
             run_just(ROOT, config, "tools")
@@ -138,7 +138,10 @@ def run_e2e() -> int:
             verify_all_inputs(ROOT, config)
             run_just(ROOT, config, "create-management")
 
-        run_just(ROOT, config, "tenant-create", "local", str(spec_path))
+        with timings.phase("tenant_control_plane"):
+            run_just(ROOT, config, "local-tenant-apply", str(manifest))
+            wait_tenant_ready(ROOT, config, tenant_name)
+        run_just(ROOT, config, "local-tenant-status", tenant_name)
         print("representative tenant PostgreSQL cluster is healthy")
     except BaseException as exc:
         failure = exc

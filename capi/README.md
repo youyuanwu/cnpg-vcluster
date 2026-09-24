@@ -9,9 +9,10 @@ containers, and one to three CloudNativePG instances.
 
 The Azure profile provisions an independently managed AKS foundation with
 Kamaji control planes, CAPZ-managed Azure worker machines, and the external
-Azure cloud provider. Local and Azure tenants share the same strict
-specification, lifecycle classifications, confirmation, identity, recovery,
-and evidence contract.
+Azure cloud provider. The local and Azure profiles deliberately have different lifecycle surfaces.
+Local tenants are Kubernetes `Tenant` resources reconciled by the Go
+controller. Azure tenants retain the JSON specification and Python lifecycle
+while CAPZ integration remains an independent experiment.
 
 The proposed minimal Azure experiment is documented in
 [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md). It
@@ -74,17 +75,20 @@ just tools
 just prepare-host
 just preflight
 just create-management
-just tenant-create local config/tenants/examples/local.json
-just tenant-status local tenant-example
-just tenant-delete local tenant-example local/tenant-example
+just local-tenant-apply config/tenants/examples/local.yaml
+just local-tenant-status tenant-example
+just local-tenant-delete tenant-example
 just destroy
 ```
 
-Local tenants are selected only through explicit JSON specifications. Repeating
-`tenant-create` is the public reconcile/retry path. `tenant-status` is
-read-only, and `tenant-delete` requires the exact `profile/name` confirmation
-token. The bounded final E2E proves that one explicitly selected PostgreSQL
-tenant can become healthy and that teardown restores a clean host:
+Local tenants are declared through versioned YAML resources. Reapplying a
+manifest is the reconcile/retry path, status reads generation-aware Kubernetes
+conditions, and ordinary deletion is completed by the controller finalizer.
+Apply is asynchronous; repeat `just local-tenant-status tenant-example` until
+it exits zero. Tenant specifications are immutable; delete and recreate to
+change capacity, versions, or networks. The bounded final E2E proves that one
+explicitly selected PostgreSQL tenant can become healthy and that teardown
+restores a clean host:
 
 ```bash
 just test-e2e
@@ -92,16 +96,17 @@ just test-e2e
 
 ## Tenant specifications and clean cutover
 
-Both profiles require schema `1`, profile, name, Kubernetes version, worker
-count, Pod CIDR, and Service CIDR. Local specifications additionally require
-`databaseCount`. Unknown fields, unsupported versions, invalid types, and
-overlapping networks fail before mutation. Safe examples are in
+The local Tenant API requires a name, Kubernetes version, worker count,
+database count, Pod CIDR, and Service CIDR. Unknown fields, unsupported
+versions, invalid types, and overlapping networks fail before mutation. Azure
+continues to use schema `1` JSON specifications. Safe examples are in
 [`config/tenants/examples/`](config/tenants/examples/).
 
 The lifecycle does not infer a singleton tenant from environment variables.
 Removed fixed tenant commands, old Azure foundation inventories, and legacy
-tenant runtime layouts are not migrated or adopted. Create and delete retries
-must use the same specification and recorded foundation identity.
+local runtime layouts are not migrated or adopted. Local retries reapply the
+same immutable Tenant manifest; Azure retries use the same JSON specification
+and recorded foundation identity.
 
 `just cache` is the explicit online acquisition and provenance-refresh step.
 After it succeeds, `just tools` and `just preflight` verify and use the local
@@ -142,9 +147,9 @@ just test-tenant-lifecycle
 | `just create-management` | Reconcile the kind management cluster and lifecycle controllers. |
 | `just dev-bootstrap` | Prepare and bind a retained management context to the current user, host, Docker daemon, branch, revision, configuration, and exact management identity. |
 | `just dev-clean` | Run authoritative cleanup for retained tenant, management, runtime, and host state. |
-| `just tenant-create local <spec.json>` | Validate the existing foundation and reconcile exactly the selected local tenant. |
-| `just tenant-status local <name>` | Print the selected tenant's read-only lifecycle envelope. |
-| `just tenant-delete local <name> local/<name>` | Delete exactly the selected tenant after survivor validation and explicit approval. |
+| `just local-tenant-apply <manifest.yaml>` | Strictly apply one declarative local Tenant. |
+| `just local-tenant-status <name>` | Print generation-aware local Tenant conditions. |
+| `just local-tenant-delete <name>` | Delete one local Tenant and wait for finalization. |
 | `just tenant-create azure <spec.json>` | Reconcile one explicit Azure tenant on the recorded AKS/CAPZ foundation. |
 | `just tenant-status azure <name>` | Inspect one Azure tenant without mutating state. |
 | `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through CAPI/CAPZ and verify foundation preservation. |
@@ -152,23 +157,25 @@ just test-tenant-lifecycle
 | `just diagnose management` | Print management status, workloads, CRDs, and events without mutation. |
 | `just destroy` | Remove recorded tenants, controllers, the management cluster, runtime state, and restore host settings. |
 
-All mutating tenant paths validate pinned inputs and recorded tenant networks
-before changing state. Generated credentials, journals, Ready evidence, and
-identity records are owner-only files below ignored `.runtime/`. Commands use
-explicit kubeconfig paths and do not depend on the user's current Kubernetes
-context.
+All mutating tenant paths validate pinned inputs and tenant networks before
+changing state. Local lifecycle state is held in the Tenant resource,
+controller-owned ConfigMaps, provider resources, and exact Docker identities;
+the public local commands do not maintain a second filesystem journal or
+readiness evaluator. Azure credentials, journals, Ready evidence, and identity
+records remain owner-only below ignored `.runtime/`. Commands use explicit
+kubeconfig paths and do not depend on the user's current Kubernetes context.
 
 The retained workflow is a development optimization, not a final gate. It
 retains only the explicitly bound management foundation:
 
 ```bash
 just dev-bootstrap
-just tenant-create local config/tenants/examples/local.json
+just local-tenant-apply config/tenants/examples/local.yaml
 just dev-clean
 ```
 
 `dev-bootstrap` validates the retained binding and management identity.
-Tenant lifecycle remains specification-driven through the generic commands.
+Local Tenant lifecycle remains declarative through the Tenant API.
 Always run `just test-e2e` or `just test-e2e-offline` before treating a change
 as lifecycle-complete.
 
@@ -200,20 +207,18 @@ with Azure CSI volumes.
 
 ## Networking and add-ons
 
-Calico and a repository-owned `capi-kube-proxy` are delivered initially
-through a ClusterResourceSet. Source ConfigMaps are deterministically split at
-YAML document boundaries, limited to 900 KiB each, capped at 100 references,
-and verified against a complete SHA-256 inventory before apply.
+The Tenant controller is the single networking writer. It transforms the
+verified Calico asset, builds the repository-owned `capi-kube-proxy` objects,
+and applies each object directly through the tenant client with exact Tenant,
+specification, foundation, and resource-role markers. Same-name replacements
+with a different UID or ownership markers make the Tenant
+`OwnershipInvalid`.
 
-ClusterResourceSet is the bootstrap and source-change delivery mechanism. Once
-the source objects are handed off, arbitrary target drift is detected by
-status and repaired explicitly; the lab does not assume ClusterResourceSet
-will continuously repair every target mutation.
-
-Before the ClusterResourceSet is applied, the lab restores exact worker images
-from the active cache and verifies concurrent imports in all pre-CNI worker
-containerd stores. Replacement validation invokes the same import barrier
-before accepting network readiness.
+Worker image delivery is bootstrap-owned rather than a second reconciliation
+loop. The `KubeadmConfigTemplate` verifies archive checksums, imports the
+required images into containerd, creates exact digest/tag aliases, configures
+the offline mirror when enabled, and installs the offline egress rules before
+kubeadm runs. Bootstrap failure prevents the Machine from becoming Ready.
 
 The custom kube-proxy name prevents Kamaji from cleaning the repository-owned
 resources. `conntrack.maxPerCore: 0` avoids the nested-container
@@ -235,7 +240,7 @@ expected labels and records are refused rather than adopted or deleted.
 
 ## Retry and interruption recovery
 
-Create retry and deletion are fail-closed:
+Reconciliation and deletion are fail-closed:
 
 - management and tenant kubeconfigs are bound to exact ownership, active
   context, endpoint, CA, and required permissions;
@@ -243,34 +248,36 @@ Create retry and deletion are fail-closed:
   Machine-to-MachineSet-to-MachineDeployment ownership chain;
 - inspection distinguishes present, canonical Kubernetes `NotFound`, and
   inspection failure;
-- deletion journals bind the exact Cluster UID after live API cleanup, making
-  retries safe before or after Cluster deletion;
-- an absent Docker volume with a valid retained identity record is treated as
-  an interrupted cleanup and completed safely.
+- one finalizer removes tenant-API resources, deletes the CAPI Cluster, waits
+  for provider objects and CAPD containers, removes the exact owned volume and
+  credentials, deletes the Namespace, releases the endpoint, and removes the
+  finalizer last;
+- an identity-bound teardown checkpoint permits restart recovery if the
+  hosted API is unavailable after exact management ownership preflight. In
+  this disposable local experiment, tenant-API cleanup may be skipped before
+  provider teardown; ownership conflicts and management inspection failures
+  still block.
 
 ## Status, conditions, and exits
 
-`just tenant-status <profile> <name>` returns `0` only for Ready or
-authoritatively absent. It returns `1` for progressing, deleting, degraded,
-failed, or ownership-invalid. Mutating commands and test recipes return `0` on
-success and `1` on validation, ownership, admission, reconciliation, timeout,
-or cleanup failure. The settings reserve exit `2` for a possible blocked
-outcome, but the current CAPI implementation does not emit it.
+`just local-tenant-status <name>` returns `0` only when status and the Ready
+condition observe the current generation and the phase is `Ready`. It returns
+`1` for progressing, deleting, degraded, failed, ownership-invalid, stale, or
+absent resources. Azure `tenant-status` retains its provider-neutral envelope.
+Mutating commands and test recipes return `0` on success and `1` on validation,
+ownership, admission, reconciliation, timeout, or cleanup failure.
 
 Condition checks require the current resource generation rather than accepting
-a stale `True` condition. A healthy tenant requires:
+a stale `True` condition. A healthy local Tenant requires:
 
-- management API readiness, four available CAPI providers, required
-  controller workloads, ready webhooks, Kamaji, and its datastore;
-- CAPI `Cluster` and `KamajiControlPlane` `Available=True`, initialized and
-  unpaused control plane, plus matching Cluster/DevCluster/Kamaji endpoints;
-- exact Ready Machine, DevMachine, Docker container, Node, and bootstrap
-  Secret inventories;
-- Ready Calico, CoreDNS, Konnectivity, and repository-owned kube-proxy;
-- owned Docker volume and static PV/PVC state without PV node affinity;
-- digest-pinned CNPG operator, `Cluster in healthy state`, three Ready
-  PostgreSQL Pods on distinct workers, three Bound PVCs, and a reachable
-  read-write endpoint.
+- current affirmative provider conditions for the CAPI `Cluster`, CAPD
+  `DevCluster`, and `KamajiControlPlane`, plus an initialized, unpaused control
+  plane and matching endpoints;
+- exact Ready Machine, DevMachine, Docker container, and Node inventories;
+- available Calico, CoreDNS, and repository-owned kube-proxy workloads;
+- the expected static StorageClass and exact owned Docker volume;
+- a healthy CNPG Cluster using the pinned PostgreSQL image, the requested one
+  to three Ready PostgreSQL Pods, and the same number of Bound PVCs.
 
 Canonical Kubernetes `Error from server (NotFound):` is the only accepted
 absence proof in fail-closed lifecycle inspections. Other API errors are
@@ -280,9 +287,14 @@ failures, not absent or healthy states.
 
 Normal recovery is:
 
-1. run `just tenant-status <profile> <name>` and `just diagnose management`;
+1. for local, run `just local-tenant-status <name>` and
+   `just diagnose management`; for Azure, run
+   `just tenant-status azure <name>`;
 2. restore the failed controller or dependency;
-3. retry `just tenant-create`, `just tenant-delete`, or `just destroy`.
+3. retry local reconciliation with
+   `just local-tenant-apply <manifest.yaml>`, retry deletion with
+   `just local-tenant-delete <name>`, or run `just destroy`; Azure keeps
+   `tenant-create` and `tenant-delete`.
 
 Finalizer removal is exceptional and should be used only when controller
 recovery has been exhausted and the exact deleting resource has been
@@ -322,10 +334,10 @@ versions are still checked on every preflight. Preflight does not silently
 acquire missing content. Missing, changed, symlinked, broad-permission,
 platform-mismatched, or stale entries require a new online `just cache`.
 
-Management images are imported before controller installation. Worker images
-are imported before ClusterResourceSet workloads and retain exact
-digest-qualified runtime validation. Runtime transforms still replace expected
-tags only and fail on changed image counts or unresolved placeholders.
+Management images are imported before controller installation. Worker
+`preKubeadmCommands` import the exact required archives before kubeadm and
+networking start. The controller image contains only the static manager binary
+and checksum-verified Calico and CNPG assets.
 
 The enforced-offline path additionally verifies and restores the pinned
 Kubernetes API-server, controller-manager, scheduler, Konnectivity server, and
@@ -350,8 +362,8 @@ The enforced-offline gate also prints `CAPI_OFFLINE_EGRESS` records with the
 node and counted reject-rule packets, plus `CAPI_OFFLINE_MIRROR` records for
 each exact digest-qualified image exercised through the local mirror.
 
-Generic create and delete operations additionally print redacted
-tenant-specific `TENANT_TIMING` records and persist owner-only timing evidence.
+Azure create and delete operations additionally print redacted tenant-specific
+`TENANT_TIMING` records and persist owner-only timing evidence.
 
 Exact versions, URLs, checksums, source commits, and image digests are in
 [`config/versions.env`](config/versions.env). See
@@ -368,8 +380,9 @@ Exact versions, URLs, checksums, source commits, and image digests are in
 - The offline registry is an ephemeral, unauthenticated service on the private
   disposable kind Docker network only; it has no published host port and is
   removed by authoritative teardown.
-- Tenant mutation is serialized by profile and reconciles one explicit
-  specification at a time.
+- Local reconciliation uses leader election and one bounded reconcile worker;
+  multiple deleting Tenants can still make independent progress without a
+  lab-wide deletion lock.
 - The Azure profile is an experiment with a shared resource group, VNet,
   subnet, and broad resource-group Contributor identity.
 - CAPZ `v1.21.1` requires the narrowly scoped external-control-plane webhook

@@ -12,9 +12,10 @@ from scripts.lib.process import run
 from scripts.lib.redaction import redact
 from scripts.lib.tenants import NOT_FOUND, _tenant_kubectl
 from scripts.lib.tenants import storage_volume_name
-from scripts.lib.addons import delete_addons
-from scripts.lib.tenants import delete_tenant
-from scripts.storage import _delete_storage, run_storage_gate
+from scripts.lib.controller_scenarios import (
+    wait_tenant_ready,
+)
+from scripts.storage import _cleanup_storage_and_tenant, run_storage_gate
 from scripts.lib.config import parse_duration
 
 
@@ -54,69 +55,6 @@ def _static_pv_items(config: dict[str, str], tenant) -> str:
         type: DirectoryOrCreate"""
         )
     return "\n".join(items)
-
-
-def _render_operator(root: Path, config: dict[str, str], tenant) -> Path:
-    source = root / ".tools" / "inputs" / "cnpg.yaml"
-    verify_sha256(source, config["CNPG_MANIFEST_SHA256"])
-    content = source.read_text(encoding="utf-8")
-    tagged = config["CNPG_CONTROLLER_IMAGE_TAGGED"]
-    if content.count(tagged) != 2:
-        raise IntegrityError("unexpected CNPG operator image count")
-    content = content.replace(tagged, config["CNPG_CONTROLLER_IMAGE"])
-    path = root / ".runtime" / "rendered" / "cnpg" / tenant.name / "operator.yaml"
-    write_private_file(path, content)
-    return path
-
-
-def _render_cluster(root: Path, config: dict[str, str], tenant) -> tuple[Path, Path]:
-    replacements = {
-        "${CNPG_CLUSTER}": tenant.cnpg_cluster,
-        "${POSTGRES_IMAGE}": config["POSTGRES_IMAGE"],
-        "${STORAGE_CLASS}": config["SPIKE_STORAGE_CLASS"],
-        "${STORAGE_PATH}": config["SPIKE_STORAGE_CONTAINER_PATH"],
-        "${CNPG_INSTANCES}": str(_database_count(tenant)),
-        "${CNPG_ANTI_AFFINITY_TYPE}": _anti_affinity_type(tenant),
-        "${CNPG_PV_ITEMS}": _static_pv_items(config, tenant),
-    }
-    rendered = []
-    for source_name, destination_name in (
-        ("static-pvs.yaml.tpl", "static-pvs.yaml"),
-        ("cluster.yaml.tpl", "cluster.yaml"),
-    ):
-        content = (root / "manifests" / "cnpg" / source_name).read_text(
-            encoding="utf-8"
-        )
-        for placeholder, value in replacements.items():
-            content = content.replace(placeholder, value)
-        if "${" in content:
-            raise IntegrityError(f"unresolved CNPG template: {source_name}")
-        path = root / ".runtime" / "rendered" / "cnpg" / tenant.name / destination_name
-        write_private_file(path, content)
-        rendered.append(path)
-    return rendered[0], rendered[1]
-
-
-def _prepare_cnpg_directories(config: dict[str, str], tenant) -> None:
-    run(
-        [
-            "docker",
-            "run",
-            "--rm",
-            "-v",
-            f"{storage_volume_name(config, tenant)}:/data",
-            "--entrypoint",
-            "sh",
-            config["VERIFY_IMAGE"],
-            "-ec",
-            f"for ordinal in $(seq 1 {_database_count(tenant)}); do "
-            "mkdir -p /data/volumes/cnpg/$ordinal; "
-            "chown 26:26 /data/volumes/cnpg/$ordinal; "
-            "chmod 700 /data/volumes/cnpg/$ordinal; "
-            "done",
-        ],
-        timeout=60,
-    )
 
 
 def _cnpg_ready(root: Path, config: dict[str, str], tenant) -> bool:
@@ -242,42 +180,6 @@ def _cnpg_ready(root: Path, config: dict[str, str], tenant) -> bool:
         )
         and endpoint.returncode == 0
         and bool(endpoint.stdout)
-    )
-
-
-def install_cnpg(root: Path, config: dict[str, str], tenant) -> None:
-    operator = _render_operator(root, config, tenant)
-    _tenant_kubectl(
-        root,
-        config,
-        tenant,
-        "apply",
-        "--server-side",
-        "--field-manager=capi-kamaji-lab",
-        "--force-conflicts",
-        "-f",
-        str(operator),
-    )
-    _tenant_kubectl(
-        root,
-        config,
-        tenant,
-        "-n",
-        config["CNPG_NAMESPACE"],
-        "rollout",
-        "status",
-        "deployment/cnpg-controller-manager",
-        f"--timeout={config['CNPG_TIMEOUT']}",
-    )
-    pvs, cluster = _render_cluster(root, config, tenant)
-    _prepare_cnpg_directories(config, tenant)
-    _tenant_kubectl(root, config, tenant, "apply", "-f", str(pvs))
-    _tenant_kubectl(root, config, tenant, "apply", "-f", str(cluster))
-    wait_for(
-        "CNPG cluster readiness",
-        parse_duration(config["CNPG_TIMEOUT"]),
-        5,
-        lambda: _cnpg_ready(root, config, tenant),
     )
 
 
@@ -662,152 +564,6 @@ def _primary_failover(root: Path, config: dict[str, str], tenant) -> None:
     )
 
 
-def delete_cnpg(root: Path, config: dict[str, str], tenant) -> None:
-    _, cluster = _render_cluster(root, config, tenant)
-    pvs, _ = _render_cluster(root, config, tenant)
-    _tenant_kubectl(
-        root,
-        config,
-        tenant,
-        "delete",
-        "-f",
-        str(cluster),
-        "--ignore-not-found",
-        "--wait=true",
-        f"--timeout={config['DELETE_TIMEOUT']}",
-    )
-    _tenant_kubectl(
-        root,
-        config,
-        tenant,
-        "delete",
-        "-f",
-        str(pvs),
-        "--ignore-not-found",
-        "--wait=true",
-        f"--timeout={config['DELETE_TIMEOUT']}",
-    )
-    leftovers = _tenant_kubectl(
-        root,
-        config,
-        tenant,
-        "-n",
-        config["DATABASE_NAMESPACE"],
-        "get",
-        "pvc",
-        "-l",
-        f"cnpg.io/cluster={tenant.cnpg_cluster}",
-        "-o",
-        "name",
-        check=False,
-    )
-    if leftovers.returncode == 0 and leftovers.stdout.strip():
-        raise RuntimeError("CNPG PVCs remain after cluster deletion")
-    if leftovers.returncode != 0 and not re.search(
-        r"Error from server \(NotFound\):",
-        leftovers.stderr,
-        re.IGNORECASE,
-    ):
-        raise RuntimeError(
-            f"CNPG PVC deletion inspection failed: {leftovers.stderr}"
-        )
-    operator = _render_operator(root, config, tenant)
-    _tenant_kubectl(
-        root,
-        config,
-        tenant,
-        "delete",
-        "-f",
-        str(operator),
-        "--ignore-not-found",
-        "--wait=false",
-    )
-
-    def operator_absent():
-        for arguments in (
-            (
-                "-n",
-                config["CNPG_NAMESPACE"],
-                "get",
-                "deployment/cnpg-controller-manager",
-            ),
-            ("get", "crd/clusters.postgresql.cnpg.io"),
-        ):
-            response = _tenant_kubectl(
-                root,
-                config,
-                tenant,
-                *arguments,
-                check=False,
-            )
-            if response.returncode == 0:
-                return None
-            if not re.search(
-                r"Error from server \(NotFound\):",
-                response.stderr,
-                re.IGNORECASE,
-            ):
-                raise RuntimeError(
-                    f"CNPG operator deletion inspection failed: "
-                    f"{response.stderr}"
-                )
-        return True
-
-    wait_for(
-        "CNPG operator deletion",
-        parse_duration(config["DELETE_TIMEOUT"]),
-        parse_duration(config["WAIT_POLL_INTERVAL"]),
-        operator_absent,
-    )
-
-
-def cnpg_artifacts_present(root: Path, config: dict[str, str], tenant) -> bool:
-    checks = (
-        (
-            ("-n", config["DATABASE_NAMESPACE"]),
-            "pvc",
-        ),
-        ((), f"pv/{tenant.cnpg_cluster}-pv-1"),
-        ((), f"pv/{tenant.cnpg_cluster}-pv-2"),
-        ((), f"pv/{tenant.cnpg_cluster}-pv-3"),
-        (
-            ("-n", config["CNPG_NAMESPACE"]),
-            "deployment/cnpg-controller-manager",
-        ),
-        ((), "crd/clusters.postgresql.cnpg.io"),
-    )
-    for scope, resource in checks:
-        arguments = [*scope, "get", resource]
-        is_list = resource == "pvc"
-        if is_list:
-            arguments.extend(
-                (
-                    "-l",
-                    f"cnpg.io/cluster={tenant.cnpg_cluster}",
-                    "-o",
-                    "name",
-                )
-            )
-        response = _tenant_kubectl(
-            root,
-            config,
-            tenant,
-            *arguments,
-            check=False,
-        )
-        if response.returncode == 0 and (not is_list or response.stdout.strip()):
-            return True
-        if response.returncode != 0 and not re.search(
-            r"Error from server \(NotFound\):",
-            response.stderr,
-            re.IGNORECASE,
-        ):
-            raise RuntimeError(
-                f"CNPG artifact inspection failed for {resource}: {response.stderr}"
-            )
-    return False
-
-
 def _evidence_payload(root: Path, config: dict[str, str], client, tenant) -> dict[str, object]:
     machines = json.loads(
         client.kubectl(
@@ -908,15 +664,13 @@ def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
     evidence = None
     try:
         client, tenant, _ = run_storage_gate(root, config, cleanup=False)
-        install_cnpg(root, config, tenant)
-        from scripts.status import collect_status, status_healthy
-
-        if not status_healthy(collect_status(root, config)):
-            raise RuntimeError("status does not report healthy CNPG topology")
+        if not _cnpg_ready(root, config, tenant):
+            raise RuntimeError("controller-created CNPG topology is not healthy")
         before = _storage_identity(root, config, tenant)
         _write_marker(root, config, tenant)
         _verify_filesystem(config, tenant)
         _replace_machine(root, config, client, tenant)
+        wait_tenant_ready(root, config, tenant.name)
         if _storage_identity(root, config, tenant) != before:
             raise RuntimeError("CNPG storage identity changed across Machine replacement")
         _verify_marker(root, config, tenant)
@@ -932,10 +686,7 @@ def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
     finally:
         if client is not None and tenant is not None:
             try:
-                delete_cnpg(root, config, tenant)
-                _delete_storage(root, config, tenant)
-                delete_addons(root, config, client, tenant)
-                delete_tenant(root, config, client, tenant)
+                _cleanup_storage_and_tenant(root, config, tenant)
             except Exception as exc:
                 success.unlink(missing_ok=True)
                 write_private_file(failure, redact(str(exc)) + "\n")

@@ -3,71 +3,47 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scripts.create import stable_tenant_snapshot
 from scripts.create_management import create_management
 from scripts.destroy import destroy
-from scripts.destroy_tenant import prepare_tenant_deletion
+from scripts.lib.controller_scenarios import (
+    apply_controller_tenant,
+    delete_controller_tenant,
+    manifest_tenant_name,
+    tenant_document,
+    tenant_manifest,
+    tenant_snapshot,
+    wait_tenant_absent,
+    wait_tenant_ready,
+)
 from scripts.lib.kube import ManagementClient
 from scripts.lib.locking import tools_lock
-from scripts.lib.management import tenant_endpoint_allocation
 from scripts.lib.redaction import redact
-from scripts.lib.tenant_runtime import TenantRuntime
-from scripts.lib.tenants import resolve_tenant_storage, tenant_from_spec
-from scripts.tenant import execute
+from scripts.lib.tenants import _tenant_kubectl
 
 
-def _spec_paths(root: Path) -> dict[str, Path]:
-    directory = root / "config" / "tenants" / "tests"
-    return {
-        name: directory / f"{name}.json"
-        for name in ("tenant-a", "tenant-b", "tenant-c")
-    }
-
-
-def _tenant(root: Path, config: dict[str, str], name: str):
-    identity = TenantRuntime(root, "local", name).load_identity()
-    endpoint = tenant_endpoint_allocation(root, config, name)
-    if endpoint is None:
-        raise RuntimeError(f"tenant endpoint allocation is absent: {name}")
-    tenant = tenant_from_spec(root, identity.specification, endpoint)
-    return resolve_tenant_storage(root, config, tenant)
-
-
-def _snapshot(root: Path, config: dict[str, str], name: str):
-    snapshot = stable_tenant_snapshot(
-        root,
-        config,
-        ManagementClient(root, config),
-        _tenant(root, config, name),
+def _apply(
+    root: Path,
+    config: dict[str, str],
+    name: str,
+) -> dict[str, object]:
+    _, _, document = apply_controller_tenant(
+        root, config, tenant_manifest(root, name)
     )
-    if snapshot is None:
-        raise RuntimeError(f"tenant snapshot is incomplete: {name}")
-    return snapshot
+    return document
 
 
-def _create(root: Path, path: Path) -> None:
-    execute(root, ["create", "local", str(path)])
-
-
-def _delete(root: Path, name: str) -> None:
-    execute(root, ["delete", "local", name, f"local/{name}"])
-
-
-def _require_status(root: Path, name: str, classification: str) -> None:
-    from scripts.local_tenant import LocalTenantAdapter
-
-    status = LocalTenantAdapter().status(root, name)
-    if status.classification != classification:
-        raise RuntimeError(
-            f"unexpected tenant status for {name}: "
-            f"{status.classification}: {status.blockers}"
-        )
+def _snapshot(client: ManagementClient, name: str) -> dict[str, object]:
+    document = tenant_document(client, name)
+    if document is None:
+        raise RuntimeError(f"Tenant is absent: {name}")
+    return tenant_snapshot(document)
 
 
 def _drift_kube_proxy(root: Path, config: dict[str, str], name: str) -> None:
-    from scripts.lib.tenants import _tenant_kubectl
+    document = wait_tenant_ready(root, config, name)
+    from scripts.lib.controller_scenarios import tenant_from_document
 
-    tenant = _tenant(root, config, name)
+    tenant = tenant_from_document(root, config, document)
     _tenant_kubectl(
         root,
         config,
@@ -85,77 +61,62 @@ def _drift_kube_proxy(root: Path, config: dict[str, str], name: str) -> None:
 
 def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
     failure = None
-    specs = _spec_paths(root)
+    names = ("tenant-a", "tenant-b", "tenant-c")
+    client = ManagementClient(root, config)
+    first_tenant_c_uid = None
     try:
         with tools_lock(root, exclusive=True):
             create_management(root, config)
-        for name in ("tenant-a", "tenant-b", "tenant-c"):
-            _create(root, specs[name])
-            _require_status(root, name, "ready")
+        for name in names:
+            _apply(root, config, name)
 
         survivors = {
-            name: _snapshot(root, config, name)
+            name: _snapshot(client, name)
             for name in ("tenant-a", "tenant-b")
         }
-        _delete(root, "tenant-c")
-        _require_status(root, "tenant-c", "absent")
+        first_tenant_c_uid = _snapshot(client, "tenant-c")["uid"]
+        delete_controller_tenant(root, config, "tenant-c")
         for name, before in survivors.items():
-            if _snapshot(root, config, name) != before:
+            if _snapshot(client, name) != before:
                 raise RuntimeError(f"targeted deletion changed survivor: {name}")
 
-        _create(root, specs["tenant-c"])
-        target_before = _snapshot(root, config, "tenant-c")
-        try:
-            execute(
-                root,
-                ["delete", "local", "tenant-c", "wrong-confirmation"],
-            )
-        except RuntimeError:
-            pass
-        else:
-            raise RuntimeError("invalid deletion confirmation was accepted")
-        if _snapshot(root, config, "tenant-c") != target_before:
-            raise RuntimeError("invalid confirmation changed the target")
+        recreated = _apply(root, config, "tenant-c")
+        if recreated["metadata"]["uid"] == first_tenant_c_uid:
+            raise RuntimeError("recreated Tenant retained its previous UID")
+
         _drift_kube_proxy(root, config, "tenant-a")
-        try:
-            _delete(root, "tenant-c")
-        except RuntimeError:
-            pass
-        else:
-            raise RuntimeError("unhealthy survivor did not block deletion")
-        if _snapshot(root, config, "tenant-c") != target_before:
-            raise RuntimeError("refused deletion changed the target")
-        _create(root, specs["tenant-a"])
+        delete_controller_tenant(root, config, "tenant-c")
+        if tenant_document(client, "tenant-a") is None:
+            raise RuntimeError("peer-independent deletion removed tenant-a")
 
-        tenant_c = _tenant(root, config, "tenant-c")
-        client = ManagementClient(root, config)
-        cluster = json.loads(
-            client.kubectl(
-                "-n",
-                tenant_c.namespace,
-                "get",
-                f"cluster/{tenant_c.name}",
-                "-o",
-                "json",
-            ).stdout
-        )
-        prepare_tenant_deletion(root, config, client, tenant_c, cluster)
-        _delete(root, "tenant-c")
-        _require_status(root, "tenant-c", "absent")
-        _create(root, specs["tenant-c"])
+        manifest = tenant_manifest(root, "tenant-c")
+        if manifest_tenant_name(manifest) != "tenant-c":
+            raise RuntimeError("Tenant manifest identity changed")
+        from scripts.lib.controller_client import apply_tenant
 
-        _delete(root, "tenant-b")
-        _delete(root, "tenant-c")
-        _delete(root, "tenant-a")
-        for name in ("tenant-a", "tenant-b", "tenant-c"):
-            _require_status(root, name, "absent")
+        apply_tenant(root, config, manifest)
+        delete_controller_tenant(root, config, "tenant-c")
+
+        _apply(root, config, "tenant-b")
+        _apply(root, config, "tenant-c")
+        delete_controller_tenant(root, config, "tenant-b", wait=False)
+        delete_controller_tenant(root, config, "tenant-c", wait=False)
+        wait_tenant_absent(root, config, "tenant-b")
+        wait_tenant_absent(root, config, "tenant-c")
+        delete_controller_tenant(root, config, "tenant-b")
+        delete_controller_tenant(root, config, "tenant-c")
+        delete_controller_tenant(root, config, "tenant-a")
+
+        for name in names:
+            if tenant_document(client, name) is not None:
+                raise RuntimeError(f"Tenant remained after deletion: {name}")
         print(
             json.dumps(
                 {
-                    "arbitraryTenant": "tenant-c",
-                    "multipleSurvivors": ["tenant-a", "tenant-b"],
+                    "concurrentDeletion": ["tenant-b", "tenant-c"],
+                    "peerIndependentDeletion": "tenant-c",
                     "recreated": "tenant-c",
-                    "soleTenantDeleted": "tenant-a",
+                    "survivors": ["tenant-a", "tenant-b"],
                 },
                 sort_keys=True,
             )

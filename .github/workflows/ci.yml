@@ -53,5 +53,14 @@ jobs:
       - name: Acquire pinned tools and images
         run: just cache
 
+      - name: Install pinned local tools
+        run: just tools
+
+      - name: Verify and test Tenant controller
+        run: |
+          just controller-verify
+          just controller-test
+          just controller-image
+
       - name: Run end-to-end test
         run: just test-e2e

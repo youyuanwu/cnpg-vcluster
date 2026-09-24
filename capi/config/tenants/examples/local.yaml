@@ -1,0 +1,10 @@
+apiVersion: tenancy.cnpg-vcluster.io/v1alpha1
+kind: Tenant
+metadata:
+  name: tenant-example
+spec:
+  kubernetesVersion: 1.36.4
+  workers: 1
+  databaseCount: 1
+  podCIDR: 10.73.0.0/16
+  serviceCIDR: 10.143.0.0/16

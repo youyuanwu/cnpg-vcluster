@@ -1,0 +1,31 @@
+apiVersion: admissionregistration.k8s.io/v1
+kind: ValidatingWebhookConfiguration
+metadata:
+  name: tenant-controller-validating-webhook
+  annotations:
+    cert-manager.io/inject-ca-from: tenant-system/tenant-controller-serving-cert
+webhooks:
+- name: vtenant.tenancy.cnpg-vcluster.io
+  admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: tenant-controller-webhook
+      namespace: tenant-system
+      path: /validate-tenancy-cnpg-vcluster-io-v1alpha1-tenant
+      port: 443
+  failurePolicy: Fail
+  matchPolicy: Equivalent
+  rules:
+  - apiGroups:
+    - tenancy.cnpg-vcluster.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - CREATE
+    - UPDATE
+    resources:
+    - tenants
+    scope: Cluster
+  sideEffects: None
+  timeoutSeconds: 10

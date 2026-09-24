@@ -55,6 +55,54 @@ tenant-status profile tenant:
 tenant-delete profile tenant confirmation:
     @python3 scripts/tenant.py delete {{quote(profile)}} {{quote(tenant)}} {{quote(confirmation)}}
 
+# Apply one local Tenant manifest through strict server-side validation.
+local-tenant-apply manifest="config/tenants/examples/local.yaml":
+    @python3 scripts/controller_tenant.py apply {{quote(manifest)}}
+
+# Report one local Tenant from generation-aware Kubernetes conditions.
+local-tenant-status tenant="tenant-example":
+    @python3 scripts/controller_tenant_status.py {{quote(tenant)}}
+
+# Delete one local Tenant through ordinary Kubernetes deletion and finalization.
+local-tenant-delete tenant="tenant-example":
+    @python3 scripts/controller_tenant.py delete {{quote(tenant)}}
+
+# Generate Tenant API deep-copy, CRD, and RBAC artifacts from pinned Go modules.
+controller-generate:
+    @python3 scripts/generate_controller.py
+
+# Verify generated Tenant API artifacts are current.
+controller-verify:
+    @python3 scripts/generate_controller.py --verify
+
+# Run Go unit and API tests using the standard Go module cache.
+controller-test:
+    @python3 scripts/test_controller.py
+
+# Build the static Tenant controller manager binary.
+controller-build:
+    @python3 scripts/build_controller.py --binary
+
+# Build the scratch Tenant controller image from verified assets.
+controller-image:
+    @python3 scripts/build_controller.py
+
+# Exercise locked temporary controller mutation through the Phase 2 boundary.
+test-controller-phase2:
+    @python3 scripts/run_locked.py scripts/test_controller_phase2.py
+
+# Exercise complete temporary controller mutation through Ready and Phase 3 finalization.
+test-controller-phase3:
+    @python3 scripts/run_locked.py scripts/test_controller_phase3.py
+
+# Exercise ordinary Tenant deletion, restart recovery, and same-name recreation.
+test-controller-deletion:
+    @python3 scripts/run_locked.py scripts/test_controller_deletion.py
+
+# Evaluate Tenant status from generation-aware Kubernetes conditions.
+controller-tenant-status tenant:
+    @python3 scripts/controller_tenant_status.py {{quote(tenant)}}
+
 # [implemented] Reconcile the management cluster and lifecycle controllers.
 create-management:
     @python3 scripts/lab.py create-management

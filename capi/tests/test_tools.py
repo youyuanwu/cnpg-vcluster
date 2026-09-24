@@ -7,7 +7,7 @@ from contextlib import contextmanager
 from pathlib import Path
 
 from scripts.lib.files import IntegrityError
-from scripts.tools import _verify_crd, _verify_private_input, _verify_tag, prepare_tools
+from scripts.tools import DOWNLOADS, _verify_crd, _verify_private_input, _verify_tag, prepare_tools
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
@@ -30,6 +30,26 @@ class ToolSchemaTests(unittest.TestCase):
             Path("/tmp/example"), {}, inputs_verified=True
         )
         run.assert_not_called()
+
+    def test_prepare_tools_verifies_complete_materialized_inputs_before_refresh(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            inputs = root / ".tools" / "inputs"
+            inputs.mkdir(parents=True)
+            config = {"CERT_MANAGER_VERSION": "v1"}
+            expected = {
+                filename for filename, _, _ in DOWNLOADS
+            } | {"cert-manager-v1.tgz", "cert-manager-v1.digest"}
+            for name in expected:
+                (inputs / name).write_text("fixture", encoding="utf-8")
+            with (
+                patch("scripts.cache.verify_cache", return_value=object()),
+                patch("scripts.tools.verify_all_inputs") as verify_inputs,
+                patch("scripts.cache.materialize_inputs"),
+                patch("scripts.tools._install_tools"),
+            ):
+                prepare_tools(root, config)
+            verify_inputs.assert_called_once_with(root, config, inputs)
 
     def test_cached_input_rejects_symlink_and_broad_permissions(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

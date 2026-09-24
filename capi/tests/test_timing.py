@@ -68,9 +68,13 @@ class TimingTests(unittest.TestCase):
     @staticmethod
     def _root(temporary: str) -> Path:
         root = Path(temporary)
-        spec = root / "config" / "tenants" / "examples" / "local.json"
+        spec = root / "config" / "tenants" / "examples" / "local.yaml"
         spec.parent.mkdir(parents=True)
-        spec.write_text('{"name":"tenant-example"}\n')
+        spec.write_text(
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha1\n"
+            "kind: Tenant\nmetadata:\n  name: tenant-example\n",
+            encoding="utf-8",
+        )
         return root
 
     def test_e2e_tenant_create_failure_still_runs_teardown(self) -> None:
@@ -79,7 +83,7 @@ class TimingTests(unittest.TestCase):
             root = self._root(temporary)
 
             def run_just(*args, **_kwargs):
-                if "tenant-create" in args:
+                if "local-tenant-apply" in args:
                     raise RuntimeError("injected tenant setup failure")
 
             with (
@@ -89,6 +93,7 @@ class TimingTests(unittest.TestCase):
                 patch("scripts.test_e2e.run_just", side_effect=run_just),
                 patch("scripts.test_e2e.verify_all_inputs"),
                 patch("scripts.test_e2e.verify_no_lab_residue"),
+                patch("scripts.test_e2e.wait_tenant_ready"),
                 redirect_stdout(output),
             ):
                 with self.assertRaisesRegex(RuntimeError, "tenant setup failure"):
@@ -107,7 +112,7 @@ class TimingTests(unittest.TestCase):
 
             def run_just_failure(*args, **_kwargs):
                 nonlocal calls
-                if "tenant-create" in args:
+                if "local-tenant-apply" in args:
                     raise RuntimeError("injected primary failure")
                 if args[-1] == "destroy":
                     calls += 1
@@ -123,6 +128,7 @@ class TimingTests(unittest.TestCase):
                     side_effect=run_just_failure,
                 ),
                 patch("scripts.test_e2e.verify_all_inputs"),
+                patch("scripts.test_e2e.wait_tenant_ready"),
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,

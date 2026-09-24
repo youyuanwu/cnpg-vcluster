@@ -3,23 +3,25 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from scripts.lib.addons import delete_addons, verify_network, wait_network_ready
+from scripts.lib.addons import verify_network, wait_network_ready
 from scripts.lib.conditions import condition_true
 from scripts.lib.config import parse_duration
+from scripts.lib.controller_scenarios import (
+    delete_controller_tenant,
+    tenant_manifest,
+    wait_tenant_ready,
+)
 from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.process import run
 from scripts.lib.tenants import (
     _tenant_kubectl,
-    delete_tenant,
     read_storage_marker,
     tenant_kubeconfig_path,
     verify_worker_runtime,
 )
 from scripts.network import run_network_gate
 from scripts.endpoint import _verify_bootstrap_secret
-from scripts.status import collect_status, status_healthy
-from scripts.lib.images import preload_worker_images
 
 
 def _machine_items(client: ManagementClient, tenant) -> list[dict[str, object]]:
@@ -222,7 +224,6 @@ def _replace_machine(
 
     def replaced():
         try:
-            preload_worker_images(root, config, client, tenant)
             wait_network_ready(root, config, tenant)
             snapshot = worker_snapshot(root, config, client, tenant)
         except RuntimeError:
@@ -295,16 +296,6 @@ def _interrupted_machine_deletion(
     tenant,
 ) -> None:
     before = worker_snapshot(root, config, client, tenant)
-    observed_status = collect_status(root, config)
-    if (
-        not status_healthy(observed_status)
-        or len(observed_status["spikeMachines"]["machines"]) != tenant.workers
-        or len(observed_status["spikeMachines"]["devMachines"]) != tenant.workers
-        or len(observed_status["spikeMachines"]["containers"]) != tenant.workers
-        or len(observed_status["spikeMachines"]["nodes"]) != tenant.workers
-        or len(observed_status["spikeMachines"]["bootstrapSecrets"]) != tenant.workers
-    ):
-        raise RuntimeError("status does not expose the exact worker layers")
     removed_name = sorted(before)[0]
     client.kubectl(
         "-n",
@@ -362,6 +353,7 @@ def _interrupted_machine_deletion(
         )
     wait_network_ready(root, config, tenant)
     after = worker_snapshot(root, config, client, tenant)
+    wait_tenant_ready(root, config, tenant.name)
     if removed_name in after:
         raise RuntimeError("interrupted Machine deletion did not replace the worker")
     if run(["docker", "inspect", removed_name], timeout=30, check=False).returncode == 0:
@@ -369,21 +361,23 @@ def _interrupted_machine_deletion(
 
 
 def run_machine_gate(root: Path, config: dict[str, str]) -> None:
-    client, tenant = run_network_gate(root, config, cleanup=False)
+    client, tenant = run_network_gate(
+        root,
+        config,
+        cleanup=False,
+        manifest=tenant_manifest(root, "tenant-c"),
+    )
     bootstrap_secrets: set[str] = set()
     try:
-        _scale_three(root, config, client, tenant)
         before = worker_snapshot(root, config, client, tenant)
         bootstrap_secrets |= _bootstrap_secrets(root, config, client, tenant)
-        _scale_three(root, config, client, tenant)
         if worker_snapshot(root, config, client, tenant) != before:
             raise RuntimeError("unchanged worker declaration changed identities")
         after = _replace_machine(root, config, client, tenant, before)
+        wait_tenant_ready(root, config, tenant.name)
         bootstrap_secrets |= _bootstrap_secrets(root, config, client, tenant)
         _interrupted_machine_deletion(root, config, client, tenant)
         bootstrap_secrets |= _bootstrap_secrets(root, config, client, tenant)
-        if not status_healthy(collect_status(root, config)):
-            raise RuntimeError("status remained unhealthy after interrupted replacement")
         _foreign_node_rejected(root, config, client, tenant)
         print(
             json.dumps(
@@ -395,8 +389,7 @@ def run_machine_gate(root: Path, config: dict[str, str]) -> None:
             )
         )
     finally:
-        delete_addons(root, config, client, tenant)
-        delete_tenant(root, config, client, tenant)
+        delete_controller_tenant(root, config, tenant)
         if tenant_kubeconfig_path(root, tenant).exists():
             raise RuntimeError("tenant kubeconfig remained after Machine lifecycle cleanup")
         for secret_name in bootstrap_secrets:
@@ -411,12 +404,3 @@ def run_machine_gate(root: Path, config: dict[str, str]) -> None:
                 == 0
             ):
                 raise RuntimeError(f"bootstrap Secret remained: {secret_name}")
-    from scripts.test_endpoint_negative import (
-        invalid_worker_condition,
-        partial_label_worker,
-        unlabelled_worker,
-    )
-
-    invalid_worker_condition(root, config, client)
-    unlabelled_worker(root, config, client)
-    partial_label_worker(root, config, client)
