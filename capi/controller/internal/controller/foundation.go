@@ -192,6 +192,7 @@ func readFoundation(ctx context.Context, reader client.Reader, namespace, name s
 		return Foundation{}, fmt.Errorf("decode Tenant foundation: %w", err)
 	}
 	delete(immutable, "mutationEnabled")
+	delete(immutable, "controllerImage")
 	canonical, err := json.Marshal(immutable)
 	if err != nil {
 		return Foundation{}, fmt.Errorf("encode immutable Tenant foundation: %w", err)

@@ -224,12 +224,11 @@ func TestEndpointReleaseCrashWindowCompletesWithoutAllocationConfigMap(t *testin
 	}
 }
 
-func TestKubeconfigIsDeletedBeforeManagementRoots(t *testing.T) {
+func TestKubeconfigOwnershipMismatchBlocksTenantCleanup(t *testing.T) {
 	tenant := deletingTenant("tenant-a")
 	tenant.Status.FoundationHash = "foundation-hash"
 	tenant.Status.ClusterUID = "cluster-uid"
 	tenant.Status.TenantAPICreationAuthorized = true
-	tenant.Status.TenantCleanupClusterUID = tenant.Status.ClusterUID
 	foundation := testFoundation()
 	foundation.Hash = tenant.Status.FoundationHash
 	cluster := markedManagementObject(clusterGVK, tenant, foundation, "cluster", tenant.Name, "cluster-uid")
@@ -243,7 +242,7 @@ func TestKubeconfigIsDeletedBeforeManagementRoots(t *testing.T) {
 				APIVersion: controlPlaneGVK.GroupVersion().String(),
 				Kind:       controlPlaneGVK.Kind,
 				Name:       controlPlane.GetName(),
-				UID:        controlPlane.GetUID(),
+				UID:        "foreign-control-plane",
 			}},
 		},
 		Type: corev1.SecretType("cluster.x-k8s.io/secret"),
@@ -255,23 +254,18 @@ func TestKubeconfigIsDeletedBeforeManagementRoots(t *testing.T) {
 		WithObjects(tenant, cluster, controlPlane, secret).
 		Build()
 	reconciler := &TenantReconciler{
-		Client:    kubernetes,
-		APIReader: kubernetes,
-		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+		Client:        kubernetes,
+		APIReader:     kubernetes,
+		Docker:        &fakeDockerClient{volumes: map[string]DockerVolume{}},
+		TenantClients: staticClientFactory{client: kubernetes},
 	}
-	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err != nil {
-		t.Fatal(err)
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err == nil {
+		t.Fatal("foreign kubeconfig Secret owner was accepted")
 	}
-	var currentSecret corev1.Secret
-	if err := kubernetes.Get(context.Background(), client.ObjectKeyFromObject(secret), &currentSecret); !apierrors.IsNotFound(err) {
-		t.Fatalf("kubeconfig Secret remained: %v", err)
-	}
-	for _, object := range []*unstructured.Unstructured{cluster, controlPlane} {
-		current := &unstructured.Unstructured{}
-		current.SetGroupVersionKind(object.GroupVersionKind())
-		if err := kubernetes.Get(context.Background(), client.ObjectKeyFromObject(object), current); err != nil {
-			t.Fatalf("%s was deleted before kubeconfig Secret: %v", object.GetKind(), err)
-		}
+	current := &unstructured.Unstructured{}
+	current.SetGroupVersionKind(clusterGVK)
+	if err := kubernetes.Get(context.Background(), client.ObjectKeyFromObject(cluster), current); err != nil {
+		t.Fatalf("Cluster was deleted before kubeconfig ownership validation: %v", err)
 	}
 }
 
@@ -298,6 +292,14 @@ func simplifiedFinalizerScheme(t *testing.T) *runtime.Scheme {
 		scheme.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
 	}
 	return scheme
+}
+
+type staticClientFactory struct {
+	client client.Client
+}
+
+func (factory staticClientFactory) ClientFor([]byte, string) (client.Client, error) {
+	return factory.client, nil
 }
 
 func markedManagementObject(gvk schema.GroupVersionKind, tenant *tenancyv1alpha1.Tenant, foundation Foundation, resource, name, uid string) *unstructured.Unstructured {

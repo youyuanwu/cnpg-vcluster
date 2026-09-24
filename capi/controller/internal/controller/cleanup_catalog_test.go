@@ -5,14 +5,31 @@ import (
 	"errors"
 	"testing"
 
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
+
+type noMatchClient struct {
+	client.Client
+}
+
+func (value noMatchClient) Get(context.Context, client.ObjectKey, client.Object, ...client.GetOption) error {
+	return &meta.NoResourceMatchError{
+		PartialResource: schema.GroupVersionResource{
+			Group:    "postgresql.cnpg.io",
+			Version:  "v1",
+			Resource: "clusters",
+		},
+	}
+}
 
 func TestCleanupCatalogMatchesDesiredCoordinates(t *testing.T) {
 	foundation := testFoundation()
@@ -158,5 +175,29 @@ func TestValidateClusterUIDRejectsReplacement(t *testing.T) {
 	cluster.SetUID("replacement")
 	if err := validateClusterUID(tenant, cluster); err == nil {
 		t.Fatal("replacement Cluster UID was accepted")
+	}
+}
+
+func TestTenantCleanupTreatsRemovedCRDAsAuthoritativeAbsence(t *testing.T) {
+	tenant := testTenant()
+	absent, err := deleteTenantResources(
+		context.Background(),
+		noMatchClient{},
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+		[]cleanupCoordinate{{
+			GVK: schema.GroupVersionKind{
+				Group:   "postgresql.cnpg.io",
+				Version: "v1",
+				Kind:    "Cluster",
+			},
+			Namespace: "database",
+			Name:      "capi-postgres",
+			Resource:  "cnpg",
+		}},
+	)
+	if err != nil || !absent {
+		t.Fatalf("removed CRD was not treated as absence: absent=%v err=%v", absent, err)
 	}
 }

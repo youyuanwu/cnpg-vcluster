@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -123,7 +124,7 @@ func applyBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
 		case *rbacv1.RoleBinding:
 			existing := current.(*rbacv1.RoleBinding)
 			if !equality.Semantic.DeepEqual(existing.RoleRef, desired.RoleRef) ||
-				!equality.Semantic.DeepEqual(existing.Subjects, desired.Subjects) {
+				!bootstrapSubjectsEqual(existing.Subjects, desired.Subjects) {
 				desired.ResourceVersion = existing.ResourceVersion
 				if err := tenantClient.Update(ctx, desired); err != nil {
 					if apierrors.IsForbidden(err) {
@@ -161,7 +162,7 @@ func deleteBootstrapRBAC(ctx context.Context, tenantClient client.Client) (bool,
 		case *rbacv1.RoleBinding:
 			actual := current.(*rbacv1.RoleBinding)
 			if !equality.Semantic.DeepEqual(actual.RoleRef, expected.RoleRef) ||
-				!equality.Semantic.DeepEqual(actual.Subjects, expected.Subjects) {
+				!bootstrapSubjectsEqual(actual.Subjects, expected.Subjects) {
 				return false, fmt.Errorf("Tenant bootstrap RoleBinding %s ownership cannot be proven", expected.Name)
 			}
 		default:
@@ -191,4 +192,24 @@ func emptyBootstrapObject(object client.Object) (client.Object, error) {
 	default:
 		return nil, fmt.Errorf("unsupported Tenant bootstrap object %T", object)
 	}
+}
+
+func bootstrapSubjectsEqual(left, right []rbacv1.Subject) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	key := func(subject rbacv1.Subject) string {
+		return subject.APIGroup + "/" + subject.Kind + "/" + subject.Namespace + "/" + subject.Name
+	}
+	leftKeys := make([]string, 0, len(left))
+	rightKeys := make([]string, 0, len(right))
+	for _, subject := range left {
+		leftKeys = append(leftKeys, key(subject))
+	}
+	for _, subject := range right {
+		rightKeys = append(rightKeys, key(subject))
+	}
+	sort.Strings(leftKeys)
+	sort.Strings(rightKeys)
+	return equality.Semantic.DeepEqual(leftKeys, rightKeys)
 }

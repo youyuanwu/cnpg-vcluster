@@ -32,11 +32,15 @@ def _apply(
     return document
 
 
-def _snapshot(client: ManagementClient, name: str) -> dict[str, object]:
+def _snapshot(
+    config: dict[str, str],
+    client: ManagementClient,
+    name: str,
+) -> dict[str, object]:
     document = tenant_document(client, name)
     if document is None:
         raise RuntimeError(f"Tenant is absent: {name}")
-    return tenant_snapshot(document)
+    return tenant_snapshot(config, client, document)
 
 
 def _drift_kube_proxy(root: Path, config: dict[str, str], name: str) -> None:
@@ -71,13 +75,13 @@ def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
             _apply(root, config, name)
 
         survivors = {
-            name: _snapshot(client, name)
+            name: _snapshot(config, client, name)
             for name in ("tenant-a", "tenant-b")
         }
-        first_tenant_c_uid = _snapshot(client, "tenant-c")["uid"]
+        first_tenant_c_uid = _snapshot(config, client, "tenant-c")["uid"]
         delete_controller_tenant(root, config, "tenant-c")
         for name, before in survivors.items():
-            if _snapshot(client, name) != before:
+            if _snapshot(config, client, name) != before:
                 raise RuntimeError(f"targeted deletion changed survivor: {name}")
 
         recreated = _apply(root, config, "tenant-c")

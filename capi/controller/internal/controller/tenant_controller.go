@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -22,6 +23,11 @@ import (
 )
 
 const tenantFinalizer = "tenancy.cnpg-vcluster.io/finalizer"
+const progressRequeueInterval = time.Second
+
+func progressRequeue() ctrl.Result {
+	return ctrl.Result{RequeueAfter: progressRequeueInterval}
+}
 
 // +kubebuilder:rbac:groups=tenancy.cnpg-vcluster.io,resources=tenants,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=tenancy.cnpg-vcluster.io,resources=tenants/status,verbs=get;update;patch
@@ -52,7 +58,7 @@ type TenantReconciler struct {
 
 func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	var tenant tenancyv1alpha1.Tenant
-	if err := reconciler.Get(ctx, types.NamespacedName{Name: request.Name}, &tenant); err != nil {
+	if err := reconciler.reader().Get(ctx, types.NamespacedName{Name: request.Name}, &tenant); err != nil {
 		if ignored := client.IgnoreNotFound(err); ignored != nil {
 			return ctrl.Result{}, fmt.Errorf("%s", sanitize.Text(ignored.Error()))
 		}
@@ -105,10 +111,10 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		if err := reconciler.Update(ctx, updated); err != nil {
 			return ctrl.Result{}, fmt.Errorf("%s", sanitize.Text(err.Error()))
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return progressRequeue(), nil
 	}
 	if tenant.Status.FoundationHash == "" {
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.FoundationHash = foundation.Hash
 			return nil
 		})
@@ -135,7 +141,7 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 				"error",
 				sanitize.Text(err.Error()),
 			)
-			return ctrl.Result{Requeue: true}, nil
+			return progressRequeue(), nil
 		}
 		if errors.Is(err, errImmutableDrift) {
 			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "ImmutableDrift", err)

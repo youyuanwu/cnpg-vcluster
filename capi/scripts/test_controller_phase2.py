@@ -60,7 +60,10 @@ def _tenant(client: ManagementClient) -> dict[str, object] | None:
     return json.loads(response.stdout)
 
 
-def _workers_applied(client: ManagementClient) -> dict[str, object] | None:
+def _converging(
+    client: ManagementClient,
+    config: dict[str, str],
+) -> dict[str, object] | None:
     tenant = _tenant(client)
     if tenant is None:
         return None
@@ -69,25 +72,38 @@ def _workers_applied(client: ManagementClient) -> dict[str, object] | None:
         raise RuntimeError(
             f"Phase 2 Tenant failed: {json.dumps(status, sort_keys=True)}"
         )
-    accepted_stages = {
-        "WorkersApplied",
-        "NetworkReady",
-        "PostCNIWorkersReady",
-        "StorageApplied",
-        "StorageReady",
-        "CNPGOperatorApplied",
-        "CNPGStoragePrepared",
-        "CNPGClusterApplied",
-        "DatabaseReady",
-        "Ready",
-    }
-    if status.get("stage") not in accepted_stages:
+    if not all(
+        (
+            status.get("endpoint"),
+            status.get("foundationHash"),
+            status.get("clusterUID"),
+            status.get("tenantAPICreationAuthorized") is True,
+        )
+    ):
         return None
-    workers = status.get("workerContainers") or []
-    if len(workers) != 1 or not workers[0].get("id"):
-        raise RuntimeError("Phase 2 worker container reference is incomplete")
-    if not status.get("dockerVolume") or not status.get("endpoint"):
-        raise RuntimeError("Phase 2 endpoint or Docker volume identity is missing")
+    workers = run(
+        [
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            f"label=io.x-k8s.kind.cluster={TENANT_NAME}",
+            "--filter",
+            "label=io.x-k8s.kind.role=worker",
+            "--format",
+            "{{.ID}}",
+        ],
+        timeout=30,
+    ).stdout.split()
+    if len(workers) != 1:
+        return None
+    volume = _volume_name(config)
+    if run(
+        ["docker", "volume", "inspect", volume],
+        timeout=30,
+        check=False,
+    ).returncode != 0:
+        return None
     ready = next(
         (
             condition
@@ -96,11 +112,15 @@ def _workers_applied(client: ManagementClient) -> dict[str, object] | None:
         ),
         None,
     )
-    if status.get("stage") == "WorkersApplied" and (
+    if status.get("phase") != "Ready" and (
         ready is None or ready.get("status") != "False"
     ):
-        raise RuntimeError("Phase 2 incorrectly reported the Tenant Ready")
+        raise RuntimeError("converging Tenant incorrectly reported Ready")
     return tenant
+
+
+def _volume_name(config: dict[str, str]) -> str:
+    return f"{config['LAB_PREFIX']}-{TENANT_NAME}-storage"
 
 
 def _absent(client: ManagementClient) -> bool | None:
@@ -172,7 +192,7 @@ def main() -> None:
                     parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"])
                     + parse_duration(config["WORKER_REGISTRATION_TIMEOUT"]),
                     parse_duration(config["WAIT_POLL_INTERVAL"]),
-                    lambda: _workers_applied(client),
+                    lambda: _converging(client, config),
                 )
             except RuntimeError as exc:
                 tenant = _tenant(client)
@@ -182,7 +202,8 @@ def main() -> None:
                     f"{json.dumps(status, sort_keys=True)}"
                 ) from exc
             endpoint = first["status"]["endpoint"]
-            volume = first["status"]["dockerVolume"]["name"]
+            cluster_uid = first["status"]["clusterUID"]
+            volume = _volume_name(config)
             client.kubectl(
                 "apply",
                 "--server-side",
@@ -196,11 +217,11 @@ def main() -> None:
                 "idempotent Tenant Phase 2 status",
                 parse_duration(config["CONDITION_TIMEOUT"]),
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
-                lambda: _workers_applied(client),
+                lambda: _converging(client, config),
             )
             if (
                 second["status"]["endpoint"] != endpoint
-                or second["status"]["dockerVolume"]["name"] != volume
+                or second["status"]["clusterUID"] != cluster_uid
             ):
                 raise RuntimeError("Phase 2 idempotent reconcile changed stable identity")
             delete_tenant_resource(client, TENANT_NAME, wait=False)

@@ -51,18 +51,30 @@ func (reconciler *TenantReconciler) reconcileWorkers(
 		{resources.DevMachineTemplate(resourceContext), "dev-machine-template"},
 		{resources.MachineDeployment(resourceContext), "machine-deployment"},
 	} {
-		if _, changed, err := reconciler.ensureManagementObject(ctx, desired.object, tenant, specHash, foundation, desired.resource); err != nil || changed {
-			return ctrl.Result{Requeue: changed}, err
+		if _, changed, err := reconciler.ensureManagementObject(ctx, desired.object, tenant, specHash, foundation, desired.resource); err != nil {
+			return ctrl.Result{}, err
+		} else if changed {
+			return progressRequeue(), nil
 		}
 	}
 	machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
 	if err != nil {
 		if errors.Is(err, errWorkerRuntimePending) {
+			ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "worker-runtime")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
+		ctrl.LoggerFrom(ctx).V(1).Info(
+			"waiting for Tenant component",
+			"component",
+			"worker-inventory",
+			"machines",
+			len(machines),
+			"containers",
+			len(containers),
+		)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return reconciler.reconcileNetwork(ctx, tenantClient, tenant, canonical, specHash, foundation)

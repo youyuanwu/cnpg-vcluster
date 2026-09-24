@@ -28,7 +28,7 @@ func (reconciler *TenantReconciler) reconcileStorage(
 			return ctrl.Result{}, err
 		}
 		if changed {
-			return ctrl.Result{Requeue: true}, nil
+			return progressRequeue(), nil
 		}
 	}
 	return reconciler.reconcileCNPG(ctx, tenantClient, tenant, canonical, specHash, foundation)

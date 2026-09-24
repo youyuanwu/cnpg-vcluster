@@ -444,6 +444,8 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             original_hash = payload["data"]["foundation.sha256"]
             data["mutationEnabled"] = not data["mutationEnabled"]
             self.assertEqual(original_hash, _foundation_checksum(data))
+            data["controllerImage"] = "controller:replacement"
+            self.assertEqual(original_hash, _foundation_checksum(data))
 
     def test_public_apply_uses_all_lifecycle_locks(self) -> None:
         calls = []

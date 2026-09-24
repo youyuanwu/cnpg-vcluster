@@ -36,7 +36,7 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 		if err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.Endpoint = endpoint
 			return nil
 		})
@@ -44,19 +44,25 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 
 	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
 	changed, err := reconciler.ensureNamespace(ctx, resources.Namespace(resourceContext), tenant, specHash, foundation)
-	if err != nil || changed {
-		return ctrl.Result{Requeue: changed}, err
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if changed {
+		return progressRequeue(), nil
 	}
 	cluster, err := resources.Cluster(resourceContext)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	currentCluster, changed, err := reconciler.ensureManagementObject(ctx, cluster, tenant, specHash, foundation, "cluster")
-	if err != nil || changed {
-		return ctrl.Result{Requeue: changed}, err
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if changed {
+		return progressRequeue(), nil
 	}
 	if tenant.Status.ClusterUID == "" {
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.ClusterUID = string(currentCluster.GetUID())
 			return nil
 		})
@@ -66,11 +72,13 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if _, changed, err := reconciler.ensureManagementObject(ctx, devCluster, tenant, specHash, foundation, "dev-cluster"); err != nil || changed {
-		return ctrl.Result{Requeue: changed}, err
+	if _, changed, err := reconciler.ensureManagementObject(ctx, devCluster, tenant, specHash, foundation, "dev-cluster"); err != nil {
+		return ctrl.Result{}, err
+	} else if changed {
+		return progressRequeue(), nil
 	}
 	if !tenant.Status.TenantAPICreationAuthorized {
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.TenantAPICreationAuthorized = true
 			return nil
 		})
@@ -80,18 +88,23 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 		return ctrl.Result{}, err
 	}
 	currentControlPlane, changed, err := reconciler.ensureManagementObject(ctx, controlPlane, tenant, specHash, foundation, "kamaji-control-plane")
-	if err != nil || changed {
-		return ctrl.Result{Requeue: changed}, err
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	current, err := reconciler.managementObjectsCurrent(ctx, tenant, specHash, foundation)
+	if changed {
+		return progressRequeue(), nil
+	}
+	current, err := reconciler.managementControlPlaneCurrent(ctx, tenant, specHash, foundation)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if !current {
+		ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "management-control-plane")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	tenantClient, secret, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
 	if apierrors.IsNotFound(err) {
+		ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "kubeconfig")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if err != nil {
@@ -102,6 +115,7 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 	}
 	if err := applyBootstrapRBAC(ctx, tenantClient); err != nil {
 		if errors.Is(err, errTenantAdministrativeAccessPending) {
+			ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "bootstrap-rbac")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
@@ -110,6 +124,14 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 }
 
 func (reconciler *TenantReconciler) managementObjectsCurrent(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
+	return reconciler.managementObjectsReady(ctx, tenant, specHash, foundation, true)
+}
+
+func (reconciler *TenantReconciler) managementControlPlaneCurrent(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
+	return reconciler.managementObjectsReady(ctx, tenant, specHash, foundation, false)
+}
+
+func (reconciler *TenantReconciler) managementObjectsReady(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation, requireClusterAvailable bool) (bool, error) {
 	for _, item := range []struct {
 		gvk      schema.GroupVersionKind
 		resource string
@@ -161,7 +183,7 @@ func (reconciler *TenantReconciler) managementObjectsCurrent(ctx context.Context
 				continue
 			}
 			conditionType, _ := condition["type"].(string)
-			if conditionType != "Ready" && conditionType != "Available" && conditionType != "ControlPlaneReady" {
+			if !containsString(managementReadinessConditionTypes(item.gvk.Kind, requireClusterAvailable), conditionType) {
 				continue
 			}
 			readinessFound = true
@@ -184,6 +206,16 @@ func (reconciler *TenantReconciler) managementObjectsCurrent(ctx context.Context
 		}
 	}
 	return true, nil
+}
+
+func managementReadinessConditionTypes(kind string, requireClusterAvailable bool) []string {
+	if kind == "Cluster" {
+		if requireClusterAvailable {
+			return []string{"Available"}
+		}
+		return []string{"ControlPlaneAvailable", "ControlPlaneReady"}
+	}
+	return []string{"Ready", "Available", "ControlPlaneReady"}
 }
 
 func observedGenerationIsCurrent(object *unstructured.Unstructured) bool {
@@ -256,6 +288,15 @@ func (reconciler *TenantReconciler) ensureManagementObject(
 	if desiredMatchesCurrent(desired, current) {
 		return current, false, nil
 	}
+	ctrl.LoggerFrom(ctx).Info(
+		"repairing management resource drift",
+		"kind",
+		desired.GetKind(),
+		"name",
+		desired.GetName(),
+		"mismatch",
+		desiredMismatchPath(desired, current),
+	)
 	applied := desired.DeepCopy()
 	applied.SetUID(current.GetUID())
 	applied.SetResourceVersion(current.GetResourceVersion())

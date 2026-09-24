@@ -49,7 +49,7 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 			return ctrl.Result{}, err
 		}
 		if changed {
-			return ctrl.Result{Requeue: true}, nil
+			return progressRequeue(), nil
 		}
 	}
 	deployment := &unstructured.Unstructured{}
@@ -85,7 +85,7 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 		if err := reconciler.execRequired(ctx, containers[0].ID, []string{"sh", "-ec", command}); err != nil {
 			return ctrl.Result{}, err
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return progressRequeue(), nil
 	}
 	for _, desired := range resources.CNPGObjects(resourceContext, tenantStorageClass, postgresImage.Reference) {
 		changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
@@ -93,7 +93,7 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 			return ctrl.Result{}, err
 		}
 		if changed {
-			return ctrl.Result{Requeue: true}, nil
+			return progressRequeue(), nil
 		}
 	}
 	ready, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount, postgresImage.Reference)

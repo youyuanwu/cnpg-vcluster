@@ -3,6 +3,7 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
+from subprocess import CompletedProcess
 from unittest.mock import patch
 
 from scripts.endpoint import run_endpoint_gate
@@ -17,6 +18,7 @@ def tenant_document() -> dict[str, object]:
     return {
         "metadata": {"name": "tenant-a", "uid": "tenant-uid"},
         "spec": {
+            "kubernetesVersion": "1.36.4",
             "workers": 2,
             "databaseCount": 3,
             "podCIDR": "10.73.0.0/16",
@@ -24,25 +26,9 @@ def tenant_document() -> dict[str, object]:
         },
         "status": {
             "endpoint": "172.18.255.10:6443",
-            "specHash": "spec",
             "foundationHash": "foundation",
-            "dockerVolume": {
-                "name": "tenant-a-storage",
-                "mountpoint": "/var/lib/docker/volumes/tenant-a/_data",
-            },
-            "observedResources": [
-                {
-                    "apiVersion": "v1",
-                    "kind": "Namespace",
-                    "name": "tenant-a",
-                    "uid": "namespace-uid",
-                }
-            ],
-            "tenantResources": [],
-            "workerContainers": [
-                {"name": "worker-b", "id": "container-b"},
-                {"name": "worker-a", "id": "container-a"},
-            ],
+            "clusterUID": "cluster-uid",
+            "tenantAPICreationAuthorized": True,
         },
     }
 
@@ -65,31 +51,80 @@ class ControllerScenarioTests(unittest.TestCase):
             self.assertEqual("tenant-a", manifest_tenant_name(path))
 
     def test_tenant_is_derived_from_controller_status(self) -> None:
-        tenant = tenant_from_document(
-            Path("."),
-            {
-                "SPIKE_API_PORT": "6443",
-                "SPIKE_CLUSTER_DOMAIN": "spike.capi.local",
-                "SPIKE_CNPG_CLUSTER": "capi-postgres",
-            },
-            tenant_document(),
-        )
+        with patch(
+            "scripts.lib.controller_scenarios.run",
+            return_value=CompletedProcess(
+                [],
+                0,
+                stdout='[{"Mountpoint":"/var/lib/docker/volumes/tenant-a/_data"}]',
+                stderr="",
+            ),
+        ):
+            tenant = tenant_from_document(
+                Path("."),
+                {
+                    "LAB_PREFIX": "lab",
+                    "SPIKE_API_PORT": "6443",
+                    "SPIKE_CLUSTER_DOMAIN": "spike.capi.local",
+                    "SPIKE_CNPG_CLUSTER": "capi-postgres",
+                },
+                tenant_document(),
+            )
         self.assertEqual("tenant-a", tenant.name)
         self.assertEqual("172.18.255.10", tenant.vip)
         self.assertEqual("10.143.0.10", tenant.dns_ip)
         self.assertEqual(2, tenant.workers)
         self.assertEqual(3, tenant.database_count)
 
-    def test_snapshot_sorts_identity_inventories(self) -> None:
-        snapshot = tenant_snapshot(tenant_document())
+    def test_snapshot_uses_live_management_and_host_identities(self) -> None:
+        class Client:
+            def __init__(self) -> None:
+                self.index = 0
+
+            def kubectl(self, *_arguments):
+                self.index += 1
+                return CompletedProcess(
+                    [],
+                    0,
+                    stdout=(
+                        '{"metadata":{"uid":"resource-'
+                        + str(self.index)
+                        + '"}}'
+                    ),
+                    stderr="",
+                )
+
+        with patch(
+            "scripts.lib.controller_scenarios.run",
+            side_effect=[
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout='[{"Name":"volume","CreatedAt":"now","Mountpoint":"/volume","Labels":{"owned":"true"}}]',
+                    stderr="",
+                ),
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout="worker-b bbbb\nworker-a aaaa\n",
+                    stderr="",
+                ),
+            ],
+        ):
+            snapshot = tenant_snapshot(
+                {"LAB_PREFIX": "lab"},
+                Client(),
+                tenant_document(),
+            )
         self.assertEqual("tenant-uid", snapshot["uid"])
         self.assertEqual(
             [
-                ("worker-a", "container-a"),
-                ("worker-b", "container-b"),
+                "worker-a aaaa",
+                "worker-b bbbb",
             ],
             snapshot["workerContainers"],
         )
+        self.assertEqual(8, len(snapshot["managementResources"]))
 
     def test_endpoint_gate_cleans_partially_applied_tenant(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

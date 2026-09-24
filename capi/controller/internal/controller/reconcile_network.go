@@ -45,7 +45,7 @@ func (reconciler *TenantReconciler) reconcileNetwork(
 			return ctrl.Result{}, err
 		}
 		if changed {
-			return ctrl.Result{Requeue: true}, nil
+			return progressRequeue(), nil
 		}
 	}
 	ready, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
@@ -53,6 +53,7 @@ func (reconciler *TenantReconciler) reconcileNetwork(
 		return ctrl.Result{}, err
 	}
 	if !ready {
+		ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "network")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return reconciler.reconcilePostCNIWorkers(ctx, tenantClient, tenant, canonical, specHash, foundation)

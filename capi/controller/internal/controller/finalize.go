@@ -38,7 +38,7 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 		if !present {
 			return ctrl.Result{}, reconciler.removeTenantFinalizer(ctx, tenant.Name)
 		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.FoundationHash = foundation.Hash
 			return nil
 		})
@@ -52,7 +52,7 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 		return ctrl.Result{}, err
 	}
 	if cluster != nil && tenant.Status.ClusterUID == "" {
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.ClusterUID = string(cluster.GetUID())
 			return nil
 		})
@@ -62,7 +62,7 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 			return ctrl.Result{}, fmt.Errorf("tenant API creation was authorized but Cluster identity is missing")
 		}
 		if tenant.Status.TenantCleanupClusterUID != tenant.Status.ClusterUID {
-			tenantClient, _, err := tenantClientFromSecret(
+			tenantClient, secret, err := tenantClientFromSecret(
 				ctx,
 				reconciler.reader(),
 				reconciler.tenantFactory(),
@@ -72,6 +72,17 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 			)
 			if err != nil {
 				return ctrl.Result{}, fmt.Errorf("Tenant API cleanup is blocked: %w", err)
+			}
+			controlPlane := &unstructured.Unstructured{}
+			controlPlane.SetGroupVersionKind(controlPlaneGVK)
+			if err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name}, controlPlane); err != nil {
+				return ctrl.Result{}, fmt.Errorf("read KamajiControlPlane before Tenant API cleanup: %w", err)
+			}
+			if err := validateRootOwnership(controlPlane, tenant, specHash, foundation.Hash, "kamaji-control-plane", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
+				return ctrl.Result{}, err
+			}
+			if err := validateKubeconfigSecret(secret, controlPlane); err != nil {
+				return ctrl.Result{}, err
 			}
 			calico, err := os.ReadFile("/assets/calico.yaml")
 			if err != nil {
@@ -106,7 +117,7 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 			if !complete {
 				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 			}
-			return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 				status.TenantCleanupClusterUID = status.ClusterUID
 				return nil
 			})
@@ -117,13 +128,6 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 		}
 	}
 
-	secretAbsent, err := reconciler.deleteKubeconfigSecret(ctx, tenant, specHash, foundation)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if !secretAbsent {
-		return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-	}
 	clusterAbsent, err := reconciler.deleteExactUnstructured(ctx, tenant, specHash, foundation, clusterGVK, tenant.Name, tenant.Name, "cluster")
 	if err != nil {
 		return ctrl.Result{}, err
@@ -168,7 +172,7 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 		return ctrl.Result{}, err
 	}
 	if tenant.Status.Endpoint != "" {
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.Endpoint = ""
 			return nil
 		})
@@ -314,40 +318,6 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 		return false, fmt.Errorf("Tenant endpoint allocation is missing before terminal cleanup")
 	}
 	return present, nil
-}
-
-func (reconciler *TenantReconciler) deleteKubeconfigSecret(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
-	var secret corev1.Secret
-	err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name + "-kubeconfig"}, &secret)
-	if apierrors.IsNotFound(err) {
-		return true, nil
-	}
-	if err != nil {
-		return false, err
-	}
-	controlPlane := &unstructured.Unstructured{}
-	controlPlane.SetGroupVersionKind(controlPlaneGVK)
-	if err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name}, controlPlane); err != nil {
-		return false, fmt.Errorf("read KamajiControlPlane before kubeconfig deletion: %w", err)
-	}
-	if err := validateRootOwnership(controlPlane, tenant, specHash, foundation.Hash, "kamaji-control-plane", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-		return false, err
-	}
-	if err := validateKubeconfigSecret(&secret, controlPlane); err != nil {
-		return false, err
-	}
-	if secret.DeletionTimestamp != nil {
-		return false, nil
-	}
-	uid := secret.UID
-	resourceVersion := secret.ResourceVersion
-	err = reconciler.Delete(ctx, &secret, &client.DeleteOptions{
-		Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
-	})
-	if err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
-		return false, err
-	}
-	return false, nil
 }
 
 func (reconciler *TenantReconciler) removeTenantFinalizer(ctx context.Context, name string) error {

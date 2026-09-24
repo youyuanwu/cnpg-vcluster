@@ -166,6 +166,7 @@ func foundationConfigMap(t *testing.T, foundation Foundation) *corev1.ConfigMap 
 		t.Fatal(err)
 	}
 	delete(immutable, "mutationEnabled")
+	delete(immutable, "controllerImage")
 	canonical, err := json.Marshal(immutable)
 	if err != nil {
 		t.Fatal(err)

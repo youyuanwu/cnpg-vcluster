@@ -233,6 +233,49 @@ def check_repository_boundaries() -> None:
             token not in production_python,
             f"obsolete callable local mutator remains: {token}",
         )
+    controller_python = "\n".join(
+        (ROOT / relative).read_text(encoding="utf-8")
+        for relative in (
+            "scripts/lib/controller_scenarios.py",
+            "scripts/test_controller_phase2.py",
+            "scripts/test_controller_phase3.py",
+            "scripts/test_controller_deletion.py",
+            "scripts/test_tenant_lifecycle.py",
+        )
+    )
+    for token in (
+        'status.get("stage")',
+        'status.get("observedResources")',
+        'status.get("tenantResources")',
+        'status.get("dockerVolume")',
+        'status.get("workerContainers")',
+        'status.get("teardown")',
+        'status.get("specHash")',
+    ):
+        check(
+            token not in controller_python,
+            f"controller scenario still consumes removed status field: {token}",
+        )
+    controller_go = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "controller").rglob("*.go")
+        if not path.name.endswith("_test.go")
+    )
+    for token in (
+        ".Status.Stage",
+        ".ObservedResources",
+        ".TenantResources",
+        "DockerVolumeIdentity",
+        "WorkerContainerEvidence",
+        "TeardownStatus",
+        "TenantAPICleanupUnavailable",
+        "LiveBootstrapRBACCleanupComplete",
+        "reconcileStableDesiredObjects",
+    ):
+        check(
+            token not in controller_go,
+            f"simplified controller restored removed workflow state: {token}",
+        )
     check(
         "def delete_tenant(" not in (
             ROOT / "scripts" / "lib" / "tenants.py"

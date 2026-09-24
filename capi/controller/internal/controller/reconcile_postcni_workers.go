@@ -43,6 +43,15 @@ func (reconciler *TenantReconciler) reconcilePostCNIWorkers(
 		return ctrl.Result{}, err
 	}
 	if !state.inventoryComplete || !state.allReady {
+		ctrl.LoggerFrom(ctx).V(1).Info(
+			"waiting for Tenant component",
+			"component",
+			"post-cni-workers",
+			"inventoryComplete",
+			state.inventoryComplete,
+			"allReady",
+			state.allReady,
+		)
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return reconciler.reconcileStorage(ctx, tenantClient, tenant, canonical, specHash, foundation)

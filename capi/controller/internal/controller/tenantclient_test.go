@@ -46,6 +46,7 @@ func TestBootstrapRBACDeletionRefusesForeignReplacement(t *testing.T) {
 	if err := rbacv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
 	}
+
 	foreign := &rbacv1.Role{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:            "kubeadm:nodes-kubeadm-config",
@@ -66,5 +67,20 @@ func TestBootstrapRBACDeletionRefusesForeignReplacement(t *testing.T) {
 	var current rbacv1.Role
 	if err := tenantClient.Get(context.Background(), client.ObjectKeyFromObject(foreign), &current); err != nil {
 		t.Fatalf("foreign bootstrap Role was not preserved: %v", err)
+	}
+}
+
+func TestBootstrapSubjectsMatchRegardlessOfOrder(t *testing.T) {
+	left := []rbacv1.Subject{
+		{APIGroup: rbacv1.GroupName, Kind: "Group", Name: "system:nodes"},
+		{APIGroup: rbacv1.GroupName, Kind: "Group", Name: "system:bootstrappers:kubeadm:default-node-token"},
+	}
+	right := []rbacv1.Subject{left[1], left[0]}
+	if !bootstrapSubjectsEqual(left, right) {
+		t.Fatal("equivalent bootstrap subjects were order-sensitive")
+	}
+	right[0].Name = "foreign"
+	if bootstrapSubjectsEqual(left, right) {
+		t.Fatal("foreign bootstrap subject was accepted")
 	}
 }

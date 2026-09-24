@@ -34,6 +34,7 @@ CONTROLLER_LIFECYCLE_EPOCH = "desired-state-v2"
 def _foundation_checksum(data: dict[str, object]) -> str:
     immutable = dict(data)
     immutable.pop("mutationEnabled", None)
+    immutable.pop("controllerImage", None)
     encoded = json.dumps(immutable, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()
 

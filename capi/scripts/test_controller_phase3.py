@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.controller import delete_tenant_resource, set_controller_mutation
+from scripts.lib.controller_scenarios import tenant_snapshot
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.locking import profile_lock, tools_lock
 from scripts.lib.redaction import redact
@@ -40,7 +41,7 @@ def _ready(client: ManagementClient) -> dict[str, object] | None:
         raise RuntimeError(
             f"Phase 3 Tenant failed: {json.dumps(status, sort_keys=True)}"
         )
-    if status.get("stage") != "Ready" or status.get("phase") != "Ready":
+    if status.get("phase") != "Ready":
         return None
     ready = next(
         (
@@ -52,8 +53,11 @@ def _ready(client: ManagementClient) -> dict[str, object] | None:
     )
     if ready.get("status") != "True":
         raise RuntimeError("Phase 3 Ready condition is not true")
-    if not status.get("tenantResources"):
-        raise RuntimeError("Phase 3 exact tenant identities are incomplete")
+    metadata = tenant.get("metadata") or {}
+    if ready.get("observedGeneration") != metadata.get("generation"):
+        raise RuntimeError("Phase 3 Ready condition generation is stale")
+    if not status.get("clusterUID") or not status.get("foundationHash"):
+        raise RuntimeError("Phase 3 root identity is incomplete")
     return tenant
 
 
@@ -97,13 +101,7 @@ def main() -> None:
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: _ready(client),
             )
-            identities = {
-                (item["apiVersion"], item["kind"], item.get("namespace", ""), item["name"]): item["uid"]
-                for item in [
-                    *(first["status"].get("observedResources") or []),
-                    *(first["status"].get("tenantResources") or []),
-                ]
-            }
+            identities = tenant_snapshot(config, client, first)
             client.kubectl(
                 "-n",
                 "tenant-system",
@@ -125,13 +123,7 @@ def main() -> None:
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: _ready(client),
             )
-            after = {
-                (item["apiVersion"], item["kind"], item.get("namespace", ""), item["name"]): item["uid"]
-                for item in [
-                    *(second["status"].get("observedResources") or []),
-                    *(second["status"].get("tenantResources") or []),
-                ]
-            }
+            after = tenant_snapshot(config, client, second)
             if after != identities:
                 raise RuntimeError("Phase 3 identities changed across controller restart")
             status = client.kubectl(
