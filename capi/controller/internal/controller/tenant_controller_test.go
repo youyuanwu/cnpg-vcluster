@@ -141,3 +141,33 @@ func TestImmutableDriftPublishesBoundedDegradedCondition(t *testing.T) {
 		t.Fatalf("unexpected immutable drift condition: %#v", condition)
 	}
 }
+
+func TestTenantCleanupFailurePublishesRecoveryCondition(t *testing.T) {
+	tenant := validTenant("tenant-a")
+	tenant.Generation = 2
+	client := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant).
+		Build()
+	reconciler := &TenantReconciler{Client: client, APIReader: client}
+	if err := reconciler.failure(
+		context.Background(),
+		tenant,
+		"spec-hash",
+		tenancyv1alpha1.PhaseDeleting,
+		"TenantCleanupBlocked",
+		errTenantCleanupBlocked,
+	); err == nil {
+		t.Fatal("failure helper unexpectedly returned nil")
+	}
+	var updated tenancyv1alpha1.Tenant
+	if err := client.Get(context.Background(), types.NamespacedName{Name: tenant.Name}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if condition == nil || condition.Reason != "TenantCleanupBlocked" ||
+		condition.ObservedGeneration != tenant.Generation {
+		t.Fatalf("unexpected tenant cleanup condition: %#v", condition)
+	}
+}

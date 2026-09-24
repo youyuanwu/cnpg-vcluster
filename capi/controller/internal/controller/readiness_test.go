@@ -27,7 +27,8 @@ func TestManagementReadinessSeparatesControlPlaneFromWorkers(t *testing.T) {
 }
 
 func TestReadyAndDegradedTenantsUseBoundedResync(t *testing.T) {
-	if readyObservationInterval != 30*time.Second {
-		t.Fatalf("unexpected readiness resync interval: %s", readyObservationInterval)
+	result := readinessRequeue()
+	if result.RequeueAfter != 30*time.Second || result.Requeue {
+		t.Fatalf("unexpected readiness resync result: %#v", result)
 	}
 }

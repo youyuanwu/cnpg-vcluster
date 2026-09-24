@@ -196,7 +196,7 @@ func validateKubeconfigSecret(secret *corev1.Secret, controlPlane *unstructured.
 		return fmt.Errorf("Tenant kubeconfig Secret contract is invalid")
 	}
 	if controlPlane == nil || !hasOwnerUID(secret.OwnerReferences, controlPlane.GetUID()) {
-		return fmt.Errorf("Tenant kubeconfig Secret owner cannot be proven")
+		return fmt.Errorf("Tenant kubeconfig Secret ownership cannot be proven")
 	}
 	return nil
 }

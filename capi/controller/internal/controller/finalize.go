@@ -85,7 +85,10 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 				return ctrl.Result{}, err
 			}
 			if err := validateKubeconfigSecret(secret, controlPlane); err != nil {
-				return ctrl.Result{}, err
+				if isOwnershipError(err) {
+					return ctrl.Result{}, err
+				}
+				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
 			}
 			calico, err := os.ReadFile("/assets/calico.yaml")
 			if err != nil {
@@ -291,7 +294,11 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 			if err := validateClusterUID(tenant, object); err != nil {
 				return false, err
 			}
-		} else if err := validateProviderOwner(ctx, reconciler.reader(), object, tenant.Name, false); err != nil {
+		} else if tenant.Status.ClusterUID == "" {
+			if err := validateProviderOwner(ctx, reconciler.reader(), object, tenant.Name, false); err != nil {
+				return false, err
+			}
+		} else if err := validateProviderOwnerForDeletion(ctx, reconciler.reader(), object, tenant); err != nil {
 			return false, err
 		}
 		if item.gvk == controlPlaneGVK {

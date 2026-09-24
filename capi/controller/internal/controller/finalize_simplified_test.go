@@ -400,19 +400,15 @@ func TestManagementChildDeletionRefusesWrongProviderOwner(t *testing.T) {
 	}})
 	kubernetes := fake.NewClientBuilder().
 		WithScheme(simplifiedFinalizerScheme(t)).
-		WithObjects(controlPlane).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, controlPlane).
 		Build()
-	reconciler := &TenantReconciler{Client: kubernetes, APIReader: kubernetes}
-	if _, err := reconciler.deleteExactUnstructured(
-		context.Background(),
-		tenant,
-		"spec-hash",
-		foundation,
-		controlPlaneGVK,
-		tenant.Name,
-		tenant.Name,
-		"kamaji-control-plane",
-	); err == nil {
+	reconciler := &TenantReconciler{
+		Client:    kubernetes,
+		APIReader: kubernetes,
+		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err == nil {
 		t.Fatal("wrong-owner management child was deleted")
 	}
 
@@ -427,6 +423,8 @@ func TestManagementChildDeletionAcceptsRecordedDanglingClusterOwner(t *testing.T
 	tenant := deletingTenant("tenant-a")
 	tenant.Status.FoundationHash = "foundation-hash"
 	tenant.Status.ClusterUID = "cluster-uid"
+	tenant.Status.TenantAPICreationAuthorized = true
+	tenant.Status.TenantCleanupClusterUID = tenant.Status.ClusterUID
 	foundation := testFoundation()
 	foundation.Hash = tenant.Status.FoundationHash
 	controlPlane := markedManagementObject(
@@ -445,21 +443,16 @@ func TestManagementChildDeletionAcceptsRecordedDanglingClusterOwner(t *testing.T
 	}})
 	kubernetes := fake.NewClientBuilder().
 		WithScheme(simplifiedFinalizerScheme(t)).
-		WithObjects(controlPlane).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant, controlPlane).
 		Build()
-	reconciler := &TenantReconciler{Client: kubernetes, APIReader: kubernetes}
-	absent, err := reconciler.deleteExactUnstructured(
-		context.Background(),
-		tenant,
-		"spec-hash",
-		foundation,
-		controlPlaneGVK,
-		tenant.Name,
-		tenant.Name,
-		"kamaji-control-plane",
-	)
-	if err != nil || absent {
-		t.Fatalf("recorded dangling owner was not accepted: absent=%v err=%v", absent, err)
+	reconciler := &TenantReconciler{
+		Client:    kubernetes,
+		APIReader: kubernetes,
+		Docker:    &fakeDockerClient{volumes: map[string]DockerVolume{}},
+	}
+	if _, err := reconciler.finalizeTenant(context.Background(), tenant, "spec-hash", foundation); err != nil {
+		t.Fatalf("recorded dangling owner was not accepted: %v", err)
 	}
 	current := &unstructured.Unstructured{}
 	current.SetGroupVersionKind(controlPlaneGVK)
