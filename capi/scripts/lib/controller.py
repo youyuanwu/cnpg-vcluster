@@ -732,6 +732,12 @@ def reconcile_controller(
     verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
     if requires_cutover:
         set_controller_mutation(config, client, enabled=True)
+        render_controller_manager(
+            root,
+            config,
+            image,
+            mutation_enabled=True,
+        )
 
 
 def delete_controller(
