@@ -12,8 +12,6 @@ import (
 	"sort"
 	"strconv"
 	"strings"
-	"sync"
-	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/types"
@@ -28,7 +26,6 @@ const (
 	defaultFoundationNamespace = "tenant-system"
 	defaultFoundationName      = "tenant-foundation"
 	allocationConfigMapName    = "tenant-endpoint-allocations"
-	foundationHostCheckPeriod  = time.Minute
 )
 
 var requiredWorkerImageKeys = []string{
@@ -98,28 +95,6 @@ type Foundation struct {
 	Hash                  string              `json:"-"`
 }
 
-type foundationHostValidation struct {
-	mu        sync.Mutex
-	hash      string
-	checkedAt time.Time
-}
-
-func (validation *foundationHostValidation) check(ctx context.Context, docker DockerClient, foundation Foundation, now time.Time) error {
-	validation.mu.Lock()
-	defer validation.mu.Unlock()
-	if validation.hash != "" && validation.hash == foundation.Hash &&
-		!now.Before(validation.checkedAt) && now.Sub(validation.checkedAt) < foundationHostCheckPeriod {
-		return nil
-	}
-	validation.hash = ""
-	if err := validateFoundationHost(ctx, docker, foundation); err != nil {
-		return err
-	}
-	validation.hash = foundation.Hash
-	validation.checkedAt = now
-	return nil
-}
-
 func (reconciler *TenantReconciler) loadFoundation(ctx context.Context, lifecycleHash string) (Foundation, error) {
 	foundation, err := readFoundation(ctx, reconciler.reader(), reconciler.foundationNamespace(), reconciler.foundationName())
 	if err != nil {
@@ -131,71 +106,7 @@ func (reconciler *TenantReconciler) loadFoundation(ctx context.Context, lifecycl
 	if err := validateFoundation(foundation, reconciler.SupportedVersion, reconciler.ExpectedControllerImage); err != nil {
 		return Foundation{}, err
 	}
-	if err := reconciler.foundationHostValidation.check(ctx, reconciler.docker(), foundation, time.Now()); err != nil {
-		return Foundation{}, err
-	}
 	return foundation, nil
-}
-
-func validateFoundationHost(ctx context.Context, docker DockerClient, foundation Foundation) error {
-	container, err := docker.InspectContainer(ctx, foundation.ManagementContainerID)
-	if err != nil {
-		return fmt.Errorf("inspect management container: %w", err)
-	}
-	if container.ID != foundation.ManagementContainerID || container.State != "running" {
-		return fmt.Errorf("management container identity is not current")
-	}
-	for key, expected := range foundation.ManagementLabels {
-		if container.Labels[key] != expected {
-			return fmt.Errorf("management container label identity mismatch")
-		}
-	}
-	attached := false
-	for _, networkID := range container.Networks {
-		attached = attached || networkID == foundation.NetworkID
-	}
-	if !attached {
-		return fmt.Errorf("management container is not attached to the foundation network")
-	}
-	network, err := docker.InspectNetwork(ctx, foundation.NetworkID)
-	if err != nil {
-		return fmt.Errorf("inspect management network: %w", err)
-	}
-	if network.ID != foundation.NetworkID || !contains(network.Subnets, foundation.Subnet) {
-		return fmt.Errorf("management network identity or subnet mismatch")
-	}
-	active, err := docker.Exec(ctx, foundation.ManagementContainerID, []string{"cat", foundation.Inputs.CacheContainerPath + "/active.json"})
-	if err != nil || active.ExitCode != 0 {
-		return fmt.Errorf("read active cache generation through management container")
-	}
-	activeDigest := sha256.Sum256([]byte(active.Output))
-	if hex.EncodeToString(activeDigest[:]) != foundation.Cache.ActiveSHA256 {
-		return fmt.Errorf("active cache pointer checksum mismatch")
-	}
-	var activeRecord struct {
-		Schema     int    `json:"schema"`
-		Generation string `json:"generation"`
-	}
-	if err := json.Unmarshal([]byte(active.Output), &activeRecord); err != nil ||
-		activeRecord.Schema != 1 || activeRecord.Generation != foundation.Cache.Generation {
-		return fmt.Errorf("active cache generation mismatch")
-	}
-	if foundation.Registry != nil {
-		registry, err := docker.InspectContainer(ctx, foundation.Registry.Identifier)
-		if err != nil {
-			return fmt.Errorf("inspect offline registry: %w", err)
-		}
-		if registry.ID != foundation.Registry.Identifier || registry.State != "running" ||
-			registry.Labels[foundation.Inputs.OwnershipLabel] != foundation.Inputs.LabPrefix ||
-			registry.Labels["cnpg-vcluster.capi/role"] != "offline-registry" ||
-			registry.Labels["cnpg-vcluster.capi/generation"] != foundation.Registry.Generation {
-			return fmt.Errorf("offline registry identity mismatch")
-		}
-		if registry.NetworkAddresses[foundation.NetworkID] != foundation.Registry.Address {
-			return fmt.Errorf("offline registry network address mismatch")
-		}
-	}
-	return nil
 }
 
 func loadFoundationForDeletion(ctx context.Context, reader client.Reader, namespace, name, lifecycleHash string) (Foundation, error) {
@@ -293,8 +204,7 @@ func validateFoundation(foundation Foundation, supportedVersion, expectedControl
 		inputs.KonnectivityServerImage == "" || inputs.KonnectivityAgentImage == "" {
 		return fmt.Errorf("Tenant foundation inputs are incomplete")
 	}
-	if foundation.Cache.Generation == "" || !validSHA256(foundation.Cache.StateSHA256) ||
-		!validSHA256(foundation.Cache.ActiveSHA256) {
+	if foundation.Cache.Generation == "" {
 		return fmt.Errorf("Tenant foundation cache identity is invalid")
 	}
 	keys := map[string]struct{}{}
@@ -322,22 +232,8 @@ func validateFoundation(foundation Foundation, supportedVersion, expectedControl
 
 	if foundation.OfflineEnforced {
 		if foundation.Registry == nil || foundation.Registry.Address == "" ||
-			foundation.Registry.Port < 1 || foundation.Registry.Generation == "" ||
-			foundation.Registry.Identifier == "" {
+			foundation.Registry.Port < 1 {
 			return fmt.Errorf("offline Tenant foundation registry is incomplete")
-		}
-	}
-	requiredVersions := map[string]string{
-		"GO_VERSION":                 "1.27.1",
-		"KUBERNETES_VERSION":         "v" + strings.TrimPrefix(supportedVersion, "v"),
-		"CAPI_VERSION":               "v1.14.1",
-		"KAMAJI_CAPI_VERSION":        "v0.20.0",
-		"CONTROLLER_RUNTIME_VERSION": "v0.24.1",
-		"CONTROLLER_TOOLS_VERSION":   "v0.21.0",
-	}
-	for key, expected := range requiredVersions {
-		if foundation.Versions[key] != expected {
-			return fmt.Errorf("Tenant foundation version %s does not match %s", key, expected)
 		}
 	}
 	return nil

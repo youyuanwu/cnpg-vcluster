@@ -47,15 +47,14 @@ func progressRequeue() ctrl.Result {
 
 type TenantReconciler struct {
 	client.Client
-	APIReader                client.Reader
-	Docker                   DockerClient
-	TenantClients            TenantClientFactory
-	SupportedVersion         string
-	MutationEnabled          bool
-	FoundationNamespace      string
-	FoundationName           string
-	ExpectedControllerImage  string
-	foundationHostValidation foundationHostValidation
+	APIReader               client.Reader
+	Docker                  DockerClient
+	TenantClients           TenantClientFactory
+	SupportedVersion        string
+	MutationEnabled         bool
+	FoundationNamespace     string
+	FoundationName          string
+	ExpectedControllerImage string
 }
 
 func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {

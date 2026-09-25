@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"fmt"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -52,11 +51,7 @@ func (reconciler *TenantReconciler) reconcileReadiness(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	postgresImage, found := archiveByKey(foundation.Cache.ImageArchives, "POSTGRES_IMAGE")
-	if !found {
-		return ctrl.Result{}, fmt.Errorf("POSTGRES_IMAGE is missing")
-	}
-	databaseReady, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount, postgresImage.Reference)
+	databaseReady, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

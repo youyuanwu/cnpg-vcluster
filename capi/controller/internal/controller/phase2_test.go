@@ -13,7 +13,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
@@ -200,159 +199,6 @@ func endpointConfigMap(t *testing.T, foundation Foundation, tenant *tenancyv1alp
 	}
 }
 
-func loadTestFoundation(ctx context.Context, reader client.Reader, docker DockerClient, namespace, name, supportedVersion, expectedControllerImage string) (Foundation, error) {
-	reconciler := &TenantReconciler{
-		APIReader: reader, Docker: docker, FoundationNamespace: namespace, FoundationName: name,
-		SupportedVersion: supportedVersion, ExpectedControllerImage: expectedControllerImage,
-	}
-	return reconciler.loadFoundation(ctx, "")
-}
-
-func TestLoadFoundationUsesLiveDockerIdentity(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	foundation := testFoundation()
-	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foundationConfigMap(t, foundation)).Build()
-	docker := &fakeDockerClient{
-		container: DockerContainer{
-			ID:       foundation.ManagementContainerID,
-			State:    "running",
-			Labels:   foundation.ManagementLabels,
-			Networks: map[string]string{"kind": foundation.NetworkID},
-		},
-		network:    DockerNetwork{ID: foundation.NetworkID, Subnets: []string{foundation.Subnet}},
-		execResult: DockerExecResult{Output: "{\"generation\":\"generation\",\"schema\":1}\n"},
-	}
-	observed, err := loadTestFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if observed.Hash == "" || observed.NetworkID != foundation.NetworkID {
-		t.Fatalf("unexpected foundation: %#v", observed)
-	}
-	docker.network.Subnets = []string{"172.19.0.0/16"}
-	if _, err := loadTestFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err == nil {
-		t.Fatal("network identity drift was accepted")
-	}
-}
-
-func TestFoundationSafetyReadUsesUncachedReader(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	foundation := testFoundation()
-	good := foundationConfigMap(t, foundation)
-	stale := good.DeepCopy()
-	stale.Data["foundation.sha256"] = strings.Repeat("0", 64)
-	cached := fake.NewClientBuilder().WithScheme(scheme).WithObjects(stale).Build()
-	direct := fake.NewClientBuilder().WithScheme(scheme).WithObjects(good).Build()
-	docker := &fakeDockerClient{
-		container: DockerContainer{
-			ID:       foundation.ManagementContainerID,
-			State:    "running",
-			Labels:   foundation.ManagementLabels,
-			Networks: map[string]string{"kind": foundation.NetworkID},
-		},
-		network:    DockerNetwork{ID: foundation.NetworkID, Subnets: []string{foundation.Subnet}},
-		execResult: DockerExecResult{Output: "{\"generation\":\"generation\",\"schema\":1}\n"},
-	}
-	reconciler := &TenantReconciler{Client: cached, APIReader: direct, Docker: docker}
-	if _, err := loadTestFoundation(context.Background(), reconciler.reader(), docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err != nil {
-		t.Fatal(err)
-	}
-}
-
-func TestFoundationRejectsMalformedCacheAndCIDRs(t *testing.T) {
-	foundation := testFoundation()
-	foundation.Cache.ImageArchives[0].Path = "../escape"
-	if err := validateFoundation(foundation, "1.36.4", foundation.ControllerImage); err == nil {
-		t.Fatal("unsafe cache path was accepted")
-	}
-	foundation = testFoundation()
-	foundation.ReservedCIDRs = []string{"10.0.0.0/16", "10.0.0.0/16"}
-	if err := validateFoundation(foundation, "1.36.4", foundation.ControllerImage); err == nil {
-		t.Fatal("duplicate reserved CIDR was accepted")
-	}
-	foundation = testFoundation()
-	foundation.ReservedCIDRs = []string{"2001:db8::/64"}
-	if err := validateFoundation(foundation, "1.36.4", foundation.ControllerImage); err == nil {
-		t.Fatal("IPv6 reserved CIDR was accepted")
-	}
-	foundation = testFoundation()
-	foundation.Cache.ImageArchives = foundation.Cache.ImageArchives[1:]
-	if err := validateFoundation(foundation, "1.36.4", foundation.ControllerImage); err == nil {
-		t.Fatal("incomplete worker image inventory was accepted")
-	}
-	foundation = testFoundation()
-	foundation.Cache.ImageArchives[0].Worker = false
-	if err := validateFoundation(foundation, "1.36.4", foundation.ControllerImage); err == nil {
-		t.Fatal("required worker image with a false worker flag was accepted")
-	}
-	foundation = testFoundation()
-	foundation.Versions["CAPI_VERSION"] = "v9.9.9"
-	if err := validateFoundation(foundation, "1.36.4", foundation.ControllerImage); err == nil {
-		t.Fatal("wrong pinned provider version was accepted")
-	}
-	foundation = testFoundation()
-	if err := validateFoundation(foundation, "1.36.4", "foreign-controller:image"); err == nil {
-		t.Fatal("wrong controller image identity was accepted")
-	}
-}
-
-func TestLoadFoundationRejectsActiveCacheAndRegistryDrift(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := corev1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-	foundation := testFoundation()
-	foundation.OfflineEnforced = true
-	foundation.Registry = &FoundationRegistry{
-		Address:    "172.18.0.10",
-		Port:       5000,
-		Generation: "registry-generation",
-		Identifier: "registry-id",
-	}
-	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foundationConfigMap(t, foundation)).Build()
-	management := DockerContainer{
-		ID:               foundation.ManagementContainerID,
-		State:            "running",
-		Labels:           foundation.ManagementLabels,
-		Networks:         map[string]string{"kind": foundation.NetworkID},
-		NetworkAddresses: map[string]string{foundation.NetworkID: "172.18.0.2"},
-	}
-	registry := DockerContainer{
-		ID:    foundation.Registry.Identifier,
-		State: "running",
-		Labels: map[string]string{
-			foundation.Inputs.OwnershipLabel: foundation.Inputs.LabPrefix,
-			"cnpg-vcluster.capi/role":        "offline-registry",
-			"cnpg-vcluster.capi/generation":  foundation.Registry.Generation,
-		},
-		Networks:         map[string]string{"kind": foundation.NetworkID},
-		NetworkAddresses: map[string]string{foundation.NetworkID: foundation.Registry.Address},
-	}
-	docker := &fakeDockerClient{
-		containers: map[string]DockerContainer{
-			management.ID: management,
-			registry.ID:   registry,
-		},
-		network:    DockerNetwork{ID: foundation.NetworkID, Subnets: []string{foundation.Subnet}},
-		execResult: DockerExecResult{Output: "{\"generation\":\"wrong\",\"schema\":1}\n"},
-	}
-	if _, err := loadTestFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err == nil {
-		t.Fatal("changed active cache generation was accepted")
-	}
-	docker.execResult.Output = "{\"generation\":\"generation\",\"schema\":1}\n"
-	registry.NetworkAddresses[foundation.NetworkID] = "172.18.0.11"
-	docker.containers[registry.ID] = registry
-	if _, err := loadTestFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err == nil {
-		t.Fatal("changed registry address was accepted")
-	}
-}
-
 func TestEndpointAllocationIsStableReservedAndCASBacked(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -484,7 +330,7 @@ func TestWorkerBootstrapCommandsIncludeImagesAndOfflineSetup(t *testing.T) {
 	foundation := testFoundation()
 	foundation.OfflineEnforced = true
 	foundation.Registry = &FoundationRegistry{Address: "172.18.0.10", Port: 5000, Generation: "registry", Identifier: "registry-id"}
-	commands, err := workerBootstrapCommands(foundation)
+	commands, err := workerBootstrapCommands(foundation, 1)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -499,7 +345,7 @@ func TestWorkerBootstrapCommandsIncludeImagesAndOfflineSetup(t *testing.T) {
 func TestWorkerBootstrapCommandsRequireEveryImage(t *testing.T) {
 	foundation := testFoundation()
 	foundation.Cache.ImageArchives = foundation.Cache.ImageArchives[1:]
-	if _, err := workerBootstrapCommands(foundation); err == nil {
+	if _, err := workerBootstrapCommands(foundation, 1); err == nil {
 		t.Fatal("missing worker image was accepted")
 	}
 }

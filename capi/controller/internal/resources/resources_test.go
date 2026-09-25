@@ -72,8 +72,13 @@ func TestWorkerBuildersPreserveCacheStorageAndReplicaContract(t *testing.T) {
 	machine := DevMachineTemplate(context)
 	mounts, _, _ := unstructuredNested(machine.Object, "spec", "template", "spec", "backend", "docker", "extraMounts")
 	items := mounts.([]any)
-	if len(items) != 2 || items[0].(map[string]any)["readOnly"] != true ||
-		items[1].(map[string]any)["hostPath"] != context.VolumePath {
+	if len(items) != 2 ||
+		items[0].(map[string]any)["readOnly"] != true ||
+		items[0].(map[string]any)["hostPath"] != context.Inputs.CacheHostPath ||
+		items[0].(map[string]any)["containerPath"] != context.Inputs.CacheContainerPath ||
+		items[1].(map[string]any)["hostPath"] != context.VolumePath ||
+		items[1].(map[string]any)["containerPath"] != context.Inputs.StorageContainerPath ||
+		items[1].(map[string]any)["readOnly"] != false {
 		t.Fatalf("unexpected worker mounts: %#v", items)
 	}
 	deployment := MachineDeployment(context)

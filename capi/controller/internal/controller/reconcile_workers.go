@@ -16,7 +16,6 @@ import (
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
-	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/sanitize"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
 
@@ -38,7 +37,7 @@ func (reconciler *TenantReconciler) reconcileWorkers(
 	}
 	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
 	resourceContext.VolumePath = volume.Mountpoint
-	commands, err := workerBootstrapCommands(foundation)
+	commands, err := workerBootstrapCommands(foundation, canonical.DatabaseCount)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -156,7 +155,7 @@ func (reconciler *TenantReconciler) observePreCNIWorkers(ctx context.Context, te
 	return machines, containers, nil
 }
 
-func workerBootstrapCommands(foundation Foundation) ([]string, error) {
+func workerBootstrapCommands(foundation Foundation, databaseCount int32) ([]string, error) {
 	archives := make([]FoundationArchive, 0)
 	for _, key := range requiredWorkerImageKeys {
 		archive, found := archiveByKey(foundation.Cache.ImageArchives, key)
@@ -176,6 +175,10 @@ func workerBootstrapCommands(foundation Foundation) ([]string, error) {
 			"ctr --namespace k8s.io images tag --force "+shellQuote(archive.Tagged)+" "+shellQuote(canonicalExactReference(archive)),
 			"ctr --namespace k8s.io images tag --force "+shellQuote(archive.Tagged)+" "+shellQuote(runtimeDigestReference(archive)),
 		)
+	}
+	for ordinal := int32(1); ordinal <= databaseCount; ordinal++ {
+		directory := shellQuote(fmt.Sprintf("%s/volumes/cnpg/%d", foundation.Inputs.StorageContainerPath, ordinal))
+		commands = append(commands, "mkdir -p "+directory+" && chown 26:26 "+directory+" && chmod 0700 "+directory)
 	}
 	if !foundation.OfflineEnforced {
 		return commands, nil
@@ -229,23 +232,6 @@ func runtimeDigestReference(archive FoundationArchive) string {
 		tagged = tagged[:lastColon]
 	}
 	return tagged + "@" + archive.Reference[strings.LastIndex(archive.Reference, "@")+1:]
-}
-
-func (reconciler *TenantReconciler) execRequired(ctx context.Context, container string, command []string) error {
-	result, err := reconciler.exec(ctx, container, command)
-	if err != nil {
-		return err
-	}
-
-	if result.ExitCode != 0 {
-		return fmt.Errorf("container command failed with exit %d: %s", result.ExitCode, sanitize.Text(result.Output))
-	}
-	return nil
-}
-
-func (reconciler *TenantReconciler) exec(ctx context.Context, container string, command []string) (DockerExecResult, error) {
-	bounded := append([]string{"timeout", "90"}, command...)
-	return reconciler.docker().Exec(ctx, container, bounded)
 }
 
 func imageRegistry(reference string) string {
