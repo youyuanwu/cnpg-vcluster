@@ -43,10 +43,6 @@ func (reconciler *TenantReconciler) reconcileReadiness(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	networkReady, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
-	if err != nil {
-		return ctrl.Result{}, err
-	}
 	storageReady, err := storageClassReady(ctx, tenantClient)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -56,6 +52,7 @@ func (reconciler *TenantReconciler) reconcileReadiness(
 		return ctrl.Result{}, err
 	}
 	workersReady := workers.inventoryComplete && workers.allReady
+	networkReady := workers.networkReady
 	ready := controlPlaneReady && workersReady && networkReady && storageReady && databaseReady
 	if !ready {
 		return readinessRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {

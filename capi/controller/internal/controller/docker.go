@@ -3,7 +3,6 @@ package controller
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -35,11 +34,6 @@ type DockerVolume struct {
 	Labels     map[string]string
 }
 
-type DockerExecResult struct {
-	ExitCode int
-	Output   string
-}
-
 type DockerClient interface {
 	InspectContainer(context.Context, string) (DockerContainer, error)
 	InspectNetwork(context.Context, string) (DockerNetwork, error)
@@ -47,7 +41,6 @@ type DockerClient interface {
 	CreateVolume(context.Context, string, map[string]string) (DockerVolume, error)
 	RemoveVolume(context.Context, string) error
 	ListWorkerContainers(context.Context, string) ([]DockerContainer, error)
-	Exec(context.Context, string, []string) (DockerExecResult, error)
 }
 
 type socketDockerClient struct {
@@ -197,36 +190,6 @@ func (client *socketDockerClient) ListWorkerContainers(ctx context.Context, tena
 	return result, nil
 }
 
-func (client *socketDockerClient) Exec(ctx context.Context, container string, command []string) (DockerExecResult, error) {
-	var created struct {
-		ID string `json:"Id"`
-	}
-	if err := client.json(ctx, http.MethodPost, "/containers/"+url.PathEscape(container)+"/exec", map[string]any{
-		"AttachStdout": true,
-		"AttachStderr": true,
-		"Cmd":          command,
-	}, &created); err != nil {
-		return DockerExecResult{}, err
-	}
-	body, status, err := client.request(ctx, http.MethodPost, "/exec/"+url.PathEscape(created.ID)+"/start", map[string]any{
-		"Detach": false,
-		"Tty":    false,
-	})
-	if err != nil {
-		return DockerExecResult{}, err
-	}
-	if status < 200 || status >= 300 {
-		return DockerExecResult{}, &dockerError{status: status, message: string(body)}
-	}
-	var inspected struct {
-		ExitCode int `json:"ExitCode"`
-	}
-	if err := client.json(ctx, http.MethodGet, "/exec/"+url.PathEscape(created.ID)+"/json", nil, &inspected); err != nil {
-		return DockerExecResult{}, err
-	}
-	return DockerExecResult{ExitCode: inspected.ExitCode, Output: decodeDockerStream(body)}, nil
-}
-
 func (client *socketDockerClient) json(ctx context.Context, method, path string, input, output any) error {
 	body, status, err := client.request(ctx, method, path, input)
 	if err != nil {
@@ -286,20 +249,4 @@ func dockerStatus(err error) int {
 		return value.status
 	}
 	return 0
-}
-
-func decodeDockerStream(data []byte) string {
-	var output bytes.Buffer
-	for len(data) >= 8 {
-		size := int(binary.BigEndian.Uint32(data[4:8]))
-		if size < 0 || len(data) < 8+size {
-			return string(data)
-		}
-		output.Write(data[8 : 8+size])
-		data = data[8+size:]
-	}
-	if output.Len() == 0 {
-		return string(data)
-	}
-	return output.String()
 }

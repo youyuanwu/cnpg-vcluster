@@ -4,11 +4,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
-	ctrl "sigs.k8s.io/controller-runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
@@ -17,6 +17,7 @@ import (
 
 var (
 	errWorkerOwnershipInvalid = errors.New("worker ownership is invalid")
+	machineGVK                = schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "Machine"}
 	postCNIDevMachineGVK      = schema.GroupVersionKind{Group: "infrastructure.cluster.x-k8s.io", Version: "v1beta2", Kind: "DevMachine"}
 	postCNINodeGVK            = schema.GroupVersionKind{Version: "v1", Kind: "Node"}
 )
@@ -28,24 +29,7 @@ type postCNIWorkerState struct {
 	containers        []DockerContainer
 	inventoryComplete bool
 	allReady          bool
-}
-
-func (reconciler *TenantReconciler) reconcilePostCNIWorkers(
-	ctx context.Context,
-	tenantClient client.Client,
-	tenant *tenancyv1alpha1.Tenant,
-	canonical validation.CanonicalSpec,
-	specHash string,
-	foundation Foundation,
-) (ctrl.Result, error) {
-	state, err := reconciler.observePostCNIWorkerState(ctx, tenantClient, tenant, canonical, specHash, foundation)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if !state.inventoryComplete || !state.allReady {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-	return reconciler.reconcileStorage(ctx, tenantClient, tenant, canonical, specHash, foundation)
+	networkReady      bool
 }
 
 func (reconciler *TenantReconciler) observePostCNIWorkerState(
@@ -57,23 +41,62 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	foundation Foundation,
 ) (postCNIWorkerState, error) {
 	state := postCNIWorkerState{}
-	machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
-	if err == errWorkerRuntimePending {
-		return state, nil
+	machines := &unstructured.UnstructuredList{}
+	machines.SetGroupVersionKind(machineGVK.GroupVersion().WithKind("MachineList"))
+	if err := reconciler.reader().List(ctx, machines, client.InNamespace(tenant.Name), client.MatchingLabels{"cluster.x-k8s.io/cluster-name": tenant.Name}); err != nil {
+		return state, fmt.Errorf("list Tenant Machines: %w", err)
 	}
-	if err != nil {
+	machineDeployment := &unstructured.Unstructured{}
+	machineDeployment.SetGroupVersionKind(machineDeploymentGVK)
+	if err := reconciler.reader().Get(ctx, client.ObjectKey{Namespace: tenant.Name, Name: tenant.Name + "-worker"}, machineDeployment); err != nil {
+		return state, fmt.Errorf("read Tenant MachineDeployment: %w", err)
+	}
+	if err := validateRootOwnership(machineDeployment, tenant, specHash, foundation.Hash, "machine-deployment", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 		return state, err
 	}
-	state.machines = machines
-	state.containers = containers
-	if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
+	if len(machines.Items) != int(canonical.Workers) {
 		return state, nil
 	}
 	machinesReady := true
-	for _, machine := range machines {
+	machineNames := map[string]struct{}{}
+	machineByUID := map[string]*unstructured.Unstructured{}
+	for index := range machines.Items {
+		machine := machines.Items[index].DeepCopy()
+		if err := validateRootOwnership(machine, tenant, specHash, foundation.Hash, "machine", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
+			return state, err
+		}
+		if err := validateOwnerChain(ctx, reconciler.reader(), machine, machineDeployment.GetUID()); err != nil {
+			return state, err
+		}
 		if !tenantObjectReady(machine) {
 			machinesReady = false
 		}
+		machineNames[machine.GetName()] = struct{}{}
+		machineByUID[string(machine.GetUID())] = machine
+		state.machines = append(state.machines, machine)
+	}
+	containers, err := reconciler.docker().ListWorkerContainers(ctx, tenant.Name)
+	if err != nil {
+		return state, fmt.Errorf("list Tenant worker containers: %w", err)
+	}
+	if len(containers) != int(canonical.Workers) {
+		return state, nil
+	}
+	for _, container := range containers {
+		if _, expected := machineNames[container.Name]; !expected {
+			return state, fmt.Errorf("%w: worker container %s has no exact Machine", errWorkerOwnershipInvalid, container.Name)
+		}
+		attached := false
+		for _, networkID := range container.Networks {
+			attached = attached || networkID == foundation.NetworkID
+		}
+		if !attached {
+			return state, fmt.Errorf("%w: worker container %s is not on the foundation network", errWorkerOwnershipInvalid, container.Name)
+		}
+		if container.State != "running" {
+			return state, nil
+		}
+		state.containers = append(state.containers, container)
 	}
 	devMachines := &unstructured.UnstructuredList{}
 	devMachines.SetGroupVersionKind(postCNIDevMachineGVK.GroupVersion().WithKind("DevMachineList"))
@@ -82,12 +105,6 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	}
 	if len(devMachines.Items) != int(canonical.Workers) {
 		return state, nil
-	}
-	machineByUID := map[string]*unstructured.Unstructured{}
-	machineNames := map[string]struct{}{}
-	for _, machine := range machines {
-		machineByUID[string(machine.GetUID())] = machine
-		machineNames[machine.GetName()] = struct{}{}
 	}
 	devMachinesReady := true
 	for index := range devMachines.Items {
@@ -133,5 +150,35 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	}
 	state.inventoryComplete = true
 	state.allReady = machinesReady && devMachinesReady && nodesReady
+	networkReady, err := networkWorkloadsReady(ctx, tenantClient)
+	if err != nil {
+		return state, err
+	}
+	state.networkReady = networkReady
 	return state, nil
+}
+
+func networkWorkloadsReady(ctx context.Context, tenantClient client.Client) (bool, error) {
+	for _, item := range []struct {
+		gvk             schema.GroupVersionKind
+		namespace, name string
+	}{
+		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "DaemonSet"}, "kube-system", "calico-node"},
+		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, "kube-system", "calico-kube-controllers"},
+		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "DaemonSet"}, "kube-system", "capi-kube-proxy"},
+		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, "kube-system", "coredns"},
+	} {
+		object := &unstructured.Unstructured{}
+		object.SetGroupVersionKind(item.gvk)
+		if err := tenantClient.Get(ctx, types.NamespacedName{Namespace: item.namespace, Name: item.name}, object); err != nil {
+			if apierrors.IsNotFound(err) {
+				return false, nil
+			}
+			return false, err
+		}
+		if !workloadAvailable(object) {
+			return false, nil
+		}
+	}
+	return true, nil
 }

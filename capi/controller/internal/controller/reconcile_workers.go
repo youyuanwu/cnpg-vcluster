@@ -2,15 +2,12 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path"
 	"sort"
 	"strings"
-	"time"
 
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -18,10 +15,6 @@ import (
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
-
-var machineGVK = schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "Machine"}
-
-var errWorkerRuntimePending = errors.New("worker runtime is pending")
 
 func (reconciler *TenantReconciler) reconcileWorkers(
 	ctx context.Context,
@@ -56,16 +49,6 @@ func (reconciler *TenantReconciler) reconcileWorkers(
 			return progressRequeue(), nil
 		}
 	}
-	machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
-	if err != nil {
-		if errors.Is(err, errWorkerRuntimePending) {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		return ctrl.Result{}, err
-	}
-	if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
 	return reconciler.reconcileNetwork(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 
@@ -95,64 +78,6 @@ func (reconciler *TenantReconciler) ensureVolume(ctx context.Context, tenant *te
 		return DockerVolume{}, fmt.Errorf("Docker volume ownership identity mismatch")
 	}
 	return *volume, nil
-}
-
-func (reconciler *TenantReconciler) observePreCNIWorkers(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) ([]*unstructured.Unstructured, []DockerContainer, error) {
-	list := &unstructured.UnstructuredList{}
-	list.SetGroupVersionKind(schema.GroupVersionKind{Group: machineGVK.Group, Version: machineGVK.Version, Kind: "MachineList"})
-	if err := reconciler.reader().List(ctx, list, client.InNamespace(tenant.Name), client.MatchingLabels{"cluster.x-k8s.io/cluster-name": tenant.Name}); err != nil {
-		return nil, nil, fmt.Errorf("list Tenant Machines: %w", err)
-	}
-	machineDeployment := &unstructured.Unstructured{}
-	machineDeployment.SetGroupVersionKind(machineDeploymentGVK)
-	if err := reconciler.reader().Get(ctx, client.ObjectKey{Namespace: tenant.Name, Name: tenant.Name + "-worker"}, machineDeployment); err != nil {
-		return nil, nil, fmt.Errorf("read Tenant MachineDeployment: %w", err)
-	}
-	if err := validateRootOwnership(machineDeployment, tenant, specHash, foundation.Hash, "machine-deployment", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-		return nil, nil, err
-	}
-	machines := make([]*unstructured.Unstructured, 0, len(list.Items))
-	machineNames := map[string]struct{}{}
-	for index := range list.Items {
-		machine := list.Items[index].DeepCopy()
-		if err := validateRootOwnership(machine, tenant, specHash, foundation.Hash, "machine", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-			return nil, nil, err
-		}
-		if err := validateOwnerChain(ctx, reconciler.reader(), machine, machineDeployment.GetUID()); err != nil {
-			return nil, nil, err
-		}
-		machines = append(machines, machine)
-		machineNames[machine.GetName()] = struct{}{}
-	}
-	containers, err := reconciler.docker().ListWorkerContainers(ctx, tenant.Name)
-	if err != nil {
-		return nil, nil, fmt.Errorf("list Tenant worker containers: %w", err)
-	}
-	for _, container := range containers {
-		if container.State != "running" {
-			return nil, nil, errWorkerRuntimePending
-		}
-		if _, expected := machineNames[container.Name]; !expected {
-			return nil, nil, fmt.Errorf("worker container %s has no exact Machine", container.Name)
-		}
-		attached := false
-		for _, networkID := range container.Networks {
-			attached = attached || networkID == foundation.NetworkID
-		}
-		if !attached {
-			return nil, nil, fmt.Errorf("worker container %s is not on the foundation network", container.Name)
-		}
-		result, err := reconciler.docker().Exec(ctx, container.ID, []string{"test", "-S", "/run/containerd/containerd.sock"})
-		if err != nil {
-			return nil, nil, err
-		}
-		if result.ExitCode != 0 {
-			return nil, nil, errWorkerRuntimePending
-		}
-	}
-	sort.Slice(machines, func(left, right int) bool { return machines[left].GetName() < machines[right].GetName() })
-	sort.Slice(containers, func(left, right int) bool { return containers[left].Name < containers[right].Name })
-	return machines, containers, nil
 }
 
 func workerBootstrapCommands(foundation Foundation, databaseCount int32) ([]string, error) {

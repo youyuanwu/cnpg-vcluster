@@ -11,6 +11,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
@@ -18,34 +19,57 @@ import (
 )
 
 func TestObservePostCNIWorkerStateValidatesExactTopologyAndReadiness(t *testing.T) {
-	state, err := observePostCNIFixture(t, "worker-a", "worker-a", true)
+	state, nodeLists, err := observePostCNIFixture(t, "worker-a", "worker-a", true, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !state.inventoryComplete || !state.allReady {
+	if !state.inventoryComplete || !state.allReady || !state.networkReady {
 		t.Fatalf("exact ready topology was rejected: %#v", state)
 	}
+	if nodeLists != 1 {
+		t.Fatalf("combined readiness listed Nodes %d times", nodeLists)
+	}
 
-	_, err = observePostCNIFixture(t, "worker-b", "worker-a", true)
+	_, _, err = observePostCNIFixture(t, "worker-b", "worker-a", true, true)
 	if !errors.Is(err, errWorkerOwnershipInvalid) || !isOwnershipError(err) {
 		t.Fatalf("DevMachine name mismatch was not OwnershipInvalid: %v", err)
 	}
 
-	_, err = observePostCNIFixture(t, "worker-a", "worker-b", true)
+	_, _, err = observePostCNIFixture(t, "worker-a", "worker-b", true, true)
 	if !errors.Is(err, errWorkerOwnershipInvalid) || !isOwnershipError(err) {
 		t.Fatalf("Node set mismatch was not OwnershipInvalid: %v", err)
 	}
 
-	state, err = observePostCNIFixture(t, "worker-a", "worker-a", false)
+	state, _, err = observePostCNIFixture(t, "worker-a", "worker-a", false, true)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !state.inventoryComplete || state.allReady {
-		t.Fatalf("unready Node did not invalidate readiness: %#v", state)
+	if !state.inventoryComplete || state.allReady || !state.networkReady {
+		t.Fatalf("worker and network readiness were not independent: %#v", state)
+	}
+
+	state, _, err = observePostCNIFixture(t, "worker-a", "worker-a", true, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !state.inventoryComplete || !state.allReady || state.networkReady {
+		t.Fatalf("unavailable network workload did not remain distinct: %#v", state)
 	}
 }
 
-func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeReady bool) (postCNIWorkerState, error) {
+type nodeListCountingClient struct {
+	client.Client
+	nodeLists int
+}
+
+func (value *nodeListCountingClient) List(ctx context.Context, list client.ObjectList, options ...client.ListOption) error {
+	if list.GetObjectKind().GroupVersionKind().Kind == "NodeList" {
+		value.nodeLists++
+	}
+	return value.Client.List(ctx, list, options...)
+}
+
+func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeReady, networkReady bool) (postCNIWorkerState, int, error) {
 	t.Helper()
 	foundation := testFoundation()
 	foundation.Hash = "foundation-hash"
@@ -97,8 +121,22 @@ func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeRe
 	if err := corev1.AddToScheme(tenantScheme); err != nil {
 		t.Fatal(err)
 	}
+	workloads := []*unstructured.Unstructured{
+		workloadObject("apps/v1", "DaemonSet", "calico-node", networkReady),
+		workloadObject("apps/v1", "Deployment", "calico-kube-controllers", true),
+		workloadObject("apps/v1", "DaemonSet", "capi-kube-proxy", true),
+		workloadObject("apps/v1", "Deployment", "coredns", true),
+	}
+	for _, workload := range workloads {
+		gvk := workload.GroupVersionKind()
+		tenantScheme.AddKnownTypeWithName(gvk, &unstructured.Unstructured{})
+	}
 	node := topologyObject(postCNINodeGVK, "", nodeName, "node-uid", nodeReady)
-	tenantClient := fake.NewClientBuilder().WithScheme(tenantScheme).WithObjects(node).Build()
+	objects := []client.Object{node}
+	for _, workload := range workloads {
+		objects = append(objects, workload)
+	}
+	tenantClient := &nodeListCountingClient{Client: fake.NewClientBuilder().WithScheme(tenantScheme).WithObjects(objects...).Build()}
 	reconciler := &TenantReconciler{
 		Client:    management,
 		APIReader: management,
@@ -109,7 +147,7 @@ func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeRe
 			}},
 		},
 	}
-	return reconciler.observePostCNIWorkerState(
+	state, err := reconciler.observePostCNIWorkerState(
 		context.Background(),
 		tenantClient,
 		tenant,
@@ -117,6 +155,38 @@ func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeRe
 		"spec-hash",
 		foundation,
 	)
+	return state, tenantClient.nodeLists, err
+}
+
+func workloadObject(apiVersion, kind, name string, available bool) *unstructured.Unstructured {
+	desired, current := int64(1), int64(1)
+	if !available {
+		current = 0
+	}
+	status := map[string]any{
+		"observedGeneration": int64(1),
+		"availableReplicas":  current,
+	}
+	spec := map[string]any{"replicas": desired}
+	if kind == "DaemonSet" {
+		status = map[string]any{
+			"observedGeneration":     int64(1),
+			"desiredNumberScheduled": desired,
+			"numberAvailable":        current,
+		}
+		spec = map[string]any{}
+	}
+	return &unstructured.Unstructured{Object: map[string]any{
+		"apiVersion": apiVersion,
+		"kind":       kind,
+		"metadata": map[string]any{
+			"name":       name,
+			"namespace":  "kube-system",
+			"generation": int64(1),
+		},
+		"spec":   spec,
+		"status": status,
+	}}
 }
 
 func topologyObject(gvk schema.GroupVersionKind, namespace, name, uid string, ready bool) *unstructured.Unstructured {
