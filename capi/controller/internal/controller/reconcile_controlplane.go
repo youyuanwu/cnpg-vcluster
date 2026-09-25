@@ -115,98 +115,79 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 }
 
 func (reconciler *TenantReconciler) managementObjectsCurrent(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
-	return reconciler.managementObjectsReady(ctx, tenant, specHash, foundation, true)
+	return reconciler.managementClusterReady(ctx, tenant, specHash, foundation, "Available")
 }
 
 func (reconciler *TenantReconciler) managementControlPlaneCurrent(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
-	return reconciler.managementObjectsReady(ctx, tenant, specHash, foundation, false)
+	return reconciler.managementClusterReady(ctx, tenant, specHash, foundation, "ControlPlaneReady", "ControlPlaneAvailable")
 }
 
-func (reconciler *TenantReconciler) managementObjectsReady(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation, requireClusterAvailable bool) (bool, error) {
-	for _, item := range []struct {
-		gvk      schema.GroupVersionKind
-		resource string
-	}{
-		{clusterGVK, "cluster"},
-		{devClusterGVK, "dev-cluster"},
-		{controlPlaneGVK, "kamaji-control-plane"},
-	} {
-		object := &unstructured.Unstructured{}
-		object.SetGroupVersionKind(item.gvk)
-		if err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name}, object); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		if err := validateRootOwnership(object, tenant, specHash, foundation.Hash, item.resource, foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-			return false, err
-		}
-		if item.gvk == clusterGVK {
-			if err := validateClusterUID(tenant, object); err != nil {
-				return false, err
-			}
-		}
-		if err := validateProviderOwner(ctx, reconciler.reader(), object, tenant.Name, item.gvk.Kind != "Cluster"); err != nil {
-			if errors.Is(err, errProviderOwnerPending) {
-				return false, nil
-			}
-			return false, err
-		}
-		observedGeneration, found, err := unstructured.NestedInt64(object.Object, "status", "observedGeneration")
-		if err != nil {
-			return false, fmt.Errorf("read %s observedGeneration: %w", item.gvk.Kind, err)
-		}
-		if found && observedGeneration < object.GetGeneration() {
+func (reconciler *TenantReconciler) managementClusterReady(
+	ctx context.Context,
+	tenant *tenancyv1alpha1.Tenant,
+	specHash string,
+	foundation Foundation,
+	conditionTypes ...string,
+) (bool, error) {
+	cluster := &unstructured.Unstructured{}
+	cluster.SetGroupVersionKind(clusterGVK)
+	if err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name}, cluster); err != nil {
+		if apierrors.IsNotFound(err) {
 			return false, nil
 		}
-		conditions, found, err := unstructured.NestedSlice(object.Object, "status", "conditions")
-		if err != nil {
-			return false, fmt.Errorf("read %s conditions: %w", item.gvk.Kind, err)
-		}
-		if !found || len(conditions) == 0 {
-			return false, nil
-		}
-		readinessFound := false
-		for _, raw := range conditions {
-			condition, ok := raw.(map[string]any)
-			if !ok {
-				continue
-			}
-			conditionType, _ := condition["type"].(string)
-			if !containsString(managementReadinessConditionTypes(item.gvk.Kind, requireClusterAvailable), conditionType) {
-				continue
-			}
-			readinessFound = true
-			if condition["status"] != "True" {
-				return false, nil
-			}
-			conditionGeneration, found, err := unstructured.NestedInt64(condition, "observedGeneration")
-			if err != nil {
-				return false, fmt.Errorf("read %s %s observedGeneration: %w", item.gvk.Kind, conditionType, err)
-			}
-			if found && conditionGeneration < object.GetGeneration() {
-				return false, nil
-			}
-			if !found && !observedGenerationIsCurrent(object) {
-				return false, nil
-			}
-		}
-		if !readinessFound {
-			return false, nil
-		}
+		return false, err
 	}
-	return true, nil
+	if err := validateRootOwnership(cluster, tenant, specHash, foundation.Hash, "cluster", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
+		return false, err
+	}
+	if err := validateClusterUID(tenant, cluster); err != nil {
+		return false, err
+	}
+	if err := validateProviderOwner(ctx, reconciler.reader(), cluster, tenant.Name, false); err != nil {
+		if errors.Is(err, errProviderOwnerPending) {
+			return false, nil
+		}
+		return false, err
+	}
+	return managementConditionsReady(cluster, conditionTypes...)
 }
 
-func managementReadinessConditionTypes(kind string, requireClusterAvailable bool) []string {
-	if kind == "Cluster" {
-		if requireClusterAvailable {
-			return []string{"Available"}
-		}
-		return []string{"ControlPlaneAvailable", "ControlPlaneReady"}
+func managementConditionsReady(object *unstructured.Unstructured, conditionTypes ...string) (bool, error) {
+	observedGeneration, found, err := unstructured.NestedInt64(object.Object, "status", "observedGeneration")
+	if err != nil {
+		return false, fmt.Errorf("read %s observedGeneration: %w", object.GetKind(), err)
 	}
-	return []string{"Ready", "Available", "ControlPlaneReady"}
+	if found && observedGeneration < object.GetGeneration() {
+		return false, nil
+	}
+	conditions, found, err := unstructured.NestedSlice(object.Object, "status", "conditions")
+	if err != nil {
+		return false, fmt.Errorf("read %s conditions: %w", object.GetKind(), err)
+	}
+	if !found {
+		return false, nil
+	}
+	for _, raw := range conditions {
+		condition, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		conditionType, _ := condition["type"].(string)
+		if !containsString(conditionTypes, conditionType) || condition["status"] != "True" {
+			continue
+		}
+		conditionGeneration, found, err := unstructured.NestedInt64(condition, "observedGeneration")
+		if err != nil {
+			return false, fmt.Errorf("read %s %s observedGeneration: %w", object.GetKind(), conditionType, err)
+		}
+		if found && conditionGeneration >= object.GetGeneration() {
+			return true, nil
+		}
+		if !found && observedGenerationIsCurrent(object) {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func observedGenerationIsCurrent(object *unstructured.Unstructured) bool {
