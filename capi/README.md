@@ -228,6 +228,9 @@ loop. The `KubeadmConfigTemplate` verifies archive checksums, imports the
 required images into containerd, creates exact digest/tag aliases, configures
 the offline mirror when enabled, and installs the offline egress rules before
 kubeadm runs. Bootstrap failure prevents the Machine from becoming Ready.
+After worker desired state is created, the controller applies networking
+immediately; it does not wait for or probe the worker's internal containerd
+socket.
 
 The custom kube-proxy name prevents Kamaji from cleaning the repository-owned
 resources. `conntrack.maxPerCore: 0` avoids the nested-container
@@ -297,11 +300,13 @@ ownership, admission, reconciliation, timeout, or cleanup failure.
 Condition checks require the current resource generation rather than accepting
 a stale `True` condition. A healthy local Tenant requires:
 
-- current affirmative provider conditions for the CAPI `Cluster`, CAPD
-  `DevCluster`, and `KamajiControlPlane`, plus an initialized, unpaused control
-  plane and matching endpoints;
-- exact Ready Machine, DevMachine, Docker container, and Node inventories;
-- available Calico, CoreDNS, and repository-owned kube-proxy workloads;
+- a current affirmative aggregate `Available` condition on the CAPI `Cluster`;
+  initial tenant access accepts its current `ControlPlaneReady` or
+  `ControlPlaneAvailable` condition;
+- one combined exact Machine, DevMachine, Docker container, and Node inventory,
+  with containers running on the foundation network;
+- available Calico, CoreDNS, and repository-owned kube-proxy workloads from
+  that same observation;
 - the expected static StorageClass and exact owned Docker volume;
 - a CNPG Cluster in healthy state with the requested number of ready
   instances.
