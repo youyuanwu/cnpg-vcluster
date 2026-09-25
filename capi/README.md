@@ -264,8 +264,8 @@ Reconciliation and deletion are fail-closed:
 - tenant-internal resources and bootstrap RBAC are disposable with the
   dedicated tenant cluster; finalization does not contact the tenant API or
   require a cleanup checkpoint. Management/host ownership remains fail-closed.
-  The `disposable-cluster-v3` epoch requires a clean cutover from older stored
-  status contracts; existing Tenants are not migrated.
+  The `worker-bootstrap-v4` epoch requires a clean cutover from older stored
+  status and worker-bootstrap contracts; existing Tenants are not migrated.
 
 The controller does not persist a creation program counter or child-resource
 UID ledger. Missing children are discovered from live state. Static bootstrap

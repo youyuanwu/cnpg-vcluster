@@ -36,12 +36,13 @@ only the exactly owned storage volume, Namespace/credentials, endpoint
 allocation, and finalizer, in that order. It does not connect to the tenant API.
 Management and host ownership checks remain fail-closed.
 
-The `disposable-cluster-v3` lifecycle epoch removes tenant-API creation
-authorization and successful-cleanup status fields, along with the cleanup
-catalog. This stored-contract change requires a clean cutover from
-`desired-state-v2`; no status migration is supported. Lifecycle epoch changes
-scale the old controller to zero and reject existing Tenant/provider/host
-residue; status from older epochs is not silently migrated.
+The `worker-bootstrap-v4` lifecycle epoch includes the earlier removal of
+tenant-API creation authorization, successful-cleanup status fields, and the
+cleanup catalog. It additionally requires CNPG storage directory preparation
+in worker bootstrap. This stored and bootstrap-contract change requires a clean
+cutover from `disposable-cluster-v3`; no status or existing-worker migration is
+supported. Lifecycle epoch changes scale the old controller to zero and reject
+existing Tenant/provider/host residue; older state is not silently migrated.
 
 A second served version must not be added until conversion behavior, storage
 version migration, downgrade behavior, and removal criteria are documented and

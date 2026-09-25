@@ -214,8 +214,10 @@ Partial creation is handled from live management and host state, even when a
 Cluster, control plane, or workers were never created. An observed root Cluster
 UID is recorded before deletion. Ownership conflicts, failed management/host
 inspection, and foundation hash changes still block destructive progress.
-The `disposable-cluster-v3` lifecycle epoch requires a clean cutover from the
-old tenant-cleanup status contract, not migration of existing Tenants.
+The `worker-bootstrap-v4` lifecycle epoch requires a clean cutover from older
+tenant-cleanup and worker-bootstrap contracts, not migration of existing
+Tenants. This prevents workers created before CNPG storage preparation moved
+into bootstrap from being reused without the required directory ownership.
 The foundation lifecycle hash excludes mutation mode and controller image
 identity, allowing same-epoch controller rebuilds while resource-affecting
 foundation inputs remain immutable.

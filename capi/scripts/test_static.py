@@ -191,7 +191,7 @@ def check_repository_boundaries() -> None:
         "--mutation-enabled=${CONTROLLER_MUTATION_ENABLED}" in manager,
         "Tenant controller mutation template placeholder is missing",
     )
-    lifecycle_epoch = "disposable-cluster-v3"
+    lifecycle_epoch = "worker-bootstrap-v4"
     check(
         f'CONTROLLER_LIFECYCLE_EPOCH = "{lifecycle_epoch}"'
         in (ROOT / "scripts" / "lib" / "controller.py").read_text(
