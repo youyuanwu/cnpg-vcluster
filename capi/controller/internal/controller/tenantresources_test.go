@@ -93,7 +93,6 @@ func TestEnsureStaticTenantObjectDoesNotMutateExistingDuringProgress(t *testing.
 		tenant,
 		"spec-hash",
 		"foundation-hash",
-		false,
 	)
 	if err != nil || changed {
 		t.Fatalf("unexpected static progress result: changed=%t err=%v", changed, err)
@@ -103,7 +102,7 @@ func TestEnsureStaticTenantObjectDoesNotMutateExistingDuringProgress(t *testing.
 	}
 }
 
-func TestEnsureStaticTenantObjectRecreatesMissingWhileReady(t *testing.T) {
+func TestEnsureStaticTenantObjectRecreatesMissing(t *testing.T) {
 	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
 	tenant := testTenant()
 	tenantClient := &recordingPatchClient{
@@ -116,69 +115,9 @@ func TestEnsureStaticTenantObjectRecreatesMissingWhileReady(t *testing.T) {
 		tenant,
 		"spec-hash",
 		"foundation-hash",
-		true,
 	)
 	if err != nil || !changed || !tenantClient.created {
-		t.Fatalf("missing Ready static resource was not recreated: changed=%t err=%v", changed, err)
-	}
-}
-
-func TestEnsureStaticTenantObjectAcceptsMatchingReadyResource(t *testing.T) {
-	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
-	tenant := testTenant()
-	desired := markedTenantConfigMap(gvk, tenant, "desired")
-	current := desired.DeepCopy()
-	current.SetUID("live-uid")
-	current.SetResourceVersion("7")
-	tenantClient := &recordingPatchClient{
-		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build(),
-	}
-	changed, err := ensureStaticTenantObject(
-		context.Background(),
-		tenantClient,
-		desired,
-		tenant,
-		"spec-hash",
-		"foundation-hash",
-		true,
-	)
-	if err != nil || changed {
-		t.Fatalf("unexpected matching static result: changed=%t err=%v", changed, err)
-	}
-	if !tenantClient.patched {
-		t.Fatal("Ready static resource was not dry-run validated")
-	}
-}
-
-func TestEnsureStaticTenantObjectReportsDriftWithoutMutation(t *testing.T) {
-	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
-	tenant := testTenant()
-	current := markedTenantConfigMap(gvk, tenant, "drifted")
-	current.SetUID("live-uid")
-	current.SetResourceVersion("7")
-	desired := markedTenantConfigMap(gvk, tenant, "desired")
-	base := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build()
-	tenantClient := &recordingPatchClient{Client: base}
-	changed, err := ensureStaticTenantObject(
-		context.Background(),
-		tenantClient,
-		desired,
-		tenant,
-		"spec-hash",
-		"foundation-hash",
-		true,
-	)
-	if changed || !errors.Is(err, errStaticResourceDrift) {
-		t.Fatalf("static drift was not reported: changed=%t err=%v", changed, err)
-	}
-	var preserved unstructured.Unstructured
-	preserved.SetGroupVersionKind(gvk)
-	if err := base.Get(context.Background(), client.ObjectKeyFromObject(current), &preserved); err != nil {
-		t.Fatal(err)
-	}
-	data, _, _ := unstructured.NestedStringMap(preserved.Object, "data")
-	if data["value"] != "drifted" {
-		t.Fatalf("dry-run validation mutated the live resource: %v", data)
+		t.Fatalf("missing static resource was not recreated: changed=%t err=%v", changed, err)
 	}
 }
 

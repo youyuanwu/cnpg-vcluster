@@ -50,7 +50,6 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 		tenant,
 		specHash,
 		foundation.Hash,
-		staticDriftValidationEnabled(tenant),
 	)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -62,16 +61,13 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 	deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
 	if err := tenantClient.Get(ctx, client.ObjectKey{Namespace: "cnpg-system", Name: "cnpg-controller-manager"}, deployment); err != nil {
 		if apierrors.IsNotFound(err) {
-			reconciler.componentTimings.transition(ctx, tenant, "cnpg-operator")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if !workloadAvailable(deployment) {
-		reconciler.componentTimings.transition(ctx, tenant, "cnpg-operator")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	reconciler.componentTimings.transition(ctx, tenant, "database")
 	_, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
 	if err != nil {
 		if errors.Is(err, errWorkerRuntimePending) {
@@ -119,7 +115,6 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 		tenant,
 		specHash,
 		foundation.Hash,
-		staticDriftValidationEnabled(tenant),
 	)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -144,7 +139,6 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		reconciler.componentTimings.transition(ctx, tenant, "database")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return reconciler.reconcileReadiness(ctx, tenantClient, tenant, canonical, specHash, foundation)

@@ -18,11 +18,6 @@ import (
 
 const readyObservationInterval = 5 * time.Minute
 
-func staticDriftValidationEnabled(tenant *tenancyv1alpha1.Tenant) bool {
-	return tenant.Status.ObservedGeneration == tenant.Generation &&
-		tenantHasReadinessObservation(tenant)
-}
-
 func tenantHasReadinessObservation(tenant *tenancyv1alpha1.Tenant) bool {
 	for _, condition := range tenant.Status.Conditions {
 		if condition.Type == "DatabaseReady" &&
@@ -83,7 +78,6 @@ func (reconciler *TenantReconciler) reconcileReadiness(
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
-	reconciler.componentTimings.complete(ctx, tenant)
 	return readinessRequeue(), nil
 }
 

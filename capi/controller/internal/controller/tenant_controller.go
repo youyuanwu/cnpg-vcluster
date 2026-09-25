@@ -56,7 +56,6 @@ type TenantReconciler struct {
 	FoundationName           string
 	ExpectedControllerImage  string
 	foundationHostValidation foundationHostValidation
-	componentTimings         componentTimingTracker
 }
 
 func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -65,7 +64,6 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		if ignored := client.IgnoreNotFound(err); ignored != nil {
 			return ctrl.Result{}, fmt.Errorf("%s", sanitize.Text(ignored.Error()))
 		}
-		reconciler.componentTimings.clearName(request.Name)
 		return ctrl.Result{}, nil
 	}
 	canonical, specHash, validationErr := validation.Validate(tenant.Name, tenant.Spec, reconciler.SupportedVersion)
@@ -95,7 +93,6 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, phase, reason, err)
 	}
 	if !tenant.DeletionTimestamp.IsZero() {
-		reconciler.componentTimings.clearName(tenant.Name)
 		if !containsString(tenant.Finalizers, tenantFinalizer) {
 			return ctrl.Result{}, nil
 		}
@@ -153,8 +150,8 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		if errors.Is(err, errImmutableDrift) {
 			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "ImmutableDrift", err)
 		}
-		if errors.Is(err, errStaticResourceDrift) {
-			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "StaticResourceDrift", err)
+		if errors.Is(err, errBootstrapAccessMismatch) {
+			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "BootstrapAccessMismatch", err)
 		}
 		if errors.Is(err, errRootClusterMissing) {
 			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "RootClusterMissing", err)

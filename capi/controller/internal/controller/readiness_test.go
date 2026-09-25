@@ -36,31 +36,7 @@ func TestReadyAndDegradedTenantsUseBoundedResync(t *testing.T) {
 	}
 }
 
-func TestStaticDriftValidationRemainsEnabledWhileDegraded(t *testing.T) {
-	tenant := testTenant()
-	tenant.Generation = 3
-	tenant.Status.ObservedGeneration = 3
-	tenant.Status.Conditions = []metav1.Condition{{
-		Type:               "DatabaseReady",
-		Status:             metav1.ConditionTrue,
-		ObservedGeneration: 3,
-	}}
-	for _, phase := range []tenancyv1alpha1.TenantPhase{
-		tenancyv1alpha1.PhaseReady,
-		tenancyv1alpha1.PhaseDegraded,
-	} {
-		tenant.Status.Phase = phase
-		if !staticDriftValidationEnabled(tenant) {
-			t.Fatalf("static drift validation disabled for %s Tenant", phase)
-		}
-	}
-	tenant.Status.ObservedGeneration = 2
-	if staticDriftValidationEnabled(tenant) {
-		t.Fatal("static drift validation accepted a stale observed generation")
-	}
-}
-
-func TestEstablishedTenantRecoveryRemainsDegradedAndAudited(t *testing.T) {
+func TestEstablishedTenantRecoveryRemainsDegraded(t *testing.T) {
 	tenant := testTenant()
 	tenant.Generation = 2
 	tenant.Status.ObservedGeneration = 2
@@ -75,8 +51,5 @@ func TestEstablishedTenantRecoveryRemainsDegradedAndAudited(t *testing.T) {
 	tenant.Status = status
 	if tenant.Status.Phase != tenancyv1alpha1.PhaseDegraded {
 		t.Fatalf("established recovery became %s", tenant.Status.Phase)
-	}
-	if !staticDriftValidationEnabled(tenant) {
-		t.Fatal("established recovery disabled static drift validation")
 	}
 }

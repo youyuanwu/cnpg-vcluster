@@ -43,7 +43,6 @@ func (reconciler *TenantReconciler) reconcilePostCNIWorkers(
 		return ctrl.Result{}, err
 	}
 	if !state.inventoryComplete || !state.allReady {
-		reconciler.componentTimings.transition(ctx, tenant, "worker-readiness")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return reconciler.reconcileStorage(ctx, tenantClient, tenant, canonical, specHash, foundation)

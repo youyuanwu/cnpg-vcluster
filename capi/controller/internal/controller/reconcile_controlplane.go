@@ -93,12 +93,10 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 		return ctrl.Result{}, err
 	}
 	if !current {
-		reconciler.componentTimings.transition(ctx, tenant, "control-plane")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	tenantClient, secret, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
 	if apierrors.IsNotFound(err) {
-		reconciler.componentTimings.transition(ctx, tenant, "control-plane")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if err != nil {
@@ -109,12 +107,10 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 	}
 	if err := ensureBootstrapRBAC(ctx, tenantClient); err != nil {
 		if errors.Is(err, errTenantAdministrativeAccessPending) {
-			reconciler.componentTimings.transition(ctx, tenant, "control-plane")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
-	reconciler.componentTimings.transition(ctx, tenant, "worker-image-preparation")
 	return reconciler.reconcileWorkers(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 

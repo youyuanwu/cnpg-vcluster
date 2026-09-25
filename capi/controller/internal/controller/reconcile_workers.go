@@ -60,16 +60,13 @@ func (reconciler *TenantReconciler) reconcileWorkers(
 	machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
 	if err != nil {
 		if errors.Is(err, errWorkerRuntimePending) {
-			reconciler.componentTimings.transition(ctx, tenant, "worker-image-preparation")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
-		reconciler.componentTimings.transition(ctx, tenant, "worker-image-preparation")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	reconciler.componentTimings.transition(ctx, tenant, "network")
 	return reconciler.reconcileNetwork(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 

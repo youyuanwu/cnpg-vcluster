@@ -21,7 +21,6 @@ from scripts.lib.timing import PhaseTimings
 from scripts.lib.registry import registry_name
 from scripts.lib.controller_scenarios import (
     delete_controller_tenant,
-    emit_controller_component_timings,
     tenant_from_document,
     tenant_snapshot,
     wait_tenant_ready,
@@ -292,10 +291,6 @@ def run_e2e() -> int:
             run_just(ROOT, config, "local-tenant-apply", str(manifest))
             document = wait_tenant_ready(ROOT, config, tenant_name)
         run_just(ROOT, config, "local-tenant-status", tenant_name)
-        emit_controller_component_timings(
-            ManagementClient(ROOT, config),
-            document,
-        )
         with timings.phase("tenant_sql_probe"):
             tenant = tenant_from_document(ROOT, config, document)
             export_tenant_kubeconfig(

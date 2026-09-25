@@ -46,7 +46,6 @@ func (reconciler *TenantReconciler) reconcileNetwork(
 		tenant,
 		specHash,
 		foundation.Hash,
-		staticDriftValidationEnabled(tenant),
 	)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -59,10 +58,8 @@ func (reconciler *TenantReconciler) reconcileNetwork(
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		reconciler.componentTimings.transition(ctx, tenant, "network")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	reconciler.componentTimings.transition(ctx, tenant, "worker-readiness")
 	return reconciler.reconcilePostCNIWorkers(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 
