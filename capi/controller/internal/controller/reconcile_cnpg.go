@@ -43,7 +43,15 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	applied, err := ensureTenantObjects(ctx, tenantClient, objects, tenant, specHash, foundation.Hash)
+	applied, err := ensureTenantObjects(
+		ctx,
+		tenantClient,
+		objects,
+		tenant,
+		specHash,
+		foundation.Hash,
+		staticDriftValidationEnabled(tenant),
+	)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -54,13 +62,16 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 	deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
 	if err := tenantClient.Get(ctx, client.ObjectKey{Namespace: "cnpg-system", Name: "cnpg-controller-manager"}, deployment); err != nil {
 		if apierrors.IsNotFound(err) {
+			reconciler.componentTimings.transition(ctx, tenant, "cnpg-operator")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if !workloadAvailable(deployment) {
+		reconciler.componentTimings.transition(ctx, tenant, "cnpg-operator")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
+	reconciler.componentTimings.transition(ctx, tenant, "database")
 	_, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
 	if err != nil {
 		if errors.Is(err, errWorkerRuntimePending) {
@@ -85,11 +96,47 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 		}
 		return progressRequeue(), nil
 	}
-	applied, err = ensureTenantObjects(ctx, tenantClient, resources.CNPGObjects(resourceContext, tenantStorageClass, postgresImage.Reference), tenant, specHash, foundation.Hash)
+	databaseObjects := resources.CNPGObjects(resourceContext, tenantStorageClass, postgresImage.Reference)
+	staticObjects := make([]*unstructured.Unstructured, 0, len(databaseObjects)-1)
+	var databaseCluster *unstructured.Unstructured
+	for _, object := range databaseObjects {
+		if object.GetAPIVersion() == "postgresql.cnpg.io/v1" && object.GetKind() == "Cluster" {
+			if databaseCluster != nil {
+				return ctrl.Result{}, fmt.Errorf("database desired state contains multiple CNPG Clusters")
+			}
+			databaseCluster = object
+			continue
+		}
+		staticObjects = append(staticObjects, object)
+	}
+	if databaseCluster == nil {
+		return ctrl.Result{}, fmt.Errorf("database desired state omits the CNPG Cluster")
+	}
+	applied, err = ensureTenantObjects(
+		ctx,
+		tenantClient,
+		staticObjects,
+		tenant,
+		specHash,
+		foundation.Hash,
+		staticDriftValidationEnabled(tenant),
+	)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if applied.Created || applied.Pending {
+		return progressRequeue(), nil
+	}
+	if changed, err := ensureTenantObject(
+		ctx,
+		tenantClient,
+		databaseCluster,
+		tenant,
+		specHash,
+		foundation.Hash,
+	); err != nil {
+		return ctrl.Result{}, err
+	} else if changed {
 		return progressRequeue(), nil
 	}
 	ready, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount, postgresImage.Reference)
@@ -97,6 +144,7 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 		return ctrl.Result{}, err
 	}
 	if !ready {
+		reconciler.componentTimings.transition(ctx, tenant, "database")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return reconciler.reconcileReadiness(ctx, tenantClient, tenant, canonical, specHash, foundation)

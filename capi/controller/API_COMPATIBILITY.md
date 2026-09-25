@@ -20,6 +20,14 @@ cluster, so status has no tenant-API creation or cleanup checkpoint.
 The supported local status command is the compatibility surface for exit
 classification.
 
+Static tenant bootstrap resources are created when absent but are not
+continuously repaired. Once Ready, the controller periodically uses
+non-persisting server-side dry-run to detect supported-field drift and reports
+`StaticResourceDrift` without mutating the object. Dynamic CAPI roots and the
+CNPG database `Cluster` retain targeted repair. Additive fields owned by other
+field managers are preserved and are not part of the static drift contract.
+Clients must not interpret component timing logs as persisted API state.
+
 Deletion is ordinary Kubernetes DELETE guarded by the
 `tenancy.cnpg-vcluster.io/finalizer`. Clients must not depend on preparatory
 reservations, Leases, filesystem journals, force deletion, or provider

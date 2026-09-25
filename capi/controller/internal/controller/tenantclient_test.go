@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	rbacv1 "k8s.io/api/rbac/v1"
@@ -11,7 +12,7 @@ import (
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
-func TestBootstrapRBACConvergesPreexistingRoleBinding(t *testing.T) {
+func TestBootstrapRBACRefusesPreexistingRoleBindingDrift(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := rbacv1.AddToScheme(scheme); err != nil {
 		t.Fatal(err)
@@ -27,17 +28,15 @@ func TestBootstrapRBACConvergesPreexistingRoleBinding(t *testing.T) {
 		Subjects: []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: "Group", Name: "foreign"}},
 	}
 	tenantClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
-	if err := applyBootstrapRBAC(context.Background(), tenantClient); err != nil {
+	if err := ensureBootstrapRBAC(context.Background(), tenantClient); !errors.Is(err, errStaticResourceDrift) {
+		t.Fatalf("bootstrap RoleBinding drift was not refused: %v", err)
+	}
+	var preserved rbacv1.RoleBinding
+	if err := tenantClient.Get(context.Background(), client.ObjectKey{Namespace: "kube-system", Name: existing.Name}, &preserved); err != nil {
 		t.Fatal(err)
 	}
-	var updated rbacv1.RoleBinding
-	if err := tenantClient.Get(context.Background(), client.ObjectKey{Namespace: "kube-system", Name: existing.Name}, &updated); err != nil {
-		t.Fatal(err)
-	}
-	if len(updated.Subjects) != 2 ||
-		updated.Subjects[0].Name != "system:bootstrappers:kubeadm:default-node-token" ||
-		updated.Subjects[1].Name != "system:nodes" {
-		t.Fatalf("bootstrap RoleBinding did not converge: %#v", updated.Subjects)
+	if len(preserved.Subjects) != 1 || preserved.Subjects[0].Name != "foreign" {
+		t.Fatalf("bootstrap RoleBinding drift was mutated: %#v", preserved.Subjects)
 	}
 }
 

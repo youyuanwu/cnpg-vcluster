@@ -16,7 +16,22 @@ import (
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/validation"
 )
 
-const readyObservationInterval = 30 * time.Second
+const readyObservationInterval = 5 * time.Minute
+
+func staticDriftValidationEnabled(tenant *tenancyv1alpha1.Tenant) bool {
+	return tenant.Status.ObservedGeneration == tenant.Generation &&
+		tenantHasReadinessObservation(tenant)
+}
+
+func tenantHasReadinessObservation(tenant *tenancyv1alpha1.Tenant) bool {
+	for _, condition := range tenant.Status.Conditions {
+		if condition.Type == "DatabaseReady" &&
+			condition.ObservedGeneration == tenant.Generation {
+			return true
+		}
+	}
+	return false
+}
 
 func (reconciler *TenantReconciler) reconcileReadiness(
 	ctx context.Context,
@@ -60,12 +75,16 @@ func (reconciler *TenantReconciler) reconcileReadiness(
 			return nil
 		})
 	}
-	return readinessRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 		status.Phase = tenancyv1alpha1.PhaseReady
 		setReadyObservationConditions(status, tenant, true, true, true, true, true)
 		setCondition(status, tenant, "Ready", metav1.ConditionTrue, "Ready", "Tenant components are ready")
 		return nil
-	})
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	reconciler.componentTimings.complete(ctx, tenant)
+	return readinessRequeue(), nil
 }
 
 func readinessRequeue() ctrl.Result {
