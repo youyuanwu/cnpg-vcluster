@@ -29,6 +29,7 @@ func main() {
 		webhookCertDir   string
 		supportedVersion string
 		controllerImage  string
+		lifecycleEpoch   string
 	)
 	flag.BoolVar(&leaderElect, "leader-elect", true, "Enable leader election")
 	flag.BoolVar(&mutationEnabled, "mutation-enabled", false, "Enable Tenant provider mutation")
@@ -37,10 +38,12 @@ func main() {
 	flag.StringVar(&webhookCertDir, "webhook-cert-dir", "/var/run/tenant-controller/tls", "Webhook certificate directory")
 	flag.StringVar(&supportedVersion, "supported-kubernetes-version", "1.36.4", "Supported Tenant Kubernetes version")
 	flag.StringVar(&controllerImage, "controller-image", "", "Exact Tenant controller image identity")
+	flag.StringVar(&lifecycleEpoch, "lifecycle-epoch", "desired-state-v2", "Tenant lifecycle compatibility epoch")
 	options := zap.Options{Development: false}
 	options.BindFlags(flag.CommandLine)
 	flag.Parse()
 	ctrl.SetLogger(sanitize.Logger(zap.New(zap.UseFlagOptions(&options))))
+	ctrl.Log.Info("starting Tenant controller", "lifecycleEpoch", lifecycleEpoch)
 
 	scheme := runtime.NewScheme()
 	must(clientgoscheme.AddToScheme(scheme))

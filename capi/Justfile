@@ -79,6 +79,10 @@ controller-verify:
 controller-test:
     @python3 scripts/test_controller.py
 
+# Run Go vet using the pinned Go toolchain and module cache.
+controller-vet:
+    @python3 scripts/vet_controller.py
+
 # Build the static Tenant controller manager binary.
 controller-build:
     @python3 scripts/build_controller.py --binary
@@ -87,13 +91,13 @@ controller-build:
 controller-image:
     @python3 scripts/build_controller.py
 
-# Exercise locked temporary controller mutation through the Phase 2 boundary.
-test-controller-phase2:
-    @python3 scripts/run_locked.py scripts/test_controller_phase2.py
+# Exercise controller convergence through worker and host-resource creation.
+test-controller-convergence:
+    @python3 scripts/run_locked.py scripts/test_controller_convergence.py
 
-# Exercise complete temporary controller mutation through Ready and Phase 3 finalization.
-test-controller-phase3:
-    @python3 scripts/run_locked.py scripts/test_controller_phase3.py
+# Exercise complete Ready reconciliation and controller restart behavior.
+test-controller-readiness:
+    @python3 scripts/run_locked.py scripts/test_controller_readiness.py
 
 # Exercise ordinary Tenant deletion, restart recovery, and same-name recreation.
 test-controller-deletion:

@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING
 from scripts.cache import canonical_tagged
 from scripts.lib.config import parse_duration
 from scripts.lib.controller_cutover import (
-    controller_mutation_enabled,
+    controller_lifecycle_epoch,
     require_clean_controller_cutover,
 )
 from scripts.lib.files import ensure_private_dir, write_private_file
@@ -28,11 +28,17 @@ if TYPE_CHECKING:
 CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
+CONTROLLER_LIFECYCLE_EPOCH = "desired-state-v2"
+
+
+def controller_requires_cutover(installed_epoch: str | None) -> bool:
+    return installed_epoch != CONTROLLER_LIFECYCLE_EPOCH
 
 
 def _foundation_checksum(data: dict[str, object]) -> str:
     immutable = dict(data)
     immutable.pop("mutationEnabled", None)
+    immutable.pop("controllerImage", None)
     encoded = json.dumps(immutable, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode()).hexdigest()
 
@@ -96,6 +102,15 @@ def test_controller(root: Path, config: dict[str, str]) -> None:
         [str(root / ".tools" / "bin" / "go"), "test", "./..."],
         cwd=root / "controller",
         env=environment,
+        timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,
+    )
+
+
+def vet_controller(root: Path, config: dict[str, str]) -> None:
+    run(
+        [str(root / ".tools" / "bin" / "go"), "vet", "./..."],
+        cwd=root / "controller",
+        env=go_environment(root),
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,
     )
 
@@ -190,7 +205,13 @@ def build_controller_image(
         shutil.rmtree(build_root, ignore_errors=True)
 
 
-def render_controller_manager(root: Path, config: dict[str, str], image: str) -> Path:
+def render_controller_manager(
+    root: Path,
+    config: dict[str, str],
+    image: str,
+    *,
+    mutation_enabled: bool,
+) -> Path:
     template = (
         root / "controller" / "config" / "manager" / "manager.yaml.tpl"
     ).read_text(encoding="utf-8")
@@ -199,6 +220,11 @@ def render_controller_manager(root: Path, config: dict[str, str], image: str) ->
         .replace(
             "${SUPPORTED_KUBERNETES_VERSION}",
             config["KUBERNETES_VERSION"].removeprefix("v"),
+        )
+        .replace("${CONTROLLER_LIFECYCLE_EPOCH}", CONTROLLER_LIFECYCLE_EPOCH)
+        .replace(
+            "${CONTROLLER_MUTATION_ENABLED}",
+            "true" if mutation_enabled else "false",
         )
     )
     destination = root / ".runtime" / "rendered" / "controller" / "manager.yaml"
@@ -213,6 +239,8 @@ def _foundation_payload(
     image: str,
     verified_cache: VerifiedCache,
     registry: dict[str, object] | None,
+    *,
+    mutation_enabled: bool = True,
 ) -> dict[str, object]:
     identity = require_management_ownership(root, config)
     reserved = sorted(
@@ -261,7 +289,7 @@ def _foundation_payload(
         "allowedSubnets": allowed_subnets,
         "kubernetesVersion": config["KUBERNETES_VERSION"],
         "controllerImage": image,
-        "mutationEnabled": True,
+        "mutationEnabled": mutation_enabled,
         "offlineEnforced": os.environ.get("CAPI_OFFLINE_ENFORCED") == "1",
         "versions": versions,
         "cache": {
@@ -488,6 +516,95 @@ def delete_controller_tenants(
         )
 
 
+def stop_controller_for_cutover(
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    deployment = client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "get",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        check=False,
+    )
+    if deployment.returncode != 0:
+        output = f"{deployment.stdout}{deployment.stderr}".lower()
+        if "notfound" in output or "not found" in output:
+            return
+        raise RuntimeError(
+            f"failed to inspect Tenant controller before cutover: {deployment.stderr}"
+        )
+    client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "scale",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        "--replicas=0",
+    )
+
+    def old_pods_absent() -> bool | None:
+        pods = client.json(
+            "-n",
+            CONTROLLER_NAMESPACE,
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=tenant-controller",
+        )
+        return True if not pods.get("items") else None
+
+    wait_for(
+        "old Tenant controller Pods to terminate",
+        parse_duration(config["CONDITION_TIMEOUT"]),
+        2,
+        old_pods_absent,
+    )
+
+
+def verify_running_controller_epoch(
+    client: ManagementClient,
+    expected: str,
+) -> None:
+    deployment_epoch = controller_lifecycle_epoch(client)
+    if deployment_epoch != expected:
+        raise RuntimeError(
+            "Tenant controller Deployment lifecycle epoch mismatch: "
+            f"expected {expected}, observed {deployment_epoch or '<missing>'}"
+        )
+    pods = client.json(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "get",
+        "pods",
+        "-l",
+        "app.kubernetes.io/name=tenant-controller",
+    ).get("items", [])
+    if not pods:
+        raise RuntimeError("Tenant controller has no running Pod")
+    prefix = "--lifecycle-epoch="
+    for pod in pods:
+        manager = next(
+            (
+                container
+                for container in pod.get("spec", {}).get("containers", [])
+                if container.get("name") == "manager"
+            ),
+            None,
+        )
+        if manager is None:
+            raise RuntimeError("Tenant controller Pod manager container is missing")
+        epochs = [
+            value.removeprefix(prefix)
+            for value in manager.get("args", [])
+            if value.startswith(prefix)
+        ]
+        if epochs != [expected]:
+            name = pod.get("metadata", {}).get("name", "<unknown>")
+            raise RuntimeError(
+                f"Tenant controller Pod {name} lifecycle epoch mismatch"
+            )
+
+
 def reconcile_controller(
     root: Path,
     config: dict[str, str],
@@ -496,9 +613,12 @@ def reconcile_controller(
     verified_cache: VerifiedCache,
     registry: dict[str, object] | None,
 ) -> None:
-    if not controller_mutation_enabled(client):
-        require_clean_controller_cutover(root, config, client)
+    installed_epoch = controller_lifecycle_epoch(client)
+    requires_cutover = controller_requires_cutover(installed_epoch)
     image = build_controller_image(root, config)
+    if requires_cutover:
+        stop_controller_for_cutover(config, client)
+        require_clean_controller_cutover(root, config, client)
     run(
         [
             str(root / ".tools" / "bin" / "kind"),
@@ -510,7 +630,12 @@ def reconcile_controller(
         ],
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
     )
-    manager = render_controller_manager(root, config, image)
+    manager = render_controller_manager(
+        root,
+        config,
+        image,
+        mutation_enabled=not requires_cutover,
+    )
     paths = (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
         root / "controller" / "config" / "crd" / "bases",
@@ -536,6 +661,7 @@ def reconcile_controller(
         image,
         verified_cache,
         registry,
+        mutation_enabled=not requires_cutover,
     )
     client.kubectl(
         "apply",
@@ -607,6 +733,15 @@ def reconcile_controller(
         2,
         webhook_ready,
     )
+    verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
+    if requires_cutover:
+        set_controller_mutation(config, client, enabled=True)
+        render_controller_manager(
+            root,
+            config,
+            image,
+            mutation_enabled=True,
+        )
 
 
 def delete_controller(

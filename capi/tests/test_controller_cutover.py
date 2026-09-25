@@ -8,6 +8,7 @@ from subprocess import CompletedProcess
 from unittest.mock import patch
 
 from scripts.lib.controller_cutover import (
+    controller_lifecycle_epoch,
     controller_mutation_enabled,
     require_clean_controller_cutover,
 )
@@ -52,6 +53,52 @@ class ControllerCutoverTests(unittest.TestCase):
         )
         self.assertTrue(controller_mutation_enabled(client))
 
+    def test_lifecycle_epoch_reads_manager_arguments(self) -> None:
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": [
+                                    "--mutation-enabled=true",
+                                    "--lifecycle-epoch=desired-state-v2",
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        client = FakeManagementClient(
+            [CompletedProcess([], 0, stdout=json.dumps(deployment), stderr="")]
+        )
+        self.assertEqual(
+            "desired-state-v2",
+            controller_lifecycle_epoch(client),
+        )
+
+    def test_legacy_controller_has_no_lifecycle_epoch(self) -> None:
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": ["--mutation-enabled=true"],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        client = FakeManagementClient(
+            [CompletedProcess([], 0, stdout=json.dumps(deployment), stderr="")]
+        )
+        self.assertIsNone(controller_lifecycle_epoch(client))
+
     def test_legacy_runtime_residue_blocks_before_cluster_inspection(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
@@ -66,6 +113,25 @@ class ControllerCutoverTests(unittest.TestCase):
                     client,
                 )
             self.assertEqual([], client.calls)
+
+    def test_existing_deleting_tenant_blocks_epoch_cutover(self) -> None:
+        client = FakeManagementClient(
+            [
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout="tenant.tenancy.cnpg-vcluster.io/deleting\n",
+                    stderr="",
+                )
+            ]
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            with self.assertRaisesRegex(RuntimeError, "existing Tenant resources"):
+                require_clean_controller_cutover(
+                    Path(temporary),
+                    {"OWNERSHIP_LABEL": "example.io/owned", "LAB_PREFIX": "lab"},
+                    client,
+                )
 
     def test_legacy_credentials_and_endpoint_allocations_block(self) -> None:
         for relative, content, expected in (

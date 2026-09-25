@@ -62,33 +62,40 @@ non-canonical or overlapping networks, and non-equivalent spec updates.
 Ordinary Kubernetes DELETE is accepted without a reservation or custom client
 protocol.
 
-Status contains the observed generation, phase, stage, standard conditions,
-endpoint, specification and foundation hashes, current exact resource
-identities, current worker container identities, exact Docker volume identity,
-and the minimum teardown checkpoint needed for restart-safe ordering.
-Historical replacement journals, readiness certificates, observation hashes,
-survivor snapshots, and foundation snapshots are intentionally absent.
+Status contains the observed generation, phase, standard conditions, endpoint,
+foundation hash, exact root Cluster UID, a one-way tenant API creation
+authorization barrier, and the exact Cluster UID whose tenant cleanup
+completed. There is no persisted creation stage, child-resource UID ledger,
+worker-container evidence, or Docker volume identity.
 
-The manager uses leader election and one bounded reconcile worker. Each
-reconcile performs a small mutation or observation step and persists progress.
-This keeps endpoint allocation simple without holding a long polling loop.
+The manager uses leader election and one bounded reconcile worker. Initial
+creation and steady-state repair use the same grouped desired-state path.
+Expected progress uses a fixed one-second requeue, while Ready and Degraded
+Tenants resynchronize every 30 seconds to observe tenant-cluster drift.
 
 ## Reconciliation flow
 
-Creation proceeds through these responsibilities:
+Reconciliation proceeds through these responsibilities:
 
 1. validate the immutable spec and bind the current foundation;
 2. add the Tenant finalizer before external mutation;
-3. allocate one endpoint with ConfigMap resource-version compare-and-swap;
-4. create the Namespace, CAPI Cluster, CAPD DevCluster, and
+3. persist the foundation hash before external mutation;
+4. allocate one endpoint with ConfigMap resource-version compare-and-swap;
+5. create the Namespace, CAPI Cluster, and CAPD DevCluster;
+6. persist tenant API creation authorization before creating
    KamajiControlPlane;
-5. validate and use the exact Kamaji kubeconfig Secret;
-6. create the exact Docker volume and worker templates;
-7. wait for the requested pre-CNI worker containers and registered Nodes;
-8. directly apply tenant networking through the tenant client;
-9. wait for the requested post-CNI Ready worker and Node topology;
-10. create the static StorageClass, CNPG operator, static PVs, and CNPG Cluster;
+7. validate and use the exact Kamaji kubeconfig Secret and bootstrap RBAC;
+8. create or validate the exact Docker volume and worker templates;
+9. observe the requested pre-CNI workers;
+10. directly apply tenant networking, storage, CNPG operator, static PVs, and
+    CNPG Cluster resources;
 11. set Ready only after current live observations pass.
+
+Missing objects use create-or-refuse semantics. Existing owned objects use
+unconditional UID/resource-version-bound server-side apply.
+Missing non-root children may be recreated. A missing or different-UID root
+Cluster after `status.clusterUID` is recorded becomes Degraded or
+OwnershipInvalid and is not silently replaced.
 
 Objects applied by the Tenant controller have deterministic names and exact
 Tenant UID, specification hash, foundation hash, and resource-role markers.
@@ -114,8 +121,8 @@ The controller periodically requires:
 - available Calico, CoreDNS, and `capi-kube-proxy` workloads;
 - the expected static StorageClass;
 - a healthy CNPG Cluster with the requested Ready Pods and Bound PVCs;
-- unchanged exact identities and ownership markers for every recorded direct
-  tenant resource.
+- current ownership markers for every direct tenant resource and the recorded
+  exact UID for the root CAPI Cluster.
 
 False, Unknown, missing, or stale provider conditions are not Ready.
 Same-name resources with foreign UIDs or markers produce `OwnershipInvalid`.
@@ -152,16 +159,22 @@ The CAPD HAProxy container remains a provider readiness dependency but is not
 the authoritative tenant endpoint.
 
 The controller refuses destructive mutation unless exact target ownership is
-proved. Kubernetes resources are checked by API identity, UID, provider owner
-chain, and lifecycle markers. The Docker volume is checked by exact name,
-creation time, mountpoint, and complete labels. Provider-owned worker
-containers are observed but never directly deleted by the Tenant controller.
+proved. Kubernetes resources are checked by deterministic API coordinates,
+provider owner chain, and lifecycle markers; destructive deletes use live UID
+and resource-version preconditions. The root CAPI Cluster must also match its
+recorded UID. The Docker volume is checked by exact name and complete labels,
+and its live mountpoint is used when building worker resources.
+Provider-owned worker containers are observed but never directly deleted by
+the Tenant controller.
 
 Unrelated kind clusters do not block first activation. Clean cutover rejects
 legacy local runtime records, nonempty legacy endpoint allocations, existing
 Tenant/CAPI/provider objects, controller endpoint allocations, exact
 tenant-storage volumes, owned tenant worker containers, and CAPD external
-load-balancer containers.
+load-balancer containers. Lifecycle epoch changes first scale the old
+controller to zero, wait for every old manager Pod to terminate, run this
+clean-cutover gate, start the new epoch mutation-disabled, verify the running
+epoch, and then enable mutation.
 
 ## Finalization and recovery
 
@@ -172,24 +185,28 @@ not acquire a shared destructive lock.
 Finalization is ordered:
 
 1. revalidate the target Tenant, foundation binding, endpoint allocation, and
-   exact recorded ownership;
-2. delete controller-applied CNPG, storage, networking, and bootstrap resources
-   through the live tenant API;
-3. persist the exact Cluster-UID-bound live-cleanup checkpoint;
-4. delete the CAPI Cluster with UID/resourceVersion preconditions and
+   live ownership;
+2. use the tenant API creation barrier to distinguish safe partial creation
+   from a Tenant that may have hosted workloads;
+3. validate the kubeconfig against the live KamajiControlPlane, delete the
+   lifecycle-versioned CNPG, storage, and networking catalog plus bootstrap
+   RBAC through the live tenant API, and wait for authoritative absence;
+4. persist `tenantCleanupClusterUID` for the exact root Cluster UID;
+5. delete the CAPI Cluster with UID/resourceVersion preconditions and
    Background propagation;
-5. wait for authoritative Cluster/provider absence and CAPD container absence;
-6. delete only the exact owned Docker volume and controller-used credentials;
-7. delete the Namespace with UID/resourceVersion preconditions;
-8. release only the target endpoint;
-9. remove the finalizer last.
+6. wait for authoritative Cluster/provider absence and CAPD container absence;
+7. delete only the exact owned Docker volume;
+8. delete the Namespace and its kubeconfig credential;
+9. release only the target endpoint;
+10. remove the finalizer last.
 
-If the tenant API becomes unavailable after exact management ownership
-preflight, a local disposable-cluster checkpoint can authorize provider
-teardown without pretending that ownership or absence was observed.
-Ownership conflicts still block. Deletion-time foundation loading does not
-require the active cache, registry, controller image, or running management
-container, so teardown can recover from foundation degradation.
+If the tenant API is unavailable before the successful-cleanup checkpoint,
+deletion blocks and provider/host state is preserved. After the checkpoint,
+tenant API loss is expected because Cluster deletion destroys the hosted
+control plane. Ownership conflicts and foundation hash changes still block.
+The foundation lifecycle hash excludes mutation mode and controller image
+identity, allowing same-epoch controller rebuilds while resource-affecting
+foundation inputs remain immutable.
 
 Controller restart recovery is exercised with a pending finalizer: the old
 controller Pod is proved absent, a distinct ready Pod UID is proved after

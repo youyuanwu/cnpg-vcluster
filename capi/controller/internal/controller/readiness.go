@@ -18,34 +18,19 @@ import (
 
 const readyObservationInterval = 30 * time.Second
 
-func (reconciler *TenantReconciler) reconcileReadiness(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
-	if tenant.Status.Stage != tenancyv1alpha1.StageDatabaseReady &&
-		tenant.Status.Stage != tenancyv1alpha1.StageReady {
-		return ctrl.Result{}, fmt.Errorf("unsupported readiness stage %q", tenant.Status.Stage)
-	}
-	tenantClient, _, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	changed, err := reconciler.reconcileStableDesiredObjects(
-		ctx,
-		tenantClient,
-		tenant,
-		canonical,
-		specHash,
-		foundation,
-	)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if changed {
-		return ctrl.Result{Requeue: true}, nil
-	}
+func (reconciler *TenantReconciler) reconcileReadiness(
+	ctx context.Context,
+	tenantClient client.Client,
+	tenant *tenancyv1alpha1.Tenant,
+	canonical validation.CanonicalSpec,
+	specHash string,
+	foundation Foundation,
+) (ctrl.Result, error) {
 	controlPlaneReady, err := reconciler.managementObjectsCurrent(ctx, tenant, specHash, foundation)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	workers, err := reconciler.observePostCNIWorkerState(ctx, tenant, canonical, specHash, foundation)
+	workers, err := reconciler.observePostCNIWorkerState(ctx, tenantClient, tenant, canonical, specHash, foundation)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -68,21 +53,23 @@ func (reconciler *TenantReconciler) reconcileReadiness(ctx context.Context, tena
 	workersReady := workers.inventoryComplete && workers.allReady
 	ready := controlPlaneReady && workersReady && networkReady && storageReady && databaseReady
 	if !ready {
-		return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		return readinessRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 			status.Phase = tenancyv1alpha1.PhaseDegraded
 			setReadyObservationConditions(status, tenant, controlPlaneReady, workersReady, networkReady, storageReady, databaseReady)
 			setCondition(status, tenant, "Ready", metav1.ConditionFalse, "ComponentsNotReady", "One or more Tenant components are not ready")
 			return nil
 		})
 	}
-	return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		recordPostCNIWorkerState(status, workers)
-		status.Stage = tenancyv1alpha1.StageReady
+	return readinessRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 		status.Phase = tenancyv1alpha1.PhaseReady
 		setReadyObservationConditions(status, tenant, true, true, true, true, true)
 		setCondition(status, tenant, "Ready", metav1.ConditionTrue, "Ready", "Tenant components are ready")
 		return nil
 	})
+}
+
+func readinessRequeue() ctrl.Result {
+	return ctrl.Result{RequeueAfter: readyObservationInterval}
 }
 
 func setReadyObservationConditions(status *tenancyv1alpha1.TenantStatus, tenant *tenancyv1alpha1.Tenant, controlPlane, workers, network, storage, database bool) {

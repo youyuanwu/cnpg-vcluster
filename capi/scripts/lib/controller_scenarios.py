@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import json
 import re
@@ -8,6 +9,7 @@ from pathlib import Path
 from .config import parse_duration
 from .controller_client import apply_tenant, delete_tenant
 from .kube import ManagementClient, wait_for
+from .process import run
 from .tenants import Tenant, export_tenant_kubeconfig, tenant_kubeconfig_path
 from scripts.controller_tenant_status import evaluate_tenant
 
@@ -130,12 +132,30 @@ def tenant_from_document(
         dns_ip = str(service.network_address + 10)
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(f"Tenant endpoint or network is invalid: {name}") from exc
-    volume = status.get("dockerVolume")
-    volume_path = (
-        Path(str(volume.get("mountpoint")))
-        if isinstance(volume, dict) and volume.get("mountpoint")
-        else Path("/")
+    volume_name = f"{config['LAB_PREFIX']}-{name}-storage"
+    volume = json.loads(
+        run(
+            ["docker", "volume", "inspect", volume_name],
+            timeout=30,
+        ).stdout
     )
+    if (
+        not isinstance(volume, list)
+        or len(volume) != 1
+        or not isinstance(volume[0], dict)
+        or not volume[0].get("Mountpoint")
+    ):
+        raise RuntimeError(f"Tenant Docker volume is invalid: {name}")
+    canonical = {
+        "kubernetesVersion": str(spec["kubernetesVersion"]).removeprefix("v"),
+        "workers": int(spec["workers"]),
+        "databaseCount": int(spec["databaseCount"]),
+        "podCIDR": str(ipaddress.ip_network(str(spec["podCIDR"]))),
+        "serviceCIDR": str(ipaddress.ip_network(str(spec["serviceCIDR"]))),
+    }
+    specification_sha256 = hashlib.sha256(
+        json.dumps(canonical, separators=(",", ":")).encode()
+    ).hexdigest()
     return Tenant(
         name=name,
         namespace=name,
@@ -144,11 +164,11 @@ def tenant_from_document(
         service_cidr=str(spec["serviceCIDR"]),
         dns_ip=dns_ip,
         domain=config["SPIKE_CLUSTER_DOMAIN"],
-        storage_host_path=volume_path,
+        storage_host_path=Path(str(volume[0]["Mountpoint"])),
         cnpg_cluster=config["SPIKE_CNPG_CLUSTER"],
         workers=int(spec["workers"]),
         database_count=int(spec["databaseCount"]),
-        specification_sha256=str(status.get("specHash", "")),
+        specification_sha256=specification_sha256,
     )
 
 
@@ -189,42 +209,84 @@ def delete_controller_tenant(
             pass
 
 
-def tenant_snapshot(document: dict[str, object]) -> dict[str, object]:
+def tenant_snapshot(
+    config: dict[str, str],
+    client: ManagementClient,
+    document: dict[str, object],
+) -> dict[str, object]:
     metadata = document.get("metadata")
     status = document.get("status")
     if not isinstance(metadata, dict) or not isinstance(status, dict):
         raise RuntimeError("Tenant document is missing metadata or status")
+    name = str(metadata.get("name", ""))
+    if not name:
+        raise RuntimeError("Tenant document has no metadata.name")
+    management_resources = []
+    for resource, namespace, object_name in (
+        ("namespace", None, name),
+        ("clusters.cluster.x-k8s.io", name, name),
+        ("devclusters.infrastructure.cluster.x-k8s.io", name, name),
+        ("kamajicontrolplanes.controlplane.cluster.x-k8s.io", name, name),
+        ("kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io", name, f"{name}-worker"),
+        ("devmachinetemplates.infrastructure.cluster.x-k8s.io", name, f"{name}-worker"),
+        ("machinedeployments.cluster.x-k8s.io", name, f"{name}-worker"),
+        ("secret", name, f"{name}-kubeconfig"),
+    ):
+        arguments = []
+        if namespace is not None:
+            arguments.extend(["-n", namespace])
+        arguments.extend(["get", f"{resource}/{object_name}", "-o", "json"])
+        payload = json.loads(client.kubectl(*arguments).stdout)
+        item_metadata = payload.get("metadata")
+        if not isinstance(item_metadata, dict) or not item_metadata.get("uid"):
+            raise RuntimeError(
+                f"Tenant management identity is incomplete: {resource}/{object_name}"
+            )
+        management_resources.append(
+            (
+                resource,
+                namespace or "",
+                object_name,
+                item_metadata["uid"],
+            )
+        )
+    volume_name = f"{config['LAB_PREFIX']}-{name}-storage"
+    volumes = json.loads(
+        run(["docker", "volume", "inspect", volume_name], timeout=30).stdout
+    )
+    if not isinstance(volumes, list) or len(volumes) != 1:
+        raise RuntimeError(f"Tenant Docker volume is missing: {name}")
+    volume = volumes[0]
+    workers = sorted(
+        run(
+            [
+                "docker",
+                "ps",
+                "-a",
+                "--filter",
+                f"label=io.x-k8s.kind.cluster={name}",
+                "--filter",
+                "label=io.x-k8s.kind.role=worker",
+                "--format",
+                "{{.Names}} {{.ID}}",
+            ],
+            timeout=30,
+        ).stdout.splitlines()
+    )
     return {
         "uid": metadata.get("uid"),
         "endpoint": status.get("endpoint"),
-        "specHash": status.get("specHash"),
         "foundationHash": status.get("foundationHash"),
-        "observedResources": sorted(
-            (
-                item.get("apiVersion"),
-                item.get("kind"),
-                item.get("namespace", ""),
-                item.get("name"),
-                item.get("uid"),
-            )
-            for item in status.get("observedResources", [])
-            if isinstance(item, dict)
+        "clusterUID": status.get("clusterUID"),
+        "tenantAPICreationAuthorized": status.get(
+            "tenantAPICreationAuthorized", False
         ),
-        "tenantResources": sorted(
-            (
-                item.get("apiVersion"),
-                item.get("kind"),
-                item.get("namespace", ""),
-                item.get("name"),
-                item.get("uid"),
-            )
-            for item in status.get("tenantResources", [])
-            if isinstance(item, dict)
-        ),
-        "dockerVolume": status.get("dockerVolume"),
-        "workerContainers": sorted(
-            (item.get("name"), item.get("id"))
-            for item in status.get("workerContainers", [])
-            if isinstance(item, dict)
-        ),
+        "managementResources": sorted(management_resources),
+        "dockerVolume": {
+            "name": volume.get("Name"),
+            "createdAt": volume.get("CreatedAt"),
+            "mountpoint": volume.get("Mountpoint"),
+            "labels": volume.get("Labels"),
+        },
+        "workerContainers": workers,
     }

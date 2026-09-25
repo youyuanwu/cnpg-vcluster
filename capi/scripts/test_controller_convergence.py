@@ -56,38 +56,54 @@ def _tenant(client: ManagementClient) -> dict[str, object] | None:
         output = f"{response.stdout}{response.stderr}".lower()
         if "not found" in output or "notfound" in output:
             return None
-        raise RuntimeError(f"failed to inspect Phase 2 Tenant: {output}")
+        raise RuntimeError(        f"failed to inspect convergence Tenant: {output}")
     return json.loads(response.stdout)
 
 
-def _workers_applied(client: ManagementClient) -> dict[str, object] | None:
+def _converging(
+    client: ManagementClient,
+    config: dict[str, str],
+) -> dict[str, object] | None:
     tenant = _tenant(client)
     if tenant is None:
         return None
     status = tenant.get("status") or {}
     if status.get("phase") in {"Failed", "OwnershipInvalid"}:
         raise RuntimeError(
-            f"Phase 2 Tenant failed: {json.dumps(status, sort_keys=True)}"
+            f"convergence Tenant failed: {json.dumps(status, sort_keys=True)}"
         )
-    accepted_stages = {
-        "WorkersApplied",
-        "NetworkReady",
-        "PostCNIWorkersReady",
-        "StorageApplied",
-        "StorageReady",
-        "CNPGOperatorApplied",
-        "CNPGStoragePrepared",
-        "CNPGClusterApplied",
-        "DatabaseReady",
-        "Ready",
-    }
-    if status.get("stage") not in accepted_stages:
+    if not all(
+        (
+            status.get("endpoint"),
+            status.get("foundationHash"),
+            status.get("clusterUID"),
+            status.get("tenantAPICreationAuthorized") is True,
+        )
+    ):
         return None
-    workers = status.get("workerContainers") or []
-    if len(workers) != 1 or not workers[0].get("id"):
-        raise RuntimeError("Phase 2 worker container reference is incomplete")
-    if not status.get("dockerVolume") or not status.get("endpoint"):
-        raise RuntimeError("Phase 2 endpoint or Docker volume identity is missing")
+    workers = run(
+        [
+            "docker",
+            "ps",
+            "-a",
+            "--filter",
+            f"label=io.x-k8s.kind.cluster={TENANT_NAME}",
+            "--filter",
+            "label=io.x-k8s.kind.role=worker",
+            "--format",
+            "{{.ID}}",
+        ],
+        timeout=30,
+    ).stdout.split()
+    if len(workers) != 1:
+        return None
+    volume = _volume_name(config)
+    if run(
+        ["docker", "volume", "inspect", volume],
+        timeout=30,
+        check=False,
+    ).returncode != 0:
+        return None
     ready = next(
         (
             condition
@@ -96,11 +112,15 @@ def _workers_applied(client: ManagementClient) -> dict[str, object] | None:
         ),
         None,
     )
-    if status.get("stage") == "WorkersApplied" and (
+    if status.get("phase") != "Ready" and (
         ready is None or ready.get("status") != "False"
     ):
-        raise RuntimeError("Phase 2 incorrectly reported the Tenant Ready")
+        raise RuntimeError("converging Tenant incorrectly reported Ready")
     return tenant
+
+
+def _volume_name(config: dict[str, str]) -> str:
+    return f"{config['LAB_PREFIX']}-{TENANT_NAME}-storage"
 
 
 def _absent(client: ManagementClient) -> bool | None:
@@ -125,11 +145,11 @@ def _restore_after_gate(
             )
             if cleanup.returncode != 0 or _tenant(client) is not None:
                 cleanup_error = (
-                    "Phase 2 cleanup is incomplete; "
+                    "convergence cleanup is incomplete; "
                     "Tenant state remains for the next locked recovery"
                 )
     except RuntimeError as exc:
-        cleanup_error = f"Phase 2 cleanup inspection failed: {exc}"
+        cleanup_error = f"convergence cleanup inspection failed: {exc}"
     try:
         set_controller_mutation(config, client, enabled=False)
     except RuntimeError as disable_error:
@@ -168,11 +188,11 @@ def main() -> None:
             )
             try:
                 first = wait_for(
-                    "Tenant Phase 2 WorkersApplied",
+                    "Tenant worker convergence",
                     parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"])
                     + parse_duration(config["WORKER_REGISTRATION_TIMEOUT"]),
                     parse_duration(config["WAIT_POLL_INTERVAL"]),
-                    lambda: _workers_applied(client),
+                    lambda: _converging(client, config),
                 )
             except RuntimeError as exc:
                 tenant = _tenant(client)
@@ -182,7 +202,8 @@ def main() -> None:
                     f"{json.dumps(status, sort_keys=True)}"
                 ) from exc
             endpoint = first["status"]["endpoint"]
-            volume = first["status"]["dockerVolume"]["name"]
+            cluster_uid = first["status"]["clusterUID"]
+            volume = _volume_name(config)
             client.kubectl(
                 "apply",
                 "--server-side",
@@ -193,19 +214,19 @@ def main() -> None:
                 input_text=json.dumps(manifest),
             )
             second = wait_for(
-                "idempotent Tenant Phase 2 status",
+                "idempotent Tenant convergence status",
                 parse_duration(config["CONDITION_TIMEOUT"]),
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
-                lambda: _workers_applied(client),
+                lambda: _converging(client, config),
             )
             if (
                 second["status"]["endpoint"] != endpoint
-                or second["status"]["dockerVolume"]["name"] != volume
+                or second["status"]["clusterUID"] != cluster_uid
             ):
-                raise RuntimeError("Phase 2 idempotent reconcile changed stable identity")
+                raise RuntimeError("idempotent convergence changed stable identity")
             delete_tenant_resource(client, TENANT_NAME, wait=False)
             wait_for(
-                "Tenant Phase 2 finalization",
+                "Tenant convergence finalization",
                 parse_duration(config["DELETE_TIMEOUT"]),
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: _absent(client),
@@ -216,14 +237,14 @@ def main() -> None:
                 check=False,
             )
             if namespace.returncode == 0:
-                raise RuntimeError("Phase 2 Namespace remained after finalization")
+                raise RuntimeError("convergence Namespace remained after finalization")
             volume_check = run(
                 ["docker", "volume", "inspect", volume],
                 timeout=30,
                 check=False,
             )
             if volume_check.returncode == 0:
-                raise RuntimeError("Phase 2 Docker volume remained after finalization")
+                raise RuntimeError("convergence Docker volume remained after finalization")
         finally:
             _restore_after_gate(config, client, sys.exc_info()[1])
             shutil.rmtree(

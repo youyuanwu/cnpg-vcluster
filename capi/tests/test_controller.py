@@ -11,16 +11,21 @@ from unittest.mock import patch
 
 from scripts.cache import VerifiedCache
 from scripts.controller_tenant import main as controller_tenant_main
-from scripts.test_controller_phase2 import _restore_after_gate
+from scripts.test_controller_convergence import _restore_after_gate
 from scripts.lib.controller import (
+    CONTROLLER_LIFECYCLE_EPOCH,
     _foundation_payload,
     _foundation_checksum,
     build_controller_image,
+    controller_requires_cutover,
     controller_source_digest,
     delete_controller_tenants,
     delete_tenant_resource,
     delete_controller,
+    render_controller_manager,
     set_controller_mutation,
+    stop_controller_for_cutover,
+    verify_running_controller_epoch,
 )
 from scripts.lib.ownership import IdentityRecord
 
@@ -42,6 +47,140 @@ class FakeManagementClient:
 
 
 class ControllerIntegrationUnitTests(unittest.TestCase):
+    def test_lifecycle_epoch_decides_cutover(self) -> None:
+        self.assertFalse(controller_requires_cutover(CONTROLLER_LIFECYCLE_EPOCH))
+        self.assertTrue(controller_requires_cutover(None))
+        self.assertTrue(controller_requires_cutover("legacy-status-v1"))
+
+    def test_rendered_manager_contains_epoch_and_mutation_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            template = root / "controller" / "config" / "manager"
+            template.mkdir(parents=True)
+            (template / "manager.yaml.tpl").write_text(
+                "image: ${TENANT_CONTROLLER_IMAGE}\n"
+                "version: ${SUPPORTED_KUBERNETES_VERSION}\n"
+                "epoch: ${CONTROLLER_LIFECYCLE_EPOCH}\n"
+                "mutation: ${CONTROLLER_MUTATION_ENABLED}\n",
+                encoding="utf-8",
+            )
+            rendered = render_controller_manager(
+                root,
+                {"KUBERNETES_VERSION": "v1.36.4"},
+                "example/controller:test",
+                mutation_enabled=False,
+            )
+            content = rendered.read_text(encoding="utf-8")
+            self.assertIn(f"epoch: {CONTROLLER_LIFECYCLE_EPOCH}", content)
+            self.assertIn("mutation: false", content)
+
+    def test_cutover_stops_old_controller_before_returning(self) -> None:
+        client = FakeManagementClient(
+            [
+                CompletedProcess([], 0, stdout="deployment", stderr=""),
+                CompletedProcess([], 0, stdout="", stderr=""),
+                CompletedProcess([], 0, stdout='{"items":[]}', stderr=""),
+            ]
+        )
+        stop_controller_for_cutover(
+            {"CONDITION_TIMEOUT": "1s"},
+            client,
+        )
+        arguments = [call[0] for call in client.calls]
+        self.assertEqual(
+            (
+                "-n",
+                "tenant-system",
+                "scale",
+                "deployment/tenant-controller",
+                "--replicas=0",
+            ),
+            arguments[1],
+        )
+
+    def test_running_controller_epoch_checks_deployment_and_pod(self) -> None:
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": [
+                                    f"--lifecycle-epoch={CONTROLLER_LIFECYCLE_EPOCH}"
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        pods = {
+            "items": [
+                {
+                    "metadata": {"name": "tenant-controller-1"},
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": [
+                                    f"--lifecycle-epoch={CONTROLLER_LIFECYCLE_EPOCH}"
+                                ],
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        client = FakeManagementClient(
+            [
+                CompletedProcess([], 0, stdout=json.dumps(deployment), stderr=""),
+                CompletedProcess([], 0, stdout=json.dumps(pods), stderr=""),
+            ]
+        )
+        verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
+
+    def test_running_controller_epoch_rejects_partial_rollout(self) -> None:
+        deployment = {
+            "spec": {
+                "template": {
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": [
+                                    f"--lifecycle-epoch={CONTROLLER_LIFECYCLE_EPOCH}"
+                                ],
+                            }
+                        ]
+                    }
+                }
+            }
+        }
+        pods = {
+            "items": [
+                {
+                    "metadata": {"name": "tenant-controller-old"},
+                    "spec": {
+                        "containers": [
+                            {
+                                "name": "manager",
+                                "args": ["--lifecycle-epoch=legacy-status-v1"],
+                            }
+                        ]
+                    },
+                }
+            ]
+        }
+        client = FakeManagementClient(
+            [
+                CompletedProcess([], 0, stdout=json.dumps(deployment), stderr=""),
+                CompletedProcess([], 0, stdout=json.dumps(pods), stderr=""),
+            ]
+        )
+        with self.assertRaisesRegex(RuntimeError, "Pod .* lifecycle epoch mismatch"):
+            verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
+
     def test_delete_tenant_resource_uses_ordinary_kubernetes_delete(self) -> None:
         client = FakeManagementClient(
             [
@@ -352,6 +491,8 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             original_hash = payload["data"]["foundation.sha256"]
             data["mutationEnabled"] = not data["mutationEnabled"]
             self.assertEqual(original_hash, _foundation_checksum(data))
+            data["controllerImage"] = "controller:replacement"
+            self.assertEqual(original_hash, _foundation_checksum(data))
 
     def test_public_apply_uses_all_lifecycle_locks(self) -> None:
         calls = []
@@ -493,14 +634,14 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         primary = RuntimeError("primary failure")
         with (
             patch(
-                "scripts.test_controller_phase2._tenant",
+                "scripts.test_controller_convergence._tenant",
                 side_effect=[{"metadata": {"name": "controller-phase2"}}, {"metadata": {"name": "controller-phase2"}}],
             ),
             patch(
-                "scripts.test_controller_phase2.set_controller_mutation"
+                "scripts.test_controller_convergence.set_controller_mutation"
             ) as mutation,
             patch(
-                "scripts.test_controller_phase2.delete_tenant_resource",
+                "scripts.test_controller_convergence.delete_tenant_resource",
                 return_value=CompletedProcess([], 1, stdout="", stderr="cleanup blocked"),
             ),
         ):
@@ -523,11 +664,11 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         primary = RuntimeError("primary failure")
         with (
             patch(
-                "scripts.test_controller_phase2._tenant",
+                "scripts.test_controller_convergence._tenant",
                 side_effect=RuntimeError("inspection failed"),
             ),
             patch(
-                "scripts.test_controller_phase2.set_controller_mutation"
+                "scripts.test_controller_convergence.set_controller_mutation"
             ) as mutation,
         ):
             _restore_after_gate(

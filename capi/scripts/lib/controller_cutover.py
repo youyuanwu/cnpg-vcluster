@@ -8,7 +8,7 @@ from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
 
 
-def controller_mutation_enabled(client: ManagementClient) -> bool:
+def _controller_manager_args(client: ManagementClient) -> list[str] | None:
     response = client.kubectl(
         "-n",
         "tenant-system",
@@ -21,9 +21,9 @@ def controller_mutation_enabled(client: ManagementClient) -> bool:
     if response.returncode != 0:
         output = f"{response.stdout}{response.stderr}"
         if re.search(r"not\s*found|notfound", output, re.IGNORECASE):
-            return False
+            return None
         raise RuntimeError(
-            f"failed to inspect Tenant controller mutation mode: {response.stderr}"
+            f"failed to inspect Tenant controller deployment: {response.stderr}"
         )
     deployment = json.loads(response.stdout)
     containers = (
@@ -34,9 +34,27 @@ def controller_mutation_enabled(client: ManagementClient) -> bool:
     )
     manager = next(
         (container for container in containers if container.get("name") == "manager"),
-        {},
+        None,
     )
-    return "--mutation-enabled=true" in manager.get("args", [])
+    if manager is None:
+        raise RuntimeError("Tenant controller manager container is missing")
+    return manager.get("args", [])
+
+
+def controller_mutation_enabled(client: ManagementClient) -> bool:
+    args = _controller_manager_args(client)
+    return args is not None and "--mutation-enabled=true" in args
+
+
+def controller_lifecycle_epoch(client: ManagementClient) -> str | None:
+    args = _controller_manager_args(client)
+    if args is None:
+        return None
+    prefix = "--lifecycle-epoch="
+    values = [value.removeprefix(prefix) for value in args if value.startswith(prefix)]
+    if len(values) > 1:
+        raise RuntimeError("Tenant controller lifecycle epoch argument is duplicated")
+    return values[0] if values else None
 
 
 def require_clean_controller_cutover(

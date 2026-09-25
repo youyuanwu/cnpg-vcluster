@@ -3,6 +3,7 @@ package controller
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 
@@ -15,6 +16,8 @@ import (
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 )
+
+var errEndpointAllocationMissing = errors.New("Tenant endpoint allocation is missing")
 
 type endpointAllocation struct {
 	TenantName     string `json:"tenantName"`
@@ -104,6 +107,9 @@ func observeEndpoint(ctx context.Context, reader client.Reader, namespace string
 		if apierrors.IsNotFound(err) && tenant.Status.Endpoint == "" {
 			return "", false, nil
 		}
+		if apierrors.IsNotFound(err) {
+			return "", false, fmt.Errorf("%w: allocation ConfigMap is absent", errEndpointAllocationMissing)
+		}
 		return "", false, fmt.Errorf("read Tenant endpoint allocation: %w", err)
 	}
 	state, err := decodeAllocationState(configMap.Data["allocations.json"], foundation)
@@ -122,7 +128,7 @@ func observeEndpoint(ctx context.Context, reader client.Reader, namespace string
 		return foundation.Endpoint(address), true, nil
 	}
 	if tenant.Status.Endpoint != "" {
-		return "", false, fmt.Errorf("Tenant endpoint allocation is missing")
+		return "", false, errEndpointAllocationMissing
 	}
 	return "", false, nil
 }

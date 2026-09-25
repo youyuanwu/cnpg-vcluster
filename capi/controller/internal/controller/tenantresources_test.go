@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"strings"
 	"testing"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -28,6 +27,21 @@ type recordingPatchClient struct {
 	patchErr        error
 }
 
+type createRaceClient struct {
+	client.Client
+	foreign client.Object
+}
+
+func (value *createRaceClient) Create(ctx context.Context, object client.Object, options ...client.CreateOption) error {
+	if err := value.Client.Create(ctx, value.foreign); err != nil {
+		return err
+	}
+	return apierrors.NewAlreadyExists(
+		schema.GroupResource{Group: object.GetObjectKind().GroupVersionKind().Group, Resource: "objects"},
+		object.GetName(),
+	)
+}
+
 func (tenantClient *recordingPatchClient) Patch(ctx context.Context, object client.Object, patch client.Patch, options ...client.PatchOption) error {
 	tenantClient.patched = true
 	tenantClient.patchUID = object.GetUID()
@@ -43,135 +57,141 @@ func (tenantClient *recordingPatchClient) Create(ctx context.Context, object cli
 	return tenantClient.Client.Create(ctx, object, options...)
 }
 
-func TestEnsureTenantObjectRejectsRecordedReplacementBeforePatch(t *testing.T) {
+func TestEnsureTenantObjectCreatesMissingChild(t *testing.T) {
 	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
-	tenant := &tenancyv1alpha1.Tenant{
-		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
-		Status: tenancyv1alpha1.TenantStatus{
-			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
-				APIVersion: gvk.GroupVersion().String(),
-				Kind:       gvk.Kind,
-				Namespace:  "default",
-				Name:       "network-config",
-				UID:        "recorded-uid",
-			}},
-		},
-	}
-	desired := markedTenantConfigMap(gvk, tenant, "desired")
-	current := markedTenantConfigMap(gvk, tenant, "foreign")
-	current.SetUID(types.UID("replacement-uid"))
-	base := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build()
-	tenantClient := &recordingPatchClient{Client: base}
-
-	_, _, err := ensureTenantObject(
-		context.Background(),
-		tenantClient,
-		desired,
-		tenant,
-		"spec-hash",
-		"foundation-hash",
-	)
-	if err == nil || !strings.Contains(err.Error(), "identity changed") {
-		t.Fatalf("recorded replacement was not rejected: %v", err)
-	}
-	if tenantClient.patched {
-		t.Fatal("recorded replacement was mutated before UID validation")
-	}
-}
-
-func TestEnsureTenantObjectRejectsMissingRecordedIdentityBeforeCreate(t *testing.T) {
-	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
-	tenant := &tenancyv1alpha1.Tenant{
-		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
-		Status: tenancyv1alpha1.TenantStatus{
-			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
-				APIVersion: gvk.GroupVersion().String(),
-				Kind:       gvk.Kind,
-				Namespace:  "default",
-				Name:       "network-config",
-				UID:        "recorded-uid",
-			}},
-		},
-	}
+	tenant := testTenant()
 	tenantClient := &recordingPatchClient{
 		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
 	}
-	_, _, err := ensureTenantObject(
+	changed, err := ensureTenantObject(
 		context.Background(),
 		tenantClient,
 		markedTenantConfigMap(gvk, tenant, "desired"),
 		tenant,
 		"spec-hash",
 		"foundation-hash",
-	)
-	if err == nil || !strings.Contains(err.Error(), "is absent") {
-		t.Fatalf("missing recorded resource was recreated: %v", err)
-	}
-	if tenantClient.created {
-		t.Fatal("missing recorded resource was created before identity validation")
-	}
-}
-
-func TestEnsureTenantObjectBindsDriftRepairToObservedIdentity(t *testing.T) {
-	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
-	tenant := &tenancyv1alpha1.Tenant{
-		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
-		Status: tenancyv1alpha1.TenantStatus{
-			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
-				APIVersion: gvk.GroupVersion().String(),
-				Kind:       gvk.Kind,
-				Namespace:  "default",
-				Name:       "network-config",
-				UID:        "recorded-uid",
-			}},
-		},
-	}
-	current := markedTenantConfigMap(gvk, tenant, "drifted")
-	current.SetUID("recorded-uid")
-	current.SetResourceVersion("7")
-	tenantClient := &recordingPatchClient{
-		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build(),
-	}
-	_, changed, err := ensureTenantObjectWithPatchResult(
-		context.Background(),
-		tenantClient,
-		markedTenantConfigMap(gvk, tenant, "desired"),
-		tenant,
-		"spec-hash",
-		"foundation-hash",
-		true,
 	)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed || !tenantClient.patched {
-		t.Fatal("same-identity drift was not repaired")
+	if !changed || !tenantClient.created {
+		t.Fatal("missing child was not created")
 	}
-	if tenantClient.patchUID != "recorded-uid" || tenantClient.patchResourceRV != "7" {
-		t.Fatalf(
-			"drift repair was not bound to the observed identity: uid=%s rv=%s",
-			tenantClient.patchUID,
-			tenantClient.patchResourceRV,
-		)
+}
+
+func TestEnsureTenantObjectRefusesForeignSameName(t *testing.T) {
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	tenant := testTenant()
+	foreign := markedTenantConfigMap(gvk, tenant, "foreign")
+	foreign.SetAnnotations(map[string]string{resources.TenantAnnotation: "other"})
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(foreign).Build()
+	tenantClient := &recordingPatchClient{Client: base}
+	_, err := ensureTenantObject(
+		context.Background(),
+		tenantClient,
+		markedTenantConfigMap(gvk, tenant, "desired"),
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+	)
+	if err == nil {
+		t.Fatal("foreign same-name child was accepted")
+	}
+
+	if tenantClient.patched {
+		t.Fatal("foreign same-name child was mutated")
+	}
+}
+
+func TestEnsureTenantObjectRefusesForeignCreateRace(t *testing.T) {
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	tenant := testTenant()
+	foreign := markedTenantConfigMap(gvk, tenant, "foreign")
+	foreign.SetAnnotations(map[string]string{resources.TenantAnnotation: "other"})
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	tenantClient := &createRaceClient{Client: base, foreign: foreign}
+	if _, err := ensureTenantObject(
+		context.Background(),
+		tenantClient,
+		markedTenantConfigMap(gvk, tenant, "desired"),
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+	); err == nil {
+		t.Fatal("foreign create race was accepted")
+	}
+	var current unstructured.Unstructured
+	current.SetGroupVersionKind(gvk)
+	if err := base.Get(context.Background(), client.ObjectKeyFromObject(foreign), &current); err != nil {
+		t.Fatal(err)
+	}
+	if current.GetAnnotations()[resources.TenantAnnotation] != "other" {
+		t.Fatal("foreign create-race object was modified")
+	}
+}
+
+func TestEnsureManagementObjectRefusesForeignCreateRace(t *testing.T) {
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	tenant := testTenant()
+	foundation := testFoundation()
+	foundation.Hash = "foundation-hash"
+	desired := markedTenantConfigMap(gvk, tenant, "desired")
+	desired.SetAnnotations(map[string]string{
+		resources.TenantAnnotation:     tenant.Name,
+		resources.TenantUIDAnnotation:  string(tenant.UID),
+		resources.SpecHashAnnotation:   "spec-hash",
+		resources.FoundationAnnotation: foundation.Hash,
+		resources.ResourceAnnotation:   "management-test",
+	})
+	foreign := desired.DeepCopy()
+	foreign.SetAnnotations(map[string]string{resources.TenantAnnotation: "other"})
+	base := fake.NewClientBuilder().WithScheme(testScheme(t)).Build()
+	race := &createRaceClient{Client: base, foreign: foreign}
+	reconciler := &TenantReconciler{Client: race, APIReader: race}
+	if _, _, err := reconciler.ensureManagementObject(
+		context.Background(),
+		desired,
+		tenant,
+		"spec-hash",
+		foundation,
+		"management-test",
+	); err == nil {
+		t.Fatal("foreign management create race was accepted")
+	}
+}
+
+func TestEnsureTenantObjectBindsDriftRepairToLiveIdentity(t *testing.T) {
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	tenant := testTenant()
+	current := markedTenantConfigMap(gvk, tenant, "drifted")
+	current.SetUID("live-uid")
+	current.SetResourceVersion("7")
+	tenantClient := &recordingPatchClient{
+		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build(),
+	}
+	changed, err := ensureTenantObject(
+		context.Background(),
+		tenantClient,
+		markedTenantConfigMap(gvk, tenant, "desired"),
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changed || !tenantClient.patched {
+		t.Fatal("owned drift was not repaired")
+	}
+	if tenantClient.patchUID != "live-uid" || tenantClient.patchResourceRV != "7" {
+		t.Fatalf("drift repair was not bound to the live identity: uid=%s rv=%s", tenantClient.patchUID, tenantClient.patchResourceRV)
 	}
 }
 
 func TestEnsureTenantObjectReturnsRetryableApplyConflict(t *testing.T) {
 	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
-	tenant := &tenancyv1alpha1.Tenant{
-		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
-		Status: tenancyv1alpha1.TenantStatus{
-			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
-				APIVersion: gvk.GroupVersion().String(),
-				Kind:       gvk.Kind,
-				Namespace:  "default",
-				Name:       "network-config",
-				UID:        "recorded-uid",
-			}},
-		},
-	}
+	tenant := testTenant()
 	current := markedTenantConfigMap(gvk, tenant, "drifted")
-	current.SetUID("recorded-uid")
 	tenantClient := &recordingPatchClient{
 		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build(),
 		patchErr: apierrors.NewConflict(
@@ -180,17 +200,42 @@ func TestEnsureTenantObjectReturnsRetryableApplyConflict(t *testing.T) {
 			fmt.Errorf("changed"),
 		),
 	}
-	_, _, err := ensureTenantObjectWithPatchResult(
+
+	_, err := ensureTenantObject(
 		context.Background(),
 		tenantClient,
 		markedTenantConfigMap(gvk, tenant, "desired"),
 		tenant,
 		"spec-hash",
 		"foundation-hash",
-		true,
 	)
 	if !errors.Is(err, errStableApplyConflict) {
 		t.Fatalf("apply conflict was not marked retryable: %v", err)
+	}
+}
+
+func TestEnsureTenantObjectClassifiesImmutableApplyFailure(t *testing.T) {
+	gvk := schema.GroupVersionKind{Version: "v1", Kind: "ConfigMap"}
+	tenant := testTenant()
+	current := markedTenantConfigMap(gvk, tenant, "drifted")
+	tenantClient := &recordingPatchClient{
+		Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build(),
+		patchErr: apierrors.NewInvalid(
+			schema.GroupKind{Group: gvk.Group, Kind: gvk.Kind},
+			current.GetName(),
+			nil,
+		),
+	}
+	_, err := ensureTenantObject(
+		context.Background(),
+		tenantClient,
+		markedTenantConfigMap(gvk, tenant, "desired"),
+		tenant,
+		"spec-hash",
+		"foundation-hash",
+	)
+	if !errors.Is(err, errImmutableDrift) {
+		t.Fatalf("invalid apply was not classified as immutable drift: %v", err)
 	}
 }
 
@@ -223,103 +268,14 @@ func TestReadinessRejectsStaleObservedGenerations(t *testing.T) {
 	}
 }
 
-func TestDesiredMatchIgnoresServerAddedDefaultsButDetectsDrift(t *testing.T) {
-	desired := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "apps/v1",
-		"kind":       "Deployment",
-		"metadata": map[string]any{
-			"name": "example",
-		},
-		"spec": map[string]any{
-			"template": map[string]any{
-				"spec": map[string]any{
-					"containers": []any{map[string]any{
-						"name":  "main",
-						"image": "example@sha256:exact",
-					}},
-				},
-			},
-		},
-	}}
-	current := desired.DeepCopy()
-	desired.Object["preserveUnknownFields"] = false
-	desired.Object["maximum"] = int64(4294967295)
-	desired.Object["status"] = map[string]any{"acceptedNames": "source-only"}
-	current.Object["maximum"] = float64(4294967295)
-	containers, _, _ := unstructured.NestedSlice(
-		current.Object,
-		"spec",
-		"template",
-		"spec",
-		"containers",
-	)
-	containers[0].(map[string]any)["imagePullPolicy"] = "IfNotPresent"
-	if err := unstructured.SetNestedSlice(
-		current.Object,
-		containers,
-		"spec",
-		"template",
-		"spec",
-		"containers",
-	); err != nil {
-		t.Fatal(err)
-	}
-	if !desiredMatchesCurrent(desired, current) {
-		t.Fatal("server-added default was treated as desired-field drift")
-	}
-	containers[0].(map[string]any)["image"] = "example:drifted"
-	if err := unstructured.SetNestedSlice(
-		current.Object,
-		containers,
-		"spec",
-		"template",
-		"spec",
-		"containers",
-	); err != nil {
-		t.Fatal(err)
-	}
-	if desiredMatchesCurrent(desired, current) {
-		t.Fatal("desired image drift was ignored")
-	}
-}
-
-func TestValidateTenantResourceOwnershipRejectsReplacement(t *testing.T) {
-	gvk := schema.GroupVersionKind{Group: "storage.k8s.io", Version: "v1", Kind: "StorageClass"}
-	tenant := &tenancyv1alpha1.Tenant{
+func testTenant() *tenancyv1alpha1.Tenant {
+	return &tenancyv1alpha1.Tenant{
 		ObjectMeta: metav1.ObjectMeta{Name: "tenant-a", UID: "tenant-uid"},
-		Status: tenancyv1alpha1.TenantStatus{
-			TenantResources: []tenancyv1alpha1.ObservedResourceIdentity{{
-				APIVersion: gvk.GroupVersion().String(),
-				Kind:       gvk.Kind,
-				Name:       tenantStorageClass,
-				UID:        "recorded-uid",
-			}},
-		},
-	}
-	current := &unstructured.Unstructured{}
-	current.SetGroupVersionKind(gvk)
-	current.SetName(tenantStorageClass)
-	current.SetUID("replacement-uid")
-	current.SetAnnotations(map[string]string{
-		resources.TenantAnnotation:     tenant.Name,
-		resources.TenantUIDAnnotation:  string(tenant.UID),
-		resources.SpecHashAnnotation:   "spec-hash",
-		resources.FoundationAnnotation: "foundation-hash",
-	})
-	kubernetes := fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(current).Build()
-	if err := validateTenantResourceOwnership(
-		context.Background(),
-		kubernetes,
-		tenant,
-		"spec-hash",
-		"foundation-hash",
-	); err == nil || !strings.Contains(err.Error(), "ownership changed") {
-		t.Fatalf("same-name Tenant resource replacement was accepted: %v", err)
 	}
 }
 
 func markedTenantConfigMap(gvk schema.GroupVersionKind, tenant *tenancyv1alpha1.Tenant, value string) *unstructured.Unstructured {
-	object := &unstructured.Unstructured{Object: map[string]any{
+	return &unstructured.Unstructured{Object: map[string]any{
 		"apiVersion": gvk.GroupVersion().String(),
 		"kind":       gvk.Kind,
 		"metadata": map[string]any{
@@ -335,5 +291,4 @@ func markedTenantConfigMap(gvk schema.GroupVersionKind, tenant *tenancyv1alpha1.
 		},
 		"data": map[string]any{"value": value},
 	}}
-	return object
 }

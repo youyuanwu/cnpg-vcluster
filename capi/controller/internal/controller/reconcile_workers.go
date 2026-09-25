@@ -9,7 +9,6 @@ import (
 	"strings"
 	"time"
 
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -25,82 +24,60 @@ var machineGVK = schema.GroupVersionKind{Group: "cluster.x-k8s.io", Version: "v1
 
 var errWorkerRuntimePending = errors.New("worker runtime is pending")
 
-func (reconciler *TenantReconciler) reconcileWorkers(ctx context.Context, tenant *tenancyv1alpha1.Tenant, canonical validation.CanonicalSpec, specHash string, foundation Foundation) (ctrl.Result, error) {
-	resourceContext := resources.Context{
-		Tenant:         tenant,
-		Spec:           canonical,
-		SpecHash:       specHash,
-		FoundationHash: foundation.Hash,
-		Endpoint:       tenant.Status.Endpoint,
-		Inputs:         foundation.ResourceInputs(),
+func (reconciler *TenantReconciler) reconcileWorkers(
+	ctx context.Context,
+	tenantClient client.Client,
+	tenant *tenancyv1alpha1.Tenant,
+	canonical validation.CanonicalSpec,
+	specHash string,
+	foundation Foundation,
+) (ctrl.Result, error) {
+	volume, err := reconciler.ensureVolume(ctx, tenant, specHash, foundation)
+	if err != nil {
+		return ctrl.Result{}, err
 	}
-	switch tenant.Status.Stage {
-	case tenancyv1alpha1.StageBootstrapRBACApplied:
-		volume, err := reconciler.ensureVolume(ctx, tenant, specHash, foundation)
-		if err != nil {
+	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
+	resourceContext.VolumePath = volume.Mountpoint
+	commands, err := workerBootstrapCommands(foundation)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	resourceContext.WorkerBootstrapCommands = commands
+	for _, desired := range []struct {
+		object   *unstructured.Unstructured
+		resource string
+	}{
+		{resources.KubeadmConfigTemplate(resourceContext), "kubeadm-config-template"},
+		{resources.DevMachineTemplate(resourceContext), "dev-machine-template"},
+		{resources.MachineDeployment(resourceContext), "machine-deployment"},
+	} {
+		if _, changed, err := reconciler.ensureManagementObject(ctx, desired.object, tenant, specHash, foundation, desired.resource); err != nil {
 			return ctrl.Result{}, err
+		} else if changed {
+			return progressRequeue(), nil
 		}
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.DockerVolume = &tenancyv1alpha1.DockerVolumeIdentity{
-				Name:       volume.Name,
-				CreatedAt:  volume.CreatedAt,
-				Mountpoint: volume.Mountpoint,
-				Labels:     volume.Labels,
-			}
-			status.Stage = tenancyv1alpha1.StageVolumeCreated
-			return nil
-		})
-	case tenancyv1alpha1.StageVolumeCreated:
-		resourceContext.VolumePath = tenant.Status.DockerVolume.Mountpoint
-		commands, err := workerBootstrapCommands(foundation)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		resourceContext.WorkerBootstrapCommands = commands
-		identity, err := reconciler.ensureUnstructured(ctx, resources.KubeadmConfigTemplate(resourceContext), tenant, specHash, foundation, "kubeadm-config-template")
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageKubeadmTemplateCreated, identity)
-	case tenancyv1alpha1.StageKubeadmTemplateCreated:
-		resourceContext.VolumePath = tenant.Status.DockerVolume.Mountpoint
-		identity, err := reconciler.ensureUnstructured(ctx, resources.DevMachineTemplate(resourceContext), tenant, specHash, foundation, "dev-machine-template")
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageMachineTemplateCreated, identity)
-	case tenancyv1alpha1.StageMachineTemplateCreated:
-		resourceContext.VolumePath = tenant.Status.DockerVolume.Mountpoint
-		identity, err := reconciler.ensureUnstructured(ctx, resources.MachineDeployment(resourceContext), tenant, specHash, foundation, "machine-deployment")
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		return ctrl.Result{Requeue: true}, reconciler.advanceWithIdentity(ctx, tenant, tenancyv1alpha1.StageMachineDeploymentCreated, identity)
-	case tenancyv1alpha1.StageMachineDeploymentCreated:
-		machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
-		if err != nil {
-			if errors.Is(err, errWorkerRuntimePending) {
-				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-			}
-			return ctrl.Result{}, err
-		}
-		if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
+	}
+	machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
+	if err != nil {
+		if errors.Is(err, errWorkerRuntimePending) {
+			ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "worker-runtime")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
-		references := workerContainerReferences(containers)
-		return ctrl.Result{Requeue: true}, reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.WorkerContainers = references
-			replaceMachineIdentities(status, machines)
-			status.Stage = tenancyv1alpha1.StageWorkersApplied
-			setCondition(status, tenant, "WorkersReady", metav1.ConditionFalse, "PreCNIWorkersApplied", "Pre-CNI worker containers are running; Node readiness is not evaluated yet")
-			setCondition(status, tenant, "Ready", metav1.ConditionFalse, "Phase3Pending", "Tenant networking, storage, and database reconciliation are pending")
-			return nil
-		})
-	case tenancyv1alpha1.StageWorkersApplied:
-		return reconciler.reconcileNetwork(ctx, tenant, canonical, specHash, foundation)
-	default:
-		return reconciler.reconcileNetwork(ctx, tenant, canonical, specHash, foundation)
+		return ctrl.Result{}, err
 	}
+	if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
+		ctrl.LoggerFrom(ctx).V(1).Info(
+			"waiting for Tenant component",
+			"component",
+			"worker-inventory",
+			"machines",
+			len(machines),
+			"containers",
+			len(containers),
+		)
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	return reconciler.reconcileNetwork(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 
 func (reconciler *TenantReconciler) ensureVolume(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (DockerVolume, error) {
@@ -131,43 +108,19 @@ func (reconciler *TenantReconciler) ensureVolume(ctx context.Context, tenant *te
 	return *volume, nil
 }
 
-func (reconciler *TenantReconciler) validateRecordedVolume(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) error {
-	if tenant.Status.DockerVolume == nil {
-		return nil
-	}
-	volume, err := reconciler.docker().InspectVolume(ctx, tenant.Status.DockerVolume.Name)
-	if err != nil {
-		return err
-	}
-	if volume == nil {
-		return fmt.Errorf("recorded Docker volume is missing")
-	}
-	expected := map[string]string{
-		foundation.Inputs.OwnershipLabel:           foundation.Inputs.LabPrefix,
-		"cnpg-vcluster.capi/role":                  "tenant-storage",
-		"cnpg-vcluster.capi/tenant":                tenant.Name,
-		"tenancy.cnpg-vcluster.io/tenant-uid":      string(tenant.UID),
-		"tenancy.cnpg-vcluster.io/spec-hash":       specHash,
-		"tenancy.cnpg-vcluster.io/foundation-hash": foundation.Hash,
-	}
-	if volume.Name != tenant.Status.DockerVolume.Name ||
-		volume.CreatedAt != tenant.Status.DockerVolume.CreatedAt ||
-		volume.Mountpoint != tenant.Status.DockerVolume.Mountpoint ||
-		!stringMapEqual(volume.Labels, expected) {
-		return fmt.Errorf("recorded Docker volume identity changed")
-	}
-	return nil
-}
-
 func (reconciler *TenantReconciler) observePreCNIWorkers(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) ([]*unstructured.Unstructured, []DockerContainer, error) {
 	list := &unstructured.UnstructuredList{}
 	list.SetGroupVersionKind(schema.GroupVersionKind{Group: machineGVK.Group, Version: machineGVK.Version, Kind: "MachineList"})
 	if err := reconciler.reader().List(ctx, list, client.InNamespace(tenant.Name), client.MatchingLabels{"cluster.x-k8s.io/cluster-name": tenant.Name}); err != nil {
 		return nil, nil, fmt.Errorf("list Tenant Machines: %w", err)
 	}
-	machineDeployment := findIdentity(tenant.Status, machineDeploymentGVK, tenant.Name, tenant.Name+"-worker")
-	if machineDeployment == nil {
-		return nil, nil, fmt.Errorf("MachineDeployment identity is not recorded")
+	machineDeployment := &unstructured.Unstructured{}
+	machineDeployment.SetGroupVersionKind(machineDeploymentGVK)
+	if err := reconciler.reader().Get(ctx, client.ObjectKey{Namespace: tenant.Name, Name: tenant.Name + "-worker"}, machineDeployment); err != nil {
+		return nil, nil, fmt.Errorf("read Tenant MachineDeployment: %w", err)
+	}
+	if err := validateRootOwnership(machineDeployment, tenant, specHash, foundation.Hash, "machine-deployment", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
+		return nil, nil, err
 	}
 	machines := make([]*unstructured.Unstructured, 0, len(list.Items))
 	machineNames := map[string]struct{}{}
@@ -176,7 +129,7 @@ func (reconciler *TenantReconciler) observePreCNIWorkers(ctx context.Context, te
 		if err := validateRootOwnership(machine, tenant, specHash, foundation.Hash, "machine", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 			return nil, nil, err
 		}
-		if err := validateOwnerChain(ctx, reconciler.reader(), machine, *machineDeployment); err != nil {
+		if err := validateOwnerChain(ctx, reconciler.reader(), machine, machineDeployment.GetUID()); err != nil {
 			return nil, nil, err
 		}
 		machines = append(machines, machine)
@@ -328,45 +281,4 @@ func stringMapEqual(left, right map[string]string) bool {
 		}
 	}
 	return true
-}
-
-func workerContainerReferences(containers []DockerContainer) []tenancyv1alpha1.WorkerContainerEvidence {
-	result := make([]tenancyv1alpha1.WorkerContainerEvidence, 0, len(containers))
-	for _, container := range containers {
-		result = append(result, tenancyv1alpha1.WorkerContainerEvidence{Name: container.Name, ID: container.ID})
-	}
-	sort.Slice(result, func(left, right int) bool {
-		return result[left].Name < result[right].Name
-	})
-	return result
-}
-
-func replaceMachineIdentities(status *tenancyv1alpha1.TenantStatus, machines []*unstructured.Unstructured) {
-	status.ObservedResources = replaceResourceIdentities(status.ObservedResources, machineGVK, machines)
-}
-
-func replaceResourceIdentities(
-	values []tenancyv1alpha1.ObservedResourceIdentity,
-	gvk schema.GroupVersionKind,
-	objects []*unstructured.Unstructured,
-) []tenancyv1alpha1.ObservedResourceIdentity {
-	retained := make([]tenancyv1alpha1.ObservedResourceIdentity, 0, len(values))
-	for _, identity := range values {
-		if identity.Kind == gvk.Kind && identity.APIVersion == gvk.GroupVersion().String() {
-			continue
-		}
-		retained = append(retained, identity)
-	}
-	current := make([]tenancyv1alpha1.ObservedResourceIdentity, 0, len(objects))
-	for _, object := range objects {
-		current = append(current, identityFor(object))
-	}
-	result := append(retained, current...)
-	sort.Slice(result, func(left, right int) bool {
-		a := result[left]
-		b := result[right]
-		return a.APIVersion+"/"+a.Kind+"/"+a.Namespace+"/"+a.Name <
-			b.APIVersion+"/"+b.Kind+"/"+b.Namespace+"/"+b.Name
-	})
-	return result
 }

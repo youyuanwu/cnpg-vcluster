@@ -15,11 +15,10 @@ func TestTenantStatusRoundTrip(t *testing.T) {
 			ServiceCIDR:       "10.21.0.0/16",
 		},
 		Status: TenantStatus{
-			Phase: PhaseProgressing,
-			WorkerContainers: []WorkerContainerEvidence{{
-				Name: "worker-a",
-				ID:   "container-a",
-			}},
+			Phase:                       PhaseProgressing,
+			ClusterUID:                  "cluster-a",
+			TenantAPICreationAuthorized: true,
+			TenantCleanupClusterUID:     "cluster-a",
 		},
 	}
 	data, err := json.Marshal(&tenant)
@@ -31,8 +30,9 @@ func TestTenantStatusRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	if decoded.Status.Phase != PhaseProgressing ||
-		len(decoded.Status.WorkerContainers) != 1 ||
-		decoded.Status.WorkerContainers[0].ID != "container-a" {
+		decoded.Status.ClusterUID != "cluster-a" ||
+		!decoded.Status.TenantAPICreationAuthorized ||
+		decoded.Status.TenantCleanupClusterUID != "cluster-a" {
 		t.Fatalf("unexpected round trip: %#v", decoded.Status)
 	}
 }

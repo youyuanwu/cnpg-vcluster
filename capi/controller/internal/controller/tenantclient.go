@@ -6,12 +6,14 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"sort"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
@@ -86,9 +88,12 @@ func tenantClientFromSecret(ctx context.Context, reader client.Reader, factory T
 func applyBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
 	for _, raw := range resources.BootstrapRBAC() {
 		object := raw.(client.Object)
-		current := object.DeepCopyObject().(client.Object)
+		current, err := emptyBootstrapObject(object)
+		if err != nil {
+			return err
+		}
 		key := client.ObjectKeyFromObject(object)
-		err := tenantClient.Get(ctx, key, current)
+		err = tenantClient.Get(ctx, key, current)
 		if apierrors.IsForbidden(err) {
 			return errTenantAdministrativeAccessPending
 		}
@@ -119,7 +124,7 @@ func applyBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
 		case *rbacv1.RoleBinding:
 			existing := current.(*rbacv1.RoleBinding)
 			if !equality.Semantic.DeepEqual(existing.RoleRef, desired.RoleRef) ||
-				!equality.Semantic.DeepEqual(existing.Subjects, desired.Subjects) {
+				!bootstrapSubjectsEqual(existing.Subjects, desired.Subjects) {
 				desired.ResourceVersion = existing.ResourceVersion
 				if err := tenantClient.Update(ctx, desired); err != nil {
 					if apierrors.IsForbidden(err) {
@@ -135,20 +140,76 @@ func applyBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
 
 func deleteBootstrapRBAC(ctx context.Context, tenantClient client.Client) (bool, error) {
 	for _, raw := range resources.BootstrapRBAC() {
-		object := raw.(client.Object)
-		key := client.ObjectKeyFromObject(object)
-		current := object.DeepCopyObject().(client.Object)
-		err := tenantClient.Get(ctx, key, current)
+		desired := raw.(client.Object)
+		key := client.ObjectKeyFromObject(desired)
+		current, err := emptyBootstrapObject(desired)
+		if err != nil {
+			return false, err
+		}
+		err = tenantClient.Get(ctx, key, current)
 		if apierrors.IsNotFound(err) {
 			continue
 		}
 		if err != nil {
 			return false, fmt.Errorf("inspect Tenant bootstrap RBAC: %w", err)
 		}
-		if err := tenantClient.Delete(ctx, current); err != nil && !apierrors.IsNotFound(err) {
+		switch expected := desired.(type) {
+		case *rbacv1.Role:
+			actual := current.(*rbacv1.Role)
+			if !equality.Semantic.DeepEqual(actual.Rules, expected.Rules) {
+				return false, fmt.Errorf("Tenant bootstrap Role %s ownership cannot be proven", expected.Name)
+			}
+		case *rbacv1.RoleBinding:
+			actual := current.(*rbacv1.RoleBinding)
+			if !equality.Semantic.DeepEqual(actual.RoleRef, expected.RoleRef) ||
+				!bootstrapSubjectsEqual(actual.Subjects, expected.Subjects) {
+				return false, fmt.Errorf("Tenant bootstrap RoleBinding %s ownership cannot be proven", expected.Name)
+			}
+		default:
+			return false, fmt.Errorf("unsupported Tenant bootstrap object %T", desired)
+		}
+		if current.GetDeletionTimestamp() != nil {
+			return false, nil
+		}
+		uid := current.GetUID()
+		resourceVersion := current.GetResourceVersion()
+		if err := tenantClient.Delete(ctx, current, &client.DeleteOptions{
+			Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
+		}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
 			return false, fmt.Errorf("delete Tenant bootstrap RBAC: %w", err)
 		}
 		return false, nil
 	}
 	return true, nil
+}
+
+func emptyBootstrapObject(object client.Object) (client.Object, error) {
+	switch object.(type) {
+	case *rbacv1.Role:
+		return &rbacv1.Role{}, nil
+	case *rbacv1.RoleBinding:
+		return &rbacv1.RoleBinding{}, nil
+	default:
+		return nil, fmt.Errorf("unsupported Tenant bootstrap object %T", object)
+	}
+}
+
+func bootstrapSubjectsEqual(left, right []rbacv1.Subject) bool {
+	if len(left) != len(right) {
+		return false
+	}
+	key := func(subject rbacv1.Subject) string {
+		return subject.APIGroup + "/" + subject.Kind + "/" + subject.Namespace + "/" + subject.Name
+	}
+	leftKeys := make([]string, 0, len(left))
+	rightKeys := make([]string, 0, len(right))
+	for _, subject := range left {
+		leftKeys = append(leftKeys, key(subject))
+	}
+	for _, subject := range right {
+		rightKeys = append(rightKeys, key(subject))
+	}
+	sort.Strings(leftKeys)
+	sort.Strings(rightKeys)
+	return equality.Semantic.DeepEqual(leftKeys, rightKeys)
 }

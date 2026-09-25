@@ -2,9 +2,11 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
@@ -60,10 +62,9 @@ func TestReconcileMetadataPreservesDegradedReadinessPhase(t *testing.T) {
 	tenant := validTenant("tenant-a")
 	tenant.Generation = 4
 	status := tenancyv1alpha1.TenantStatus{
-		Stage: tenancyv1alpha1.StageDatabaseReady,
 		Phase: tenancyv1alpha1.PhaseDegraded,
 	}
-	initializeReconcileStatus(&status, tenant, "spec-hash", "foundation-hash")
+	initializeReconcileStatus(&status, tenant)
 	if status.Phase != tenancyv1alpha1.PhaseDegraded {
 		t.Fatalf("readiness degradation was overwritten: %q", status.Phase)
 	}
@@ -84,6 +85,7 @@ func TestInvalidTenantFailsWithoutFinalizer(t *testing.T) {
 			ServiceCIDR:       "10.21.0.0/16",
 		},
 	}
+
 	client := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(tenant).WithObjects(tenant).Build()
 	reconciler := &TenantReconciler{Client: client, SupportedVersion: "1.36.4"}
 	if _, err := reconciler.Reconcile(context.Background(), ctrl.Request{NamespacedName: types.NamespacedName{Name: tenant.Name}}); err != nil {
@@ -95,5 +97,77 @@ func TestInvalidTenantFailsWithoutFinalizer(t *testing.T) {
 	}
 	if updated.Status.Phase != tenancyv1alpha1.PhaseFailed || len(updated.Finalizers) != 0 {
 		t.Fatalf("unexpected invalid Tenant state: %#v", updated)
+	}
+}
+
+func TestDeletionFailureReasonsExposeRecoveryClass(t *testing.T) {
+	phase, reason := classifyDeletionFailure(fmt.Errorf("%w: unavailable", errTenantCleanupBlocked))
+	if phase != tenancyv1alpha1.PhaseDeleting || reason != "TenantCleanupBlocked" {
+		t.Fatalf("unexpected tenant cleanup classification: %s %s", phase, reason)
+	}
+
+	phase, reason = classifyDeletionFailure(fmt.Errorf("ownership mismatch"))
+	if phase != tenancyv1alpha1.PhaseOwnershipInvalid || reason != "OwnershipInvalid" {
+		t.Fatalf("unexpected ownership classification: %s %s", phase, reason)
+	}
+	phase, reason = classifyFoundationFailure(true, errFoundationMismatch)
+	if phase != tenancyv1alpha1.PhaseDeleting || reason != "FoundationMismatch" {
+		t.Fatalf("unexpected foundation classification: %s %s", phase, reason)
+	}
+}
+
+func TestImmutableDriftPublishesBoundedDegradedCondition(t *testing.T) {
+	tenant := validTenant("tenant-a")
+	tenant.Generation = 3
+	client := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant).
+		Build()
+	reconciler := &TenantReconciler{Client: client, APIReader: client}
+	if err := reconciler.degraded(context.Background(), tenant, "ImmutableDrift", errImmutableDrift); err != nil {
+		t.Fatal(err)
+	}
+	var updated tenancyv1alpha1.Tenant
+	if err := client.Get(context.Background(), types.NamespacedName{Name: tenant.Name}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	if updated.Status.Phase != tenancyv1alpha1.PhaseDegraded {
+		t.Fatalf("unexpected phase: %s", updated.Status.Phase)
+	}
+	condition := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if condition == nil || condition.Reason != "ImmutableDrift" ||
+		condition.ObservedGeneration != tenant.Generation {
+		t.Fatalf("unexpected immutable drift condition: %#v", condition)
+	}
+}
+
+func TestTenantCleanupFailurePublishesRecoveryCondition(t *testing.T) {
+	tenant := validTenant("tenant-a")
+	tenant.Generation = 2
+	client := fake.NewClientBuilder().
+		WithScheme(testScheme(t)).
+		WithStatusSubresource(tenant).
+		WithObjects(tenant).
+		Build()
+	reconciler := &TenantReconciler{Client: client, APIReader: client}
+	if err := reconciler.failure(
+		context.Background(),
+		tenant,
+		"spec-hash",
+		tenancyv1alpha1.PhaseDeleting,
+		"TenantCleanupBlocked",
+		errTenantCleanupBlocked,
+	); err == nil {
+		t.Fatal("failure helper unexpectedly returned nil")
+	}
+	var updated tenancyv1alpha1.Tenant
+	if err := client.Get(context.Background(), types.NamespacedName{Name: tenant.Name}, &updated); err != nil {
+		t.Fatal(err)
+	}
+	condition := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
+	if condition == nil || condition.Reason != "TenantCleanupBlocked" ||
+		condition.ObservedGeneration != tenant.Generation {
+		t.Fatalf("unexpected tenant cleanup condition: %#v", condition)
 	}
 }

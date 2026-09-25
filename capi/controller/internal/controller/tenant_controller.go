@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"time"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
@@ -22,6 +23,11 @@ import (
 )
 
 const tenantFinalizer = "tenancy.cnpg-vcluster.io/finalizer"
+const progressRequeueInterval = time.Second
+
+func progressRequeue() ctrl.Result {
+	return ctrl.Result{RequeueAfter: progressRequeueInterval}
+}
 
 // +kubebuilder:rbac:groups=tenancy.cnpg-vcluster.io,resources=tenants,verbs=get;list;watch;update
 // +kubebuilder:rbac:groups=tenancy.cnpg-vcluster.io,resources=tenants/status,verbs=get;update;patch
@@ -52,7 +58,7 @@ type TenantReconciler struct {
 
 func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
 	var tenant tenancyv1alpha1.Tenant
-	if err := reconciler.Get(ctx, types.NamespacedName{Name: request.Name}, &tenant); err != nil {
+	if err := reconciler.reader().Get(ctx, types.NamespacedName{Name: request.Name}, &tenant); err != nil {
 		if ignored := client.IgnoreNotFound(err); ignored != nil {
 			return ctrl.Result{}, fmt.Errorf("%s", sanitize.Text(ignored.Error()))
 		}
@@ -81,15 +87,17 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		foundation, err = loadFoundation(ctx, reconciler.reader(), reconciler.docker(), reconciler.foundationNamespace(), reconciler.foundationName(), reconciler.SupportedVersion, reconciler.ExpectedControllerImage)
 	}
 	if err != nil {
-		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "FoundationInvalid", err)
+		phase, reason := classifyFoundationFailure(managedDeletion, err)
+		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, phase, reason, err)
 	}
 	if !tenant.DeletionTimestamp.IsZero() {
 		if !containsString(tenant.Finalizers, tenantFinalizer) {
 			return ctrl.Result{}, nil
 		}
-		result, err := reconciler.finalizePartial(ctx, &tenant, specHash, foundation)
+		result, err := reconciler.finalizeTenant(ctx, &tenant, specHash, foundation)
 		if err != nil {
-			return result, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseDeleting, "DeletionBlocked", err)
+			phase, reason := classifyDeletionFailure(err)
+			return result, reconciler.failure(ctx, &tenant, specHash, phase, reason, err)
 		}
 		return result, nil
 	}
@@ -105,26 +113,29 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		if err := reconciler.Update(ctx, updated); err != nil {
 			return ctrl.Result{}, fmt.Errorf("%s", sanitize.Text(err.Error()))
 		}
-		return ctrl.Result{Requeue: true}, nil
+		return progressRequeue(), nil
+	}
+	if tenant.Status.FoundationHash == "" {
+		return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.FoundationHash = foundation.Hash
+			return nil
+		})
+	}
+	if tenant.Status.FoundationHash != foundation.Hash {
+		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseFailed, "FoundationMismatch", fmt.Errorf("Tenant foundation identity changed"))
 	}
 	if tenant.Status.Endpoint != "" {
 		if err := validateEndpoint(ctx, reconciler.reader(), reconciler.foundationNamespace(), foundation, &tenant, specHash); err != nil {
 			return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseOwnershipInvalid, "EndpointOwnershipInvalid", err)
 		}
 	}
-	if err := validateRecordedResources(ctx, reconciler.reader(), &tenant, specHash, foundation); err != nil {
-		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseOwnershipInvalid, "OwnershipInvalid", err)
-	}
-	if err := reconciler.validateRecordedVolume(ctx, &tenant, specHash, foundation); err != nil {
-		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, tenancyv1alpha1.PhaseOwnershipInvalid, "VolumeOwnershipInvalid", err)
-	}
 	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-		initializeReconcileStatus(status, &tenant, specHash, foundation.Hash)
+		initializeReconcileStatus(status, &tenant)
 		return nil
 	}); err != nil {
 		return ctrl.Result{}, err
 	}
-	result, err := reconciler.reconcileControlPlane(ctx, &tenant, canonical, specHash, foundation)
+	result, err := reconciler.reconcileDesiredState(ctx, &tenant, canonical, specHash, foundation)
 	if err != nil {
 		if errors.Is(err, errStableApplyConflict) {
 			ctrl.LoggerFrom(ctx).Info(
@@ -132,7 +143,13 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 				"error",
 				sanitize.Text(err.Error()),
 			)
-			return ctrl.Result{Requeue: true}, nil
+			return progressRequeue(), nil
+		}
+		if errors.Is(err, errImmutableDrift) {
+			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "ImmutableDrift", err)
+		}
+		if errors.Is(err, errRootClusterMissing) {
+			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "RootClusterMissing", err)
 		}
 		phase := tenancyv1alpha1.PhaseFailed
 		reason := "ReconcileFailed"
@@ -142,13 +159,21 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		}
 		return result, reconciler.failure(ctx, &tenant, specHash, phase, reason, err)
 	}
+	if result.Requeue || (result.RequeueAfter > 0 && result.RequeueAfter < readyObservationInterval) {
+		if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+			status.ObservedGeneration = tenant.Generation
+			status.Phase = tenancyv1alpha1.PhaseProgressing
+			setCondition(status, &tenant, "Ready", metav1.ConditionFalse, "Progressing", "Tenant reconciliation is progressing")
+			return nil
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+	}
 	return result, nil
 }
 
-func initializeReconcileStatus(status *tenancyv1alpha1.TenantStatus, tenant *tenancyv1alpha1.Tenant, specHash, foundationHash string) {
+func initializeReconcileStatus(status *tenancyv1alpha1.TenantStatus, tenant *tenancyv1alpha1.Tenant) {
 	status.ObservedGeneration = tenant.Generation
-	status.SpecHash = specHash
-	status.FoundationHash = foundationHash
 	if status.Phase == "" || status.Phase == tenancyv1alpha1.PhasePending {
 		status.Phase = tenancyv1alpha1.PhaseProgressing
 	}
@@ -160,7 +185,6 @@ func initializeReconcileStatus(status *tenancyv1alpha1.TenantStatus, tenant *ten
 func (reconciler *TenantReconciler) publishValidation(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, validationErr error) error {
 	return reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 		status.ObservedGeneration = tenant.Generation
-		status.SpecHash = specHash
 		status.Phase = tenancyv1alpha1.PhaseFailed
 		setCondition(status, tenant, "Accepted", metav1.ConditionFalse, "InvalidSpec", validationErr.Error())
 		setCondition(status, tenant, "Ready", metav1.ConditionFalse, "InvalidSpec", "Tenant specification is invalid")
@@ -171,7 +195,6 @@ func (reconciler *TenantReconciler) publishValidation(ctx context.Context, tenan
 func (reconciler *TenantReconciler) publishMutationDisabled(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string) error {
 	return reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 		status.ObservedGeneration = tenant.Generation
-		status.SpecHash = specHash
 		status.Phase = tenancyv1alpha1.PhaseProgressing
 		setCondition(status, tenant, "Accepted", metav1.ConditionTrue, "Accepted", "Tenant specification is accepted")
 		setCondition(status, tenant, "Ready", metav1.ConditionFalse, "MutationDisabled", "Tenant controller mutation is disabled until the clean cutover")
@@ -182,17 +205,28 @@ func (reconciler *TenantReconciler) publishMutationDisabled(ctx context.Context,
 func (reconciler *TenantReconciler) failure(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, phase tenancyv1alpha1.TenantPhase, reason string, cause error) error {
 	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
 		status.ObservedGeneration = tenant.Generation
-		status.SpecHash = specHash
 		status.Phase = phase
 		setCondition(status, tenant, "Ready", metav1.ConditionFalse, reason, cause.Error())
 		if phase == tenancyv1alpha1.PhaseOwnershipInvalid {
 			setCondition(status, tenant, "OwnershipValid", metav1.ConditionFalse, reason, cause.Error())
+		}
+		if reason == "FoundationMismatch" || reason == "FoundationInvalid" {
+			setCondition(status, tenant, "FoundationReady", metav1.ConditionFalse, reason, cause.Error())
 		}
 		return nil
 	}); err != nil {
 		return fmt.Errorf("%s; status update failed: %s", sanitize.Text(cause.Error()), sanitize.Text(err.Error()))
 	}
 	return fmt.Errorf("%s", sanitize.Text(cause.Error()))
+}
+
+func (reconciler *TenantReconciler) degraded(ctx context.Context, tenant *tenancyv1alpha1.Tenant, reason string, cause error) error {
+	return reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
+		status.ObservedGeneration = tenant.Generation
+		status.Phase = tenancyv1alpha1.PhaseDegraded
+		setCondition(status, tenant, "Ready", metav1.ConditionFalse, reason, cause.Error())
+		return nil
+	})
 }
 
 func (reconciler *TenantReconciler) SetupWithManager(manager ctrl.Manager) error {
@@ -288,4 +322,25 @@ func containsAny(value string, needles ...string) bool {
 		}
 	}
 	return false
+}
+
+func classifyFoundationFailure(managedDeletion bool, err error) (tenancyv1alpha1.TenantPhase, string) {
+	phase := tenancyv1alpha1.PhaseFailed
+	if managedDeletion {
+		phase = tenancyv1alpha1.PhaseDeleting
+	}
+	if errors.Is(err, errFoundationMismatch) {
+		return phase, "FoundationMismatch"
+	}
+	return phase, "FoundationInvalid"
+}
+
+func classifyDeletionFailure(err error) (tenancyv1alpha1.TenantPhase, string) {
+	if errors.Is(err, errTenantCleanupBlocked) {
+		return tenancyv1alpha1.PhaseDeleting, "TenantCleanupBlocked"
+	}
+	if isOwnershipError(err) {
+		return tenancyv1alpha1.PhaseOwnershipInvalid, "OwnershipInvalid"
+	}
+	return tenancyv1alpha1.PhaseDeleting, "DeletionBlocked"
 }

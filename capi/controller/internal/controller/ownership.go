@@ -2,13 +2,11 @@ package controller
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"sort"
 
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -43,65 +41,13 @@ func validateRootOwnership(object metav1.Object, tenant *tenancyv1alpha1.Tenant,
 	return nil
 }
 
-func identityFor(object client.Object) tenancyv1alpha1.ObservedResourceIdentity {
-	gvk := object.GetObjectKind().GroupVersionKind()
-	return tenancyv1alpha1.ObservedResourceIdentity{
-		APIVersion: gvk.GroupVersion().String(),
-		Kind:       gvk.Kind,
-		Namespace:  object.GetNamespace(),
-		Name:       object.GetName(),
-		UID:        string(object.GetUID()),
-	}
-
-}
-
-func kubeconfigSecretIdentity(secret *corev1.Secret) tenancyv1alpha1.ObservedResourceIdentity {
-	identity := identityFor(secret)
-	digest := sha256.Sum256(secret.Data["value"])
-	identity.ContentSHA256 = hex.EncodeToString(digest[:])
-	return identity
-}
-
-func upsertIdentity(status *tenancyv1alpha1.TenantStatus, identity tenancyv1alpha1.ObservedResourceIdentity) error {
-	for index := range status.ObservedResources {
-		current := &status.ObservedResources[index]
-		if current.APIVersion == identity.APIVersion && current.Kind == identity.Kind &&
-			current.Namespace == identity.Namespace && current.Name == identity.Name {
-			if current.UID != identity.UID {
-				return fmt.Errorf("%s %s identity changed from %s to %s", identity.Kind, identity.Name, current.UID, identity.UID)
-			}
-			return nil
-		}
-	}
-	status.ObservedResources = append(status.ObservedResources, identity)
-	sort.Slice(status.ObservedResources, func(left, right int) bool {
-		a := status.ObservedResources[left]
-		b := status.ObservedResources[right]
-		return a.APIVersion+"/"+a.Kind+"/"+a.Namespace+"/"+a.Name <
-			b.APIVersion+"/"+b.Kind+"/"+b.Namespace+"/"+b.Name
-	})
-	return nil
-}
-
-func findIdentity(status tenancyv1alpha1.TenantStatus, gvk schema.GroupVersionKind, namespace, name string) *tenancyv1alpha1.ObservedResourceIdentity {
-	for index := range status.ObservedResources {
-		identity := &status.ObservedResources[index]
-		if identity.APIVersion == gvk.GroupVersion().String() && identity.Kind == gvk.Kind &&
-			identity.Namespace == namespace && identity.Name == name {
-			return identity
-		}
-	}
-	return nil
-}
-
-func validateOwnerChain(ctx context.Context, reader client.Reader, object *unstructured.Unstructured, expectedRoot tenancyv1alpha1.ObservedResourceIdentity) error {
+func validateOwnerChain(ctx context.Context, reader client.Reader, object *unstructured.Unstructured, expectedRootUID types.UID) error {
 	current := object
 	visited := map[types.UID]struct{}{}
 	for {
-		if current.GetUID() == types.UID(expectedRoot.UID) {
+		if current.GetUID() == expectedRootUID {
 			return nil
 		}
-
 		if _, duplicate := visited[current.GetUID()]; duplicate {
 			return fmt.Errorf("provider owner chain contains a cycle")
 		}
@@ -127,82 +73,51 @@ func validateOwnerChain(ctx context.Context, reader client.Reader, object *unstr
 	}
 }
 
-func validateRecordedResources(ctx context.Context, reader client.Reader, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) error {
-	expectedResources := map[string]string{
-		"Namespace":             "namespace",
-		"Cluster":               "cluster",
-		"DevCluster":            "dev-cluster",
-		"KamajiControlPlane":    "kamaji-control-plane",
-		"KubeadmConfigTemplate": "kubeadm-config-template",
-		"DevMachineTemplate":    "dev-machine-template",
-		"MachineDeployment":     "machine-deployment",
-		"Machine":               "machine",
-	}
-	controlPlane := findIdentity(tenant.Status, controlPlaneGVK, tenant.Name, tenant.Name)
-	for _, identity := range tenant.Status.ObservedResources {
-		if identity.Kind == machineGVK.Kind &&
-			identity.APIVersion == machineGVK.GroupVersion().String() {
-			continue
-		}
-		if identity.Kind == "DevMachine" &&
-			identity.APIVersion == "infrastructure.cluster.x-k8s.io/v1beta2" {
-			continue
-		}
-		groupVersion, err := schema.ParseGroupVersion(identity.APIVersion)
-		if err != nil {
-			return fmt.Errorf("parse recorded resource API version: %w", err)
-		}
-		object := &unstructured.Unstructured{}
-		object.SetGroupVersionKind(groupVersion.WithKind(identity.Kind))
-		if err := reader.Get(ctx, types.NamespacedName{Namespace: identity.Namespace, Name: identity.Name}, object); err != nil {
-			return fmt.Errorf("read recorded %s %s: %w", identity.Kind, identity.Name, err)
-		}
-		if string(object.GetUID()) != identity.UID {
-			return fmt.Errorf("%s %s identity changed from %s to %s", identity.Kind, identity.Name, identity.UID, object.GetUID())
-		}
-		if identity.Kind == "Secret" {
-			if controlPlane == nil || !hasOwnerUID(object.GetOwnerReferences(), types.UID(controlPlane.UID)) {
-				return fmt.Errorf("recorded Tenant kubeconfig Secret owner changed")
-			}
-			continue
-		}
-		resource, known := expectedResources[identity.Kind]
-		if !known {
-			return fmt.Errorf("recorded resource kind %s is unsupported", identity.Kind)
-		}
-		if err := validateRootOwnership(object, tenant, specHash, foundation.Hash, resource, foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-			return err
-		}
-		if err := validateProviderOwner(object, tenant.Status, false); err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-func validateProviderOwner(object *unstructured.Unstructured, status tenancyv1alpha1.TenantStatus, required bool) error {
-	expected := make([]*tenancyv1alpha1.ObservedResourceIdentity, 0, 2)
+func validateProviderOwner(ctx context.Context, reader client.Reader, object *unstructured.Unstructured, tenantName string, required bool) error {
 	switch object.GetKind() {
 	case "Namespace", "Cluster":
 		if len(object.GetOwnerReferences()) != 0 {
 			return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
 		}
 		return nil
+	}
+
+	expected := make([]metav1.OwnerReference, 0, 2)
+	addExpected := func(gvk schema.GroupVersionKind, name string) error {
+		value := &unstructured.Unstructured{}
+		value.SetGroupVersionKind(gvk)
+		err := reader.Get(ctx, types.NamespacedName{Namespace: tenantName, Name: name}, value)
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		expected = append(expected, metav1.OwnerReference{
+			APIVersion: gvk.GroupVersion().String(),
+			Kind:       gvk.Kind,
+			Name:       name,
+			UID:        value.GetUID(),
+		})
+		return nil
+	}
+
+	switch object.GetKind() {
 	case "DevCluster", "KamajiControlPlane", "MachineDeployment":
-		if identity := findIdentity(status, clusterGVK, object.GetNamespace(), object.GetNamespace()); identity != nil {
-			expected = append(expected, identity)
+		if err := addExpected(clusterGVK, tenantName); err != nil {
+			return err
 		}
 	case "KubeadmConfigTemplate", "DevMachineTemplate":
-		if identity := findIdentity(status, clusterGVK, object.GetNamespace(), object.GetNamespace()); identity != nil {
-			expected = append(expected, identity)
+		if err := addExpected(clusterGVK, tenantName); err != nil {
+			return err
 		}
-		if identity := findIdentity(status, machineDeploymentGVK, object.GetNamespace(), object.GetNamespace()+"-worker"); identity != nil {
-			expected = append(expected, identity)
+		if err := addExpected(machineDeploymentGVK, tenantName+"-worker"); err != nil {
+			return err
 		}
 	default:
 		return nil
 	}
+
 	owners := object.GetOwnerReferences()
 	if len(owners) == 0 {
 		if required {
@@ -213,19 +128,75 @@ func validateProviderOwner(object *unstructured.Unstructured, status tenancyv1al
 	if len(owners) != 1 {
 		return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
 	}
-	for _, identity := range expected {
-		if owners[0].UID == types.UID(identity.UID) &&
-			owners[0].Kind == identity.Kind && owners[0].APIVersion == identity.APIVersion {
+	for _, owner := range expected {
+		if owners[0].UID == owner.UID &&
+			owners[0].Kind == owner.Kind &&
+			owners[0].APIVersion == owner.APIVersion &&
+			owners[0].Name == owner.Name {
 			return nil
 		}
 	}
 	return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
 }
 
-func validateRecordedUID(status tenancyv1alpha1.TenantStatus, object client.Object) error {
-	identity := findIdentity(status, object.GetObjectKind().GroupVersionKind(), object.GetNamespace(), object.GetName())
-	if identity != nil && identity.UID != string(object.GetUID()) {
-		return fmt.Errorf("%s %s identity changed from %s to %s", identity.Kind, identity.Name, identity.UID, object.GetUID())
+func validateProviderOwnerForDeletion(ctx context.Context, reader client.Reader, object *unstructured.Unstructured, tenant *tenancyv1alpha1.Tenant) error {
+	owners := object.GetOwnerReferences()
+	if len(owners) == 0 {
+		return nil
+	}
+	if len(owners) != 1 {
+		return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
+	}
+	owner := owners[0]
+	clusterOwner := owner.APIVersion == clusterGVK.GroupVersion().String() &&
+		owner.Kind == clusterGVK.Kind &&
+		owner.Name == tenant.Name &&
+		tenant.Status.ClusterUID != "" &&
+		owner.UID == types.UID(tenant.Status.ClusterUID)
+	switch object.GetKind() {
+	case "DevCluster", "KamajiControlPlane", "MachineDeployment":
+		if clusterOwner {
+			return nil
+		}
+	case "KubeadmConfigTemplate", "DevMachineTemplate":
+		if clusterOwner {
+			return nil
+		}
+		if owner.APIVersion == machineDeploymentGVK.GroupVersion().String() &&
+			owner.Kind == machineDeploymentGVK.Kind &&
+			owner.Name == tenant.Name+"-worker" {
+			machineDeployment := &unstructured.Unstructured{}
+			machineDeployment.SetGroupVersionKind(machineDeploymentGVK)
+			if err := reader.Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: owner.Name}, machineDeployment); err != nil {
+				return fmt.Errorf("read template provider owner %s: %w", owner.Name, err)
+			}
+			if machineDeployment.GetUID() == owner.UID {
+				return nil
+			}
+		}
+	default:
+		return nil
+	}
+	return fmt.Errorf("%s %s has an unexpected provider owner", object.GetKind(), object.GetName())
+}
+
+func validateClusterUID(tenant *tenancyv1alpha1.Tenant, object metav1.Object) error {
+	if tenant.Status.ClusterUID != "" && tenant.Status.ClusterUID != string(object.GetUID()) {
+		return fmt.Errorf(
+			"Cluster identity changed from %s to %s",
+			tenant.Status.ClusterUID,
+			object.GetUID(),
+		)
+	}
+	return nil
+}
+
+func validateKubeconfigSecret(secret *corev1.Secret, controlPlane *unstructured.Unstructured) error {
+	if secret.Type != corev1.SecretType("cluster.x-k8s.io/secret") || len(secret.Data["value"]) == 0 {
+		return fmt.Errorf("Tenant kubeconfig Secret contract is invalid")
+	}
+	if controlPlane == nil || !hasOwnerUID(secret.OwnerReferences, controlPlane.GetUID()) {
+		return fmt.Errorf("Tenant kubeconfig Secret ownership cannot be proven")
 	}
 	return nil
 }

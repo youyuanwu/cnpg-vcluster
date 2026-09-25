@@ -211,8 +211,9 @@ The Tenant controller is the single networking writer. It transforms the
 verified Calico asset, builds the repository-owned `capi-kube-proxy` objects,
 and applies each object directly through the tenant client with exact Tenant,
 specification, foundation, and resource-role markers. Same-name replacements
-with a different UID or ownership markers make the Tenant
-`OwnershipInvalid`.
+with foreign ownership markers make the Tenant `OwnershipInvalid`. Missing
+non-root owned children are recreated; a missing or replaced root CAPI Cluster
+is refused after its UID has been recorded.
 
 Worker image delivery is bootstrap-owned rather than a second reconciliation
 loop. The `KubeadmConfigTemplate` verifies archive checksums, imports the
@@ -249,14 +250,18 @@ Reconciliation and deletion are fail-closed:
 - inspection distinguishes present, canonical Kubernetes `NotFound`, and
   inspection failure;
 - one finalizer removes tenant-API resources, deletes the CAPI Cluster, waits
-  for provider objects and CAPD containers, removes the exact owned volume and
-  credentials, deletes the Namespace, releases the endpoint, and removes the
-  finalizer last;
-- an identity-bound teardown checkpoint permits restart recovery if the
-  hosted API is unavailable after exact management ownership preflight. In
-  this disposable local experiment, tenant-API cleanup may be skipped before
-  provider teardown; ownership conflicts and management inspection failures
-  still block.
+  for provider objects and CAPD containers, removes the exact owned volume,
+  deletes the Namespace and its credentials, releases the endpoint, and
+  removes the finalizer last;
+- `tenantCleanupClusterUID` is recorded only after live tenant-API cleanup and
+  bootstrap RBAC removal succeed for the exact Cluster UID. If the hosted API
+  is unavailable before that checkpoint, deletion blocks. After the
+  checkpoint, control-plane loss is expected and provider teardown resumes.
+
+The controller does not persist a creation program counter or child-resource
+UID ledger. Missing children are discovered from live state, and Ready or
+Degraded Tenants are resynchronized every 30 seconds. Expected progress uses a
+fixed poll interval rather than rate-limited requeue backoff.
 
 ## Status, conditions, and exits
 

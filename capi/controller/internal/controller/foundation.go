@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/netip"
 	"path"
@@ -18,6 +19,8 @@ import (
 
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 )
+
+var errFoundationMismatch = errors.New("Tenant foundation identity changed")
 
 const (
 	defaultFoundationNamespace = "tenant-system"
@@ -165,8 +168,8 @@ func loadFoundationForDeletion(ctx context.Context, reader client.Reader, namesp
 	if err != nil {
 		return Foundation{}, err
 	}
-	if lifecycleHash != "" {
-		foundation.Hash = lifecycleHash
+	if lifecycleHash != "" && foundation.Hash != lifecycleHash {
+		return Foundation{}, errFoundationMismatch
 	}
 	if foundation.Schema != 2 ||
 		foundation.NetworkID == "" ||
@@ -192,6 +195,7 @@ func readFoundation(ctx context.Context, reader client.Reader, namespace, name s
 		return Foundation{}, fmt.Errorf("decode Tenant foundation: %w", err)
 	}
 	delete(immutable, "mutationEnabled")
+	delete(immutable, "controllerImage")
 	canonical, err := json.Marshal(immutable)
 	if err != nil {
 		return Foundation{}, fmt.Errorf("encode immutable Tenant foundation: %w", err)

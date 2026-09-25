@@ -3,12 +3,11 @@ package controller
 import (
 	"context"
 	"fmt"
-	"sort"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
@@ -21,43 +20,32 @@ func deleteTenantResources(
 	tenant *tenancyv1alpha1.Tenant,
 	specHash,
 	foundationHash string,
-	workloadsCleanupComplete bool,
+	catalog []cleanupCoordinate,
 ) (bool, error) {
-	values := append([]tenancyv1alpha1.ObservedResourceIdentity(nil), tenant.Status.TenantResources...)
-	sort.Slice(values, func(left, right int) bool {
-		leftPriority := tenantDeletePriority(values[left].Kind)
-		rightPriority := tenantDeletePriority(values[right].Kind)
-		if leftPriority != rightPriority {
-			return leftPriority < rightPriority
-		}
-		leftIdentity := values[left].APIVersion + "/" + values[left].Kind + "/" + values[left].Namespace + "/" + values[left].Name
-		rightIdentity := values[right].APIVersion + "/" + values[right].Kind + "/" + values[right].Namespace + "/" + values[right].Name
-		return leftIdentity < rightIdentity
-	})
-	for _, identity := range values {
-		if identity.Kind == "Node" {
-			continue
-		}
-		isDefinitionOrNamespace := identity.Kind == "CustomResourceDefinition" || identity.Kind == "Namespace"
-		if workloadsCleanupComplete != isDefinitionOrNamespace {
-			continue
-		}
-		gvk := schema.FromAPIVersionAndKind(identity.APIVersion, identity.Kind)
+	for _, coordinate := range catalog {
 		object := &unstructured.Unstructured{}
-		object.SetGroupVersionKind(gvk)
-		err := tenantClient.Get(ctx, client.ObjectKey{Namespace: identity.Namespace, Name: identity.Name}, object)
-		if apierrors.IsNotFound(err) {
+		object.SetGroupVersionKind(coordinate.GVK)
+		err := tenantClient.Get(ctx, client.ObjectKey{
+			Namespace: coordinate.Namespace,
+			Name:      coordinate.Name,
+		}, object)
+		if apierrors.IsNotFound(err) || meta.IsNoMatchError(err) {
 			continue
 		}
 		if err != nil {
 			return false, err
 		}
 		annotations := object.GetAnnotations()
-		if string(object.GetUID()) != identity.UID ||
+		if annotations[resources.TenantAnnotation] != tenant.Name ||
 			annotations[resources.TenantUIDAnnotation] != string(tenant.UID) ||
 			annotations[resources.SpecHashAnnotation] != specHash ||
-			annotations[resources.FoundationAnnotation] != foundationHash {
-			return false, fmt.Errorf("tenant resource %s/%s ownership changed before cleanup", identity.Kind, identity.Name)
+			annotations[resources.FoundationAnnotation] != foundationHash ||
+			annotations[resources.ResourceAnnotation] != coordinate.Resource {
+			return false, fmt.Errorf(
+				"tenant resource %s/%s ownership changed before cleanup",
+				object.GetKind(),
+				object.GetName(),
+			)
 		}
 		if !object.GetDeletionTimestamp().IsZero() {
 			return false, nil

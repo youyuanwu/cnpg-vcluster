@@ -34,10 +34,11 @@ EXPECTED_RECIPES = {
     "controller-generate",
     "controller-verify",
     "controller-test",
+    "controller-vet",
     "controller-build",
     "controller-image",
-    "test-controller-phase2",
-    "test-controller-phase3",
+    "test-controller-convergence",
+    "test-controller-readiness",
     "test-controller-deletion",
     "controller-tenant-status",
     "create-management",
@@ -186,9 +187,34 @@ def check_repository_boundaries() -> None:
         ROOT / "controller" / "config" / "manager" / "manager.yaml.tpl"
     ).read_text(encoding="utf-8")
     check(
-        "--mutation-enabled=true" in manager
-        and "--mutation-enabled=false" not in manager,
-        "normal Tenant controller mutation is not enabled",
+        "--mutation-enabled=${CONTROLLER_MUTATION_ENABLED}" in manager,
+        "Tenant controller mutation template placeholder is missing",
+    )
+    lifecycle_epoch = "desired-state-v2"
+    check(
+        f'CONTROLLER_LIFECYCLE_EPOCH = "{lifecycle_epoch}"'
+        in (ROOT / "scripts" / "lib" / "controller.py").read_text(
+            encoding="utf-8"
+        ),
+        "controller installer lifecycle epoch is inconsistent",
+    )
+    check(
+        f'"lifecycle-epoch", "{lifecycle_epoch}"'
+        in (ROOT / "controller" / "cmd" / "manager" / "main.go").read_text(
+            encoding="utf-8"
+        ),
+        "controller manager lifecycle epoch is inconsistent",
+    )
+    check(
+        f'cleanupCatalogEpoch = "{lifecycle_epoch}"'
+        in (
+            ROOT
+            / "controller"
+            / "internal"
+            / "controller"
+            / "cleanup_catalog.go"
+        ).read_text(encoding="utf-8"),
+        "cleanup catalog lifecycle epoch is inconsistent",
     )
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
     check(
@@ -204,6 +230,8 @@ def check_repository_boundaries() -> None:
         "config/tenants/tests/tenant-a.json",
         "config/tenants/tests/tenant-b.json",
         "config/tenants/tests/tenant-c.json",
+        "scripts/test_controller_phase2.py",
+        "scripts/test_controller_phase3.py",
     ):
         check(
             not (ROOT / relative).exists(),
@@ -232,6 +260,49 @@ def check_repository_boundaries() -> None:
         check(
             token not in production_python,
             f"obsolete callable local mutator remains: {token}",
+        )
+    controller_python = "\n".join(
+        (ROOT / relative).read_text(encoding="utf-8")
+        for relative in (
+            "scripts/lib/controller_scenarios.py",
+            "scripts/test_controller_convergence.py",
+            "scripts/test_controller_readiness.py",
+            "scripts/test_controller_deletion.py",
+            "scripts/test_tenant_lifecycle.py",
+        )
+    )
+    for token in (
+        'status.get("stage")',
+        'status.get("observedResources")',
+        'status.get("tenantResources")',
+        'status.get("dockerVolume")',
+        'status.get("workerContainers")',
+        'status.get("teardown")',
+        'status.get("specHash")',
+    ):
+        check(
+            token not in controller_python,
+            f"controller scenario still consumes removed status field: {token}",
+        )
+    controller_go = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "controller").rglob("*.go")
+        if not path.name.endswith("_test.go")
+    )
+    for token in (
+        ".Status.Stage",
+        ".ObservedResources",
+        ".TenantResources",
+        "DockerVolumeIdentity",
+        "WorkerContainerEvidence",
+        "TeardownStatus",
+        "TenantAPICleanupUnavailable",
+        "LiveBootstrapRBACCleanupComplete",
+        "reconcileStableDesiredObjects",
+    ):
+        check(
+            token not in controller_go,
+            f"simplified controller restored removed workflow state: {token}",
         )
     check(
         "def delete_tenant(" not in (
