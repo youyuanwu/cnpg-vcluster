@@ -28,7 +28,7 @@ func TestBootstrapRBACRefusesPreexistingRoleBindingDrift(t *testing.T) {
 		Subjects: []rbacv1.Subject{{APIGroup: rbacv1.GroupName, Kind: "Group", Name: "foreign"}},
 	}
 	tenantClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(existing).Build()
-	if err := ensureBootstrapRBAC(context.Background(), tenantClient); !errors.Is(err, errStaticResourceDrift) {
+	if err := ensureBootstrapRBAC(context.Background(), tenantClient); !errors.Is(err, errBootstrapAccessMismatch) {
 		t.Fatalf("bootstrap RoleBinding drift was not refused: %v", err)
 	}
 	var preserved rbacv1.RoleBinding

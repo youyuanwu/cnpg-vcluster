@@ -22,7 +22,6 @@ func ensureTenantObjects(
 	objects []*unstructured.Unstructured,
 	tenant *tenancyv1alpha1.Tenant,
 	specHash, foundationHash string,
-	validateDrift bool,
 ) (tenantApplyResult, error) {
 	var groups [3][]*unstructured.Unstructured
 	var crds []*unstructured.Unstructured
@@ -59,7 +58,6 @@ func ensureTenantObjects(
 				tenant,
 				specHash,
 				foundationHash,
-				validateDrift,
 			)
 			result.Created = result.Created || created
 			if err != nil {

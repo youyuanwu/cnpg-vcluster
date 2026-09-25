@@ -70,7 +70,7 @@ worker-container evidence, or Docker volume identity.
 The manager uses leader election and one bounded reconcile worker. Initial
 creation uses a grouped desired-state path. Expected progress uses a fixed
 one-second requeue. Ready and Degraded Tenants resynchronize every five minutes
-to observe readiness and static-resource drift.
+to observe readiness.
 
 ## Reconciliation flow
 
@@ -83,7 +83,8 @@ Reconciliation proceeds through these responsibilities:
 5. create the Namespace, CAPI Cluster, and CAPD DevCluster;
 6. create the KamajiControlPlane and validate its exact kubeconfig Secret;
 7. establish bootstrap RBAC;
-8. create or validate the exact Docker volume and worker templates;
+8. create or validate the exact Docker volume and worker templates, whose
+   bootstrap prepares the CNPG storage directories;
 9. observe the requested pre-CNI workers;
 10. create missing static networking, storage, CNPG operator, Namespace, and PV
     resources without rewriting existing owned objects;
@@ -93,11 +94,10 @@ Reconciliation proceeds through these responsibilities:
 Missing objects use create-or-refuse semantics. Existing owned objects use
 different contracts by role:
 
-- static bootstrap objects are ownership-validated during progress and checked
-  with non-persisting server-side dry-run after Ready; changes to fields
-  declared by the controller, or ownership conflicts on those fields, become
-  `StaticResourceDrift` and are not repaired. Additive fields owned by other
-  managers are preserved and are outside the audit contract;
+- static bootstrap objects are created when missing and ownership-validated
+  when present, but their existing content is not generically audited or
+  rewritten. Bootstrap Roles and RoleBindings retain explicit content
+  validation because they establish administrative access;
 - dynamic management roots and the CNPG Cluster use
   UID/resource-version-bound server-side apply.
 
@@ -110,11 +110,6 @@ Tenant UID, specification hash, foundation hash, and resource-role markers.
 Tenant owner references are deliberately not used on lifecycle roots, because
 garbage collection must not bypass ordered finalization. Provider-owned
 descendants retain their normal CAPI, CAPD, Kamaji, and CNPG owner graphs.
-
-The controller keeps only the current component name in memory for diagnostics.
-Transition logs include elapsed time for control plane, worker image
-preparation, network, worker readiness, CNPG operator, and database readiness.
-Restarts reset this diagnostic tracker; no timing or stage state is persisted.
 
 ## Readiness and conditions
 
@@ -133,7 +128,7 @@ The controller periodically requires:
   topology;
 - available Calico, CoreDNS, and `capi-kube-proxy` workloads;
 - the expected static StorageClass;
-- a healthy CNPG Cluster with the requested Ready Pods and Bound PVCs;
+- a CNPG Cluster in healthy state with the requested ready instance count;
 - current ownership markers for every direct tenant resource and the recorded
   exact UID for the root CAPI Cluster.
 
@@ -219,8 +214,10 @@ Partial creation is handled from live management and host state, even when a
 Cluster, control plane, or workers were never created. An observed root Cluster
 UID is recorded before deletion. Ownership conflicts, failed management/host
 inspection, and foundation hash changes still block destructive progress.
-The `disposable-cluster-v3` lifecycle epoch requires a clean cutover from the
-old tenant-cleanup status contract, not migration of existing Tenants.
+The `worker-bootstrap-v4` lifecycle epoch requires a clean cutover from older
+tenant-cleanup and worker-bootstrap contracts, not migration of existing
+Tenants. This prevents workers created before CNPG storage preparation moved
+into bootstrap from being reused without the required directory ownership.
 The foundation lifecycle hash excludes mutation mode and controller image
 identity, allowing same-epoch controller rebuilds while resource-affecting
 foundation inputs remain immutable.
@@ -235,7 +232,9 @@ UID.
 Each Tenant owns one Docker volume mounted at
 `/var/lib/capi-tenant-storage` in every worker. The controller creates one
 no-provisioner `capi-hostpath` StorageClass and one prebound static PV per
-requested CNPG instance. The PVs intentionally omit node affinity.
+requested CNPG instance. Worker bootstrap idempotently creates each ordinal
+directory with UID/GID 26 and mode `0700` before kubeadm. The PVs intentionally
+omit node affinity.
 
 The persistence scenario writes a SQL marker, verifies PostgreSQL filesystem
 ownership, replaces a Machine, restarts a replica, deletes the primary, and

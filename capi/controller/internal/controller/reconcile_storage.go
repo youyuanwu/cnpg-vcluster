@@ -29,7 +29,6 @@ func (reconciler *TenantReconciler) reconcileStorage(
 		tenant,
 		specHash,
 		foundation.Hash,
-		staticDriftValidationEnabled(tenant),
 	)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -37,6 +36,5 @@ func (reconciler *TenantReconciler) reconcileStorage(
 	if applied.Created || applied.Pending {
 		return progressRequeue(), nil
 	}
-	reconciler.componentTimings.transition(ctx, tenant, "cnpg-operator")
 	return reconciler.reconcileCNPG(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }

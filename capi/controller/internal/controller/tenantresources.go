@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 
-	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	ctrl "sigs.k8s.io/controller-runtime"
@@ -18,7 +17,6 @@ import (
 var (
 	errStableApplyConflict = errors.New("stable apply conflict")
 	errImmutableDrift      = errors.New("immutable owned drift")
-	errStaticResourceDrift = errors.New("static owned resource drift")
 )
 
 func ensureStaticTenantObject(
@@ -28,7 +26,6 @@ func ensureStaticTenantObject(
 	tenant *tenancyv1alpha1.Tenant,
 	specHash,
 	foundationHash string,
-	validateDrift bool,
 ) (bool, error) {
 	desired = desired.DeepCopy()
 	delete(desired.Object, "status")
@@ -52,55 +49,7 @@ func ensureStaticTenantObject(
 	if err := validateTenantObjectOwnership(current, desired, tenant, specHash, foundationHash); err != nil {
 		return false, err
 	}
-	if !validateDrift {
-		return false, nil
-	}
-	candidate := desired.DeepCopy()
-	candidate.SetUID(current.GetUID())
-	if err := tenantClient.Patch(
-		ctx,
-		candidate,
-		client.Apply,
-		client.FieldOwner("cnpg-vcluster-tenant-controller"),
-		client.DryRunAll,
-	); err != nil {
-		if apierrors.IsConflict(err) || apierrors.IsInvalid(err) {
-			return false, fmt.Errorf("%w: %v", errStaticResourceDrift, err)
-		}
-		return false, err
-	}
-	if !equality.Semantic.DeepEqual(
-		staticTenantObjectContent(current),
-		staticTenantObjectContent(candidate),
-	) {
-		name := current.GetName()
-		if current.GetNamespace() != "" {
-			name = current.GetNamespace() + "/" + name
-		}
-		return false, fmt.Errorf(
-			"%w: %s %s differs from the supported bootstrap content",
-			errStaticResourceDrift,
-			current.GetKind(),
-			name,
-		)
-	}
 	return false, nil
-}
-
-func staticTenantObjectContent(object *unstructured.Unstructured) map[string]any {
-	content := object.DeepCopy().Object
-	delete(content, "status")
-	for _, field := range []string{
-		"creationTimestamp",
-		"generation",
-		"managedFields",
-		"resourceVersion",
-		"selfLink",
-		"uid",
-	} {
-		unstructured.RemoveNestedField(content, "metadata", field)
-	}
-	return content
 }
 
 func ensureTenantObject(

@@ -1,6 +1,8 @@
 package resources
 
 import (
+	"fmt"
+	"slices"
 	"strings"
 	"testing"
 
@@ -52,28 +54,59 @@ func TestStorageAndCNPGBuildersPreserveCountsAndAffinity(t *testing.T) {
 	}
 	database := CNPGObjects(context, "capi-hostpath", "postgres:exact")
 	pvs := 0
+	clusters := 0
 	for _, object := range database {
 		if object.GetKind() == "PersistentVolume" {
 			pvs++
 			if _, found, _ := unstructured.NestedFieldNoCopy(object.Object, "spec", "nodeAffinity"); found {
 				t.Fatal("CNPG static PV has node affinity")
 			}
+			for _, field := range []struct {
+				path []string
+				want string
+			}{
+				{[]string{"hostPath", "path"}, fmt.Sprintf("%s/volumes/cnpg/%d", context.Inputs.StorageContainerPath, pvs)},
+				{[]string{"hostPath", "type"}, "DirectoryOrCreate"},
+				{[]string{"claimRef", "namespace"}, "database"},
+				{[]string{"claimRef", "name"}, fmt.Sprintf("capi-postgres-%d", pvs)},
+				{[]string{"storageClassName"}, "capi-hostpath"},
+				{[]string{"persistentVolumeReclaimPolicy"}, "Retain"},
+				{[]string{"capacity", "storage"}, "1Gi"},
+			} {
+				got, _, _ := unstructured.NestedString(object.Object, append([]string{"spec"}, field.path...)...)
+				if got != field.want {
+					t.Fatalf("PV %s %v = %q, want %q", object.GetName(), field.path, got, field.want)
+				}
+			}
+			modes, _, _ := unstructured.NestedStringSlice(object.Object, "spec", "accessModes")
+			if !slices.Equal(modes, []string{"ReadWriteOnce"}) {
+				t.Fatalf("unexpected PV access modes: %v", modes)
+			}
 		}
 		if object.GetKind() == "Cluster" {
+			clusters++
+			image, _, _ := unstructured.NestedString(object.Object, "spec", "imageName")
+			instances, _, _ := unstructured.NestedInt64(object.Object, "spec", "instances")
+			if image != "postgres:exact" || instances != 3 {
+				t.Fatalf("unexpected CNPG image or instance count: %s %d", image, instances)
+			}
 			affinity, _, _ := unstructured.NestedString(object.Object, "spec", "affinity", "podAntiAffinityType")
 			if affinity != "preferred" {
 				t.Fatalf("unexpected anti-affinity: %s", affinity)
 			}
 		}
 	}
-	if pvs != 3 {
-		t.Fatalf("unexpected CNPG PV count: %d", pvs)
+	if pvs != 3 || clusters != 1 {
+		t.Fatalf("unexpected CNPG object counts: %d PVs, %d Clusters", pvs, clusters)
 	}
 }
 
 func TestWorkerBootstrapCommandsArePassedToKubeadm(t *testing.T) {
 	context := resourceContext()
-	context.WorkerBootstrapCommands = []string{"echo first", "echo second"}
+	context.WorkerBootstrapCommands = []string{
+		"ctr --namespace k8s.io images import --digests '/cache/postgres.tar'",
+		"mkdir -p '/var/lib/storage/volumes/cnpg/1' && chown 26:26 '/var/lib/storage/volumes/cnpg/1' && chmod 0700 '/var/lib/storage/volumes/cnpg/1'",
+	}
 	template := KubeadmConfigTemplate(context)
 	commands, found, err := unstructured.NestedStringSlice(
 		template.Object,
@@ -85,7 +118,7 @@ func TestWorkerBootstrapCommandsArePassedToKubeadm(t *testing.T) {
 	if err != nil || !found {
 		t.Fatalf("worker bootstrap commands are missing: found=%v err=%v", found, err)
 	}
-	if len(commands) != 2 || commands[0] != "echo first" || commands[1] != "echo second" {
+	if !slices.Equal(commands, context.WorkerBootstrapCommands) {
 		t.Fatalf("unexpected worker bootstrap commands: %#v", commands)
 	}
 }

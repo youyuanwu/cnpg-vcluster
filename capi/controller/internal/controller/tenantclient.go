@@ -21,7 +21,10 @@ import (
 	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 )
 
-var errTenantAdministrativeAccessPending = errors.New("Tenant administrative access is pending")
+var (
+	errTenantAdministrativeAccessPending = errors.New("Tenant administrative access is pending")
+	errBootstrapAccessMismatch           = errors.New("Tenant bootstrap access differs from the supported content")
+)
 
 type TenantClientFactory interface {
 	ClientFor([]byte, string) (client.Client, error)
@@ -113,8 +116,8 @@ func ensureBootstrapRBAC(ctx context.Context, tenantClient client.Client) error 
 			existing := current.(*rbacv1.Role)
 			if !equality.Semantic.DeepEqual(existing.Rules, desired.Rules) {
 				return fmt.Errorf(
-					"%w: Tenant bootstrap Role %s differs from the supported content",
-					errStaticResourceDrift,
+					"%w: Role %s",
+					errBootstrapAccessMismatch,
 					desired.Name,
 				)
 			}
@@ -123,8 +126,8 @@ func ensureBootstrapRBAC(ctx context.Context, tenantClient client.Client) error 
 			if !equality.Semantic.DeepEqual(existing.RoleRef, desired.RoleRef) ||
 				!bootstrapSubjectsEqual(existing.Subjects, desired.Subjects) {
 				return fmt.Errorf(
-					"%w: Tenant bootstrap RoleBinding %s differs from the supported content",
-					errStaticResourceDrift,
+					"%w: RoleBinding %s",
+					errBootstrapAccessMismatch,
 					desired.Name,
 				)
 			}

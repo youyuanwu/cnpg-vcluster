@@ -2,7 +2,6 @@ package controller
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"time"
@@ -50,7 +49,6 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 		tenant,
 		specHash,
 		foundation.Hash,
-		staticDriftValidationEnabled(tenant),
 	)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -62,39 +60,12 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 	deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
 	if err := tenantClient.Get(ctx, client.ObjectKey{Namespace: "cnpg-system", Name: "cnpg-controller-manager"}, deployment); err != nil {
 		if apierrors.IsNotFound(err) {
-			reconciler.componentTimings.transition(ctx, tenant, "cnpg-operator")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if !workloadAvailable(deployment) {
-		reconciler.componentTimings.transition(ctx, tenant, "cnpg-operator")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-	reconciler.componentTimings.transition(ctx, tenant, "database")
-	_, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
-	if err != nil {
-		if errors.Is(err, errWorkerRuntimePending) {
-			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-		}
-		return ctrl.Result{}, err
-	}
-	if len(containers) == 0 {
-		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
-	}
-	probe := fmt.Sprintf("for ordinal in $(seq 1 %d); do path=%s/volumes/cnpg/$ordinal; test -d \"$path\" && test \"$(stat -c '%%u:%%g:%%a' \"$path\")\" = '26:26:700' || exit 1; done",
-		canonical.DatabaseCount, foundation.Inputs.StorageContainerPath)
-	result, err := reconciler.exec(ctx, containers[0].ID, []string{"sh", "-ec", probe})
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	if result.ExitCode != 0 {
-		command := fmt.Sprintf("for ordinal in $(seq 1 %d); do mkdir -p %s/volumes/cnpg/$ordinal; chown 26:26 %s/volumes/cnpg/$ordinal; chmod 700 %s/volumes/cnpg/$ordinal; done",
-			canonical.DatabaseCount, foundation.Inputs.StorageContainerPath, foundation.Inputs.StorageContainerPath, foundation.Inputs.StorageContainerPath)
-		if err := reconciler.execRequired(ctx, containers[0].ID, []string{"sh", "-ec", command}); err != nil {
-			return ctrl.Result{}, err
-		}
-		return progressRequeue(), nil
 	}
 	databaseObjects := resources.CNPGObjects(resourceContext, tenantStorageClass, postgresImage.Reference)
 	staticObjects := make([]*unstructured.Unstructured, 0, len(databaseObjects)-1)
@@ -119,7 +90,6 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 		tenant,
 		specHash,
 		foundation.Hash,
-		staticDriftValidationEnabled(tenant),
 	)
 	if err != nil {
 		return ctrl.Result{}, err
@@ -139,18 +109,17 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 	} else if changed {
 		return progressRequeue(), nil
 	}
-	ready, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount, postgresImage.Reference)
+	ready, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
 	if !ready {
-		reconciler.componentTimings.transition(ctx, tenant, "database")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	return reconciler.reconcileReadiness(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 
-func databaseStructurallyReady(ctx context.Context, tenantClient client.Client, count int32, postgresImage string) (bool, error) {
+func databaseStructurallyReady(ctx context.Context, tenantClient client.Client, count int32) (bool, error) {
 	cluster := &unstructured.Unstructured{}
 	cluster.SetGroupVersionKind(schema.GroupVersionKind{Group: "postgresql.cnpg.io", Version: "v1", Kind: "Cluster"})
 	if err := tenantClient.Get(ctx, client.ObjectKey{Namespace: "database", Name: "capi-postgres"}, cluster); err != nil {
@@ -161,47 +130,5 @@ func databaseStructurallyReady(ctx context.Context, tenantClient client.Client, 
 	}
 	phase, _, _ := unstructured.NestedString(cluster.Object, "status", "phase")
 	readyInstances, _, _ := unstructured.NestedInt64(cluster.Object, "status", "readyInstances")
-	if phase != "Cluster in healthy state" ||
-		readyInstances != int64(count) {
-		return false, nil
-	}
-	pods := &unstructured.UnstructuredList{}
-	pods.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "PodList"})
-	if err := tenantClient.List(ctx, pods, client.InNamespace("database"), client.MatchingLabels{"cnpg.io/cluster": "capi-postgres"}); err != nil {
-		return false, err
-	}
-	if len(pods.Items) != int(count) {
-		return false, nil
-	}
-	for index := range pods.Items {
-		if !tenantObjectReady(&pods.Items[index]) {
-			return false, nil
-		}
-		containers, _, _ := unstructured.NestedSlice(pods.Items[index].Object, "spec", "containers")
-		found := false
-		for _, raw := range containers {
-			container, ok := raw.(map[string]any)
-			if ok && container["name"] == "postgres" {
-				found = container["image"] == postgresImage
-			}
-		}
-		if !found {
-			return false, fmt.Errorf("Postgres image drift")
-		}
-	}
-	pvcs := &unstructured.UnstructuredList{}
-	pvcs.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "PersistentVolumeClaimList"})
-	if err := tenantClient.List(ctx, pvcs, client.InNamespace("database"), client.MatchingLabels{"cnpg.io/cluster": "capi-postgres"}); err != nil {
-		return false, err
-	}
-	if len(pvcs.Items) != int(count) {
-		return false, nil
-	}
-	for index := range pvcs.Items {
-		value, _, _ := unstructured.NestedString(pvcs.Items[index].Object, "status", "phase")
-		if value != "Bound" {
-			return false, nil
-		}
-	}
-	return true, nil
+	return phase == "Cluster in healthy state" && readyInstances == int64(count), nil
 }

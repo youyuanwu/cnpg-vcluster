@@ -21,12 +21,11 @@ The supported local status command is the compatibility surface for exit
 classification.
 
 Static tenant bootstrap resources are created when absent but are not
-continuously repaired. Once Ready, the controller periodically uses
-non-persisting server-side dry-run to detect supported-field drift and reports
-`StaticResourceDrift` without mutating the object. Dynamic CAPI roots and the
-CNPG database `Cluster` retain targeted repair. Additive fields owned by other
-field managers are preserved and are not part of the static drift contract.
-Clients must not interpret component timing logs as persisted API state.
+continuously repaired or generically content-audited. Existing resources must
+retain the exact Tenant ownership markers; bootstrap Roles and RoleBindings
+also retain explicit content validation because they establish administrative
+access. Dynamic CAPI roots and the CNPG database `Cluster` retain targeted
+repair.
 
 Deletion is ordinary Kubernetes DELETE guarded by the
 `tenancy.cnpg-vcluster.io/finalizer`. Clients must not depend on preparatory
@@ -37,12 +36,13 @@ only the exactly owned storage volume, Namespace/credentials, endpoint
 allocation, and finalizer, in that order. It does not connect to the tenant API.
 Management and host ownership checks remain fail-closed.
 
-The `disposable-cluster-v3` lifecycle epoch removes tenant-API creation
-authorization and successful-cleanup status fields, along with the cleanup
-catalog. This stored-contract change requires a clean cutover from
-`desired-state-v2`; no status migration is supported. Lifecycle epoch changes
-scale the old controller to zero and reject existing Tenant/provider/host
-residue; status from older epochs is not silently migrated.
+The `worker-bootstrap-v4` lifecycle epoch includes the earlier removal of
+tenant-API creation authorization, successful-cleanup status fields, and the
+cleanup catalog. It additionally requires CNPG storage directory preparation
+in worker bootstrap. This stored and bootstrap-contract change requires a clean
+cutover from `disposable-cluster-v3`; no status or existing-worker migration is
+supported. Lifecycle epoch changes scale the old controller to zero and reject
+existing Tenant/provider/host residue; older state is not silently migrated.
 
 A second served version must not be added until conversion behavior, storage
 version migration, downgrade behavior, and removal criteria are documented and
