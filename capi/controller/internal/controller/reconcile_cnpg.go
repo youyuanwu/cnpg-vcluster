@@ -43,14 +43,12 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	for _, desired := range objects {
-		changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if changed {
-			return progressRequeue(), nil
-		}
+	applied, err := ensureTenantObjects(ctx, tenantClient, objects, tenant, specHash, foundation.Hash)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if applied.Created || applied.Pending {
+		return progressRequeue(), nil
 	}
 	deployment := &unstructured.Unstructured{}
 	deployment.SetGroupVersionKind(schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"})
@@ -87,14 +85,12 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 		}
 		return progressRequeue(), nil
 	}
-	for _, desired := range resources.CNPGObjects(resourceContext, tenantStorageClass, postgresImage.Reference) {
-		changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if changed {
-			return progressRequeue(), nil
-		}
+	applied, err = ensureTenantObjects(ctx, tenantClient, resources.CNPGObjects(resourceContext, tenantStorageClass, postgresImage.Reference), tenant, specHash, foundation.Hash)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if applied.Created || applied.Pending {
+		return progressRequeue(), nil
 	}
 	ready, err := databaseStructurallyReady(ctx, tenantClient, canonical.DatabaseCount, postgresImage.Reference)
 	if err != nil {

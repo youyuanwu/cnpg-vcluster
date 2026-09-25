@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import io
 import hashlib
 import json
@@ -9,12 +10,13 @@ import tempfile
 import unittest
 from pathlib import Path
 from subprocess import CompletedProcess
-from unittest.mock import patch
+from unittest.mock import MagicMock, call, patch
 
 from scripts.cache import (
     ACTIVE_SCHEMA,
     CACHE_SCHEMA,
     IMAGE_PLATFORM,
+    _registry_get,
     _verify_archive_metadata,
     restore_host_image,
     acquire_cache,
@@ -104,6 +106,58 @@ def write_archive(
 
 
 class CacheTests(unittest.TestCase):
+    def test_registry_get_retries_incomplete_response_body(self) -> None:
+        incomplete = MagicMock()
+        incomplete.__enter__.return_value.read.side_effect = (
+            http.client.IncompleteRead(b"partial", 8)
+        )
+        complete = MagicMock()
+        complete.__enter__.return_value.read.return_value = b"complete"
+        with (
+            patch(
+                "scripts.cache.urllib.request.urlopen",
+                side_effect=[incomplete, complete],
+            ) as urlopen,
+            patch("scripts.cache.time.sleep") as sleep,
+        ):
+            data = _registry_get(
+                "registry.example",
+                "project/image",
+                "blobs/sha256:example",
+                30,
+            )
+        self.assertEqual(b"complete", data)
+        self.assertEqual(2, urlopen.call_count)
+        sleep.assert_called_once_with(1)
+
+    def test_registry_get_rejects_repeated_incomplete_response_body(self) -> None:
+        responses = []
+        for _ in range(4):
+            response = MagicMock()
+            response.__enter__.return_value.read.side_effect = (
+                http.client.IncompleteRead(b"partial", 8)
+            )
+            responses.append(response)
+        with (
+            patch(
+                "scripts.cache.urllib.request.urlopen",
+                side_effect=responses,
+            ) as urlopen,
+            patch("scripts.cache.time.sleep") as sleep,
+        ):
+            with self.assertRaisesRegex(
+                IntegrityError,
+                "registry response was incomplete",
+            ):
+                _registry_get(
+                    "registry.example",
+                    "project/image",
+                    "blobs/sha256:example",
+                    30,
+                )
+        self.assertEqual(4, urlopen.call_count)
+        self.assertEqual([call(1), call(2), call(4)], sleep.call_args_list)
+
     def test_archive_requires_tagged_and_digest_identity(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             archive = Path(temporary) / "image.tar"

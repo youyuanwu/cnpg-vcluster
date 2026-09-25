@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import http.client
 import json
 import hashlib
 import io
@@ -277,9 +278,31 @@ def _registry_get(
             timeout=timeout,
         )
 
+    def read(extra: dict[str, str] | None = None) -> bytes:
+        for attempt in range(4):
+            try:
+                with request(extra) as response:
+                    return response.read()
+            except urllib.error.HTTPError as exc:
+                if exc.code not in {429, 500, 502, 503, 504} or attempt == 3:
+                    raise
+                failure = exc
+            except (
+                http.client.IncompleteRead,
+                urllib.error.URLError,
+                ConnectionError,
+                TimeoutError,
+            ) as exc:
+                if attempt == 3:
+                    raise IntegrityError(
+                        f"registry response was incomplete for {url}: {exc}"
+                    ) from exc
+                failure = exc
+            time.sleep(2 ** attempt)
+        raise IntegrityError(f"registry request produced no result for {url}: {failure}")
+
     try:
-        with request() as response:
-            return response.read()
+        return read()
     except urllib.error.HTTPError as exc:
         challenge = exc.headers.get("WWW-Authenticate", "")
         if exc.code != 401 or not challenge.lower().startswith("bearer "):
@@ -311,8 +334,10 @@ def _registry_get(
     token = token_payload.get("token") or token_payload.get("access_token")
     if not token:
         raise IntegrityError(f"registry token response was empty: {registry}")
-    with request({"Authorization": f"Bearer {token}"}) as response:
-        return response.read()
+    try:
+        return read({"Authorization": f"Bearer {token}"})
+    except urllib.error.HTTPError as exc:
+        raise IntegrityError(f"registry request failed for {url}: {exc}") from exc
 
 
 def _write_registry_oci_archive(

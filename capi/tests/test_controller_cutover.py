@@ -63,7 +63,7 @@ class ControllerCutoverTests(unittest.TestCase):
                                 "name": "manager",
                                 "args": [
                                     "--mutation-enabled=true",
-                                    "--lifecycle-epoch=desired-state-v2",
+                                    "--lifecycle-epoch=disposable-cluster-v3",
                                 ],
                             }
                         ]
@@ -75,7 +75,7 @@ class ControllerCutoverTests(unittest.TestCase):
             [CompletedProcess([], 0, stdout=json.dumps(deployment), stderr="")]
         )
         self.assertEqual(
-            "desired-state-v2",
+            "disposable-cluster-v3",
             controller_lifecycle_epoch(client),
         )
 

@@ -39,14 +39,12 @@ func (reconciler *TenantReconciler) reconcileNetwork(
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	for _, desired := range bundle.Objects {
-		changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if changed {
-			return progressRequeue(), nil
-		}
+	applied, err := ensureTenantObjects(ctx, tenantClient, bundle.Objects, tenant, specHash, foundation.Hash)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if applied.Created || applied.Pending {
+		return progressRequeue(), nil
 	}
 	ready, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
 	if err != nil {

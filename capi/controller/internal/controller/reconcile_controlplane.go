@@ -77,12 +77,6 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 	} else if changed {
 		return progressRequeue(), nil
 	}
-	if !tenant.Status.TenantAPICreationAuthorized {
-		return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.TenantAPICreationAuthorized = true
-			return nil
-		})
-	}
 	controlPlane, err := resources.KamajiControlPlane(resourceContext)
 	if err != nil {
 		return ctrl.Result{}, err

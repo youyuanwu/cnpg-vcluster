@@ -10,10 +10,10 @@ PHASES = (
     "initial_cleanup",
     "host_preparation",
     "management_bootstrap",
-    "tenant_control_plane",
-    "tenant_workers_network",
-    "cnpg_readiness_sql",
-    "teardown",
+    "tenant_convergence",
+    "tenant_sql_probe",
+    "tenant_deletion_finalization",
+    "management_teardown_host_restoration",
 )
 
 
@@ -28,6 +28,7 @@ class PhaseTimings:
         if name in self._records:
             raise RuntimeError(f"lifecycle timing phase already recorded: {name}")
         started = time.monotonic()
+        print(f"CAPI_PHASE_START {name}", flush=True)
         try:
             yield
         except BaseException:
@@ -59,5 +60,6 @@ class PhaseTimings:
         for record in self.records():
             print(
                 "CAPI_TIMING "
-                + json.dumps(record, sort_keys=True, separators=(",", ":"))
+                + json.dumps(record, sort_keys=True, separators=(",", ":")),
+                flush=True,
             )

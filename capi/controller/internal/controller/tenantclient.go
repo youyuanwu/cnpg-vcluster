@@ -13,7 +13,6 @@ import (
 	rbacv1 "k8s.io/api/rbac/v1"
 	"k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
@@ -136,51 +135,6 @@ func applyBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
 		}
 	}
 	return nil
-}
-
-func deleteBootstrapRBAC(ctx context.Context, tenantClient client.Client) (bool, error) {
-	for _, raw := range resources.BootstrapRBAC() {
-		desired := raw.(client.Object)
-		key := client.ObjectKeyFromObject(desired)
-		current, err := emptyBootstrapObject(desired)
-		if err != nil {
-			return false, err
-		}
-		err = tenantClient.Get(ctx, key, current)
-		if apierrors.IsNotFound(err) {
-			continue
-		}
-		if err != nil {
-			return false, fmt.Errorf("inspect Tenant bootstrap RBAC: %w", err)
-		}
-		switch expected := desired.(type) {
-		case *rbacv1.Role:
-			actual := current.(*rbacv1.Role)
-			if !equality.Semantic.DeepEqual(actual.Rules, expected.Rules) {
-				return false, fmt.Errorf("Tenant bootstrap Role %s ownership cannot be proven", expected.Name)
-			}
-		case *rbacv1.RoleBinding:
-			actual := current.(*rbacv1.RoleBinding)
-			if !equality.Semantic.DeepEqual(actual.RoleRef, expected.RoleRef) ||
-				!bootstrapSubjectsEqual(actual.Subjects, expected.Subjects) {
-				return false, fmt.Errorf("Tenant bootstrap RoleBinding %s ownership cannot be proven", expected.Name)
-			}
-		default:
-			return false, fmt.Errorf("unsupported Tenant bootstrap object %T", desired)
-		}
-		if current.GetDeletionTimestamp() != nil {
-			return false, nil
-		}
-		uid := current.GetUID()
-		resourceVersion := current.GetResourceVersion()
-		if err := tenantClient.Delete(ctx, current, &client.DeleteOptions{
-			Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &resourceVersion},
-		}); err != nil && !apierrors.IsNotFound(err) && !apierrors.IsConflict(err) {
-			return false, fmt.Errorf("delete Tenant bootstrap RBAC: %w", err)
-		}
-		return false, nil
-	}
-	return true, nil
 }
 
 func emptyBootstrapObject(object client.Object) (client.Object, error) {

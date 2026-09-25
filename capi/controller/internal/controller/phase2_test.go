@@ -13,6 +13,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
@@ -199,6 +200,14 @@ func endpointConfigMap(t *testing.T, foundation Foundation, tenant *tenancyv1alp
 	}
 }
 
+func loadTestFoundation(ctx context.Context, reader client.Reader, docker DockerClient, namespace, name, supportedVersion, expectedControllerImage string) (Foundation, error) {
+	reconciler := &TenantReconciler{
+		APIReader: reader, Docker: docker, FoundationNamespace: namespace, FoundationName: name,
+		SupportedVersion: supportedVersion, ExpectedControllerImage: expectedControllerImage,
+	}
+	return reconciler.loadFoundation(ctx, "")
+}
+
 func TestLoadFoundationUsesLiveDockerIdentity(t *testing.T) {
 	scheme := runtime.NewScheme()
 	if err := corev1.AddToScheme(scheme); err != nil {
@@ -216,7 +225,7 @@ func TestLoadFoundationUsesLiveDockerIdentity(t *testing.T) {
 		network:    DockerNetwork{ID: foundation.NetworkID, Subnets: []string{foundation.Subnet}},
 		execResult: DockerExecResult{Output: "{\"generation\":\"generation\",\"schema\":1}\n"},
 	}
-	observed, err := loadFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage)
+	observed, err := loadTestFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -224,7 +233,7 @@ func TestLoadFoundationUsesLiveDockerIdentity(t *testing.T) {
 		t.Fatalf("unexpected foundation: %#v", observed)
 	}
 	docker.network.Subnets = []string{"172.19.0.0/16"}
-	if _, err := loadFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err == nil {
+	if _, err := loadTestFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err == nil {
 		t.Fatal("network identity drift was accepted")
 	}
 }
@@ -251,7 +260,7 @@ func TestFoundationSafetyReadUsesUncachedReader(t *testing.T) {
 		execResult: DockerExecResult{Output: "{\"generation\":\"generation\",\"schema\":1}\n"},
 	}
 	reconciler := &TenantReconciler{Client: cached, APIReader: direct, Docker: docker}
-	if _, err := loadFoundation(context.Background(), reconciler.reader(), docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err != nil {
+	if _, err := loadTestFoundation(context.Background(), reconciler.reader(), docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err != nil {
 		t.Fatal(err)
 	}
 }
@@ -333,13 +342,13 @@ func TestLoadFoundationRejectsActiveCacheAndRegistryDrift(t *testing.T) {
 		network:    DockerNetwork{ID: foundation.NetworkID, Subnets: []string{foundation.Subnet}},
 		execResult: DockerExecResult{Output: "{\"generation\":\"wrong\",\"schema\":1}\n"},
 	}
-	if _, err := loadFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err == nil {
+	if _, err := loadTestFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err == nil {
 		t.Fatal("changed active cache generation was accepted")
 	}
 	docker.execResult.Output = "{\"generation\":\"generation\",\"schema\":1}\n"
 	registry.NetworkAddresses[foundation.NetworkID] = "172.18.0.11"
 	docker.containers[registry.ID] = registry
-	if _, err := loadFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err == nil {
+	if _, err := loadTestFoundation(context.Background(), kubernetes, docker, defaultFoundationNamespace, defaultFoundationName, "1.36.4", foundation.ControllerImage); err == nil {
 		t.Fatal("changed registry address was accepted")
 	}
 }

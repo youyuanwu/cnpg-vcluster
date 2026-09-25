@@ -46,6 +46,13 @@ rules:
 - apiGroups:
   - bootstrap.cluster.x-k8s.io
   resources:
+  - kubeadmconfigs
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - bootstrap.cluster.x-k8s.io
+  resources:
   - kubeadmconfigtemplates
   verbs:
   - create

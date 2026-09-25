@@ -14,19 +14,27 @@ Status is controller-owned and may add optional observational fields without
 changing spec semantics. Clients must use `metadata.generation`,
 `status.observedGeneration`, and the Ready condition's `observedGeneration`
 rather than depending on condition order or internal reconciliation progress.
-The status currently exposes the endpoint, foundation hash, exact root Cluster
-UID, tenant API creation authorization, and successful-cleanup Cluster UID.
+The status currently exposes the endpoint, foundation hash, and exact root
+Cluster UID. Tenant-internal resources are disposable with the dedicated
+cluster, so status has no tenant-API creation or cleanup checkpoint.
 The supported local status command is the compatibility surface for exit
 classification.
 
 Deletion is ordinary Kubernetes DELETE guarded by the
 `tenancy.cnpg-vcluster.io/finalizer`. Clients must not depend on preparatory
 reservations, Leases, filesystem journals, force deletion, or provider
-finalizer removal. A newer controller must continue to understand every
-cleanup checkpoint it may encounter in stored `v1alpha1` status, or require an
-explicit clean cutover before rollout. Lifecycle epoch changes scale the old
-controller to zero and reject existing Tenant/provider/host residue; status
-from older epochs is not silently migrated.
+finalizer removal. Finalization deletes the exact recorded CAPI Cluster, waits
+for provider descendants and dedicated workers to disappear, then removes
+only the exactly owned storage volume, Namespace/credentials, endpoint
+allocation, and finalizer, in that order. It does not connect to the tenant API.
+Management and host ownership checks remain fail-closed.
+
+The `disposable-cluster-v3` lifecycle epoch removes tenant-API creation
+authorization and successful-cleanup status fields, along with the cleanup
+catalog. This stored-contract change requires a clean cutover from
+`desired-state-v2`; no status migration is supported. Lifecycle epoch changes
+scale the old controller to zero and reject existing Tenant/provider/host
+residue; status from older epochs is not silently migrated.
 
 A second served version must not be added until conversion behavior, storage
 version migration, downgrade behavior, and removal criteria are documented and

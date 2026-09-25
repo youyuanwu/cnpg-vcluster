@@ -159,10 +159,6 @@ spec:
                 - Failed
                 - OwnershipInvalid
                 type: string
-              tenantAPICreationAuthorized:
-                type: boolean
-              tenantCleanupClusterUID:
-                type: string
             type: object
         required:
         - spec

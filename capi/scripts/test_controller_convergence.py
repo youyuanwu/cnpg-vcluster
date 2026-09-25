@@ -77,7 +77,6 @@ def _converging(
             status.get("endpoint"),
             status.get("foundationHash"),
             status.get("clusterUID"),
-            status.get("tenantAPICreationAuthorized") is True,
         )
     ):
         return None

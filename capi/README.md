@@ -86,9 +86,11 @@ manifest is the reconcile/retry path, status reads generation-aware Kubernetes
 conditions, and ordinary deletion is completed by the controller finalizer.
 Apply is asynchronous; repeat `just local-tenant-status tenant-example` until
 it exits zero. Tenant specifications are immutable; delete and recreate to
-change capacity, versions, or networks. The bounded final E2E proves that one
-explicitly selected PostgreSQL tenant can become healthy and that teardown
-restores a clean host:
+change capacity, versions, or networks. The bounded final E2E waits for one
+explicitly selected Tenant's structural Ready contract, runs `SELECT 1`
+through its PostgreSQL read/write service with the existing disposable SQL
+probe, waits for ordinary Tenant deletion/finalization, and verifies that
+management teardown restores a clean host:
 
 ```bash
 just test-e2e
@@ -215,6 +217,12 @@ with foreign ownership markers make the Tenant `OwnershipInvalid`. Missing
 non-root owned children are recreated; a missing or replaced root CAPI Cluster
 is refused after its UID has been recorded.
 
+Network, storage, and CNPG objects are applied in dependency-ordered batches:
+Namespaces and CRDs first, supporting configuration/RBAC/storage next, then
+workloads. Every object in a batch is checked and applied without a per-object
+requeue. CRDs must be Established and their served versions discoverable before
+dependent batches proceed; same-name create races still require exact ownership.
+
 Worker image delivery is bootstrap-owned rather than a second reconciliation
 loop. The `KubeadmConfigTemplate` verifies archive checksums, imports the
 required images into containerd, creates exact digest/tag aliases, configures
@@ -249,19 +257,28 @@ Reconciliation and deletion are fail-closed:
   Machine-to-MachineSet-to-MachineDeployment ownership chain;
 - inspection distinguishes present, canonical Kubernetes `NotFound`, and
   inspection failure;
-- one finalizer removes tenant-API resources, deletes the CAPI Cluster, waits
+- one finalizer deletes the exact recorded CAPI Cluster, waits
   for provider objects and CAPD containers, removes the exact owned volume,
   deletes the Namespace and its credentials, releases the endpoint, and
   removes the finalizer last;
-- `tenantCleanupClusterUID` is recorded only after live tenant-API cleanup and
-  bootstrap RBAC removal succeed for the exact Cluster UID. If the hosted API
-  is unavailable before that checkpoint, deletion blocks. After the
-  checkpoint, control-plane loss is expected and provider teardown resumes.
+- tenant-internal resources and bootstrap RBAC are disposable with the
+  dedicated tenant cluster; finalization does not contact the tenant API or
+  require a cleanup checkpoint. Management/host ownership remains fail-closed.
+  The `disposable-cluster-v3` epoch requires a clean cutover from older stored
+  status contracts; existing Tenants are not migrated.
 
 The controller does not persist a creation program counter or child-resource
 UID ledger. Missing children are discovered from live state, and Ready or
 Degraded Tenants are resynchronized every 30 seconds. Expected progress uses a
 fixed poll interval rather than rate-limited requeue backoff.
+
+Each normal reconciliation reads the foundation ConfigMap directly and checks
+its immutable checksum, lifecycle hash, controller image, and mutation gate.
+Successful management-container, network, active-cache, and offline-registry
+host checks are cached in memory for at most one minute per foundation hash.
+A changed hash or controller restart requires fresh host checks; failures are
+not cached. Deletion does not use this cache and retains live host ownership
+checks before destructive operations.
 
 ## Status, conditions, and exits
 
@@ -355,14 +372,78 @@ the upstream server as a fail-closed fallback; the node egress rule rejects any
 fallback attempt. Cleanup requires the exact recorded container ID, image ID,
 labels, network, address, generation-backed file inventory, and checksums.
 
+## Continuous integration
+
+GitHub Actions runs Python unit/static checks and Go generation, vet, unit,
+and envtest checks in **CAPI fast checks**, independently of the destructive
+**CAPI end-to-end** job. Parallel jobs allow image acquisition and fast checks
+to overlap; E2E builds the controller image during management bootstrap.
+The final **CAPI tests** check requires both jobs to succeed on every PR
+(including fork PRs), manual dispatch, and the weekly Monday 04:23 UTC schedule.
+Keep **CAPI tests** as the required branch-protection check: its always-running
+gate rejects failed, cancelled, or unexpectedly skipped prerequisite jobs.
+Pushes to `main` run fast checks only, avoiding an immediate repeat of the PR's
+destructive E2E. Concurrency cancels superseded runs of the same event/ref,
+without a `main` push cancelling a scheduled or manually dispatched full gate.
+
+Fast checks use `just controller-tools` to acquire only checksum-pinned Go and
+envtest archives, without Docker, management assets, or OCI image acquisition.
+Acquisition and extraction hold the shared E2E lock followed by the exclusive
+tools lock, just like other tool commands; an E2E child inherits its parent's
+E2E exclusion and takes only the tools lock.
+The cache allow-list contains those two compressed archives (about 119 MiB)
+and `.tools/go-mod-cache` (about 238 MiB with current pins), keyed by OS,
+architecture, tool pins, and module manifests as applicable. E2E may restore
+the module cache from earlier runs but does not wait for or depend on a cache
+hit. Archives are checksum-verified before installation even on cache hits.
+Cache parent directories are created owner-only before restoration so the
+lab's private-path checks also work on clean GitHub-hosted runners.
+The 18 GiB `.tools/cache` OCI store, Docker layers, compiled Go cache, and
+runtime/kubeconfig state are **never uploaded to Actions caches**.
+
+The custom Go wrapper installs to `.tools/bin/go`, with `GOROOT=.tools/go`,
+`GOMODCACHE=.tools/go-mod-cache`, and local `GOCACHE=.tools/go-cache`.
+Envtest uses `.tools/envtest/envtest` via `KUBEBUILDER_ASSETS`; these paths are
+resolved against the absolute `capi` directory by the Python harness, rather
+than relying on `setup-go` defaults. For Docker-free local checks:
+
+```bash
+just controller-tools
+just test-unit
+just test-static
+just controller-verify
+just controller-vet
+just controller-test
+```
+
 ## Lifecycle timing
 
 The clean-to-clean gates print one `CAPI_TIMING` JSON record for each of:
 `tools_cache`, `initial_cleanup`, `host_preparation`,
-`management_bootstrap`, `tenant_control_plane`,
-`tenant_workers_network`, `cnpg_readiness_sql`, and `teardown`. Records contain
+`management_bootstrap`, `tenant_convergence`, `tenant_sql_probe`,
+`tenant_deletion_finalization`, and `management_teardown_host_restoration`.
+`CAPI_PHASE_START` lines identify the active phase immediately. Timing records contain
 only schema, phase, passed/failed/skipped status, and elapsed seconds. They do
 not include commands, environment values, credentials, or exception text.
+The tools phase measures local cache verification/installation; online image
+acquisition remains the separate `Acquire pinned tools and images` CI step.
+The deletion phase captures the live Tenant UID, management object UIDs,
+endpoint allocation, full worker-container IDs, and exact storage volume name.
+After Tenant absence, it verifies those Namespace/provider roots, allocations,
+containers, and volume are absent **before** management teardown. A leak or
+inspection failure fails deletion even if the subsequent full cleanup succeeds.
+
+During convergence, `CAPI_TENANT_TRANSITION` JSON lines report elapsed seconds,
+classification, generation, and each condition's type/status/reason/observed
+generation. The initial observation and meaningful transitions are flushed
+immediately; unchanged polls, condition ordering, messages, and timestamp-only
+changes do not spam the log. These observations
+show whichever component conditions the controller currently publishes,
+without controller stage fields. Initial creation can retain a generic
+`Progressing` condition until component readiness is observed; condition logs
+alone cannot subdivide that interval into control-plane, worker, or add-on time.
+Condition messages are omitted, and timeout diagnostics use the shared
+redaction helper.
 The enforced-offline gate also prints `CAPI_OFFLINE_EGRESS` records with the
 node and counted reject-rule packets, plus `CAPI_OFFLINE_MIRROR` records for
 each exact digest-qualified image exercised through the local mirror.

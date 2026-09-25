@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+import io
+import json
+from contextlib import redirect_stdout
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
@@ -11,6 +14,7 @@ from scripts.lib.controller_scenarios import (
     manifest_tenant_name,
     tenant_from_document,
     tenant_snapshot,
+    wait_tenant_ready,
 )
 
 
@@ -28,12 +32,118 @@ def tenant_document() -> dict[str, object]:
             "endpoint": "172.18.255.10:6443",
             "foundationHash": "foundation",
             "clusterUID": "cluster-uid",
-            "tenantAPICreationAuthorized": True,
         },
     }
 
 
 class ControllerScenarioTests(unittest.TestCase):
+    def test_wait_logs_condition_and_classification_transitions_without_messages(self) -> None:
+        def result(
+            classification="progressing", reason="WaitingForWorkers", generation=1,
+            *, reverse=False, message="",
+        ):
+            conditions = [
+                {
+                    "type": "Ready",
+                    "status": "True" if classification == "ready" else "False",
+                    "reason": reason,
+                    "observedGeneration": generation,
+                    "message": message,
+                    "lastTransitionTime": message,
+                },
+                {"type": "Accepted", "status": "True", "reason": "Valid"},
+            ]
+            return {
+                "classification": classification,
+                "observedGeneration": generation,
+                "conditions": list(reversed(conditions)) if reverse else conditions,
+            }
+
+        results = [
+            result(message=f"password={'first-secret'}"),
+            result(reverse=True, message=f"password={'second-secret'}"),
+            result(reason="WaitingForDatabases"),
+            result(classification="degraded", reason="WaitingForDatabases"),
+            result(generation=2),
+            result(classification="ready", generation=2),
+        ]
+        self.assertIn("first-secret", json.dumps(results))
+        self.assertIn("second-secret", json.dumps(results))
+        documents = [None] + [
+            {"metadata": {"name": "tenant-a", "generation": 2 if index >= 4 else 1}}
+            for index in range(len(results))
+        ]
+        output = io.StringIO()
+
+        def wait(description, timeout, interval, predicate):
+            self.assertEqual(("Tenant tenant-a Ready", 60, 1), (description, timeout, interval))
+            for _ in range(len(documents)):
+                value = predicate()
+                if value:
+                    return value
+            self.fail("readiness was never observed")
+
+        with (
+            patch("scripts.lib.controller_scenarios.ManagementClient"),
+            patch("scripts.lib.controller_scenarios.tenant_document", side_effect=documents),
+            patch("scripts.lib.controller_scenarios.evaluate_tenant", side_effect=results),
+            patch("scripts.lib.controller_scenarios.wait_for", side_effect=wait),
+            patch("scripts.lib.controller_scenarios.time.monotonic", side_effect=range(7)),
+            redirect_stdout(output),
+        ):
+            document = wait_tenant_ready(Path("."), {
+                "TENANT_CONTROL_PLANE_TIMEOUT": "10s",
+                "WORKER_REGISTRATION_TIMEOUT": "20s",
+                "CNPG_TIMEOUT": "30s",
+                "WAIT_POLL_INTERVAL": "1s",
+            }, "tenant-a")
+        self.assertEqual(documents[-1], document)
+        transitions = [
+            json.loads(line.removeprefix("CAPI_TENANT_TRANSITION "))
+            for line in output.getvalue().splitlines()
+        ]
+        self.assertEqual(
+            ["absent", "progressing", "progressing", "degraded", "progressing", "ready"],
+            [transition["classification"] for transition in transitions],
+        )
+        self.assertEqual(list(range(1, 7)), [item["seconds"] for item in transitions])
+        self.assertEqual("WaitingForDatabases", transitions[2]["conditions"][1]["reason"])
+        self.assertEqual(2, transitions[-1]["generation"])
+        self.assertNotIn("first-secret", output.getvalue())
+        self.assertNotIn("second-secret", output.getvalue())
+        self.assertNotIn('"message"', output.getvalue())
+        self.assertNotIn("lastTransitionTime", output.getvalue())
+
+    def test_wait_timeout_preserves_last_status_and_redacts_diagnostics(self) -> None:
+        status = {
+            "classification": "degraded",
+            "conditions": [{"type": "Ready", "status": "False", "reason": "MissingWorkers"}],
+            "blockers": [f"password={'do-not-log'}"],
+        }
+        self.assertIn("do-not-log", json.dumps(status))
+
+        def wait(_description, _timeout, _interval, predicate):
+            predicate()
+            raise RuntimeError("timed out waiting")
+
+        with (
+            patch("scripts.lib.controller_scenarios.ManagementClient"),
+            patch("scripts.lib.controller_scenarios.tenant_document", return_value={"metadata": {}}),
+            patch("scripts.lib.controller_scenarios.evaluate_tenant", return_value=status),
+            patch("scripts.lib.controller_scenarios.wait_for", side_effect=wait),
+            redirect_stdout(io.StringIO()),
+        ):
+            with self.assertRaises(RuntimeError) as failure:
+                wait_tenant_ready(Path("."), {
+                    "TENANT_CONTROL_PLANE_TIMEOUT": "1s",
+                    "WORKER_REGISTRATION_TIMEOUT": "1s",
+                    "CNPG_TIMEOUT": "1s",
+                    "WAIT_POLL_INTERVAL": "1s",
+                }, "tenant-a")
+        self.assertIn("MissingWorkers", str(failure.exception))
+        self.assertNotIn("do-not-log", str(failure.exception))
+        self.assertIn("REDACTED", str(failure.exception))
+
     def test_manifest_name_is_read_from_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "custom.yaml"

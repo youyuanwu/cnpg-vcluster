@@ -51,6 +51,7 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         self.assertFalse(controller_requires_cutover(CONTROLLER_LIFECYCLE_EPOCH))
         self.assertTrue(controller_requires_cutover(None))
         self.assertTrue(controller_requires_cutover("legacy-status-v1"))
+        self.assertTrue(controller_requires_cutover("desired-state-v2"))
 
     def test_rendered_manager_contains_epoch_and_mutation_mode(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

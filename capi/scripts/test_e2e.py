@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import os
 import sys
 from pathlib import Path
@@ -9,14 +10,22 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
+from scripts.cnpg import _sql
 from scripts.lib.host import read_inotify, resolve_host_just
+from scripts.lib.kube import ManagementClient
 from scripts.lib.locking import e2e_lock
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
 from scripts.tools import verify_all_inputs
 from scripts.lib.timing import PhaseTimings
 from scripts.lib.registry import registry_name
-from scripts.lib.controller_scenarios import wait_tenant_ready
+from scripts.lib.controller_scenarios import (
+    delete_controller_tenant,
+    tenant_from_document,
+    tenant_snapshot,
+    wait_tenant_ready,
+)
+from scripts.lib.tenants import export_tenant_kubeconfig
 
 
 def run_just(
@@ -116,6 +125,146 @@ def verify_no_local_runtime_residue(root: Path) -> None:
         )
 
 
+def _inspect_management_object(
+    client: ManagementClient,
+    resource: str,
+    namespace: str = "",
+) -> dict[str, object] | None:
+    arguments = ["-n", namespace] if namespace else []
+    response = client.kubectl(
+        *arguments, "get", resource, "-o", "json",
+        "--ignore-not-found=true", check=False,
+    )
+    if response.returncode != 0:
+        raise RuntimeError(
+            f"failed to inspect {resource}: {redact(response.stderr)}"
+        )
+    if not response.stdout.strip():
+        return None
+    try:
+        document = json.loads(response.stdout)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid inspection response for {resource}") from exc
+    if not isinstance(document, dict):
+        raise RuntimeError(f"invalid inspection response for {resource}")
+    return document
+
+
+def _endpoint_allocations(client: ManagementClient) -> dict[str, dict[str, str]]:
+    document = _inspect_management_object(
+        client, "configmap/tenant-endpoint-allocations", "tenant-system",
+    )
+    if document is None:
+        return {}
+    try:
+        state = json.loads(document["data"]["allocations.json"])
+        if (
+            not isinstance(state, dict)
+            or type(state.get("schema")) is not int
+            or state["schema"] != 1
+        ):
+            raise ValueError
+        allocations = state["allocations"]
+        if not isinstance(allocations, dict):
+            raise ValueError
+        for address, allocation in allocations.items():
+            if not address or not isinstance(allocation, dict):
+                raise ValueError
+            for field in ("tenantName", "tenantUID", "specHash", "foundationHash"):
+                if not isinstance(allocation.get(field), str) or not allocation[field]:
+                    raise ValueError
+        return allocations
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("invalid endpoint allocation inspection response") from exc
+
+
+def capture_tenant_deletion_identity(
+    config: dict[str, str],
+    client: ManagementClient,
+    document: dict[str, object],
+) -> dict[str, object]:
+    metadata = document.get("metadata", {})
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Tenant deletion identity is incomplete")
+    name, uid = metadata.get("name"), metadata.get("uid")
+    if not isinstance(name, str) or not name or not isinstance(uid, str) or not uid:
+        raise RuntimeError("Tenant deletion identity is incomplete")
+    current = _inspect_management_object(client, f"tenant/{name}")
+    current_metadata = current.get("metadata") if current is not None else None
+    if not isinstance(current_metadata, dict) or current_metadata.get("uid") != uid:
+        raise RuntimeError("Tenant identity changed before deletion")
+    identity = tenant_snapshot(config, client, current)
+    identity["name"] = name
+    address = str(identity["endpoint"]).rsplit(":", 1)[0]
+    allocation = _endpoint_allocations(client).get(address)
+    if (
+        allocation is None
+        or allocation["tenantUID"] != uid
+        or allocation["tenantName"] != name
+        or allocation["foundationHash"] != identity["foundationHash"]
+    ):
+        raise RuntimeError("Tenant endpoint allocation identity changed before deletion")
+    identity["endpointAddress"] = address
+    identity["endpointAllocation"] = allocation
+    cluster_uids = [
+        recorded_uid
+        for resource, namespace, object_name, recorded_uid in identity["managementResources"]
+        if resource == "clusters.cluster.x-k8s.io" and namespace == name and object_name == name
+    ]
+    if (
+        identity["dockerVolume"]["name"] != f"{config['LAB_PREFIX']}-{name}-storage"
+        or not identity["workerContainers"]
+        or not identity["clusterUID"]
+        or cluster_uids != [identity["clusterUID"]]
+    ):
+        raise RuntimeError("Tenant provider deletion identity is incomplete")
+    return identity
+
+
+def verify_tenant_deletion(
+    client: ManagementClient,
+    identity: dict[str, object],
+) -> None:
+    name = identity["name"]
+    if _inspect_management_object(client, f"tenant/{name}") is not None:
+        raise RuntimeError(f"Tenant remained or was recreated after deletion: {name}")
+    for resource, namespace, object_name, uid in identity["managementResources"]:
+        if _inspect_management_object(
+            client, f"{resource}/{object_name}", namespace,
+        ) is not None:
+            raise RuntimeError(
+                f"Tenant management resource remained after deletion: "
+                f"{resource}/{object_name} (recorded UID {uid})"
+            )
+    for address, allocation in _endpoint_allocations(client).items():
+        if (
+            address == identity["endpointAddress"]
+            or allocation["tenantUID"] == identity["uid"]
+            or allocation["tenantName"] == name
+        ):
+            raise RuntimeError(f"Tenant endpoint allocation remained after deletion: {name}")
+    containers = set(run(
+        ["docker", "ps", "-aq", "--no-trunc"], timeout=30,
+    ).stdout.split())
+    recorded = {
+        worker.split()[1] for worker in identity["workerContainers"]
+    }
+    scoped = run(
+        [
+            "docker", "ps", "-aq",
+            "--filter", f"label=io.x-k8s.kind.cluster={name}",
+        ],
+        timeout=30,
+    ).stdout.split()
+    if containers & recorded or scoped:
+        raise RuntimeError(f"Tenant worker containers remained after deletion: {name}")
+    volumes = run(
+        ["docker", "volume", "ls", "--format", "{{.Name}}"], timeout=30,
+    ).stdout.splitlines()
+    if identity["dockerVolume"]["name"] in volumes:
+        raise RuntimeError(f"Tenant storage volume remained after deletion: {name}")
+
+
 def run_e2e() -> int:
     os.umask(0o077)
     config = load_configuration(ROOT)
@@ -138,15 +287,27 @@ def run_e2e() -> int:
             verify_all_inputs(ROOT, config)
             run_just(ROOT, config, "create-management")
 
-        with timings.phase("tenant_control_plane"):
+        with timings.phase("tenant_convergence"):
             run_just(ROOT, config, "local-tenant-apply", str(manifest))
-            wait_tenant_ready(ROOT, config, tenant_name)
+            document = wait_tenant_ready(ROOT, config, tenant_name)
         run_just(ROOT, config, "local-tenant-status", tenant_name)
-        print("representative tenant PostgreSQL cluster is healthy")
+        with timings.phase("tenant_sql_probe"):
+            tenant = tenant_from_document(ROOT, config, document)
+            export_tenant_kubeconfig(
+                ROOT, config, ManagementClient(ROOT, config), tenant,
+            )
+            if _sql(ROOT, config, tenant, "SELECT 1;") != "1":
+                raise RuntimeError("representative tenant PostgreSQL SELECT 1 failed")
+        print("representative tenant PostgreSQL SELECT 1 succeeded")
+        with timings.phase("tenant_deletion_finalization"):
+            client = ManagementClient(ROOT, config)
+            identity = capture_tenant_deletion_identity(config, client, document)
+            delete_controller_tenant(ROOT, config, identity["name"])
+            verify_tenant_deletion(client, identity)
     except BaseException as exc:
         failure = exc
     try:
-        with timings.phase("teardown"):
+        with timings.phase("management_teardown_host_restoration"):
             run_just(ROOT, config, "destroy")
             verify_no_lab_residue(config, (tenant_name,))
             verify_no_local_runtime_residue(ROOT)

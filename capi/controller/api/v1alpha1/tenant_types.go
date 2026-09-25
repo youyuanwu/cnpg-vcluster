@@ -33,14 +33,12 @@ type TenantSpec struct {
 }
 
 type TenantStatus struct {
-	ObservedGeneration          int64              `json:"observedGeneration,omitempty"`
-	Phase                       TenantPhase        `json:"phase,omitempty"`
-	Conditions                  []metav1.Condition `json:"conditions,omitempty"`
-	Endpoint                    string             `json:"endpoint,omitempty"`
-	FoundationHash              string             `json:"foundationHash,omitempty"`
-	ClusterUID                  string             `json:"clusterUID,omitempty"`
-	TenantAPICreationAuthorized bool               `json:"tenantAPICreationAuthorized,omitempty"`
-	TenantCleanupClusterUID     string             `json:"tenantCleanupClusterUID,omitempty"`
+	ObservedGeneration int64              `json:"observedGeneration,omitempty"`
+	Phase              TenantPhase        `json:"phase,omitempty"`
+	Conditions         []metav1.Condition `json:"conditions,omitempty"`
+	Endpoint           string             `json:"endpoint,omitempty"`
+	FoundationHash     string             `json:"foundationHash,omitempty"`
+	ClusterUID         string             `json:"clusterUID,omitempty"`
 }
 
 // +kubebuilder:object:root=true

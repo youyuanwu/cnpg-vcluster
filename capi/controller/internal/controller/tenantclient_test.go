@@ -41,35 +41,6 @@ func TestBootstrapRBACConvergesPreexistingRoleBinding(t *testing.T) {
 	}
 }
 
-func TestBootstrapRBACDeletionRefusesForeignReplacement(t *testing.T) {
-	scheme := runtime.NewScheme()
-	if err := rbacv1.AddToScheme(scheme); err != nil {
-		t.Fatal(err)
-	}
-
-	foreign := &rbacv1.Role{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:            "kubeadm:nodes-kubeadm-config",
-			Namespace:       "kube-system",
-			UID:             "foreign-uid",
-			ResourceVersion: "7",
-		},
-		Rules: []rbacv1.PolicyRule{{
-			APIGroups: []string{""},
-			Resources: []string{"configmaps"},
-			Verbs:     []string{"get"},
-		}},
-	}
-	tenantClient := fake.NewClientBuilder().WithScheme(scheme).WithObjects(foreign).Build()
-	if _, err := deleteBootstrapRBAC(context.Background(), tenantClient); err == nil {
-		t.Fatal("foreign bootstrap Role was deleted")
-	}
-	var current rbacv1.Role
-	if err := tenantClient.Get(context.Background(), client.ObjectKeyFromObject(foreign), &current); err != nil {
-		t.Fatalf("foreign bootstrap Role was not preserved: %v", err)
-	}
-}
-
 func TestBootstrapSubjectsMatchRegardlessOfOrder(t *testing.T) {
 	left := []rbacv1.Subject{
 		{APIGroup: rbacv1.GroupName, Kind: "Group", Name: "system:nodes"},
