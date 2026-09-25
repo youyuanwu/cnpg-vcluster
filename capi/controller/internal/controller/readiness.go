@@ -34,16 +34,9 @@ func (reconciler *TenantReconciler) reconcileReadiness(
 	canonical validation.CanonicalSpec,
 	specHash string,
 	foundation Foundation,
+	workers postCNIWorkerState,
 ) (ctrl.Result, error) {
 	controlPlaneReady, err := reconciler.managementObjectsCurrent(ctx, tenant, specHash, foundation)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	workers, err := reconciler.observePostCNIWorkerState(ctx, tenantClient, tenant, canonical, specHash, foundation)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	networkReady, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
 	if err != nil {
 		return ctrl.Result{}, err
 	}
@@ -56,6 +49,7 @@ func (reconciler *TenantReconciler) reconcileReadiness(
 		return ctrl.Result{}, err
 	}
 	workersReady := workers.inventoryComplete && workers.allReady
+	networkReady := workers.networkReady
 	ready := controlPlaneReady && workersReady && networkReady && storageReady && databaseReady
 	if !ready {
 		return readinessRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {

@@ -25,9 +25,6 @@ type fakeDockerClient struct {
 	network    DockerNetwork
 	volumes    map[string]DockerVolume
 	workers    []DockerContainer
-	execResult DockerExecResult
-	execFunc   func([]string) (DockerExecResult, error)
-	commands   [][]string
 	removed    []string
 	err        error
 }
@@ -77,14 +74,6 @@ func (fake *fakeDockerClient) RemoveVolume(_ context.Context, name string) error
 
 func (fake *fakeDockerClient) ListWorkerContainers(context.Context, string) ([]DockerContainer, error) {
 	return fake.workers, fake.err
-}
-
-func (fake *fakeDockerClient) Exec(_ context.Context, _ string, command []string) (DockerExecResult, error) {
-	fake.commands = append(fake.commands, append([]string(nil), command...))
-	if fake.execFunc != nil {
-		return fake.execFunc(command)
-	}
-	return fake.execResult, fake.err
 }
 
 func testFoundation() Foundation {

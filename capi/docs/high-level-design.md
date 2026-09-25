@@ -85,11 +85,13 @@ Reconciliation proceeds through these responsibilities:
 7. establish bootstrap RBAC;
 8. create or validate the exact Docker volume and worker templates, whose
    bootstrap prepares the CNPG storage directories;
-9. observe the requested pre-CNI workers;
-10. create missing static networking, storage, CNPG operator, Namespace, and PV
-    resources without rewriting existing owned objects;
-11. reconcile the dynamic CNPG Cluster;
-12. set Ready only after current live observations pass.
+9. create missing static networking resources without rewriting existing owned
+   objects;
+10. require one exact worker, container, Node, and network observation;
+11. create missing storage, CNPG operator, Namespace, and PV resources, then
+    reconcile the dynamic CNPG Cluster;
+12. reuse the worker/network observation and set Ready only after the remaining
+    component observations pass.
 
 Missing objects use create-or-refuse semantics. Existing owned objects use
 different contracts by role:
@@ -122,17 +124,19 @@ Python evaluator. The status command accepts Ready only when:
 
 The controller periodically requires:
 
-- affirmative current readiness on Cluster, DevCluster, and
-  KamajiControlPlane;
-- the exact requested Machine, DevMachine, worker container, and Ready Node
-  topology;
-- available Calico, CoreDNS, and `capi-kube-proxy` workloads;
+- a current affirmative aggregate `Available` condition on the CAPI Cluster;
+  initial tenant access uses its current `ControlPlaneReady` or
+  `ControlPlaneAvailable` condition;
+- one exact requested Machine, DevMachine, worker container, and Ready Node
+  topology observation, with containers running on the foundation network;
+- available Calico, CoreDNS, and `capi-kube-proxy` workloads from that same
+  observation;
 - the expected static StorageClass;
 - a CNPG Cluster in healthy state with the requested ready instance count;
 - current ownership markers for every direct tenant resource and the recorded
   exact UID for the root CAPI Cluster.
 
-False, Unknown, missing, or stale provider conditions are not Ready.
+False, Unknown, missing, or stale aggregate Cluster conditions are not Ready.
 Same-name resources with foreign UIDs or markers produce `OwnershipInvalid`.
 API inspection failures remain errors rather than success-shaped status.
 

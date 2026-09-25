@@ -6,10 +6,6 @@ import (
 	"os"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -53,50 +49,12 @@ func (reconciler *TenantReconciler) reconcileNetwork(
 	if applied.Created || applied.Pending {
 		return progressRequeue(), nil
 	}
-	ready, err := networkStructurallyReady(ctx, tenantClient, int64(canonical.Workers))
+	workers, err := reconciler.observePostCNIWorkerState(ctx, tenantClient, tenant, canonical, specHash, foundation)
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if !ready {
+	if !workers.inventoryComplete || !workers.allReady || !workers.networkReady {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	return reconciler.reconcilePostCNIWorkers(ctx, tenantClient, tenant, canonical, specHash, foundation)
-}
-
-func networkStructurallyReady(ctx context.Context, tenantClient client.Client, workers int64) (bool, error) {
-	nodes := &unstructured.UnstructuredList{}
-	nodes.SetGroupVersionKind(schema.GroupVersionKind{Version: "v1", Kind: "NodeList"})
-	if err := tenantClient.List(ctx, nodes); err != nil {
-		return false, err
-	}
-	if int64(len(nodes.Items)) != workers {
-		return false, nil
-	}
-	for index := range nodes.Items {
-		if !tenantObjectReady(&nodes.Items[index]) {
-			return false, nil
-		}
-	}
-	for _, item := range []struct {
-		gvk             schema.GroupVersionKind
-		namespace, name string
-	}{
-		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "DaemonSet"}, "kube-system", "calico-node"},
-		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, "kube-system", "calico-kube-controllers"},
-		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "DaemonSet"}, "kube-system", "capi-kube-proxy"},
-		{schema.GroupVersionKind{Group: "apps", Version: "v1", Kind: "Deployment"}, "kube-system", "coredns"},
-	} {
-		object := &unstructured.Unstructured{}
-		object.SetGroupVersionKind(item.gvk)
-		if err := tenantClient.Get(ctx, types.NamespacedName{Namespace: item.namespace, Name: item.name}, object); err != nil {
-			if apierrors.IsNotFound(err) {
-				return false, nil
-			}
-			return false, err
-		}
-		if !workloadAvailable(object) {
-			return false, nil
-		}
-	}
-	return true, nil
+	return reconciler.reconcileStorage(ctx, tenantClient, tenant, canonical, specHash, foundation, workers)
 }

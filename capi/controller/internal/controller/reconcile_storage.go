@@ -20,6 +20,7 @@ func (reconciler *TenantReconciler) reconcileStorage(
 	canonical validation.CanonicalSpec,
 	specHash string,
 	foundation Foundation,
+	workers postCNIWorkerState,
 ) (ctrl.Result, error) {
 	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
 	applied, err := ensureTenantObjects(
@@ -36,5 +37,5 @@ func (reconciler *TenantReconciler) reconcileStorage(
 	if applied.Created || applied.Pending {
 		return progressRequeue(), nil
 	}
-	return reconciler.reconcileCNPG(ctx, tenantClient, tenant, canonical, specHash, foundation)
+	return reconciler.reconcileCNPG(ctx, tenantClient, tenant, canonical, specHash, foundation, workers)
 }
