@@ -91,8 +91,8 @@ Reconciliation proceeds through these responsibilities:
     CNPG Cluster resources;
 11. set Ready only after current live observations pass.
 
-Missing objects use create-or-refuse semantics. Existing owned objects use a
-desired-field comparison and UID/resource-version-bound server-side apply.
+Missing objects use create-or-refuse semantics. Existing owned objects use
+unconditional UID/resource-version-bound server-side apply.
 Missing non-root children may be recreated. A missing or different-UID root
 Cluster after `status.clusterUID` is recorded becomes Degraded or
 OwnershipInvalid and is not silently replaced.

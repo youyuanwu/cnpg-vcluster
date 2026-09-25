@@ -11,7 +11,7 @@ from unittest.mock import patch
 
 from scripts.cache import VerifiedCache
 from scripts.controller_tenant import main as controller_tenant_main
-from scripts.test_controller_phase2 import _restore_after_gate
+from scripts.test_controller_convergence import _restore_after_gate
 from scripts.lib.controller import (
     CONTROLLER_LIFECYCLE_EPOCH,
     _foundation_payload,
@@ -634,14 +634,14 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         primary = RuntimeError("primary failure")
         with (
             patch(
-                "scripts.test_controller_phase2._tenant",
+                "scripts.test_controller_convergence._tenant",
                 side_effect=[{"metadata": {"name": "controller-phase2"}}, {"metadata": {"name": "controller-phase2"}}],
             ),
             patch(
-                "scripts.test_controller_phase2.set_controller_mutation"
+                "scripts.test_controller_convergence.set_controller_mutation"
             ) as mutation,
             patch(
-                "scripts.test_controller_phase2.delete_tenant_resource",
+                "scripts.test_controller_convergence.delete_tenant_resource",
                 return_value=CompletedProcess([], 1, stdout="", stderr="cleanup blocked"),
             ),
         ):
@@ -664,11 +664,11 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         primary = RuntimeError("primary failure")
         with (
             patch(
-                "scripts.test_controller_phase2._tenant",
+                "scripts.test_controller_convergence._tenant",
                 side_effect=RuntimeError("inspection failed"),
             ),
             patch(
-                "scripts.test_controller_phase2.set_controller_mutation"
+                "scripts.test_controller_convergence.set_controller_mutation"
             ) as mutation,
         ):
             _restore_after_gate(

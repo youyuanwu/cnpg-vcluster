@@ -180,7 +180,7 @@ func TestEnsureTenantObjectBindsDriftRepairToLiveIdentity(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !changed || !tenantClient.patched {
+	if changed || !tenantClient.patched {
 		t.Fatal("owned drift was not repaired")
 	}
 	if tenantClient.patchUID != "live-uid" || tenantClient.patchResourceRV != "7" {
@@ -265,37 +265,6 @@ func TestReadinessRejectsStaleObservedGenerations(t *testing.T) {
 	}}
 	if tenantObjectReady(machine) {
 		t.Fatal("stale Ready condition generation was accepted")
-	}
-}
-
-func TestDesiredMatchIgnoresServerDefaultsButDetectsDrift(t *testing.T) {
-	desired := &unstructured.Unstructured{Object: map[string]any{
-		"apiVersion": "apps/v1",
-		"kind":       "Deployment",
-		"metadata":   map[string]any{"name": "example"},
-		"spec": map[string]any{"template": map[string]any{"spec": map[string]any{
-			"containers": []any{map[string]any{"name": "main", "image": "example@sha256:exact"}},
-		}}},
-	}}
-	current := desired.DeepCopy()
-	desired.Object["preserveUnknownFields"] = false
-	desired.Object["maximum"] = int64(4294967295)
-	desired.Object["status"] = map[string]any{"acceptedNames": "source-only"}
-	current.Object["maximum"] = float64(4294967295)
-	containers, _, _ := unstructured.NestedSlice(current.Object, "spec", "template", "spec", "containers")
-	containers[0].(map[string]any)["imagePullPolicy"] = "IfNotPresent"
-	if err := unstructured.SetNestedSlice(current.Object, containers, "spec", "template", "spec", "containers"); err != nil {
-		t.Fatal(err)
-	}
-	if !desiredMatchesCurrent(desired, current) {
-		t.Fatal("server-added default was treated as drift")
-	}
-	containers[0].(map[string]any)["image"] = "example:drifted"
-	if err := unstructured.SetNestedSlice(current.Object, containers, "spec", "template", "spec", "containers"); err != nil {
-		t.Fatal(err)
-	}
-	if desiredMatchesCurrent(desired, current) {
-		t.Fatal("desired image drift was ignored")
 	}
 }
 

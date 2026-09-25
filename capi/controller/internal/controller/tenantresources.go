@@ -5,10 +5,8 @@ import (
 	"errors"
 	"fmt"
 
-	apiequality "k8s.io/apimachinery/pkg/api/equality"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
-	"k8s.io/apimachinery/pkg/runtime"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 
@@ -51,22 +49,17 @@ func ensureTenantObject(
 	if err := validateTenantObjectOwnership(current, desired, tenant, specHash, foundationHash); err != nil {
 		return false, err
 	}
-	if desiredMatchesCurrent(desired, current) {
-		return false, nil
-	}
 	applied := desired.DeepCopy()
 	applied.SetUID(current.GetUID())
 	applied.SetResourceVersion(current.GetResourceVersion())
-	ctrl.LoggerFrom(ctx).Info(
-		"repairing tenant resource drift",
+	ctrl.LoggerFrom(ctx).V(1).Info(
+		"applying tenant resource desired state",
 		"kind",
 		desired.GetKind(),
 		"namespace",
 		desired.GetNamespace(),
 		"name",
 		desired.GetName(),
-		"mismatch",
-		desiredMismatchPath(desired, current),
 	)
 	if err := tenantClient.Patch(
 		ctx,
@@ -95,7 +88,7 @@ func ensureTenantObject(
 			refreshed.GetName(),
 		)
 	}
-	return true, nil
+	return false, nil
 }
 
 func validateTenantObjectOwnership(
@@ -118,133 +111,6 @@ func validateTenantObjectOwnership(
 		)
 	}
 	return nil
-}
-
-func desiredMatchesCurrent(desired, current *unstructured.Unstructured) bool {
-	return desiredMismatchPath(desired, current) == ""
-}
-
-func desiredMismatchPath(desired, current *unstructured.Unstructured) string {
-	subset := runtime.DeepCopyJSON(desired.Object)
-	delete(subset, "status")
-	pruneNilValues(subset)
-	return firstDesiredMismatch(subset, current.Object, "")
-}
-
-func pruneNilValues(value any) {
-	switch typed := value.(type) {
-	case map[string]any:
-		for key, item := range typed {
-			if item == nil {
-				delete(typed, key)
-				continue
-			}
-			pruneNilValues(item)
-		}
-	case []any:
-		for _, item := range typed {
-			if item != nil {
-				pruneNilValues(item)
-			}
-		}
-	}
-}
-
-func firstDesiredMismatch(desired, current any, path string) string {
-	switch expected := desired.(type) {
-	case map[string]any:
-		actual, ok := current.(map[string]any)
-		if !ok {
-			return path + ":type"
-		}
-		for key, value := range expected {
-			currentValue, found := actual[key]
-			if !found {
-				if isZeroJSONValue(value) {
-					continue
-				}
-				return path + "/" + key + ":missing"
-			}
-			if mismatch := firstDesiredMismatch(value, currentValue, path+"/"+key); mismatch != "" {
-				return mismatch
-			}
-		}
-		return ""
-	case []any:
-		actual, ok := current.([]any)
-		if !ok || len(expected) != len(actual) {
-			return path + ":list"
-		}
-		for index := range expected {
-			if mismatch := firstDesiredMismatch(
-				expected[index],
-				actual[index],
-				fmt.Sprintf("%s/%d", path, index),
-			); mismatch != "" {
-				return mismatch
-			}
-		}
-		return ""
-	default:
-		if expectedNumber, expectedOK := numericJSONValue(desired); expectedOK {
-			if currentNumber, currentOK := numericJSONValue(current); currentOK &&
-				expectedNumber == currentNumber {
-				return ""
-			}
-		}
-		if !apiequality.Semantic.DeepEqual(desired, current) {
-			return path + ":value"
-		}
-		return ""
-	}
-}
-
-func numericJSONValue(value any) (float64, bool) {
-	switch typed := value.(type) {
-	case int:
-		return float64(typed), true
-	case int32:
-		return float64(typed), true
-	case int64:
-		return float64(typed), true
-	case uint:
-		return float64(typed), true
-	case uint32:
-		return float64(typed), true
-	case uint64:
-		return float64(typed), true
-	case float32:
-		return float64(typed), true
-	case float64:
-		return typed, true
-	default:
-		return 0, false
-	}
-}
-
-func isZeroJSONValue(value any) bool {
-	switch typed := value.(type) {
-	case nil:
-		return true
-	case bool:
-		return !typed
-	case string:
-		return typed == ""
-	case int64:
-		return typed == 0
-	case int32:
-		return typed == 0
-	case int:
-		return typed == 0
-	case float64:
-		return typed == 0
-	case map[string]any:
-		return len(typed) == 0
-	case []any:
-		return len(typed) == 0
-	default:
-		return false
-	}
 }
 
 func tenantObjectReady(object *unstructured.Unstructured) bool {

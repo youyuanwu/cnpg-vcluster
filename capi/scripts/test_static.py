@@ -37,8 +37,8 @@ EXPECTED_RECIPES = {
     "controller-vet",
     "controller-build",
     "controller-image",
-    "test-controller-phase2",
-    "test-controller-phase3",
+    "test-controller-convergence",
+    "test-controller-readiness",
     "test-controller-deletion",
     "controller-tenant-status",
     "create-management",
@@ -230,6 +230,8 @@ def check_repository_boundaries() -> None:
         "config/tenants/tests/tenant-a.json",
         "config/tenants/tests/tenant-b.json",
         "config/tenants/tests/tenant-c.json",
+        "scripts/test_controller_phase2.py",
+        "scripts/test_controller_phase3.py",
     ):
         check(
             not (ROOT / relative).exists(),
@@ -263,8 +265,8 @@ def check_repository_boundaries() -> None:
         (ROOT / relative).read_text(encoding="utf-8")
         for relative in (
             "scripts/lib/controller_scenarios.py",
-            "scripts/test_controller_phase2.py",
-            "scripts/test_controller_phase3.py",
+            "scripts/test_controller_convergence.py",
+            "scripts/test_controller_readiness.py",
             "scripts/test_controller_deletion.py",
             "scripts/test_tenant_lifecycle.py",
         )

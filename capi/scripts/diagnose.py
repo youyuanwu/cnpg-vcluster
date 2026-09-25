@@ -9,7 +9,7 @@ from scripts.status import collect_status, status_healthy
 
 def diagnose(root: Path, config: dict[str, str], scope: str) -> int:
     if scope not in {"all", "management"}:
-        raise RuntimeError("Phase 2 diagnostics support only all or management")
+        raise RuntimeError("local diagnostics support only all or management")
     result = collect_status(root, config)
     print(json.dumps(result, indent=2, sort_keys=True))
     if not result["management"].get("apiReady"):

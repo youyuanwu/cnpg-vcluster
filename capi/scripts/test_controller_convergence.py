@@ -56,7 +56,7 @@ def _tenant(client: ManagementClient) -> dict[str, object] | None:
         output = f"{response.stdout}{response.stderr}".lower()
         if "not found" in output or "notfound" in output:
             return None
-        raise RuntimeError(f"failed to inspect Phase 2 Tenant: {output}")
+        raise RuntimeError(        f"failed to inspect convergence Tenant: {output}")
     return json.loads(response.stdout)
 
 
@@ -70,7 +70,7 @@ def _converging(
     status = tenant.get("status") or {}
     if status.get("phase") in {"Failed", "OwnershipInvalid"}:
         raise RuntimeError(
-            f"Phase 2 Tenant failed: {json.dumps(status, sort_keys=True)}"
+            f"convergence Tenant failed: {json.dumps(status, sort_keys=True)}"
         )
     if not all(
         (
@@ -145,11 +145,11 @@ def _restore_after_gate(
             )
             if cleanup.returncode != 0 or _tenant(client) is not None:
                 cleanup_error = (
-                    "Phase 2 cleanup is incomplete; "
+                    "convergence cleanup is incomplete; "
                     "Tenant state remains for the next locked recovery"
                 )
     except RuntimeError as exc:
-        cleanup_error = f"Phase 2 cleanup inspection failed: {exc}"
+        cleanup_error = f"convergence cleanup inspection failed: {exc}"
     try:
         set_controller_mutation(config, client, enabled=False)
     except RuntimeError as disable_error:
@@ -188,7 +188,7 @@ def main() -> None:
             )
             try:
                 first = wait_for(
-                    "Tenant Phase 2 WorkersApplied",
+                    "Tenant worker convergence",
                     parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"])
                     + parse_duration(config["WORKER_REGISTRATION_TIMEOUT"]),
                     parse_duration(config["WAIT_POLL_INTERVAL"]),
@@ -214,7 +214,7 @@ def main() -> None:
                 input_text=json.dumps(manifest),
             )
             second = wait_for(
-                "idempotent Tenant Phase 2 status",
+                "idempotent Tenant convergence status",
                 parse_duration(config["CONDITION_TIMEOUT"]),
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: _converging(client, config),
@@ -223,10 +223,10 @@ def main() -> None:
                 second["status"]["endpoint"] != endpoint
                 or second["status"]["clusterUID"] != cluster_uid
             ):
-                raise RuntimeError("Phase 2 idempotent reconcile changed stable identity")
+                raise RuntimeError("idempotent convergence changed stable identity")
             delete_tenant_resource(client, TENANT_NAME, wait=False)
             wait_for(
-                "Tenant Phase 2 finalization",
+                "Tenant convergence finalization",
                 parse_duration(config["DELETE_TIMEOUT"]),
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: _absent(client),
@@ -237,14 +237,14 @@ def main() -> None:
                 check=False,
             )
             if namespace.returncode == 0:
-                raise RuntimeError("Phase 2 Namespace remained after finalization")
+                raise RuntimeError("convergence Namespace remained after finalization")
             volume_check = run(
                 ["docker", "volume", "inspect", volume],
                 timeout=30,
                 check=False,
             )
             if volume_check.returncode == 0:
-                raise RuntimeError("Phase 2 Docker volume remained after finalization")
+                raise RuntimeError("convergence Docker volume remained after finalization")
         finally:
             _restore_after_gate(config, client, sys.exc_info()[1])
             shutil.rmtree(

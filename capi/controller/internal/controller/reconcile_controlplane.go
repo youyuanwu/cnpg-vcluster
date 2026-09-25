@@ -285,17 +285,12 @@ func (reconciler *TenantReconciler) ensureManagementObject(
 	if err := validateProviderOwner(ctx, reconciler.reader(), current, tenant.Name, false); err != nil {
 		return nil, false, err
 	}
-	if desiredMatchesCurrent(desired, current) {
-		return current, false, nil
-	}
-	ctrl.LoggerFrom(ctx).Info(
-		"repairing management resource drift",
+	ctrl.LoggerFrom(ctx).V(1).Info(
+		"applying management resource desired state",
 		"kind",
 		desired.GetKind(),
 		"name",
 		desired.GetName(),
-		"mismatch",
-		desiredMismatchPath(desired, current),
 	)
 	applied := desired.DeepCopy()
 	applied.SetUID(current.GetUID())
@@ -323,7 +318,7 @@ func (reconciler *TenantReconciler) ensureManagementObject(
 	if refreshed.GetUID() != current.GetUID() {
 		return nil, false, fmt.Errorf("%s %s identity changed during apply", refreshed.GetKind(), refreshed.GetName())
 	}
-	return refreshed, true, nil
+	return refreshed, false, nil
 }
 
 func hasOwnerUID(owners []metav1.OwnerReference, uid types.UID) bool {
