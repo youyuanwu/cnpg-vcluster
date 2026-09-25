@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"time"
 
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
@@ -48,5 +49,12 @@ func (reconciler *TenantReconciler) reconcileNetwork(
 	if applied.Created || applied.Pending {
 		return progressRequeue(), nil
 	}
-	return reconciler.reconcileStorage(ctx, tenantClient, tenant, canonical, specHash, foundation)
+	workers, err := reconciler.observePostCNIWorkerState(ctx, tenantClient, tenant, canonical, specHash, foundation)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !workers.inventoryComplete || !workers.allReady || !workers.networkReady {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+	}
+	return reconciler.reconcileStorage(ctx, tenantClient, tenant, canonical, specHash, foundation, workers)
 }

@@ -24,6 +24,7 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 	canonical validation.CanonicalSpec,
 	specHash string,
 	foundation Foundation,
+	workers postCNIWorkerState,
 ) (ctrl.Result, error) {
 	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
 	controllerImage, ok := archiveByKey(foundation.Cache.ImageArchives, "CNPG_CONTROLLER_IMAGE")
@@ -116,7 +117,7 @@ func (reconciler *TenantReconciler) reconcileCNPG(
 	if !ready {
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
-	return reconciler.reconcileReadiness(ctx, tenantClient, tenant, canonical, specHash, foundation)
+	return reconciler.reconcileReadiness(ctx, tenantClient, tenant, canonical, specHash, foundation, workers)
 }
 
 func databaseStructurallyReady(ctx context.Context, tenantClient client.Client, count int32) (bool, error) {

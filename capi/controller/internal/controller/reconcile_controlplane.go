@@ -72,9 +72,11 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 	if err != nil {
 		return ctrl.Result{}, err
 	}
-	if _, changed, err := reconciler.ensureManagementObject(ctx, devCluster, tenant, specHash, foundation, "dev-cluster"); err != nil {
+	currentDevCluster, changed, err := reconciler.ensureManagementObject(ctx, devCluster, tenant, specHash, foundation, "dev-cluster")
+	if err != nil {
 		return ctrl.Result{}, err
-	} else if changed {
+	}
+	if changed {
 		return progressRequeue(), nil
 	}
 	controlPlane, err := resources.KamajiControlPlane(resourceContext)
@@ -87,6 +89,14 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 	}
 	if changed {
 		return progressRequeue(), nil
+	}
+	for _, provider := range []*unstructured.Unstructured{currentDevCluster, currentControlPlane} {
+		if err := validateProviderOwner(ctx, reconciler.reader(), provider, tenant.Name, true); err != nil {
+			if errors.Is(err, errProviderOwnerPending) {
+				return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
+			}
+			return ctrl.Result{}, err
+		}
 	}
 	current, err := reconciler.managementControlPlaneCurrent(ctx, tenant, specHash, foundation)
 	if err != nil {

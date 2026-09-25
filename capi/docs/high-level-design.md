@@ -85,11 +85,13 @@ Reconciliation proceeds through these responsibilities:
 7. establish bootstrap RBAC;
 8. create or validate the exact Docker volume and worker templates, whose
    bootstrap prepares the CNPG storage directories;
-9. create missing static networking, storage, CNPG operator, Namespace, and PV
-    resources without rewriting existing owned objects;
-10. reconcile the dynamic CNPG Cluster;
-11. set Ready only after one combined worker, container, Node, and network
-    observation plus the remaining component observations pass.
+9. create missing static networking resources without rewriting existing owned
+   objects;
+10. require one exact worker, container, Node, and network observation;
+11. create missing storage, CNPG operator, Namespace, and PV resources, then
+    reconcile the dynamic CNPG Cluster;
+12. reuse the worker/network observation and set Ready only after the remaining
+    component observations pass.
 
 Missing objects use create-or-refuse semantics. Existing owned objects use
 different contracts by role:

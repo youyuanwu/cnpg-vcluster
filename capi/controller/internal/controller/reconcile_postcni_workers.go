@@ -54,9 +54,6 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	if err := validateRootOwnership(machineDeployment, tenant, specHash, foundation.Hash, "machine-deployment", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 		return state, err
 	}
-	if len(machines.Items) != int(canonical.Workers) {
-		return state, nil
-	}
 	machinesReady := true
 	machineNames := map[string]struct{}{}
 	machineByUID := map[string]*unstructured.Unstructured{}
@@ -79,9 +76,6 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 	if err != nil {
 		return state, fmt.Errorf("list Tenant worker containers: %w", err)
 	}
-	if len(containers) != int(canonical.Workers) {
-		return state, nil
-	}
 	for _, container := range containers {
 		if _, expected := machineNames[container.Name]; !expected {
 			return state, fmt.Errorf("%w: worker container %s has no exact Machine", errWorkerOwnershipInvalid, container.Name)
@@ -97,6 +91,9 @@ func (reconciler *TenantReconciler) observePostCNIWorkerState(
 			return state, nil
 		}
 		state.containers = append(state.containers, container)
+	}
+	if len(machines.Items) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
+		return state, nil
 	}
 	devMachines := &unstructured.UnstructuredList{}
 	devMachines.SetGroupVersionKind(postCNIDevMachineGVK.GroupVersion().WithKind("DevMachineList"))

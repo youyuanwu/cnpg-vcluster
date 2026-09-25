@@ -57,6 +57,54 @@ func TestObservePostCNIWorkerStateValidatesExactTopologyAndReadiness(t *testing.
 	}
 }
 
+func TestObservePostCNIWorkerStateValidatesContainersBeforeCounts(t *testing.T) {
+	defaultContainer := DockerContainer{
+		Name: "worker-a", ID: "container-uid", State: "running",
+		Networks: map[string]string{"kind": "network-id"},
+	}
+	for _, test := range []struct {
+		name       string
+		containers []DockerContainer
+		wantError  bool
+	}{
+		{"pending count", nil, false},
+		{"pending state", []DockerContainer{{
+			Name: "worker-a", ID: "container-uid", State: "created",
+			Networks: map[string]string{"kind": "network-id"},
+		}}, false},
+		{"foreign name", []DockerContainer{{
+			Name: "worker-b", ID: "container-uid", State: "running",
+			Networks: map[string]string{"kind": "network-id"},
+		}}, true},
+		{"foreign network", []DockerContainer{{
+			Name: "worker-a", ID: "container-uid", State: "running",
+			Networks: map[string]string{"kind": "other-network"},
+		}}, true},
+		{"extra foreign container", []DockerContainer{
+			defaultContainer,
+			{Name: "worker-b", ID: "other-container", State: "running", Networks: map[string]string{"kind": "network-id"}},
+		}, true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			state, _, err := observePostCNIFixtureWithContainers(
+				t, "worker-a", "worker-a", true, true, test.containers,
+			)
+			if test.wantError {
+				if !errors.Is(err, errWorkerOwnershipInvalid) || !isOwnershipError(err) {
+					t.Fatalf("foreign container was not OwnershipInvalid: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if state.inventoryComplete || state.allReady {
+				t.Fatalf("pending container inventory was accepted: %#v", state)
+			}
+		})
+	}
+}
+
 type nodeListCountingClient struct {
 	client.Client
 	nodeLists int
@@ -70,6 +118,20 @@ func (value *nodeListCountingClient) List(ctx context.Context, list client.Objec
 }
 
 func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeReady, networkReady bool) (postCNIWorkerState, int, error) {
+	return observePostCNIFixtureWithContainers(t, devMachineName, nodeName, nodeReady, networkReady, []DockerContainer{{
+		Name: "worker-a", ID: "container-uid", State: "running",
+		Networks: map[string]string{"kind": "network-id"},
+	}})
+}
+
+func observePostCNIFixtureWithContainers(
+	t *testing.T,
+	devMachineName,
+	nodeName string,
+	nodeReady,
+	networkReady bool,
+	containers []DockerContainer,
+) (postCNIWorkerState, int, error) {
 	t.Helper()
 	foundation := testFoundation()
 	foundation.Hash = "foundation-hash"
@@ -140,12 +202,7 @@ func observePostCNIFixture(t *testing.T, devMachineName, nodeName string, nodeRe
 	reconciler := &TenantReconciler{
 		Client:    management,
 		APIReader: management,
-		Docker: &fakeDockerClient{
-			workers: []DockerContainer{{
-				Name: "worker-a", ID: "container-uid", State: "running",
-				Networks: map[string]string{"kind": foundation.NetworkID},
-			}},
-		},
+		Docker:    &fakeDockerClient{workers: containers},
 	}
 	state, err := reconciler.observePostCNIWorkerState(
 		context.Background(),

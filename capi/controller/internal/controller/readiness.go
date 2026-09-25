@@ -34,12 +34,9 @@ func (reconciler *TenantReconciler) reconcileReadiness(
 	canonical validation.CanonicalSpec,
 	specHash string,
 	foundation Foundation,
+	workers postCNIWorkerState,
 ) (ctrl.Result, error) {
 	controlPlaneReady, err := reconciler.managementObjectsCurrent(ctx, tenant, specHash, foundation)
-	if err != nil {
-		return ctrl.Result{}, err
-	}
-	workers, err := reconciler.observePostCNIWorkerState(ctx, tenantClient, tenant, canonical, specHash, foundation)
 	if err != nil {
 		return ctrl.Result{}, err
 	}

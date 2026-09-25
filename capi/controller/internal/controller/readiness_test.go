@@ -1,13 +1,16 @@
 package controller
 
 import (
+	"context"
 	"fmt"
 	"testing"
 	"time"
 
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
+	"github.com/youyuanwu/cnpg-vcluster/capi/controller/internal/resources"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
+	"sigs.k8s.io/controller-runtime/pkg/client/fake"
 )
 
 func TestWorkerTopologyOwnershipErrorsAreClassified(t *testing.T) {
@@ -52,6 +55,48 @@ func TestManagementReadinessUsesCurrentAggregateClusterConditions(t *testing.T) 
 	)
 	if _, err := managementConditionsReady(cluster, "Available"); err == nil {
 		t.Fatal("malformed condition generation was accepted")
+	}
+}
+
+func TestManagementClusterReadinessValidatesRootIdentity(t *testing.T) {
+	foundation := testFoundation()
+	foundation.Hash = "foundation-hash"
+	tenant := validTenant("tenant-a")
+	tenant.UID = "tenant-uid"
+	tenant.Status.ClusterUID = "cluster-uid"
+	cluster := managementClusterFixture(1, 1,
+		map[string]any{"type": "Available", "status": "True", "observedGeneration": int64(1)},
+	)
+	cluster.SetUID("cluster-uid")
+	cluster.SetLabels(map[string]string{foundation.Inputs.OwnershipLabel: foundation.Inputs.LabPrefix})
+	cluster.SetAnnotations(map[string]string{
+		resources.TenantAnnotation:     tenant.Name,
+		resources.TenantUIDAnnotation:  string(tenant.UID),
+		resources.SpecHashAnnotation:   "spec-hash",
+		resources.FoundationAnnotation: foundation.Hash,
+		resources.ResourceAnnotation:   "cluster",
+	})
+	scheme := testScheme(t)
+	scheme.AddKnownTypeWithName(clusterGVK, &unstructured.Unstructured{})
+	kubernetes := fake.NewClientBuilder().WithScheme(scheme).WithObjects(cluster).Build()
+	reconciler := &TenantReconciler{Client: kubernetes, APIReader: kubernetes}
+	ready, err := reconciler.managementObjectsCurrent(context.Background(), tenant, "spec-hash", foundation)
+	if err != nil || !ready {
+		t.Fatalf("valid aggregate Cluster was rejected: ready=%t err=%v", ready, err)
+	}
+
+	tenant.Status.ClusterUID = "replacement-uid"
+	if _, err := reconciler.managementObjectsCurrent(context.Background(), tenant, "spec-hash", foundation); err == nil || !isOwnershipError(err) {
+		t.Fatalf("replacement Cluster UID was not rejected: %v", err)
+	}
+
+	tenant.Status.ClusterUID = "cluster-uid"
+	cluster.SetAnnotations(map[string]string{resources.TenantAnnotation: "foreign"})
+	if err := kubernetes.Update(context.Background(), cluster); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := reconciler.managementObjectsCurrent(context.Background(), tenant, "spec-hash", foundation); err == nil || !isOwnershipError(err) {
+		t.Fatalf("foreign Cluster markers were not rejected: %v", err)
 	}
 }
 
