@@ -4,12 +4,14 @@ import hashlib
 import ipaddress
 import json
 import re
+import time
 from pathlib import Path
 
 from .config import parse_duration
 from .controller_client import apply_tenant, delete_tenant
 from .kube import ManagementClient, wait_for
 from .process import run
+from .redaction import redact_value
 from .tenants import Tenant, export_tenant_kubeconfig, tenant_kubeconfig_path
 from scripts.controller_tenant_status import evaluate_tenant
 
@@ -54,16 +56,56 @@ def wait_tenant_ready(
 ) -> dict[str, object]:
     client = ManagementClient(root, config)
     last_result: dict[str, object] = {}
+    last_transition: dict[str, object] | None = None
+    started = time.monotonic()
 
     def ready():
-        nonlocal last_result
+        nonlocal last_result, last_transition
         document = tenant_document(client, name)
         if document is None:
             last_result = {"classification": "absent", "blockers": ["Tenant is absent"]}
-            return None
-        result = evaluate_tenant(document)
-        last_result = result
-        return document if result["classification"] == "ready" else None
+        else:
+            last_result = evaluate_tenant(document)
+        raw_conditions = last_result.get("conditions", [])
+        conditions = sorted(
+            (
+                {
+                    field: condition.get(field)
+                    for field in ("type", "status", "reason", "observedGeneration")
+                }
+                for condition in (
+                    raw_conditions if isinstance(raw_conditions, list) else []
+                )
+                if isinstance(condition, dict)
+            ),
+            key=lambda condition: str(condition["type"]),
+        )
+        metadata = document.get("metadata") if document else None
+        if not isinstance(metadata, dict):
+            metadata = {}
+        transition = {
+            "classification": last_result["classification"],
+            "generation": metadata.get("generation"),
+            "observedGeneration": last_result.get("observedGeneration"),
+            "conditions": redact_value(conditions),
+        }
+        if transition != last_transition:
+            print(
+                "CAPI_TENANT_TRANSITION "
+                + json.dumps(
+                    redact_value({
+                        "schema": 1,
+                        "tenant": name,
+                        "seconds": round(time.monotonic() - started, 3),
+                        **transition,
+                    }),
+                    sort_keys=True,
+                    separators=(",", ":"),
+                ),
+                flush=True,
+            )
+            last_transition = transition
+        return document if last_result["classification"] == "ready" else None
 
     try:
         return wait_for(
@@ -78,7 +120,7 @@ def wait_tenant_ready(
         )
     except RuntimeError as exc:
         raise RuntimeError(
-            f"{exc}: {json.dumps(last_result, sort_keys=True)}"
+            f"{exc}: {json.dumps(redact_value(last_result), sort_keys=True)}"
         ) from exc
 
 
@@ -263,6 +305,7 @@ def tenant_snapshot(
                 "docker",
                 "ps",
                 "-a",
+                "--no-trunc",
                 "--filter",
                 f"label=io.x-k8s.kind.cluster={name}",
                 "--filter",
@@ -278,9 +321,6 @@ def tenant_snapshot(
         "endpoint": status.get("endpoint"),
         "foundationHash": status.get("foundationHash"),
         "clusterUID": status.get("clusterUID"),
-        "tenantAPICreationAuthorized": status.get(
-            "tenantAPICreationAuthorized", False
-        ),
         "managementResources": sorted(management_resources),
         "dockerVolume": {
             "name": volume.get("Name"),

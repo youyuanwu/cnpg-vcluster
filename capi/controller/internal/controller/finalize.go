@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -21,7 +20,12 @@ import (
 	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
 )
 
-var errTenantCleanupBlocked = errors.New("Tenant API cleanup is blocked")
+var deletionDescendantGVKs = []schema.GroupVersionKind{
+	{Group: "cluster.x-k8s.io", Version: "v1beta2", Kind: "MachineSet"},
+	machineGVK,
+	postCNIDevMachineGVK,
+	{Group: "bootstrap.cluster.x-k8s.io", Version: "v1beta2", Kind: "KubeadmConfig"},
+}
 
 func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (ctrl.Result, error) {
 	if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
@@ -60,89 +64,6 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 			return nil
 		})
 	}
-	if tenant.Status.TenantAPICreationAuthorized {
-		if tenant.Status.ClusterUID == "" {
-			return ctrl.Result{}, fmt.Errorf("tenant API creation was authorized but Cluster identity is missing")
-		}
-		if tenant.Status.TenantCleanupClusterUID != tenant.Status.ClusterUID {
-			tenantClient, secret, err := tenantClientFromSecret(
-				ctx,
-				reconciler.reader(),
-				reconciler.tenantFactory(),
-				tenant.Name,
-				tenant.Name,
-				tenant.Status.Endpoint,
-			)
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
-			}
-			controlPlane := &unstructured.Unstructured{}
-			controlPlane.SetGroupVersionKind(controlPlaneGVK)
-			if err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name}, controlPlane); err != nil {
-				return ctrl.Result{}, fmt.Errorf("%w: read KamajiControlPlane: %v", errTenantCleanupBlocked, err)
-			}
-			if err := validateRootOwnership(controlPlane, tenant, specHash, foundation.Hash, "kamaji-control-plane", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
-				return ctrl.Result{}, err
-			}
-			if err := validateKubeconfigSecret(secret, controlPlane); err != nil {
-				if isOwnershipError(err) {
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
-			}
-			calico, err := os.ReadFile("/assets/calico.yaml")
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("read Calico cleanup catalog: %w", err)
-			}
-			cnpg, err := os.ReadFile("/assets/cnpg.yaml")
-			if err != nil {
-				return ctrl.Result{}, fmt.Errorf("read CNPG cleanup catalog: %w", err)
-			}
-			catalog, err := tenantCleanupCatalog(calico, cnpg, tenant.Spec.DatabaseCount)
-			if err != nil {
-				if isOwnershipError(err) {
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
-			}
-			absent, err := deleteTenantResources(
-				ctx,
-				tenantClient,
-				tenant,
-				specHash,
-				foundation.Hash,
-				catalog,
-			)
-			if err != nil {
-				if isOwnershipError(err) {
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
-			}
-			if !absent {
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-			}
-			complete, err := deleteBootstrapRBAC(ctx, tenantClient)
-			if err != nil {
-				if isOwnershipError(err) {
-					return ctrl.Result{}, err
-				}
-				return ctrl.Result{}, fmt.Errorf("%w: %v", errTenantCleanupBlocked, err)
-			}
-			if !complete {
-				return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
-			}
-			return progressRequeue(), reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-				status.TenantCleanupClusterUID = status.ClusterUID
-				return nil
-			})
-		}
-	} else {
-		if err := reconciler.validateTenantAPINotCreated(ctx, tenant); err != nil {
-			return ctrl.Result{}, err
-		}
-	}
-
 	clusterAbsent, err := reconciler.deleteExactUnstructured(ctx, tenant, specHash, foundation, clusterGVK, tenant.Name, tenant.Name, "cluster")
 	if err != nil {
 		return ctrl.Result{}, err
@@ -168,6 +89,13 @@ func (reconciler *TenantReconciler) finalizeTenant(ctx context.Context, tenant *
 		if !absent {
 			return ctrl.Result{RequeueAfter: 2 * time.Second}, nil
 		}
+	}
+	descendantsAbsent, err := reconciler.deletionDescendantsAbsent(ctx, tenant)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if !descendantsAbsent {
+		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	hostAbsent, err := reconciler.deleteTenantHostState(ctx, tenant, specHash, foundation)
 	if err != nil {
@@ -214,32 +142,28 @@ func (reconciler *TenantReconciler) observeDeletionCluster(ctx context.Context, 
 	if err := validateClusterUID(tenant, cluster); err != nil {
 		return nil, err
 	}
+	if err := validateProviderOwner(ctx, reconciler.reader(), cluster, tenant.Name, false); err != nil {
+		return nil, err
+	}
 	return cluster, nil
 }
 
-func (reconciler *TenantReconciler) validateTenantAPINotCreated(ctx context.Context, tenant *tenancyv1alpha1.Tenant) error {
-	for _, item := range []client.Object{
-		&unstructured.Unstructured{},
-		&corev1.Secret{},
-	} {
-		switch value := item.(type) {
-		case *unstructured.Unstructured:
-			value.SetGroupVersionKind(controlPlaneGVK)
+func (reconciler *TenantReconciler) deletionDescendantsAbsent(ctx context.Context, tenant *tenancyv1alpha1.Tenant) (bool, error) {
+	for _, gvk := range deletionDescendantGVKs {
+		objects := &unstructured.UnstructuredList{}
+		objects.SetGroupVersionKind(gvk.GroupVersion().WithKind(gvk.Kind + "List"))
+		// The Namespace is dedicated to this Tenant. Even unlabelled provider
+		// residue must disappear before host storage or the Namespace is removed.
+		if err := reconciler.reader().List(ctx, objects, client.InNamespace(tenant.Name)); err != nil {
+			// NoMatch/discovery failures also block host and Namespace destruction:
+			// provider residue cannot be authoritatively inspected.
+			return false, fmt.Errorf("inspect %s descendants before cleanup: %w", gvk.Kind, err)
 		}
-		name := tenant.Name
-		if _, ok := item.(*corev1.Secret); ok {
-			name += "-kubeconfig"
+		if len(objects.Items) != 0 {
+			return false, nil
 		}
-		err := reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: name}, item)
-		if apierrors.IsNotFound(err) {
-			continue
-		}
-		if err != nil {
-			return err
-		}
-		return fmt.Errorf("tenant API state exists before creation authorization")
 	}
-	return nil
+	return true, nil
 }
 
 func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Context, tenant *tenancyv1alpha1.Tenant, specHash string, foundation Foundation) (bool, error) {
@@ -263,8 +187,11 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 		if err := validateRootOwnership(&namespace, tenant, specHash, foundation.Hash, "namespace", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 			return false, err
 		}
+		if len(namespace.OwnerReferences) != 0 {
+			return false, fmt.Errorf("Namespace %s has an unexpected provider owner", namespace.Name)
+		}
 	}
-	var controlPlane *unstructured.Unstructured
+	var controlPlane, machineDeployment *unstructured.Unstructured
 	for _, item := range []struct {
 		gvk      schema.GroupVersionKind
 		name     string
@@ -294,6 +221,9 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 			if err := validateClusterUID(tenant, object); err != nil {
 				return false, err
 			}
+			if err := validateProviderOwner(ctx, reconciler.reader(), object, tenant.Name, false); err != nil {
+				return false, err
+			}
 		} else if tenant.Status.ClusterUID == "" {
 			if err := validateProviderOwner(ctx, reconciler.reader(), object, tenant.Name, false); err != nil {
 				return false, err
@@ -303,6 +233,9 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 		}
 		if item.gvk == controlPlaneGVK {
 			controlPlane = object
+		}
+		if item.gvk == machineDeploymentGVK {
+			machineDeployment = object
 		}
 	}
 	machineNames := map[string]types.UID{}
@@ -316,6 +249,12 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 		for index := range machines.Items {
 			machine := &machines.Items[index]
 			if err := validateRootOwnership(machine, tenant, specHash, foundation.Hash, "machine", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
+				return false, err
+			}
+			if machineDeployment == nil {
+				return false, fmt.Errorf("Machine %s ownership cannot be proven before deletion", machine.GetName())
+			}
+			if err := validateOwnerChain(ctx, reconciler.reader(), machine, machineDeployment.GetUID()); err != nil {
 				return false, err
 			}
 			present = true
@@ -335,7 +274,10 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 				return false, err
 			}
 			owners := devMachine.GetOwnerReferences()
-			if len(owners) != 1 || machineNames[owners[0].Name] != owners[0].UID {
+			if len(owners) != 1 || owners[0].UID == "" ||
+				owners[0].APIVersion != machineGVK.GroupVersion().String() ||
+				owners[0].Kind != machineGVK.Kind ||
+				machineNames[owners[0].Name] != owners[0].UID {
 				return false, fmt.Errorf("DevMachine %s ownership cannot be proven before deletion", devMachine.GetName())
 			}
 			present = true
@@ -351,6 +293,11 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 		}
 		present = true
 	}
+	descendantsAbsent, err := reconciler.deletionDescendantsAbsent(ctx, tenant)
+	if err != nil {
+		return false, err
+	}
+	present = present || !descendantsAbsent
 	var secret corev1.Secret
 	err = reconciler.reader().Get(ctx, types.NamespacedName{Namespace: tenant.Name, Name: tenant.Name + "-kubeconfig"}, &secret)
 	if apierrors.IsNotFound(err) {
@@ -358,8 +305,13 @@ func (reconciler *TenantReconciler) validatePartialDeletionState(ctx context.Con
 		return false, err
 	} else {
 		present = true
-		if err := validateKubeconfigSecret(&secret, controlPlane); err != nil {
-			return false, err
+		owners := secret.OwnerReferences
+		if controlPlane == nil || len(owners) != 1 ||
+			owners[0].APIVersion != controlPlaneGVK.GroupVersion().String() ||
+			owners[0].Kind != controlPlaneGVK.Kind ||
+			owners[0].Name != controlPlane.GetName() ||
+			owners[0].UID != controlPlane.GetUID() {
+			return false, fmt.Errorf("Tenant kubeconfig Secret ownership cannot be proven before deletion")
 		}
 	}
 	volumeName := foundation.Inputs.LabPrefix + "-" + tenant.Name + "-storage"

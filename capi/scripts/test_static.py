@@ -32,6 +32,7 @@ EXPECTED_RECIPES = {
     "local-tenant-status",
     "local-tenant-delete",
     "controller-generate",
+    "controller-tools",
     "controller-verify",
     "controller-test",
     "controller-vet",
@@ -190,7 +191,7 @@ def check_repository_boundaries() -> None:
         "--mutation-enabled=${CONTROLLER_MUTATION_ENABLED}" in manager,
         "Tenant controller mutation template placeholder is missing",
     )
-    lifecycle_epoch = "desired-state-v2"
+    lifecycle_epoch = "disposable-cluster-v3"
     check(
         f'CONTROLLER_LIFECYCLE_EPOCH = "{lifecycle_epoch}"'
         in (ROOT / "scripts" / "lib" / "controller.py").read_text(
@@ -204,17 +205,6 @@ def check_repository_boundaries() -> None:
             encoding="utf-8"
         ),
         "controller manager lifecycle epoch is inconsistent",
-    )
-    check(
-        f'cleanupCatalogEpoch = "{lifecycle_epoch}"'
-        in (
-            ROOT
-            / "controller"
-            / "internal"
-            / "controller"
-            / "cleanup_catalog.go"
-        ).read_text(encoding="utf-8"),
-        "cleanup catalog lifecycle epoch is inconsistent",
     )
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
     check(
@@ -396,7 +386,7 @@ def check_documentation() -> None:
         "This is a local persistence proof only.",
         "The Tenant controller is the single networking writer.",
         "Worker image delivery is bootstrap-owned",
-        "one finalizer removes tenant-API resources, deletes the CAPI Cluster",
+        "one finalizer deletes the exact recorded CAPI Cluster",
         "while retaining its PVC, PV, and bytes.",
         "`just cache` is the explicit online acquisition",
         "The retained workflow is a development optimization, not a final gate",

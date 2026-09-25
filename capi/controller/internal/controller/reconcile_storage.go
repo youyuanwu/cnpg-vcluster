@@ -22,14 +22,12 @@ func (reconciler *TenantReconciler) reconcileStorage(
 	foundation Foundation,
 ) (ctrl.Result, error) {
 	resourceContext := serviceResourceContext(tenant, canonical, specHash, foundation)
-	for _, desired := range resources.StorageObjects(resourceContext, tenantStorageClass) {
-		changed, err := ensureTenantObject(ctx, tenantClient, desired, tenant, specHash, foundation.Hash)
-		if err != nil {
-			return ctrl.Result{}, err
-		}
-		if changed {
-			return progressRequeue(), nil
-		}
+	applied, err := ensureTenantObjects(ctx, tenantClient, resources.StorageObjects(resourceContext, tenantStorageClass), tenant, specHash, foundation.Hash)
+	if err != nil {
+		return ctrl.Result{}, err
+	}
+	if applied.Created || applied.Pending {
+		return progressRequeue(), nil
 	}
 	return reconciler.reconcileCNPG(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }

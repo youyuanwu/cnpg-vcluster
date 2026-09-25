@@ -28,7 +28,7 @@ if TYPE_CHECKING:
 CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
-CONTROLLER_LIFECYCLE_EPOCH = "desired-state-v2"
+CONTROLLER_LIFECYCLE_EPOCH = "disposable-cluster-v3"
 
 
 def controller_requires_cutover(installed_epoch: str | None) -> bool:

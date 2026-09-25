@@ -41,19 +41,21 @@ func progressRequeue() ctrl.Result {
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=devclusters;devmachinetemplates,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups=infrastructure.cluster.x-k8s.io,resources=devmachines,verbs=get;list;watch;create;delete
 // +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kubeadmconfigtemplates,verbs=get;list;watch;create;patch;delete
+// +kubebuilder:rbac:groups=bootstrap.cluster.x-k8s.io,resources=kubeadmconfigs,verbs=get;list
 // +kubebuilder:rbac:groups=controlplane.cluster.x-k8s.io,resources=kamajicontrolplanes,verbs=get;list;watch;create;patch;delete
 // +kubebuilder:rbac:groups=coordination.k8s.io,resources=leases,verbs=get;list;watch;create;update;patch;delete
 
 type TenantReconciler struct {
 	client.Client
-	APIReader               client.Reader
-	Docker                  DockerClient
-	TenantClients           TenantClientFactory
-	SupportedVersion        string
-	MutationEnabled         bool
-	FoundationNamespace     string
-	FoundationName          string
-	ExpectedControllerImage string
+	APIReader                client.Reader
+	Docker                   DockerClient
+	TenantClients            TenantClientFactory
+	SupportedVersion         string
+	MutationEnabled          bool
+	FoundationNamespace      string
+	FoundationName           string
+	ExpectedControllerImage  string
+	foundationHostValidation foundationHostValidation
 }
 
 func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -84,7 +86,7 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 			tenant.Status.FoundationHash,
 		)
 	} else {
-		foundation, err = loadFoundation(ctx, reconciler.reader(), reconciler.docker(), reconciler.foundationNamespace(), reconciler.foundationName(), reconciler.SupportedVersion, reconciler.ExpectedControllerImage)
+		foundation, err = reconciler.loadFoundation(ctx, tenant.Status.FoundationHash)
 	}
 	if err != nil {
 		phase, reason := classifyFoundationFailure(managedDeletion, err)
@@ -336,9 +338,6 @@ func classifyFoundationFailure(managedDeletion bool, err error) (tenancyv1alpha1
 }
 
 func classifyDeletionFailure(err error) (tenancyv1alpha1.TenantPhase, string) {
-	if errors.Is(err, errTenantCleanupBlocked) {
-		return tenancyv1alpha1.PhaseDeleting, "TenantCleanupBlocked"
-	}
 	if isOwnershipError(err) {
 		return tenancyv1alpha1.PhaseOwnershipInvalid, "OwnershipInvalid"
 	}

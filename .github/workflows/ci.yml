@@ -6,23 +6,81 @@ on:
     branches:
       - main
   workflow_dispatch:
+  schedule:
+    - cron: "23 4 * * 1"
 
 permissions:
   contents: read
 
 concurrency:
-  group: capi-tests-${{ github.workflow }}-${{ github.ref }}
+  group: capi-tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 jobs:
-  capi-tests:
-    name: CAPI tests
+  fast-checks:
+    name: CAPI fast checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: capi
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+
+      - name: Set up just
+        uses: extractions/setup-just@v4
+        with:
+          just-version: "1.58.0"
+
+      - name: Run unit and static tests
+        run: |
+          just test-unit
+          just test-static
+
+      - name: Prepare owner-only cache directories
+        run: |
+          umask 077
+          mkdir -p .tools/controller-inputs .tools/go-mod-cache
+
+      - name: Cache pinned Go and envtest archives
+        uses: actions/cache@v4
+        with:
+          path: |
+            capi/.tools/controller-inputs/go-linux-amd64.tar.gz
+            capi/.tools/controller-inputs/envtest-linux-amd64.tar.gz
+          key: controller-inputs-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('capi/config/versions.env') }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: capi/.tools/go-mod-cache
+          key: controller-modules-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('capi/config/versions.env', 'capi/controller/go.mod', 'capi/controller/go.sum') }}
+
+      - name: Install pinned controller test tools
+        run: just controller-tools
+
+      - name: Verify and test Tenant controller
+        run: |
+          just controller-verify
+          just controller-vet
+          just controller-test
+
+  e2e:
+    name: CAPI end-to-end
+    if: github.event_name != 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 90
     env:
       MIN_DOCKER_CPUS: "2"
       MIN_DOCKER_MEMORY_GIB: "6"
       MIN_DOCKER_STORAGE_GIB: "10"
+      PYTHONUNBUFFERED: "1"
     defaults:
       run:
         working-directory: capi
@@ -41,11 +99,16 @@ jobs:
         with:
           just-version: "1.58.0"
 
-      - name: Run unit tests
-        run: just test-unit
+      - name: Prepare owner-only cache directories
+        run: |
+          umask 077
+          mkdir -p .tools/go-mod-cache
 
-      - name: Run static tests
-        run: just test-static
+      - name: Restore Go modules
+        uses: actions/cache/restore@v4
+        with:
+          path: capi/.tools/go-mod-cache
+          key: controller-modules-v1-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('capi/config/versions.env', 'capi/controller/go.mod', 'capi/controller/go.sum') }}
 
       - name: Show Docker capacity
         run: docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}} DockerRoot={{.DockerRootDir}}'
@@ -53,14 +116,25 @@ jobs:
       - name: Acquire pinned tools and images
         run: just cache
 
-      - name: Install pinned local tools
-        run: just tools
-
-      - name: Verify and test Tenant controller
-        run: |
-          just controller-verify
-          just controller-test
-          just controller-image
-
       - name: Run end-to-end test
         run: just test-e2e
+
+  capi-tests:
+    name: CAPI tests
+    if: always()
+    needs: [fast-checks, e2e]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Require all applicable checks
+        env:
+          FAST_RESULT: ${{ needs.fast-checks.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          test "$FAST_RESULT" = success
+          if [ "$EVENT_NAME" = push ]; then
+            test "$E2E_RESULT" = skipped
+          else
+            test "$E2E_RESULT" = success
+          fi

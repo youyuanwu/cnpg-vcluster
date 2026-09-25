@@ -186,24 +186,28 @@ Finalization is ordered:
 
 1. revalidate the target Tenant, foundation binding, endpoint allocation, and
    live ownership;
-2. use the tenant API creation barrier to distinguish safe partial creation
-   from a Tenant that may have hosted workloads;
-3. validate the kubeconfig against the live KamajiControlPlane, delete the
-   lifecycle-versioned CNPG, storage, and networking catalog plus bootstrap
-   RBAC through the live tenant API, and wait for authoritative absence;
-4. persist `tenantCleanupClusterUID` for the exact root Cluster UID;
-5. delete the CAPI Cluster with UID/resourceVersion preconditions and
+2. delete the exact recorded CAPI Cluster with UID/resourceVersion preconditions and
    Background propagation;
-6. wait for authoritative Cluster/provider absence and CAPD container absence;
-7. delete only the exact owned Docker volume;
-8. delete the Namespace and its kubeconfig credential;
-9. release only the target endpoint;
-10. remove the finalizer last.
+3. wait for authoritative Cluster/provider descendant absence and CAPD
+   container absence, deleting only exactly owned residual management roots
+   with ordinary Kubernetes deletion;
+4. delete only the exact owned Docker volume;
+5. delete the Namespace and its credentials;
+6. release only the target endpoint;
+7. remove the finalizer last.
 
-If the tenant API is unavailable before the successful-cleanup checkpoint,
-deletion blocks and provider/host state is preserved. After the checkpoint,
-tenant API loss is expected because Cluster deletion destroys the hosted
-control plane. Ownership conflicts and foundation hash changes still block.
+Each local Tenant has dedicated worker containers and an exactly labelled
+storage volume. Tenant-internal CNPG, storage, networking, and bootstrap RBAC
+resources are disposable with that cluster: finalization neither contacts the
+tenant API nor persists a tenant-cleanup checkpoint. Tenant API unavailability
+does not block the Tenant finalizer from requesting Cluster deletion; provider
+controllers still complete their own ordinary finalizers.
+Partial creation is handled from live management and host state, even when a
+Cluster, control plane, or workers were never created. An observed root Cluster
+UID is recorded before deletion. Ownership conflicts, failed management/host
+inspection, and foundation hash changes still block destructive progress.
+The `disposable-cluster-v3` lifecycle epoch requires a clean cutover from the
+old tenant-cleanup status contract, not migration of existing Tenants.
 The foundation lifecycle hash excludes mutation mode and controller image
 identity, allowing same-epoch controller rebuilds while resource-affecting
 foundation inputs remain immutable.

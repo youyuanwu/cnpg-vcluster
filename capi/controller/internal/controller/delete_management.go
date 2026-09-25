@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -29,6 +30,9 @@ func (reconciler *TenantReconciler) deleteExactUnstructured(ctx context.Context,
 	}
 	if gvk == clusterGVK {
 		if err := validateClusterUID(tenant, object); err != nil {
+			return false, err
+		}
+		if err := validateProviderOwner(ctx, reconciler.reader(), object, tenant.Name, false); err != nil {
 			return false, err
 		}
 	} else if err := validateProviderOwnerForDeletion(ctx, reconciler.reader(), object, tenant); err != nil {
@@ -61,6 +65,9 @@ func (reconciler *TenantReconciler) deleteExactNamespace(ctx context.Context, te
 	}
 	if err := validateRootOwnership(&namespace, tenant, specHash, foundation.Hash, "namespace", foundation.Inputs.OwnershipLabel, foundation.Inputs.LabPrefix); err != nil {
 		return false, err
+	}
+	if len(namespace.OwnerReferences) != 0 {
+		return false, fmt.Errorf("Namespace %s has an unexpected provider owner", namespace.Name)
 	}
 	namespace.GetObjectKind().SetGroupVersionKind(corev1.SchemeGroupVersion.WithKind("Namespace"))
 	if namespace.DeletionTimestamp != nil {

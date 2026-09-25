@@ -101,9 +101,9 @@ func TestInvalidTenantFailsWithoutFinalizer(t *testing.T) {
 }
 
 func TestDeletionFailureReasonsExposeRecoveryClass(t *testing.T) {
-	phase, reason := classifyDeletionFailure(fmt.Errorf("%w: unavailable", errTenantCleanupBlocked))
-	if phase != tenancyv1alpha1.PhaseDeleting || reason != "TenantCleanupBlocked" {
-		t.Fatalf("unexpected tenant cleanup classification: %s %s", phase, reason)
+	phase, reason := classifyDeletionFailure(fmt.Errorf("Docker inspection unavailable"))
+	if phase != tenancyv1alpha1.PhaseDeleting || reason != "DeletionBlocked" {
+		t.Fatalf("unexpected deletion classification: %s %s", phase, reason)
 	}
 
 	phase, reason = classifyDeletionFailure(fmt.Errorf("ownership mismatch"))
@@ -142,7 +142,7 @@ func TestImmutableDriftPublishesBoundedDegradedCondition(t *testing.T) {
 	}
 }
 
-func TestTenantCleanupFailurePublishesRecoveryCondition(t *testing.T) {
+func TestDeletionFailurePublishesRecoveryCondition(t *testing.T) {
 	tenant := validTenant("tenant-a")
 	tenant.Generation = 2
 	client := fake.NewClientBuilder().
@@ -156,8 +156,8 @@ func TestTenantCleanupFailurePublishesRecoveryCondition(t *testing.T) {
 		tenant,
 		"spec-hash",
 		tenancyv1alpha1.PhaseDeleting,
-		"TenantCleanupBlocked",
-		errTenantCleanupBlocked,
+		"DeletionBlocked",
+		fmt.Errorf("Docker inspection unavailable"),
 	); err == nil {
 		t.Fatal("failure helper unexpectedly returned nil")
 	}
@@ -166,8 +166,8 @@ func TestTenantCleanupFailurePublishesRecoveryCondition(t *testing.T) {
 		t.Fatal(err)
 	}
 	condition := meta.FindStatusCondition(updated.Status.Conditions, "Ready")
-	if condition == nil || condition.Reason != "TenantCleanupBlocked" ||
+	if condition == nil || condition.Reason != "DeletionBlocked" ||
 		condition.ObservedGeneration != tenant.Generation {
-		t.Fatalf("unexpected tenant cleanup condition: %#v", condition)
+		t.Fatalf("unexpected deletion condition: %#v", condition)
 	}
 }
