@@ -56,6 +56,7 @@ type TenantReconciler struct {
 	FoundationName           string
 	ExpectedControllerImage  string
 	foundationHostValidation foundationHostValidation
+	componentTimings         componentTimingTracker
 }
 
 func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.Request) (ctrl.Result, error) {
@@ -64,6 +65,7 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		if ignored := client.IgnoreNotFound(err); ignored != nil {
 			return ctrl.Result{}, fmt.Errorf("%s", sanitize.Text(ignored.Error()))
 		}
+		reconciler.componentTimings.clearName(request.Name)
 		return ctrl.Result{}, nil
 	}
 	canonical, specHash, validationErr := validation.Validate(tenant.Name, tenant.Spec, reconciler.SupportedVersion)
@@ -93,6 +95,7 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		return ctrl.Result{}, reconciler.failure(ctx, &tenant, specHash, phase, reason, err)
 	}
 	if !tenant.DeletionTimestamp.IsZero() {
+		reconciler.componentTimings.clearName(tenant.Name)
 		if !containsString(tenant.Finalizers, tenantFinalizer) {
 			return ctrl.Result{}, nil
 		}
@@ -150,6 +153,9 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 		if errors.Is(err, errImmutableDrift) {
 			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "ImmutableDrift", err)
 		}
+		if errors.Is(err, errStaticResourceDrift) {
+			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "StaticResourceDrift", err)
+		}
 		if errors.Is(err, errRootClusterMissing) {
 			return ctrl.Result{RequeueAfter: readyObservationInterval}, reconciler.degraded(ctx, &tenant, "RootClusterMissing", err)
 		}
@@ -163,15 +169,27 @@ func (reconciler *TenantReconciler) Reconcile(ctx context.Context, request ctrl.
 	}
 	if result.Requeue || (result.RequeueAfter > 0 && result.RequeueAfter < readyObservationInterval) {
 		if err := reconciler.patchStatus(ctx, tenant.Name, func(status *tenancyv1alpha1.TenantStatus) error {
-			status.ObservedGeneration = tenant.Generation
-			status.Phase = tenancyv1alpha1.PhaseProgressing
-			setCondition(status, &tenant, "Ready", metav1.ConditionFalse, "Progressing", "Tenant reconciliation is progressing")
+			setReconcileProgressStatus(status, &tenant)
 			return nil
 		}); err != nil {
 			return ctrl.Result{}, err
 		}
 	}
 	return result, nil
+}
+
+func setReconcileProgressStatus(
+	status *tenancyv1alpha1.TenantStatus,
+	tenant *tenancyv1alpha1.Tenant,
+) {
+	status.ObservedGeneration = tenant.Generation
+	if tenantHasReadinessObservation(tenant) {
+		status.Phase = tenancyv1alpha1.PhaseDegraded
+		setCondition(status, tenant, "Ready", metav1.ConditionFalse, "Recovering", "Established Tenant reconciliation is recovering")
+		return
+	}
+	status.Phase = tenancyv1alpha1.PhaseProgressing
+	setCondition(status, tenant, "Ready", metav1.ConditionFalse, "Progressing", "Tenant reconciliation is progressing")
 }
 
 func initializeReconcileStatus(status *tenancyv1alpha1.TenantStatus, tenant *tenancyv1alpha1.Tenant) {

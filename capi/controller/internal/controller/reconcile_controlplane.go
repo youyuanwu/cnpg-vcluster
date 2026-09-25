@@ -93,12 +93,12 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 		return ctrl.Result{}, err
 	}
 	if !current {
-		ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "management-control-plane")
+		reconciler.componentTimings.transition(ctx, tenant, "control-plane")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	tenantClient, secret, err := tenantClientFromSecret(ctx, reconciler.reader(), reconciler.tenantFactory(), tenant.Name, tenant.Name, tenant.Status.Endpoint)
 	if apierrors.IsNotFound(err) {
-		ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "kubeconfig")
+		reconciler.componentTimings.transition(ctx, tenant, "control-plane")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
 	if err != nil {
@@ -107,13 +107,14 @@ func (reconciler *TenantReconciler) reconcileDesiredState(ctx context.Context, t
 	if err := validateKubeconfigSecret(secret, currentControlPlane); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err := applyBootstrapRBAC(ctx, tenantClient); err != nil {
+	if err := ensureBootstrapRBAC(ctx, tenantClient); err != nil {
 		if errors.Is(err, errTenantAdministrativeAccessPending) {
-			ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "bootstrap-rbac")
+			reconciler.componentTimings.transition(ctx, tenant, "control-plane")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
+	reconciler.componentTimings.transition(ctx, tenant, "worker-image-preparation")
 	return reconciler.reconcileWorkers(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 

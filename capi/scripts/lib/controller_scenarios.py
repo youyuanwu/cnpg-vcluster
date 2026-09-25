@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import math
 import re
 import time
 from pathlib import Path
@@ -11,7 +12,7 @@ from .config import parse_duration
 from .controller_client import apply_tenant, delete_tenant
 from .kube import ManagementClient, wait_for
 from .process import run
-from .redaction import redact_value
+from .redaction import redact, redact_value
 from .tenants import Tenant, export_tenant_kubeconfig, tenant_kubeconfig_path
 from scripts.controller_tenant_status import evaluate_tenant
 
@@ -122,6 +123,97 @@ def wait_tenant_ready(
         raise RuntimeError(
             f"{exc}: {json.dumps(redact_value(last_result), sort_keys=True)}"
         ) from exc
+
+
+def emit_controller_component_timings(
+    client: ManagementClient,
+    document: dict[str, object],
+) -> None:
+    metadata = document.get("metadata")
+    if not isinstance(metadata, dict):
+        raise RuntimeError("Tenant timing identity is incomplete")
+    tenant_name = metadata.get("name")
+    tenant_uid = metadata.get("uid")
+    created = metadata.get("creationTimestamp")
+    if not all(isinstance(value, str) and value for value in (
+        tenant_name, tenant_uid, created,
+    )):
+        raise RuntimeError("Tenant timing identity is incomplete")
+    result = client.kubectl(
+        "-n",
+        "tenant-system",
+        "logs",
+        "deployment/tenant-controller",
+        f"--since-time={created}",
+        check=False,
+    )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Tenant controller timing logs are unavailable: {redact(result.stderr)}"
+        )
+    records = []
+    for line in result.stdout.splitlines():
+        if "Tenant component transition" not in line:
+            continue
+        try:
+            payload = json.loads(line)
+        except ValueError:
+            continue
+        if (
+            payload.get("tenant") != tenant_name
+            or payload.get("tenantUID") != tenant_uid
+        ):
+            continue
+        component = payload.get("component")
+        state = payload.get("state")
+        elapsed = payload.get("elapsedSeconds")
+        if (
+            not isinstance(component, str)
+            or state not in {"waiting", "ready"}
+            or isinstance(elapsed, bool)
+            or not isinstance(elapsed, (int, float))
+            or not math.isfinite(elapsed)
+            or elapsed < 0
+        ):
+            raise RuntimeError("Tenant controller emitted invalid component timing")
+        records.append(redact_value({
+            "schema": 1,
+            "tenant": tenant_name,
+            "tenantUID": tenant_uid,
+            "component": payload.get("component"),
+            "state": payload.get("state"),
+            "elapsedSeconds": payload.get("elapsedSeconds"),
+        }))
+    expected = [
+        {"component": component, "state": state}
+        for component in (
+            "control-plane",
+            "worker-image-preparation",
+            "network",
+            "worker-readiness",
+            "cnpg-operator",
+            "database",
+        )
+        for state in ("waiting", "ready")
+    ]
+    actual = [
+        {"component": record["component"], "state": record["state"]}
+        for record in records
+    ]
+    elapsed = [float(record["elapsedSeconds"]) for record in records]
+    if actual != expected or any(
+        current < previous
+        for previous, current in zip(elapsed, elapsed[1:])
+    ):
+        raise RuntimeError(
+            f"Tenant controller component timing is incomplete for {tenant_name}"
+        )
+    for record in records:
+        print(
+            "CAPI_COMPONENT_TIMING "
+            + json.dumps(record, sort_keys=True, separators=(",", ":")),
+            flush=True,
+        )
 
 
 def wait_tenant_absent(

@@ -63,15 +63,14 @@ Ordinary Kubernetes DELETE is accepted without a reservation or custom client
 protocol.
 
 Status contains the observed generation, phase, standard conditions, endpoint,
-foundation hash, exact root Cluster UID, a one-way tenant API creation
-authorization barrier, and the exact Cluster UID whose tenant cleanup
-completed. There is no persisted creation stage, child-resource UID ledger,
+foundation hash, and exact root Cluster UID. There is no persisted creation
+stage, tenant-API cleanup checkpoint, child-resource UID ledger,
 worker-container evidence, or Docker volume identity.
 
 The manager uses leader election and one bounded reconcile worker. Initial
-creation and steady-state repair use the same grouped desired-state path.
-Expected progress uses a fixed one-second requeue, while Ready and Degraded
-Tenants resynchronize every 30 seconds to observe tenant-cluster drift.
+creation uses a grouped desired-state path. Expected progress uses a fixed
+one-second requeue. Ready and Degraded Tenants resynchronize every five minutes
+to observe readiness and static-resource drift.
 
 ## Reconciliation flow
 
@@ -82,17 +81,26 @@ Reconciliation proceeds through these responsibilities:
 3. persist the foundation hash before external mutation;
 4. allocate one endpoint with ConfigMap resource-version compare-and-swap;
 5. create the Namespace, CAPI Cluster, and CAPD DevCluster;
-6. persist tenant API creation authorization before creating
-   KamajiControlPlane;
-7. validate and use the exact Kamaji kubeconfig Secret and bootstrap RBAC;
+6. create the KamajiControlPlane and validate its exact kubeconfig Secret;
+7. establish bootstrap RBAC;
 8. create or validate the exact Docker volume and worker templates;
 9. observe the requested pre-CNI workers;
-10. directly apply tenant networking, storage, CNPG operator, static PVs, and
-    CNPG Cluster resources;
-11. set Ready only after current live observations pass.
+10. create missing static networking, storage, CNPG operator, Namespace, and PV
+    resources without rewriting existing owned objects;
+11. reconcile the dynamic CNPG Cluster;
+12. set Ready only after current live observations pass.
 
 Missing objects use create-or-refuse semantics. Existing owned objects use
-unconditional UID/resource-version-bound server-side apply.
+different contracts by role:
+
+- static bootstrap objects are ownership-validated during progress and checked
+  with non-persisting server-side dry-run after Ready; changes to fields
+  declared by the controller, or ownership conflicts on those fields, become
+  `StaticResourceDrift` and are not repaired. Additive fields owned by other
+  managers are preserved and are outside the audit contract;
+- dynamic management roots and the CNPG Cluster use
+  UID/resource-version-bound server-side apply.
+
 Missing non-root children may be recreated. A missing or different-UID root
 Cluster after `status.clusterUID` is recorded becomes Degraded or
 OwnershipInvalid and is not silently replaced.
@@ -102,6 +110,11 @@ Tenant UID, specification hash, foundation hash, and resource-role markers.
 Tenant owner references are deliberately not used on lifecycle roots, because
 garbage collection must not bypass ordered finalization. Provider-owned
 descendants retain their normal CAPI, CAPD, Kamaji, and CNPG owner graphs.
+
+The controller keeps only the current component name in memory for diagnostics.
+Transition logs include elapsed time for control plane, worker image
+preparation, network, worker readiness, CNPG operator, and database readiness.
+Restarts reset this diagnostic tracker; no timing or stage state is persisted.
 
 ## Readiness and conditions
 

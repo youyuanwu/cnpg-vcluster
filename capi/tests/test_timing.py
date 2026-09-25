@@ -263,6 +263,7 @@ class TimingTests(unittest.TestCase):
                 patch("scripts.test_e2e.verify_all_inputs"),
                 patch("scripts.test_e2e.verify_no_lab_residue"),
                 patch("scripts.test_e2e.wait_tenant_ready", return_value=document),
+                patch("scripts.test_e2e.emit_controller_component_timings"),
                 patch("scripts.test_e2e.tenant_from_document", return_value=tenant),
                 patch("scripts.test_e2e.ManagementClient", return_value=client),
                 patch("scripts.test_e2e.export_tenant_kubeconfig") as export,

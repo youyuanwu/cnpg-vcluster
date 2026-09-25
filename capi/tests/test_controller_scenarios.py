@@ -7,10 +7,11 @@ import json
 from contextlib import redirect_stdout
 from pathlib import Path
 from subprocess import CompletedProcess
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.endpoint import run_endpoint_gate
 from scripts.lib.controller_scenarios import (
+    emit_controller_component_timings,
     manifest_tenant_name,
     tenant_from_document,
     tenant_snapshot,
@@ -37,6 +38,95 @@ def tenant_document() -> dict[str, object]:
 
 
 class ControllerScenarioTests(unittest.TestCase):
+    def test_component_timing_logs_are_exposed_for_the_requested_tenant(self) -> None:
+        client = Mock()
+        document = {
+            "metadata": {
+                "name": "tenant-a",
+                "uid": "tenant-a-uid",
+                "creationTimestamp": "2026-09-25T04:00:00Z",
+            }
+        }
+        lines = []
+        elapsed = 1.0
+        for component in (
+            "control-plane",
+            "worker-image-preparation",
+            "network",
+            "worker-readiness",
+            "cnpg-operator",
+            "database",
+        ):
+            for state in ("waiting", "ready"):
+                lines.append(json.dumps({
+                    "msg": "Tenant component transition",
+                    "tenant": "tenant-a",
+                    "tenantUID": "tenant-a-uid",
+                    "component": component,
+                    "state": state,
+                    "elapsedSeconds": elapsed,
+                }))
+                elapsed += 1
+        lines.append(json.dumps({
+            "msg": "Tenant component transition",
+            "tenant": "tenant-a",
+            "tenantUID": "stale-uid",
+            "component": "database",
+            "state": "ready",
+            "elapsedSeconds": 99,
+        }))
+        client.kubectl.return_value = CompletedProcess(
+            [],
+            0,
+            stdout="\n".join(lines) + "\n",
+            stderr="",
+        )
+        output = io.StringIO()
+        with redirect_stdout(output):
+            emit_controller_component_timings(client, document)
+        client.kubectl.assert_called_once_with(
+            "-n",
+            "tenant-system",
+            "logs",
+            "deployment/tenant-controller",
+            "--since-time=2026-09-25T04:00:00Z",
+            check=False,
+        )
+        records = [
+            json.loads(line.removeprefix("CAPI_COMPONENT_TIMING "))
+            for line in output.getvalue().splitlines()
+        ]
+        self.assertEqual(12, len(records))
+        self.assertEqual("control-plane", records[0]["component"])
+        self.assertEqual("database", records[-1]["component"])
+        self.assertTrue(all(
+            record["tenantUID"] == "tenant-a-uid" for record in records
+        ))
+
+    def test_missing_component_timing_logs_fail_the_gate(self) -> None:
+        client = Mock()
+        client.kubectl.return_value = CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps({
+                "msg": "Tenant component transition",
+                "tenant": "tenant-a",
+                "tenantUID": "tenant-a-uid",
+                "component": "database",
+                "state": "waiting",
+                "elapsedSeconds": 20,
+            }) + "\n",
+            stderr="",
+        )
+        with self.assertRaisesRegex(RuntimeError, "component timing is incomplete"):
+            emit_controller_component_timings(client, {
+                "metadata": {
+                    "name": "tenant-a",
+                    "uid": "tenant-a-uid",
+                    "creationTimestamp": "2026-09-25T04:00:00Z",
+                }
+            })
+
     def test_wait_logs_condition_and_classification_transitions_without_messages(self) -> None:
         def result(
             classification="progressing", reason="WaitingForWorkers", generation=1,

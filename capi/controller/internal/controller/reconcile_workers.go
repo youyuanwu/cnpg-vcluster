@@ -60,23 +60,16 @@ func (reconciler *TenantReconciler) reconcileWorkers(
 	machines, containers, err := reconciler.observePreCNIWorkers(ctx, tenant, specHash, foundation)
 	if err != nil {
 		if errors.Is(err, errWorkerRuntimePending) {
-			ctrl.LoggerFrom(ctx).V(1).Info("waiting for Tenant component", "component", "worker-runtime")
+			reconciler.componentTimings.transition(ctx, tenant, "worker-image-preparation")
 			return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 		}
 		return ctrl.Result{}, err
 	}
 	if len(machines) != int(canonical.Workers) || len(containers) != int(canonical.Workers) {
-		ctrl.LoggerFrom(ctx).V(1).Info(
-			"waiting for Tenant component",
-			"component",
-			"worker-inventory",
-			"machines",
-			len(machines),
-			"containers",
-			len(containers),
-		)
+		reconciler.componentTimings.transition(ctx, tenant, "worker-image-preparation")
 		return ctrl.Result{RequeueAfter: 5 * time.Second}, nil
 	}
+	reconciler.componentTimings.transition(ctx, tenant, "network")
 	return reconciler.reconcileNetwork(ctx, tenantClient, tenant, canonical, specHash, foundation)
 }
 

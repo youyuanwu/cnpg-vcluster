@@ -4,6 +4,9 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	tenancyv1alpha1 "github.com/youyuanwu/cnpg-vcluster/capi/controller/api/v1alpha1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
 func TestWorkerTopologyOwnershipErrorsAreClassified(t *testing.T) {
@@ -28,7 +31,52 @@ func TestManagementReadinessSeparatesControlPlaneFromWorkers(t *testing.T) {
 
 func TestReadyAndDegradedTenantsUseBoundedResync(t *testing.T) {
 	result := readinessRequeue()
-	if result.RequeueAfter != 30*time.Second || result.Requeue {
+	if result.RequeueAfter != 5*time.Minute || result.Requeue {
 		t.Fatalf("unexpected readiness resync result: %#v", result)
+	}
+}
+
+func TestStaticDriftValidationRemainsEnabledWhileDegraded(t *testing.T) {
+	tenant := testTenant()
+	tenant.Generation = 3
+	tenant.Status.ObservedGeneration = 3
+	tenant.Status.Conditions = []metav1.Condition{{
+		Type:               "DatabaseReady",
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 3,
+	}}
+	for _, phase := range []tenancyv1alpha1.TenantPhase{
+		tenancyv1alpha1.PhaseReady,
+		tenancyv1alpha1.PhaseDegraded,
+	} {
+		tenant.Status.Phase = phase
+		if !staticDriftValidationEnabled(tenant) {
+			t.Fatalf("static drift validation disabled for %s Tenant", phase)
+		}
+	}
+	tenant.Status.ObservedGeneration = 2
+	if staticDriftValidationEnabled(tenant) {
+		t.Fatal("static drift validation accepted a stale observed generation")
+	}
+}
+
+func TestEstablishedTenantRecoveryRemainsDegradedAndAudited(t *testing.T) {
+	tenant := testTenant()
+	tenant.Generation = 2
+	tenant.Status.ObservedGeneration = 2
+	tenant.Status.Phase = tenancyv1alpha1.PhaseReady
+	tenant.Status.Conditions = []metav1.Condition{{
+		Type:               "DatabaseReady",
+		Status:             metav1.ConditionTrue,
+		ObservedGeneration: 2,
+	}}
+	status := tenant.Status
+	setReconcileProgressStatus(&status, tenant)
+	tenant.Status = status
+	if tenant.Status.Phase != tenancyv1alpha1.PhaseDegraded {
+		t.Fatalf("established recovery became %s", tenant.Status.Phase)
+	}
+	if !staticDriftValidationEnabled(tenant) {
+		t.Fatal("established recovery disabled static drift validation")
 	}
 }

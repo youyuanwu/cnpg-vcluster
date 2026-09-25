@@ -268,9 +268,15 @@ Reconciliation and deletion are fail-closed:
   status contracts; existing Tenants are not migrated.
 
 The controller does not persist a creation program counter or child-resource
-UID ledger. Missing children are discovered from live state, and Ready or
-Degraded Tenants are resynchronized every 30 seconds. Expected progress uses a
-fixed poll interval rather than rate-limited requeue backoff.
+UID ledger. Missing children are discovered from live state. Static bootstrap
+objects are created when absent and ownership-validated while creation is
+progressing; existing objects are not continuously rewritten. After Ready, a
+five-minute dry-run audit reports drift in controller-declared static fields as
+Degraded without mutating it. Additive fields owned by other managers are
+preserved and are outside this audit contract. Dynamic CAPI roots and the CNPG
+`Cluster` retain targeted repair.
+Expected progress uses a fixed poll interval rather than rate-limited requeue
+backoff.
 
 Each normal reconciliation reads the foundation ConfigMap directly and checks
 its immutable checksum, lifecycle hash, controller image, and mutation gate.
@@ -400,6 +406,13 @@ Cache parent directories are created owner-only before restoration so the
 lab's private-path checks also work on clean GitHub-hosted runners.
 The 18 GiB `.tools/cache` OCI store, Docker layers, compiled Go cache, and
 runtime/kubeconfig state are **never uploaded to Actions caches**.
+
+Successful E2E output also includes `CAPI_COMPONENT_TIMING` records copied from
+transition-only controller logs. They show elapsed control-plane,
+worker-image-preparation, network, worker-readiness, CNPG-operator, and database
+boundaries without adding stages or timing evidence to Tenant status. The gate
+requires one UID-scoped waiting/ready pair for each component in monotonic
+order, using the Tenant creation timestamp as the log window.
 
 The custom Go wrapper installs to `.tools/bin/go`, with `GOROOT=.tools/go`,
 `GOMODCACHE=.tools/go-mod-cache`, and local `GOCACHE=.tools/go-cache`.

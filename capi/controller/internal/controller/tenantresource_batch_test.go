@@ -61,19 +61,19 @@ func TestEnsureTenantObjectsCreatesAndValidatesWholeBatch(t *testing.T) {
 		objects[index] = batchObject("v1", "ConfigMap", "default", fmt.Sprintf("config-%02d", index))
 	}
 	kubernetes := &batchRecordingClient{Client: fake.NewClientBuilder().WithScheme(testScheme(t)).Build()}
-	result, err := ensureTenantObjects(context.Background(), kubernetes, objects, testTenant(), "spec-hash", "foundation-hash")
+	result, err := ensureTenantObjects(context.Background(), kubernetes, objects, testTenant(), "spec-hash", "foundation-hash", false)
 	if err != nil || !result.Created || result.Pending {
 		t.Fatalf("unexpected first batch result: %+v, %v", result, err)
 	}
 	if len(kubernetes.creates) != count || len(kubernetes.patches) != 0 {
 		t.Fatalf("batch did not create every object exactly once: creates=%d patches=%d", len(kubernetes.creates), len(kubernetes.patches))
 	}
-	result, err = ensureTenantObjects(context.Background(), kubernetes, objects, testTenant(), "spec-hash", "foundation-hash")
+	result, err = ensureTenantObjects(context.Background(), kubernetes, objects, testTenant(), "spec-hash", "foundation-hash", false)
 	if err != nil || result.Created || result.Pending {
 		t.Fatalf("unexpected existing batch result: %+v, %v", result, err)
 	}
-	if len(kubernetes.creates) != count || len(kubernetes.patches) != count {
-		t.Fatalf("existing objects were not each validated/applied once: creates=%d patches=%d", len(kubernetes.creates), len(kubernetes.patches))
+	if len(kubernetes.creates) != count || len(kubernetes.patches) != 0 {
+		t.Fatalf("existing static objects were mutated: creates=%d patches=%d", len(kubernetes.creates), len(kubernetes.patches))
 	}
 }
 
@@ -93,7 +93,7 @@ func TestEnsureTenantObjectsChecksOwnershipAfterCreation(t *testing.T) {
 			kubernetes := &batchRecordingClient{
 				Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(foreign).Build(),
 			}
-			result, err := ensureTenantObjects(context.Background(), kubernetes, []*unstructured.Unstructured{first, second, last}, testTenant(), "spec-hash", "foundation-hash")
+			result, err := ensureTenantObjects(context.Background(), kubernetes, []*unstructured.Unstructured{first, second, last}, testTenant(), "spec-hash", "foundation-hash", false)
 			if err == nil || !result.Created || !isOwnershipError(err) {
 				t.Fatalf("batch skipped ownership validation after a creation: %+v, %v", result, err)
 			}
@@ -120,13 +120,13 @@ func TestEnsureTenantObjectsHandlesCreateRaces(t *testing.T) {
 				Client: fake.NewClientBuilder().WithScheme(testScheme(t)).Build(),
 				races:  map[string]*unstructured.Unstructured{"raced": current},
 			}
-			result, err := ensureTenantObjects(context.Background(), kubernetes, []*unstructured.Unstructured{first, raced, last}, testTenant(), "spec-hash", "foundation-hash")
+			result, err := ensureTenantObjects(context.Background(), kubernetes, []*unstructured.Unstructured{first, raced, last}, testTenant(), "spec-hash", "foundation-hash", false)
 			if !result.Created {
 				t.Fatal("batch lost the earlier creation")
 			}
 			if owned {
 				if err != nil || !slices.Equal(kubernetes.creates, []string{"first", "raced", "last"}) ||
-					!slices.Equal(kubernetes.patches, []string{"raced"}) {
+					len(kubernetes.patches) != 0 {
 					t.Fatalf("owned create race did not continue: %+v, %v, creates=%v patches=%v", result, err, kubernetes.creates, kubernetes.patches)
 				}
 			} else if err == nil || !isOwnershipError(err) || len(kubernetes.patches) != 0 || len(kubernetes.creates) != 2 {
@@ -136,14 +136,13 @@ func TestEnsureTenantObjectsHandlesCreateRaces(t *testing.T) {
 	}
 }
 
-func TestEnsureTenantObjectsPreservesApplyFailureClassification(t *testing.T) {
+func TestEnsureTenantObjectsClassifiesDryRunApplyFailuresAsStaticDrift(t *testing.T) {
 	for _, test := range []struct {
 		name string
 		err  error
-		want error
 	}{
-		{"conflict", apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, "existing", errors.New("changed")), errStableApplyConflict},
-		{"immutable", apierrors.NewInvalid(schema.GroupKind{Kind: "ConfigMap"}, "existing", nil), errImmutableDrift},
+		{"conflict", apierrors.NewConflict(schema.GroupResource{Resource: "configmaps"}, "existing", errors.New("changed"))},
+		{"immutable", apierrors.NewInvalid(schema.GroupKind{Kind: "ConfigMap"}, "existing", nil)},
 	} {
 		t.Run(test.name, func(t *testing.T) {
 			first := batchObject("v1", "ConfigMap", "default", "first")
@@ -152,9 +151,9 @@ func TestEnsureTenantObjectsPreservesApplyFailureClassification(t *testing.T) {
 				Client:   fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(existing).Build(),
 				patchErr: test.err,
 			}
-			result, err := ensureTenantObjects(context.Background(), kubernetes, []*unstructured.Unstructured{first, existing}, testTenant(), "spec-hash", "foundation-hash")
-			if !result.Created || !errors.Is(err, test.want) {
-				t.Fatalf("batch lost apply error classification: %+v, %v", result, err)
+			result, err := ensureTenantObjects(context.Background(), kubernetes, []*unstructured.Unstructured{first, existing}, testTenant(), "spec-hash", "foundation-hash", true)
+			if !result.Created || !errors.Is(err, errStaticResourceDrift) {
+				t.Fatalf("batch lost static drift classification: %+v, %v", result, err)
 			}
 		})
 	}
@@ -192,7 +191,7 @@ func TestEnsureTenantObjectsWaitsForCRDEstablishmentAndDiscovery(t *testing.T) {
 		Build()}
 	apply := func() tenantApplyResult {
 		t.Helper()
-		result, err := ensureTenantObjects(ctx, kubernetes, objects, testTenant(), "spec-hash", "foundation-hash")
+		result, err := ensureTenantObjects(ctx, kubernetes, objects, testTenant(), "spec-hash", "foundation-hash", false)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -245,7 +244,7 @@ func TestEnsureTenantObjectsRejectsForeignCRDBeforeDependents(t *testing.T) {
 	kubernetes := &batchRecordingClient{Client: fake.NewClientBuilder().WithScheme(testScheme(t)).WithObjects(foreign).Build()}
 	_, err := ensureTenantObjects(context.Background(), kubernetes, []*unstructured.Unstructured{
 		batchObject("example.io/v1", "Widget", "default", "widget"), crd,
-	}, testTenant(), "spec-hash", "foundation-hash")
+	}, testTenant(), "spec-hash", "foundation-hash", false)
 	if err == nil || !isOwnershipError(err) || len(kubernetes.creates) != 0 || len(kubernetes.patches) != 0 {
 		t.Fatalf("foreign CRD was not rejected before dependent mutation: %v", err)
 	}

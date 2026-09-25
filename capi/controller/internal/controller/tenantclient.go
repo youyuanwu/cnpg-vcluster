@@ -84,7 +84,7 @@ func tenantClientFromSecret(ctx context.Context, reader client.Reader, factory T
 	return tenantClient, &secret, nil
 }
 
-func applyBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
+func ensureBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
 	for _, raw := range resources.BootstrapRBAC() {
 		object := raw.(client.Object)
 		current, err := emptyBootstrapObject(object)
@@ -112,25 +112,21 @@ func applyBootstrapRBAC(ctx context.Context, tenantClient client.Client) error {
 		case *rbacv1.Role:
 			existing := current.(*rbacv1.Role)
 			if !equality.Semantic.DeepEqual(existing.Rules, desired.Rules) {
-				desired.ResourceVersion = existing.ResourceVersion
-				if err := tenantClient.Update(ctx, desired); err != nil {
-					if apierrors.IsForbidden(err) {
-						return errTenantAdministrativeAccessPending
-					}
-					return fmt.Errorf("update Tenant bootstrap Role %s: %w", desired.Name, err)
-				}
+				return fmt.Errorf(
+					"%w: Tenant bootstrap Role %s differs from the supported content",
+					errStaticResourceDrift,
+					desired.Name,
+				)
 			}
 		case *rbacv1.RoleBinding:
 			existing := current.(*rbacv1.RoleBinding)
 			if !equality.Semantic.DeepEqual(existing.RoleRef, desired.RoleRef) ||
 				!bootstrapSubjectsEqual(existing.Subjects, desired.Subjects) {
-				desired.ResourceVersion = existing.ResourceVersion
-				if err := tenantClient.Update(ctx, desired); err != nil {
-					if apierrors.IsForbidden(err) {
-						return errTenantAdministrativeAccessPending
-					}
-					return fmt.Errorf("update Tenant bootstrap RoleBinding %s: %w", desired.Name, err)
-				}
+				return fmt.Errorf(
+					"%w: Tenant bootstrap RoleBinding %s differs from the supported content",
+					errStaticResourceDrift,
+					desired.Name,
+				)
 			}
 		}
 	}
