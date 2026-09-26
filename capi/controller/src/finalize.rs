@@ -510,10 +510,10 @@ impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
                     .ok_or_else(|| invalid("provider descendant has no live MachineDeployment"))?;
                 validate_owner_chain(object, uid(&deployment.metadata)?, &inventory)
                     .map_err(|error| invalid(error.to_string()))?;
-                if index == 1 || index == 2 {
+                if matches!(descendant_kinds[index].kind, "Machine" | "DevMachine") {
                     validate_root_ownership(&object.metadata, identity, "machine")
                         .map_err(|error| invalid(error.to_string()))?;
-                    if index == 1 {
+                    if descendant_kinds[index].kind == "Machine" {
                         machine_names.insert(
                             object
                                 .metadata

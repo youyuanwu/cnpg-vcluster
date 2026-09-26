@@ -106,5 +106,39 @@ mod tests {
             assert!(rule.verbs.contains(&"get".into()));
             assert!(rule.verbs.contains(&"list".into()));
         }
+        for (kind, expected) in [
+            (
+                "Cluster",
+                &["create", "delete", "get", "list", "patch", "watch"][..],
+            ),
+            ("Machine", &["create", "delete", "get", "list", "watch"][..]),
+            ("KubeadmConfig", &["get", "list"][..]),
+            (
+                "Namespace",
+                &["create", "delete", "get", "list", "watch"][..],
+            ),
+            ("Secret", &["delete", "get", "list", "watch"][..]),
+            (
+                "Lease",
+                &[
+                    "create", "delete", "get", "list", "patch", "update", "watch",
+                ][..],
+            ),
+            ("TenantControlPlane", &["get", "list"][..]),
+        ] {
+            let resource = MANAGEMENT_RESOURCES
+                .iter()
+                .find(|resource| resource.kind == kind)
+                .unwrap();
+            let rule = rules
+                .iter()
+                .find(|rule| {
+                    rule.resources
+                        .as_ref()
+                        .is_some_and(|values| values == &vec![resource.plural.to_string()])
+                })
+                .unwrap();
+            assert_eq!(rule.verbs, expected);
+        }
     }
 }
