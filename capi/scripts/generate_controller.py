@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import subprocess
 import sys
 from pathlib import Path
 
@@ -17,22 +16,7 @@ def main(arguments: list[str]) -> int:
     if arguments and not verify:
         print("usage: generate_controller.py [--verify]", file=sys.stderr)
         return 1
-    generate_controller(ROOT, load_configuration(ROOT))
-    if verify:
-        result = subprocess.run(
-            [
-                "git",
-                "diff",
-                "--exit-code",
-                "--",
-                "controller/api/v1alpha1/zz_generated.deepcopy.go",
-                "controller/config/crd/bases",
-                "controller/config/rbac/role.yaml",
-            ],
-            cwd=ROOT,
-            check=False,
-        )
-        return result.returncode
+    generate_controller(ROOT, load_configuration(ROOT), check=verify)
     return 0
 
 

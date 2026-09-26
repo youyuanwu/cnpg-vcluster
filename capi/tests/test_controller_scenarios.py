@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import copy
+import hashlib
 import json
 import tempfile
 import unittest
@@ -14,6 +16,11 @@ from scripts.lib.controller_scenarios import (
     manifest_tenant_name,
     tenant_from_document,
     tenant_snapshot,
+    allocation_lease_manifest,
+    allocation_lease_name,
+    tenant_allocation,
+    tenant_spec_hash,
+    verify_allocation_lease,
     wait_tenant_ready,
 )
 
@@ -24,19 +31,97 @@ def tenant_document() -> dict[str, object]:
         "spec": {
             "kubernetesVersion": "1.36.4",
             "workers": 2,
-            "databaseCount": 3,
-            "podCIDR": "10.73.0.0/16",
-            "serviceCIDR": "10.143.0.0/16",
+            "databases": 3,
         },
         "status": {
-            "endpoint": "172.18.255.10:6443",
+            "allocation": {
+                "slotId": "slot-0",
+                "endpoint": "172.18.255.10",
+                "podCIDR": "10.73.0.0/16",
+                "serviceCIDR": "10.143.0.0/16",
+            },
             "foundationHash": "foundation",
             "clusterUID": "cluster-uid",
         },
     }
 
 
+CONFIG = {"OWNERSHIP_LABEL": "lab-owner", "LAB_PREFIX": "lab"}
+
+
+def allocation_lease():
+    lease = allocation_lease_manifest(CONFIG, tenant_document())
+    lease["metadata"].update(uid="lease-uid", resourceVersion="7")
+    lease["spec"] = {}
+    return lease
+
+
 class ControllerScenarioTests(unittest.TestCase):
+    def test_spec_hash_matches_rust_canonical_contract(self) -> None:
+        document = tenant_document()
+        expected = hashlib.sha256(
+            b'{"kubernetesVersion":"1.36.4","workers":2,"databases":3}'
+        ).hexdigest()
+        self.assertEqual(expected, tenant_spec_hash(document))
+        document["spec"]["kubernetesVersion"] = "v1.36.4"
+        self.assertEqual(expected, tenant_spec_hash(document))
+        document["status"]["allocation"]["podCIDR"] = "10.99.0.0/16"
+        self.assertEqual(expected, tenant_spec_hash(document))
+
+    def test_spec_networks_are_never_allocation_fallbacks(self) -> None:
+        document = tenant_document()
+        document["spec"].update(podCIDR="10.1.0.0/16", serviceCIDR="10.2.0.0/16")
+        with self.assertRaisesRegex(RuntimeError, "v1alpha2"):
+            tenant_spec_hash(document)
+        del document["status"]["allocation"]
+        with self.assertRaisesRegex(RuntimeError, "allocation"):
+            tenant_allocation(document)
+
+    def test_allocation_requires_canonical_disjoint_ipv4_networks(self) -> None:
+        for field, value in (
+            ("slotId", ""), ("endpoint", "172.18.255.10:6443"),
+            ("endpoint", "10.73.0.1"),
+            ("podCIDR", "10.73.0.1/16"), ("serviceCIDR", "10.73.0.0/16"),
+            ("serviceCIDR", "::/64"), ("serviceCIDR", "10.144.0.0/30"),
+        ):
+            with self.subTest(field=field, value=value):
+                document = tenant_document()
+                document["status"]["allocation"][field] = value
+                with self.assertRaisesRegex(RuntimeError, "allocation"):
+                    tenant_allocation(document)
+
+    def test_lease_name_and_exact_markers_match_rust(self) -> None:
+        client = Mock()
+        client.json.return_value = {"items": [allocation_lease()]}
+        identity = verify_allocation_lease(CONFIG, client, tenant_document())
+        self.assertEqual("lease-uid", identity["uid"])
+        self.assertEqual("tenant-slot-" + hashlib.sha256(b"slot-0").hexdigest()[:51],
+                         allocation_lease_name("slot-0"))
+        client.json.assert_called_once_with("-n", "tenant-system", "get", "leases.coordination.k8s.io")
+
+    def test_foreign_replaced_malformed_or_duplicate_claims_are_rejected(self) -> None:
+        cases = [[], [allocation_lease(), allocation_lease()]]
+        for field, value in (
+            ("namespace", "foreign"), ("uid", ""), ("resourceVersion", ""),
+            ("ownerReferences", [{"uid": "foreign"}]), ("deletionTimestamp", "now"),
+        ):
+            lease = allocation_lease()
+            lease["metadata"][field] = value
+            cases.append([lease])
+        for field in ("tenant", "tenant-uid", "spec-hash", "foundation-hash", "endpoint", "pod-cidr", "service-cidr"):
+            lease = allocation_lease()
+            lease["metadata"]["annotations"]["tenancy.cnpg-vcluster.io/" + field] = "foreign"
+            cases.append([lease])
+        lease = allocation_lease()
+        lease["spec"] = {"holderIdentity": "foreign"}
+        cases.append([lease])
+        for leases in cases:
+            with self.subTest(leases=leases):
+                client = Mock()
+                client.json.return_value = {"items": leases}
+                with self.assertRaisesRegex(RuntimeError, "Lease"):
+                    verify_allocation_lease(CONFIG, client, tenant_document())
+
     def test_wait_logs_condition_and_classification_transitions_without_messages(self) -> None:
         def result(
             classification="progressing", reason="WaitingForWorkers", generation=1,
@@ -148,7 +233,7 @@ class ControllerScenarioTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "custom.yaml"
             path.write_text(
-                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha1\n"
+                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2\n"
                 "kind: Tenant\n"
                 "metadata:\n"
                 "  labels:\n"
@@ -204,6 +289,9 @@ class ControllerScenarioTests(unittest.TestCase):
                     stderr="",
                 )
 
+            def json(self, *_arguments):
+                return {"items": [allocation_lease()]}
+
         with patch(
             "scripts.lib.controller_scenarios.run",
             side_effect=[
@@ -219,10 +307,13 @@ class ControllerScenarioTests(unittest.TestCase):
                     stdout="worker-b bbbb\nworker-a aaaa\n",
                     stderr="",
                 ),
+                CompletedProcess(
+                    [], 0, stdout="worker-b bbbb\nworker-a aaaa\ntenant-a-lb cccc\n", stderr="",
+                ),
             ],
         ):
             snapshot = tenant_snapshot(
-                {"LAB_PREFIX": "lab"},
+                CONFIG,
                 Client(),
                 tenant_document(),
             )
@@ -235,13 +326,14 @@ class ControllerScenarioTests(unittest.TestCase):
             snapshot["workerContainers"],
         )
         self.assertEqual(8, len(snapshot["managementResources"]))
+        self.assertIn("tenant-a-lb cccc", snapshot["providerContainers"])
 
     def test_endpoint_gate_cleans_partially_applied_tenant(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             manifest = root / "tenant.yaml"
             manifest.write_text(
-                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha1\n"
+                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2\n"
                 "kind: Tenant\nmetadata:\n  name: tenant-a\n",
                 encoding="utf-8",
             )

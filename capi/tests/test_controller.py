@@ -28,6 +28,7 @@ from scripts.lib.controller import (
     verify_running_controller_epoch,
 )
 from scripts.lib.ownership import IdentityRecord
+from scripts.lib.images import WORKER_IMAGE_KEYS
 
 
 class FakeManagementClient:
@@ -292,22 +293,12 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             (root / "controller" / "Dockerfile").write_text(
                 "FROM scratch\n", encoding="utf-8"
             )
-            (root / "controller" / "main.go").write_text(
-                "package main\n", encoding="utf-8"
-            )
-            (root / "config").mkdir()
-            (root / "config" / "versions.env").write_text(
-                "GO_VERSION=1\n", encoding="utf-8"
-            )
             inputs = root / ".tools" / "inputs"
             inputs.mkdir(parents=True)
             (inputs / "calico.yaml").write_text("calico", encoding="utf-8")
             (inputs / "cnpg.yaml").write_text("cnpg", encoding="utf-8")
             config = {
                 "TENANT_CONTROLLER_IMAGE_REPOSITORY": "example/controller",
-                "GO_VERSION": "1",
-                "CONTROLLER_RUNTIME_VERSION": "runtime",
-                "CONTROLLER_TOOLS_VERSION": "tools",
                 "COMMAND_TIMEOUT": "1s",
             }
 
@@ -325,6 +316,9 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                     return_value=binary,
                 ),
                 patch("scripts.lib.controller.verify_all_inputs") as verify,
+                patch("scripts.lib.controller.generate_controller"),
+                patch("scripts.lib.controller.verify_static_manager"),
+                patch("scripts.lib.controller.controller_image", return_value="example/controller:rust"),
                 patch("scripts.lib.controller.run", side_effect=verify_build),
             ):
                 image = build_controller_image(root, config)
@@ -343,22 +337,12 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             (root / "controller" / "Dockerfile").write_text(
                 "FROM scratch\n", encoding="utf-8"
             )
-            (root / "controller" / "main.go").write_text(
-                "package main\n", encoding="utf-8"
-            )
-            (root / "config").mkdir()
-            (root / "config" / "versions.env").write_text(
-                "GO_VERSION=1\n", encoding="utf-8"
-            )
             inputs = root / ".tools" / "inputs"
             inputs.mkdir(parents=True)
             (inputs / "calico.yaml").write_text("calico", encoding="utf-8")
             (inputs / "cnpg.yaml").write_text("cnpg", encoding="utf-8")
             config = {
                 "TENANT_CONTROLLER_IMAGE_REPOSITORY": "example/controller",
-                "GO_VERSION": "1",
-                "CONTROLLER_RUNTIME_VERSION": "runtime",
-                "CONTROLLER_TOOLS_VERSION": "tools",
                 "COMMAND_TIMEOUT": "1s",
             }
             with (
@@ -367,6 +351,9 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                     return_value=binary,
                 ),
                 patch("scripts.lib.controller.verify_all_inputs"),
+                patch("scripts.lib.controller.generate_controller"),
+                patch("scripts.lib.controller.verify_static_manager"),
+                patch("scripts.lib.controller.controller_image", return_value="example/controller:rust"),
                 patch(
                     "scripts.lib.controller.run",
                     side_effect=RuntimeError("docker failed"),
@@ -378,30 +365,31 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 (root / ".runtime" / "rendered" / "controller-build").exists()
             )
 
-    def test_controller_digest_includes_assets_and_versions(self) -> None:
+    @patch("scripts.lib.controller.rust_toolchain", return_value=("cargo", {}, "rustc 1.96"))
+    def test_controller_digest_includes_assets_and_versions(self, _toolchain) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             (root / "controller").mkdir()
-            (root / "controller" / "main.go").write_text("package main", encoding="utf-8")
-            (root / "config").mkdir()
-            (root / "config" / "versions.env").write_text("GO_VERSION=1\n", encoding="utf-8")
+            for filename in ("Cargo.toml", "Cargo.lock", "Dockerfile"):
+                (root / "controller" / filename).write_text(filename, encoding="utf-8")
+            manager = root / "controller/config/manager/manager.yaml.tpl"
+            manager.parent.mkdir(parents=True)
+            manager.write_text("manager")
             inputs = root / ".tools" / "inputs"
             inputs.mkdir(parents=True)
             (inputs / "calico.yaml").write_text("calico", encoding="utf-8")
             (inputs / "cnpg.yaml").write_text("cnpg", encoding="utf-8")
             config = {
-                "GO_VERSION": "1",
-                "CONTROLLER_RUNTIME_VERSION": "runtime",
-                "CONTROLLER_TOOLS_VERSION": "tools",
+                "KUBERNETES_VERSION": "v1.36.4",
             }
             before = controller_source_digest(root, config)
             (inputs / "calico.yaml").write_text("changed", encoding="utf-8")
             self.assertNotEqual(before, controller_source_digest(root, config))
             (inputs / "calico.yaml").write_text("calico", encoding="utf-8")
-            config["GO_VERSION"] = "2"
+            config["KUBERNETES_VERSION"] = "v1.36.5"
             self.assertNotEqual(before, controller_source_digest(root, config))
 
-    def test_foundation_payload_contains_cache_registry_and_versions(self) -> None:
+    def test_foundation_payload_contains_cache_registry_and_slots(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             generation = root / "generation-1"
@@ -425,12 +413,9 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 state_sha256="b" * 64,
             )
             config = {
-                "GO_VERSION": "1.27.1",
                 "KUBERNETES_VERSION": "v1.36.4",
                 "CAPI_VERSION": "v1.14.1",
                 "KAMAJI_CAPI_VERSION": "v0.20.0",
-                "CONTROLLER_RUNTIME_VERSION": "v0.24.1",
-                "CONTROLLER_TOOLS_VERSION": "v0.21.0",
                 "CAPI_CONTRACT": "v1beta2",
                 "KAMAJI_CAPI_CONTRACT": "v1beta2",
                 "MANAGEMENT_POD_CIDR": "10.0.0.0/16",
@@ -439,6 +424,7 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 "OWNERSHIP_LABEL": "example.io/owned",
                 "LAB_PREFIX": "example",
                 "SPIKE_API_PORT": "6443",
+                "SPIKE_API_VIP_SLOT": "2",
                 "SPIKE_CLUSTER_DOMAIN": "example.local",
                 "KIND_NODE_IMAGE": "kindest/node:v1@sha256:" + "d" * 64,
                 "SPIKE_STORAGE_CONTAINER_PATH": "/var/lib/example",
@@ -448,8 +434,9 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             network = {
                 "network_id": "network-id",
                 "subnet": "172.18.0.0/16",
-                "pool_start": "172.18.255.1",
-                "pool_end": "172.18.255.2",
+                "pool_start": "172.18.255.223",
+                "pool_end": "172.18.255.238",
+                "slots": {"spike": "172.18.255.225"},
             }
             registry = {
                 "address": "172.18.0.10",
@@ -465,8 +452,18 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                     "io.x-k8s.kind.role": "control-plane",
                 },
             )
+            (root / "config").mkdir()
+            (root / "config/tenant-allocation-slots.json").write_text(
+                (Path(__file__).resolve().parents[1] / "config/tenant-allocation-slots.json").read_text()
+            )
+            for key in WORKER_IMAGE_KEYS:
+                config[key] = config["IMAGE"]
+                config[f"{key}_TAGGED"] = config["IMAGE_TAGGED"]
+                cache.inventory["imageArchives"].append({
+                    "key": key, "path": f"images/{key}.tar", "sha256": "a" * 64,
+                })
             with patch(
-                "scripts.lib.controller.require_management_ownership",
+                "scripts.lib.management.require_management_ownership",
                 return_value=identity,
             ):
                 payload = _foundation_payload(
@@ -481,7 +478,9 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             self.assertEqual("generation-1", data["cache"]["generation"])
             self.assertEqual("172.18.0.10", data["registry"]["address"])
             self.assertIn("172.18.0.0/16", data["allowedSubnets"])
-            self.assertEqual("v0.24.1", data["versions"]["CONTROLLER_RUNTIME_VERSION"])
+            self.assertEqual(3, data["schema"])
+            self.assertEqual(15, len(data["slots"]))
+            self.assertNotIn("versions", data)
             self.assertEqual("images/image.tar", data["cache"]["imageArchives"][0]["path"])
             self.assertEqual(
                 "docker.io/example/image:v1",
@@ -571,7 +570,7 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
 
     def test_temporary_mutation_updates_foundation_before_manager(self) -> None:
         foundation = json.dumps(
-            {"schema": 2, "mutationEnabled": False},
+            {"schema": 3, "mutationEnabled": False, "controllerImage": "rust:image"},
             sort_keys=True,
             separators=(",", ":"),
         )
@@ -598,7 +597,10 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                     [],
                     0,
                     stdout=json.dumps(
-                        {"data": {"foundation.json": foundation}}
+                        {"data": {
+                            "foundation.json": foundation,
+                            "foundation.sha256": _foundation_checksum(json.loads(foundation)),
+                        }}
                     ),
                     stderr="",
                 ),
@@ -609,14 +611,15 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 CompletedProcess([], 0, stdout="", stderr=""),
             ]
         )
-        set_controller_mutation(
-            {
-                "CONDITION_TIMEOUT": "1s",
-                "KUBERNETES_VERSION": "v1.36.4",
-            },
-            client,
-            enabled=True,
-        )
+        with patch("scripts.lib.controller.verify_running_controller"):
+            set_controller_mutation(
+                {
+                    "CONDITION_TIMEOUT": "1s",
+                    "KUBERNETES_VERSION": "v1.36.4",
+                },
+                client,
+                enabled=True,
+            )
         arguments = [call[0] for call in client.calls]
         self.assertIn("configmap/tenant-foundation", arguments[2])
         self.assertIn("deployment/tenant-controller", arguments[3])

@@ -1,0 +1,38 @@
+{
+  "apiVersion": "cluster.x-k8s.io/v1beta2",
+  "kind": "Cluster",
+  "metadata": {
+    "name": "tenant-a",
+    "namespace": "tenant-a",
+    "labels": {
+      "example.io/owned": "example",
+      "cnpg-vcluster.capi/addons": "tenant-a"
+    },
+    "annotations": {
+      "tenancy.cnpg-vcluster.io/tenant": "tenant-a",
+      "tenancy.cnpg-vcluster.io/tenant-uid": "uid-a",
+      "tenancy.cnpg-vcluster.io/spec-hash": "spec-hash",
+      "tenancy.cnpg-vcluster.io/foundation-hash": "foundation-hash",
+      "tenancy.cnpg-vcluster.io/resource": "cluster"
+    }
+  },
+  "spec": {
+    "controlPlaneEndpoint": {"host": "172.18.255.1", "port": 6443},
+    "clusterNetwork": {
+      "apiServerPort": 6443,
+      "services": {"cidrBlocks": ["10.21.0.0/16"]},
+      "pods": {"cidrBlocks": ["10.20.0.0/16"]},
+      "serviceDomain": "example.local"
+    },
+    "infrastructureRef": {
+      "apiGroup": "infrastructure.cluster.x-k8s.io",
+      "kind": "DevCluster",
+      "name": "tenant-a"
+    },
+    "controlPlaneRef": {
+      "apiGroup": "controlplane.cluster.x-k8s.io",
+      "kind": "KamajiControlPlane",
+      "name": "tenant-a"
+    }
+  }
+}

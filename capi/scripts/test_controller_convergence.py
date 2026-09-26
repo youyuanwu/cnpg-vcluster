@@ -12,10 +12,13 @@ sys.path.insert(0, str(ROOT))
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.controller import delete_tenant_resource, set_controller_mutation
 from scripts.lib.controller_cutover import require_clean_controller_cutover
+from scripts.lib.controller_client import tenant_manifest_document
+from scripts.lib.controller_scenarios import verify_allocation_lease, verify_allocation_released
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.locking import profile_lock, tools_lock
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
+from scripts.test_controller_allocation import run_allocation_gate
 
 
 TENANT_NAME = "controller-phase2"
@@ -30,18 +33,7 @@ def _require_clean_cutover(
 
 
 def _tenant_manifest(config: dict[str, str]) -> dict[str, object]:
-    return {
-        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
-        "kind": "Tenant",
-        "metadata": {"name": TENANT_NAME},
-        "spec": {
-            "kubernetesVersion": config["KUBERNETES_VERSION"].removeprefix("v"),
-            "workers": 1,
-            "databaseCount": 1,
-            "podCIDR": "10.73.0.0/16",
-            "serviceCIDR": "10.143.0.0/16",
-        },
-    }
+    return tenant_manifest_document(config, TENANT_NAME)
 
 
 def _tenant(client: ManagementClient) -> dict[str, object] | None:
@@ -74,7 +66,7 @@ def _converging(
         )
     if not all(
         (
-            status.get("endpoint"),
+            status.get("allocation"),
             status.get("foundationHash"),
             status.get("clusterUID"),
         )
@@ -175,6 +167,7 @@ def main() -> None:
         _require_clean_cutover(ROOT, config, client)
         try:
             set_controller_mutation(config, client, enabled=True)
+            run_allocation_gate(ROOT, config, client)
             manifest = _tenant_manifest(config)
             client.kubectl(
                 "apply",
@@ -200,7 +193,8 @@ def main() -> None:
                     f"{exc}; last Tenant status: "
                     f"{json.dumps(status, sort_keys=True)}"
                 ) from exc
-            endpoint = first["status"]["endpoint"]
+            allocation = first["status"]["allocation"]
+            lease = verify_allocation_lease(config, client, first)
             cluster_uid = first["status"]["clusterUID"]
             volume = _volume_name(config)
             client.kubectl(
@@ -219,8 +213,9 @@ def main() -> None:
                 lambda: _converging(client, config),
             )
             if (
-                second["status"]["endpoint"] != endpoint
+                second["status"]["allocation"] != allocation
                 or second["status"]["clusterUID"] != cluster_uid
+                or verify_allocation_lease(config, client, second) != lease
             ):
                 raise RuntimeError("idempotent convergence changed stable identity")
             delete_tenant_resource(client, TENANT_NAME, wait=False)
@@ -244,6 +239,10 @@ def main() -> None:
             )
             if volume_check.returncode == 0:
                 raise RuntimeError("convergence Docker volume remained after finalization")
+            verify_allocation_released(client, {
+                "name": TENANT_NAME, "uid": first["metadata"]["uid"],
+                "allocationLease": lease,
+            })
         finally:
             _restore_after_gate(config, client, sys.exc_info()[1])
             shutil.rmtree(

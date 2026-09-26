@@ -72,7 +72,7 @@ class TimingTests(unittest.TestCase):
         spec = root / "config" / "tenants" / "examples" / "local.yaml"
         spec.parent.mkdir(parents=True)
         spec.write_text(
-            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha1\n"
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2\n"
             "kind: Tenant\nmetadata:\n  name: tenant-example\n",
             encoding="utf-8",
         )
@@ -199,12 +199,13 @@ class TimingTests(unittest.TestCase):
         identity = {
             "name": "tenant-example",
             "uid": "tenant-uid",
-            "endpointAddress": "172.18.255.10",
+            "allocationLease": {"name": "tenant-slot-test", "uid": "lease-uid"},
             "managementResources": [
                 ("namespace", "", "tenant-example", "namespace-uid"),
                 ("clusters.cluster.x-k8s.io", "tenant-example", "tenant-example", "cluster-uid"),
             ],
             "workerContainers": ["tenant-worker " + "a" * 64],
+            "providerContainers": ["tenant-worker " + "a" * 64],
             "dockerVolume": {"name": "lab-tenant-example-storage"},
         }
 
@@ -216,18 +217,13 @@ class TimingTests(unittest.TestCase):
                     payload = '{"metadata":{"uid":"namespace-uid"}}'
                 if residue == "inspection-error":
                     return CompletedProcess([], 1, stdout="", stderr="inspection unavailable")
-            if resource == "configmap/tenant-endpoint-allocations" and residue == "allocation":
-                payload = json.dumps({"data": {"allocations.json": json.dumps({
-                    "schema": 1,
-                    "allocations": {"172.18.255.10": {
-                        "tenantName": "tenant-example", "tenantUID": "tenant-uid",
-                        "foundationHash": "foundation", "specHash": "spec",
-                    }},
-                })}})
             return CompletedProcess([], 0, stdout=payload, stderr="")
 
         client = Mock()
         client.kubectl.side_effect = inspect
+        client.json.return_value = {"items": [
+            {"metadata": {"name": "tenant-slot-test", "uid": "lease-uid"}}
+        ] if residue == "allocation" else []}
 
         def capture(*args):
             self.assertEqual(({}, client, document), args)
@@ -267,6 +263,7 @@ class TimingTests(unittest.TestCase):
                 patch("scripts.test_e2e.ManagementClient", return_value=client),
                 patch("scripts.test_e2e.export_tenant_kubeconfig") as export,
                 patch("scripts.test_e2e._sql", side_effect=sql),
+                patch("scripts.test_e2e.verify_restart_persistence", side_effect=lambda *_: calls.append("persistence")),
                 patch("scripts.test_e2e.capture_tenant_deletion_identity", side_effect=capture),
                 patch("scripts.test_e2e.verify_tenant_deletion", side_effect=verify),
                 patch("scripts.test_e2e.run", return_value=CompletedProcess([], 0, stdout="", stderr="")),
@@ -289,7 +286,7 @@ class TimingTests(unittest.TestCase):
         self.assertEqual("passed", timings["management_teardown_host_restoration"])
         if sql_result == "1":
             delete.assert_called_once_with(root, {}, "tenant-example")
-            expected = ["sql", "identity", "finalization"]
+            expected = ["sql", "persistence", "identity", "finalization"]
             if not deletion_failure:
                 expected.append("verify-absence")
             expected.append("destroy")

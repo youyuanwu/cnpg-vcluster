@@ -16,6 +16,149 @@ from .tenants import Tenant, export_tenant_kubeconfig, tenant_kubeconfig_path
 from scripts.controller_tenant_status import evaluate_tenant
 
 
+MARKER = "tenancy.cnpg-vcluster.io/"
+LEASE_NAMESPACE = "tenant-system"
+
+
+def tenant_spec_hash(document: dict[str, object]) -> str:
+    spec = document.get("spec")
+    if not isinstance(spec, dict) or set(spec) != {"kubernetesVersion", "workers", "databases"}:
+        raise RuntimeError("Tenant spec is not the v1alpha2 contract")
+    version = spec["kubernetesVersion"]
+    if not isinstance(version, str) or not re.fullmatch(r"v?[0-9]+\.[0-9]+\.[0-9]+", version):
+        raise RuntimeError("Tenant Kubernetes version is invalid")
+    if any(type(spec[field]) is not int or not 1 <= spec[field] <= 3 for field in ("workers", "databases")):
+        raise RuntimeError("Tenant counts are invalid")
+    canonical = {
+        "kubernetesVersion": version.removeprefix("v"),
+        "workers": spec["workers"],
+        "databases": spec["databases"],
+    }
+    return hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode()).hexdigest()
+
+
+def tenant_allocation(document: dict[str, object]) -> dict[str, str]:
+    status = document.get("status")
+    allocation = status.get("allocation") if isinstance(status, dict) else None
+    try:
+        if not isinstance(allocation, dict) or set(allocation) != {"slotId", "endpoint", "podCIDR", "serviceCIDR"}:
+            raise ValueError
+        if not isinstance(allocation["slotId"], str) or not re.fullmatch(
+            r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", allocation["slotId"],
+        ):
+            raise ValueError
+        address = ipaddress.IPv4Address(allocation["endpoint"])
+        pod = ipaddress.IPv4Network(allocation["podCIDR"])
+        service = ipaddress.IPv4Network(allocation["serviceCIDR"])
+        if (
+            str(address) != allocation["endpoint"]
+            or str(pod) != allocation["podCIDR"]
+            or str(service) != allocation["serviceCIDR"]
+            or pod.overlaps(service) or address in pod or address in service
+            or service.num_addresses <= 10
+        ):
+            raise ValueError
+    except (KeyError, TypeError, ValueError) as exc:
+        raise RuntimeError("Tenant status allocation is invalid or absent") from exc
+    return dict(allocation)
+
+
+def allocation_lease_name(slot_id: str) -> str:
+    return "tenant-slot-" + hashlib.sha256(slot_id.encode()).hexdigest()[:51]
+
+
+def allocation_lease_manifest(
+    config: dict[str, str], document: dict[str, object],
+) -> dict[str, object]:
+    allocation = tenant_allocation(document)
+    metadata = document["metadata"]
+    foundation_hash = document["status"].get("foundationHash")
+    if not metadata.get("name") or not metadata.get("uid") or not foundation_hash:
+        raise RuntimeError("Tenant allocation identity is incomplete")
+    return {
+        "apiVersion": "coordination.k8s.io/v1",
+        "kind": "Lease",
+        "metadata": {
+            "name": allocation_lease_name(allocation["slotId"]),
+            "namespace": LEASE_NAMESPACE,
+            "labels": {
+                config["OWNERSHIP_LABEL"]: config["LAB_PREFIX"],
+                MARKER + "slot-id": allocation["slotId"],
+                MARKER + "tenant": metadata["name"],
+            },
+            "annotations": {
+                MARKER + "tenant": metadata["name"],
+                MARKER + "tenant-uid": metadata["uid"],
+                MARKER + "spec-hash": tenant_spec_hash(document),
+                MARKER + "foundation-hash": foundation_hash,
+                MARKER + "resource": "allocation-lease",
+                MARKER + "slot-id": allocation["slotId"],
+                MARKER + "endpoint": allocation["endpoint"],
+                MARKER + "pod-cidr": allocation["podCIDR"],
+                MARKER + "service-cidr": allocation["serviceCIDR"],
+            },
+        },
+    }
+
+
+def allocation_leases(client: ManagementClient) -> list[dict[str, object]]:
+    payload = client.json("-n", LEASE_NAMESPACE, "get", "leases.coordination.k8s.io")
+    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+        raise RuntimeError("invalid allocation Lease inventory")
+    if any(
+        not isinstance(item, dict)
+        or not isinstance(item.get("metadata"), dict)
+        or not item["metadata"].get("name")
+        or not item["metadata"].get("uid")
+        or not isinstance(item["metadata"].get("annotations", {}), dict)
+        for item in payload["items"]
+    ):
+        raise RuntimeError("invalid allocation Lease identity")
+    return payload["items"]
+
+
+def verify_allocation_lease(
+    config: dict[str, str], client: ManagementClient, document: dict[str, object],
+) -> dict[str, object]:
+    expected = allocation_lease_manifest(config, document)["metadata"]
+    inventory = allocation_leases(client)
+    same_uid = [
+        lease for lease in inventory
+        if lease["metadata"].get("annotations", {}).get(MARKER + "tenant-uid")
+        == document["metadata"]["uid"]
+    ]
+    matches = [lease for lease in inventory if lease["metadata"]["name"] == expected["name"]]
+    if len(matches) != 1 or same_uid != matches:
+        raise RuntimeError("Tenant allocation Lease is absent, replaced, or duplicated")
+    lease = matches[0]
+    metadata = lease["metadata"]
+    if (
+        any(metadata.get(field) != expected[field] for field in ("name", "namespace", "labels", "annotations"))
+        or not metadata.get("resourceVersion") or metadata.get("ownerReferences")
+        or metadata.get("deletionTimestamp") or lease.get("spec") not in (None, {})
+    ):
+        raise RuntimeError("Tenant allocation Lease identity changed")
+    return {
+        "name": metadata["name"], "uid": metadata["uid"],
+        "namespace": metadata["namespace"],
+        "labels": metadata["labels"], "annotations": metadata["annotations"],
+    }
+
+
+def verify_allocation_released(client: ManagementClient, identity: dict[str, object]) -> None:
+    lease_identity = identity["allocationLease"]
+    for lease in allocation_leases(client):
+        metadata = lease["metadata"]
+        annotations = metadata.get("annotations", {})
+        if (
+            metadata["name"] == lease_identity["name"]
+            or metadata["uid"] == lease_identity["uid"]
+            or annotations.get(MARKER + "tenant-uid") == identity["uid"]
+            or annotations.get(MARKER + "tenant") == identity["name"]
+        ):
+            raise RuntimeError(f"Tenant allocation Lease remained after deletion: {identity['name']}")
+
+
 def tenant_manifest(root: Path, name: str) -> Path:
     if name == "tenant-example":
         return root / "config" / "tenants" / "examples" / "local.yaml"
@@ -165,12 +308,11 @@ def tenant_from_document(
     if not all(isinstance(value, dict) for value in (metadata, spec, status)):
         raise RuntimeError("Tenant document is missing metadata, spec, or status")
     name = str(metadata.get("name", ""))
-    endpoint = str(status.get("endpoint", ""))
+    allocation = tenant_allocation(document)
+    specification_sha256 = tenant_spec_hash(document)
     try:
-        address, port = endpoint.rsplit(":", 1)
-        if int(port) != int(config["SPIKE_API_PORT"]):
-            raise ValueError
-        service = ipaddress.ip_network(str(spec["serviceCIDR"]))
+        address = allocation["endpoint"]
+        service = ipaddress.ip_network(allocation["serviceCIDR"])
         dns_ip = str(service.network_address + 10)
     except (KeyError, TypeError, ValueError) as exc:
         raise RuntimeError(f"Tenant endpoint or network is invalid: {name}") from exc
@@ -188,28 +330,18 @@ def tenant_from_document(
         or not volume[0].get("Mountpoint")
     ):
         raise RuntimeError(f"Tenant Docker volume is invalid: {name}")
-    canonical = {
-        "kubernetesVersion": str(spec["kubernetesVersion"]).removeprefix("v"),
-        "workers": int(spec["workers"]),
-        "databaseCount": int(spec["databaseCount"]),
-        "podCIDR": str(ipaddress.ip_network(str(spec["podCIDR"]))),
-        "serviceCIDR": str(ipaddress.ip_network(str(spec["serviceCIDR"]))),
-    }
-    specification_sha256 = hashlib.sha256(
-        json.dumps(canonical, separators=(",", ":")).encode()
-    ).hexdigest()
     return Tenant(
         name=name,
         namespace=name,
         vip=address,
-        pod_cidr=str(spec["podCIDR"]),
-        service_cidr=str(spec["serviceCIDR"]),
+        pod_cidr=allocation["podCIDR"],
+        service_cidr=allocation["serviceCIDR"],
         dns_ip=dns_ip,
         domain=config["SPIKE_CLUSTER_DOMAIN"],
         storage_host_path=Path(str(volume[0]["Mountpoint"])),
         cnpg_cluster=config["SPIKE_CNPG_CLUSTER"],
         workers=int(spec["workers"]),
-        database_count=int(spec["databaseCount"]),
+        database_count=int(spec["databases"]),
         specification_sha256=specification_sha256,
     )
 
@@ -221,6 +353,7 @@ def apply_controller_tenant(
 ) -> tuple[ManagementClient, Tenant, dict[str, object]]:
     apply_tenant(root, config, manifest)
     document = wait_tenant_ready(root, config, manifest_tenant_name(manifest))
+    verify_allocation_lease(config, ManagementClient(root, config), document)
     tenant = tenant_from_document(root, config, document)
     client = ManagementClient(root, config)
     export_tenant_kubeconfig(root, config, client, tenant)
@@ -316,9 +449,17 @@ def tenant_snapshot(
             timeout=30,
         ).stdout.splitlines()
     )
+    containers = sorted(run(
+        [
+            "docker", "ps", "-a", "--no-trunc", "--filter",
+            f"label=io.x-k8s.kind.cluster={name}", "--format", "{{.Names}} {{.ID}}",
+        ],
+        timeout=30,
+    ).stdout.splitlines())
     return {
         "uid": metadata.get("uid"),
-        "endpoint": status.get("endpoint"),
+        "allocation": tenant_allocation(document),
+        "allocationLease": verify_allocation_lease(config, client, document),
         "foundationHash": status.get("foundationHash"),
         "clusterUID": status.get("clusterUID"),
         "managementResources": sorted(management_resources),
@@ -329,4 +470,5 @@ def tenant_snapshot(
             "labels": volume.get("Labels"),
         },
         "workerContainers": workers,
+        "providerContainers": containers,
     }

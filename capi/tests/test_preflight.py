@@ -12,6 +12,7 @@ from scripts.preflight import (
     run_retained_preflight,
     verify_images,
     verify_management_name,
+    verify_tools,
 )
 from scripts.preflight import verify_privileged_probe
 from scripts.lib.process import CommandError
@@ -26,6 +27,18 @@ BASE = {
 
 
 class PreflightTests(unittest.TestCase):
+    def test_system_rust_is_required_before_controller_preflight(self) -> None:
+        with (
+            patch("scripts.preflight.resolve_host_just"),
+            patch("scripts.preflight.rust_toolchain",
+                  side_effect=RuntimeError("installed Cargo missing")) as rust,
+            patch("scripts.preflight.verify_sha256") as checksum,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "Cargo missing"):
+                verify_tools(Path("local-root"), {}, 30)
+        rust.assert_called_once_with(Path("local-root"))
+        checksum.assert_not_called()
+
     def test_retained_preflight_verifies_without_install_or_overlap(self) -> None:
         calls: list[str] = []
         with (

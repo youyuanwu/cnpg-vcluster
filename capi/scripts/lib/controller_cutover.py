@@ -8,6 +8,70 @@ from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
 
 
+LEGACY_WEBHOOK_RESOURCES = (
+    (None, "validatingwebhookconfiguration/tenant-controller-validating-webhook"),
+    ("tenant-system", "service/tenant-controller-webhook"),
+    ("tenant-system", "certificate.cert-manager.io/tenant-controller-serving-cert"),
+    ("tenant-system", "issuer.cert-manager.io/tenant-controller-selfsigned"),
+    ("tenant-system", "secret/tenant-controller-serving-cert"),
+)
+
+
+def _missing(response, *, undiscovered: bool = False) -> bool:
+    pattern = r"not\s*found|notfound"
+    if undiscovered:
+        pattern += r"|doesn't have a resource type|could not find the requested resource"
+    return response.returncode != 0 and bool(
+        re.search(pattern, f"{response.stdout}{response.stderr}", re.IGNORECASE)
+    )
+
+
+def verify_absent(client: ManagementClient, namespace: str | None, resource: str) -> None:
+    scope = ("-n", namespace) if namespace else ()
+    response = client.kubectl(*scope, "get", resource, "-o", "name", check=False)
+    if not _missing(response, undiscovered=resource.startswith(
+        ("certificate.cert-manager.io/", "issuer.cert-manager.io/")
+    )):
+        raise RuntimeError(f"cannot prove {resource} absent: {response.stdout}{response.stderr}")
+
+
+def delete_named(
+    config: dict[str, str], client: ManagementClient,
+    namespace: str | None, resource: str,
+) -> None:
+    scope = ("-n", namespace) if namespace else ()
+    response = client.kubectl(
+        *scope, "delete", resource, "--ignore-not-found=true", "--wait=true",
+        "--cascade=foreground",
+        f"--timeout={config['DELETE_TIMEOUT']}", check=False,
+    )
+    if response.returncode != 0 and not _missing(response, undiscovered=resource.startswith(
+        ("certificate.cert-manager.io/", "issuer.cert-manager.io/")
+    )):
+        raise RuntimeError(f"failed to remove {resource}: {response.stderr}")
+    verify_absent(client, namespace, resource)
+
+
+def verify_legacy_webhook_absent(client: ManagementClient) -> None:
+    for namespace, resource in LEGACY_WEBHOOK_RESOURCES:
+        verify_absent(client, namespace, resource)
+
+
+def delete_legacy_controller(
+    root: Path, config: dict[str, str], client: ManagementClient,
+) -> None:
+    for namespace, resource in (
+        *LEGACY_WEBHOOK_RESOURCES,
+        ("tenant-system", "deployment/tenant-controller"),
+        ("tenant-system", "configmap/tenant-endpoint-allocations"),
+        (None, "crd/tenants.tenancy.cnpg-vcluster.io"),
+    ):
+        delete_named(config, client, namespace, resource)
+    ledger = root / ".runtime" / "management" / "tenant-endpoints.json"
+    ledger.unlink(missing_ok=True)
+    verify_legacy_webhook_absent(client)
+
+
 def _controller_manager_args(client: ManagementClient) -> list[str] | None:
     response = client.kubectl(
         "-n",
@@ -117,9 +181,13 @@ def require_clean_controller_cutover(
         re.IGNORECASE,
     ):
         raise RuntimeError(f"failed to inspect Tenant resources: {tenants.stderr}")
+    if tenants.returncode != 0:
+        verify_absent(client, None, "crd/tenants.tenancy.cnpg-vcluster.io")
 
     clusters = client.json("get", "clusters.cluster.x-k8s.io", "-A")
-    if clusters.get("items"):
+    if not isinstance(clusters.get("items"), list):
+        raise RuntimeError("failed to inspect CAPI Cluster inventory")
+    if clusters["items"]:
         raise RuntimeError("existing CAPI Clusters block controller activation")
     selector = f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}"
     for resource in (
@@ -129,13 +197,17 @@ def require_clean_controller_cutover(
         "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io",
         "devmachinetemplates.infrastructure.cluster.x-k8s.io",
         "machinedeployments.cluster.x-k8s.io",
+        "machines.cluster.x-k8s.io",
+        "machinesets.cluster.x-k8s.io",
+        "kubeadmconfigs.bootstrap.cluster.x-k8s.io",
+        "devmachines.infrastructure.cluster.x-k8s.io",
+        "tenantcontrolplanes.kamaji.clastix.io",
     ):
         response = client.kubectl(
             "get",
             resource,
             "-A",
-            "-l",
-            selector,
+            *(["-l", selector] if resource == "namespaces" else []),
             "-o",
             "name",
             check=False,
@@ -158,7 +230,18 @@ def require_clean_controller_cutover(
     )
     if allocations.returncode == 0:
         document = json.loads(allocations.stdout)
-        state = json.loads(document.get("data", {}).get("allocations.json", "{}"))
+        try:
+            state = json.loads(document["data"]["allocations.json"])
+        except (KeyError, TypeError, json.JSONDecodeError) as exc:
+            raise RuntimeError("legacy endpoint allocation ledger is malformed") from exc
+        if (
+            not isinstance(state, dict) or state.get("schema") != 1
+            or not isinstance(state.get("allocations"), dict)
+            or any(not isinstance(state.get(key), str) or not state[key] for key in (
+                "foundationHash", "networkId", "poolStart", "poolEnd",
+            ))
+        ):
+            raise RuntimeError("legacy endpoint allocation ledger is malformed")
         if state.get("allocations"):
             raise RuntimeError(
                 "endpoint allocations without active controller Tenants block activation"
@@ -171,6 +254,17 @@ def require_clean_controller_cutover(
         raise RuntimeError(
             f"failed to inspect endpoint allocations: {allocations.stderr}"
         )
+
+    leases = client.json("-n", "tenant-system", "get", "leases.coordination.k8s.io")
+    for lease in leases["items"]:
+        metadata = lease["metadata"]
+        if (
+            metadata["name"] != "tenant-controller.tenancy.cnpg-vcluster.io"
+            or "tenancy.cnpg-vcluster.io/slot-id" in metadata.get("labels", {})
+            or metadata.get("annotations", {}).get("tenancy.cnpg-vcluster.io/resource")
+            == "allocation-lease"
+        ):
+            raise RuntimeError("allocation Lease residue blocks controller activation")
 
     volumes = run(
         [
@@ -209,7 +303,11 @@ def require_clean_controller_cutover(
         ],
         timeout=30,
     ).stdout.split()
-    tenant_containers = sorted(set(owned_containers) | set(load_balancers))
+    workers = run(
+        ["docker", "ps", "-aq", "--filter", "label=io.x-k8s.kind.role=worker"],
+        timeout=30,
+    ).stdout.split()
+    tenant_containers = sorted(set(owned_containers) | set(load_balancers) | set(workers))
     if tenant_containers:
         raise RuntimeError(
             "CAPD tenant containers block controller activation: "

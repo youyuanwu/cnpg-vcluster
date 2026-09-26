@@ -11,6 +11,8 @@ sys.path.insert(0, str(ROOT))
 from scripts.lib.config import load_configuration, parse_duration
 from scripts.lib.controller import delete_tenant_resource, set_controller_mutation
 from scripts.lib.controller_scenarios import tenant_snapshot
+from scripts.lib.controller_client import tenant_manifest_document
+from scripts.test_e2e import capture_tenant_deletion_identity, verify_tenant_deletion
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.locking import profile_lock, tools_lock
 from scripts.lib.redaction import redact
@@ -72,18 +74,7 @@ def main() -> None:
         _require_clean_cutover(ROOT, config, client)
         try:
             set_controller_mutation(config, client, enabled=True)
-            manifest = {
-                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
-                "kind": "Tenant",
-                "metadata": {"name": TENANT_NAME},
-                "spec": {
-                    "kubernetesVersion": config["KUBERNETES_VERSION"].removeprefix("v"),
-                    "workers": 1,
-                    "databaseCount": 2,
-                    "podCIDR": "10.74.0.0/16",
-                    "serviceCIDR": "10.144.0.0/16",
-                },
-            }
+            manifest = tenant_manifest_document(config, TENANT_NAME, databases=2)
             client.kubectl(
                 "apply",
                 "--server-side",
@@ -143,6 +134,7 @@ def main() -> None:
                     "independent readiness status evaluation is not Ready: "
                     + json.dumps(evaluation["blockers"], sort_keys=True)
                 )
+            deletion = capture_tenant_deletion_identity(config, client, second)
             delete_tenant_resource(client, TENANT_NAME, wait=False)
             wait_for(
                 "Tenant readiness finalization",
@@ -150,6 +142,7 @@ def main() -> None:
                 parse_duration(config["WAIT_POLL_INTERVAL"]),
                 lambda: True if _tenant(client) is None else None,
             )
+            verify_tenant_deletion(client, deletion)
         except BaseException as exc:
             primary = exc
             raise

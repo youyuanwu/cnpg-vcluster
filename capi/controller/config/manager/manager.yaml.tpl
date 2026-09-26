@@ -7,6 +7,8 @@ metadata:
     tenancy.cnpg-vcluster.io/lifecycle-epoch: ${CONTROLLER_LIFECYCLE_EPOCH}
 spec:
   replicas: 1
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: tenant-controller
@@ -18,6 +20,7 @@ spec:
         tenancy.cnpg-vcluster.io/lifecycle-epoch: ${CONTROLLER_LIFECYCLE_EPOCH}
     spec:
       serviceAccountName: tenant-controller
+      terminationGracePeriodSeconds: 60
       containers:
       - name: manager
         image: ${TENANT_CONTROLLER_IMAGE}
@@ -28,10 +31,17 @@ spec:
         - --lifecycle-epoch=${CONTROLLER_LIFECYCLE_EPOCH}
         - --controller-image=${TENANT_CONTROLLER_IMAGE}
         - --supported-kubernetes-version=${SUPPORTED_KUBERNETES_VERSION}
-        - --webhook-cert-dir=/var/run/tenant-controller/tls
+        - --health-probe-bind-address=0.0.0.0:8081
+        env:
+        - name: POD_NAME
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.name
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
         ports:
-        - name: webhook
-          containerPort: 9443
         - name: health
           containerPort: 8081
         livenessProbe:
@@ -47,15 +57,9 @@ spec:
             cpu: 50m
             memory: 64Mi
         volumeMounts:
-        - name: webhook-cert
-          mountPath: /var/run/tenant-controller/tls
-          readOnly: true
         - name: docker-socket
           mountPath: /var/run/docker.sock
       volumes:
-      - name: webhook-cert
-        secret:
-          secretName: tenant-controller-serving-cert
       - name: docker-socket
         hostPath:
           path: /var/run/docker.sock

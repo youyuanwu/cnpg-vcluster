@@ -21,13 +21,13 @@ class ToolSchemaTests(unittest.TestCase):
             patch("scripts.tools._install_tools") as install,
             patch("scripts.tools.run") as run,
         ):
-            result = prepare_tools(Path("/tmp/example"), {})
+            result = prepare_tools(Path("example"), {})
         self.assertIs(result, verified)
         materialize.assert_called_once_with(
-            Path("/tmp/example"), {}, verified=verified
+            Path("example"), {}, verified=verified
         )
         install.assert_called_once_with(
-            Path("/tmp/example"), {}, inputs_verified=True
+            Path("example"), {}, inputs_verified=True
         )
         run.assert_not_called()
 

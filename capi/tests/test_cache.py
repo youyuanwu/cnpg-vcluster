@@ -16,6 +16,8 @@ from scripts.cache import (
     ACTIVE_SCHEMA,
     CACHE_SCHEMA,
     IMAGE_PLATFORM,
+    VerifiedCache,
+    _requirements,
     _registry_get,
     _verify_archive_metadata,
     restore_host_image,
@@ -24,6 +26,7 @@ from scripts.cache import (
 )
 from scripts.lib.files import IntegrityError
 from scripts.lib.files import write_private_file as real_write_private_file
+from scripts.lib.config import load_configuration
 
 
 TAGGED = "example.invalid/lab/image:v1"
@@ -106,6 +109,63 @@ def write_archive(
 
 
 class CacheTests(unittest.TestCase):
+    def test_cargo_lock_and_compiler_are_cache_requirements(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            controller = root / "controller"
+            controller.mkdir()
+            (controller / "Cargo.toml").write_text("[package]\n")
+            (controller / "Cargo.lock").write_text("locked inputs")
+            config = load_configuration(Path(__file__).resolve().parents[1])
+            with patch("scripts.lib.controller.rust_toolchain",
+                       return_value=("cargo", {}, "compiler A")):
+                original = _requirements(config, root)
+                self.assertEqual(original["cargo"]["lockSha256"],
+                                 hashlib.sha256(b"locked inputs").hexdigest())
+            with patch("scripts.lib.controller.rust_toolchain",
+                       return_value=("cargo", {}, "compiler B")):
+                self.assertNotEqual(original, _requirements(config, root))
+            (controller / "Cargo.lock").write_text("changed")
+            with patch("scripts.lib.controller.rust_toolchain",
+                       return_value=("cargo", {}, "compiler A")):
+                self.assertNotEqual(original, _requirements(config, root))
+            (controller / "Cargo.lock").unlink()
+            with self.assertRaisesRegex(IntegrityError, "Cargo.lock"):
+                _requirements(config, root)
+
+    def test_verified_cache_rejects_missing_offline_cargo_dependencies(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "controller").mkdir()
+            (root / "controller/Cargo.toml").write_text("[package]\n")
+            with (
+                patch("scripts.cache.active_generation", return_value=root),
+                patch("scripts.cache._requirements", return_value={"cargo": {}}),
+                patch("scripts.cache._load_inventory_header", return_value={}),
+                patch("scripts.cache._cache_state_sha256", return_value="state"),
+                patch("scripts.lib.controller.fetch_controller_dependencies",
+                      side_effect=RuntimeError("missing locked crate")) as fetch,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "missing locked crate"):
+                    verify_cache(root, {})
+                fetch.assert_called_once_with(root, {}, offline=True)
+
+    def test_online_cache_does_not_publish_before_locked_cargo_fetch(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            (root / "controller").mkdir()
+            (root / "controller/Cargo.toml").write_text("[package]\n")
+            with (
+                patch("scripts.cache.acquire_tools"),
+                patch("scripts.lib.controller.fetch_controller_dependencies",
+                      side_effect=RuntimeError("locked fetch failed")) as fetch,
+            ):
+                with self.assertRaisesRegex(RuntimeError, "locked fetch failed"):
+                    acquire_cache(root, {"DOWNLOAD_TIMEOUT": "1s"})
+            fetch.assert_called_once_with(root, {"DOWNLOAD_TIMEOUT": "1s"})
+            self.assertFalse((root / ".tools/cache/active.json").exists())
+            self.assertEqual([], list((root / ".tools/cache/generations").iterdir()))
+
     def test_registry_get_retries_incomplete_response_body(self) -> None:
         incomplete = MagicMock()
         incomplete.__enter__.return_value.read.side_effect = (
@@ -349,6 +409,51 @@ class CacheTests(unittest.TestCase):
                 "old",
             )
             self.assertFalse((cache / "generations/new").exists())
+
+    def test_reacquiring_identical_cache_keeps_foundation_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            root.joinpath(".tools/cache").mkdir(parents=True, mode=0o700)
+            for directory in (root / ".tools", root / ".tools/cache"):
+                directory.chmod(0o700)
+            archive_content = [b"same"]
+
+            def tools(*_, tools_dir: Path, **__) -> None:
+                (tools_dir / "bin").mkdir()
+
+            def archive(_config, _key, destination, _timeout) -> None:
+                destination.parent.mkdir()
+                destination.write_bytes(archive_content[0])
+
+            def verified_cache(path, _config, *, force=False):
+                active = json.loads((path / ".tools/cache/active.json").read_text())
+                return VerifiedCache(
+                    path / ".tools/cache/generations" / active["generation"], {}, "state",
+                )
+
+            with (
+                patch("scripts.cache.acquire_tools", side_effect=tools),
+                patch("scripts.cache.image_keys", return_value=("TEST_IMAGE",)),
+                patch("scripts.cache._archive_image", side_effect=archive),
+                patch("scripts.cache._requirements", return_value={"inputs": "pinned"}),
+                patch("scripts.cache.verify_generation") as verify,
+                patch("scripts.cache.verify_cache", side_effect=verified_cache),
+                patch("scripts.cache.materialize_inputs"),
+            ):
+                config = {"DOWNLOAD_TIMEOUT": "1s"}
+                acquire_cache(root, config)
+                active = root / ".tools/cache/active.json"
+                first = json.loads(active.read_text())["generation"]
+                acquire_cache(root, config)
+                self.assertEqual(json.loads(active.read_text())["generation"], first)
+                self.assertEqual(
+                    [path.name for path in (root / ".tools/cache/generations").iterdir()],
+                    [first],
+                )
+                self.assertEqual(verify.call_args_list[-1].args[2].name, first)
+                archive_content[0] = b"changed"
+                acquire_cache(root, config)
+                self.assertNotEqual(json.loads(active.read_text())["generation"], first)
 
     def test_active_pointer_publication_failure_keeps_old_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

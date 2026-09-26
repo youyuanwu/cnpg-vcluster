@@ -1,10 +1,8 @@
-apiVersion: tenancy.cnpg-vcluster.io/v1alpha1
+apiVersion: tenancy.cnpg-vcluster.io/v1alpha2
 kind: Tenant
 metadata:
   name: tenant-c
 spec:
   kubernetesVersion: 1.36.4
   workers: 3
-  databaseCount: 3
-  podCIDR: 10.75.0.0/16
-  serviceCIDR: 10.145.0.0/16
+  databases: 3

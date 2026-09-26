@@ -96,14 +96,12 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
         spec = {
             "kubernetesVersion": version,
             "workers": workers,
-            "databaseCount": 1,
-            "podCIDR": "10.220.0.0/16",
-            "serviceCIDR": "10.221.0.0/16",
+            "databases": 1,
         }
         if unknown:
             spec["unknown"] = True
         return {
-            "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+            "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
             "kind": "Tenant",
             "metadata": {"name": "validation-fixture"},
             "spec": spec,
@@ -123,7 +121,7 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
         unknown.stdout + unknown.stderr
     ).lower():
         raise RuntimeError(
-            "Tenant webhook accepted an unknown field\n"
+            "Tenant API accepted an unknown field under strict validation\n"
             f"{unknown.stdout}{unknown.stderr}"
         )
     for description, invalid in (
@@ -135,12 +133,12 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
             },
         ),
         (
-            "overlapping networks",
+            "database count above the maximum",
             {
                 **manifest(),
                 "spec": {
                     **manifest()["spec"],
-                    "serviceCIDR": manifest()["spec"]["podCIDR"],
+                    "databases": 4,
                 },
             },
         ),
@@ -156,7 +154,7 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
             check=False,
         )
         if rejected.returncode == 0:
-            raise RuntimeError(f"Tenant webhook accepted {description}")
+            raise RuntimeError(f"Tenant API accepted {description}")
 
     client.kubectl(
         "apply",
@@ -186,7 +184,7 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
         "--field-manager=management-test",
         "-f",
         "-",
-        input_text=json.dumps(manifest(version="1.36.4")),
+        input_text=json.dumps(manifest()),
     )
     changed = client.kubectl(
         "apply",
@@ -195,13 +193,13 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
         "--field-manager=management-test",
         "-f",
         "-",
-        input_text=json.dumps(manifest(version="1.36.4", workers=2)),
+        input_text=json.dumps(manifest(workers=2)),
         check=False,
     )
     if changed.returncode == 0 or "immutable" not in (
         changed.stdout + changed.stderr
     ).lower():
-        raise RuntimeError("Tenant webhook accepted a semantic specification change")
+        raise RuntimeError("Tenant CEL accepted a semantic specification change")
     client.kubectl(
         "delete",
         "tenant",

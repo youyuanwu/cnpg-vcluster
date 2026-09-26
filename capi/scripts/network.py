@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from pathlib import Path
 
 from scripts.endpoint import run_endpoint_gate
@@ -8,6 +9,7 @@ from scripts.lib.addons import verify_network, wait_network_ready
 from scripts.lib.config import parse_duration
 from scripts.lib.controller_scenarios import (
     delete_controller_tenant,
+    tenant_document,
     tenant_manifest,
     wait_tenant_ready,
 )
@@ -157,43 +159,83 @@ def _restart_controller(client, config, tenant) -> None:
     wait_tenant_ready(client.root, config, tenant.name)
 
 
-def _drift_kube_proxy_and_wait_for_repair(
+def _verify_static_kube_proxy(
     root: Path,
     config: dict[str, str],
     tenant,
 ) -> None:
-    _tenant_kubectl(
-        root,
-        config,
-        tenant,
-        "-n",
-        "kube-system",
-        "patch",
-        "configmap/capi-kube-proxy",
-        "--type=merge",
-        "-p",
-        '{"data":{"config.conf":"apiVersion: kubeproxy.config.k8s.io/v1alpha1\\n'
-        'kind: KubeProxyConfiguration\\nconntrack:\\n  maxPerCore: 1\\n"}}',
-    )
-    try:
-        verify_network(root, config, tenant)
-    except RuntimeError:
-        pass
-    else:
-        raise RuntimeError("kube-proxy drift was not detected")
+    from scripts.lib.kube import ManagementClient
 
-    def repaired():
-        try:
-            verify_network(root, config, tenant)
-            return True
-        except RuntimeError:
+    client = ManagementClient(root, config)
+    arguments = ("-n", "kube-system")
+    resource = "configmap/capi-kube-proxy"
+    original = json.loads(_tenant_kubectl(
+        root, config, tenant, *arguments, "get", resource, "-o", "json",
+    ).stdout)
+    annotation = "tenancy.cnpg-vcluster.io/tenant-uid"
+    uid = original["metadata"]["annotations"][annotation]
+
+    def reconcile():
+        # Static objects are not content watches; wake the Tenant without changing its spec.
+        client.kubectl("annotate", f"tenant/{tenant.name}", "--overwrite",
+                       f"tenancy.cnpg-vcluster.io/live-probe={time.monotonic_ns()}")
+
+    _tenant_kubectl(root, config, tenant, *arguments, "annotate", resource,
+                    f"{annotation}=foreign-fixture", "--overwrite")
+    reconcile()
+    try:
+        wait_for(
+            "static kube-proxy foreign ownership refusal",
+            parse_duration(config["CONDITION_TIMEOUT"]), 2,
+            lambda: (
+                document if (document := tenant_document(client, tenant.name))
+                and document.get("status", {}).get("phase") == "OwnershipInvalid" else None
+            ),
+        )
+        foreign = json.loads(_tenant_kubectl(
+            root, config, tenant, *arguments, "get", resource, "-o", "json",
+        ).stdout)
+        if (
+            foreign["metadata"]["uid"] != original["metadata"]["uid"]
+            or foreign["metadata"]["annotations"][annotation] != "foreign-fixture"
+            or foreign["data"] != original["data"]
+        ):
+            raise RuntimeError("controller modified a foreign static resource")
+    finally:
+        _tenant_kubectl(
+            root, config, tenant, *arguments, "patch", resource, "--type=json", "-p",
+            json.dumps([
+                {"op": "test", "path": "/metadata/uid", "value": original["metadata"]["uid"]},
+                {"op": "test", "path": "/metadata/annotations/tenancy.cnpg-vcluster.io~1tenant-uid", "value": "foreign-fixture"},
+                {"op": "replace", "path": "/metadata/annotations/tenancy.cnpg-vcluster.io~1tenant-uid", "value": uid},
+            ]),
+        )
+        reconcile()
+    wait_tenant_ready(root, config, tenant.name)
+    _tenant_kubectl(root, config, tenant, *arguments, "delete", resource, "--wait=true")
+    reconcile()
+
+    def recreated():
+        response = _tenant_kubectl(
+            root, config, tenant, *arguments, "get", resource, "-o", "json",
+            "--ignore-not-found=true",
+        )
+        if not response.stdout.strip():
             return None
+        observed = json.loads(response.stdout)
+        if observed["metadata"]["uid"] == original["metadata"]["uid"]:
+            return None
+        if (
+            observed["data"] != original["data"]
+            or observed["metadata"]["annotations"] != original["metadata"]["annotations"]
+            or observed["metadata"]["labels"] != original["metadata"]["labels"]
+        ):
+            raise RuntimeError("recreated static resource content or ownership differs")
+        return observed
 
     wait_for(
-        "controller kube-proxy drift repair",
-        parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"]),
-        parse_duration(config["WAIT_POLL_INTERVAL"]),
-        repaired,
+        "controller static kube-proxy recreation",
+        parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"]), 2, recreated,
     )
 
 
@@ -255,7 +297,7 @@ def run_network_gate(
         _restart_kube_proxy(root, config, tenant)
         wait_tenant_ready(root, config, tenant.name)
         verify_network(root, config, tenant)
-        _drift_kube_proxy_and_wait_for_repair(root, config, tenant)
+        _verify_static_kube_proxy(root, config, tenant)
         _drift_machine_deployment_and_wait_for_repair(client, config, tenant)
         _restart_controller(client, config, tenant)
         verify_network(root, config, tenant)

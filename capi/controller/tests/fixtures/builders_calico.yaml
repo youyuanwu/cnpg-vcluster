@@ -1,0 +1,47 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: calico-node
+  namespace: kube-system
+  labels:
+    k8s-app: calico-node
+  annotations:
+    upstream.example/keep: preserved
+spec:
+  template:
+    spec:
+      containers:
+      - name: calico-node
+        image: calico/node:tag
+        env:
+        - name: OTHER
+          value: preserved
+      initContainers:
+      - name: install-cni
+        image: calico/cni:tag
+      - name: upgrade-ipam
+        image: calico/cni:tag
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: calico-kube-controllers
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: controller
+        image: calico/controllers:tag
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: calico-typha
+  namespace: kube-system
+spec:
+  template:
+    spec:
+      containers:
+      - name: typha
+        image: calico/node:tag

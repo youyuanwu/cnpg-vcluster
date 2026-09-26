@@ -32,10 +32,10 @@ EXPECTED_RECIPES = {
     "local-tenant-status",
     "local-tenant-delete",
     "controller-generate",
-    "controller-tools",
+    "controller-fetch",
     "controller-verify",
     "controller-test",
-    "controller-vet",
+    "controller-lint",
     "controller-build",
     "controller-image",
     "test-controller-convergence",
@@ -165,12 +165,13 @@ def check_repository_boundaries() -> None:
     check(not (repository / "vcluster").exists(), "obsolete vcluster lab remains")
     check(not (repository / "kamaji").exists(), "obsolete standalone Kamaji lab remains")
     required_controller_files = (
-        "controller/go.mod",
+        "controller/Cargo.toml",
+        "controller/Cargo.lock",
+        "controller/src/bin/manager.rs",
         "controller/Dockerfile",
         "controller/API_COMPATIBILITY.md",
-        "controller/api/v1alpha1/tenant_types.go",
-        "controller/cmd/manager/main.go",
-        "controller/config/webhook/validating-webhook.yaml",
+        "controller/config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml",
+        "controller/config/rbac/role.yaml",
         "config/tenants/examples/local.yaml",
         "config/tenants/tests/tenant-a.yaml",
         "config/tenants/tests/tenant-b.yaml",
@@ -180,31 +181,64 @@ def check_repository_boundaries() -> None:
     )
     for relative in required_controller_files:
         check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
-    check(
-        not (ROOT / "controller" / "vendor").exists(),
-        "Go dependencies must use the module cache; controller/vendor is forbidden",
+    controller = ROOT / "controller"
+    check(not list(controller.rglob("*.go")), "local controller Go source remains")
+    check(not list(controller.rglob("go.mod")) and not list(controller.rglob("go.sum")),
+          "local controller Go module remains")
+    check(not (controller / "config" / "staged").exists(), "staged artifacts remain")
+    check(not (controller / "config" / "webhook").exists(), "local webhook manifests remain")
+    crd = (controller / "config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml").read_text(
+        encoding="utf-8"
     )
-    manager = (
-        ROOT / "controller" / "config" / "manager" / "manager.yaml.tpl"
-    ).read_text(encoding="utf-8")
+    check("name: v1alpha2" in crd and "name: v1alpha1" not in crd
+          and "controller-gen.kubebuilder.io" not in crd,
+          "the authoritative Tenant CRD is not Rust v1alpha2")
+    generator = (controller / "src/bin/generate.rs").read_text(encoding="utf-8")
+    check('join("config")' in generator and
+          '"crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml"' in generator,
+          "generator does not target the authoritative CRD")
+    tracked = output("git", "ls-files", "--cached", "capi/controller").stdout.splitlines()
+    present = output("git", "ls-files", "--deleted", "capi/controller").stdout.splitlines()
+    live_tracked = set(tracked) - set(present)
+    check(not any(name.endswith((".go", "/go.mod", "/go.sum")) or
+                  "/config/webhook/" in name for name in live_tracked),
+          "tracked legacy controller surface remains")
+    manager = (controller / "config" / "manager" / "manager.yaml.tpl").read_text(encoding="utf-8")
+    check(not re.search(r"webhook|tls|9443|serving-cert", manager, re.IGNORECASE),
+          "manager still exposes local admission webhook or TLS")
+    for relative in ("scripts", "config/versions.env", "Justfile"):
+        paths = (ROOT / relative).rglob("*.py") if relative == "scripts" else (ROOT / relative,)
+        for path in paths:
+            text = path.read_text(encoding="utf-8")
+            if path.name == "test_static.py" or path.name == "controller_cutover.py":
+                continue
+            check(not re.search(r"GO_VERSION|GO_URL|GO_SHA256|ENVTEST_|controller-gen\b|"
+                                r"GOCACHE|GOMODCACHE|KUBEBUILDER_ASSETS|"
+                                r"controller-tools|controller-vet|go-mod-cache|"
+                                r"go-linux-amd64|envtest-linux-amd64", text),
+                  f"legacy controller acquisition or environment in {path}")
+    for relative in ("scripts/lib/controller.py", "scripts/endpoint.py"):
+        text = (ROOT / relative).read_text(encoding="utf-8")
+        check(not re.search(r'config[/"]\s*/?\s*["\']webhook|'
+                            r'validating-webhook\.yaml|tenant-controller-serving-cert|'
+                            r'--webhook-port|9443', text),
+              f"local admission lifecycle remains in {relative}")
+    workflow = (ROOT.parent / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    check(not re.search(r"go\.mod|go\.sum|envtest|controller-gen\b|"
+                        r"controller-tools|controller-vet|go-mod-cache|"
+                        r"go-linux-amd64|GO_VERSION|GOCACHE|GOMODCACHE", workflow),
+          "CI still references local Go tooling")
     check(
         "--mutation-enabled=${CONTROLLER_MUTATION_ENABLED}" in manager,
         "Tenant controller mutation template placeholder is missing",
     )
-    lifecycle_epoch = "worker-bootstrap-v4"
+    lifecycle_epoch = "rust-operator-v1"
     check(
         f'CONTROLLER_LIFECYCLE_EPOCH = "{lifecycle_epoch}"'
         in (ROOT / "scripts" / "lib" / "controller.py").read_text(
             encoding="utf-8"
         ),
         "controller installer lifecycle epoch is inconsistent",
-    )
-    check(
-        f'"lifecycle-epoch", "{lifecycle_epoch}"'
-        in (ROOT / "controller" / "cmd" / "manager" / "main.go").read_text(
-            encoding="utf-8"
-        ),
-        "controller manager lifecycle epoch is inconsistent",
     )
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
     check(
@@ -258,7 +292,9 @@ def check_repository_boundaries() -> None:
             "scripts/test_controller_convergence.py",
             "scripts/test_controller_readiness.py",
             "scripts/test_controller_deletion.py",
+            "scripts/test_controller_allocation.py",
             "scripts/test_tenant_lifecycle.py",
+            "scripts/test_e2e.py",
         )
     )
     for token in (
@@ -269,31 +305,23 @@ def check_repository_boundaries() -> None:
         'status.get("workerContainers")',
         'status.get("teardown")',
         'status.get("specHash")',
+        'status.get("endpoint")',
+        'spec["podCIDR"]',
+        'spec["serviceCIDR"]',
+        'spec["databaseCount"]',
+        "tenant-endpoint-allocations",
     ):
         check(
             token not in controller_python,
             f"controller scenario still consumes removed status field: {token}",
         )
-    controller_go = "\n".join(
-        path.read_text(encoding="utf-8")
-        for path in (ROOT / "controller").rglob("*.go")
-        if not path.name.endswith("_test.go")
+    network_source = (ROOT / "scripts" / "network.py").read_text(encoding="utf-8")
+    check(
+        "_drift_kube_proxy_and_wait_for_repair" not in network_source
+        and "_verify_static_kube_proxy" in network_source
+        and "_drift_machine_deployment_and_wait_for_repair" in network_source,
+        "network gate must retain static ownership/recreation and dynamic repair, not static content repair",
     )
-    for token in (
-        ".Status.Stage",
-        ".ObservedResources",
-        ".TenantResources",
-        "DockerVolumeIdentity",
-        "WorkerContainerEvidence",
-        "TeardownStatus",
-        "TenantAPICleanupUnavailable",
-        "LiveBootstrapRBACCleanupComplete",
-        "reconcileStableDesiredObjects",
-    ):
-        check(
-            token not in controller_go,
-            f"simplified controller restored removed workflow state: {token}",
-        )
     check(
         "def delete_tenant(" not in (
             ROOT / "scripts" / "lib" / "tenants.py"
@@ -308,9 +336,11 @@ def check_repository_boundaries() -> None:
     ):
         manifest = (ROOT / relative).read_text(encoding="utf-8")
         check(
-            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha1" in manifest
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2" in manifest
             and "kind: Tenant" in manifest
-            and f"name: {expected_name}" in manifest,
+            and f"name: {expected_name}" in manifest
+            and set(re.findall(r"^  ([a-zA-Z]+):", manifest.split("spec:\n")[1], re.MULTILINE))
+            == {"kubernetesVersion", "workers", "databases"},
             f"invalid local Tenant manifest {relative}",
         )
     production = [
@@ -396,7 +426,6 @@ def check_documentation() -> None:
         "only on the private kind Docker network",
     )
     required_design = (
-        "`tenancy.cnpg-vcluster.io/v1alpha1`",
         "Ordinary Kubernetes DELETE is accepted",
         "There is no ClusterResourceSet",
         "`preKubeadmCommands`",
@@ -428,7 +457,6 @@ def check_documentation() -> None:
         "Foundation status rejects a missing, broadened, or conflicting selector.",
         "Targeted deletion to canonical absence",
         "Recreate from the same specification and reach Ready",
-        "The local `tenancy.cnpg-vcluster.io/v1alpha1` CRD and Go controller are not the Azure lifecycle API",
     )
     for token in required_azure_design:
         check(
