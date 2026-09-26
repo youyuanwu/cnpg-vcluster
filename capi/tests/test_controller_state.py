@@ -97,6 +97,49 @@ class ControllerStateTests(unittest.TestCase):
                 for entry in catalog
             )
         )
+        by_kind = {entry["kind"]: entry for entry in catalog}
+        self.assertEqual(
+            {
+                key: by_kind["Namespace"][key]
+                for key in (
+                    "namespaced", "role", "inventoryPolicy", "exemptions"
+                )
+            },
+            {
+                "namespaced": False,
+                "role": "namespace",
+                "inventoryPolicy": "tenant-markers",
+                "exemptions": ["management-infrastructure"],
+            },
+        )
+        self.assertEqual(
+            {
+                key: by_kind["Secret"][key]
+                for key in (
+                    "namespaced", "role", "inventoryPolicy", "exemptions"
+                )
+            },
+            {
+                "namespaced": True,
+                "role": "tenant-kubeconfig",
+                "inventoryPolicy": "tenant-markers-or-kamaji-owner",
+                "exemptions": ["controller-installation-secrets"],
+            },
+        )
+        self.assertEqual(
+            {
+                key: by_kind["Lease"][key]
+                for key in (
+                    "namespaced", "role", "inventoryPolicy", "exemptions"
+                )
+            },
+            {
+                "namespaced": True,
+                "role": "allocation-lease",
+                "inventoryPolicy": "allocation-markers",
+                "exemptions": ["controller-leader-election"],
+            },
+        )
 
     def test_activation_ticket_is_bound_to_candidate_and_time(self) -> None:
         ticket = activation_ticket("hash-a", "token-a")

@@ -656,9 +656,10 @@ def reconcile_controller(
                 "-o",
                 "json",
             ).stdout.strip()
+            accepted_document = json.loads(accepted) if accepted else None
             current_hash = (
-                json.loads(accepted).get("data", {}).get("configurationHash")
-                if accepted
+                accepted_document.get("data", {}).get("configurationHash")
+                if accepted_document
                 else None
             )
             if current_hash == desired_hash:
@@ -668,6 +669,40 @@ def reconcile_controller(
                     "controller acceptance changed during failed replacement; "
                     "refusing to restore an older identity"
                 )
+            if accepted_document is not None:
+                rollback_token = uuid.uuid4().hex
+                client.kubectl(
+                    "-n",
+                    CONTROLLER_NAMESPACE,
+                    "patch",
+                    "configmap/tenant-controller-state",
+                    "--type=merge",
+                    "-p",
+                    json.dumps({
+                        "metadata": {
+                            "resourceVersion": accepted_document["metadata"][
+                                "resourceVersion"
+                            ]
+                        },
+                        "data": {"rollbackToken": rollback_token},
+                    }),
+                )
+                stop_controller(config, client)
+                locked = client.json(
+                    "-n",
+                    CONTROLLER_NAMESPACE,
+                    "get",
+                    "configmap/tenant-controller-state",
+                )
+                if (
+                    locked.get("data", {}).get("configurationHash")
+                    != accepted_hash
+                    or locked.get("data", {}).get("rollbackToken")
+                    != rollback_token
+                ):
+                    raise RuntimeError(
+                        "controller acceptance changed while acquiring rollback lock"
+                    )
             for name, document in previous.items():
                 if name == "configmap/tenant-controller-state":
                     continue
@@ -697,6 +732,21 @@ def reconcile_controller(
                 CONTROLLER_NAMESPACE,
                 "configmap/tenant-controller-activation",
             )
+            if accepted_document is not None:
+                client.kubectl(
+                    "-n",
+                    CONTROLLER_NAMESPACE,
+                    "patch",
+                    "configmap/tenant-controller-state",
+                    "--type=merge",
+                    "-p",
+                    json.dumps({
+                        "metadata": {
+                            "resourceVersion": locked["metadata"]["resourceVersion"]
+                        },
+                        "data": {"rollbackToken": None},
+                    }),
+                )
         raise
     verify_controller_image(config, client, image)
     verify_controller_api(config, client)

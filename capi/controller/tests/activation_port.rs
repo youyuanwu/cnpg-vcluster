@@ -78,6 +78,42 @@ async fn same_identity_restart_needs_no_ticket_or_inventory() {
     assert!(docker.calls.lock().unwrap().is_empty());
 }
 
+#[test]
+fn typed_catalog_policies_match_activation_contract() {
+    for (kind, namespaced, role, policy, exemption) in [
+        (
+            "Namespace",
+            false,
+            "namespace",
+            InventoryPolicy::TenantMarkers,
+            "management-infrastructure",
+        ),
+        (
+            "Secret",
+            true,
+            "tenant-kubeconfig",
+            InventoryPolicy::TenantMarkersOrKamajiOwner,
+            "controller-installation-secrets",
+        ),
+        (
+            "Lease",
+            true,
+            "allocation-lease",
+            InventoryPolicy::AllocationMarkers,
+            "controller-leader-election",
+        ),
+    ] {
+        let resource = ACTIVATION_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == kind)
+            .unwrap();
+        assert_eq!(resource.namespaced, namespaced);
+        assert_eq!(resource.role, role);
+        assert_eq!(resource.inventory_policy, policy);
+        assert_eq!(resource.exemptions, [exemption]);
+    }
+}
+
 #[tokio::test]
 async fn changed_identity_requires_ticket_and_atomically_accepts_clean_state() {
     let server = clean_server();
@@ -179,12 +215,16 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
             ),
             "volume" => {
                 docker.volumes.lock().unwrap().insert(
-                    "tenant-a-storage".into(),
+                    "project-volume".into(),
                     tenant_controller::docker::DockerVolume {
-                        name: "tenant-a-storage".into(),
+                        name: "project-volume".into(),
                         created_at: "now".into(),
                         mountpoint: "/volume".into(),
-                        labels: Default::default(),
+                        labels: [(
+                            "cnpg-vcluster.capi/role".into(),
+                            "unexpected-role".into(),
+                        )]
+                        .into(),
                     },
                 );
             }

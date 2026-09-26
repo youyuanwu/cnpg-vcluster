@@ -258,7 +258,11 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         old_state = {
             "apiVersion": "v1",
             "kind": "ConfigMap",
-            "metadata": {"name": "tenant-controller-state", "namespace": "tenant-system"},
+            "metadata": {
+                "name": "tenant-controller-state",
+                "namespace": "tenant-system",
+                "resourceVersion": "1",
+            },
             "data": {"configurationHash": "old-hash"},
         }
         old_deployment = {
@@ -269,13 +273,20 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         }
         events = []
 
+        current_state = copy.deepcopy(old_state)
+
         def handle(*args, **kwargs):
             if "get" in args and "configmap/tenant-foundation" in args:
                 return response(old)
             if "get" in args and "configmap/tenant-controller-state" in args:
-                return response(old_state)
+                return response(current_state)
             if "get" in args and "deployment/tenant-controller" in args:
                 return response(old_deployment)
+            if "patch" in args and "configmap/tenant-controller-state" in args:
+                patch_value = json.loads(args[args.index("-p") + 1])
+                current_state["data"].update(patch_value["data"])
+                current_state["metadata"]["resourceVersion"] = "2"
+                return response(current_state)
             if kwargs.get("input_text"):
                 events.append(("apply", kwargs["input_text"]))
             return response()
@@ -315,7 +326,11 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         old_state = {
             "apiVersion": "v1",
             "kind": "ConfigMap",
-            "metadata": {"name": "tenant-controller-state", "namespace": "tenant-system"},
+            "metadata": {
+                "name": "tenant-controller-state",
+                "namespace": "tenant-system",
+                "resourceVersion": "1",
+            },
             "data": {"configurationHash": "old-hash"},
         }
         for accepted_after, error in (

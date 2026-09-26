@@ -260,11 +260,7 @@ async fn require_clean_inventory<D: DockerClient>(
         .iter()
         .any(|volume| {
             volume.name.ends_with("-storage")
-                || volume
-                    .labels
-                    .get("cnpg-vcluster.capi/role")
-                    .map(String::as_str)
-                    == Some("tenant-storage")
+                || volume.labels.contains_key("cnpg-vcluster.capi/role")
                 || volume.labels.contains_key("cnpg-vcluster.capi/tenant")
                 || volume
                     .labels
