@@ -1,12 +1,9 @@
-mod creation_support;
-mod support;
-
-use creation_support::{FakeDocker, tenant};
+use crate::creation_support::{FakeDocker, tenant};
+use crate::support::Server;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use serde_json::json;
-use support::Server;
 use tenant_controller::{
     activation::{STATE_NAME, TICKET_NAME, admit},
     management::{InventoryPolicy, MANAGEMENT_RESOURCES},
@@ -279,7 +276,7 @@ async fn accepted_state_survives_ticket_delete_failure_without_replay() {
         "DELETE",
         TICKET,
         503,
-        support::kube::status(503, "Unavailable"),
+        crate::support::kube::status(503, "Unavailable"),
     );
     let docker = FakeDocker::default();
     assert!(
@@ -302,7 +299,12 @@ async fn provider_discovery_uncertainty_is_not_absence() {
         .unwrap();
     let (group, version) = first.api_version.split_once('/').unwrap();
     let path = format!("/apis/{group}/{version}/{}", first.plural);
-    server.respond("GET", &path, 404, support::kube::status(404, "NotFound"));
+    server.respond(
+        "GET",
+        &path,
+        404,
+        crate::support::kube::status(404, "NotFound"),
+    );
     assert!(
         admit(server.client(), &FakeDocker::default(), "hash-b", "token-b")
             .await

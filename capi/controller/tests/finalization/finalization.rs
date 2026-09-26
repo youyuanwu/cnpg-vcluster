@@ -1,16 +1,13 @@
-mod creation_support;
-mod support;
-
 use std::{
     collections::BTreeMap,
     sync::{Arc, Mutex},
 };
 
+use crate::support::Server;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Namespace;
 use kube::{ResourceExt, core::DynamicObject, runtime::controller::Action};
 use serde_json::{Value, json};
-use support::Server;
 use tenant_controller::{
     allocation::{ClaimContext, new_lease},
     api::{
@@ -34,7 +31,7 @@ const NAMESPACE: &str = "/api/v1/namespaces/tenant-a";
 
 fn fixture() -> (Arc<RuntimeFoundation>, String, AllocationSlot) {
     let value: Value =
-        serde_json::from_str(include_str!("fixtures/foundation-schema3.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/foundation-schema3.json")).unwrap();
     let raw = value["foundation"].to_string();
     let hash = canonical_hash(&raw).unwrap();
     let slot = serde_json::from_value(value["foundation"]["slots"][0].clone()).unwrap();
@@ -87,7 +84,7 @@ fn identity<'a>(hash: &'a str) -> Identity<'a> {
 }
 
 fn path(object: &DynamicObject) -> String {
-    creation_support::path(object)
+    crate::creation_support::path(object)
 }
 
 fn root(hash: &str) -> DynamicObject {
@@ -95,7 +92,7 @@ fn root(hash: &str) -> DynamicObject {
         .iter()
         .find(|resource| resource.kind == "Cluster")
         .unwrap();
-    let mut object = creation_support::object(
+    let mut object = crate::creation_support::object(
         resource.api_version,
         resource.kind,
         NAME,
@@ -343,7 +340,7 @@ async fn generation_change_and_status_conflict_never_mutate_resources() {
                 "PATCH",
                 &format!("{TENANT_PATH}/status"),
                 409,
-                support::kube::status(409, "Conflict"),
+                crate::support::kube::status(409, "Conflict"),
             );
         }
         assert!(
@@ -380,7 +377,7 @@ async fn discovery_failure_and_successor_race_retain_finalizer() {
                 "GET",
                 &format!("/apis/{group}/{version}/namespaces/{NAME}/{}", first.plural),
                 503,
-                support::kube::status(503, "Unavailable"),
+                crate::support::kube::status(503, "Unavailable"),
             );
         } else {
             server.replace_on(

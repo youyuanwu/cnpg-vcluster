@@ -113,7 +113,7 @@ fn management_cluster_golden_and_namespace_identity() {
     let context = fixture.context();
     let object = cluster(&context).unwrap();
     let golden: Value =
-        serde_json::from_str(include_str!("fixtures/builders_cluster.json")).unwrap();
+        serde_json::from_str(include_str!("../fixtures/builders_cluster.json")).unwrap();
     assert_eq!(value(&object), golden);
     assert_markers(&object, "cluster");
     let namespace: Namespace = namespace(&context);
@@ -382,7 +382,7 @@ fn find<'a>(objects: &'a [DynamicObject], kind: &str, name: &str) -> &'a Dynamic
 fn network_builder_pins_images_updates_pool_merges_metadata_and_sorts() {
     let fixture = Fixture::new();
     let context = fixture.context();
-    let calico = include_bytes!("fixtures/builders_calico.yaml");
+    let calico = include_bytes!("../fixtures/builders_calico.yaml");
     let bundle = build_network(&context, calico, &images()).unwrap();
     assert_eq!(bundle.objects.len(), 8);
     let node = find(&bundle.objects, "DaemonSet", "calico-node");
@@ -446,7 +446,7 @@ fn network_builder_pins_images_updates_pool_merges_metadata_and_sorts() {
 #[test]
 fn network_rejects_changed_upstream_image_counts_and_malformed_pools() {
     let fixture = Fixture::new();
-    let calico = include_str!("fixtures/builders_calico.yaml");
+    let calico = include_str!("../fixtures/builders_calico.yaml");
     for image in [
         "calico/cni:tag",
         "calico/node:tag",

@@ -169,15 +169,30 @@ def build_controller_binary(
     root: Path,
     config: dict[str, str],
 ) -> Path:
+    output = root / ".runtime" / "rendered" / "controller" / "manager"
+    ensure_private_dir(output.parent)
+    output.unlink(missing_ok=True)
+    prebuilt = os.environ.get("CAPI_PREBUILT_CONTROLLER_BINARY")
+    if prebuilt:
+        source = Path(prebuilt).resolve()
+        expected_root = (root / ".tools" / "artifacts").resolve()
+        if (
+            not source.is_file()
+            or not source.is_relative_to(expected_root)
+        ):
+            raise RuntimeError(
+                "configured prebuilt controller binary is missing or outside .tools/artifacts"
+            )
+        verify_static_manager(source)
+        shutil.copy2(source, output)
+        output.chmod(0o700)
+        return output
     fetch_controller_dependencies(root, config)
     cargo, environment, _ = rust_toolchain(root)
     target = root.resolve() / ".tools" / "cargo-target" / "offline-verification"
     shutil.rmtree(target, ignore_errors=True)
     ensure_private_dir(target)
     environment["CARGO_TARGET_DIR"] = str(target)
-    output = root / ".runtime" / "rendered" / "controller" / "manager"
-    ensure_private_dir(output.parent)
-    output.unlink(missing_ok=True)
     run(
         [
             cargo, "rustc", "--locked", "--offline", "--release", "--bin", "manager",

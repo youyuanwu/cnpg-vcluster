@@ -1,19 +1,17 @@
 use std::time::Duration;
 
-mod support;
-
+use crate::support::{Server, kube::Call};
 use base64::{Engine, engine::general_purpose::STANDARD};
 use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
 use kube::core::{DynamicObject, Status};
 use serde_json::{Value, json};
-use support::{Server, kube::Call};
 use tenant_controller::resources::bootstrap_rbac;
 use tenant_controller::tenant_client::*;
 
 // Self-signed, deliberately public test identity. Never used by live clients.
-const CERTIFICATE: &str = include_str!("fixtures/adapters-test-only.crt");
-const PRIVATE_KEY: &str = include_str!("fixtures/adapters-test-only.key");
+const CERTIFICATE: &str = include_str!("../fixtures/adapters-test-only.crt");
+const PRIVATE_KEY: &str = include_str!("../fixtures/adapters-test-only.key");
 const ENDPOINT: &str = "172.18.255.2:6443";
 
 fn config() -> Value {

@@ -142,6 +142,35 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(output.read_bytes(), b"\x7fELFstatic")
         self.assertEqual(output.stat().st_mode & 0o777, 0o700)
 
+    def test_prebuilt_manager_is_verified_cleanup_safe_and_never_falls_back(self):
+        source = self.root / ".tools/artifacts/commit/manager"
+        source.parent.mkdir(parents=True)
+        source.write_bytes(b"\x7fELFprebuilt")
+        source.chmod(0o600)
+        with (
+            patch.dict(
+                os.environ,
+                {"CAPI_PREBUILT_CONTROLLER_BINARY": str(source)},
+            ),
+            patch.object(packaging, "verify_static_manager") as verify,
+            patch.object(packaging, "fetch_controller_dependencies") as fetch,
+            patch.object(packaging, "run") as run,
+        ):
+            output = packaging.build_controller_binary(self.root, CONFIG)
+        verify.assert_called_once_with(source.resolve())
+        fetch.assert_not_called()
+        run.assert_not_called()
+        self.assertTrue(source.exists())
+        self.assertEqual(output.read_bytes(), source.read_bytes())
+        self.assertEqual(output.stat().st_mode & 0o777, 0o700)
+        outside = self.root / "outside-manager"
+        outside.write_bytes(b"\x7fELF")
+        with patch.dict(
+            os.environ,
+            {"CAPI_PREBUILT_CONTROLLER_BINARY": str(outside)},
+        ), self.assertRaisesRegex(RuntimeError, "outside"):
+            packaging.build_controller_binary(self.root, CONFIG)
+
     def test_static_checks_fail_closed_on_non_elf_interp_and_needed(self):
         binary = self.root / "manager"
         binary.write_bytes(b"not ELF")

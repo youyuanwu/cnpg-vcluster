@@ -1,8 +1,5 @@
 //! Go parity: tenantresources_test.go and tenantresource_batch_test.go.
-mod creation_support;
-mod support;
-
-use creation_support::*;
+use crate::creation_support::*;
 use kube::{ResourceExt, api::ListParams};
 use serde_json::json;
 use tenant_controller::{

@@ -1,11 +1,8 @@
 //! Go parity: tenant_controller, phase2, readiness, reconcile_cnpg and status.
 //! This Tower service drives the real creation pipeline across every barrier.
-mod creation_support;
-mod support;
-
 use std::sync::Arc;
 
-use creation_support::*;
+use crate::creation_support::*;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{ResourceExt, core::DynamicObject, runtime::controller::Action};
 use serde_json::{Value, json};
@@ -38,7 +35,7 @@ impl Fixture {
         let workload = Server::default();
         management.insert(TENANT, tenant());
         let mut raw: Value =
-            serde_json::from_str::<Value>(include_str!("fixtures/foundation-schema3.json"))
+            serde_json::from_str::<Value>(include_str!("../fixtures/foundation-schema3.json"))
                 .unwrap()["foundation"]
                 .clone();
         raw["inputs"]["cacheHostPath"] = json!("/cache");

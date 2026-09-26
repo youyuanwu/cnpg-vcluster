@@ -85,7 +85,7 @@ controller-test:
 
 # Report Rust production lines before test-only modules.
 controller-metrics:
-    @python3 scripts/controller_metrics.py
+    @python3 scripts/controller_metrics.py --max 8050
 
 # Check Rust format and Clippy warnings.
 controller-lint:

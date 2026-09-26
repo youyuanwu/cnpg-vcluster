@@ -1,11 +1,9 @@
-mod support;
-
 use std::collections::BTreeMap;
 
+use crate::support::Server;
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
 use kube::Client;
 use serde_json::{Value, json};
-use support::Server;
 use tenant_controller::{
     allocation::{
         AllocationError, ClaimContext, ClaimDecision, ReleaseDecision, allocate, decide_claim,
@@ -573,7 +571,7 @@ impl Mock {
             "POST",
             LEASES,
             409,
-            support::kube::status(409, "AlreadyExists"),
+            crate::support::kube::status(409, "AlreadyExists"),
         );
     }
 

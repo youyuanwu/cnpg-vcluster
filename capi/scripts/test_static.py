@@ -187,6 +187,18 @@ def check_repository_boundaries() -> None:
     justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
     check("controller-metrics:" in justfile, "controller metrics recipe is missing")
     controller = ROOT / "controller"
+    integration_targets = sorted(
+        path.name for path in (controller / "tests").glob("*.rs")
+    )
+    check(
+        integration_targets
+        == ["adapters.rs", "allocation.rs", "controller.rs", "finalization.rs"],
+        f"unexpected controller integration targets: {integration_targets}",
+    )
+    check(
+        (controller / "tests/support/kube.rs").is_file(),
+        "shared controller Kubernetes test support is missing",
+    )
     check(not list(controller.rglob("*.go")), "local controller Go source remains")
     check(not list(controller.rglob("go.mod")) and not list(controller.rglob("go.sum")),
           "local controller Go module remains")

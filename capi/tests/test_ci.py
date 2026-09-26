@@ -28,7 +28,8 @@ class CIWorkflowTests(unittest.TestCase):
         fast, e2e, high, gate = (
             job(name) for name in ("fast-checks", "e2e", "high-capacity", "capi-tests")
         )
-        self.assertNotIn("    needs:", fast + e2e + high)
+        self.assertNotIn("    needs:", fast + high)
+        self.assertIn("needs: fast-checks", e2e)
         self.assertNotIn("    if:", fast)
         self.assertIn("if: github.event_name == 'pull_request'", e2e)
         self.assertIn("if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'", high)
@@ -38,13 +39,17 @@ class CIWorkflowTests(unittest.TestCase):
         for command in (
             "just test-unit", "just test-static", "just controller-fetch",
             "just controller-verify", "just controller-lint", "just controller-test",
-            "just controller-build",
+            "just controller-metrics", "just controller-build",
         ):
             self.assertIn(command, fast)
         self.assertNotIn("just cache", fast)
         self.assertLess(e2e.index("just cache"), e2e.index("just test-e2e"))
         self.assertIn("just test-e2e", e2e)
         self.assertNotIn("just test-e2e-offline", e2e)
+        self.assertIn("actions/upload-artifact@v6", fast)
+        self.assertIn("controller-manager-${{ github.sha }}", fast)
+        self.assertIn("actions/download-artifact@v7", e2e)
+        self.assertIn("CAPI_PREBUILT_CONTROLLER_BINARY", e2e)
         setup = (
             "just cache", "just tools", "just prepare-host",
             "just create-management",
@@ -103,6 +108,7 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("cancel-in-progress: true", WORKFLOW)
 
     def test_optional_cargo_cache_uses_lock_compiler_and_platform(self) -> None:
+        fast, e2e, high = (job(name) for name in ("fast-checks", "e2e", "high-capacity"))
         keys = re.findall(r"(?m)^\s+key: (controller-cargo-.*)$", WORKFLOW)
         self.assertEqual(2, len(keys))
         self.assertEqual(keys[0], keys[1])
@@ -111,7 +117,8 @@ class CIWorkflowTests(unittest.TestCase):
             self.assertIn(token, keys[0])
         self.assertEqual(2, WORKFLOW.count("path: capi/.tools/cargo-home"))
         self.assertNotIn("restore-keys:", WORKFLOW)
-        self.assertNotIn("cargo-target", WORKFLOW)
+        self.assertIn("path: capi/.tools/cargo-target", fast)
+        self.assertNotIn("path: capi/.tools/cargo-target", e2e + high)
         self.assertNotIn("rustup", WORKFLOW)
         self.assertNotRegex(WORKFLOW, r"go\.mod|go\.sum|envtest|controller-gen|"
                             r"controller-tools|controller-vet|go-mod-cache|"

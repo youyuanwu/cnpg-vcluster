@@ -1,9 +1,6 @@
 //! Go parity: postcni_test.go. Also rejects unlabeled/extra inventory before
 //! count-based pending and verifies that the complete pass lists Nodes once.
-mod creation_support;
-mod support;
-
-use creation_support::*;
+use crate::creation_support::*;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{ResourceExt, core::DynamicObject};
 use serde_json::json;
