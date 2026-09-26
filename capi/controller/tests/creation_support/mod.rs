@@ -5,13 +5,13 @@ use std::{
     sync::{Arc, Mutex},
 };
 
-use kube::{Client, ResourceExt, core::DynamicObject, runtime::controller::Action};
+use kube::{Client, ResourceExt, core::DynamicObject};
 use serde_json::json;
 use tenant_controller::{
     api::{Tenant, TenantSpec},
     docker::{DockerClient, DockerContainer, DockerError, DockerNetwork, DockerVolume},
     ownership::Identity,
-    reconcile::{DeletionHandler, ReconcileError, TenantAccess},
+    reconcile::TenantAccess,
     tenant_client::TenantClientError,
 };
 
@@ -135,21 +135,5 @@ impl TenantAccess for FakeAccess {
     ) -> Result<Client, TenantClientError> {
         assert!(endpoint.ends_with(":6443"));
         Ok(self.0.clone())
-    }
-}
-
-#[derive(Clone, Default)]
-pub struct FakeDeletion(pub Arc<Mutex<Vec<(String, String)>>>);
-impl DeletionHandler for FakeDeletion {
-    async fn reconcile(
-        &self,
-        tenant: &Tenant,
-        supported_version: &str,
-    ) -> Result<Action, ReconcileError> {
-        self.0
-            .lock()
-            .unwrap()
-            .push((tenant.name_any(), supported_version.into()));
-        Ok(Action::requeue(std::time::Duration::from_secs(5)))
     }
 }

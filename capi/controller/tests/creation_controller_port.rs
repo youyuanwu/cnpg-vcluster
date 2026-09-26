@@ -27,7 +27,7 @@ const DEPLOYMENT: &str =
 struct Fixture {
     management: Server,
     workload: Server,
-    reconciler: Reconciler<FakeDocker, FakeAccess, FakeDeletion>,
+    reconciler: Reconciler<FakeDocker, FakeAccess>,
     foundation: Foundation,
     hash: String,
 }
@@ -66,7 +66,6 @@ impl Fixture {
             client: management.client(),
             docker: FakeDocker::default(),
             access: FakeAccess(workload.client()),
-            deletion: FakeDeletion::default(),
             config: Config::default(),
             assets: Assets { calico, cnpg },
             foundation: runtime_foundation,
@@ -303,52 +302,6 @@ async fn validation_uses_runtime_supported_version_not_a_compiled_literal() {
         Some(tenant_controller::api::TenantPhase::Failed)
     );
     assert_eq!(fixture.management.calls().len(), 2);
-}
-
-#[tokio::test]
-async fn deletion_receives_the_runtime_supported_version() {
-    let mut fixture = Fixture::new(false);
-    fixture.reconciler.config.supported_version = "1.36.5".into();
-    let mut tenant = fixture.current();
-    tenant.spec.kubernetes_version = "v1.36.5".into();
-    tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
-    tenant.metadata.deletion_timestamp =
-        Some(serde_json::from_value(json!("2026-09-25T00:00:00Z")).unwrap());
-    fixture.management.insert(TENANT, tenant);
-    fixture.step().await;
-    assert_eq!(
-        *fixture.reconciler.deletion.0.lock().unwrap(),
-        [("tenant-a".into(), "1.36.5".into())]
-    );
-}
-
-#[tokio::test]
-async fn managed_deletion_bypasses_both_creation_mutation_gates_and_assets() {
-    for managed in [false, true] {
-        let mut fixture = Fixture::new(false);
-        let mut tenant = fixture.current();
-        tenant.metadata.deletion_timestamp =
-            Some(serde_json::from_value(json!("2026-09-25T00:00:00Z")).unwrap());
-        if managed {
-            tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
-        }
-        fixture.management.insert(TENANT, tenant);
-        fixture
-            .management
-            .0
-            .lock()
-            .unwrap()
-            .objects
-            .remove(FOUNDATION);
-        fixture.reconciler.assets = Assets::default();
-        fixture.step().await;
-        assert_eq!(
-            fixture.reconciler.deletion.0.lock().unwrap().len(),
-            usize::from(managed)
-        );
-        assert_eq!(fixture.management.calls().len(), 1);
-        assert!(fixture.workload.calls().is_empty());
-    }
 }
 
 #[tokio::test]

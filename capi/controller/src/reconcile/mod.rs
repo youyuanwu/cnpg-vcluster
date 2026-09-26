@@ -116,55 +116,10 @@ impl TenantAccess for LiveTenantAccess {
     }
 }
 
-pub trait DeletionHandler: Send + Sync {
-    fn reconcile(
-        &self,
-        tenant: &Tenant,
-        supported_version: &str,
-    ) -> impl Future<Output = Result<Action, ReconcileError>> + Send;
-}
-
-pub struct LiveDeletion {
-    pub client: Client,
-    pub docker: BollardDockerClient,
-    pub foundation: Arc<RuntimeFoundation>,
-}
-
-impl DeletionHandler for LiveDeletion {
-    async fn reconcile(
-        &self,
-        tenant: &Tenant,
-        supported_version: &str,
-    ) -> Result<Action, ReconcileError> {
-        finalize(
-            self.client.clone(),
-            self.docker.clone(),
-            tenant,
-            supported_version,
-            self.foundation.clone(),
-        )
-        .await
-    }
-}
-
-async fn finalize(
-    client: Client,
-    docker: BollardDockerClient,
-    tenant: &Tenant,
-    supported_version: &str,
-    foundation: Arc<RuntimeFoundation>,
-) -> Result<Action, ReconcileError> {
-    crate::finalize::Finalizer::new(client, docker, supported_version, foundation)
-        .reconcile(tenant)
-        .await
-        .map_err(Into::into)
-}
-
-pub struct Reconciler<D = BollardDockerClient, A = LiveTenantAccess, H = LiveDeletion> {
+pub struct Reconciler<D = BollardDockerClient, A = LiveTenantAccess> {
     pub client: Client,
     pub docker: D,
     pub access: A,
-    pub deletion: H,
     pub config: Config,
     pub assets: Assets,
     pub foundation: Arc<RuntimeFoundation>,
@@ -179,11 +134,6 @@ impl Reconciler {
         foundation: Arc<RuntimeFoundation>,
     ) -> Self {
         Self {
-            deletion: LiveDeletion {
-                client: client.clone(),
-                docker: docker.clone(),
-                foundation: foundation.clone(),
-            },
             client,
             docker,
             access: LiveTenantAccess,
@@ -194,7 +144,7 @@ impl Reconciler {
     }
 }
 
-impl<D: DockerClient, A: TenantAccess, H: DeletionHandler> Reconciler<D, A, H> {
+impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
     pub async fn reconcile_name(&self, name: &str) -> Result<Action, ReconcileError> {
         let Some(tenant) = Api::<Tenant>::all(self.client.clone())
             .get_opt(name)
@@ -233,13 +183,17 @@ impl<D: DockerClient, A: TenantAccess, H: DeletionHandler> Reconciler<D, A, H> {
             if !tenant.finalizers().iter().any(|value| value == FINALIZER) {
                 return Ok(Action::await_change());
             }
-            return match self
-                .deletion
-                .reconcile(&tenant, &self.config.supported_version)
-                .await
+            return match crate::finalize::Finalizer::with_docker(
+                self.client.clone(),
+                self.docker.clone(),
+                &self.config.supported_version,
+                self.foundation.clone(),
+            )
+            .reconcile(&tenant)
+            .await
             {
                 Ok(action) => Ok(action),
-                Err(error) => self.failure(&tenant, error).await,
+                Err(error) => self.failure(&tenant, error.into()).await,
             };
         }
         match self.create(&tenant, &spec).await {

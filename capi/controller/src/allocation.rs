@@ -598,7 +598,7 @@ pub async fn release(
             let live = api.get_opt(&intent.name).await?;
             let Some(live) = live else {
                 return if all_old_residue_absent {
-                    Ok(ReleaseDecision::Complete)
+                    Ok(ReleaseDecision::Pending)
                 } else {
                     Err(AllocationError::Missing)
                 };
@@ -615,6 +615,7 @@ pub async fn release(
                     uid: Some(fresh.uid),
                     resource_version: Some(fresh.resource_version),
                 }),
+                propagation_policy: Some(kube::api::PropagationPolicy::Background),
                 ..DeleteParams::default()
             };
             api.delete(&fresh.name, &params).await?;
