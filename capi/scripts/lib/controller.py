@@ -669,6 +669,8 @@ def reconcile_controller(
                     "refusing to restore an older identity"
                 )
             for name, document in previous.items():
+                if name == "configmap/tenant-controller-state":
+                    continue
                 if document:
                     value = json.loads(document)
                     value.pop("status", None)
@@ -740,6 +742,7 @@ def delete_controller(
         (None, "clusterrolebinding/tenant-controller"),
         (None, "clusterrole/tenant-controller-role"),
         ("tenant-system", "serviceaccount/tenant-controller"),
+        (None, f"crd/{TENANT_CRD}"),
         (None, "namespace/tenant-system"),
     ):
         delete_named(config, client, namespace, resource)

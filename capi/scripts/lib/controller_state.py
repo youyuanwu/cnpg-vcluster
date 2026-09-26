@@ -91,7 +91,7 @@ def require_clean_controller_state(
         raise RuntimeError(
             f"Tenant resources block activation: {tenants.stdout.strip()}"
         )
-    if tenants.returncode != 0 and not _missing(tenants, undiscovered=True):
+    if tenants.returncode != 0:
         raise RuntimeError(f"failed to inspect Tenant resources: {tenants.stderr}")
     catalog = json.loads(
         (root / "controller/config/management-resources.json").read_text(
@@ -111,49 +111,80 @@ def require_clean_controller_state(
             "exemptions",
         }:
             raise RuntimeError("management resource catalog is invalid")
-        if entry["inventoryPolicy"] != "block-any-instance":
-            continue
-        group, _, version = entry["apiVersion"].partition("/")
-        if not group or not version:
-            raise RuntimeError("management resource catalog API version is invalid")
-        resource = f"{entry['plural']}.{group}"
-        response = client.kubectl(
-            "get", resource, "-A", "-o", "name", check=False
+        if (
+            not isinstance(entry["namespaced"], bool)
+            or not isinstance(entry["role"], str)
+            or not entry["role"]
+            or not isinstance(entry["exemptions"], list)
+            or not all(isinstance(value, str) for value in entry["exemptions"])
+        ):
+            raise RuntimeError("management resource catalog metadata is invalid")
+        policy = entry["inventoryPolicy"]
+        group, separator, _version = entry["apiVersion"].partition("/")
+        resource = (
+            f"{entry['plural']}.{group}" if separator else entry["plural"]
         )
-        if response.returncode != 0 and not _missing(response, undiscovered=True):
-            raise RuntimeError(f"failed to inspect provider resource {resource}")
-        if response.returncode == 0 and response.stdout.strip():
-            raise RuntimeError(
-                f"provider residue blocks activation: {response.stdout.strip()}"
+        if policy == "block-any-instance":
+            response = client.kubectl(
+                "get", resource, "-A", "-o", "name", check=False
             )
-    for resource in ("namespaces", "secrets"):
-        document = client.json("get", resource, "-A")
+            if response.returncode != 0:
+                raise RuntimeError(
+                    f"failed to inspect provider resource {resource}: "
+                    f"{response.stderr}"
+                )
+            if response.stdout.strip():
+                raise RuntimeError(
+                    f"provider residue blocks activation: {response.stdout.strip()}"
+                )
+            continue
+        if policy == "allocation-markers":
+            document = client.json(
+                "-n", "tenant-system", "get", resource
+            )
+            for item in document.get("items", []):
+                metadata = item.get("metadata", {})
+                if (
+                    "tenancy.cnpg-vcluster.io/slot-id"
+                    in metadata.get("labels", {})
+                    or metadata.get("annotations", {}).get(
+                        "tenancy.cnpg-vcluster.io/resource"
+                    )
+                    == "allocation-lease"
+                ):
+                    raise RuntimeError(
+                        "allocation Lease residue blocks activation"
+                    )
+            continue
+        arguments = ["get", resource]
+        if entry["namespaced"]:
+            arguments.append("-A")
+        document = client.json(*arguments)
         for item in document.get("items", []):
             metadata = item.get("metadata", {})
             annotations = metadata.get("annotations", {})
             owners = metadata.get("ownerReferences", [])
-            if (
+            marked = (
                 "tenancy.cnpg-vcluster.io/tenant" in annotations
                 or "tenancy.cnpg-vcluster.io/tenant-uid" in annotations
-                or any(owner.get("kind") == "KamajiControlPlane" for owner in owners)
-            ):
+            )
+            if policy == "tenant-markers-or-kamaji-owner":
+                marked = marked or any(
+                    owner.get("kind") == "KamajiControlPlane"
+                    for owner in owners
+                )
+            if policy not in {
+                "tenant-markers",
+                "tenant-markers-or-kamaji-owner",
+            }:
+                raise RuntimeError(
+                    "management resource catalog inventory policy is invalid"
+                )
+            if marked:
                 raise RuntimeError(
                     f"{resource} residue blocks activation: "
                     f"{metadata.get('name', '<unknown>')}"
                 )
-    leases = client.json(
-        "-n", "tenant-system", "get", "leases.coordination.k8s.io"
-    )
-    for lease in leases.get("items", []):
-        metadata = lease.get("metadata", {})
-        if (
-            "tenancy.cnpg-vcluster.io/slot-id" in metadata.get("labels", {})
-            or metadata.get("annotations", {}).get(
-                "tenancy.cnpg-vcluster.io/resource"
-            )
-            == "allocation-lease"
-        ):
-            raise RuntimeError("allocation Lease residue blocks activation")
     volumes = set(run(
         ["docker", "volume", "ls", "-q"],
         timeout=30,

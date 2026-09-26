@@ -318,45 +318,50 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             "metadata": {"name": "tenant-controller-state", "namespace": "tenant-system"},
             "data": {"configurationHash": "old-hash"},
         }
-        state_reads = 0
-        rollback_applies = []
-
-        def handle(*args, **kwargs):
-            nonlocal state_reads
-            if "get" in args and "configmap/tenant-controller-state" in args:
-                state_reads += 1
-                if state_reads == 1:
-                    return response(old_state)
-                return response({"data": {"configurationHash": desired_hash}})
-            if "get" in args:
-                return response()
-            if kwargs.get("input_text") and "rollback" in " ".join(args):
-                rollback_applies.append(kwargs["input_text"])
-            return response()
-
-        with (
-            patch.object(packaging, "build_controller_image", return_value="rust:image"),
-            patch.object(packaging, "_foundation_payload", return_value=desired),
-            patch.object(packaging, "run"),
-            patch.object(packaging, "verify_controller_crd"),
-            patch.object(packaging, "stop_controller"),
-            patch.object(packaging, "require_clean_controller_state"),
-            patch.object(
-                packaging,
-                "render_controller_manager",
-                return_value=Path("manager.yaml"),
-            ),
-            patch.object(
-                packaging,
-                "verify_running_controller",
-                side_effect=RuntimeError("candidate failed after acceptance"),
-            ),
-            self.assertRaisesRegex(RuntimeError, "candidate failed after acceptance"),
+        for accepted_after, error in (
+            (desired_hash, "candidate failed after acceptance"),
+            ("third-hash", "acceptance changed"),
         ):
-            packaging.reconcile_controller(
-                Path("."), CONFIG, Client(handle), {}, Mock(), None
-            )
-        self.assertEqual(rollback_applies, [])
+            state_reads = 0
+            rollback_applies = []
+
+            def handle(*args, **kwargs):
+                nonlocal state_reads
+                if "get" in args and "configmap/tenant-controller-state" in args:
+                    state_reads += 1
+                    if state_reads == 1:
+                        return response(old_state)
+                    return response({"data": {"configurationHash": accepted_after}})
+                if "get" in args:
+                    return response()
+                if kwargs.get("input_text") and "rollback" in " ".join(args):
+                    rollback_applies.append(kwargs["input_text"])
+                return response()
+
+            with (
+                self.subTest(accepted_after=accepted_after),
+                patch.object(packaging, "build_controller_image", return_value="rust:image"),
+                patch.object(packaging, "_foundation_payload", return_value=desired),
+                patch.object(packaging, "run"),
+                patch.object(packaging, "verify_controller_crd"),
+                patch.object(packaging, "stop_controller"),
+                patch.object(packaging, "require_clean_controller_state"),
+                patch.object(
+                    packaging,
+                    "render_controller_manager",
+                    return_value=Path("manager.yaml"),
+                ),
+                patch.object(
+                    packaging,
+                    "verify_running_controller",
+                    side_effect=RuntimeError("candidate failed after acceptance"),
+                ),
+                self.assertRaisesRegex(RuntimeError, error),
+            ):
+                packaging.reconcile_controller(
+                    Path("."), CONFIG, Client(handle), {}, Mock(), None
+                )
+            self.assertEqual(rollback_applies, [])
 
     def test_uninstall_keeps_controller_alive_until_ordinary_tenant_delete_finishes(self):
         events = []

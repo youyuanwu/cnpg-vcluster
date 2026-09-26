@@ -37,7 +37,7 @@ class Client:
 
 def clean_handler(*args, **_kwargs):
     if "tenants.tenancy.cnpg-vcluster.io" in args:
-        return response(code=1, error="NotFound")
+        return response("")
     if "leases.coordination.k8s.io" in args:
         return response({"items": []})
     if "namespaces" in args or "secrets" in args:
