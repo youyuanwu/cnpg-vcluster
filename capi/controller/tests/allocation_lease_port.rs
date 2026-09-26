@@ -873,3 +873,39 @@ async fn changed_bound_claim_and_delete_race_never_mutate_successor() {
         Some("successor")
     );
 }
+
+#[tokio::test]
+async fn observed_old_claim_replaced_by_valid_successor_requires_another_pass() {
+    let mock = Mock::default();
+    let slots = slots();
+    let old_context = context("uid-a", &slots);
+    let old = owned(&old_context, &slots[0], "old-lease", "14");
+    let bound = match decide_claim(&old_context, std::slice::from_ref(&old), None).unwrap() {
+        ClaimDecision::Existing(claim) => claim.status(),
+        _ => unreachable!(),
+    };
+    mock.insert(old);
+    let successor_context = ClaimContext {
+        tenant_name: "tenant-b",
+        tenant_uid: "uid-b",
+        spec_hash: "spec-b",
+        ..old_context
+    };
+    let successor = owned(&successor_context, &slots[0], "successor", "15");
+    mock.replace_on_get(successor);
+    assert_eq!(
+        release(mock.client(), &old_context, Some(&bound), true)
+            .await
+            .unwrap(),
+        ReleaseDecision::Pending
+    );
+    assert!(
+        mock.requests()
+            .iter()
+            .all(|(method, _, _)| method != "DELETE")
+    );
+    assert_eq!(
+        mock.lease(&lease_name("slot-a")).metadata.uid.as_deref(),
+        Some("successor")
+    );
+}

@@ -605,7 +605,7 @@ pub async fn release(
             };
             let fresh = decide_release(context, &[live], bound, all_old_residue_absent)?;
             let ReleaseDecision::Delete(fresh) = fresh else {
-                return Ok(fresh);
+                return Ok(ReleaseDecision::Pending);
             };
             if fresh.uid != intent.uid {
                 return Err(AllocationError::Claim(intent.name));

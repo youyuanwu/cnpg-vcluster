@@ -8,7 +8,7 @@ use std::{
 
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::Namespace;
-use kube::{ResourceExt, core::DynamicObject};
+use kube::{ResourceExt, core::DynamicObject, runtime::controller::Action};
 use serde_json::{Value, json};
 use support::Server;
 use tenant_controller::{
@@ -136,6 +136,24 @@ fn lease(hash: &str, slot: &AllocationSlot) -> Lease {
     let mut lease = new_lease(&context, slot);
     lease.metadata.uid = Some("lease-uid".into());
     lease.metadata.resource_version = Some("1".into());
+    lease
+}
+
+fn successor_lease(hash: &str, slot: &AllocationSlot) -> Lease {
+    let slots = [slot.clone()];
+    let context = ClaimContext {
+        namespace: "tenant-system",
+        ownership_label: "example.io/owned",
+        lab_prefix: "example",
+        tenant_name: "tenant-b",
+        tenant_uid: "successor-uid",
+        spec_hash: "successor-spec",
+        foundation_hash: hash,
+        slots: &slots,
+    };
+    let mut lease = new_lease(&context, slot);
+    lease.metadata.uid = Some("successor-lease".into());
+    lease.metadata.resource_version = Some("2".into());
     lease
 }
 
@@ -300,4 +318,96 @@ async fn runtime_version_mismatch_fails_before_api_or_docker_calls() {
     assert!(matches!(error, ControllerError::InvalidInput(_)));
     assert!(server.calls().is_empty());
     assert!(docker.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn generation_change_and_status_conflict_never_mutate_resources() {
+    let (foundation, hash, _) = fixture();
+    for generation_change in [false, true] {
+        let mut original = tenant(&hash);
+        if !generation_change {
+            original.status.as_mut().unwrap().phase = None;
+        }
+        let server = server(&original);
+        if generation_change {
+            let mut replacement = original.clone();
+            replacement.metadata.generation = Some(2);
+            replacement.metadata.resource_version = Some("2".into());
+            server.replace_on(
+                "GET",
+                TENANT_PATH,
+                Some(serde_json::to_value(replacement).unwrap()),
+            );
+        } else {
+            server.respond(
+                "PATCH",
+                &format!("{TENANT_PATH}/status"),
+                409,
+                support::kube::status(409, "Conflict"),
+            );
+        }
+        assert!(
+            Finalizer::with_docker(
+                server.client(),
+                Docker::default(),
+                SUPPORTED_KUBERNETES_VERSION,
+                foundation.clone(),
+            )
+            .reconcile(&original)
+            .await
+            .is_err()
+        );
+        assert!(server.calls().iter().all(|call| call.method != "DELETE"));
+    }
+}
+
+#[tokio::test]
+async fn discovery_failure_and_successor_race_retain_finalizer() {
+    let (foundation, hash, slot) = fixture();
+    for discovery_failure in [false, true] {
+        let mut original = tenant(&hash);
+        original.status.as_mut().unwrap().allocation = Some((&slot).into());
+        let server = server(&original);
+        let old = lease(&hash, &slot);
+        let lease_path = format!("{LEASES}/{}", old.name_any());
+        server.insert(&lease_path, old);
+        if discovery_failure {
+            let first = tenant_controller::management::descendants()
+                .find(|resource| resource.role != "provider")
+                .unwrap();
+            let (group, version) = first.api_version.split_once('/').unwrap();
+            server.respond(
+                "GET",
+                &format!("/apis/{group}/{version}/namespaces/{NAME}/{}", first.plural),
+                503,
+                support::kube::status(503, "Unavailable"),
+            );
+        } else {
+            server.replace_on(
+                "GET",
+                &lease_path,
+                Some(serde_json::to_value(successor_lease(&hash, &slot)).unwrap()),
+            );
+        }
+        let result = Finalizer::with_docker(
+            server.client(),
+            Docker::default(),
+            SUPPORTED_KUBERNETES_VERSION,
+            foundation.clone(),
+        )
+        .reconcile(&original)
+        .await;
+        if discovery_failure {
+            assert!(result.is_err());
+        } else {
+            assert_eq!(
+                result.unwrap(),
+                Action::requeue(std::time::Duration::from_secs(5))
+            );
+        }
+        let current: Tenant = serde_json::from_value(server.get(TENANT_PATH)).unwrap();
+        assert!(current.finalizers().iter().any(|value| value == FINALIZER));
+        assert!(current.status.unwrap().allocation.is_some());
+        assert!(server.calls().iter().all(|call| call.method != "DELETE"));
+    }
 }

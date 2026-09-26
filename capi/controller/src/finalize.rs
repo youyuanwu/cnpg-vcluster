@@ -101,7 +101,10 @@ async fn patch_status(
             &tenant.name_any(),
             &PatchParams::default(),
             &Patch::Merge(&json!({
-                "metadata":{"resourceVersion":version(&tenant.metadata)?},
+                "metadata":{
+                    "resourceVersion":version(&tenant.metadata)?,
+                    "uid":uid(&tenant.metadata)?
+                },
                 "status":status
             })),
         )
@@ -409,6 +412,7 @@ impl<D: DockerClient> Finalizer<D> {
             .await?
             .ok_or_else(|| invalid("Tenant disappeared during deletion"))?;
         if current.metadata.uid.as_deref() != Some(tenant_uid)
+            || current.metadata.generation != tenant.metadata.generation
             || current.metadata.deletion_timestamp.is_none()
             || current.spec != tenant.spec
         {
