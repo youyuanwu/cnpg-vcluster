@@ -16,7 +16,7 @@ use crate::{
     api::Tenant,
     docker::{DockerClient, WORKER_ROLE_LABEL},
     error::ControllerError,
-    management::ACTIVATION_RESOURCES,
+    management::{ACTIVATION_RESOURCES, InventoryPolicy},
 };
 
 pub const STATE_NAME: &str = "tenant-controller-state";
@@ -147,7 +147,10 @@ async fn require_clean_inventory<D: DockerClient>(
             "Tenant resources block configuration activation".into(),
         ));
     }
-    for resource in ACTIVATION_RESOURCES {
+    for resource in ACTIVATION_RESOURCES
+        .iter()
+        .filter(|resource| resource.inventory_policy == InventoryPolicy::BlockAnyInstance)
+    {
         let items = Api::<DynamicObject>::all_with(client.clone(), &resource.api_resource())
             .list(&ListParams::default())
             .await;
@@ -235,7 +238,13 @@ async fn require_clean_inventory<D: DockerClient>(
             matches!(
                 container.labels.get(WORKER_ROLE_LABEL).map(String::as_str),
                 Some("worker" | "external-load-balancer")
-            )
+            ) || [
+                "cnpg-vcluster.capi/role",
+                "cnpg-vcluster.capi/tenant",
+                "tenancy.cnpg-vcluster.io/tenant-uid",
+            ]
+            .iter()
+            .any(|key| container.labels.contains_key(*key))
         })
     {
         return Err(ControllerError::Configuration(
@@ -256,6 +265,10 @@ async fn require_clean_inventory<D: DockerClient>(
                     .get("cnpg-vcluster.capi/role")
                     .map(String::as_str)
                     == Some("tenant-storage")
+                || volume.labels.contains_key("cnpg-vcluster.capi/tenant")
+                || volume
+                    .labels
+                    .contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
         })
     {
         return Err(ControllerError::Configuration(

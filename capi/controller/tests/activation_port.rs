@@ -9,7 +9,7 @@ use serde_json::json;
 use support::Server;
 use tenant_controller::{
     activation::{STATE_NAME, TICKET_NAME, admit},
-    management::ACTIVATION_RESOURCES,
+    management::{ACTIVATION_RESOURCES, InventoryPolicy},
 };
 
 const CONFIG_MAPS: &str = "/api/v1/namespaces/tenant-system/configmaps";
@@ -43,7 +43,10 @@ fn clean_server() -> Server {
     for path in [TENANTS, NAMESPACES, SECRETS, LEASES] {
         server.allow_list(path);
     }
-    for resource in ACTIVATION_RESOURCES {
+    for resource in ACTIVATION_RESOURCES
+        .iter()
+        .filter(|resource| resource.inventory_policy == InventoryPolicy::BlockAnyInstance)
+    {
         let (group, version) = resource.api_version.split_once('/').unwrap();
         server.allow_list(&format!("/apis/{group}/{version}/{}", resource.plural));
     }
@@ -221,7 +224,10 @@ async fn accepted_state_survives_ticket_delete_failure_without_replay() {
 async fn provider_discovery_uncertainty_is_not_absence() {
     let server = clean_server();
     server.insert(TICKET, ticket("hash-b", "token-b"));
-    let first = ACTIVATION_RESOURCES[0];
+    let first = ACTIVATION_RESOURCES
+        .iter()
+        .find(|resource| resource.inventory_policy == InventoryPolicy::BlockAnyInstance)
+        .unwrap();
     let (group, version) = first.api_version.split_once('/').unwrap();
     let path = format!("/apis/{group}/{version}/{}", first.plural);
     server.respond("GET", &path, 404, support::kube::status(404, "NotFound"));

@@ -656,10 +656,18 @@ def reconcile_controller(
                 "-o",
                 "json",
             ).stdout.strip()
-            if accepted and json.loads(accepted).get("data", {}).get(
-                "configurationHash"
-            ) == desired_hash:
+            current_hash = (
+                json.loads(accepted).get("data", {}).get("configurationHash")
+                if accepted
+                else None
+            )
+            if current_hash == desired_hash:
                 raise
+            if current_hash != accepted_hash:
+                raise RuntimeError(
+                    "controller acceptance changed during failed replacement; "
+                    "refusing to restore an older identity"
+                )
             for name, document in previous.items():
                 if document:
                     value = json.loads(document)

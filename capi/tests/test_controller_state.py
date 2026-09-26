@@ -77,8 +77,26 @@ class ControllerStateTests(unittest.TestCase):
                 "kamajicontrolplanes",
             ),
             ("kamaji.clastix.io/v1alpha1", "TenantControlPlane", "tenantcontrolplanes"),
+            ("v1", "Namespace", "namespaces"),
+            ("v1", "Secret", "secrets"),
+            ("coordination.k8s.io/v1", "Lease", "leases"),
         ):
             self.assertIn(required, identities)
+        self.assertTrue(
+            all(
+                set(entry)
+                == {
+                    "apiVersion",
+                    "kind",
+                    "plural",
+                    "namespaced",
+                    "role",
+                    "inventoryPolicy",
+                    "exemptions",
+                }
+                for entry in catalog
+            )
+        )
 
     def test_activation_ticket_is_bound_to_candidate_and_time(self) -> None:
         ticket = activation_ticket("hash-a", "token-a")
@@ -118,16 +136,21 @@ class ControllerStateTests(unittest.TestCase):
                         }}]})
                     return clean_handler(*args, **kwargs)
 
-                outputs = iter(
-                    [
-                        response("tenant-a-storage" if case == "volume" else ""),
-                        response("container-a" if case == "container" else ""),
-                        response(""),
-                    ]
-                )
+                def docker(*args, **_kwargs):
+                    command = args[0]
+                    if case == "volume" and command[:4] == [
+                        "docker", "volume", "ls", "-q"
+                    ] and "--filter" not in command:
+                        return response("tenant-a-storage")
+                    if case == "container" and command[:3] == [
+                        "docker", "ps", "-aq"
+                    ] and "label=io.x-k8s.kind.role=worker" in command:
+                        return response("container-a")
+                    return response("")
+
                 with patch(
                     "scripts.lib.controller_state.run",
-                    side_effect=lambda *_a, **_k: next(outputs),
+                    side_effect=docker,
                 ), self.assertRaises(RuntimeError):
                     require_clean_controller_state(root, Client(handle))
 

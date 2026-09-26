@@ -102,9 +102,17 @@ def require_clean_controller_state(
         raise RuntimeError("management resource catalog is invalid")
     for entry in catalog:
         if not isinstance(entry, dict) or set(entry) != {
-            "apiVersion", "kind", "plural"
+            "apiVersion",
+            "kind",
+            "plural",
+            "namespaced",
+            "role",
+            "inventoryPolicy",
+            "exemptions",
         }:
             raise RuntimeError("management resource catalog is invalid")
+        if entry["inventoryPolicy"] != "block-any-instance":
+            continue
         group, _, version = entry["apiVersion"].partition("/")
         if not group or not version:
             raise RuntimeError("management resource catalog API version is invalid")
@@ -146,14 +154,25 @@ def require_clean_controller_state(
             == "allocation-lease"
         ):
             raise RuntimeError("allocation Lease residue blocks activation")
-    volumes = run(
+    volumes = set(run(
         ["docker", "volume", "ls", "-q"],
         timeout=30,
-    ).stdout.split()
-    tenant_volumes = [name for name in volumes if name.endswith("-storage")]
+    ).stdout.split())
+    tenant_volumes = {name for name in volumes if name.endswith("-storage")}
+    for label in (
+        "cnpg-vcluster.capi/role",
+        "cnpg-vcluster.capi/tenant",
+        "tenancy.cnpg-vcluster.io/tenant-uid",
+    ):
+        tenant_volumes.update(
+            run(
+                ["docker", "volume", "ls", "-q", "--filter", f"label={label}"],
+                timeout=30,
+            ).stdout.split()
+        )
     if tenant_volumes:
         raise RuntimeError(
-            f"Tenant storage volumes block activation: {tenant_volumes}"
+            f"Tenant storage volumes block activation: {sorted(tenant_volumes)}"
         )
     containers: set[str] = set()
     for role in ("worker", "external-load-balancer"):
@@ -166,6 +185,17 @@ def require_clean_controller_state(
                     "--filter",
                     f"label=io.x-k8s.kind.role={role}",
                 ],
+                timeout=30,
+            ).stdout.split()
+        )
+    for label in (
+        "cnpg-vcluster.capi/role",
+        "cnpg-vcluster.capi/tenant",
+        "tenancy.cnpg-vcluster.io/tenant-uid",
+    ):
+        containers.update(
+            run(
+                ["docker", "ps", "-aq", "--filter", f"label={label}"],
                 timeout=30,
             ).stdout.split()
         )

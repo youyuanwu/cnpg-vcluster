@@ -2,56 +2,133 @@
   {
     "apiVersion": "cluster.x-k8s.io/v1beta2",
     "kind": "Cluster",
-    "plural": "clusters"
+    "plural": "clusters",
+    "namespaced": true,
+    "role": "cluster",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "cluster.x-k8s.io/v1beta2",
     "kind": "MachineDeployment",
-    "plural": "machinedeployments"
+    "plural": "machinedeployments",
+    "namespaced": true,
+    "role": "machine-deployment",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "cluster.x-k8s.io/v1beta2",
     "kind": "MachineSet",
-    "plural": "machinesets"
+    "plural": "machinesets",
+    "namespaced": true,
+    "role": "machine",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "cluster.x-k8s.io/v1beta2",
     "kind": "Machine",
-    "plural": "machines"
+    "plural": "machines",
+    "namespaced": true,
+    "role": "machine",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta2",
     "kind": "DevCluster",
-    "plural": "devclusters"
+    "plural": "devclusters",
+    "namespaced": true,
+    "role": "dev-cluster",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta2",
     "kind": "DevMachineTemplate",
-    "plural": "devmachinetemplates"
+    "plural": "devmachinetemplates",
+    "namespaced": true,
+    "role": "dev-machine-template",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta2",
     "kind": "DevMachine",
-    "plural": "devmachines"
+    "plural": "devmachines",
+    "namespaced": true,
+    "role": "machine",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "bootstrap.cluster.x-k8s.io/v1beta2",
     "kind": "KubeadmConfigTemplate",
-    "plural": "kubeadmconfigtemplates"
+    "plural": "kubeadmconfigtemplates",
+    "namespaced": true,
+    "role": "kubeadm-config-template",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "bootstrap.cluster.x-k8s.io/v1beta2",
     "kind": "KubeadmConfig",
-    "plural": "kubeadmconfigs"
+    "plural": "kubeadmconfigs",
+    "namespaced": true,
+    "role": "machine",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "controlplane.cluster.x-k8s.io/v1alpha2",
     "kind": "KamajiControlPlane",
-    "plural": "kamajicontrolplanes"
+    "plural": "kamajicontrolplanes",
+    "namespaced": true,
+    "role": "kamaji-control-plane",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
   },
   {
     "apiVersion": "kamaji.clastix.io/v1alpha1",
     "kind": "TenantControlPlane",
-    "plural": "tenantcontrolplanes"
+    "plural": "tenantcontrolplanes",
+    "namespaced": true,
+    "role": "provider",
+    "inventoryPolicy": "block-any-instance",
+    "exemptions": []
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Namespace",
+    "plural": "namespaces",
+    "namespaced": false,
+    "role": "namespace",
+    "inventoryPolicy": "tenant-markers",
+    "exemptions": [
+      "management-infrastructure"
+    ]
+  },
+  {
+    "apiVersion": "v1",
+    "kind": "Secret",
+    "plural": "secrets",
+    "namespaced": true,
+    "role": "tenant-kubeconfig",
+    "inventoryPolicy": "tenant-markers-or-kamaji-owner",
+    "exemptions": [
+      "controller-installation-secrets"
+    ]
+  },
+  {
+    "apiVersion": "coordination.k8s.io/v1",
+    "kind": "Lease",
+    "plural": "leases",
+    "namespaced": true,
+    "role": "allocation-lease",
+    "inventoryPolicy": "allocation-markers",
+    "exemptions": [
+      "controller-leader-election"
+    ]
   }
 ]
