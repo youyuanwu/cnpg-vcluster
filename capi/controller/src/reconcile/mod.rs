@@ -35,6 +35,7 @@ use crate::{
     docker::{BollardDockerClient, DockerClient, validate_volume},
     error::ControllerError,
     foundation::{self, Foundation, ImageArchive, RuntimeFoundation},
+    management::{self, ResourceClass},
     ownership,
     readiness::{self, Components, set_condition},
     resources::{self, Context as ResourceContext},
@@ -802,27 +803,10 @@ pub fn controller(client: Client, _config: &Config) -> Controller<Tenant> {
                     .unwrap_or_default()
             },
         );
-    for (version, kind) in [
-        ("cluster.x-k8s.io/v1beta2", "Cluster"),
-        ("cluster.x-k8s.io/v1beta2", "MachineDeployment"),
-        ("cluster.x-k8s.io/v1beta2", "MachineSet"),
-        ("cluster.x-k8s.io/v1beta2", "Machine"),
-        ("infrastructure.cluster.x-k8s.io/v1beta2", "DevCluster"),
-        (
-            "infrastructure.cluster.x-k8s.io/v1beta2",
-            "DevMachineTemplate",
-        ),
-        ("infrastructure.cluster.x-k8s.io/v1beta2", "DevMachine"),
-        (
-            "bootstrap.cluster.x-k8s.io/v1beta2",
-            "KubeadmConfigTemplate",
-        ),
-        (
-            "controlplane.cluster.x-k8s.io/v1alpha2",
-            "KamajiControlPlane",
-        ),
-    ] {
-        let resource = objects::resource(version, kind);
+    for definition in
+        management::watched().filter(|resource| resource.class != ResourceClass::Typed)
+    {
+        let resource = definition.api_resource();
         controller = controller.watches_with(
             Api::<DynamicObject>::all_with(client.clone(), &resource),
             resource,

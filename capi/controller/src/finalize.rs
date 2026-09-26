@@ -9,7 +9,7 @@ use std::time::Duration;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{Namespace, Secret};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, Preconditions};
-use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
+use kube::core::DynamicObject;
 use kube::runtime::controller::Action;
 use kube::{Api, Client};
 use serde_json::{Value, json};
@@ -22,6 +22,7 @@ use crate::docker::{
 };
 use crate::error::ControllerError as ReconcileError;
 use crate::foundation::RuntimeFoundation;
+use crate::management::{self, ManagementResource};
 use crate::ownership::{
     Identity, validate_cluster_uid, validate_kubeconfig_secret_for_deletion, validate_owner_chain,
     validate_provider_owner, validate_provider_owner_for_deletion, validate_root_ownership,
@@ -30,118 +31,6 @@ use crate::ownership::{
 const FOUNDATION_NAMESPACE: &str = "tenant-system";
 const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 const RETRY: Duration = Duration::from_secs(5);
-
-#[derive(Clone, Copy)]
-struct Kind {
-    group: &'static str,
-    version: &'static str,
-    kind: &'static str,
-    plural: &'static str,
-    resource: &'static str,
-    worker_suffix: bool,
-}
-
-const ROOTS: [Kind; 6] = [
-    Kind {
-        group: "cluster.x-k8s.io",
-        version: "v1beta2",
-        kind: "Cluster",
-        plural: "clusters",
-        resource: "cluster",
-        worker_suffix: false,
-    },
-    Kind {
-        group: "infrastructure.cluster.x-k8s.io",
-        version: "v1beta2",
-        kind: "DevCluster",
-        plural: "devclusters",
-        resource: "dev-cluster",
-        worker_suffix: false,
-    },
-    Kind {
-        group: "controlplane.cluster.x-k8s.io",
-        version: "v1alpha2",
-        kind: "KamajiControlPlane",
-        plural: "kamajicontrolplanes",
-        resource: "kamaji-control-plane",
-        worker_suffix: false,
-    },
-    Kind {
-        group: "bootstrap.cluster.x-k8s.io",
-        version: "v1beta2",
-        kind: "KubeadmConfigTemplate",
-        plural: "kubeadmconfigtemplates",
-        resource: "kubeadm-config-template",
-        worker_suffix: true,
-    },
-    Kind {
-        group: "infrastructure.cluster.x-k8s.io",
-        version: "v1beta2",
-        kind: "DevMachineTemplate",
-        plural: "devmachinetemplates",
-        resource: "dev-machine-template",
-        worker_suffix: true,
-    },
-    Kind {
-        group: "cluster.x-k8s.io",
-        version: "v1beta2",
-        kind: "MachineDeployment",
-        plural: "machinedeployments",
-        resource: "machine-deployment",
-        worker_suffix: true,
-    },
-];
-const DESCENDANTS: [Kind; 4] = [
-    Kind {
-        group: "cluster.x-k8s.io",
-        version: "v1beta2",
-        kind: "MachineSet",
-        plural: "machinesets",
-        resource: "machine",
-        worker_suffix: false,
-    },
-    Kind {
-        group: "cluster.x-k8s.io",
-        version: "v1beta2",
-        kind: "Machine",
-        plural: "machines",
-        resource: "machine",
-        worker_suffix: false,
-    },
-    Kind {
-        group: "infrastructure.cluster.x-k8s.io",
-        version: "v1beta2",
-        kind: "DevMachine",
-        plural: "devmachines",
-        resource: "machine",
-        worker_suffix: false,
-    },
-    Kind {
-        group: "bootstrap.cluster.x-k8s.io",
-        version: "v1beta2",
-        kind: "KubeadmConfig",
-        plural: "kubeadmconfigs",
-        resource: "machine",
-        worker_suffix: false,
-    },
-];
-
-impl Kind {
-    fn api_resource(self) -> ApiResource {
-        let mut resource =
-            ApiResource::from_gvk(&GroupVersionKind::gvk(self.group, self.version, self.kind));
-        resource.plural = self.plural.into();
-        resource
-    }
-
-    fn name(self, tenant: &str) -> String {
-        if self.worker_suffix {
-            format!("{tenant}-worker")
-        } else {
-            tenant.into()
-        }
-    }
-}
 
 fn invalid(message: impl Into<String>) -> ReconcileError {
     ReconcileError::OwnershipInvalid(message.into())
@@ -252,8 +141,7 @@ impl FinalizationKube for LiveKube {
         namespace: &str,
         name: &str,
     ) -> Result<Option<DynamicObject>, ReconcileError> {
-        let resource = ROOTS
-            .iter()
+        let resource = management::roots()
             .find(|item| item.kind == kind)
             .ok_or_else(|| invalid("unknown root kind"))?;
         Ok(Api::<DynamicObject>::namespaced_with(
@@ -269,8 +157,8 @@ impl FinalizationKube for LiveKube {
         kind: &str,
         namespace: &str,
     ) -> Result<Vec<DynamicObject>, ReconcileError> {
-        let resource = DESCENDANTS
-            .iter()
+        let resource = management::descendants()
+            .filter(|resource| resource.role != "provider")
             .find(|item| item.kind == kind)
             .ok_or_else(|| invalid("unknown descendant kind"))?;
         let mut items = Api::<DynamicObject>::namespaced_with(
@@ -284,7 +172,7 @@ impl FinalizationKube for LiveKube {
         for item in &mut items {
             if item.types.is_none() {
                 item.types = Some(kube::core::TypeMeta {
-                    api_version: format!("{}/{}", resource.group, resource.version),
+                    api_version: resource.api_version.into(),
                     kind: resource.kind.into(),
                 });
             }
@@ -314,8 +202,7 @@ impl FinalizationKube for LiveKube {
         uid: &str,
         rv: &str,
     ) -> Result<(), ReconcileError> {
-        let resource = ROOTS
-            .iter()
+        let resource = management::roots()
             .find(|item| item.kind == kind)
             .ok_or_else(|| invalid("unknown root kind"))?;
         Api::<DynamicObject>::namespaced_with(
@@ -516,20 +403,20 @@ impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
                 return Err(invalid("Namespace has a provider owner"));
             }
         }
-        let mut roots = Vec::with_capacity(ROOTS.len());
-        for root in ROOTS {
+        let root_kinds: Vec<_> = management::roots().collect();
+        let mut roots = Vec::with_capacity(root_kinds.len());
+        for root in &root_kinds {
             let object = self.kube.root(root.kind, name, &root.name(name)).await?;
             if let Some(object) = &object {
-                let expected_version = format!("{}/{}", root.group, root.version);
                 if object.metadata.name.as_deref() != Some(root.name(name).as_str())
                     || object.metadata.namespace.as_deref() != Some(name)
                     || object.types.as_ref().is_none_or(|types| {
-                        types.kind != root.kind || types.api_version != expected_version
+                        types.kind != root.kind || types.api_version != root.api_version
                     })
                 {
                     return Err(invalid("management root identity changed during GET"));
                 }
-                validate_root_ownership(&object.metadata, identity, root.resource)
+                validate_root_ownership(&object.metadata, identity, root.role)
                     .map_err(|error| invalid(error.to_string()))?;
                 if root.kind == "Cluster" {
                     validate_cluster_uid(tenant, &object.metadata)
@@ -538,7 +425,11 @@ impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
             }
             roots.push(object);
         }
-        let cluster = roots[0].as_ref();
+        let cluster_index = root_kinds
+            .iter()
+            .position(|root| root.kind == "Cluster")
+            .unwrap();
+        let cluster = roots[cluster_index].as_ref();
         let cluster_uid = tenant
             .status
             .as_ref()
@@ -547,7 +438,7 @@ impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
         let mut inventory: Vec<DynamicObject> = roots.iter().flatten().cloned().collect();
         for (index, root) in roots.iter().enumerate() {
             if let Some(object) = root {
-                let checked = if index == 0 || cluster_uid.is_none() {
+                let checked = if index == cluster_index || cluster_uid.is_none() {
                     validate_provider_owner(object, name, false, &inventory)
                 } else {
                     validate_provider_owner_for_deletion(object, tenant, &inventory)
@@ -560,11 +451,18 @@ impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
             .secret(name, &format!("{name}-kubeconfig"))
             .await?;
         if let Some(secret) = &secret {
-            validate_kubeconfig_secret_for_deletion(secret, roots[2].as_ref())
+            let control_plane = root_kinds
+                .iter()
+                .position(|root| root.kind == "KamajiControlPlane")
+                .and_then(|index| roots[index].as_ref());
+            validate_kubeconfig_secret_for_deletion(secret, control_plane)
                 .map_err(|error| invalid(error.to_string()))?;
         }
-        let mut descendants: Vec<Vec<DynamicObject>> = Vec::with_capacity(DESCENDANTS.len());
-        for kind in DESCENDANTS {
+        let descendant_kinds: Vec<_> = management::descendants()
+            .filter(|resource| resource.role != "provider")
+            .collect();
+        let mut descendants: Vec<Vec<DynamicObject>> = Vec::with_capacity(descendant_kinds.len());
+        for kind in &descendant_kinds {
             let observed = self.kube.descendants(kind.kind, name).await?;
             descendants.push(observed);
         }
@@ -581,33 +479,34 @@ impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
                 if object.metadata.namespace.as_deref() != Some(name)
                     || object.metadata.name.as_deref().is_none_or(str::is_empty)
                     || object.types.as_ref().is_none_or(|types| {
-                        types.kind != DESCENDANTS[index].kind
-                            || types.api_version
-                                != format!(
-                                    "{}/{}",
-                                    DESCENDANTS[index].group, DESCENDANTS[index].version
-                                )
+                        types.kind != descendant_kinds[index].kind
+                            || types.api_version != descendant_kinds[index].api_version
                     })
                 {
                     return Err(invalid("provider descendant inventory identity changed"));
                 }
-                let expected_owner = match index {
-                    0 => "MachineDeployment",
-                    1 => "MachineSet",
-                    _ => "Machine",
-                };
+                let expected_owner = descendant_kinds[index]
+                    .parent_kind
+                    .ok_or_else(|| invalid("provider descendant parent is missing"))?;
+                let expected_owner_api = management::MANAGEMENT_RESOURCES
+                    .iter()
+                    .find(|resource| resource.kind == expected_owner)
+                    .map(|resource| resource.api_version)
+                    .ok_or_else(|| invalid("provider descendant parent kind is unknown"))?;
                 let owners = object
                     .metadata
                     .owner_references
                     .as_deref()
                     .unwrap_or_default();
                 if !matches!(owners, [owner] if owner.kind == expected_owner
-                    && owner.api_version == crate::ownership::CLUSTER_API_VERSION)
+                    && owner.api_version == expected_owner_api)
                 {
                     return Err(invalid("provider descendant has no exact provider owner"));
                 }
-                let deployment = roots[5]
-                    .as_ref()
+                let deployment = root_kinds
+                    .iter()
+                    .position(|root| root.kind == "MachineDeployment")
+                    .and_then(|index| roots[index].as_ref())
                     .ok_or_else(|| invalid("provider descendant has no live MachineDeployment"))?;
                 validate_owner_chain(object, uid(&deployment.metadata)?, &inventory)
                     .map_err(|error| invalid(error.to_string()))?;
@@ -722,11 +621,16 @@ impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
             return Ok(pending());
         }
         if let Some(cluster) = cluster {
-            return self.delete_root(ROOTS[0], name, cluster).await;
+            return self
+                .delete_root(root_kinds[cluster_index], name, cluster)
+                .await;
         }
-        for (index, root) in roots.iter().enumerate().skip(1) {
+        for (index, root) in roots.iter().enumerate() {
+            if index == cluster_index {
+                continue;
+            }
             if let Some(root) = root {
-                return self.delete_root(ROOTS[index], name, root).await;
+                return self.delete_root(root_kinds[index], name, root).await;
             }
         }
         if descendants.iter().any(|items| !items.is_empty())
@@ -800,7 +704,7 @@ impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
 
     async fn delete_root(
         &self,
-        kind: Kind,
+        kind: ManagementResource,
         namespace: &str,
         observed: &DynamicObject,
     ) -> Result<Action, ReconcileError> {

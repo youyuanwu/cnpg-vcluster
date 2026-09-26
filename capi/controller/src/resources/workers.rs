@@ -3,9 +3,7 @@ use serde_json::json;
 use std::collections::BTreeMap;
 
 use super::Context;
-use crate::ownership::{
-    CLUSTER_API_VERSION, FOUNDATION_ANNOTATION, SPEC_HASH_ANNOTATION, TENANT_UID_ANNOTATION,
-};
+use crate::ownership::{FOUNDATION_ANNOTATION, SPEC_HASH_ANNOTATION, TENANT_UID_ANNOTATION};
 
 pub fn kubeadm_config_template(context: &Context<'_>) -> DynamicObject {
     let mut spec = json!({"template":{"spec":{"joinConfiguration":{"nodeRegistration":{"kubeletExtraArgs":[{
@@ -14,19 +12,11 @@ pub fn kubeadm_config_template(context: &Context<'_>) -> DynamicObject {
     if !context.worker_bootstrap_commands.is_empty() {
         spec["template"]["spec"]["preKubeadmCommands"] = json!(context.worker_bootstrap_commands);
     }
-    context.object(
-        "bootstrap.cluster.x-k8s.io/v1beta2",
-        "KubeadmConfigTemplate",
-        &format!("{}-worker", context.name()),
-        context.name(),
-        "kubeadm-config-template",
-        spec,
-    )
+    context.management_object("KubeadmConfigTemplate", spec)
 }
 
 pub fn dev_machine_template(context: &Context<'_>) -> DynamicObject {
-    context.object("infrastructure.cluster.x-k8s.io/v1beta2", "DevMachineTemplate",
-        &format!("{}-worker",context.name()), context.name(), "dev-machine-template", json!({
+    context.management_object("DevMachineTemplate", json!({
             "template":{"spec":{"backend":{"docker":{
                 "customImage":context.inputs.node_image,"bootstrapTimeout":"5m",
                 "extraMounts":[
@@ -45,7 +35,7 @@ pub fn machine_deployment(context: &Context<'_>) -> DynamicObject {
         context.name().into(),
     );
     labels.insert("cnpg-vcluster.capi/nodepool".into(), "worker".into());
-    context.object(CLUSTER_API_VERSION, "MachineDeployment", &name, context.name(), "machine-deployment", json!({
+    context.management_object("MachineDeployment", json!({
         "clusterName":context.name(),"replicas":context.spec.workers,
         "machineNaming":{"template":"{{ .cluster.name }}-worker-{{ .random }}"},
         "selector":{"matchLabels":{"cluster.x-k8s.io/cluster-name":context.name(),"cnpg-vcluster.capi/nodepool":"worker"}},

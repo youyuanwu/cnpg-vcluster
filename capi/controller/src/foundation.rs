@@ -116,12 +116,6 @@ pub struct DeletionInputs {
 }
 
 #[derive(Clone, Debug)]
-pub struct VerifiedFoundation<T> {
-    pub value: T,
-    pub hash: String,
-}
-
-#[derive(Clone, Debug)]
 pub struct RuntimeFoundation {
     pub deletion: DeletionFoundation,
     pub creation: Result<Foundation, FoundationError>,
@@ -162,35 +156,14 @@ pub fn canonical_hash(raw_json: &str) -> Result<String, FoundationError> {
     Ok(hex::encode(Sha256::digest(canonical)))
 }
 
-fn verified_raw(
-    raw_json: &str,
-    published_hash: &str,
-    lifecycle_hash: Option<&str>,
-) -> Result<(Value, String), FoundationError> {
+fn verified_raw(raw_json: &str, published_hash: &str) -> Result<(Value, String), FoundationError> {
     let actual = canonical_hash(raw_json)?;
     if published_hash != actual {
         return Err(FoundationError::Checksum);
     }
-    if lifecycle_hash.is_some_and(|expected| !expected.is_empty() && expected != actual) {
-        return Err(FoundationError::Identity);
-    }
     let raw =
         serde_json::from_str(raw_json).map_err(|err| FoundationError::Json(err.to_string()))?;
     Ok((raw, actual))
-}
-
-pub fn parse_for_creation(
-    raw_json: &str,
-    published_hash: &str,
-    lifecycle_hash: Option<&str>,
-    supported_version: &str,
-    expected_image: &str,
-) -> Result<VerifiedFoundation<Foundation>, FoundationError> {
-    let (raw, hash) = verified_raw(raw_json, published_hash, lifecycle_hash)?;
-    let value: Foundation =
-        serde_json::from_value(raw).map_err(|err| FoundationError::Json(err.to_string()))?;
-    validate_creation(&value, supported_version, expected_image)?;
-    Ok(VerifiedFoundation { value, hash })
 }
 
 pub fn parse_runtime(
@@ -199,7 +172,7 @@ pub fn parse_runtime(
     supported_version: &str,
     expected_image: &str,
 ) -> Result<RuntimeFoundation, FoundationError> {
-    let (raw, hash) = verified_raw(raw_json, published_hash, None)?;
+    let (raw, hash) = verified_raw(raw_json, published_hash)?;
     let deletion: DeletionFoundation = serde_json::from_value(raw.clone())
         .map_err(|err| FoundationError::Json(err.to_string()))?;
     validate_deletion(&deletion, supported_version)?;
@@ -214,18 +187,6 @@ pub fn parse_runtime(
         creation,
         hash,
     })
-}
-
-pub fn parse_for_deletion(
-    raw_json: &str,
-    published_hash: &str,
-    lifecycle_hash: Option<&str>,
-) -> Result<VerifiedFoundation<DeletionFoundation>, FoundationError> {
-    let (raw, hash) = verified_raw(raw_json, published_hash, lifecycle_hash)?;
-    let value: DeletionFoundation =
-        serde_json::from_value(raw).map_err(|err| FoundationError::Json(err.to_string()))?;
-    validate_deletion(&value, &value.kubernetes_version)?;
-    Ok(VerifiedFoundation { value, hash })
 }
 
 fn validate_deletion(
@@ -447,9 +408,11 @@ mod tests {
 
     fn creation() -> Foundation {
         let (raw, hash) = fixture();
-        parse_for_creation(&raw, &hash, None, "1.36.4", "controller:one")
+        parse_runtime(&raw, &hash, "1.36.4", "controller:one")
             .unwrap()
-            .value
+            .creation(None)
+            .unwrap()
+            .clone()
     }
 
     #[test]
@@ -466,18 +429,14 @@ mod tests {
         data["extraMetadata"] = serde_json::json!({"revision": 1});
         assert_ne!(canonical_hash(&data.to_string()).unwrap(), hash);
         assert!(matches!(
-            parse_for_creation(&data.to_string(), &hash, None, "1.36.4", "controller:one"),
+            parse_runtime(&data.to_string(), &hash, "1.36.4", "controller:one"),
             Err(FoundationError::Checksum)
         ));
         let new_hash = canonical_hash(&data.to_string()).unwrap();
         assert!(matches!(
-            parse_for_creation(
-                &data.to_string(),
-                &new_hash,
-                None,
-                "1.36.4",
-                "controller:one"
-            ),
+            parse_runtime(&data.to_string(), &new_hash, "1.36.4", "controller:one")
+                .unwrap()
+                .creation(None),
             Err(FoundationError::Json(_))
         ));
     }
@@ -485,14 +444,15 @@ mod tests {
     #[test]
     fn creation_and_minimal_deletion() {
         let (raw, hash) = fixture();
-        let created = parse_for_creation(&raw, &hash, None, "v1.36.4", "controller:one").unwrap();
+        let created = parse_runtime(&raw, &hash, "v1.36.4", "controller:one").unwrap();
+        let creation = created.creation(None).unwrap();
         assert_eq!(
-            created.value.slots[0].api_endpoint(created.value.inputs.api_port),
+            creation.slots[0].api_endpoint(creation.inputs.api_port),
             "172.18.255.223:6443"
         );
         assert_eq!(created.hash, hash);
         assert!(matches!(
-            parse_for_creation(&raw, &hash, Some("wrong"), "1.36.4", "controller:one"),
+            created.creation(Some("wrong")),
             Err(FoundationError::Identity)
         ));
         let minimal = serde_json::json!({"schema":3,"networkId":"network-one",
@@ -502,17 +462,17 @@ mod tests {
         let raw = minimal.to_string();
         let hash = canonical_hash(&raw).unwrap();
         assert_eq!(
-            parse_for_deletion(&raw, &hash, Some(&hash))
+            parse_runtime(&raw, &hash, "1.36.4", "controller:one")
                 .unwrap()
-                .value
+                .deletion(Some(&hash))
+                .unwrap()
                 .network_id,
             "network-one"
         );
-        assert!(parse_for_creation(&raw, &hash, None, "1.36.4", "controller:one").is_err());
-        assert!(parse_for_deletion(&raw, "bad", None).is_err());
-        assert!(parse_for_deletion(&raw, &hash, Some("wrong")).is_err());
         let runtime = parse_runtime(&raw, &hash, "1.36.4", "controller:one").unwrap();
         assert!(runtime.creation(None).is_err());
+        assert!(parse_runtime(&raw, "bad", "1.36.4", "controller:one").is_err());
+        assert!(runtime.deletion(Some("wrong")).is_err());
         assert_eq!(
             runtime.deletion(Some(&hash)).unwrap().network_id,
             "network-one"
@@ -620,6 +580,14 @@ mod tests {
         let mut data: Value = serde_json::from_str(&raw).unwrap();
         data["inputs"]["storageContainerPath"] = "".into();
         let raw = data.to_string();
-        assert!(parse_for_deletion(&raw, &canonical_hash(&raw).unwrap(), None).is_err());
+        assert!(
+            parse_runtime(
+                &raw,
+                &canonical_hash(&raw).unwrap(),
+                "1.36.4",
+                "controller:one"
+            )
+            .is_err()
+        );
     }
 }

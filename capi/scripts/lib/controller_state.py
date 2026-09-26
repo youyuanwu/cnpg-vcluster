@@ -107,6 +107,10 @@ def require_clean_controller_state(
             "plural",
             "namespaced",
             "role",
+            "class",
+            "parentKind",
+            "workerSuffix",
+            "watched",
             "inventoryPolicy",
             "exemptions",
         }:
@@ -115,6 +119,13 @@ def require_clean_controller_state(
             not isinstance(entry["namespaced"], bool)
             or not isinstance(entry["role"], str)
             or not entry["role"]
+            or entry["class"] not in {"root", "descendant", "typed"}
+            or (
+                entry["parentKind"] is not None
+                and not isinstance(entry["parentKind"], str)
+            )
+            or not isinstance(entry["workerSuffix"], bool)
+            or not isinstance(entry["watched"], bool)
             or not isinstance(entry["exemptions"], list)
             or not all(isinstance(value, str) for value in entry["exemptions"])
         ):

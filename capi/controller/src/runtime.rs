@@ -9,8 +9,6 @@ use axum::extract::State;
 use axum::http::StatusCode;
 use axum::routing::get;
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace};
-use kube::api::{DeleteParams, Patch, PatchParams, Preconditions};
 use kube::runtime::controller::{Config as ControllerConfig, Controller};
 use kube::runtime::reflector::ObjectRef;
 use kube::runtime::watcher;
@@ -22,7 +20,6 @@ use tokio::time::{Instant, MissedTickBehavior};
 
 use crate::api::Tenant;
 use crate::error::ControllerError;
-use crate::status::{StatusUpdatePlan, plan_status_update};
 
 pub const DEFAULT_LEADER_ELECTION_ID: &str = "tenant-controller.tenancy.cnpg-vcluster.io";
 pub const DEFAULT_LEADER_ELECTION_NAMESPACE: &str = "default";
@@ -48,114 +45,6 @@ where
         .filter(|name| !name.is_empty())
         .map(|name| vec![ObjectRef::new(name)])
         .unwrap_or_default()
-}
-
-#[derive(Clone)]
-pub struct DirectKubeClient {
-    client: Client,
-}
-
-impl DirectKubeClient {
-    #[must_use]
-    pub fn new(client: Client) -> Self {
-        Self { client }
-    }
-
-    #[must_use]
-    pub fn client(&self) -> Client {
-        self.client.clone()
-    }
-
-    pub async fn tenant(&self, name: &str) -> Result<Option<Tenant>, ControllerError> {
-        Ok(Api::<Tenant>::all(self.client.clone())
-            .get_opt(name)
-            .await?)
-    }
-
-    pub async fn config_map(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<ConfigMap>, ControllerError> {
-        Ok(Api::<ConfigMap>::namespaced(self.client.clone(), namespace)
-            .get_opt(name)
-            .await?)
-    }
-
-    pub async fn lease(
-        &self,
-        namespace: &str,
-        name: &str,
-    ) -> Result<Option<Lease>, ControllerError> {
-        Ok(Api::<Lease>::namespaced(self.client.clone(), namespace)
-            .get_opt(name)
-            .await?)
-    }
-
-    pub async fn namespace(&self, name: &str) -> Result<Option<Namespace>, ControllerError> {
-        Ok(Api::<Namespace>::all(self.client.clone())
-            .get_opt(name)
-            .await?)
-    }
-
-    pub async fn delete_lease_exact(
-        &self,
-        namespace: &str,
-        name: &str,
-        uid: &str,
-        resource_version: &str,
-    ) -> Result<(), ControllerError> {
-        let params = DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: Some(uid.into()),
-                resource_version: Some(resource_version.into()),
-            }),
-            ..DeleteParams::default()
-        };
-        Api::<Lease>::namespaced(self.client.clone(), namespace)
-            .delete(name, &params)
-            .await?;
-        Ok(())
-    }
-
-    pub async fn update_tenant_status<F>(
-        &self,
-        name: &str,
-        max_conflict_retries: usize,
-        mutate: F,
-    ) -> Result<Option<Tenant>, ControllerError>
-    where
-        F: Fn(&mut crate::api::TenantStatus) -> Result<(), ControllerError>,
-    {
-        let api = Api::<Tenant>::all(self.client.clone());
-        for attempt in 0..=max_conflict_retries {
-            let current = api.get(name).await?;
-            match plan_status_update(&current, &mutate)? {
-                StatusUpdatePlan::Noop => return Ok(None),
-                plan @ StatusUpdatePlan::Replace { .. } => {
-                    let patch = plan
-                        .merge_patch()
-                        .expect("replacement status plan has a patch");
-                    match api
-                        .patch_status(name, &PatchParams::default(), &Patch::Merge(&patch))
-                        .await
-                    {
-                        Ok(updated) => return Ok(Some(updated)),
-                        Err(kube::Error::Api(status))
-                            if status.is_conflict() && attempt < max_conflict_retries => {}
-                        Err(kube::Error::Api(status)) if status.is_conflict() => {
-                            return Err(ControllerError::StatusConflict {
-                                resource: name.into(),
-                                attempts: attempt + 1,
-                            });
-                        }
-                        Err(error) => return Err(error.into()),
-                    }
-                }
-            }
-        }
-        unreachable!("status retry loop always returns")
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -706,87 +595,17 @@ pub async fn wait_for_shutdown(mut shutdown: watch::Receiver<bool>) {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
     use std::convert::Infallible;
     use std::sync::Mutex;
 
     use axum::body::Body as AxumBody;
     use http_body_util::BodyExt;
-    use kube::ResourceExt;
+    use k8s_openapi::api::core::v1::ConfigMap;
     use kube::client::Body;
     use serde_json::{Value, json};
     use tower::{ServiceExt, service_fn};
 
-    use crate::api::{AllocationStatus, TenantPhase, TenantSpec, TenantStatus};
-
     use super::*;
-
-    #[derive(Clone)]
-    struct MockKube {
-        requests: Arc<Mutex<Vec<RecordedRequest>>>,
-        responses: Arc<Mutex<VecDeque<(StatusCode, Value)>>>,
-    }
-
-    #[derive(Clone, Debug)]
-    struct RecordedRequest {
-        method: String,
-        path: String,
-        content_type: Option<String>,
-        body: Value,
-    }
-
-    impl MockKube {
-        fn client(responses: Vec<(StatusCode, Value)>) -> (Client, Self) {
-            let mock = Self {
-                requests: Arc::new(Mutex::new(Vec::new())),
-                responses: Arc::new(Mutex::new(responses.into())),
-            };
-            let service = mock.clone();
-            let client = Client::new(
-                service_fn(move |request: axum::http::Request<Body>| {
-                    let service = service.clone();
-                    async move {
-                        let method = request.method().to_string();
-                        let path = request
-                            .uri()
-                            .path_and_query()
-                            .map_or_else(String::new, ToString::to_string);
-                        let content_type = request
-                            .headers()
-                            .get(axum::http::header::CONTENT_TYPE)
-                            .and_then(|value| value.to_str().ok())
-                            .map(str::to_owned);
-                        let bytes = request.into_body().collect().await.unwrap().to_bytes();
-                        let body = if bytes.is_empty() {
-                            Value::Null
-                        } else {
-                            serde_json::from_slice(&bytes).unwrap()
-                        };
-                        service.requests.lock().unwrap().push(RecordedRequest {
-                            method,
-                            path,
-                            content_type,
-                            body,
-                        });
-                        let (status, body) = service.responses.lock().unwrap().pop_front().unwrap();
-                        Ok::<_, Infallible>(
-                            axum::http::Response::builder()
-                                .status(status)
-                                .header("content-type", "application/json")
-                                .body(Body::from(serde_json::to_vec(&body).unwrap()))
-                                .unwrap(),
-                        )
-                    }
-                }),
-                "default",
-            );
-            (client, mock)
-        }
-
-        fn requests(&self) -> Vec<RecordedRequest> {
-            self.requests.lock().unwrap().clone()
-        }
-    }
 
     #[derive(Clone)]
     struct MockLease {
@@ -886,32 +705,6 @@ mod tests {
         .expect("leader must become unready before lease expiration");
     }
 
-    fn tenant(resource_version: &str, endpoint: &str) -> Tenant {
-        let mut tenant = Tenant::new(
-            "tenant-a",
-            TenantSpec {
-                kubernetes_version: "1.36.4".into(),
-                workers: 1,
-                databases: 1,
-            },
-        );
-        tenant.metadata.uid = Some("tenant-uid".into());
-        tenant.metadata.resource_version = Some(resource_version.into());
-        tenant.metadata.generation = Some(3);
-        tenant.status = Some(TenantStatus {
-            observed_generation: Some(3),
-            phase: Some(TenantPhase::Progressing),
-            allocation: Some(AllocationStatus {
-                slot_id: "slot-a".into(),
-                endpoint: endpoint.into(),
-                pod_cidr: "10.73.0.0/16".into(),
-                service_cidr: "10.143.0.0/16".into(),
-            }),
-            ..Default::default()
-        });
-        tenant
-    }
-
     fn api_error(code: u16, reason: &str) -> Value {
         json!({
             "apiVersion":"v1",
@@ -921,175 +714,6 @@ mod tests {
             "reason":reason,
             "code":code
         })
-    }
-
-    #[tokio::test]
-    async fn direct_reads_use_exact_uncached_paths() {
-        let tenant = tenant("1", "10.0.0.8");
-        let (client, mock) = MockKube::client(vec![
-            (StatusCode::OK, serde_json::to_value(&tenant).unwrap()),
-            (
-                StatusCode::OK,
-                json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"foundation","namespace":"system"}}),
-            ),
-            (StatusCode::NOT_FOUND, api_error(404, "NotFound")),
-        ]);
-        let direct = DirectKubeClient::new(client);
-        assert_eq!(
-            direct.tenant("tenant-a").await.unwrap().unwrap().name_any(),
-            "tenant-a"
-        );
-        assert!(
-            direct
-                .config_map("system", "foundation")
-                .await
-                .unwrap()
-                .is_some()
-        );
-        assert!(direct.lease("system", "slot-a").await.unwrap().is_none());
-        let requests = mock.requests();
-        assert_eq!(
-            requests
-                .iter()
-                .map(|request| (request.method.as_str(), request.path.as_str()))
-                .collect::<Vec<_>>(),
-            vec![
-                (
-                    "GET",
-                    "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a"
-                ),
-                ("GET", "/api/v1/namespaces/system/configmaps/foundation"),
-                (
-                    "GET",
-                    "/apis/coordination.k8s.io/v1/namespaces/system/leases/slot-a"
-                ),
-            ]
-        );
-        assert!(requests.iter().all(|request| request.body.is_null()));
-    }
-
-    #[tokio::test]
-    async fn exact_delete_sends_uid_and_resource_version_preconditions() {
-        let (client, mock) = MockKube::client(vec![(
-            StatusCode::OK,
-            json!({"apiVersion":"v1","kind":"Status","status":"Success"}),
-        )]);
-        DirectKubeClient::new(client)
-            .delete_lease_exact("system", "slot-a", "lease-uid", "17")
-            .await
-            .unwrap();
-        let requests = mock.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, "DELETE");
-        assert_eq!(
-            requests[0].path,
-            "/apis/coordination.k8s.io/v1/namespaces/system/leases/slot-a?"
-        );
-        assert_eq!(
-            requests[0].content_type.as_deref(),
-            Some("application/json")
-        );
-        assert_eq!(
-            requests[0].body,
-            json!({"preconditions":{"resourceVersion":"17","uid":"lease-uid"}})
-        );
-    }
-
-    #[tokio::test]
-    async fn status_conflict_rereads_and_preserves_concurrent_fields() {
-        let first = tenant("10", "10.0.0.8");
-        let concurrent = tenant("11", "10.0.0.9");
-        let mut updated = concurrent.clone();
-        updated.status.as_mut().unwrap().phase = Some(TenantPhase::Ready);
-        let (client, mock) = MockKube::client(vec![
-            (StatusCode::OK, serde_json::to_value(&first).unwrap()),
-            (StatusCode::CONFLICT, api_error(409, "Conflict")),
-            (StatusCode::OK, serde_json::to_value(&concurrent).unwrap()),
-            (StatusCode::OK, serde_json::to_value(&updated).unwrap()),
-        ]);
-        let result = DirectKubeClient::new(client)
-            .update_tenant_status("tenant-a", 2, |status| {
-                status.phase = Some(TenantPhase::Ready);
-                Ok(())
-            })
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            result.status.unwrap().allocation.unwrap().endpoint,
-            "10.0.0.9"
-        );
-        let requests = mock.requests();
-        assert_eq!(requests.len(), 4);
-        assert_eq!(requests[1].method, "PATCH");
-        assert_eq!(
-            requests[1].path,
-            "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a/status?"
-        );
-        assert_eq!(
-            requests[1].content_type.as_deref(),
-            Some("application/merge-patch+json")
-        );
-        assert_eq!(
-            requests[1]
-                .body
-                .as_object()
-                .unwrap()
-                .keys()
-                .map(String::as_str)
-                .collect::<Vec<_>>(),
-            vec!["metadata", "status"]
-        );
-        assert_eq!(requests[1].body["metadata"]["resourceVersion"], "10");
-        assert_eq!(requests[3].body["metadata"]["resourceVersion"], "11");
-        assert_eq!(
-            requests[3].body["status"]["allocation"]["endpoint"],
-            "10.0.0.9"
-        );
-        assert_eq!(requests[3].body["status"]["phase"], "Ready");
-    }
-
-    #[tokio::test]
-    async fn status_noop_performs_no_write() {
-        let current = tenant("10", "10.0.0.8");
-        let (client, mock) = MockKube::client(vec![(
-            StatusCode::OK,
-            serde_json::to_value(&current).unwrap(),
-        )]);
-        let result = DirectKubeClient::new(client)
-            .update_tenant_status("tenant-a", 2, |_| Ok(()))
-            .await
-            .unwrap();
-        assert!(result.is_none());
-        let requests = mock.requests();
-        assert_eq!(requests.len(), 1);
-        assert_eq!(requests[0].method, "GET");
-    }
-
-    #[tokio::test]
-    async fn status_conflict_exhaustion_is_typed() {
-        let current = tenant("10", "10.0.0.8");
-        let (client, mock) = MockKube::client(vec![
-            (StatusCode::OK, serde_json::to_value(&current).unwrap()),
-            (StatusCode::CONFLICT, api_error(409, "Conflict")),
-            (StatusCode::OK, serde_json::to_value(&current).unwrap()),
-            (StatusCode::CONFLICT, api_error(409, "Conflict")),
-        ]);
-        let error = DirectKubeClient::new(client)
-            .update_tenant_status("tenant-a", 1, |status| {
-                status.phase = Some(TenantPhase::Ready);
-                Ok(())
-            })
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            error,
-            ControllerError::StatusConflict {
-                ref resource,
-                attempts: 2
-            } if resource == "tenant-a"
-        ));
-        assert_eq!(mock.requests().len(), 4);
     }
 
     #[tokio::test]

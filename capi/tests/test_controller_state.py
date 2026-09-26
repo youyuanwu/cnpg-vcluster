@@ -91,6 +91,10 @@ class ControllerStateTests(unittest.TestCase):
                     "plural",
                     "namespaced",
                     "role",
+                    "class",
+                    "parentKind",
+                    "workerSuffix",
+                    "watched",
                     "inventoryPolicy",
                     "exemptions",
                 }

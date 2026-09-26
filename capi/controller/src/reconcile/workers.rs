@@ -4,6 +4,7 @@ use kube::{Client, ResourceExt, api::ListParams, core::DynamicObject};
 
 use crate::{
     docker::{self, DockerClient, WorkerIdentity},
+    management::MANAGEMENT_RESOURCES,
     ownership::{self, Identity},
     readiness::{node_ready, object_ready, workload_available},
 };
@@ -30,11 +31,14 @@ pub struct WorkerInputs<'a> {
 
 async fn list(
     client: Client,
-    version: &str,
     kind: &str,
     namespace: Option<&str>,
 ) -> Result<Vec<DynamicObject>, ReconcileError> {
-    let resource = resource(version, kind);
+    let definition = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == kind)
+        .ok_or_else(|| ReconcileError::InvalidInput(format!("unknown management kind {kind}")))?;
+    let resource = definition.api_resource();
     let mut items = api_for(client, &resource, namespace)
         .list(&ListParams::default())
         .await?
@@ -43,7 +47,7 @@ async fn list(
         if item
             .types
             .as_ref()
-            .is_some_and(|types| types.api_version != version || types.kind != kind)
+            .is_some_and(|types| types.api_version != definition.api_version || types.kind != kind)
             || item
                 .metadata
                 .namespace
@@ -58,7 +62,7 @@ async fn list(
             )));
         }
         item.types = Some(kube::core::TypeMeta {
-            api_version: version.into(),
+            api_version: definition.api_version.into(),
             kind: kind.into(),
         });
     }
@@ -82,27 +86,9 @@ pub async fn observe_workers<D: DockerClient>(
     let deployment_uid = deployment.uid().ok_or_else(|| {
         ReconcileError::OwnershipInvalid("MachineDeployment UID is missing".into())
     })?;
-    let sets = list(
-        management.clone(),
-        ownership::CLUSTER_API_VERSION,
-        "MachineSet",
-        Some(identity.tenant_name),
-    )
-    .await?;
-    let machines = list(
-        management.clone(),
-        ownership::CLUSTER_API_VERSION,
-        "Machine",
-        Some(identity.tenant_name),
-    )
-    .await?;
-    let dev_machines = list(
-        management,
-        "infrastructure.cluster.x-k8s.io/v1beta2",
-        "DevMachine",
-        Some(identity.tenant_name),
-    )
-    .await?;
+    let sets = list(management.clone(), "MachineSet", Some(identity.tenant_name)).await?;
+    let machines = list(management.clone(), "Machine", Some(identity.tenant_name)).await?;
+    let dev_machines = list(management, "DevMachine", Some(identity.tenant_name)).await?;
     let mut inventory = vec![deployment.clone()];
     inventory.extend(sets.iter().chain(&machines).cloned());
     let mut uids = BTreeSet::new();
@@ -163,7 +149,16 @@ pub async fn observe_workers<D: DockerClient>(
     )?;
     // Validate the complete Node inventory even when another component is short.
     // Counts must never hide a foreign identity.
-    let nodes = list(tenant_client.clone(), "v1", "Node", None).await?;
+    let mut nodes = api_for(tenant_client.clone(), &resource("v1", "Node"), None)
+        .list(&ListParams::default())
+        .await?
+        .items;
+    for node in &mut nodes {
+        node.types.get_or_insert(kube::core::TypeMeta {
+            api_version: "v1".into(),
+            kind: "Node".into(),
+        });
+    }
     let mut node_names = BTreeSet::new();
     let mut node_uids = BTreeSet::new();
     for node in &nodes {

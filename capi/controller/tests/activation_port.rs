@@ -9,7 +9,7 @@ use serde_json::json;
 use support::Server;
 use tenant_controller::{
     activation::{STATE_NAME, TICKET_NAME, admit},
-    management::{ACTIVATION_RESOURCES, InventoryPolicy},
+    management::{InventoryPolicy, MANAGEMENT_RESOURCES},
 };
 
 const CONFIG_MAPS: &str = "/api/v1/namespaces/tenant-system/configmaps";
@@ -43,7 +43,7 @@ fn clean_server() -> Server {
     for path in [TENANTS, NAMESPACES, SECRETS, LEASES] {
         server.allow_list(path);
     }
-    for resource in ACTIVATION_RESOURCES
+    for resource in MANAGEMENT_RESOURCES
         .iter()
         .filter(|resource| resource.inventory_policy == InventoryPolicy::BlockAnyInstance)
     {
@@ -135,7 +135,7 @@ fn typed_catalog_policies_match_activation_contract() {
             "controller-leader-election",
         ),
     ] {
-        let resource = ACTIVATION_RESOURCES
+        let resource = MANAGEMENT_RESOURCES
             .iter()
             .find(|resource| resource.kind == kind)
             .unwrap();
@@ -296,7 +296,7 @@ async fn accepted_state_survives_ticket_delete_failure_without_replay() {
 async fn provider_discovery_uncertainty_is_not_absence() {
     let server = clean_server();
     server.insert(TICKET, ticket("hash-b", "token-b"));
-    let first = ACTIVATION_RESOURCES
+    let first = MANAGEMENT_RESOURCES
         .iter()
         .find(|resource| resource.inventory_policy == InventoryPolicy::BlockAnyInstance)
         .unwrap();
