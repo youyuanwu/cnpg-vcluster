@@ -1,14 +1,11 @@
-use std::{
-    collections::BTreeMap,
-    convert::Infallible,
-    sync::{Arc, Mutex},
-};
+mod support;
 
-use axum::http::{Request, Response, StatusCode};
-use http_body_util::BodyExt;
+use std::collections::BTreeMap;
+
 use k8s_openapi::api::coordination::v1::{Lease, LeaseSpec};
-use kube::{Client, client::Body};
+use kube::Client;
 use serde_json::{Value, json};
+use support::Server;
 use tenant_controller::{
     allocation::{
         AllocationError, ClaimContext, ClaimDecision, ReleaseDecision, allocate, decide_claim,
@@ -16,7 +13,6 @@ use tenant_controller::{
     },
     foundation::AllocationSlot,
 };
-use tower::service_fn;
 
 fn slots() -> Vec<AllocationSlot> {
     vec![
@@ -480,7 +476,7 @@ async fn malformed_terminal_successors_never_complete_or_receive_mutations() {
             let mock = Mock::default();
             if reread {
                 mock.insert(owned(&old, &slots[0], "old-lease", "10"));
-                mock.state.lock().unwrap().replace_on_get = Some(malformed.clone());
+                mock.replace_on_get(malformed.clone());
             } else {
                 mock.insert(malformed.clone());
             }
@@ -490,10 +486,9 @@ async fn malformed_terminal_successors_never_complete_or_receive_mutations() {
                     .is_err(),
                 "{case}, reread={reread}"
             );
-            let state = mock.state.lock().unwrap();
-            assert_eq!(state.leases.values().collect::<Vec<_>>(), vec![&malformed]);
+            assert_eq!(mock.leases(), vec![malformed.clone()]);
             assert!(
-                state.requests.iter().all(|(method, _, _)| method == "GET"),
+                mock.requests().iter().all(|(method, _, _)| method == "GET"),
                 "{case}"
             );
         }
@@ -517,138 +512,88 @@ async fn malformed_terminal_successors_never_complete_or_receive_mutations() {
     }
 }
 
-#[derive(Default)]
-struct State {
-    leases: BTreeMap<String, Lease>,
-    requests: Vec<(String, String, Value)>,
-    sequence: usize,
-    create_collision: Option<Lease>,
-    replace_on_get: Option<Lease>,
-    replace_on_delete: Option<Lease>,
-}
+#[derive(Clone)]
+struct Mock(Server);
 
-#[derive(Clone, Default)]
-struct Mock {
-    state: Arc<Mutex<State>>,
-}
-
-fn response(status: StatusCode, value: Value) -> Response<Body> {
-    Response::builder()
-        .status(status)
-        .header("content-type", "application/json")
-        .body(Body::from(value.to_string().into_bytes()))
-        .unwrap()
-}
-
-fn failure(status: StatusCode, reason: &str) -> Response<Body> {
-    response(
-        status,
-        json!({"kind":"Status","apiVersion":"v1","status":"Failure",
-        "reason":reason,"message":reason,"code":status.as_u16()}),
-    )
+impl Default for Mock {
+    fn default() -> Self {
+        let server = Server::default();
+        server.allow_list(LEASES);
+        Self(server)
+    }
 }
 
 impl Mock {
     fn client(&self) -> Client {
-        let mock = self.clone();
-        Client::new(
-            service_fn(move |request: Request<Body>| {
-                let mock = mock.clone();
-                async move {
-                    let method = request.method().to_string();
-                    let path = request.uri().path().to_owned();
-                    let bytes = request.into_body().collect().await.unwrap().to_bytes();
-                    let body = if bytes.is_empty() {
-                        Value::Null
-                    } else {
-                        serde_json::from_slice(&bytes).unwrap()
-                    };
-                    let mut state = mock.state.lock().unwrap();
-                    state
-                        .requests
-                        .push((method.clone(), path.clone(), body.clone()));
-                    let name = path
-                        .strip_prefix("/apis/coordination.k8s.io/v1/namespaces/management/leases/")
-                        .map(str::to_owned);
-                    let answer = match (method.as_str(), name) {
-                        ("GET", None) => response(
-                            StatusCode::OK,
-                            json!({
-                                "apiVersion":"coordination.k8s.io/v1", "kind":"LeaseList",
-                                "metadata":{"resourceVersion":"1"},
-                                "items":state.leases.values().collect::<Vec<_>>()
-                            }),
-                        ),
-                        ("GET", Some(name)) => {
-                            if let Some(replacement) = state.replace_on_get.take() {
-                                state.leases.insert(name.clone(), replacement);
-                            }
-                            state
-                                .leases
-                                .get(&name)
-                                .map(|lease| {
-                                    response(StatusCode::OK, serde_json::to_value(lease).unwrap())
-                                })
-                                .unwrap_or_else(|| failure(StatusCode::NOT_FOUND, "NotFound"))
-                        }
-                        ("POST", None) => {
-                            let mut lease: Lease = serde_json::from_value(body).unwrap();
-                            let name = lease.metadata.name.clone().unwrap();
-                            if let Some(other) = state.create_collision.take() {
-                                state.leases.insert(name, other);
-                                failure(StatusCode::CONFLICT, "AlreadyExists")
-                            } else if state.leases.contains_key(&name) {
-                                failure(StatusCode::CONFLICT, "AlreadyExists")
-                            } else {
-                                state.sequence += 1;
-                                lease.metadata.uid = Some(format!("lease-{}", state.sequence));
-                                lease.metadata.resource_version =
-                                    Some(format!("{}", state.sequence));
-                                lease.spec.get_or_insert_default();
-                                state.leases.insert(name, lease.clone());
-                                response(StatusCode::CREATED, serde_json::to_value(lease).unwrap())
-                            }
-                        }
-                        ("DELETE", Some(name)) => {
-                            if let Some(replacement) = state.replace_on_delete.take() {
-                                state.leases.insert(name.clone(), replacement);
-                            }
-                            let current = state.leases.get(&name);
-                            let expected = &body["preconditions"];
-                            if current.is_some_and(|lease| {
-                                lease.metadata.uid.as_deref() == expected["uid"].as_str()
-                                    && lease.metadata.resource_version.as_deref()
-                                        == expected["resourceVersion"].as_str()
-                            }) {
-                                state.leases.remove(&name);
-                                response(
-                                    StatusCode::OK,
-                                    json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200}),
-                                )
-                            } else {
-                                failure(StatusCode::CONFLICT, "Conflict")
-                            }
-                        }
-                        _ => panic!("unexpected request {method} {path}"),
-                    };
-                    Ok::<_, Infallible>(answer)
-                }
-            }),
-            "default",
-        )
+        self.0.client()
     }
 
     fn insert(&self, lease: Lease) {
-        self.state
-            .lock()
-            .unwrap()
-            .leases
-            .insert(lease.metadata.name.clone().unwrap(), lease);
+        let name = lease.metadata.name.clone().unwrap();
+        self.0.insert(&lease_path(&name), lease);
     }
 
     fn requests(&self) -> Vec<(String, String, Value)> {
-        self.state.lock().unwrap().requests.clone()
+        self.0
+            .calls()
+            .into_iter()
+            .map(|call| (call.method, call.path, call.body))
+            .collect()
     }
+
+    fn clear(&self) {
+        self.0.clear();
+    }
+
+    fn remove(&self, name: &str) {
+        self.0.remove(&lease_path(name));
+    }
+
+    fn leases(&self) -> Vec<Lease> {
+        self.0
+            .values(&format!("{LEASES}/"))
+            .into_iter()
+            .map(|value| serde_json::from_value(value).unwrap())
+            .collect()
+    }
+
+    fn lease(&self, name: &str) -> Lease {
+        serde_json::from_value(self.0.get(&lease_path(name))).unwrap()
+    }
+
+    fn create_collision(&self, lease: Lease) {
+        let name = lease.metadata.name.clone().unwrap();
+        self.0.mutate_on(
+            "POST",
+            LEASES,
+            &lease_path(&name),
+            Some(serde_json::to_value(lease).unwrap()),
+        );
+        self.0.respond(
+            "POST",
+            LEASES,
+            409,
+            support::kube::status(409, "AlreadyExists"),
+        );
+    }
+
+    fn replace_on_get(&self, lease: Lease) {
+        let path = lease_path(lease.metadata.name.as_deref().unwrap());
+        self.0
+            .replace_on("GET", &path, Some(serde_json::to_value(lease).unwrap()));
+    }
+
+    fn replace_on_delete(&self, lease: Lease) {
+        let path = lease_path(lease.metadata.name.as_deref().unwrap());
+        self.0
+            .replace_on("DELETE", &path, Some(serde_json::to_value(lease).unwrap()));
+    }
+}
+
+const LEASES: &str = "/apis/coordination.k8s.io/v1/namespaces/management/leases";
+
+fn lease_path(name: &str) -> String {
+    format!("{LEASES}/{name}")
 }
 
 #[tokio::test]
@@ -688,7 +633,7 @@ async fn create_restart_before_status_and_bound_get() {
             .all(|(_, path, _)| path
                 .starts_with("/apis/coordination.k8s.io/v1/namespaces/management/leases"))
     );
-    mock.state.lock().unwrap().leases.clear();
+    mock.clear();
     assert!(matches!(
         allocate(mock.client(), &context, Some(&first.status())).await,
         Err(AllocationError::Missing)
@@ -707,8 +652,7 @@ async fn already_exists_reread_foreign_and_same_owner() {
     let slots = slots();
     let context = context("uid-a", &slots);
     let mock = Mock::default();
-    mock.state.lock().unwrap().create_collision =
-        Some(owned(&context, &slots[0], "winning-lease", "8"));
+    mock.create_collision(owned(&context, &slots[0], "winning-lease", "8"));
     let winner = allocate(mock.client(), &context, None).await.unwrap();
     assert_eq!(winner.lease_uid, "winning-lease");
     assert!(mock.requests().iter().any(|(method, _, _)| method == "GET"));
@@ -725,7 +669,7 @@ async fn already_exists_reread_foreign_and_same_owner() {
         .as_mut()
         .unwrap()
         .insert("tenancy.cnpg-vcluster.io/tenant".into(), "other".into());
-    mock.state.lock().unwrap().create_collision = Some(foreign);
+    mock.create_collision(foreign);
     let allocated = allocate(mock.client(), &context, None).await.unwrap();
     assert_eq!(allocated.slot, slots[1]);
     assert_eq!(
@@ -765,11 +709,7 @@ async fn live_duplicate_and_changed_status_bound_claim_refuse_mutation() {
             .any(|(method, _, _)| method == "POST" || method == "DELETE")
     );
 
-    mock.state
-        .lock()
-        .unwrap()
-        .leases
-        .remove(&lease_name("slot-b"));
+    mock.remove(&lease_name("slot-b"));
     let mut changed = first;
     changed
         .metadata
@@ -777,7 +717,7 @@ async fn live_duplicate_and_changed_status_bound_claim_refuse_mutation() {
         .as_mut()
         .unwrap()
         .insert("tenancy.cnpg-vcluster.io/slot-id".into(), "changed".into());
-    mock.state.lock().unwrap().replace_on_get = Some(changed);
+    mock.replace_on_get(changed);
     assert!(matches!(
         allocate(mock.client(), &context, Some(&bound)).await,
         Err(AllocationError::Claim(_))
@@ -877,10 +817,7 @@ async fn release_preconditions_crash_windows_and_successor_reuse() {
         ReleaseDecision::Complete
     );
     assert_eq!(
-        mock.state.lock().unwrap().leases[&lease_name("slot-a")]
-            .metadata
-            .uid
-            .as_deref(),
+        mock.lease(&lease_name("slot-a")).metadata.uid.as_deref(),
         Some(next.lease_uid.as_str())
     );
     assert_eq!(
@@ -910,7 +847,7 @@ async fn changed_bound_claim_and_delete_race_never_mutate_successor() {
         .as_mut()
         .unwrap()
         .insert("tenancy.cnpg-vcluster.io/endpoint".into(), "changed".into());
-    mock.state.lock().unwrap().replace_on_get = Some(changed);
+    mock.replace_on_get(changed);
     assert!(matches!(
         release(mock.client(), &context, Some(&bound), true).await,
         Err(AllocationError::Claim(_))
@@ -926,16 +863,13 @@ async fn changed_bound_claim_and_delete_race_never_mutate_successor() {
     let mut successor = old;
     successor.metadata.uid = Some("successor".into());
     successor.metadata.resource_version = Some("15".into());
-    mock.state.lock().unwrap().replace_on_delete = Some(successor);
+    mock.replace_on_delete(successor);
     assert!(matches!(
         release(mock.client(), &context, Some(&bound), true).await,
         Err(AllocationError::Api(_))
     ));
     assert_eq!(
-        mock.state.lock().unwrap().leases[&lease_name("slot-a")]
-            .metadata
-            .uid
-            .as_deref(),
+        mock.lease(&lease_name("slot-a")).metadata.uid.as_deref(),
         Some("successor")
     );
 }

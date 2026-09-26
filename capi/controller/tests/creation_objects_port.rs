@@ -3,7 +3,7 @@ mod creation_support;
 mod support;
 
 use creation_support::*;
-use kube::ResourceExt;
+use kube::{ResourceExt, api::ListParams};
 use serde_json::json;
 use tenant_controller::{
     ownership::{RESOURCE_ANNOTATION, TENANT_UID_ANNOTATION},
@@ -369,8 +369,10 @@ async fn crd_establishment_all_served_discovery_and_dependency_order_form_one_ba
     );
     assert!(server.calls().iter().all(|call| call.method == "GET"));
     for version in ["v1", "v2"] {
-        server.insert(&format!("/apis/example.io/{version}"), json!({"groupVersion":format!("example.io/{version}"),
-            "resources":[{"name":"widgets","kind":"Widget","namespaced":true,"verbs":["get","create"]}]}));
+        server.discover(
+            &format!("example.io/{version}"),
+            json!([{"name":"widgets","kind":"Widget","namespaced":true,"verbs":["get","create"]}]),
+        );
         if version == "v1" {
             assert!(
                 ensure_batch(server.client(), &objects, identity())
@@ -443,4 +445,43 @@ async fn shared_server_can_replace_an_object_before_a_live_read() {
             .ownership_invalid()
     );
     assert_eq!(server.calls().len(), 1);
+}
+
+#[tokio::test]
+#[should_panic(expected = "filtered safety inventory")]
+async fn scripted_response_cannot_bypass_unfiltered_list_guard() {
+    let server = Server::default();
+    let path = "/api/v1/namespaces/default/configmaps";
+    server.allow_list(path);
+    server.respond(
+        "GET",
+        path,
+        200,
+        json!({"apiVersion":"v1","kind":"List","metadata":{},"items":[]}),
+    );
+    api_for(
+        server.client(),
+        &resource("v1", "ConfigMap"),
+        Some("default"),
+    )
+    .list(&ListParams::default().labels("owned=true"))
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn shared_server_records_unmodelled_get_as_not_found() {
+    let server = Server::default();
+    let api = api_for(
+        server.client(),
+        &resource("v1", "ConfigMap"),
+        Some("default"),
+    );
+    let error = api.get("missing").await.unwrap_err();
+    assert!(matches!(error, kube::Error::Api(status) if status.code == 404));
+    assert_eq!(server.calls().len(), 1);
+    assert_eq!(
+        server.calls()[0].path,
+        "/api/v1/namespaces/default/configmaps/missing"
+    );
 }

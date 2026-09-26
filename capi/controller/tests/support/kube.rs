@@ -10,6 +10,15 @@ use kube::{Client, client::Body};
 use serde_json::{Value, json};
 use tower::service_fn;
 
+type RequestKey = (String, String);
+type ScriptedResponses = BTreeMap<RequestKey, VecDeque<(u16, Value)>>;
+type Replacements = BTreeMap<RequestKey, VecDeque<Replacement>>;
+
+pub struct Replacement {
+    target: String,
+    value: Option<Value>,
+}
+
 #[derive(Clone, Debug)]
 pub struct Call {
     pub method: String,
@@ -23,9 +32,11 @@ pub struct Call {
 pub struct State {
     pub objects: BTreeMap<String, Value>,
     pub lists: BTreeSet<String>,
+    pub discoveries: BTreeMap<String, Value>,
     pub calls: Vec<Call>,
-    pub responses: BTreeMap<(String, String), VecDeque<(u16, Value)>>,
-    pub replacements: BTreeMap<(String, String), VecDeque<Option<Value>>>,
+    pub queued_responses: VecDeque<(u16, Value)>,
+    pub responses: ScriptedResponses,
+    pub replacements: Replacements,
     pub revision: u32,
 }
 
@@ -62,19 +73,28 @@ impl Server {
                             .into(),
                         body: body.clone(),
                     });
+                    if method == "GET"
+                        && state.lists.contains(&path)
+                        && (query.contains("labelSelector") || query.contains("fieldSelector"))
+                    {
+                        panic!("filtered safety inventory");
+                    }
                     if let Some(replacement) = state
                         .replacements
                         .get_mut(&(method.clone(), path.clone()))
                         .and_then(VecDeque::pop_front)
                     {
-                        match replacement {
+                        match replacement.value {
                             Some(value) => {
-                                state.objects.insert(path.clone(), value);
+                                state.objects.insert(replacement.target, value);
                             }
                             None => {
-                                state.objects.remove(&path);
+                                state.objects.remove(&replacement.target);
                             }
                         }
+                    }
+                    if let Some(response) = state.queued_responses.pop_front() {
+                        return Ok::<_, Infallible>(response_body(response.0, response.1));
                     }
                     if let Some(response) = state
                         .responses
@@ -84,13 +104,10 @@ impl Server {
                         return Ok::<_, Infallible>(response_body(response.0, response.1));
                     }
                     let (code, result) = match method.as_str() {
+                        "GET" if state.discoveries.contains_key(&path) => {
+                            (200, state.discoveries[&path].clone())
+                        }
                         "GET" if state.lists.contains(&path) => {
-                            assert!(
-                                query.is_empty()
-                                    || (!query.contains("labelSelector")
-                                        && !query.contains("fieldSelector")),
-                                "filtered safety inventory"
-                            );
                             let prefix = format!("{path}/");
                             let items: Vec<_> = state
                                 .objects
@@ -212,6 +229,22 @@ impl Server {
         self.0.lock().unwrap().lists.insert(path.into());
     }
 
+    pub fn discover(&self, api_version: &str, resources: Value) {
+        let path = api_version.split_once('/').map_or_else(
+            || format!("/api/{api_version}"),
+            |(group, version)| format!("/apis/{group}/{version}"),
+        );
+        self.0.lock().unwrap().discoveries.insert(
+            path,
+            json!({
+                "apiVersion":"v1",
+                "groupVersion":api_version,
+                "kind":"APIResourceList",
+                "resources":resources
+            }),
+        );
+    }
+
     pub fn respond(&self, method: &str, path: &str, code: u16, body: Value) {
         self.0
             .lock()
@@ -222,14 +255,40 @@ impl Server {
             .push_back((code, body));
     }
 
+    pub fn queue_response(&self, code: u16, body: Value) {
+        self.0
+            .lock()
+            .unwrap()
+            .queued_responses
+            .push_back((code, body));
+    }
+
+    pub fn pending_responses(&self) -> usize {
+        let state = self.0.lock().unwrap();
+        state.queued_responses.len() + state.responses.values().map(VecDeque::len).sum::<usize>()
+    }
+
     pub fn replace_on(&self, method: &str, path: &str, replacement: Option<Value>) {
+        self.mutate_on(method, path, path, replacement);
+    }
+
+    pub fn mutate_on(
+        &self,
+        method: &str,
+        request_path: &str,
+        target_path: &str,
+        replacement: Option<Value>,
+    ) {
         self.0
             .lock()
             .unwrap()
             .replacements
-            .entry((method.into(), path.into()))
+            .entry((method.into(), request_path.into()))
             .or_default()
-            .push_back(replacement);
+            .push_back(Replacement {
+                target: target_path.into(),
+                value: replacement,
+            });
     }
 
     pub fn calls(&self) -> Vec<Call> {
@@ -242,6 +301,25 @@ impl Server {
 
     pub fn get(&self, path: &str) -> Value {
         self.0.lock().unwrap().objects[path].clone()
+    }
+
+    pub fn remove(&self, path: &str) {
+        self.0.lock().unwrap().objects.remove(path);
+    }
+
+    pub fn clear(&self) {
+        self.0.lock().unwrap().objects.clear();
+    }
+
+    pub fn values(&self, prefix: &str) -> Vec<Value> {
+        self.0
+            .lock()
+            .unwrap()
+            .objects
+            .iter()
+            .filter(|(path, _)| path.starts_with(prefix))
+            .map(|(_, value)| value.clone())
+            .collect()
     }
 }
 

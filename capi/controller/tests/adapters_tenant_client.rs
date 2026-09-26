@@ -1,20 +1,15 @@
-use std::collections::VecDeque;
-use std::convert::Infallible;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use axum::body::Body as ResponseBody;
-use axum::http::{Request, Response};
+mod support;
+
 use base64::{Engine, engine::general_purpose::STANDARD};
-use http_body_util::BodyExt;
 use k8s_openapi::api::core::v1::Secret;
 use kube::Client;
-use kube::client::Body;
 use kube::core::{DynamicObject, Status};
 use serde_json::{Value, json};
+use support::{Server, kube::Call};
 use tenant_controller::resources::bootstrap_rbac;
 use tenant_controller::tenant_client::*;
-use tower::service_fn;
 
 // Self-signed, deliberately public test identity. Never used by live clients.
 const CERTIFICATE: &str = include_str!("fixtures/adapters-test-only.crt");
@@ -274,65 +269,28 @@ async fn tls_build_errors_and_yaml_errors_never_retain_secret_material() {
     assert!(!format!("{error:?} {error}").contains("private-sentinel"));
 }
 
-#[derive(Debug)]
-struct Recorded {
-    method: String,
-    path: String,
-    body: Value,
-}
-
 #[derive(Clone)]
-struct KubeFixture {
-    responses: Arc<Mutex<VecDeque<(u16, Value)>>>,
-    requests: Arc<Mutex<Vec<Recorded>>>,
-}
+struct KubeFixture(Server);
 
 impl KubeFixture {
     fn new(responses: Vec<(u16, Value)>) -> Self {
-        Self {
-            responses: Arc::new(Mutex::new(responses.into())),
-            requests: Arc::new(Mutex::new(Vec::new())),
+        let server = Server::default();
+        for (code, body) in responses {
+            server.queue_response(code, body);
         }
+        Self(server)
     }
 
     fn client(&self) -> Client {
-        let fixture = self.clone();
-        Client::new(
-            service_fn(move |request: Request<Body>| {
-                let fixture = fixture.clone();
-                async move {
-                    let (parts, body) = request.into_parts();
-                    let bytes = body.collect().await.unwrap().to_bytes();
-                    fixture.requests.lock().unwrap().push(Recorded {
-                        method: parts.method.to_string(),
-                        path: parts.uri.path().to_owned(),
-                        body: if bytes.is_empty() {
-                            Value::Null
-                        } else {
-                            serde_json::from_slice(&bytes).unwrap()
-                        },
-                    });
-                    let (status, body) = fixture
-                        .responses
-                        .lock()
-                        .unwrap()
-                        .pop_front()
-                        .expect("unexpected API request");
-                    Ok::<_, Infallible>(
-                        Response::builder()
-                            .status(status)
-                            .header("content-type", "application/json")
-                            .body(ResponseBody::from(body.to_string()))
-                            .unwrap(),
-                    )
-                }
-            }),
-            "default",
-        )
+        self.0.client()
+    }
+
+    fn requests(&self) -> Vec<Call> {
+        self.0.calls()
     }
 
     fn assert_exhausted(&self) {
-        assert!(self.responses.lock().unwrap().is_empty());
+        assert_eq!(self.0.pending_responses(), 0);
     }
 }
 
@@ -363,7 +321,7 @@ async fn management_reads_exact_secret_and_never_falls_back_to_environment_crede
     .unwrap();
     assert_eq!(secret.metadata.uid.as_deref(), Some("secret-uid"));
     {
-        let requests = fixture.requests.lock().unwrap();
+        let requests = fixture.requests();
         assert_eq!(requests.len(), 1);
         assert_eq!(requests[0].method, "GET");
         assert_eq!(
@@ -393,7 +351,7 @@ async fn management_reads_exact_secret_and_never_falls_back_to_environment_crede
             );
         }
         assert!(!format!("{error:?} {error}").contains("private-sentinel"));
-        assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+        assert_eq!(fixture.requests().len(), 1);
         fixture.assert_exhausted();
     }
 }
@@ -450,7 +408,7 @@ async fn bootstrap_creates_only_missing_roles_and_bindings_with_exact_content() 
     let fixture = KubeFixture::new(responses);
     ensure_bootstrap_rbac(fixture.client()).await.unwrap();
     fixture.assert_exhausted();
-    let requests = fixture.requests.lock().unwrap();
+    let requests = fixture.requests();
     assert_eq!(requests.len(), 8);
     for (index, desired) in expected.iter().enumerate() {
         let resource = if desired["kind"] == "Role" {
@@ -493,9 +451,7 @@ async fn bootstrap_existing_content_is_never_patched_and_subject_order_is_ignore
     fixture.assert_exhausted();
     assert!(
         fixture
-            .requests
-            .lock()
-            .unwrap()
+            .requests()
             .iter()
             .all(|request| request.method == "GET")
     );
@@ -528,9 +484,7 @@ async fn bootstrap_foreign_existing_role_or_binding_blocks_without_repair() {
         fixture.assert_exhausted();
         assert!(
             fixture
-                .requests
-                .lock()
-                .unwrap()
+                .requests()
                 .iter()
                 .all(|request| request.method == "GET")
         );
@@ -594,7 +548,7 @@ async fn bootstrap_create_race_rereads_and_refuses_foreign_winner() {
             Err(TenantClientError::BootstrapMismatch(_))
         ));
         fixture.assert_exhausted();
-        let requests = fixture.requests.lock().unwrap();
+        let requests = fixture.requests();
         assert_eq!(requests[requests.len() - 1].method, "GET");
         assert_eq!(
             requests
@@ -627,7 +581,7 @@ async fn bootstrap_create_race_accepts_only_matching_winners() {
     let fixture = KubeFixture::new(responses);
     ensure_bootstrap_rbac(fixture.client()).await.unwrap();
     fixture.assert_exhausted();
-    let requests = fixture.requests.lock().unwrap();
+    let requests = fixture.requests();
     assert_eq!(requests.len(), 12);
     assert_eq!(
         requests
@@ -647,7 +601,7 @@ async fn bootstrap_disappearing_race_winner_is_pending_without_an_unbounded_crea
     ]);
     let error = ensure_bootstrap_rbac(fixture.client()).await.unwrap_err();
     assert_eq!(error.class(), TenantApiErrorClass::Pending);
-    assert_eq!(fixture.requests.lock().unwrap().len(), 3);
+    assert_eq!(fixture.requests().len(), 3);
     fixture.assert_exhausted();
 }
 
