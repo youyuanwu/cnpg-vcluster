@@ -186,6 +186,10 @@ def check_repository_boundaries() -> None:
         check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
     justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
     check("controller-metrics:" in justfile, "controller metrics recipe is missing")
+    check(
+        "scripts/controller_metrics.py --max 8050" in justfile,
+        "controller production-line threshold is not enforced",
+    )
     controller = ROOT / "controller"
     integration_targets = sorted(
         path.name for path in (controller / "tests").glob("*.rs")
@@ -245,6 +249,22 @@ def check_repository_boundaries() -> None:
                         r"controller-tools|controller-vet|go-mod-cache|"
                         r"go-linux-amd64|GO_VERSION|GOCACHE|GOMODCACHE", workflow),
           "CI still references local Go tooling")
+    for token in (
+        "needs: fast-checks",
+        "actions/upload-artifact@v6",
+        "actions/download-artifact@v7",
+        "controller-manager-${{ github.sha }}",
+        "CAPI_PREBUILT_CONTROLLER_BINARY",
+        "capi/.tools/artifacts/${{ github.sha }}",
+    ):
+        check(token in workflow, f"CI controller artifact wiring is missing {token}")
+    high_capacity = workflow.split("  high-capacity:", 1)[1].split(
+        "  capi-tests:", 1
+    )[0]
+    check(
+        "CAPI_PREBUILT_CONTROLLER_BINARY" not in high_capacity,
+        "high-capacity validation must retain an independent controller build",
+    )
     check("--activation-token=${CONTROLLER_ACTIVATION_TOKEN}" in manager,
           "Tenant controller activation token placeholder is missing")
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
