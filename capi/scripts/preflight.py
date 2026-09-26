@@ -10,6 +10,7 @@ import uuid
 from pathlib import Path
 
 from scripts.lib.config import parse_duration
+from scripts.lib.controller import rust_toolchain
 from scripts.lib.files import verify_sha256
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.ownership import IdentityRecord, OwnershipError
@@ -80,6 +81,7 @@ def _tool_version(path: Path, command: list[str], expected: str, timeout: int) -
 
 def verify_tools(root: Path, config: dict[str, str], timeout: int) -> None:
     resolve_host_just(root, config)
+    rust_toolchain(root)
     bin_dir = root / ".tools" / "bin"
     verify_sha256(bin_dir / "kind", config["KIND_SHA256"])
     verify_sha256(bin_dir / "kubectl", config["KUBECTL_SHA256"])

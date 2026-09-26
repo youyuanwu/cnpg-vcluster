@@ -312,6 +312,44 @@ def _verify_marker(root: Path, config: dict[str, str], tenant) -> None:
         raise RuntimeError("CNPG marker was not retained")
 
 
+def verify_restart_persistence(root: Path, config: dict[str, str], tenant) -> None:
+    _write_marker(root, config, tenant)
+    before = _storage_identity(root, config, tenant)
+    primary = _tenant_kubectl(
+        root, config, tenant, "-n", config["DATABASE_NAMESPACE"],
+        "get", f"cluster/{tenant.cnpg_cluster}", "-o", "jsonpath={.status.currentPrimary}",
+    ).stdout
+    old = json.loads(_tenant_kubectl(
+        root, config, tenant, "-n", config["DATABASE_NAMESPACE"],
+        "get", f"pod/{primary}", "-o", "json",
+    ).stdout)
+    _tenant_kubectl(
+        root, config, tenant, "-n", config["DATABASE_NAMESPACE"],
+        "delete", f"pod/{primary}", "--wait=true",
+    )
+
+    def replaced():
+        response = _tenant_kubectl(
+            root, config, tenant, "-n", config["DATABASE_NAMESPACE"],
+            "get", f"pod/{primary}", "-o", "json", "--ignore-not-found=true",
+        )
+        if not response.stdout.strip():
+            return None
+        pod = json.loads(response.stdout)
+        return True if (
+            pod["metadata"]["uid"] != old["metadata"]["uid"]
+            and _cnpg_ready(root, config, tenant)
+        ) else None
+
+    wait_for("database restart persistence", parse_duration(config["CNPG_TIMEOUT"]), 5, replaced)
+    wait_tenant_ready(root, config, tenant.name)
+    if _storage_identity(root, config, tenant) != before:
+        raise RuntimeError("CNPG storage identity changed across database restart")
+    _verify_marker(root, config, tenant)
+    _verify_filesystem(config, tenant)
+    print("CNPG SQL marker and PVC/PV identity survived database Pod replacement")
+
+
 def verify_retained_marker(root: Path, config: dict[str, str], tenant) -> None:
     cluster = json.loads(
         _tenant_kubectl(

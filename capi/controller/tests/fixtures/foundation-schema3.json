@@ -1,0 +1,42 @@
+{
+  "foundation": {
+    "schema": 3,
+    "networkId": "network-one",
+    "subnet": "172.18.0.0/16",
+    "reservedCIDRs": ["10.72.0.0/16", "10.142.0.0/16", "10.210.0.0/16", "10.211.0.0/16"],
+    "allowedSubnets": ["10.72.0.0/16", "10.142.0.0/16", "10.210.0.0/16", "10.211.0.0/16", "127.0.0.0/8", "172.18.0.0/16"],
+    "kubernetesVersion": "1.36.4",
+    "controllerImage": "controller:one",
+    "mutationEnabled": true,
+    "offlineEnforced": false,
+    "slots": [
+      {"slotId": "tenant-00", "vipOrdinal": 0, "endpoint": "172.18.255.223", "podCIDR": "10.73.0.0/16", "serviceCIDR": "10.143.0.0/16"}
+    ],
+    "cache": {
+      "generation": "generation-one",
+      "imageArchives": [
+        {"key":"CALICO_CNI_IMAGE","path":"images/cni.tar","sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","reference":"cni@sha256:a","tagged":"docker.io/cni:one","worker":true},
+        {"key":"CALICO_KUBE_CONTROLLERS_IMAGE","path":"images/controllers.tar","sha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","reference":"controllers@sha256:b","tagged":"docker.io/controllers:one","worker":true},
+        {"key":"CALICO_NODE_IMAGE","path":"images/node.tar","sha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc","reference":"node@sha256:c","tagged":"docker.io/node:one","worker":true},
+        {"key":"KUBE_PROXY_IMAGE","path":"images/proxy.tar","sha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd","reference":"proxy@sha256:d","tagged":"docker.io/proxy:one","worker":true},
+        {"key":"KONNECTIVITY_AGENT_IMAGE","path":"images/agent.tar","sha256":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee","reference":"agent@sha256:e","tagged":"docker.io/agent:one","worker":true},
+        {"key":"CNPG_CONTROLLER_IMAGE","path":"images/cnpg.tar","sha256":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff","reference":"cnpg@sha256:f","tagged":"docker.io/cnpg:one","worker":true},
+        {"key":"POSTGRES_IMAGE","path":"images/postgres.tar","sha256":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","reference":"postgres@sha256:0","tagged":"docker.io/postgres:one","worker":true}
+      ]
+    },
+    "registry": null,
+    "inputs": {
+      "ownershipLabel": "example.io/owned",
+      "labPrefix": "example",
+      "apiPort": 6443,
+      "clusterDomain": "spike.capi.local",
+      "nodeImage": "kind:one",
+      "cacheHostPath": "/tmp/cache",
+      "cacheContainerPath": "/var/lib/capi-image-cache",
+      "storageContainerPath": "/var/lib/storage",
+      "konnectivityServerImage": "server:one",
+      "konnectivityAgentImage": "agent:one"
+    }
+  },
+  "sha256": "34815dab32c9c7c43ddff1afa185abb8c467b039d10e25033be3c72d68b45575"
+}

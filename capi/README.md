@@ -10,7 +10,7 @@ containers, and one to three CloudNativePG instances.
 The Azure profile provisions an independently managed AKS foundation with
 Kamaji control planes, CAPZ-managed Azure worker machines, and the external
 Azure cloud provider. The local and Azure profiles deliberately have different lifecycle surfaces.
-Local tenants are Kubernetes `Tenant` resources reconciled by the Go
+Local tenants are Kubernetes `Tenant` resources reconciled by the Rust/kube-rs
 controller. Azure tenants retain the JSON specification and Python lifecycle
 while CAPZ integration remains an independent experiment.
 
@@ -60,7 +60,8 @@ a production worker substrate.
 - Permission to raise the runtime-only host inotify limits to
   `fs.inotify.max_user_instances=1024` and
   `fs.inotify.max_user_watches=524288`.
-- `git`, `python3`, `curl`, `tar`, and host-installed `just` 1.58.0.
+- `git`, `python3`, `curl`, `tar`, host-installed `just` 1.58.0, and
+  system-installed `rustc`/Cargo >= 1.89 (no toolchain download).
 
 The lab caches its own pinned kind, kubectl, Helm, clusterctl, charts,
 manifests, source provenance, and OCI images under ignored owner-only
@@ -86,7 +87,8 @@ manifest is the reconcile/retry path, status reads generation-aware Kubernetes
 conditions, and ordinary deletion is completed by the controller finalizer.
 Apply is asynchronous; repeat `just local-tenant-status tenant-example` until
 it exits zero. Tenant specifications are immutable; delete and recreate to
-change capacity, versions, or networks. The bounded final E2E waits for one
+change capacity or versions; endpoint and networks are assigned in status.
+The bounded final E2E waits for one
 explicitly selected Tenant's structural Ready contract, runs `SELECT 1`
 through its PostgreSQL read/write service with the existing disposable SQL
 probe, waits for ordinary Tenant deletion/finalization, and verifies that
@@ -98,15 +100,26 @@ just test-e2e
 
 ## Tenant specifications and clean cutover
 
-The local Tenant API requires a name, Kubernetes version, worker count,
-database count, Pod CIDR, and Service CIDR. Unknown fields, unsupported
-versions, invalid types, and overlapping networks fail before mutation. Azure
+The local cluster-scoped `tenancy.cnpg-vcluster.io/v1alpha2` API requires a
+name and an immutable three-field spec: `kubernetesVersion`, `workers`, and
+`databases` (each count 1-3). A schema-3 foundation supplies ordered slots
+that bind one endpoint, Pod CIDR, and Service CIDR per Tenant; the assigned
+values appear in `status.allocation`. OpenAPI/CEL reject invalid names,
+counts, version syntax, and spec updates. The controller checks the supported
+Kubernetes version (`1.36.4`). The API server prunes unknown fields under
+`fieldValidation=Warn` or `Ignore`, but rejects them under `Strict`, as used by
+the repository's local clients. No validating webhook is installed. Azure
 continues to use schema `1` JSON specifications. Safe examples are in
 [`config/tenants/examples/`](config/tenants/examples/).
 
 The lifecycle does not infer a singleton tenant from environment variables.
-Removed fixed tenant commands, old Azure foundation inventories, and legacy
-local runtime layouts are not migrated or adopted. Local retries reapply the
+The former Go-managed `v1alpha1` objects and their provider/host state must
+be removed before installing v1alpha2. The installer stops old manager Pods,
+proves clean state, removes the old CRD/webhook stack, checks v1alpha2 served
+and stored versions, and verifies the new manager mutation-disabled before
+enabling creation. There is no migration or in-place upgrade. Removed fixed
+tenant commands, old Azure foundation inventories, and legacy local runtime
+layouts are not migrated or adopted. Local retries reapply the
 same immutable Tenant manifest; Azure retries use the same JSON specification
 and recorded foundation identity.
 
@@ -160,8 +173,8 @@ just test-tenant-lifecycle
 | `just destroy` | Remove recorded tenants, controllers, the management cluster, runtime state, and restore host settings. |
 
 All mutating tenant paths validate pinned inputs and tenant networks before
-changing state. Local lifecycle state is held in the Tenant resource,
-controller-owned ConfigMaps, provider resources, and exact Docker identities;
+changing state. Local lifecycle state is held in the Tenant resource, schema-3 foundation
+ConfigMap, per-slot allocation Leases, provider resources, and exact Docker identities;
 the public local commands do not maintain a second filesystem journal or
 readiness evaluator. Azure credentials, journals, Ready evidence, and identity
 records remain owner-only below ignored `.runtime/`. Commands use explicit
@@ -211,17 +224,20 @@ with Azure CSI volumes.
 
 The Tenant controller is the single networking writer. It transforms the
 verified Calico asset, builds the repository-owned `capi-kube-proxy` objects,
-and applies each object directly through the tenant client with exact Tenant,
+and creates missing objects through the tenant client with exact Tenant,
 specification, foundation, and resource-role markers. Same-name replacements
-with foreign ownership markers make the Tenant `OwnershipInvalid`. Missing
-non-root owned children are recreated; a missing or replaced root CAPI Cluster
-is refused after its UID has been recorded.
+with foreign ownership markers make the Tenant `OwnershipInvalid`. Existing
+owned static objects are validated for identity, not generically rewritten;
+missing non-root owned children are recreated. A missing or replaced root
+CAPI Cluster is refused after its UID has been recorded.
 
-Network, storage, and CNPG objects are applied in dependency-ordered batches:
+Network, storage, and CNPG objects are reconciled in dependency-ordered batches:
 Namespaces and CRDs first, supporting configuration/RBAC/storage next, then
-workloads. Every object in a batch is checked and applied without a per-object
+workloads. Every object in a batch is checked and created if missing without a per-object
 requeue. CRDs must be Established and their served versions discoverable before
 dependent batches proceed; same-name create races still require exact ownership.
+Only dynamic management roots and the CNPG `Cluster` receive targeted
+identity-bound server-side apply.
 
 Worker image delivery is bootstrap-owned rather than a second reconciliation
 loop. The `KubeadmConfigTemplate` verifies archive checksums, imports the
@@ -262,13 +278,14 @@ Reconciliation and deletion are fail-closed:
   inspection failure;
 - one finalizer deletes the exact recorded CAPI Cluster, waits
   for provider objects and CAPD containers, removes the exact owned volume,
-  deletes the Namespace and its credentials, releases the endpoint, and
+  deletes the Namespace and its credentials, releases the exact allocation
+  Lease, and
   removes the finalizer last;
 - tenant-internal resources and bootstrap RBAC are disposable with the
   dedicated tenant cluster; finalization does not contact the tenant API or
   require a cleanup checkpoint. Management/host ownership remains fail-closed.
-  The `worker-bootstrap-v4` epoch requires a clean cutover from older stored
-  status and worker-bootstrap contracts; existing Tenants are not migrated.
+  The `rust-operator-v1` epoch requires a clean cutover from the Go controller;
+  existing Tenants are not migrated.
 
 The controller does not persist a creation program counter or child-resource
 UID ledger. Missing children are discovered from live state. Static bootstrap
@@ -286,7 +303,9 @@ the network, path, image-archive, and offline-registry values consumed by
 reconciliation. Installer-owned tool versions and cache-state digests are not
 controller compatibility checks. Normal reconciliation does not probe Docker
 foundation health; deletion retains uncached live host ownership checks before
-destructive operations.
+destructive operations. The resolved slot catalog is part of schema 3; its
+immutable hash excludes only mutation mode and controller image. Leader
+election uses a separate renewable Lease, not an allocation slot.
 
 ## Status, conditions, and exits
 
@@ -384,47 +403,44 @@ labels, network, address, generation-backed file inventory, and checksums.
 
 ## Continuous integration
 
-GitHub Actions runs Python unit/static checks and Go generation, vet, unit,
-and envtest checks in **CAPI fast checks**, independently of the destructive
-**CAPI end-to-end** job. Parallel jobs allow image acquisition and fast checks
-to overlap; E2E builds the controller image during management bootstrap.
-The final **CAPI tests** check requires both jobs to succeed on every PR
-(including fork PRs), manual dispatch, and the weekly Monday 04:23 UTC schedule.
-Keep **CAPI tests** as the required branch-protection check: its always-running
-gate rejects failed, cancelled, or unexpectedly skipped prerequisite jobs.
+GitHub Actions runs Python unit/static checks and Rust generated-artifact
+verification, format, Clippy, tests, and release/static-link build in
+**CAPI fast checks**, independently of the destructive **CAPI end-to-end**
+job. Parallel jobs allow image acquisition and fast checks to overlap; E2E
+builds the controller image during management bootstrap.
+The final **CAPI tests** check requires fast checks and the online E2E on PRs
+(including fork PRs), fast checks and the targeted/offline high-capacity job
+on manual dispatch and the weekly Monday 04:23 UTC schedule, and fast checks
+alone on `main` pushes. Keep **CAPI tests** as the required branch-protection
+check: its always-running gate rejects failed, cancelled, or unexpectedly
+skipped applicable jobs.
 Pushes to `main` run fast checks only, avoiding an immediate repeat of the PR's
 destructive E2E. Concurrency cancels superseded runs of the same event/ref,
 without a `main` push cancelling a scheduled or manually dispatched full gate.
 
-Fast checks use `just controller-tools` to acquire only checksum-pinned Go and
-envtest archives, without Docker, management assets, or OCI image acquisition.
-Acquisition and extraction hold the shared E2E lock followed by the exclusive
-tools lock, just like other tool commands; an E2E child inherits its parent's
-E2E exclusion and takes only the tools lock.
-The cache allow-list contains those two compressed archives (about 119 MiB)
-and `.tools/go-mod-cache` (about 238 MiB with current pins), keyed by OS,
-architecture, tool pins, and module manifests as applicable. E2E may restore
-the module cache from earlier runs but does not wait for or depend on a cache
-hit. Archives are checksum-verified before installation even on cache hits.
-Cache parent directories are created owner-only before restoration so the
-lab's private-path checks also work on clean GitHub-hosted runners.
-The 18 GiB `.tools/cache` OCI store, Docker layers, compiled Go cache, and
-runtime/kubeconfig state are **never uploaded to Actions caches**.
-
-The custom Go wrapper installs to `.tools/bin/go`, with `GOROOT=.tools/go`,
-`GOMODCACHE=.tools/go-mod-cache`, and local `GOCACHE=.tools/go-cache`.
-Envtest uses `.tools/envtest/envtest` via `KUBEBUILDER_ASSETS`; these paths are
-resolved against the absolute `capi` directory by the Python harness, rather
-than relying on `setup-go` defaults. For Docker-free local checks:
+Fast checks use the system Rust toolchain and `just controller-fetch` to
+acquire locked Cargo dependencies into owner-only `.tools/cargo-home`.
+The optional Cargo cache is keyed by OS, architecture, compiler identity,
+and `Cargo.lock`; cache misses fetch the locked inputs. Python wrappers put
+Cargo home, target, and temporary work in `.tools`, and offline builds use
+`CARGO_NET_OFFLINE=true` with `--locked --offline` from a fresh target.
+`Cargo.lock` checksums are the dependency integrity authority. No Go or
+controller-gen tool acquisition is needed. For Docker-free local checks:
 
 ```bash
-just controller-tools
+just controller-fetch
 just test-unit
 just test-static
 just controller-verify
-just controller-vet
+just controller-lint
 just controller-test
+just controller-build
 ```
+
+PRs require fast checks and one bounded online clean-to-clean E2E. Scheduled
+and manually dispatched high-capacity jobs run targeted live suites and
+enforced-offline E2E; pushes to `main` run fast checks. The **CAPI tests**
+gate requires the checks applicable to each event.
 
 ## Lifecycle timing
 
@@ -438,7 +454,8 @@ not include commands, environment values, credentials, or exception text.
 The tools phase measures local cache verification/installation; online image
 acquisition remains the separate `Acquire pinned tools and images` CI step.
 The deletion phase captures the live Tenant UID, management object UIDs,
-endpoint allocation, full worker-container IDs, and exact storage volume name.
+exact slot Lease identity and allocation, full worker-container IDs, and exact
+storage volume name.
 After Tenant absence, it verifies those Namespace/provider roots, allocations,
 containers, and volume are absent **before** management teardown. A leak or
 inspection failure fails deletion even if the subsequent full cleanup succeeds.

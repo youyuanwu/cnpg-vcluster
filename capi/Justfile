@@ -67,25 +67,25 @@ local-tenant-status tenant="tenant-example":
 local-tenant-delete tenant="tenant-example":
     @python3 scripts/controller_tenant.py delete {{quote(tenant)}}
 
-# Generate Tenant API deep-copy, CRD, and RBAC artifacts from pinned Go modules.
+# Generate Tenant CRD and RBAC artifacts from the locked Rust crate.
 controller-generate:
     @python3 scripts/generate_controller.py
 
-# Acquire and install only pinned Go and envtest tools, without Docker or OCI images.
-controller-tools:
-    @python3 scripts/prepare_controller_tools.py
+# Fetch locked Cargo dependencies into the repository-local Cargo home.
+controller-fetch:
+    @python3 scripts/fetch_controller.py
 
 # Verify generated Tenant API artifacts are current.
 controller-verify:
     @python3 scripts/generate_controller.py --verify
 
-# Run Go unit and API tests using the standard Go module cache.
+# Run Rust unit and integration tests from the locked Cargo cache.
 controller-test:
     @python3 scripts/test_controller.py
 
-# Run Go vet using the pinned Go toolchain and module cache.
-controller-vet:
-    @python3 scripts/vet_controller.py
+# Check Rust format and Clippy warnings.
+controller-lint:
+    @python3 scripts/lint_controller.py
 
 # Build the static Tenant controller manager binary.
 controller-build:

@@ -175,7 +175,7 @@ class ControllerCutoverTests(unittest.TestCase):
             CompletedProcess([], 0, stdout='{"items":[]}', stderr=""),
             *[
                 CompletedProcess([], 0, stdout="", stderr="")
-                for _ in range(6)
+                for _ in range(11)
             ],
             CompletedProcess(
                 [],
@@ -183,6 +183,7 @@ class ControllerCutoverTests(unittest.TestCase):
                 stdout="",
                 stderr="Error from server (NotFound)",
             ),
+            CompletedProcess([], 0, stdout='{"items":[]}', stderr=""),
         ]
         client = FakeManagementClient(responses)
         with (
@@ -221,7 +222,7 @@ class ControllerCutoverTests(unittest.TestCase):
             CompletedProcess([], 0, stdout='{"items":[]}', stderr=""),
             *[
                 CompletedProcess([], 0, stdout="", stderr="")
-                for _ in range(6)
+                for _ in range(11)
             ],
             CompletedProcess(
                 [],
@@ -229,6 +230,7 @@ class ControllerCutoverTests(unittest.TestCase):
                 stdout="",
                 stderr="Error from server (NotFound)",
             ),
+            CompletedProcess([], 0, stdout='{"items":[]}', stderr=""),
         ]
         client = FakeManagementClient(responses)
         with (
@@ -238,6 +240,7 @@ class ControllerCutoverTests(unittest.TestCase):
                 side_effect=[
                     CompletedProcess([], 0, stdout="", stderr=""),
                     CompletedProcess([], 0, stdout="container-id\n", stderr=""),
+                    CompletedProcess([], 0, stdout="", stderr=""),
                     CompletedProcess([], 0, stdout="", stderr=""),
                 ],
             ),

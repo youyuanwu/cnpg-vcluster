@@ -1,11 +1,35 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from scripts.lib.kube import ManagementClient
 
 
 FIELD_MANAGER = "cnpg-vcluster-tenant-client"
+
+
+def tenant_manifest_document(
+    config: dict[str, str], name: str, *, workers: int = 1, databases: int = 1,
+) -> dict[str, object]:
+    return {
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+        "kind": "Tenant",
+        "metadata": {"name": name},
+        "spec": {
+            "kubernetesVersion": config["KUBERNETES_VERSION"].removeprefix("v"),
+            "workers": workers,
+            "databases": databases,
+        },
+    }
+
+
+def apply_tenant_document(client: ManagementClient, document: dict[str, object]) -> None:
+    client.kubectl(
+        "apply", "--server-side", "--validate=strict",
+        f"--field-manager={FIELD_MANAGER}", "-f", "-",
+        input_text=json.dumps(document),
+    )
 
 
 def apply_tenant(

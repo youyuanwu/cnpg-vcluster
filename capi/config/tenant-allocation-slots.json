@@ -1,0 +1,17 @@
+[
+  {"slotId":"tenant-00","vipOrdinal":0,"podCIDR":"10.73.0.0/16","serviceCIDR":"10.143.0.0/16"},
+  {"slotId":"tenant-01","vipOrdinal":1,"podCIDR":"10.74.0.0/16","serviceCIDR":"10.144.0.0/16"},
+  {"slotId":"tenant-03","vipOrdinal":3,"podCIDR":"10.75.0.0/16","serviceCIDR":"10.145.0.0/16"},
+  {"slotId":"tenant-04","vipOrdinal":4,"podCIDR":"10.76.0.0/16","serviceCIDR":"10.146.0.0/16"},
+  {"slotId":"tenant-05","vipOrdinal":5,"podCIDR":"10.77.0.0/16","serviceCIDR":"10.147.0.0/16"},
+  {"slotId":"tenant-06","vipOrdinal":6,"podCIDR":"10.78.0.0/16","serviceCIDR":"10.148.0.0/16"},
+  {"slotId":"tenant-07","vipOrdinal":7,"podCIDR":"10.79.0.0/16","serviceCIDR":"10.149.0.0/16"},
+  {"slotId":"tenant-08","vipOrdinal":8,"podCIDR":"10.80.0.0/16","serviceCIDR":"10.150.0.0/16"},
+  {"slotId":"tenant-09","vipOrdinal":9,"podCIDR":"10.81.0.0/16","serviceCIDR":"10.151.0.0/16"},
+  {"slotId":"tenant-10","vipOrdinal":10,"podCIDR":"10.82.0.0/16","serviceCIDR":"10.152.0.0/16"},
+  {"slotId":"tenant-11","vipOrdinal":11,"podCIDR":"10.83.0.0/16","serviceCIDR":"10.153.0.0/16"},
+  {"slotId":"tenant-12","vipOrdinal":12,"podCIDR":"10.84.0.0/16","serviceCIDR":"10.154.0.0/16"},
+  {"slotId":"tenant-13","vipOrdinal":13,"podCIDR":"10.85.0.0/16","serviceCIDR":"10.155.0.0/16"},
+  {"slotId":"tenant-14","vipOrdinal":14,"podCIDR":"10.86.0.0/16","serviceCIDR":"10.156.0.0/16"},
+  {"slotId":"tenant-15","vipOrdinal":15,"podCIDR":"10.87.0.0/16","serviceCIDR":"10.157.0.0/16"}
+]

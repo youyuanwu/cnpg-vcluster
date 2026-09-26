@@ -27,8 +27,6 @@ if TYPE_CHECKING:
 
 
 DOWNLOADS = (
-    ("go-linux-amd64.tar.gz", "GO_URL", "GO_SHA256"),
-    ("envtest-linux-amd64.tar.gz", "ENVTEST_URL", "ENVTEST_SHA256"),
     ("kind-linux-amd64", "KIND_URL", "KIND_SHA256"),
     ("kubectl-linux-amd64", "KUBECTL_URL", "KUBECTL_SHA256"),
     ("helm-linux-amd64.tar.gz", "HELM_URL", "HELM_SHA256"),
@@ -159,57 +157,6 @@ def _install_helm(archive: Path, destination: Path, expected_binary_sha256: str)
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
-
-
-def _extract_private_archive(archive: Path, destination: Path, prefix: str) -> None:
-    shutil.rmtree(destination, ignore_errors=True)
-    ensure_private_dir(destination)
-    with tarfile.open(archive, "r:gz") as bundle:
-        for member in bundle.getmembers():
-            if member.issym() or member.islnk():
-                raise IntegrityError(f"{archive.name} contains a link: {member.name}")
-            parts = Path(member.name).parts
-            if not parts or parts[0] != prefix or ".." in parts:
-                raise IntegrityError(f"{archive.name} contains an invalid path: {member.name}")
-            relative = Path(*parts[1:])
-            if not relative.parts:
-                continue
-            target = destination / relative
-            if member.isdir():
-                ensure_private_dir(target)
-                continue
-            if not member.isfile():
-                raise IntegrityError(f"{archive.name} contains a non-regular entry: {member.name}")
-            ensure_private_dir(target.parent)
-            source = bundle.extractfile(member)
-            if source is None:
-                raise IntegrityError(f"unable to extract {member.name}")
-            with target.open("wb") as output:
-                shutil.copyfileobj(source, output)
-            target.chmod(0o700 if member.mode & 0o111 else 0o600)
-
-
-def _install_go(root: Path, archive: Path, bin_dir: Path) -> None:
-    go_root = root / ".tools" / "go"
-    _extract_private_archive(archive, go_root, "go")
-    wrapper = bin_dir / "go"
-    write_private_file(
-        wrapper,
-        "#!/bin/sh\n"
-        f"export GOROOT={str(go_root)!r}\n"
-        f"exec {str(go_root / 'bin' / 'go')!r} \"$@\"\n",
-    )
-    wrapper.chmod(0o700)
-
-
-def _install_envtest(root: Path, archive: Path) -> None:
-    destination = root / ".tools" / "envtest"
-    _extract_private_archive(archive, destination, "controller-tools")
-    assets = destination / "envtest"
-    for name in ("kube-apiserver", "etcd", "kubectl"):
-        path = assets / name
-        if not path.is_file() or not path.stat().st_mode & 0o100:
-            raise IntegrityError(f"envtest archive is missing executable {name}")
 
 
 def _verify_tag(repository: str, tag: str, expected_commit: str, timeout: int) -> None:
@@ -525,9 +472,6 @@ def _install_binaries(
     ensure_private_dir(inputs_dir)
     ensure_private_dir(bin_dir)
     downloaded = {filename: inputs_dir / filename for filename, _, _ in DOWNLOADS}
-    if bin_dir == root / ".tools" / "bin":
-        _install_go(root, downloaded["go-linux-amd64.tar.gz"], bin_dir)
-        _install_envtest(root, downloaded["envtest-linux-amd64.tar.gz"])
     _install_copy(downloaded["kind-linux-amd64"], bin_dir / "kind")
     _install_copy(downloaded["kubectl-linux-amd64"], bin_dir / "kubectl")
     _install_copy(downloaded["clusterctl-linux-amd64"], bin_dir / "clusterctl")

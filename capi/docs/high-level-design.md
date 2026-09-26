@@ -20,8 +20,9 @@ while Azure retains its JSON/Python lifecycle.
 flowchart TB
   User[just and kubectl]
   Mgmt[kind management cluster]
-  TenantCR[Tenant v1alpha1]
-  Controller[Tenant controller]
+  TenantCR[Tenant v1alpha2]
+  Controller[Rust kube-rs controller]
+  Slots[Allocation Leases]
   Providers[CAPI, CABPK, CAPD, Kamaji provider]
   Kamaji[Kamaji and shared datastore]
   API[Tenant API endpoint]
@@ -32,6 +33,7 @@ flowchart TB
 
   User --> TenantCR
   TenantCR --> Controller
+  Controller --> Slots
   Controller --> Providers
   Providers --> Kamaji --> API
   Providers --> Workers
@@ -49,25 +51,31 @@ remains responsible for worker and load-balancer creation and deletion.
 ## Tenant API and controller
 
 The cluster-scoped API is
-`tenancy.cnpg-vcluster.io/v1alpha1`, kind `Tenant`. The immutable spec contains:
+`tenancy.cnpg-vcluster.io/v1alpha2`, kind `Tenant`. The immutable spec contains:
 
 - `kubernetesVersion`;
 - `workers`, from one through three;
-- `databaseCount`, from one through three;
-- `podCIDR`;
-- `serviceCIDR`.
+- `databases`, from one through three.
 
-Admission rejects unknown fields, invalid types, unsupported versions,
-non-canonical or overlapping networks, and non-equivalent spec updates.
+OpenAPI and CEL reject invalid names, counts, version syntax, types, and
+any spec update. A leading `v` is accepted on creation, but a spelling change
+is still an immutable-spec update. The controller checks the supported
+version (`1.36.4`); schema-3 slot validation rejects overlapping or
+non-canonical networks. Unknown fields are pruned under
+`fieldValidation=Warn` or `Ignore` and rejected under `Strict`, used by the
+repository clients. There is no Tenant validating webhook.
 Ordinary Kubernetes DELETE is accepted without a reservation or custom client
 protocol.
 
-Status contains the observed generation, phase, standard conditions, endpoint,
-foundation hash, and exact root Cluster UID. There is no persisted creation
+Status contains the observed generation, phase, standard conditions,
+`allocation.{slotId,endpoint,podCIDR,serviceCIDR}`, foundation hash, and exact
+root Cluster UID. There is no persisted creation
 stage, tenant-API cleanup checkpoint, child-resource UID ledger,
 worker-container evidence, or Docker volume identity.
 
-The manager uses leader election and one bounded reconcile worker. Initial
+The Tokio manager uses kube-rs watches, a dedicated renewable leader-election
+Lease, health probes, and one bounded reconcile worker. Allocation Leases
+are separate, durable and non-expiring. Initial
 creation uses a grouped desired-state path. Expected progress uses a fixed
 one-second requeue. Ready and Degraded Tenants resynchronize every five minutes
 to observe readiness.
@@ -79,7 +87,8 @@ Reconciliation proceeds through these responsibilities:
 1. validate the immutable spec and bind the current foundation;
 2. add the Tenant finalizer before external mutation;
 3. persist the foundation hash before external mutation;
-4. allocate one endpoint with ConfigMap resource-version compare-and-swap;
+4. atomically claim one predefined endpoint/Pod CIDR/Service CIDR slot via
+   a namespaced Lease and persist the allocation in status;
 5. create the Namespace, CAPI Cluster, and CAPD DevCluster;
 6. create the KamajiControlPlane and validate its exact kubeconfig Secret;
 7. establish bootstrap RBAC;
@@ -92,6 +101,13 @@ Reconciliation proceeds through these responsibilities:
     reconcile the dynamic CNPG Cluster;
 12. reuse the worker/network observation and set Ready only after the remaining
     component observations pass.
+
+The Python-produced, checksum-verified schema-3 foundation binds the ordered
+slot catalog, networking, image archives, paths and offline inputs; the
+controller reads it directly. Its lifecycle hash excludes only mutation mode
+and controller image. A Lease is reused after restart only when the exact
+Tenant UID, spec/foundation hashes, slot, endpoint and CIDRs match; a missing
+or replaced status-bound claim fails closed before terminal deletion.
 
 Missing objects use create-or-refuse semantics. Existing owned objects use
 different contracts by role:
@@ -147,7 +163,8 @@ disruption proofs are explicit scenario gates rather than lifecycle state.
 
 The Tenant controller is the single network writer. It transforms the
 checksum-verified Calico asset and builds repository-owned kube-proxy objects,
-then applies them directly through the tenant client. There is no
+then creates missing objects and validates existing ownership through the
+tenant client without generic content repair. There is no
 ClusterResourceSet, source ConfigMap inventory, or second repair writer.
 
 The custom `capi-kube-proxy` name prevents Kamaji from removing the
@@ -180,8 +197,8 @@ Provider-owned worker containers are observed but never directly deleted by
 the Tenant controller.
 
 Unrelated kind clusters do not block first activation. Clean cutover rejects
-legacy local runtime records, nonempty legacy endpoint allocations, existing
-Tenant/CAPI/provider objects, controller endpoint allocations, exact
+legacy local runtime records, nonempty old endpoint ledgers, existing
+Tenant/CAPI/provider objects, allocation Leases, exact
 tenant-storage volumes, owned tenant worker containers, and CAPD external
 load-balancer containers. Lifecycle epoch changes first scale the old
 controller to zero, wait for every old manager Pod to terminate, run this
@@ -196,7 +213,8 @@ not acquire a shared destructive lock.
 
 Finalization is ordered:
 
-1. revalidate the target Tenant, foundation binding, endpoint allocation, and
+1. revalidate the target Tenant, foundation binding, status-bound allocation
+   Lease, and
    live ownership;
 2. delete the exact recorded CAPI Cluster with UID/resourceVersion preconditions and
    Background propagation;
@@ -205,7 +223,8 @@ Finalization is ordered:
    with ordinary Kubernetes deletion;
 4. delete only the exact owned Docker volume;
 5. delete the Namespace and its credentials;
-6. release only the target endpoint;
+6. delete/re-observe only the exact target allocation Lease with
+   UID/resourceVersion preconditions;
 7. remove the finalizer last.
 
 Each local Tenant has dedicated worker containers and an exactly labelled
@@ -214,14 +233,19 @@ resources are disposable with that cluster: finalization neither contacts the
 tenant API nor persists a tenant-cleanup checkpoint. Tenant API unavailability
 does not block the Tenant finalizer from requesting Cluster deletion; provider
 controllers still complete their own ordinary finalizers.
+Only after every old provider, Namespace, Secret, worker/load-balancer
+container, and volume identity is proved absent may a missing old Lease or a
+successor-owned Lease count as a completed release. The successor is never
+mutated; earlier missing/replaced claims retain the finalizer.
 Partial creation is handled from live management and host state, even when a
 Cluster, control plane, or workers were never created. An observed root Cluster
 UID is recorded before deletion. Ownership conflicts, failed management/host
 inspection, and foundation hash changes still block destructive progress.
-The `worker-bootstrap-v4` lifecycle epoch requires a clean cutover from older
-tenant-cleanup and worker-bootstrap contracts, not migration of existing
-Tenants. This prevents workers created before CNPG storage preparation moved
-into bootstrap from being reused without the required directory ownership.
+The `rust-operator-v1` lifecycle epoch requires a clean cutover from the
+Go-managed API and state, not migration of existing Tenants. The old
+Deployment/Pods, webhook stack, and CRD are removed only after clean-state
+proof; the new CRD serves and stores only v1alpha2. Installation starts with
+creation mutation disabled and validates live API semantics before enabling it.
 The foundation lifecycle hash excludes mutation mode and controller image
 identity, allowing same-epoch controller rebuilds while resource-affecting
 foundation inputs remain immutable.
@@ -307,6 +331,6 @@ do not appear in the management API.
 CAPD workers are privileged Docker containers sharing the host kernel, Docker
 daemon, storage hardware, network, power, and failure domain. This is not a
 hostile-tenant security boundary. The management node and Tenant controller
-also have Docker socket access. The API is experimental `v1alpha1`; incompatible
+also have Docker socket access. The API is experimental `v1alpha2`; incompatible
 changes require an explicit version transition rather than silently changing
 the meaning of stored objects.

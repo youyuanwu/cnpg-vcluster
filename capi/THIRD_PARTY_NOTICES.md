@@ -6,8 +6,11 @@ local state. No downloaded binary, chart, source archive, upstream manifest,
 or container image is committed to this repository.
 
 Exact versions, source commits, URLs, checksums, image tags, and OCI digests
-are recorded in [`config/versions.env`](config/versions.env). Upstream
-copyright, license, and NOTICE files remain authoritative.
+for the non-Rust lab inputs are recorded in
+[`config/versions.env`](config/versions.env). Rust crate versions and
+checksums are pinned in [`controller/Cargo.lock`](controller/Cargo.lock);
+the license expressions below come from the resolved crates' Cargo metadata.
+Upstream copyright, license, and NOTICE files remain authoritative.
 
 | Project | Pinned use | Upstream license |
 |---|---|---|
@@ -30,6 +33,39 @@ copyright, license, and NOTICE files remain authoritative.
 | HAProxy | CAPD load-balancer image | GPL-2.0-or-later with upstream exceptions |
 | just | host prerequisite `1.58.0`; not downloaded by the lab | CC0-1.0 |
 
+The Rust manager's **direct runtime dependencies** in the locked Cargo graph
+(versions shown are resolved versions, not necessarily manifest ranges):
+
+| Crate | Version | Cargo license expression |
+|---|---|---|
+| axum | `0.8.9` | MIT |
+| base64 | `0.22.1` | MIT OR Apache-2.0 |
+| bollard | `0.21.1` | Apache-2.0 |
+| chrono | `0.4.45` | MIT OR Apache-2.0 |
+| futures | `0.3.34` | MIT OR Apache-2.0 |
+| hex | `0.4.3` | MIT OR Apache-2.0 |
+| ipnet | `2.12.2` | MIT OR Apache-2.0 |
+| k8s-openapi | `0.28.0` | Apache-2.0 |
+| kube | `4.2.0` | Apache-2.0 |
+| kube-lease-manager | `0.12.0` | MIT |
+| schemars | `1.2.2` | MIT |
+| serde | `1.0.229` | MIT OR Apache-2.0 |
+| serde_json | `1.0.151` | MIT OR Apache-2.0 |
+| serde_yaml | `0.9.34+deprecated` | MIT OR Apache-2.0 |
+| sha2 | `0.10.9` | MIT OR Apache-2.0 |
+| thiserror | `2.0.21` | MIT OR Apache-2.0 |
+| tokio | `1.53.1` | MIT |
+| tracing | `0.1.44` | MIT |
+| tracing-subscriber | `0.3.23` | MIT |
+| url | `2.5.8` | MIT OR Apache-2.0 |
+
+Direct **test-only** dependencies are `bytes 1.12.1` (MIT),
+`http-body-util 0.1.5` (MIT), `tempfile 3.27.0` (MIT OR Apache-2.0), and
+`tower 0.5.3` (MIT). Cargo.lock also includes transitive and platform-specific
+crates; consult the resolved Cargo metadata and each upstream crate's license
+and NOTICE files before redistributing a binary or its source. No crate source
+is vendored into this repository.
+
 Source and license references:
 
 - <https://github.com/kubernetes-sigs/kind>
@@ -49,6 +85,14 @@ Source and license references:
 - <https://busybox.net/license.html>
 - <https://github.com/haproxy/haproxy>
 - <https://github.com/casey/just>
+- <https://github.com/tokio-rs/axum>
+- <https://github.com/fussybeaver/bollard>
+- <https://github.com/Arnavion/k8s-openapi>
+- <https://github.com/kube-rs/kube>
+- <https://github.com/alex-karpenko/kube-lease-manager>
+- <https://github.com/tokio-rs/tokio>
+- <https://github.com/serde-rs/serde>
+- <https://crates.io/>
 
 Container images include operating-system packages and transitive components
 with their own notices. Inspect the pinned image and its upstream distribution

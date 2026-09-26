@@ -196,20 +196,6 @@ def run_endpoint_gate(
                 "args", []
             )
         if "--mutation-enabled=true" not in arguments:
-            client.kubectl(
-                "apply",
-                "--server-side",
-                "--field-manager=cnpg-vcluster-controller-cutover",
-                "--force-conflicts",
-                "-f",
-                str(
-                    root
-                    / "controller"
-                    / "config"
-                    / "webhook"
-                    / "validating-webhook.yaml"
-                ),
-            )
             delete_tenant_resource(root, config, selected_name)
             create_management(root, config)
     evidence = root / ".runtime" / "evidence" / "endpoint-failure.txt"

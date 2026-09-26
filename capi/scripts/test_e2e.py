@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
-from scripts.cnpg import _sql
+from scripts.cnpg import _sql, verify_restart_persistence
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.kube import ManagementClient
 from scripts.lib.locking import e2e_lock
@@ -23,6 +23,7 @@ from scripts.lib.controller_scenarios import (
     delete_controller_tenant,
     tenant_from_document,
     tenant_snapshot,
+    verify_allocation_released,
     wait_tenant_ready,
 )
 from scripts.lib.tenants import export_tenant_kubeconfig
@@ -150,34 +151,6 @@ def _inspect_management_object(
     return document
 
 
-def _endpoint_allocations(client: ManagementClient) -> dict[str, dict[str, str]]:
-    document = _inspect_management_object(
-        client, "configmap/tenant-endpoint-allocations", "tenant-system",
-    )
-    if document is None:
-        return {}
-    try:
-        state = json.loads(document["data"]["allocations.json"])
-        if (
-            not isinstance(state, dict)
-            or type(state.get("schema")) is not int
-            or state["schema"] != 1
-        ):
-            raise ValueError
-        allocations = state["allocations"]
-        if not isinstance(allocations, dict):
-            raise ValueError
-        for address, allocation in allocations.items():
-            if not address or not isinstance(allocation, dict):
-                raise ValueError
-            for field in ("tenantName", "tenantUID", "specHash", "foundationHash"):
-                if not isinstance(allocation.get(field), str) or not allocation[field]:
-                    raise ValueError
-        return allocations
-    except (KeyError, TypeError, ValueError) as exc:
-        raise RuntimeError("invalid endpoint allocation inspection response") from exc
-
-
 def capture_tenant_deletion_identity(
     config: dict[str, str],
     client: ManagementClient,
@@ -195,17 +168,6 @@ def capture_tenant_deletion_identity(
         raise RuntimeError("Tenant identity changed before deletion")
     identity = tenant_snapshot(config, client, current)
     identity["name"] = name
-    address = str(identity["endpoint"]).rsplit(":", 1)[0]
-    allocation = _endpoint_allocations(client).get(address)
-    if (
-        allocation is None
-        or allocation["tenantUID"] != uid
-        or allocation["tenantName"] != name
-        or allocation["foundationHash"] != identity["foundationHash"]
-    ):
-        raise RuntimeError("Tenant endpoint allocation identity changed before deletion")
-    identity["endpointAddress"] = address
-    identity["endpointAllocation"] = allocation
     cluster_uids = [
         recorded_uid
         for resource, namespace, object_name, recorded_uid in identity["managementResources"]
@@ -214,6 +176,8 @@ def capture_tenant_deletion_identity(
     if (
         identity["dockerVolume"]["name"] != f"{config['LAB_PREFIX']}-{name}-storage"
         or not identity["workerContainers"]
+        or not set(identity["workerContainers"]) <= set(identity["providerContainers"])
+        or f"{name}-lb" not in {container.split()[0] for container in identity["providerContainers"]}
         or not identity["clusterUID"]
         or cluster_uids != [identity["clusterUID"]]
     ):
@@ -236,18 +200,12 @@ def verify_tenant_deletion(
                 f"Tenant management resource remained after deletion: "
                 f"{resource}/{object_name} (recorded UID {uid})"
             )
-    for address, allocation in _endpoint_allocations(client).items():
-        if (
-            address == identity["endpointAddress"]
-            or allocation["tenantUID"] == identity["uid"]
-            or allocation["tenantName"] == name
-        ):
-            raise RuntimeError(f"Tenant endpoint allocation remained after deletion: {name}")
+    verify_allocation_released(client, identity)
     containers = set(run(
         ["docker", "ps", "-aq", "--no-trunc"], timeout=30,
     ).stdout.split())
     recorded = {
-        worker.split()[1] for worker in identity["workerContainers"]
+        container.split()[1] for container in identity["providerContainers"]
     }
     scoped = run(
         [
@@ -298,12 +256,14 @@ def run_e2e() -> int:
             )
             if _sql(ROOT, config, tenant, "SELECT 1;") != "1":
                 raise RuntimeError("representative tenant PostgreSQL SELECT 1 failed")
+            verify_restart_persistence(ROOT, config, tenant)
         print("representative tenant PostgreSQL SELECT 1 succeeded")
         with timings.phase("tenant_deletion_finalization"):
             client = ManagementClient(ROOT, config)
             identity = capture_tenant_deletion_identity(config, client, document)
             delete_controller_tenant(ROOT, config, identity["name"])
             verify_tenant_deletion(client, identity)
+            print("exact Tenant/root/Lease/container/volume absence verified before management teardown")
     except BaseException as exc:
         failure = exc
     try:
@@ -314,6 +274,7 @@ def run_e2e() -> int:
             for name, expected in original_inotify.items():
                 if read_inotify(name) != expected:
                     raise RuntimeError(f"host inotify was not restored: {name}")
+            print("final host restoration and local infrastructure absence verified")
     except BaseException as cleanup:
         if failure is None:
             failure = cleanup

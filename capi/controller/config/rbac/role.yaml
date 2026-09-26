@@ -5,7 +5,7 @@ metadata:
   name: tenant-controller-role
 rules:
 - apiGroups:
-  - ""
+  - ''
   resources:
   - configmaps
   verbs:
@@ -17,7 +17,7 @@ rules:
   - update
   - watch
 - apiGroups:
-  - ""
+  - ''
   resources:
   - events
   verbs:
@@ -25,7 +25,7 @@ rules:
   - patch
   - update
 - apiGroups:
-  - ""
+  - ''
   resources:
   - namespaces
   verbs:
@@ -35,7 +35,7 @@ rules:
   - list
   - watch
 - apiGroups:
-  - ""
+  - ''
   resources:
   - secrets
   verbs:
@@ -136,6 +136,7 @@ rules:
   verbs:
   - get
   - list
+  - patch
   - update
   - watch
 - apiGroups:

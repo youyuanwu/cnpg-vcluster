@@ -7,6 +7,7 @@ from subprocess import CompletedProcess
 from unittest.mock import Mock, patch
 
 from scripts.test_e2e import capture_tenant_deletion_identity, verify_tenant_deletion
+from tests.test_controller_scenarios import allocation_lease
 
 
 def response(payload=None, *, error: str = "") -> CompletedProcess:
@@ -24,8 +25,7 @@ class TenantDeletionProofTests(unittest.TestCase):
             "uid": "tenant-uid",
             "clusterUID": "cluster-uid",
             "foundationHash": "foundation",
-            "endpoint": "172.18.255.10:6443",
-            "endpointAddress": "172.18.255.10",
+            "allocationLease": allocation_lease()["metadata"],
             "managementResources": [
                 ("namespace", "", "tenant-a", "namespace-uid"),
                 ("clusters.cluster.x-k8s.io", "tenant-a", "tenant-a", "cluster-uid"),
@@ -33,37 +33,25 @@ class TenantDeletionProofTests(unittest.TestCase):
                 ("kamajicontrolplanes.controlplane.cluster.x-k8s.io", "tenant-a", "tenant-a", "controlplane-uid"),
             ],
             "workerContainers": ["worker-a " + "a" * 64],
+            "providerContainers": ["worker-a " + "a" * 64, "tenant-a-lb " + "b" * 64],
             "dockerVolume": {"name": "lab-tenant-a-storage"},
-        }
-        self.allocation = {
-            "tenantName": "tenant-a", "tenantUID": "tenant-uid",
-            "specHash": "spec", "foundationHash": "foundation",
         }
         self.client = Mock()
         self.client.kubectl.return_value = response()
+        self.client.json.return_value = {"items": []}
         self.document = {"metadata": {"name": "tenant-a", "uid": "tenant-uid"}}
-
-    @staticmethod
-    def allocations(allocations):
-        return {"data": {"allocations.json": json.dumps({
-            "schema": 1, "allocations": allocations,
-        })}}
 
     def test_capture_rechecks_tenant_uid_and_records_live_snapshot_and_allocation(self) -> None:
         current = copy.deepcopy(self.document)
         current["metadata"]["resourceVersion"] = "latest"
-        self.client.kubectl.side_effect = [
-            response(current),
-            response(self.allocations({"172.18.255.10": self.allocation})),
-        ]
+        self.client.kubectl.return_value = response(current)
         with patch("scripts.test_e2e.tenant_snapshot", return_value=self.identity) as snapshot:
             captured = capture_tenant_deletion_identity(
                 {"LAB_PREFIX": "lab"}, self.client, self.document,
             )
         snapshot.assert_called_once_with({"LAB_PREFIX": "lab"}, self.client, current)
         self.assertEqual("tenant-uid", captured["uid"])
-        self.assertEqual(self.allocation, captured["endpointAllocation"])
-        self.assertEqual("172.18.255.10", captured["endpointAddress"])
+        self.assertEqual(allocation_lease()["metadata"], captured["allocationLease"])
 
     def test_capture_rejects_same_name_replacement_or_missing_tenant(self) -> None:
         for payload in (None, {"metadata": {"name": "tenant-a", "uid": "replacement"}}):
@@ -74,15 +62,10 @@ class TenantDeletionProofTests(unittest.TestCase):
                         capture_tenant_deletion_identity({}, self.client, self.document)
                     snapshot.assert_not_called()
 
-    def test_capture_rejects_mismatched_endpoint_identity(self) -> None:
-        self.client.kubectl.side_effect = [
-            response(self.document),
-            response(self.allocations({
-                "172.18.255.10": {**self.allocation, "tenantUID": "foreign"},
-            })),
-        ]
-        with patch("scripts.test_e2e.tenant_snapshot", return_value=self.identity):
-            with self.assertRaisesRegex(RuntimeError, "allocation identity changed"):
+    def test_capture_propagates_mismatched_lease_identity(self) -> None:
+        self.client.kubectl.return_value = response(self.document)
+        with patch("scripts.test_e2e.tenant_snapshot", side_effect=RuntimeError("Lease identity changed")):
+            with self.assertRaisesRegex(RuntimeError, "Lease identity changed"):
                 capture_tenant_deletion_identity({"LAB_PREFIX": "lab"}, self.client, self.document)
 
     def test_capture_rejects_replaced_provider_root_or_missing_host_identity(self) -> None:
@@ -93,10 +76,7 @@ class TenantDeletionProofTests(unittest.TestCase):
         ):
             with self.subTest(field=field):
                 identity = {**self.identity, field: value}
-                self.client.kubectl.side_effect = [
-                    response(self.document),
-                    response(self.allocations({"172.18.255.10": self.allocation})),
-                ]
+                self.client.kubectl.return_value = response(self.document)
                 with patch("scripts.test_e2e.tenant_snapshot", return_value=identity):
                     with self.assertRaisesRegex(RuntimeError, "provider deletion identity is incomplete"):
                         capture_tenant_deletion_identity({"LAB_PREFIX": "lab"}, self.client, self.document)
@@ -133,28 +113,30 @@ class TenantDeletionProofTests(unittest.TestCase):
                         verify_tenant_deletion(self.client, self.identity)
                     docker.assert_not_called()
 
-    def test_allocations_are_checked_by_address_uid_and_name(self) -> None:
-        for address, allocation in (
-            ("172.18.255.10", {**self.allocation, "tenantName": "other", "tenantUID": "other"}),
-            ("172.18.255.11", {**self.allocation, "tenantName": "other"}),
-            ("172.18.255.11", {**self.allocation, "tenantUID": "other"}),
-        ):
-            with self.subTest(address=address, allocation=allocation):
-                self.client.kubectl.side_effect = lambda *args, **_kw: (
-                    response(self.allocations({address: allocation}))
-                    if "configmap/tenant-endpoint-allocations" in args else response()
-                )
-                with self.assertRaisesRegex(RuntimeError, "allocation remained"):
+    def test_leases_are_checked_by_exact_name_uid_and_tenant_markers(self) -> None:
+        for field in ("name", "uid", "tenant", "tenant-uid"):
+            with self.subTest(field=field):
+                lease = allocation_lease()
+                lease["metadata"].update(name="foreign-name", uid="foreign-uid")
+                lease["metadata"]["annotations"].update({
+                    "tenancy.cnpg-vcluster.io/tenant": "other",
+                    "tenancy.cnpg-vcluster.io/tenant-uid": "other",
+                })
+                if field in ("name", "uid"):
+                    lease["metadata"][field] = self.identity["allocationLease"][field]
+                else:
+                    lease["metadata"]["annotations"]["tenancy.cnpg-vcluster.io/" + field] = (
+                        "tenant-a" if field == "tenant" else "tenant-uid"
+                    )
+                self.client.json.return_value = {"items": [lease]}
+                with self.assertRaisesRegex(RuntimeError, "Lease remained"):
                     verify_tenant_deletion(self.client, self.identity)
 
     def test_malformed_allocation_state_is_not_treated_as_absence(self) -> None:
-        for payload in ({}, {"data": {}}, {"data": {"allocations.json": "{}"}}):
+        for payload in ({}, {"items": None}, {"items": [{}]}):
             with self.subTest(payload=payload):
-                self.client.kubectl.side_effect = lambda *args, **_kw: (
-                    response(payload)
-                    if "configmap/tenant-endpoint-allocations" in args else response()
-                )
-                with self.assertRaisesRegex(RuntimeError, "invalid endpoint allocation"):
+                self.client.json.return_value = payload
+                with self.assertRaisesRegex(RuntimeError, "invalid allocation Lease"):
                     verify_tenant_deletion(self.client, self.identity)
 
     def test_inspection_failure_is_redacted_and_not_treated_as_absence(self) -> None:
@@ -178,6 +160,7 @@ class TenantDeletionProofTests(unittest.TestCase):
     def test_original_relabelled_worker_new_scoped_worker_or_exact_volume_is_a_leak(self) -> None:
         for outputs in (
             ["a" * 64, "", ""],
+            ["b" * 64, "", ""],
             ["", "new-scoped-worker", ""],
             ["", "", "lab-tenant-a-storage"],
         ):
