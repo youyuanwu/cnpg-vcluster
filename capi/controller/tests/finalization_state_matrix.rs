@@ -421,6 +421,11 @@ impl DockerClient for Docker {
         }
         Ok(state.containers.clone())
     }
+    async fn list_volumes(&self) -> Result<Vec<DockerVolume>, DockerError> {
+        let mut state = self.0.lock().unwrap();
+        state.requests.push("list volumes".into());
+        Ok(state.volume.iter().cloned().collect())
+    }
 }
 
 async fn tick(shared: &Arc<Mutex<State>>) -> Result<(), ControllerError> {

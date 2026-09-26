@@ -12,6 +12,8 @@ from scripts.lib.controller_state import (
     require_clean_controller_state,
 )
 
+ROOT = Path(__file__).resolve().parents[1]
+
 
 def response(value="", code=0, error=""):
     if isinstance(value, dict):
@@ -47,7 +49,37 @@ def clean_handler(*args, **_kwargs):
     return response()
 
 
+def prepare_root(directory: str) -> Path:
+    root = Path(directory)
+    target = root / "controller/config"
+    target.mkdir(parents=True)
+    target.joinpath("management-resources.json").write_bytes(
+        (ROOT / "controller/config/management-resources.json").read_bytes()
+    )
+    return root
+
+
 class ControllerStateTests(unittest.TestCase):
+    def test_generated_management_catalog_is_complete_and_unique(self) -> None:
+        catalog = json.loads(
+            (ROOT / "controller/config/management-resources.json").read_text()
+        )
+        identities = {
+            (entry["apiVersion"], entry["kind"], entry["plural"])
+            for entry in catalog
+        }
+        self.assertEqual(len(identities), len(catalog))
+        for required in (
+            ("cluster.x-k8s.io/v1beta2", "Cluster", "clusters"),
+            (
+                "controlplane.cluster.x-k8s.io/v1alpha2",
+                "KamajiControlPlane",
+                "kamajicontrolplanes",
+            ),
+            ("kamaji.clastix.io/v1alpha1", "TenantControlPlane", "tenantcontrolplanes"),
+        ):
+            self.assertIn(required, identities)
+
     def test_activation_ticket_is_bound_to_candidate_and_time(self) -> None:
         ticket = activation_ticket("hash-a", "token-a")
         self.assertEqual(
@@ -63,13 +95,13 @@ class ControllerStateTests(unittest.TestCase):
             "scripts.lib.controller_state.run",
             return_value=response(""),
         ):
-            require_clean_controller_state(Path(directory), Client(clean_handler))
+            require_clean_controller_state(prepare_root(directory), Client(clean_handler))
 
     def test_provider_tenant_lease_and_host_residue_block(self) -> None:
         cases = ("tenant", "provider", "lease", "volume", "container", "legacy-file")
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
-                root = Path(directory)
+                root = prepare_root(directory)
                 if case == "legacy-file":
                     path = root / ".runtime/management/tenant-endpoints.json"
                     path.parent.mkdir(parents=True)
@@ -88,7 +120,7 @@ class ControllerStateTests(unittest.TestCase):
 
                 outputs = iter(
                     [
-                        response("volume-a" if case == "volume" else ""),
+                        response("tenant-a-storage" if case == "volume" else ""),
                         response("container-a" if case == "container" else ""),
                         response(""),
                     ]
@@ -109,7 +141,7 @@ class ControllerStateTests(unittest.TestCase):
             "scripts.lib.controller_state.run",
             return_value=response(""),
         ), self.assertRaisesRegex(RuntimeError, "failed to inspect"):
-            require_clean_controller_state(Path(directory), Client(handle))
+            require_clean_controller_state(prepare_root(directory), Client(handle))
 
 
 if __name__ == "__main__":

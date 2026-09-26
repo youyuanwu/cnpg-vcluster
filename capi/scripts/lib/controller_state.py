@@ -18,21 +18,6 @@ LEGACY_RESOURCES = (
     ("tenant-system", "configmap/tenant-endpoint-allocations"),
 )
 
-PROVIDER_RESOURCES = (
-    "clusters.cluster.x-k8s.io",
-    "devclusters.infrastructure.cluster.x-k8s.io",
-    "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
-    "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io",
-    "devmachinetemplates.infrastructure.cluster.x-k8s.io",
-    "machinedeployments.cluster.x-k8s.io",
-    "machines.cluster.x-k8s.io",
-    "machinesets.cluster.x-k8s.io",
-    "kubeadmconfigs.bootstrap.cluster.x-k8s.io",
-    "devmachines.infrastructure.cluster.x-k8s.io",
-    "tenantcontrolplanes.kamaji.clastix.io",
-)
-
-
 def _missing(response, *, undiscovered: bool = False) -> bool:
     pattern = r"not\s*found|notfound"
     if undiscovered:
@@ -108,7 +93,22 @@ def require_clean_controller_state(
         )
     if tenants.returncode != 0 and not _missing(tenants, undiscovered=True):
         raise RuntimeError(f"failed to inspect Tenant resources: {tenants.stderr}")
-    for resource in PROVIDER_RESOURCES:
+    catalog = json.loads(
+        (root / "controller/config/management-resources.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    if not isinstance(catalog, list) or not catalog:
+        raise RuntimeError("management resource catalog is invalid")
+    for entry in catalog:
+        if not isinstance(entry, dict) or set(entry) != {
+            "apiVersion", "kind", "plural"
+        }:
+            raise RuntimeError("management resource catalog is invalid")
+        group, _, version = entry["apiVersion"].partition("/")
+        if not group or not version:
+            raise RuntimeError("management resource catalog API version is invalid")
+        resource = f"{entry['plural']}.{group}"
         response = client.kubectl(
             "get", resource, "-A", "-o", "name", check=False
         )
@@ -147,19 +147,13 @@ def require_clean_controller_state(
         ):
             raise RuntimeError("allocation Lease residue blocks activation")
     volumes = run(
-        [
-            "docker",
-            "volume",
-            "ls",
-            "-q",
-            "--filter",
-            "label=cnpg-vcluster.capi/role=tenant-storage",
-        ],
+        ["docker", "volume", "ls", "-q"],
         timeout=30,
     ).stdout.split()
-    if volumes:
+    tenant_volumes = [name for name in volumes if name.endswith("-storage")]
+    if tenant_volumes:
         raise RuntimeError(
-            f"Tenant storage volumes block activation: {volumes}"
+            f"Tenant storage volumes block activation: {tenant_volumes}"
         )
     containers: set[str] = set()
     for role in ("worker", "external-load-balancer"):

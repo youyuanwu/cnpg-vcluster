@@ -1,6 +1,8 @@
 use kube::core::{ApiResource, GroupVersionKind};
+use serde::Serialize;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ManagementResource {
     pub api_version: &'static str,
     pub kind: &'static str,

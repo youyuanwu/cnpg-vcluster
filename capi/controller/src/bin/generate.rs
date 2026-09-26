@@ -1,21 +1,26 @@
 use std::path::PathBuf;
 
-use tenant_controller::{api::tenant_crd, permissions::controller_role};
+use tenant_controller::{
+    api::tenant_crd, management::ACTIVATION_RESOURCES, permissions::controller_role,
+};
 
 type GenerateResult<T> = Result<T, Box<dyn std::error::Error>>;
-type GeneratedFiles = [(&'static str, Vec<u8>); 2];
+type GeneratedFiles = [(&'static str, Vec<u8>); 3];
 
 fn render<T: serde::Serialize>(value: &T) -> GenerateResult<Vec<u8>> {
     Ok(format!("---\n{}", serde_yaml::to_string(value)?).into_bytes())
 }
 
 fn generated_files() -> GenerateResult<GeneratedFiles> {
+    let mut resources = serde_json::to_vec_pretty(ACTIVATION_RESOURCES)?;
+    resources.push(b'\n');
     Ok([
         (
             "crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml",
             render(&tenant_crd())?,
         ),
         ("rbac/role.yaml", render(&controller_role())?),
+        ("management-resources.json", resources),
     ])
 }
 

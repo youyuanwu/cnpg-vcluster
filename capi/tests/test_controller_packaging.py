@@ -218,6 +218,18 @@ class PackagingTests(unittest.TestCase):
 
 
 class CurrentControllerPackagingTests(unittest.TestCase):
+    @staticmethod
+    def foundation(image="rust:image"):
+        raw = {"schema": 3, "controllerImage": image}
+        return {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "tenant-foundation", "namespace": "tenant-system"},
+            "data": {
+                "foundation.json": json.dumps(raw, sort_keys=True),
+                "foundation.sha256": packaging._foundation_checksum(raw),
+            },
+        }
 
     def test_crd_requires_exact_served_and_stored_version_and_status(self):
         valid = {
@@ -239,6 +251,112 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             change(invalid)
             with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "only v1alpha2"):
                 packaging.verify_controller_crd(Client(lambda *_a, **_k: response(invalid)))
+
+    def test_pre_acceptance_failure_restores_previous_controller(self):
+        desired = self.foundation()
+        old = self.foundation("old:image")
+        old_state = {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "tenant-controller-state", "namespace": "tenant-system"},
+            "data": {"configurationHash": "old-hash"},
+        }
+        old_deployment = {
+            "apiVersion": "apps/v1",
+            "kind": "Deployment",
+            "metadata": {"name": "tenant-controller", "namespace": "tenant-system"},
+            "spec": {},
+        }
+        events = []
+
+        def handle(*args, **kwargs):
+            if "get" in args and "configmap/tenant-foundation" in args:
+                return response(old)
+            if "get" in args and "configmap/tenant-controller-state" in args:
+                return response(old_state)
+            if "get" in args and "deployment/tenant-controller" in args:
+                return response(old_deployment)
+            if kwargs.get("input_text"):
+                events.append(("apply", kwargs["input_text"]))
+            return response()
+
+        client = Client(handle)
+        with (
+            patch.object(packaging, "build_controller_image", return_value="rust:image"),
+            patch.object(packaging, "_foundation_payload", return_value=desired),
+            patch.object(packaging, "run"),
+            patch.object(packaging, "verify_controller_crd"),
+            patch.object(packaging, "stop_controller", side_effect=lambda *_a: events.append("stop")),
+            patch.object(
+                packaging,
+                "require_clean_controller_state",
+                side_effect=[None, RuntimeError("second inventory failed")],
+            ),
+            patch.object(
+                packaging,
+                "render_controller_manager",
+                side_effect=lambda *_a, **_k: Path("manager.yaml"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "second inventory failed"),
+        ):
+            packaging.reconcile_controller(Path("."), CONFIG, client, {}, Mock(), None)
+        self.assertIn("stop", events)
+        self.assertTrue(
+            any(
+                "old:image" in item[1]
+                for item in events
+                if isinstance(item, tuple) and item[0] == "apply"
+            )
+        )
+
+    def test_post_acceptance_failure_never_restores_previous_controller(self):
+        desired = self.foundation()
+        desired_hash = desired["data"]["foundation.sha256"]
+        old_state = {
+            "apiVersion": "v1",
+            "kind": "ConfigMap",
+            "metadata": {"name": "tenant-controller-state", "namespace": "tenant-system"},
+            "data": {"configurationHash": "old-hash"},
+        }
+        state_reads = 0
+        rollback_applies = []
+
+        def handle(*args, **kwargs):
+            nonlocal state_reads
+            if "get" in args and "configmap/tenant-controller-state" in args:
+                state_reads += 1
+                if state_reads == 1:
+                    return response(old_state)
+                return response({"data": {"configurationHash": desired_hash}})
+            if "get" in args:
+                return response()
+            if kwargs.get("input_text") and "rollback" in " ".join(args):
+                rollback_applies.append(kwargs["input_text"])
+            return response()
+
+        with (
+            patch.object(packaging, "build_controller_image", return_value="rust:image"),
+            patch.object(packaging, "_foundation_payload", return_value=desired),
+            patch.object(packaging, "run"),
+            patch.object(packaging, "verify_controller_crd"),
+            patch.object(packaging, "stop_controller"),
+            patch.object(packaging, "require_clean_controller_state"),
+            patch.object(
+                packaging,
+                "render_controller_manager",
+                return_value=Path("manager.yaml"),
+            ),
+            patch.object(
+                packaging,
+                "verify_running_controller",
+                side_effect=RuntimeError("candidate failed after acceptance"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "candidate failed after acceptance"),
+        ):
+            packaging.reconcile_controller(
+                Path("."), CONFIG, Client(handle), {}, Mock(), None
+            )
+        self.assertEqual(rollback_applies, [])
 
     def test_uninstall_keeps_controller_alive_until_ordinary_tenant_delete_finishes(self):
         events = []

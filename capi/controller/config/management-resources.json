@@ -1,0 +1,57 @@
+[
+  {
+    "apiVersion": "cluster.x-k8s.io/v1beta2",
+    "kind": "Cluster",
+    "plural": "clusters"
+  },
+  {
+    "apiVersion": "cluster.x-k8s.io/v1beta2",
+    "kind": "MachineDeployment",
+    "plural": "machinedeployments"
+  },
+  {
+    "apiVersion": "cluster.x-k8s.io/v1beta2",
+    "kind": "MachineSet",
+    "plural": "machinesets"
+  },
+  {
+    "apiVersion": "cluster.x-k8s.io/v1beta2",
+    "kind": "Machine",
+    "plural": "machines"
+  },
+  {
+    "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta2",
+    "kind": "DevCluster",
+    "plural": "devclusters"
+  },
+  {
+    "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta2",
+    "kind": "DevMachineTemplate",
+    "plural": "devmachinetemplates"
+  },
+  {
+    "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta2",
+    "kind": "DevMachine",
+    "plural": "devmachines"
+  },
+  {
+    "apiVersion": "bootstrap.cluster.x-k8s.io/v1beta2",
+    "kind": "KubeadmConfigTemplate",
+    "plural": "kubeadmconfigtemplates"
+  },
+  {
+    "apiVersion": "bootstrap.cluster.x-k8s.io/v1beta2",
+    "kind": "KubeadmConfig",
+    "plural": "kubeadmconfigs"
+  },
+  {
+    "apiVersion": "controlplane.cluster.x-k8s.io/v1alpha2",
+    "kind": "KamajiControlPlane",
+    "plural": "kamajicontrolplanes"
+  },
+  {
+    "apiVersion": "kamaji.clastix.io/v1alpha1",
+    "kind": "TenantControlPlane",
+    "plural": "tenantcontrolplanes"
+  }
+]

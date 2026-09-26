@@ -1,7 +1,10 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use k8s_openapi::api::core::v1::ConfigMap;
+use k8s_openapi::api::{
+    coordination::v1::Lease,
+    core::v1::{ConfigMap, Namespace, Secret},
+};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::{
     Api, Client, ResourceExt,
@@ -43,6 +46,14 @@ pub async fn admit<D: DockerClient>(
         .ok_or_else(|| ControllerError::Configuration("activation ticket is missing".into()))?;
     validate_ticket(&ticket, configuration_hash, activation_token)?;
     require_clean_inventory(client, docker).await?;
+    let mut consumed = ticket.clone();
+    consumed
+        .data
+        .get_or_insert_default()
+        .insert("consumed".into(), "true".into());
+    let consumed = config_maps
+        .replace(TICKET_NAME, &PostParams::default(), &consumed)
+        .await?;
     let replacement = ConfigMap {
         metadata: ObjectMeta {
             name: Some(STATE_NAME.into()),
@@ -68,10 +79,10 @@ pub async fn admit<D: DockerClient>(
                 .await?;
         }
     }
-    let uid = ticket
+    let uid = consumed
         .uid()
         .ok_or_else(|| ControllerError::Configuration("activation ticket has no UID".into()))?;
-    let resource_version = ticket.resource_version().ok_or_else(|| {
+    let resource_version = consumed.resource_version().ok_or_else(|| {
         ControllerError::Configuration("activation ticket has no resourceVersion".into())
     })?;
     config_maps
@@ -102,6 +113,7 @@ fn validate_ticket(
         || data.get("configurationHash").map(String::as_str) != Some(configuration_hash)
         || data.get("token").map(String::as_str) != Some(activation_token)
         || data.get("hostClean").map(String::as_str) != Some("true")
+        || data.get("consumed").is_some_and(|value| value != "false")
     {
         return Err(ControllerError::Configuration(
             "activation ticket identity is invalid".into(),
@@ -147,8 +159,69 @@ async fn require_clean_inventory<D: DockerClient>(
                     resource.kind
                 )));
             }
-            Err(kube::Error::Api(status)) if status.code == 404 => {}
             Err(error) => return Err(error.into()),
+        }
+    }
+    for namespace in Api::<Namespace>::all(client.clone())
+        .list(&ListParams::default())
+        .await?
+    {
+        let annotations = namespace.metadata.annotations.as_ref();
+        if annotations.is_some_and(|annotations| {
+            annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
+                || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
+        }) {
+            return Err(ControllerError::Configuration(
+                "Tenant Namespace residue blocks configuration activation".into(),
+            ));
+        }
+    }
+    for secret in Api::<Secret>::all(client.clone())
+        .list(&ListParams::default())
+        .await?
+    {
+        let annotations = secret.metadata.annotations.as_ref();
+        if annotations.is_some_and(|annotations| {
+            annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
+                || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
+        }) || secret
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|owners| {
+                owners
+                    .iter()
+                    .any(|owner| owner.kind == "KamajiControlPlane")
+            })
+        {
+            return Err(ControllerError::Configuration(
+                "Tenant credential residue blocks configuration activation".into(),
+            ));
+        }
+    }
+    for lease in Api::<Lease>::namespaced(client.clone(), NAMESPACE)
+        .list(&ListParams::default())
+        .await?
+    {
+        if lease
+            .metadata
+            .labels
+            .as_ref()
+            .is_some_and(|labels| labels.contains_key("tenancy.cnpg-vcluster.io/slot-id"))
+            || lease
+                .metadata
+                .annotations
+                .as_ref()
+                .is_some_and(|annotations| {
+                    annotations
+                        .get("tenancy.cnpg-vcluster.io/resource")
+                        .map(String::as_str)
+                        == Some("allocation-lease")
+                })
+        {
+            return Err(ControllerError::Configuration(
+                "allocation Lease residue blocks configuration activation".into(),
+            ));
         }
     }
     if docker
@@ -167,6 +240,26 @@ async fn require_clean_inventory<D: DockerClient>(
     {
         return Err(ControllerError::Configuration(
             "worker or load-balancer containers block configuration activation".into(),
+        ));
+    }
+    if docker
+        .list_volumes()
+        .await
+        .map_err(|error| {
+            ControllerError::Configuration(format!("Docker volume inventory failed: {error}"))
+        })?
+        .iter()
+        .any(|volume| {
+            volume.name.ends_with("-storage")
+                || volume
+                    .labels
+                    .get("cnpg-vcluster.capi/role")
+                    .map(String::as_str)
+                    == Some("tenant-storage")
+        })
+    {
+        return Err(ControllerError::Configuration(
+            "Tenant storage volume residue blocks configuration activation".into(),
         ));
     }
     Ok(())

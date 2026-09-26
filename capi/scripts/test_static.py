@@ -173,6 +173,7 @@ def check_repository_boundaries() -> None:
         "controller/API_COMPATIBILITY.md",
         "controller/config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml",
         "controller/config/rbac/role.yaml",
+        "controller/config/management-resources.json",
         "config/tenants/examples/local.yaml",
         "config/tenants/tests/tenant-a.yaml",
         "config/tenants/tests/tenant-b.yaml",

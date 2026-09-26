@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use bollard::models::{ContainerInspectResponse, Volume, VolumeCreateRequest};
-use bollard::query_parameters::{ListContainersOptionsBuilder, RemoveVolumeOptions};
+use bollard::query_parameters::{
+    ListContainersOptionsBuilder, ListVolumesOptionsBuilder, RemoveVolumeOptions,
+};
 use bollard::{API_DEFAULT_VERSION, Docker};
 
 pub const WORKER_CLUSTER_LABEL: &str = "io.x-k8s.kind.cluster";
@@ -84,6 +86,7 @@ pub trait DockerClient: Send + Sync {
     fn list_containers(
         &self,
     ) -> impl Future<Output = Result<Vec<DockerContainer>, DockerError>> + Send;
+    fn list_volumes(&self) -> impl Future<Output = Result<Vec<DockerVolume>, DockerError>> + Send;
 
     fn list_worker_containers(
         &self,
@@ -354,6 +357,26 @@ impl DockerClient for BollardDockerClient {
             }
         }
         Ok(result)
+    }
+
+    async fn list_volumes(&self) -> Result<Vec<DockerVolume>, DockerError> {
+        let listed = self
+            .docker
+            .list_volumes(Some(ListVolumesOptionsBuilder::default().build()))
+            .await
+            .map_err(|error| DockerError::request("list volumes", error))?;
+        listed
+            .volumes
+            .unwrap_or_default()
+            .into_iter()
+            .map(|volume| {
+                let name = volume.name.clone();
+                if name.is_empty() {
+                    return Err(DockerError::Identity("listed volume has no name"));
+                }
+                volume_identity(volume, &name)
+            })
+            .collect()
     }
 }
 

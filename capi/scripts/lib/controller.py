@@ -604,15 +604,16 @@ def reconcile_controller(
     token = uuid.uuid4().hex if replacement else ""
     if replacement:
         require_clean_controller_state(root, client)
-        stop_controller(config, client)
-        require_clean_controller_state(root, client)
-    manager = render_controller_manager(
-        root,
-        config,
-        image,
-        activation_token=token,
-    )
     try:
+        if replacement:
+            stop_controller(config, client)
+            require_clean_controller_state(root, client)
+        manager = render_controller_manager(
+            root,
+            config,
+            image,
+            activation_token=token,
+        )
         client.kubectl(
             "apply", "--server-side", "--field-manager=cnpg-vcluster-controller",
             "--force-conflicts", "-f", "-", input_text=json.dumps(foundation),
@@ -646,6 +647,19 @@ def reconcile_controller(
         verify_running_controller(client, image, activation_token=token)
     except Exception:
         if replacement:
+            accepted = client.kubectl(
+                "-n",
+                CONTROLLER_NAMESPACE,
+                "get",
+                "configmap/tenant-controller-state",
+                "--ignore-not-found=true",
+                "-o",
+                "json",
+            ).stdout.strip()
+            if accepted and json.loads(accepted).get("data", {}).get(
+                "configurationHash"
+            ) == desired_hash:
+                raise
             for name, document in previous.items():
                 if document:
                     value = json.loads(document)

@@ -118,6 +118,10 @@ impl DockerClient for FakeDocker {
         self.calls.lock().unwrap().push("containers".into());
         Ok(self.containers.lock().unwrap().clone())
     }
+    async fn list_volumes(&self) -> Result<Vec<DockerVolume>, DockerError> {
+        self.calls.lock().unwrap().push("volumes".into());
+        Ok(self.volumes.lock().unwrap().values().cloned().collect())
+    }
 }
 
 pub struct FakeAccess(pub Client);
