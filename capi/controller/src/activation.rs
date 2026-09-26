@@ -35,6 +35,15 @@ pub async fn admit<D: DockerClient>(
     if state
         .as_ref()
         .and_then(|state| state.data.as_ref())
+        .is_some_and(|data| data.contains_key("rollbackToken"))
+    {
+        return Err(ControllerError::Configuration(
+            "controller configuration rollback is in progress".into(),
+        ));
+    }
+    if state
+        .as_ref()
+        .and_then(|state| state.data.as_ref())
         .and_then(|data| data.get("configurationHash"))
         .is_some_and(|hash| hash == configuration_hash)
     {

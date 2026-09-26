@@ -78,6 +78,38 @@ async fn same_identity_restart_needs_no_ticket_or_inventory() {
     assert!(docker.calls.lock().unwrap().is_empty());
 }
 
+#[tokio::test]
+async fn rollback_lock_blocks_same_and_changed_identity_admission() {
+    for hash in ["hash-a", "hash-b"] {
+        let server = clean_server();
+        server.insert(
+            STATE,
+            config_map(
+                STATE_NAME,
+                &[
+                    ("configurationHash", "hash-a"),
+                    ("rollbackToken", "rollback-a"),
+                ],
+            ),
+        );
+        if hash == "hash-b" {
+            server.insert(TICKET, ticket("hash-b", "token-b"));
+        }
+        let error = admit(
+            server.client(),
+            &FakeDocker::default(),
+            hash,
+            if hash == "hash-b" { "token-b" } else { "" },
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            tenant_controller::error::ControllerError::Configuration(_)
+        ));
+    }
+}
+
 #[test]
 fn typed_catalog_policies_match_activation_contract() {
     for (kind, namespaced, role, policy, exemption) in [
