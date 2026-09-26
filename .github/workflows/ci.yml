@@ -42,7 +42,7 @@ jobs:
           just-version: "1.58.0"
 
       - name: Prepare repository-local working directory
-        run: install -d -m 700 .tools/cargo-work
+        run: install -d -m 700 .tools .runtime .tools/cargo-home .tools/cargo-work
 
       - name: Run unit and static tests
         run: |
@@ -103,7 +103,7 @@ jobs:
           just-version: "1.58.0"
 
       - name: Prepare repository-local working directory
-        run: install -d -m 700 .tools/cargo-work
+        run: install -d -m 700 .tools .runtime .tools/cargo-home .tools/cargo-work
 
       - name: Identify system Rust compiler
         id: compiler
@@ -154,7 +154,7 @@ jobs:
         with:
           just-version: "1.58.0"
       - name: Prepare repository-local working directory
-        run: install -d -m 700 .tools/cargo-work
+        run: install -d -m 700 .tools .runtime .tools/cargo-home .tools/cargo-work
       - name: Show Docker capacity
         run: docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}} DockerRoot={{.DockerRootDir}}'
       - name: Acquire complete cache including locked Cargo inputs

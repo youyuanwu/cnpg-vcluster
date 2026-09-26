@@ -88,7 +88,7 @@ class CIWorkflowTests(unittest.TestCase):
         )
         for name in ("fast-checks", "e2e", "high-capacity"):
             self.assertIn(
-                "run: install -d -m 700 .tools/cargo-work",
+                "run: install -d -m 700 .tools .runtime .tools/cargo-home .tools/cargo-work",
                 job(name),
             )
 
