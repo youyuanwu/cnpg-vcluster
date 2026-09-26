@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use tenant_controller::{
-    api::tenant_crd, management::ACTIVATION_RESOURCES, permissions::controller_role,
+    api::tenant_crd, management::MANAGEMENT_RESOURCES, permissions::controller_role,
 };
 
 type GenerateResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -12,7 +12,7 @@ fn render<T: serde::Serialize>(value: &T) -> GenerateResult<Vec<u8>> {
 }
 
 fn generated_files() -> GenerateResult<GeneratedFiles> {
-    let mut resources = serde_json::to_vec_pretty(ACTIVATION_RESOURCES)?;
+    let mut resources = serde_json::to_vec_pretty(MANAGEMENT_RESOURCES)?;
     resources.push(b'\n');
     Ok([
         (

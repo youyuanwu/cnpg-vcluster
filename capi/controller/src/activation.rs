@@ -16,7 +16,7 @@ use crate::{
     api::Tenant,
     docker::{DockerClient, WORKER_ROLE_LABEL},
     error::ControllerError,
-    management::{ACTIVATION_RESOURCES, InventoryPolicy},
+    management::{InventoryPolicy, activation_resources},
 };
 
 pub const STATE_NAME: &str = "tenant-controller-state";
@@ -156,8 +156,7 @@ async fn require_clean_inventory<D: DockerClient>(
             "Tenant resources block configuration activation".into(),
         ));
     }
-    for resource in ACTIVATION_RESOURCES
-        .iter()
+    for resource in activation_resources()
         .filter(|resource| resource.inventory_policy == InventoryPolicy::BlockAnyInstance)
     {
         let items = Api::<DynamicObject>::all_with(client.clone(), &resource.api_resource())
