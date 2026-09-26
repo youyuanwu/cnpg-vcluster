@@ -64,7 +64,9 @@ fn sorted_archive_import_and_three_reference_forms_are_exact() {
     );
     let mut sorted = archives.clone();
     sorted.sort_by(|left, right| left.key.cmp(&right.key));
-    for (chunk, archive) in commands[..35].chunks_exact(5).zip(sorted) {
+    let (chunks, remainder) = commands[..35].as_chunks::<5>();
+    assert!(remainder.is_empty());
+    for (chunk, archive) in chunks.iter().zip(sorted) {
         assert!(chunk[0].contains(&archive.path));
         assert!(chunk[1].contains(&archive.path));
         assert!(chunk[2].ends_with(&shell_quote(&archive.reference)));
