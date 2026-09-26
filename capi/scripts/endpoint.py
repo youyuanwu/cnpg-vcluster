@@ -187,17 +187,6 @@ def run_endpoint_gate(
                     + deployment_response.stderr
                 )
             create_management(root, config)
-            deployment_response = None
-        if deployment_response is None:
-            arguments = ["--mutation-enabled=true"]
-        else:
-            deployment = json.loads(deployment_response.stdout)
-            arguments = deployment["spec"]["template"]["spec"]["containers"][0].get(
-                "args", []
-            )
-        if "--mutation-enabled=true" not in arguments:
-            delete_tenant_resource(root, config, selected_name)
-            create_management(root, config)
     evidence = root / ".runtime" / "evidence" / "endpoint-failure.txt"
     success_evidence = root / ".runtime" / "evidence" / "endpoint-success.json"
     evidence.unlink(missing_ok=True)

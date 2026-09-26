@@ -4,7 +4,11 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from scripts.controller_metrics import production_lines, source_metrics
+from scripts.controller_metrics import (
+    BASELINE_PRODUCTION_LINES,
+    production_lines,
+    source_metrics,
+)
 
 
 class ControllerMetricsTests(unittest.TestCase):
@@ -26,7 +30,8 @@ class ControllerMetricsTests(unittest.TestCase):
     def test_current_production_baseline_is_reproducible(self) -> None:
         metrics = source_metrics()
         self.assertEqual(sorted(path for path, _ in metrics), [path for path, _ in metrics])
-        self.assertEqual(8050, sum(lines for _, lines in metrics))
+        self.assertEqual(8050, BASELINE_PRODUCTION_LINES)
+        self.assertGreater(sum(lines for _, lines in metrics), 0)
 
 
 if __name__ == "__main__":

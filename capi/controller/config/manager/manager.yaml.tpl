@@ -3,8 +3,6 @@ kind: Deployment
 metadata:
   name: tenant-controller
   namespace: tenant-system
-  annotations:
-    tenancy.cnpg-vcluster.io/lifecycle-epoch: ${CONTROLLER_LIFECYCLE_EPOCH}
 spec:
   replicas: 1
   strategy:
@@ -16,8 +14,6 @@ spec:
     metadata:
       labels:
         app.kubernetes.io/name: tenant-controller
-      annotations:
-        tenancy.cnpg-vcluster.io/lifecycle-epoch: ${CONTROLLER_LIFECYCLE_EPOCH}
     spec:
       serviceAccountName: tenant-controller
       terminationGracePeriodSeconds: 60
@@ -27,8 +23,7 @@ spec:
         imagePullPolicy: Never
         args:
         - --leader-elect=true
-        - --mutation-enabled=${CONTROLLER_MUTATION_ENABLED}
-        - --lifecycle-epoch=${CONTROLLER_LIFECYCLE_EPOCH}
+        - --activation-token=${CONTROLLER_ACTIVATION_TOKEN}
         - --controller-image=${TENANT_CONTROLLER_IMAGE}
         - --supported-kubernetes-version=${SUPPORTED_KUBERNETES_VERSION}
         - --health-probe-bind-address=0.0.0.0:8081

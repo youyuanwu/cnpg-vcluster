@@ -3,10 +3,11 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
+use std::sync::Arc;
 use std::time::Duration;
 
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret};
+use k8s_openapi::api::core::v1::{Namespace, Secret};
 use kube::api::{DeleteParams, ListParams, Patch, PatchParams, Preconditions};
 use kube::core::{ApiResource, DynamicObject, GroupVersionKind};
 use kube::runtime::controller::Action;
@@ -20,14 +21,13 @@ use crate::docker::{
     worker_containers,
 };
 use crate::error::ControllerError as ReconcileError;
-use crate::foundation::parse_for_deletion;
+use crate::foundation::RuntimeFoundation;
 use crate::ownership::{
     Identity, validate_cluster_uid, validate_kubeconfig_secret_for_deletion, validate_owner_chain,
     validate_provider_owner, validate_provider_owner_for_deletion, validate_root_ownership,
 };
 
 const FOUNDATION_NAMESPACE: &str = "tenant-system";
-const FOUNDATION_NAME: &str = "tenant-foundation";
 const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 const RETRY: Duration = Duration::from_secs(5);
 
@@ -159,7 +159,6 @@ fn pending() -> Action {
 }
 
 pub trait FinalizationKube: Send + Sync {
-    fn foundation(&self) -> impl Future<Output = Result<ConfigMap, ReconcileError>> + Send;
     fn tenant(
         &self,
         name: &str,
@@ -232,13 +231,6 @@ impl LiveKube {
 }
 
 impl FinalizationKube for LiveKube {
-    async fn foundation(&self) -> Result<ConfigMap, ReconcileError> {
-        Ok(
-            Api::<ConfigMap>::namespaced(self.client.clone(), FOUNDATION_NAMESPACE)
-                .get(FOUNDATION_NAME)
-                .await?,
-        )
-    }
     async fn tenant(&self, name: &str) -> Result<Option<Tenant>, ReconcileError> {
         Ok(Api::<Tenant>::all(self.client.clone())
             .get_opt(name)
@@ -432,6 +424,7 @@ pub struct Finalizer<K = LiveKube, D = BollardDockerClient> {
     kube: K,
     docker: D,
     supported_version: String,
+    foundation: Arc<RuntimeFoundation>,
 }
 
 impl Finalizer<LiveKube, BollardDockerClient> {
@@ -439,21 +432,29 @@ impl Finalizer<LiveKube, BollardDockerClient> {
         client: Client,
         docker: BollardDockerClient,
         supported_version: impl Into<String>,
+        foundation: Arc<RuntimeFoundation>,
     ) -> Self {
         Self {
             kube: LiveKube::new(client),
             docker,
             supported_version: supported_version.into(),
+            foundation,
         }
     }
 }
 
 impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
-    pub fn with_adapters(kube: K, docker: D, supported_version: impl Into<String>) -> Self {
+    pub fn with_adapters(
+        kube: K,
+        docker: D,
+        supported_version: impl Into<String>,
+        foundation: Arc<RuntimeFoundation>,
+    ) -> Self {
         Self {
             kube,
             docker,
             supported_version: supported_version.into(),
+            foundation,
         }
     }
 
@@ -470,25 +471,15 @@ impl<K: FinalizationKube, D: DockerClient> Finalizer<K, D> {
         let spec = canonical_spec(name, &tenant.spec, &self.supported_version)
             .map_err(|error| ReconcileError::InvalidInput(error.to_string()))?;
         let spec_hash = spec_hash(&spec);
-        let cm = self.kube.foundation().await?;
-        let data = cm
-            .data
-            .as_ref()
-            .ok_or_else(|| invalid("foundation data is missing"))?;
-        let raw = data
-            .get("foundation.json")
-            .ok_or_else(|| invalid("foundation JSON is missing"))?;
-        let hash = data
-            .get("foundation.sha256")
-            .ok_or_else(|| invalid("foundation checksum is missing"))?;
         let recorded_hash = tenant
             .status
             .as_ref()
             .and_then(|status| status.foundation_hash.as_deref());
-        let verified = parse_for_deletion(raw, hash, recorded_hash)
+        let foundation = self
+            .foundation
+            .deletion(recorded_hash)
             .map_err(|error| ReconcileError::InvalidInput(error.to_string()))?;
-        let foundation = &verified.value;
-        let foundation_hash = &verified.hash;
+        let foundation_hash = &self.foundation.hash;
         let identity = Identity {
             tenant_name: name,
             tenant_uid,

@@ -5,8 +5,8 @@ Rust `src/bin/generate.rs` produces the checked-in
 `config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml` and
 `config/rbac/role.yaml`. `just controller-verify` compares those artifacts
 against generation without rewriting them. The v1alpha1 CRD, Go manager and
-admission webhook are not installation inputs; cutover rejects existing
-Go-managed state instead of migrating it. See
+admission webhook are not installation inputs; unsupported legacy state blocks
+the current installer and is not migrated or deleted. See
 [`API_COMPATIBILITY.md`](API_COMPATIBILITY.md) for the public contract.
 
 Use the system-installed Rust/Cargo >= 1.89; the Python wrappers keep Cargo
@@ -44,5 +44,7 @@ ports or TLS mounts. A disposable in-cluster Job probes Kubernetes DNS and
 the `default` Namespace with mounted credentials. The Python-produced
 schema-3 foundation resolves an ordered slot catalog; non-expiring per-slot
 allocation Leases and status bind each Tenant's assigned endpoint and CIDRs.
-Only after clean cutover, CEL/fieldValidation/status checks, image checks and
-foundation publication does the installer enable creation mutation.
+The manager reads one schema-3 foundation snapshot at startup. Same-identity
+restarts resume active Tenants. Changed identity requires a one-time activation
+ticket, clean authoritative inventory, and an atomic accepted-identity update
+before reconciliation opens.

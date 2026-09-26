@@ -10,12 +10,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from scripts.lib.config import parse_duration
-from scripts.lib.controller_cutover import (
-    controller_lifecycle_epoch,
-    delete_legacy_controller,
+from scripts.lib.controller_state import (
+    activation_ticket,
     delete_named,
-    require_clean_controller_cutover,
-    verify_legacy_webhook_absent,
+    require_clean_controller_state,
 )
 from scripts.lib.controller_foundation import (
     canonical_hash as _foundation_checksum,
@@ -33,12 +31,7 @@ if TYPE_CHECKING:
 CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
-CONTROLLER_LIFECYCLE_EPOCH = "rust-operator-v1"
 STATIC_MANAGER_FLAGS = ("-C", "target-feature=+crt-static")
-
-
-def controller_requires_cutover(installed_epoch: str | None) -> bool:
-    return installed_epoch != CONTROLLER_LIFECYCLE_EPOCH
 
 
 def cargo_environment(root: Path, *, offline: bool = True) -> dict[str, str]:
@@ -246,7 +239,7 @@ def render_controller_manager(
     config: dict[str, str],
     image: str,
     *,
-    mutation_enabled: bool,
+    activation_token: str,
 ) -> Path:
     template = (
         root / "controller" / "config" / "manager" / "manager.yaml.tpl"
@@ -257,116 +250,11 @@ def render_controller_manager(
             "${SUPPORTED_KUBERNETES_VERSION}",
             config["KUBERNETES_VERSION"].removeprefix("v"),
         )
-        .replace("${CONTROLLER_LIFECYCLE_EPOCH}", CONTROLLER_LIFECYCLE_EPOCH)
-        .replace(
-            "${CONTROLLER_MUTATION_ENABLED}",
-            "true" if mutation_enabled else "false",
-        )
+        .replace("${CONTROLLER_ACTIVATION_TOKEN}", activation_token)
     )
     destination = root / ".runtime" / "rendered" / "controller" / "manager.yaml"
     write_private_file(destination, rendered)
     return destination
-
-
-def set_controller_mutation(
-    config: dict[str, str],
-    client: ManagementClient,
-    *,
-    enabled: bool,
-) -> None:
-    foundation = client.json(
-        "-n",
-        CONTROLLER_NAMESPACE,
-        "get",
-        "configmap/tenant-foundation",
-    )
-    encoded = foundation["data"]["foundation.json"]
-    data = json.loads(encoded)
-    if data.get("schema") != 3 or foundation["data"].get(
-        "foundation.sha256"
-    ) != _foundation_checksum(data):
-        raise RuntimeError("controller mutation requires a verified schema-3 foundation")
-    data["mutationEnabled"] = enabled
-    updated = json.dumps(data, sort_keys=True, separators=(",", ":"))
-    patch = {
-        "data": {
-            "foundation.json": updated,
-            "foundation.sha256": _foundation_checksum(data),
-        }
-    }
-    argument = f"--mutation-enabled={'true' if enabled else 'false'}"
-    deployment = client.json(
-        "-n",
-        CONTROLLER_NAMESPACE,
-        "get",
-        f"deployment/{CONTROLLER_DEPLOYMENT}",
-    )
-    containers = deployment["spec"]["template"]["spec"]["containers"]
-    manager = next(
-        (item for item in containers if item.get("name") == "manager"),
-        None,
-    )
-    if manager is None:
-        raise RuntimeError("Tenant controller manager container is missing")
-    args = [
-        argument if value.startswith("--mutation-enabled=") else value
-        for value in manager.get("args", [])
-    ]
-    if not any(value.startswith("--mutation-enabled=") for value in args):
-        raise RuntimeError("Tenant controller mutation argument is missing")
-    deployment_patch = {
-        "spec": {
-            "template": {
-                "spec": {
-                    "containers": [
-                        {
-                            "name": "manager",
-                            "args": args,
-                        }
-                    ]
-                }
-            }
-        }
-    }
-    if enabled:
-        client.kubectl(
-            "-n",
-            CONTROLLER_NAMESPACE,
-            "patch",
-            "configmap/tenant-foundation",
-            "--type=merge",
-            "-p",
-            json.dumps(patch),
-        )
-
-    client.kubectl(
-        "-n",
-        CONTROLLER_NAMESPACE,
-        "patch",
-        f"deployment/{CONTROLLER_DEPLOYMENT}",
-        "--type=strategic",
-        "-p",
-        json.dumps(deployment_patch),
-    )
-    client.kubectl(
-        "-n",
-        CONTROLLER_NAMESPACE,
-        "rollout",
-        "status",
-        f"deployment/{CONTROLLER_DEPLOYMENT}",
-        f"--timeout={config['CONDITION_TIMEOUT']}",
-    )
-    verify_running_controller(client, data["controllerImage"], mutation_enabled=enabled)
-    if not enabled:
-        client.kubectl(
-            "-n",
-            CONTROLLER_NAMESPACE,
-            "patch",
-            "configmap/tenant-foundation",
-            "--type=merge",
-            "-p",
-            json.dumps(patch),
-        )
 
 
 def delete_tenant_resource(
@@ -421,7 +309,7 @@ def delete_controller_tenants(
         )
 
 
-def stop_controller_for_cutover(
+def stop_controller(
     config: dict[str, str],
     client: ManagementClient,
 ) -> None:
@@ -436,7 +324,7 @@ def stop_controller_for_cutover(
         output = f"{deployment.stdout}{deployment.stderr}".lower()
         if "notfound" not in output and "not found" not in output:
             raise RuntimeError(
-                f"failed to inspect Tenant controller before cutover: {deployment.stderr}"
+                f"failed to inspect Tenant controller before shutdown: {deployment.stderr}"
             )
     else:
         client.kubectl(
@@ -468,54 +356,9 @@ def stop_controller_for_cutover(
     )
 
 
-def verify_running_controller_epoch(
-    client: ManagementClient,
-    expected: str,
-) -> None:
-    deployment_epoch = controller_lifecycle_epoch(client)
-    if deployment_epoch != expected:
-        raise RuntimeError(
-            "Tenant controller Deployment lifecycle epoch mismatch: "
-            f"expected {expected}, observed {deployment_epoch or '<missing>'}"
-        )
-    pods = client.json(
-        "-n",
-        CONTROLLER_NAMESPACE,
-        "get",
-        "pods",
-        "-l",
-        "app.kubernetes.io/name=tenant-controller",
-    ).get("items", [])
-    if not pods:
-        raise RuntimeError("Tenant controller has no running Pod")
-    prefix = "--lifecycle-epoch="
-    for pod in pods:
-        manager = next(
-            (
-                container
-                for container in pod.get("spec", {}).get("containers", [])
-                if container.get("name") == "manager"
-            ),
-            None,
-        )
-        if manager is None:
-            raise RuntimeError("Tenant controller Pod manager container is missing")
-        epochs = [
-            value.removeprefix(prefix)
-            for value in manager.get("args", [])
-            if value.startswith(prefix)
-        ]
-        if epochs != [expected]:
-            name = pod.get("metadata", {}).get("name", "<unknown>")
-            raise RuntimeError(
-                f"Tenant controller Pod {name} lifecycle epoch mismatch"
-            )
-
-
 def verify_running_controller(
-    client: ManagementClient, image: str, *, mutation_enabled: bool,
+    client: ManagementClient, image: str, *, activation_token: str,
 ) -> None:
-    verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
     deployment = client.json(
         "-n", CONTROLLER_NAMESPACE, "get", f"deployment/{CONTROLLER_DEPLOYMENT}",
     )
@@ -537,9 +380,8 @@ def verify_running_controller(
         args = manager.get("args", [])
         expected = {
             "--leader-elect": "true",
-            "--mutation-enabled": str(mutation_enabled).lower(),
             "--controller-image": image,
-            "--lifecycle-epoch": CONTROLLER_LIFECYCLE_EPOCH,
+            "--activation-token": activation_token,
         }
         if manager["image"] != image or any(
             [arg for arg in args if arg.startswith(f"{key}=")] != [f"{key}={value}"]
@@ -693,60 +535,15 @@ def reconcile_controller(
     verified_cache: VerifiedCache,
     registry: dict[str, object] | None,
 ) -> None:
-    installed_epoch = controller_lifecycle_epoch(client)
-    requires_cutover = controller_requires_cutover(installed_epoch)
     image = build_controller_image(root, config)
-    enabled_foundation = _foundation_payload(
-        root, config, network, image, verified_cache, registry, mutation_enabled=True,
+    foundation = _foundation_payload(
+        root, config, network, image, verified_cache, registry,
     )
-    desired_data = enabled_foundation["data"]
+    desired_data = foundation["data"]
     desired_raw = json.loads(desired_data["foundation.json"])
     desired_hash = _foundation_checksum(desired_raw)
     if desired_raw.get("schema") != 3 or desired_data["foundation.sha256"] != desired_hash:
         raise RuntimeError("generated controller foundation is invalid")
-    current = client.kubectl(
-        "-n", CONTROLLER_NAMESPACE, "get", "configmap/tenant-foundation",
-        "--ignore-not-found=true", "-o", "json",
-    )
-    current_data = None
-    foundation_matches = False
-    if current.stdout.strip():
-        try:
-            current_data = json.loads(current.stdout)["data"]
-            encoded = current_data["foundation.json"]
-            raw = json.loads(encoded)
-            foundation_matches = (
-                isinstance(raw, dict)
-                and raw.get("schema") == 3
-                and set(raw) == set(desired_raw)
-                and isinstance(raw.get("controllerImage"), str)
-                and bool(raw["controllerImage"])
-                and isinstance(raw.get("mutationEnabled"), bool)
-                and current_data.get("foundation.sha256") == _foundation_checksum(raw)
-                and current_data["foundation.sha256"] == desired_hash
-            )
-        except (KeyError, TypeError, ValueError):
-            current_data = None
-    if requires_cutover or not foundation_matches:
-        require_clean_controller_cutover(root, config, client)
-    reuse_enabled = False
-    if not requires_cutover and current_data == desired_data:
-        deployment = client.json(
-            "-n", CONTROLLER_NAMESPACE, "get", f"deployment/{CONTROLLER_DEPLOYMENT}",
-        )
-        manager = next(
-            (item for item in deployment["spec"]["template"]["spec"]["containers"]
-             if item["name"] == "manager"), {},
-        )
-        reuse_enabled = (
-            manager.get("image") == image
-            and [arg for arg in manager.get("args", []) if arg.startswith("--mutation-enabled=")]
-            == ["--mutation-enabled=true"]
-        )
-    if requires_cutover:
-        stop_controller_for_cutover(config, client)
-        delete_legacy_controller(root, config, client)
-    verify_legacy_webhook_absent(client)
     run(
         [
             str(root / ".tools" / "bin" / "kind"),
@@ -757,12 +554,6 @@ def reconcile_controller(
             config["KIND_CLUSTER_NAME"],
         ],
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
-    )
-    manager = render_controller_manager(
-        root,
-        config,
-        image,
-        mutation_enabled=reuse_enabled,
     )
     paths = (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
@@ -788,34 +579,104 @@ def reconcile_controller(
         f"--timeout={timeout}",
     )
     verify_controller_crd(client)
-    client.kubectl(
-        "apply", "--server-side", "--field-manager=cnpg-vcluster-controller",
-        "--force-conflicts", "-f", str(manager),
+    previous = {
+        name: client.kubectl(
+            "-n",
+            CONTROLLER_NAMESPACE,
+            "get",
+            name,
+            "--ignore-not-found=true",
+            "-o",
+            "json",
+        ).stdout.strip()
+        for name in (
+            "configmap/tenant-foundation",
+            "configmap/tenant-controller-state",
+            f"deployment/{CONTROLLER_DEPLOYMENT}",
+        )
+    }
+    accepted_hash = None
+    if previous["configmap/tenant-controller-state"]:
+        accepted_hash = json.loads(
+            previous["configmap/tenant-controller-state"]
+        ).get("data", {}).get("configurationHash")
+    replacement = accepted_hash != desired_hash
+    token = uuid.uuid4().hex if replacement else ""
+    if replacement:
+        require_clean_controller_state(root, client)
+        stop_controller(config, client)
+        require_clean_controller_state(root, client)
+    manager = render_controller_manager(
+        root,
+        config,
+        image,
+        activation_token=token,
     )
-    client.kubectl(
-        "rollout",
-        "status",
-        f"deployment/{CONTROLLER_DEPLOYMENT}",
-        "-n",
-        CONTROLLER_NAMESPACE,
-        f"--timeout={timeout}",
-    )
-    verify_running_controller(client, image, mutation_enabled=reuse_enabled)
+    try:
+        client.kubectl(
+            "apply", "--server-side", "--field-manager=cnpg-vcluster-controller",
+            "--force-conflicts", "-f", "-", input_text=json.dumps(foundation),
+        )
+        if replacement:
+            client.kubectl(
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-controller",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(activation_ticket(desired_hash, token)),
+            )
+        client.kubectl(
+            "apply",
+            "--server-side",
+            "--field-manager=cnpg-vcluster-controller",
+            "--force-conflicts",
+            "-f",
+            str(manager),
+        )
+        client.kubectl(
+            "rollout",
+            "status",
+            f"deployment/{CONTROLLER_DEPLOYMENT}",
+            "-n",
+            CONTROLLER_NAMESPACE,
+            f"--timeout={timeout}",
+        )
+        verify_running_controller(client, image, activation_token=token)
+    except Exception:
+        if replacement:
+            for name, document in previous.items():
+                if document:
+                    value = json.loads(document)
+                    value.pop("status", None)
+                    metadata = value.get("metadata", {})
+                    for key in (
+                        "creationTimestamp", "generation", "managedFields",
+                        "resourceVersion", "uid",
+                    ):
+                        metadata.pop(key, None)
+                    client.kubectl(
+                        "apply",
+                        "--server-side",
+                        "--field-manager=cnpg-vcluster-controller-rollback",
+                        "--force-conflicts",
+                        "-f",
+                        "-",
+                        input_text=json.dumps(value),
+                    )
+                else:
+                    delete_named(config, client, CONTROLLER_NAMESPACE, name)
+            delete_named(
+                config,
+                client,
+                CONTROLLER_NAMESPACE,
+                "configmap/tenant-controller-activation",
+            )
+        raise
     verify_controller_image(config, client, image)
-    if not reuse_enabled:
-        verify_controller_api(config, client)
-    foundation = enabled_foundation if reuse_enabled else _foundation_payload(
-        root, config, network, image, verified_cache, registry, mutation_enabled=False,
-    )
-    client.kubectl(
-        "apply", "--server-side", "--field-manager=cnpg-vcluster-controller",
-        "--force-conflicts", "-f", "-", input_text=json.dumps(foundation),
-    )
+    verify_controller_api(config, client)
     verify_controller_crd(client)
-    verify_legacy_webhook_absent(client)
-    if not reuse_enabled:
-        set_controller_mutation(config, client, enabled=True)
-    render_controller_manager(root, config, image, mutation_enabled=True)
 
 
 def delete_controller(
@@ -847,11 +708,12 @@ def delete_controller(
             raise RuntimeError(
                 f"Tenant resources remain; refusing controller uninstall: {remaining}"
             )
-    stop_controller_for_cutover(config, client)
-    require_clean_controller_cutover(root, config, client)
-    delete_legacy_controller(root, config, client)
+    stop_controller(config, client)
+    require_clean_controller_state(root, client)
     for namespace, resource in (
         ("tenant-system", "configmap/tenant-foundation"),
+        ("tenant-system", "configmap/tenant-controller-state"),
+        ("tenant-system", "configmap/tenant-controller-activation"),
         ("tenant-system", "lease/tenant-controller.tenancy.cnpg-vcluster.io"),
         (None, "clusterrolebinding/tenant-controller"),
         (None, "clusterrole/tenant-controller-role"),

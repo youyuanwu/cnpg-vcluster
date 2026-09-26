@@ -11,7 +11,6 @@ from subprocess import CompletedProcess
 from unittest.mock import Mock, patch
 
 from scripts.lib import controller as packaging
-from scripts.lib import controller_cutover as cutover
 from scripts.lib.controller_foundation import foundation_payload
 
 
@@ -218,48 +217,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("COPY assets /assets", dockerfile)
 
 
-class CutoverPackagingTests(unittest.TestCase):
-    @staticmethod
-    def foundation(*, generation="generation-one", image="rust:image", enabled=True):
-        raw = {
-            "schema": 3, "cache": {"generation": generation},
-            "controllerImage": image, "mutationEnabled": enabled,
-        }
-        return {"data": {
-            "foundation.json": json.dumps(raw, sort_keys=True),
-            "foundation.sha256": packaging._foundation_checksum(raw),
-        }}
-
-    def test_named_legacy_cleanup_does_not_need_manifest_files_and_waits(self):
-        def handle(*args, **kwargs):
-            return response(code=1, error="NotFound") if "get" in args else response()
-
-        client = Client(handle)
-        with patch.object(Path, "unlink") as unlink:
-            cutover.delete_legacy_controller(Path("not-a-source-tree"), CONFIG, client)
-        unlink.assert_called_once_with(missing_ok=True)
-        deletes = [args for args, _ in client.calls if "delete" in args]
-        self.assertEqual(len(deletes), 8)
-        for args in deletes:
-            self.assertNotIn("-f", args)
-            self.assertIn("--wait=true", args)
-            self.assertIn("--timeout=1s", args)
-        self.assertEqual(deletes[-1][1], "crd/tenants.tenancy.cnpg-vcluster.io")
-        for namespace, resource in cutover.LEGACY_WEBHOOK_RESOURCES:
-            self.assertTrue(any(resource in args and "get" in args for args, _ in client.calls))
-
-    def test_absence_is_not_assumed_on_forbidden_or_still_present(self):
-        for result in (response(code=1, error="Forbidden"), response("service/present")):
-            with self.subTest(result=result), self.assertRaisesRegex(RuntimeError, "prove"):
-                cutover.verify_absent(Client(lambda *_a, **_k: result), "tenant-system", "service/old")
-
-    def test_cutover_still_waits_for_orphan_pods_when_deployment_absent(self):
-        client = Client(lambda *args, **kwargs: (
-            response({"items": []}) if "pods" in args else response(code=1, error="NotFound")
-        ))
-        packaging.stop_controller_for_cutover(CONFIG, client)
-        self.assertTrue(any("pods" in args for args, _ in client.calls))
-        self.assertFalse(any("scale" in args for args, _ in client.calls))
+class CurrentControllerPackagingTests(unittest.TestCase):
 
     def test_crd_requires_exact_served_and_stored_version_and_status(self):
         valid = {
@@ -282,254 +240,26 @@ class CutoverPackagingTests(unittest.TestCase):
             with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "only v1alpha2"):
                 packaging.verify_controller_crd(Client(lambda *_a, **_k: response(invalid)))
 
-    def test_clean_inventory_rejects_allocation_leases_even_without_labels(self):
-        def handle(*args, **kwargs):
-            if "configmap/tenant-endpoint-allocations" in args:
-                return response(code=1, error="NotFound")
-            if "leases.coordination.k8s.io" in args:
-                return response({"items": [{"metadata": {"name": "tenant-slot-replaced"}}]})
-            if "clusters.cluster.x-k8s.io" in args:
-                return response({"items": []})
-            return response()
-
-        with self.assertRaisesRegex(RuntimeError, "allocation Lease residue"):
-            cutover.require_clean_controller_cutover(Path("nonexistent"), CONFIG, Client(handle))
-
-    def test_clean_inventory_rejects_malformed_old_ledger(self):
-        def handle(*args, **kwargs):
-            if "configmap/tenant-endpoint-allocations" in args:
-                return response({"data": {"allocations.json": "{}"}})
-            if "clusters.cluster.x-k8s.io" in args:
-                return response({"items": []})
-            return response()
-
-        with self.assertRaisesRegex(RuntimeError, "ledger is malformed"):
-            cutover.require_clean_controller_cutover(Path("nonexistent"), CONFIG, Client(handle))
-
-    def reconcile_events(self, failed_gate=None):
-        events = []
-        client = Client(lambda *args, **kwargs: (
-            events.append("publish" if kwargs.get("input_text") else ("apply:" + args[-1] if args[0] == "apply" else "kubectl"))
-            or response()
-        ))
-        stack = ExitStack()
-        self.addCleanup(stack.close)
-        for name in (
-            "stop_controller_for_cutover", "require_clean_controller_cutover",
-            "delete_legacy_controller", "verify_legacy_webhook_absent",
-            "verify_controller_crd", "verify_running_controller",
-            "verify_controller_image", "verify_controller_api", "set_controller_mutation",
-        ):
-            def effect(*args, _name=name, **kwargs):
-                events.append(_name)
-                if _name == failed_gate:
-                    raise RuntimeError("gate failed")
-            stack.enter_context(patch.object(packaging, name, side_effect=effect))
-        stack.enter_context(patch.object(packaging, "controller_lifecycle_epoch", return_value="old"))
-        stack.enter_context(patch.object(packaging, "build_controller_image", return_value="rust:image"))
-        stack.enter_context(patch.object(packaging, "run"))
-        stack.enter_context(patch.object(packaging, "render_controller_manager", side_effect=lambda *a, **kw: (
-            events.append("render:" + str(kw["mutation_enabled"])) or Path("manager.yaml")
-        )))
-        stack.enter_context(patch.object(packaging, "_foundation_payload", return_value=self.foundation()))
-        return events, client
-
-    def test_cutover_order_foundation_after_gates_mutation_last(self):
-        events, client = self.reconcile_events()
-        packaging.reconcile_controller(Path("."), CONFIG, client, {}, Mock(), None)
-        ordered = [
-            "require_clean_controller_cutover", "stop_controller_for_cutover",
-            "delete_legacy_controller", "render:False", "verify_controller_crd",
-            "verify_running_controller", "verify_controller_image", "verify_controller_api",
-            "publish", "set_controller_mutation", "render:True",
-        ]
-        positions = [events.index(event) for event in ordered]
-        self.assertEqual(positions, sorted(positions))
-        applied = [event for event in events if event.startswith("apply:")]
-        self.assertTrue(any("config/crd/bases" in event for event in applied))
-        self.assertTrue(any("config/rbac/role.yaml" in event for event in applied))
-        self.assertFalse(any("webhook" in event or "config/staged" in event for event in applied))
-
-    def test_failed_gate_never_publishes_or_enables_mutation(self):
-        for gate in ("require_clean_controller_cutover", "verify_controller_crd",
-                     "verify_running_controller", "verify_controller_image", "verify_controller_api"):
-            with self.subTest(gate=gate):
-                events, client = self.reconcile_events(gate)
-                with self.assertRaisesRegex(RuntimeError, "gate failed"):
-                    packaging.reconcile_controller(Path("."), CONFIG, client, {}, Mock(), None)
-                self.assertNotIn("publish", events)
-                self.assertNotIn("set_controller_mutation", events)
-
-    def test_exact_current_install_does_not_toggle_mutation_or_repeat_creating_api_probe(self):
-        events, _ = self.reconcile_events()
-        foundation = self.foundation()
-        deployment = {"spec": {"template": {"spec": {"containers": [{
-            "name": "manager", "image": "rust:image", "args": ["--mutation-enabled=true"],
-        }]}}}}
-
-        def handle(*args, **kwargs):
-            if "configmap/tenant-foundation" in args:
-                return response(foundation)
-            if "get" in args:
-                return response(deployment)
-            return response()
-
-        with (
-            patch.object(packaging, "controller_lifecycle_epoch", return_value=packaging.CONTROLLER_LIFECYCLE_EPOCH),
-            patch.object(packaging, "_foundation_payload", return_value=foundation),
-            patch.object(packaging, "require_clean_controller_cutover", side_effect=AssertionError("unnecessary cutover")),
-        ):
-            packaging.reconcile_controller(Path("."), CONFIG, Client(handle), {}, Mock(), None)
-        self.assertNotIn("render:False", events)
-        self.assertNotIn("set_controller_mutation", events)
-        self.assertNotIn("verify_controller_api", events)
-        self.assertIn("verify_controller_crd", events)
-        self.assertIn("verify_running_controller", events)
-        self.assertIn("verify_controller_image", events)
-
-    def test_mutable_only_updates_do_not_require_clean_cutover(self):
-        for change in ("image", "foundation-image", "foundation-mutation", "disabled"):
-            with self.subTest(change=change):
-                events, _ = self.reconcile_events()
-                desired = self.foundation()
-                current = copy.deepcopy(desired)
-                manager = {"name": "manager", "image": "rust:image", "args": ["--mutation-enabled=true"]}
-                if change == "image":
-                    manager["image"] = "old:image"
-                elif change == "foundation-image":
-                    current = self.foundation(image="old:image")
-                elif change == "foundation-mutation":
-                    current = self.foundation(enabled=False)
-                else:
-                    manager["args"] = ["--mutation-enabled=false"]
-                deployment = {"spec": {"template": {"spec": {"containers": [manager]}}}}
-                client = Client(lambda *args, **kwargs: response(
-                    current if "configmap/tenant-foundation" in args else deployment
-                ) if "get" in args else response())
-                with (
-                    patch.object(packaging, "controller_lifecycle_epoch", return_value=packaging.CONTROLLER_LIFECYCLE_EPOCH),
-                    patch.object(packaging, "_foundation_payload", return_value=desired),
-                    patch.object(packaging, "require_clean_controller_cutover", side_effect=AssertionError("unnecessary cutover")),
-                ):
-                    packaging.reconcile_controller(Path("."), CONFIG, client, {}, Mock(), None)
-                self.assertIn("render:False", events)
-                self.assertIn("verify_controller_api", events)
-                self.assertIn("set_controller_mutation", events)
-
-    def test_immutable_or_unverified_foundation_with_active_tenant_cannot_mutate(self):
-        desired = self.foundation()
-        malformed_mutable = copy.deepcopy(desired)
-        raw = json.loads(malformed_mutable["data"]["foundation.json"])
-        raw["mutationEnabled"] = "true"
-        malformed_mutable["data"]["foundation.json"] = json.dumps(raw)
-        for current in (
-            self.foundation(generation="generation-two"),
-            None,
-            {"data": {"foundation.json": "{", "foundation.sha256": "invalid"}},
-            {**desired, "data": {**desired["data"], "foundation.sha256": "0" * 64}},
-            malformed_mutable,
-        ):
-            with self.subTest(current=current), tempfile.TemporaryDirectory() as temporary:
-                events, _ = self.reconcile_events()
-
-                def handle(*args, **kwargs):
-                    if "configmap/tenant-foundation" in args and "get" in args:
-                        return response(current) if current is not None else response()
-                    if "tenants.tenancy.cnpg-vcluster.io" in args:
-                        return response("tenant.tenancy.cnpg-vcluster.io/active\n")
-                    return response()
-
-                client = Client(handle)
-                with (
-                    patch.object(packaging, "controller_lifecycle_epoch", return_value=packaging.CONTROLLER_LIFECYCLE_EPOCH),
-                    patch.object(packaging, "_foundation_payload", return_value=desired),
-                    patch.object(packaging, "require_clean_controller_cutover", side_effect=cutover.require_clean_controller_cutover),
-                ):
-                    with self.assertRaisesRegex(RuntimeError, "existing Tenant resources"):
-                        packaging.reconcile_controller(Path(temporary), CONFIG, client, {}, Mock(), None)
-                self.assertFalse(any(
-                    "apply" in args or "patch" in args or "scale" in args
-                    for args, _ in client.calls
-                ))
-                self.assertNotIn("render:False", events)
-                self.assertNotIn("publish", events)
-
-    def test_epoch_cutover_proves_clean_before_scaling_controller(self):
-        events, _ = self.reconcile_events("require_clean_controller_cutover")
-        with self.assertRaisesRegex(RuntimeError, "gate failed"):
-            packaging.reconcile_controller(Path("."), CONFIG, Client(), {}, Mock(), None)
-        self.assertNotIn("stop_controller_for_cutover", events)
-        self.assertNotIn("publish", events)
-
-    def test_same_epoch_immutable_change_requires_full_clean_inventory(self):
-        events, _ = self.reconcile_events()
-
-        def handle(*args, **kwargs):
-            if "configmap/tenant-foundation" in args:
-                return response(self.foundation(generation="old"))
-            if "clusters.cluster.x-k8s.io" in args:
-                return response({"items": [{"metadata": {"name": "orphan"}}]})
-            return response()
-
-        client = Client(handle)
-        with (
-            tempfile.TemporaryDirectory() as temporary,
-            patch.object(packaging, "controller_lifecycle_epoch", return_value=packaging.CONTROLLER_LIFECYCLE_EPOCH),
-            patch.object(packaging, "require_clean_controller_cutover", side_effect=cutover.require_clean_controller_cutover),
-            self.assertRaisesRegex(RuntimeError, "existing CAPI Clusters"),
-        ):
-            packaging.reconcile_controller(Path(temporary), CONFIG, client, {}, Mock(), None)
-        self.assertFalse(any("apply" in args or "scale" in args for args, _ in client.calls))
-        self.assertNotIn("publish", events)
-
-    def test_mutation_enable_and_disable_order_without_webhook(self):
-        for enabled in (True, False):
-            data = {"schema": 3, "mutationEnabled": not enabled, "controllerImage": "rust:image"}
-            foundation = {"data": {
-                "foundation.json": json.dumps(data),
-                "foundation.sha256": packaging._foundation_checksum(data),
-            }}
-            deployment = {"spec": {"template": {"spec": {"containers": [{
-                "name": "manager", "args": [f"--mutation-enabled={str(not enabled).lower()}"],
-            }]}}}}
-
-            def handle(*args, **kwargs):
-                if "get" in args:
-                    return response(foundation if "configmap/tenant-foundation" in args else deployment)
-                return response()
-
-            client = Client(handle)
-            with patch.object(packaging, "verify_running_controller") as verify:
-                packaging.set_controller_mutation(CONFIG, client, enabled=enabled)
-            verify.assert_called_once_with(client, "rust:image", mutation_enabled=enabled)
-            patches = [args for args, _ in client.calls if "patch" in args]
-            self.assertIn("configmap/tenant-foundation", patches[0 if enabled else 1])
-            self.assertIn("deployment/tenant-controller", patches[1 if enabled else 0])
-            self.assertFalse(any("create" in args for args, _ in client.calls))
-
     def test_uninstall_keeps_controller_alive_until_ordinary_tenant_delete_finishes(self):
         events = []
         client = Client(lambda *args, **kwargs: events.append(args) or response())
         with ExitStack() as stack:
-            for name in ("stop_controller_for_cutover", "require_clean_controller_cutover",
-                         "delete_legacy_controller", "delete_named"):
+            for name in ("stop_controller", "require_clean_controller_state", "delete_named"):
                 stack.enter_context(patch.object(packaging, name, side_effect=lambda *a, _n=name: events.append(_n)))
             packaging.delete_controller(Path("nonexistent"), CONFIG, client)
         delete = next(item for item in events if isinstance(item, tuple) and "delete" in item)
         self.assertIn("--wait=true", delete)
-        self.assertLess(events.index(delete), events.index("stop_controller_for_cutover"))
-        self.assertLess(events.index("require_clean_controller_cutover"), events.index("delete_legacy_controller"))
+        self.assertLess(events.index(delete), events.index("stop_controller"))
+        self.assertLess(events.index("stop_controller"), events.index("require_clean_controller_state"))
 
     def test_uninstall_failed_tenant_deletion_never_stops_manager_or_removes_crd(self):
         client = Client(lambda *args, **kwargs: response(code=1, error="finalizer blocked") if "delete" in args else response())
         with (
-            patch.object(packaging, "stop_controller_for_cutover") as stop,
-            patch.object(packaging, "delete_legacy_controller") as delete,
+            patch.object(packaging, "stop_controller") as stop,
             self.assertRaisesRegex(RuntimeError, "finalizer blocked"),
         ):
             packaging.delete_controller(Path("nonexistent"), CONFIG, client)
         stop.assert_not_called()
-        delete.assert_not_called()
 
     def test_scratch_probe_uses_in_cluster_dns_and_always_cleans_job(self):
         client = Client()
@@ -588,13 +318,12 @@ class CutoverPackagingTests(unittest.TestCase):
             packaging.verify_controller_api(CONFIG, client)
         self.assertFalse(any("delete" in args for args, _ in client.calls))
 
-    def test_deployment_pod_epoch_image_and_live_health_are_verified(self):
+    def test_deployment_pod_activation_image_and_live_health_are_verified(self):
         manager = {
             "name": "manager", "image": "rust:image",
             "args": [
-                "--leader-elect=true", "--mutation-enabled=false",
+                "--leader-elect=true", "--activation-token=token-a",
                 "--controller-image=rust:image",
-                f"--lifecycle-epoch={packaging.CONTROLLER_LIFECYCLE_EPOCH}",
             ],
         }
         deployment = {
@@ -619,7 +348,7 @@ class CutoverPackagingTests(unittest.TestCase):
             return response("ok")
 
         client = Client(handle)
-        packaging.verify_running_controller(client, "rust:image", mutation_enabled=False)
+        packaging.verify_running_controller(client, "rust:image", activation_token="token-a")
         health = [args for args, _ in client.calls if "--raw" in args]
         self.assertEqual(len(health), 2)
         self.assertTrue(health[0][-1].endswith("/proxy/healthz"))
@@ -627,4 +356,6 @@ class CutoverPackagingTests(unittest.TestCase):
         manager = pods["items"][0]["spec"]["containers"][0]
         manager["image"] = "old:image"
         with self.assertRaisesRegex(RuntimeError, "image or runtime"):
-            packaging.verify_running_controller(client, "rust:image", mutation_enabled=False)
+            packaging.verify_running_controller(
+                client, "rust:image", activation_token="token-a"
+            )

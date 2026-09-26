@@ -12,7 +12,7 @@ use std::{future::Future, path::Path, sync::Arc, time::Duration};
 use futures::StreamExt;
 use k8s_openapi::api::{
     coordination::v1::Lease,
-    core::v1::{ConfigMap, Namespace, Secret},
+    core::v1::{Namespace, Secret},
 };
 use kube::{
     Api, Client, ResourceExt,
@@ -34,7 +34,7 @@ use crate::{
     },
     docker::{BollardDockerClient, DockerClient, validate_volume},
     error::ControllerError,
-    foundation::{self, Foundation, ImageArchive, VerifiedFoundation},
+    foundation::{self, Foundation, ImageArchive, RuntimeFoundation},
     ownership,
     readiness::{self, Components, set_condition},
     resources::{self, Context as ResourceContext},
@@ -46,7 +46,6 @@ use crate::{
 
 pub const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 pub const FOUNDATION_NAMESPACE: &str = "tenant-system";
-pub const FOUNDATION_NAME: &str = "tenant-foundation";
 pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEPENDENCY_INTERVAL: Duration = Duration::from_secs(5);
 pub const READY_INTERVAL: Duration = Duration::from_secs(300);
@@ -54,21 +53,13 @@ pub const STORAGE_CLASS: &str = "capi-hostpath";
 
 #[derive(Clone, Debug)]
 pub struct Config {
-    pub mutation_enabled: bool,
     pub supported_version: String,
-    pub controller_image: String,
-    pub foundation_namespace: String,
-    pub foundation_name: String,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            mutation_enabled: false,
             supported_version: SUPPORTED_KUBERNETES_VERSION.into(),
-            controller_image: String::new(),
-            foundation_namespace: FOUNDATION_NAMESPACE.into(),
-            foundation_name: FOUNDATION_NAME.into(),
         }
     }
 }
@@ -135,6 +126,7 @@ pub trait DeletionHandler: Send + Sync {
 pub struct LiveDeletion {
     pub client: Client,
     pub docker: BollardDockerClient,
+    pub foundation: Arc<RuntimeFoundation>,
 }
 
 impl DeletionHandler for LiveDeletion {
@@ -148,6 +140,7 @@ impl DeletionHandler for LiveDeletion {
             self.docker.clone(),
             tenant,
             supported_version,
+            self.foundation.clone(),
         )
         .await
     }
@@ -158,8 +151,9 @@ async fn finalize(
     docker: BollardDockerClient,
     tenant: &Tenant,
     supported_version: &str,
+    foundation: Arc<RuntimeFoundation>,
 ) -> Result<Action, ReconcileError> {
-    crate::finalize::Finalizer::new(client, docker, supported_version)
+    crate::finalize::Finalizer::new(client, docker, supported_version, foundation)
         .reconcile(tenant)
         .await
         .map_err(Into::into)
@@ -172,6 +166,7 @@ pub struct Reconciler<D = BollardDockerClient, A = LiveTenantAccess, H = LiveDel
     pub deletion: H,
     pub config: Config,
     pub assets: Assets,
+    pub foundation: Arc<RuntimeFoundation>,
 }
 
 impl Reconciler {
@@ -180,17 +175,20 @@ impl Reconciler {
         docker: BollardDockerClient,
         config: Config,
         assets: Assets,
+        foundation: Arc<RuntimeFoundation>,
     ) -> Self {
         Self {
             deletion: LiveDeletion {
                 client: client.clone(),
                 docker: docker.clone(),
+                foundation: foundation.clone(),
             },
             client,
             docker,
             access: LiveTenantAccess,
             config,
             assets,
+            foundation,
         }
     }
 }
@@ -243,30 +241,6 @@ impl<D: DockerClient, A: TenantAccess, H: DeletionHandler> Reconciler<D, A, H> {
                 Err(error) => self.failure(&tenant, error).await,
             };
         }
-        if !self.config.mutation_enabled {
-            update_status(self.client.clone(), &tenant, |status| {
-                status.phase = Some(TenantPhase::Progressing);
-                set_condition(
-                    status,
-                    &tenant,
-                    "Accepted",
-                    true,
-                    "Accepted",
-                    "Tenant specification is accepted",
-                );
-                set_condition(
-                    status,
-                    &tenant,
-                    "Ready",
-                    false,
-                    "MutationDisabled",
-                    "Tenant controller mutation is disabled until clean cutover",
-                );
-                Ok(())
-            })
-            .await?;
-            return Ok(Action::await_change());
-        }
         match self.create(&tenant, &spec).await {
             Ok(action) => Ok(action),
             Err(error) if error.pending() => self.progress(&tenant, DEPENDENCY_INTERVAL).await,
@@ -296,10 +270,7 @@ impl<D: DockerClient, A: TenantAccess, H: DeletionHandler> Reconciler<D, A, H> {
                 },
                 "FoundationMismatch",
             )
-        } else if matches!(
-            &error,
-            ReconcileError::Foundation(_) | ReconcileError::FoundationRead(_)
-        ) {
+        } else if matches!(&error, ReconcileError::Foundation(_)) {
             (
                 if deleting {
                     TenantPhase::Deleting
@@ -308,8 +279,6 @@ impl<D: DockerClient, A: TenantAccess, H: DeletionHandler> Reconciler<D, A, H> {
                 },
                 "FoundationInvalid",
             )
-        } else if matches!(&error, ReconcileError::FoundationMutationDisabled) {
-            (TenantPhase::Failed, "FoundationMutationDisabled")
         } else {
             (
                 if deleting {
@@ -370,44 +339,17 @@ impl<D: DockerClient, A: TenantAccess, H: DeletionHandler> Reconciler<D, A, H> {
         Ok(Action::requeue(interval))
     }
 
-    pub async fn load_foundation(
-        &self,
-        tenant: &Tenant,
-    ) -> Result<VerifiedFoundation<Foundation>, ReconcileError> {
-        let config_map =
-            Api::<ConfigMap>::namespaced(self.client.clone(), &self.config.foundation_namespace)
-                .get(&self.config.foundation_name)
-                .await
-                .map_err(ReconcileError::FoundationRead)?;
-        let data = config_map.data.as_ref().ok_or_else(|| {
-            foundation::FoundationError::Invalid("ConfigMap data is missing".into())
-        })?;
-        Ok(foundation::parse_for_creation(
-            data.get("foundation.json")
-                .map(String::as_str)
-                .unwrap_or(""),
-            data.get("foundation.sha256")
-                .map(String::as_str)
-                .unwrap_or(""),
-            tenant
-                .status
-                .as_ref()
-                .and_then(|status| status.foundation_hash.as_deref()),
-            &self.config.supported_version,
-            &self.config.controller_image,
-        )?)
-    }
-
     async fn create(
         &self,
         tenant: &Tenant,
         spec: &CanonicalSpec,
     ) -> Result<Action, ReconcileError> {
-        let verified = self.load_foundation(tenant).await?;
-        let foundation = &verified.value;
-        if !foundation.mutation_enabled {
-            return Err(ReconcileError::FoundationMutationDisabled);
-        }
+        let recorded_hash = tenant
+            .status
+            .as_ref()
+            .and_then(|status| status.foundation_hash.as_deref());
+        let foundation = self.foundation.creation(recorded_hash)?;
+        let foundation_hash = &self.foundation.hash;
         if tenant.uid().is_none_or(|uid| uid.is_empty())
             || tenant
                 .resource_version()
@@ -439,13 +381,13 @@ impl<D: DockerClient, A: TenantAccess, H: DeletionHandler> Reconciler<D, A, H> {
                 if status
                     .foundation_hash
                     .as_deref()
-                    .is_some_and(|hash| !hash.is_empty() && hash != verified.hash)
+                    .is_some_and(|hash| !hash.is_empty() && hash != foundation_hash)
                 {
                     return Err(ControllerError::OwnershipInvalid(
                         "foundation binding changed".into(),
                     ));
                 }
-                status.foundation_hash = Some(verified.hash.clone());
+                status.foundation_hash = Some(foundation_hash.clone());
                 readiness::progress_status(status, tenant);
                 Ok(())
             })
@@ -458,13 +400,13 @@ impl<D: DockerClient, A: TenantAccess, H: DeletionHandler> Reconciler<D, A, H> {
         let claim = allocation::allocate(
             self.client.clone(),
             &ClaimContext {
-                namespace: &self.config.foundation_namespace,
+                namespace: FOUNDATION_NAMESPACE,
                 ownership_label: &foundation.inputs.ownership_label,
                 lab_prefix: &foundation.inputs.lab_prefix,
                 tenant_name: &name,
                 tenant_uid: &uid,
                 spec_hash: &hash,
-                foundation_hash: &verified.hash,
+                foundation_hash,
                 slots: &foundation.slots,
             },
             tenant
@@ -502,7 +444,7 @@ impl<D: DockerClient, A: TenantAccess, H: DeletionHandler> Reconciler<D, A, H> {
             tenant,
             spec,
             spec_hash: &hash,
-            foundation_hash: &verified.hash,
+            foundation_hash,
             endpoint: &endpoint,
             pod_cidr: &claim.slot.pod_cidr,
             service_cidr: &claim.slot.service_cidr,
@@ -833,29 +775,8 @@ where
     unreachable!("bounded status retries return")
 }
 
-pub fn controller(client: Client, config: &Config) -> Controller<Tenant> {
-    let controller = tenant_controller(client.clone());
-    let store = controller.store();
-    let foundation_namespace = config.foundation_namespace.clone();
-    let foundation_name = config.foundation_name.clone();
-    let mut controller = controller
-        .watches(
-            Api::<ConfigMap>::all(client.clone()),
-            watcher::Config::default(),
-            move |object| {
-                if object.namespace().as_deref() == Some(&foundation_namespace)
-                    && object.name_any() == foundation_name
-                {
-                    store
-                        .state()
-                        .iter()
-                        .map(|tenant| ObjectRef::new(&tenant.name_any()))
-                        .collect()
-                } else {
-                    crate::runtime::map_dependent_to_tenant(&object)
-                }
-            },
-        )
+pub fn controller(client: Client, _config: &Config) -> Controller<Tenant> {
+    let mut controller = tenant_controller(client.clone())
         .watches(
             Api::<Namespace>::all(client.clone()),
             watcher::Config::default(),

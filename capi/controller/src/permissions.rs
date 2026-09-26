@@ -75,6 +75,11 @@ const PERMISSIONS: &[Permission] = &[
         verbs: &["create", "delete", "get", "list", "watch"],
     },
     Permission {
+        group: "kamaji.clastix.io",
+        resources: &["tenantcontrolplanes"],
+        verbs: &["get", "list"],
+    },
+    Permission {
         group: "tenancy.cnpg-vcluster.io",
         resources: &["tenants"],
         verbs: &["get", "list", "patch", "update", "watch"],
@@ -121,7 +126,7 @@ mod tests {
         let role = controller_role();
         assert_eq!(role.metadata.name.as_deref(), Some(ROLE_NAME));
         let rules = role.rules.unwrap();
-        assert_eq!(rules.len(), 15);
+        assert_eq!(rules.len(), 16);
         assert!(rules.iter().all(|r| !r.verbs.contains(&"*".to_string())));
         let lease = rules
             .iter()
@@ -149,5 +154,14 @@ mod tests {
             .find(|r| r.resources.as_ref().unwrap() == &["tenants/finalizers"])
             .unwrap();
         assert_eq!(finalizers.verbs, ["update"]);
+        let tenant_control_planes = rules
+            .iter()
+            .find(|r| r.resources.as_ref().unwrap() == &["tenantcontrolplanes"])
+            .unwrap();
+        assert_eq!(
+            tenant_control_planes.api_groups.as_ref().unwrap(),
+            &["kamaji.clastix.io"]
+        );
+        assert_eq!(tenant_control_planes.verbs, ["get", "list"]);
     }
 }

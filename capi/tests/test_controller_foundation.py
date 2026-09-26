@@ -51,7 +51,6 @@ class FoundationTests(unittest.TestCase):
         self.assertEqual(canonical_hash(json.dumps(raw, indent=2)), fixture["sha256"])
         mutable = copy.deepcopy(raw)
         mutable["controllerImage"] = "different"
-        mutable["mutationEnabled"] = False
         self.assertEqual(canonical_hash(mutable), fixture["sha256"])
         for change in (
             lambda data: data["slots"][0].update(endpoint="172.18.255.224"),
@@ -140,14 +139,13 @@ class FoundationTests(unittest.TestCase):
             published = foundation_payload(
                 ROOT, self.config, self.network, "controller:one", cache, None)
             changed = foundation_payload(
-                ROOT, self.config, self.network, "controller:two", cache, None,
-                mutation_enabled=False)
+                ROOT, self.config, self.network, "controller:two", cache, None)
         data = json.loads(published["data"]["foundation.json"])
         self.assertEqual(data["schema"], 3)
         self.assertEqual(len(data["slots"]), 15)
         self.assertEqual(set(data), {"schema", "networkId", "subnet", "reservedCIDRs",
                                     "allowedSubnets", "kubernetesVersion", "controllerImage",
-                                    "mutationEnabled", "offlineEnforced", "slots",
+                                    "offlineEnforced", "slots",
                                     "cache", "registry", "inputs"})
         self.assertEqual(set(data["cache"]), {"generation", "imageArchives"})
         self.assertEqual(published["data"]["foundation.sha256"],

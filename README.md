@@ -32,8 +32,8 @@ endpoint and Pod/Service CIDRs. Change a tenant by deleting and reapplying its
 manifest. Ready reflects current Kubernetes conditions and live component
 health. Ordinary DELETE runs a fail-closed finalizer that does not require
 tenant API access. Apply is asynchronous; repeat `local-tenant-status` until
-it exits zero. A clean cutover is required from any Go-managed installation;
-existing Tenants are not migrated. The Azure profile independently retains
+it exits zero. Installation supports only the current Rust controller and
+requires a clean environment; existing legacy Tenants are not migrated. The Azure profile independently retains
 the existing JSON-based `tenant-create`, `tenant-status`, and `tenant-delete`
 commands.
 CAPD and the shared-host storage profile remain local development mechanisms;

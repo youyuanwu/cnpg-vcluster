@@ -130,6 +130,13 @@ rules:
   - list
   - watch
 - apiGroups:
+  - kamaji.clastix.io
+  resources:
+  - tenantcontrolplanes
+  verbs:
+  - get
+  - list
+- apiGroups:
   - tenancy.cnpg-vcluster.io
   resources:
   - tenants

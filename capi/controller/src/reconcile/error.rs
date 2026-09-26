@@ -26,10 +26,6 @@ pub enum ReconcileError {
     Ownership(#[from] OwnershipError),
     #[error(transparent)]
     Foundation(#[from] FoundationError),
-    #[error("foundation API read failed: {0}")]
-    FoundationRead(kube::Error),
-    #[error("Tenant foundation mutation is disabled")]
-    FoundationMutationDisabled,
     #[error(transparent)]
     TenantClient(#[from] TenantClientError),
     #[error(transparent)]
@@ -109,9 +105,7 @@ impl ReconcileError {
             return Action::requeue(super::DEPENDENCY_INTERVAL);
         }
         match self {
-            Self::Kube(error)
-            | Self::FoundationRead(error)
-            | Self::Allocation(AllocationError::Api(error)) => match error {
+            Self::Kube(error) | Self::Allocation(AllocationError::Api(error)) => match error {
                 kube::Error::Api(status) if status.code == 409 => {
                     Action::requeue(super::PROGRESS_INTERVAL)
                 }
@@ -124,10 +118,9 @@ impl ReconcileError {
             Self::TenantClient(error) if error.class() == TenantApiErrorClass::Conflict => {
                 Action::requeue(super::PROGRESS_INTERVAL)
             }
-            Self::Foundation(_)
-            | Self::FoundationMutationDisabled
-            | Self::Build(_)
-            | Self::InvalidInput(_) => Action::requeue(super::READY_INTERVAL),
+            Self::Foundation(_) | Self::Build(_) | Self::InvalidInput(_) => {
+                Action::requeue(super::READY_INTERVAL)
+            }
             _ => Action::requeue(Duration::from_secs(30)),
         }
     }

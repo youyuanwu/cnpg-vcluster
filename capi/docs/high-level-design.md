@@ -196,14 +196,13 @@ and its live mountpoint is used when building worker resources.
 Provider-owned worker containers are observed but never directly deleted by
 the Tenant controller.
 
-Unrelated kind clusters do not block first activation. Clean cutover rejects
-legacy local runtime records, nonempty old endpoint ledgers, existing
-Tenant/CAPI/provider objects, allocation Leases, exact
-tenant-storage volumes, owned tenant worker containers, and CAPD external
-load-balancer containers. Lifecycle epoch changes first scale the old
-controller to zero, wait for every old manager Pod to terminate, run this
-clean-cutover gate, start the new epoch mutation-disabled, verify the running
-epoch, and then enable mutation.
+The manager loads one immutable foundation snapshot at startup. A stable
+accepted-identity ConfigMap permits same-identity restarts with active Tenants.
+Changed identity requires a candidate-bound activation ticket plus direct
+Tenant, provider, Lease, and Docker inventory. The installer checks host-only
+legacy state, drains the prior controller, and restores it if candidate
+activation fails. Unsupported legacy or foreign residue blocks activation and
+is never deleted automatically.
 
 ## Finalization and recovery
 
@@ -241,14 +240,12 @@ Partial creation is handled from live management and host state, even when a
 Cluster, control plane, or workers were never created. An observed root Cluster
 UID is recorded before deletion. Ownership conflicts, failed management/host
 inspection, and foundation hash changes still block destructive progress.
-The `rust-operator-v1` lifecycle epoch requires a clean cutover from the
-Go-managed API and state, not migration of existing Tenants. The old
-Deployment/Pods, webhook stack, and CRD are removed only after clean-state
-proof; the new CRD serves and stores only v1alpha2. Installation starts with
-creation mutation disabled and validates live API semantics before enabling it.
-The foundation lifecycle hash excludes mutation mode and controller image
-identity, allowing same-epoch controller rebuilds while resource-affecting
-foundation inputs remain immutable.
+The current-only installer does not migrate or automatically remove
+Go-managed API or host state. The CRD serves and stores only v1alpha2.
+The foundation identity excludes controller image identity, allowing
+same-configuration controller rebuilds while resource-affecting inputs remain
+immutable. Creation-only foundation errors block creation without preventing
+deletion through the validated minimal startup core.
 
 Controller restart recovery is exercised with a pending finalizer: the old
 controller Pod is proved absent, a distinct ready Pod UID is proved after

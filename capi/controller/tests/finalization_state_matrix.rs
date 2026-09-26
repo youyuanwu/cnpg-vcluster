@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret};
+use k8s_openapi::api::core::v1::{Namespace, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
 use kube::Client;
 use kube::core::{DynamicObject, TypeMeta};
@@ -19,7 +19,9 @@ use tenant_controller::docker::{
 };
 use tenant_controller::error::ControllerError;
 use tenant_controller::finalize::{FinalizationKube, Finalizer, LiveKube};
-use tenant_controller::foundation::{AllocationSlot, canonical_hash};
+use tenant_controller::foundation::{
+    AllocationSlot, RuntimeFoundation, canonical_hash, parse_runtime,
+};
 use tenant_controller::ownership::{CLUSTER_API_VERSION, CONTROL_PLANE_API_VERSION, Identity};
 
 const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
@@ -33,6 +35,15 @@ fn fixture() -> (String, String, AllocationSlot) {
     let hash = canonical_hash(&raw).unwrap();
     let slot = serde_json::from_value(fixture["foundation"]["slots"][0].clone()).unwrap();
     (raw, hash, slot)
+}
+
+fn runtime_foundation(raw: &str, hash: &str, supported: &str) -> Arc<RuntimeFoundation> {
+    Arc::new(parse_runtime(raw, hash, supported, "controller:one").unwrap())
+}
+
+fn default_runtime_foundation() -> Arc<RuntimeFoundation> {
+    let (raw, hash, _) = fixture();
+    runtime_foundation(&raw, &hash, SUPPORTED_KUBERNETES_VERSION)
 }
 
 fn tenant() -> Tenant {
@@ -184,7 +195,6 @@ fn lease(hash: &str, slot: &AllocationSlot) -> Lease {
 #[derive(Default)]
 struct State {
     tenant: Option<Tenant>,
-    foundation: Option<ConfigMap>,
     namespace: Option<Namespace>,
     secret: Option<Secret>,
     roots: HashMap<String, DynamicObject>,
@@ -203,21 +213,8 @@ struct State {
 }
 
 fn state() -> Arc<Mutex<State>> {
-    let (raw, hash, _) = fixture();
     Arc::new(Mutex::new(State {
         tenant: Some(tenant()),
-        foundation: Some(ConfigMap {
-            metadata: ObjectMeta {
-                name: Some("tenant-foundation".into()),
-                namespace: Some("tenant-system".into()),
-                ..Default::default()
-            },
-            data: Some(BTreeMap::from([
-                ("foundation.json".into(), raw),
-                ("foundation.sha256".into(), hash),
-            ])),
-            ..Default::default()
-        }),
         ..Default::default()
     }))
 }
@@ -232,14 +229,6 @@ fn failure(reason: &str) -> ControllerError {
 }
 
 impl FinalizationKube for Kube {
-    async fn foundation(&self) -> Result<ConfigMap, ControllerError> {
-        let mut state = self.0.lock().unwrap();
-        state.requests.push("get foundation".into());
-        state
-            .foundation
-            .clone()
-            .ok_or_else(|| failure("foundation absent"))
-    }
     async fn tenant(&self, _: &str) -> Result<Option<Tenant>, ControllerError> {
         let mut state = self.0.lock().unwrap();
         state.requests.push("get Tenant".into());
@@ -435,11 +424,25 @@ impl DockerClient for Docker {
 }
 
 async fn tick(shared: &Arc<Mutex<State>>) -> Result<(), ControllerError> {
+    tick_with(
+        shared,
+        default_runtime_foundation(),
+        SUPPORTED_KUBERNETES_VERSION,
+    )
+    .await
+}
+
+async fn tick_with(
+    shared: &Arc<Mutex<State>>,
+    foundation: Arc<RuntimeFoundation>,
+    supported_version: &str,
+) -> Result<(), ControllerError> {
     let tenant = shared.lock().unwrap().tenant.clone().unwrap();
     Finalizer::with_adapters(
         Kube(shared.clone()),
         Docker(shared.clone()),
-        SUPPORTED_KUBERNETES_VERSION,
+        supported_version,
+        foundation,
     )
     .reconcile(&tenant)
     .await?;
@@ -447,6 +450,10 @@ async fn tick(shared: &Arc<Mutex<State>>) -> Result<(), ControllerError> {
 }
 
 async fn finish(shared: &Arc<Mutex<State>>) {
+    finish_with(shared, default_runtime_foundation()).await;
+}
+
+async fn finish_with(shared: &Arc<Mutex<State>>, foundation: Arc<RuntimeFoundation>) {
     for _ in 0..32 {
         if shared
             .lock()
@@ -461,7 +468,9 @@ async fn finish(shared: &Arc<Mutex<State>>) {
         {
             return;
         }
-        tick(shared).await.unwrap();
+        tick_with(shared, foundation.clone(), SUPPORTED_KUBERNETES_VERSION)
+            .await
+            .unwrap();
     }
     panic!(
         "deletion did not converge: {:?}",
@@ -584,7 +593,7 @@ async fn deletion_uses_only_minimal_foundation_and_durable_allocation_identity()
         ] {
             let shared = state();
             let mut raw = json!({
-                "schema":3, "networkId":"network-one",
+                "schema":3, "networkId":"network-one","kubernetesVersion":"1.36.4",
                 "inputs":{"ownershipLabel":"example.io/owned","labPrefix":"example",
                     "storageContainerPath":"/var/local/tenant-storage"}
             });
@@ -593,12 +602,9 @@ async fn deletion_uses_only_minimal_foundation_and_durable_allocation_identity()
             }
             let raw = raw.to_string();
             let hash = canonical_hash(&raw).unwrap();
+            let foundation = runtime_foundation(&raw, &hash, SUPPORTED_KUBERNETES_VERSION);
             {
                 let mut s = shared.lock().unwrap();
-                s.foundation.as_mut().unwrap().data = Some(BTreeMap::from([
-                    ("foundation.json".into(), raw),
-                    ("foundation.sha256".into(), hash.clone()),
-                ]));
                 let mut status = TenantStatus::default();
                 if stage != "pre-allocation" {
                     status.foundation_hash = Some(hash.clone());
@@ -613,7 +619,7 @@ async fn deletion_uses_only_minimal_foundation_and_durable_allocation_identity()
                 }
                 s.tenant.as_mut().unwrap().status = Some(status);
             }
-            finish(&shared).await;
+            finish_with(&shared, foundation).await;
             let s = shared.lock().unwrap();
             assert!(
                 s.leases.is_empty() && s.namespace.is_none() && s.roots.is_empty(),
@@ -647,8 +653,15 @@ async fn deletion_uses_only_minimal_foundation_and_durable_allocation_identity()
 
 #[tokio::test]
 async fn finalization_validates_and_hashes_with_the_runtime_supported_version() {
-    let (_, hash, _) = fixture();
     for supported in ["1.36.5", SUPPORTED_KUBERNETES_VERSION] {
+        let mut raw: Value =
+            serde_json::from_str::<Value>(include_str!("fixtures/foundation-schema3.json"))
+                .unwrap()["foundation"]
+                .clone();
+        raw["kubernetesVersion"] = json!("1.36.5");
+        let raw = raw.to_string();
+        let hash = canonical_hash(&raw).unwrap();
+        let foundation = parse_runtime(&raw, &hash, supported, "controller:one").map(Arc::new);
         let shared = state();
         let tenant = {
             let mut s = shared.lock().unwrap();
@@ -669,10 +682,19 @@ async fn finalization_validates_and_hashes_with_the_runtime_supported_version() 
             s.roots.insert("Cluster".into(), cluster);
             tenant
         };
-        let result =
-            Finalizer::with_adapters(Kube(shared.clone()), Docker(shared.clone()), supported)
+        let result = match foundation {
+            Ok(foundation) => {
+                Finalizer::with_adapters(
+                    Kube(shared.clone()),
+                    Docker(shared.clone()),
+                    supported,
+                    foundation,
+                )
                 .reconcile(&tenant)
-                .await;
+                .await
+            }
+            Err(error) => Err(ControllerError::InvalidInput(error.to_string())),
+        };
         let s = shared.lock().unwrap();
         if supported == "1.36.5" {
             result.unwrap();
@@ -1345,7 +1367,6 @@ async fn lease_replacement_between_inventory_and_exact_get_never_deletes_success
 
 #[tokio::test]
 async fn live_kube_adapter_sends_direct_unfiltered_reads_and_exact_background_deletes() {
-    const FOUNDATION: &str = "/api/v1/namespaces/tenant-system/configmaps/tenant-foundation";
     const MACHINESETS: &str = "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/machinesets";
     const CLUSTER: &str = "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/clusters/tenant-a";
     const NAMESPACE: &str = "/api/v1/namespaces/tenant-a";
@@ -1353,17 +1374,6 @@ async fn live_kube_adapter_sends_direct_unfiltered_reads_and_exact_background_de
     const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a";
 
     let server = Server::default();
-    server.insert(
-        FOUNDATION,
-        ConfigMap {
-            metadata: ObjectMeta {
-                name: Some("tenant-foundation".into()),
-                namespace: Some("tenant-system".into()),
-                ..Default::default()
-            },
-            ..Default::default()
-        },
-    );
     server.allow_list(MACHINESETS);
     for (path, uid, kind) in [
         (CLUSTER, "cluster-uid", "Cluster"),
@@ -1387,9 +1397,9 @@ async fn live_kube_adapter_sends_direct_unfiltered_reads_and_exact_background_de
         Client,
         tenant_controller::docker::BollardDockerClient,
         String,
+        Arc<RuntimeFoundation>,
     ) -> Finalizer = Finalizer::new;
     drop(client);
-    live.foundation().await.unwrap();
     live.descendants("MachineSet", NAME).await.unwrap();
     live.delete_root("Cluster", NAME, NAME, "cluster-uid", "rv-1")
         .await
@@ -1407,24 +1417,20 @@ async fn live_kube_adapter_sends_direct_unfiltered_reads_and_exact_background_de
     let requests = server.calls();
     assert_eq!(
         requests[0].path,
-        "/api/v1/namespaces/tenant-system/configmaps/tenant-foundation"
-    );
-    assert_eq!(
-        requests[1].path,
         "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/machinesets"
     );
     for (index, uid, rv) in [
-        (2, "cluster-uid", "rv-1"),
-        (3, "namespace-uid", "rv-2"),
-        (4, "lease-uid", "rv-3"),
+        (1, "cluster-uid", "rv-1"),
+        (2, "namespace-uid", "rv-2"),
+        (3, "lease-uid", "rv-3"),
     ] {
         assert_eq!(requests[index].method, "DELETE");
         assert_eq!(requests[index].body["preconditions"]["uid"], uid);
         assert_eq!(requests[index].body["preconditions"]["resourceVersion"], rv);
         assert_eq!(requests[index].body["propagationPolicy"], "Background");
     }
+    assert_eq!(requests[4].body["metadata"]["resourceVersion"], "1");
+    assert_eq!(requests[5].body["metadata"]["uid"], UID);
     assert_eq!(requests[5].body["metadata"]["resourceVersion"], "1");
-    assert_eq!(requests[6].body["metadata"]["uid"], UID);
-    assert_eq!(requests[6].body["metadata"]["resourceVersion"], "1");
-    assert_eq!(requests[6].body["metadata"]["finalizers"], json!([]));
+    assert_eq!(requests[5].body["metadata"]["finalizers"], json!([]));
 }

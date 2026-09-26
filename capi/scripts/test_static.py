@@ -179,7 +179,7 @@ def check_repository_boundaries() -> None:
         "config/tenants/tests/tenant-c.yaml",
         "scripts/controller_tenant.py",
         "scripts/controller_metrics.py",
-        "scripts/lib/controller_cutover.py",
+        "scripts/lib/controller_state.py",
     )
     for relative in required_controller_files:
         check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
@@ -214,7 +214,7 @@ def check_repository_boundaries() -> None:
         paths = (ROOT / relative).rglob("*.py") if relative == "scripts" else (ROOT / relative,)
         for path in paths:
             text = path.read_text(encoding="utf-8")
-            if path.name == "test_static.py" or path.name == "controller_cutover.py":
+            if path.name == "test_static.py":
                 continue
             check(not re.search(r"GO_VERSION|GO_URL|GO_SHA256|ENVTEST_|controller-gen\b|"
                                 r"GOCACHE|GOMODCACHE|KUBEBUILDER_ASSETS|"
@@ -232,18 +232,8 @@ def check_repository_boundaries() -> None:
                         r"controller-tools|controller-vet|go-mod-cache|"
                         r"go-linux-amd64|GO_VERSION|GOCACHE|GOMODCACHE", workflow),
           "CI still references local Go tooling")
-    check(
-        "--mutation-enabled=${CONTROLLER_MUTATION_ENABLED}" in manager,
-        "Tenant controller mutation template placeholder is missing",
-    )
-    lifecycle_epoch = "rust-operator-v1"
-    check(
-        f'CONTROLLER_LIFECYCLE_EPOCH = "{lifecycle_epoch}"'
-        in (ROOT / "scripts" / "lib" / "controller.py").read_text(
-            encoding="utf-8"
-        ),
-        "controller installer lifecycle epoch is inconsistent",
-    )
+    check("--activation-token=${CONTROLLER_ACTIVATION_TOKEN}" in manager,
+          "Tenant controller activation token placeholder is missing")
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
     check(
         "from scripts.local_tenant import" not in tenant_dispatch,
