@@ -93,6 +93,7 @@ class ControllerStateTests(unittest.TestCase):
                     "role",
                     "class",
                     "parentKind",
+                    "alternateParentKind",
                     "workerSuffix",
                     "watched",
                     "inventoryPolicy",

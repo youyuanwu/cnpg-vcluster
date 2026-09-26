@@ -28,6 +28,7 @@ pub struct ManagementResource {
     pub role: &'static str,
     pub class: ResourceClass,
     pub parent_kind: Option<&'static str>,
+    pub alternate_parent_kind: Option<&'static str>,
     pub worker_suffix: bool,
     pub watched: bool,
     pub inventory_policy: InventoryPolicy,
@@ -73,11 +74,32 @@ const fn dynamic(
         role,
         class,
         parent_kind,
+        alternate_parent_kind: None,
         worker_suffix,
         watched,
         inventory_policy: InventoryPolicy::BlockAnyInstance,
         exemptions: &[],
     }
+}
+
+const fn template(
+    api_version: &'static str,
+    kind: &'static str,
+    plural: &'static str,
+    role: &'static str,
+) -> ManagementResource {
+    let mut resource = dynamic(
+        api_version,
+        kind,
+        plural,
+        role,
+        ResourceClass::Root,
+        Some("Cluster"),
+        true,
+        true,
+    );
+    resource.alternate_parent_kind = Some("MachineDeployment");
+    resource
 }
 
 pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
@@ -111,25 +133,17 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         false,
         true,
     ),
-    dynamic(
+    template(
         "bootstrap.cluster.x-k8s.io/v1beta2",
         "KubeadmConfigTemplate",
         "kubeadmconfigtemplates",
         "kubeadm-config-template",
-        ResourceClass::Root,
-        Some("Cluster"),
-        true,
-        true,
     ),
-    dynamic(
+    template(
         "infrastructure.cluster.x-k8s.io/v1beta2",
         "DevMachineTemplate",
         "devmachinetemplates",
         "dev-machine-template",
-        ResourceClass::Root,
-        Some("Cluster"),
-        true,
-        true,
     ),
     dynamic(
         "cluster.x-k8s.io/v1beta2",
@@ -199,6 +213,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         role: "namespace",
         class: ResourceClass::Typed,
         parent_kind: None,
+        alternate_parent_kind: None,
         worker_suffix: false,
         watched: true,
         inventory_policy: InventoryPolicy::TenantMarkers,
@@ -212,6 +227,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         role: "tenant-kubeconfig",
         class: ResourceClass::Typed,
         parent_kind: Some("KamajiControlPlane"),
+        alternate_parent_kind: None,
         worker_suffix: false,
         watched: true,
         inventory_policy: InventoryPolicy::TenantMarkersOrKamajiOwner,
@@ -225,6 +241,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         role: "allocation-lease",
         class: ResourceClass::Typed,
         parent_kind: None,
+        alternate_parent_kind: None,
         worker_suffix: false,
         watched: true,
         inventory_policy: InventoryPolicy::AllocationMarkers,
@@ -300,5 +317,44 @@ mod tests {
                     .any(|resource| resource.kind == kind && resource.watched)
             );
         }
+        const CREATED_ROOTS: &[&str] = &[
+            "Cluster",
+            "DevCluster",
+            "KamajiControlPlane",
+            "KubeadmConfigTemplate",
+            "DevMachineTemplate",
+            "MachineDeployment",
+        ];
+        const DYNAMIC_WATCHES: &[&str] = &[
+            "Cluster",
+            "DevCluster",
+            "KamajiControlPlane",
+            "KubeadmConfigTemplate",
+            "DevMachineTemplate",
+            "MachineDeployment",
+            "MachineSet",
+            "Machine",
+            "DevMachine",
+        ];
+        const FINALIZED_DESCENDANTS: &[&str] =
+            &["MachineSet", "Machine", "DevMachine", "KubeadmConfig"];
+        assert_eq!(
+            roots().map(|resource| resource.kind).collect::<Vec<_>>(),
+            CREATED_ROOTS
+        );
+        assert_eq!(
+            watched()
+                .filter(|resource| resource.class != ResourceClass::Typed)
+                .map(|resource| resource.kind)
+                .collect::<Vec<_>>(),
+            DYNAMIC_WATCHES
+        );
+        assert_eq!(
+            descendants()
+                .filter(|resource| resource.role != "provider")
+                .map(|resource| resource.kind)
+                .collect::<Vec<_>>(),
+            FINALIZED_DESCENDANTS
+        );
     }
 }

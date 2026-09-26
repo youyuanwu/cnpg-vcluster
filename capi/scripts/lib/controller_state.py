@@ -109,6 +109,7 @@ def require_clean_controller_state(
             "role",
             "class",
             "parentKind",
+            "alternateParentKind",
             "workerSuffix",
             "watched",
             "inventoryPolicy",
@@ -123,6 +124,10 @@ def require_clean_controller_state(
             or (
                 entry["parentKind"] is not None
                 and not isinstance(entry["parentKind"], str)
+            )
+            or (
+                entry["alternateParentKind"] is not None
+                and not isinstance(entry["alternateParentKind"], str)
             )
             or not isinstance(entry["workerSuffix"], bool)
             or not isinstance(entry["watched"], bool)
