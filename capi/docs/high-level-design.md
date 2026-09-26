@@ -204,11 +204,18 @@ legacy state, drains the prior controller, and restores it if candidate
 activation fails. Unsupported legacy or foreign residue blocks activation and
 is never deleted automatically.
 
+Management resource identity is generated once from the Rust catalog and
+consumed by builders, ownership validation, RBAC, watches, activation
+inventory, worker observation, finalization, and Python installation checks.
+
 ## Finalization and recovery
 
 DELETE uses an ordinary Kubernetes deletion timestamp and one finalizer. The
 target does not depend on peer Tenant health, and multiple deleting Tenants do
 not acquire a shared destructive lock.
+The finalizer owns the management Kubernetes client directly; there is no
+test-only Kubernetes adapter in the production path. Allocation release uses
+the same exact live implementation in direct tests and finalization.
 
 Finalization is ordered:
 

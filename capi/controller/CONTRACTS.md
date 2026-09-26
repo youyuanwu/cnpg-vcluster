@@ -19,6 +19,7 @@ just controller-fetch
 just controller-verify
 just controller-lint
 just controller-test
+just controller-metrics
 just controller-build
 ```
 
@@ -38,6 +39,11 @@ not proc-macro dependencies; packaging rejects dynamic ELF dependencies and
 stages the static manager with verified Calico/CNPG assets in a scratch image.
 An empty Cargo home cannot satisfy the offline build.
 
+Cargo discovers four integration targets: `controller`, `adapters`,
+`allocation`, and `finalization`. They share the Kubernetes API simulator
+under `tests/support/`. `controller-metrics` reports production Rust source
+before test-only modules and rejects growth above the 8,050-line baseline.
+
 Installation uses one `Recreate` replica, a separate leader-election Lease,
 Docker socket access, and HTTP `/healthz` and `/readyz`, without admission
 ports or TLS mounts. A disposable in-cluster Job probes Kubernetes DNS and
@@ -48,3 +54,8 @@ The manager reads one schema-3 foundation snapshot at startup. Same-identity
 restarts resume active Tenants. Changed identity requires a one-time activation
 ticket, clean authoritative inventory, and an atomic accepted-identity update
 before reconciliation opens.
+
+PR fast checks upload the verified static manager and PR E2E consumes that
+same-revision artifact from `.tools/artifacts`. Scheduled and manually
+dispatched high-capacity validation do not use the artifact and retain a clean
+enforced-offline release build.
