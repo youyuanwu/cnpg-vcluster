@@ -1,5 +1,6 @@
 //! Go parity: tenantresources_test.go and tenantresource_batch_test.go.
 mod creation_support;
+mod support;
 
 use creation_support::*;
 use kube::ResourceExt;
@@ -415,6 +416,28 @@ async fn foreign_crd_is_rejected_before_any_dependent_write() {
     ];
     assert!(
         ensure_batch(server.client(), &objects, identity())
+            .await
+            .unwrap_err()
+            .ownership_invalid()
+    );
+    assert_eq!(server.calls().len(), 1);
+}
+
+#[tokio::test]
+async fn shared_server_can_replace_an_object_before_a_live_read() {
+    let server = Server::default();
+    let desired = object("v1", "ConfigMap", "default", "network", "network");
+    server.insert(&path(&desired), &desired);
+    let mut replacement = desired.clone();
+    replacement.metadata.uid = Some("replacement-uid".into());
+    replacement.metadata.annotations = None;
+    server.replace_on(
+        "GET",
+        &path(&desired),
+        Some(serde_json::to_value(replacement).unwrap()),
+    );
+    assert!(
+        ensure_static(server.client(), &desired, identity())
             .await
             .unwrap_err()
             .ownership_invalid()

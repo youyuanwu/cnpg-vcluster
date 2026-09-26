@@ -1,15 +1,15 @@
+mod support;
+
 use std::collections::{BTreeMap, HashMap};
-use std::convert::Infallible;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::http::{Request, Response, StatusCode};
-use http_body_util::BodyExt;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace, Secret};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+use kube::Client;
 use kube::core::{DynamicObject, TypeMeta};
-use kube::{Client, client::Body};
 use serde_json::{Value, json};
+use support::Server;
 use tenant_controller::allocation::{ClaimContext, new_lease};
 use tenant_controller::api::{
     SUPPORTED_KUBERNETES_VERSION, Tenant, TenantSpec, TenantStatus, canonical_spec, spec_hash,
@@ -21,7 +21,6 @@ use tenant_controller::error::ControllerError;
 use tenant_controller::finalize::{FinalizationKube, Finalizer, LiveKube};
 use tenant_controller::foundation::{AllocationSlot, canonical_hash};
 use tenant_controller::ownership::{CLUSTER_API_VERSION, CONTROL_PLANE_API_VERSION, Identity};
-use tower::service_fn;
 
 const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 const NAME: &str = "tenant-a";
@@ -1346,52 +1345,43 @@ async fn lease_replacement_between_inventory_and_exact_get_never_deletes_success
 
 #[tokio::test]
 async fn live_kube_adapter_sends_direct_unfiltered_reads_and_exact_background_deletes() {
-    let requests: Arc<Mutex<Vec<(String, String, Value)>>> = Arc::default();
-    let observed = requests.clone();
-    let client = Client::new(
-        service_fn(move |request: Request<Body>| {
-            let observed = observed.clone();
-            async move {
-                let method = request.method().to_string();
-                let path = request.uri().to_string();
-                let bytes = request.into_body().collect().await.unwrap().to_bytes();
-                let body = if bytes.is_empty() {
-                    Value::Null
-                } else {
-                    serde_json::from_slice(&bytes).unwrap()
-                };
-                observed
-                    .lock()
-                    .unwrap()
-                    .push((method.clone(), path.clone(), body));
-                let response = if path.contains("/machinesets") {
-                    json!({"apiVersion":CLUSTER_API_VERSION,"kind":"MachineSetList","metadata":{},"items":[]})
-                } else if method == "DELETE" {
-                    json!({"apiVersion":"v1","kind":"Status","status":"Success","code":200})
-                } else if method == "PATCH" {
-                    serde_json::to_value(tenant()).unwrap()
-                } else {
-                    serde_json::to_value(ConfigMap {
-                        metadata: ObjectMeta {
-                            name: Some("tenant-foundation".into()),
-                            namespace: Some("tenant-system".into()),
-                            ..Default::default()
-                        },
-                        ..Default::default()
-                    })
-                    .unwrap()
-                };
-                Ok::<_, Infallible>(
-                    Response::builder()
-                        .status(StatusCode::OK)
-                        .header("content-type", "application/json")
-                        .body(Body::from(response.to_string().into_bytes()))
-                        .unwrap(),
-                )
-            }
-        }),
-        "default",
+    const FOUNDATION: &str = "/api/v1/namespaces/tenant-system/configmaps/tenant-foundation";
+    const MACHINESETS: &str = "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/machinesets";
+    const CLUSTER: &str = "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/clusters/tenant-a";
+    const NAMESPACE: &str = "/api/v1/namespaces/tenant-a";
+    const LEASE: &str = "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases/slot";
+    const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a";
+
+    let server = Server::default();
+    server.insert(
+        FOUNDATION,
+        ConfigMap {
+            metadata: ObjectMeta {
+                name: Some("tenant-foundation".into()),
+                namespace: Some("tenant-system".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
     );
+    server.allow_list(MACHINESETS);
+    for (path, uid, kind) in [
+        (CLUSTER, "cluster-uid", "Cluster"),
+        (NAMESPACE, "namespace-uid", "Namespace"),
+        (LEASE, "lease-uid", "Lease"),
+    ] {
+        server.insert(
+            path,
+            json!({
+                "apiVersion":"v1",
+                "kind":kind,
+                "metadata":{"name":path.rsplit('/').next().unwrap(),"uid":uid,"resourceVersion":
+                    match uid {"cluster-uid"=>"rv-1","namespace-uid"=>"rv-2",_=>"rv-3"}}
+            }),
+        );
+    }
+    server.insert(TENANT, tenant());
+    let client = server.client();
     let live = LiveKube::new(client.clone());
     let _constructor: fn(
         Client,
@@ -1414,13 +1404,13 @@ async fn live_kube_adapter_sends_direct_unfiltered_reads_and_exact_background_de
         .await
         .unwrap();
     live.remove_finalizer(&tenant()).await.unwrap();
-    let requests = requests.lock().unwrap();
+    let requests = server.calls();
     assert_eq!(
-        requests[0].1,
+        requests[0].path,
         "/api/v1/namespaces/tenant-system/configmaps/tenant-foundation"
     );
     assert_eq!(
-        requests[1].1.trim_end_matches('?'),
+        requests[1].path,
         "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/machinesets"
     );
     for (index, uid, rv) in [
@@ -1428,13 +1418,13 @@ async fn live_kube_adapter_sends_direct_unfiltered_reads_and_exact_background_de
         (3, "namespace-uid", "rv-2"),
         (4, "lease-uid", "rv-3"),
     ] {
-        assert_eq!(requests[index].0, "DELETE");
-        assert_eq!(requests[index].2["preconditions"]["uid"], uid);
-        assert_eq!(requests[index].2["preconditions"]["resourceVersion"], rv);
-        assert_eq!(requests[index].2["propagationPolicy"], "Background");
+        assert_eq!(requests[index].method, "DELETE");
+        assert_eq!(requests[index].body["preconditions"]["uid"], uid);
+        assert_eq!(requests[index].body["preconditions"]["resourceVersion"], rv);
+        assert_eq!(requests[index].body["propagationPolicy"], "Background");
     }
-    assert_eq!(requests[5].2["metadata"]["resourceVersion"], "1");
-    assert_eq!(requests[6].2["metadata"]["uid"], UID);
-    assert_eq!(requests[6].2["metadata"]["resourceVersion"], "1");
-    assert_eq!(requests[6].2["metadata"]["finalizers"], json!([]));
+    assert_eq!(requests[5].body["metadata"]["resourceVersion"], "1");
+    assert_eq!(requests[6].body["metadata"]["uid"], UID);
+    assert_eq!(requests[6].body["metadata"]["resourceVersion"], "1");
+    assert_eq!(requests[6].body["metadata"]["finalizers"], json!([]));
 }

@@ -1,6 +1,7 @@
 //! Go parity: tenant_controller, phase2, readiness, reconcile_cnpg and status.
 //! This Tower service drives the real creation pipeline across every barrier.
 mod creation_support;
+mod support;
 
 use creation_support::*;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;

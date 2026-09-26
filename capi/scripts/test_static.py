@@ -35,6 +35,7 @@ EXPECTED_RECIPES = {
     "controller-fetch",
     "controller-verify",
     "controller-test",
+    "controller-metrics",
     "controller-lint",
     "controller-build",
     "controller-image",
@@ -177,10 +178,13 @@ def check_repository_boundaries() -> None:
         "config/tenants/tests/tenant-b.yaml",
         "config/tenants/tests/tenant-c.yaml",
         "scripts/controller_tenant.py",
+        "scripts/controller_metrics.py",
         "scripts/lib/controller_cutover.py",
     )
     for relative in required_controller_files:
         check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
+    justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
+    check("controller-metrics:" in justfile, "controller metrics recipe is missing")
     controller = ROOT / "controller"
     check(not list(controller.rglob("*.go")), "local controller Go source remains")
     check(not list(controller.rglob("go.mod")) and not list(controller.rglob("go.sum")),

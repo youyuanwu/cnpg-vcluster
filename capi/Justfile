@@ -83,6 +83,10 @@ controller-verify:
 controller-test:
     @python3 scripts/test_controller.py
 
+# Report Rust production lines before test-only modules.
+controller-metrics:
+    @python3 scripts/controller_metrics.py
+
 # Check Rust format and Clippy warnings.
 controller-lint:
     @python3 scripts/lint_controller.py
