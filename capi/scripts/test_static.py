@@ -249,15 +249,26 @@ def check_repository_boundaries() -> None:
                         r"controller-tools|controller-vet|go-mod-cache|"
                         r"go-linux-amd64|GO_VERSION|GOCACHE|GOMODCACHE", workflow),
           "CI still references local Go tooling")
+    jobs = workflow.split("jobs:\n", 1)[1]
+    fast_checks = jobs.split("  fast-checks:", 1)[1].split("  e2e:", 1)[0]
+    e2e = jobs.split("  e2e:", 1)[1].split("  high-capacity:", 1)[0]
+    check(
+        re.search(r"(?m)^    needs: fast-checks$", e2e) is not None,
+        "PR E2E must depend exactly on fast-checks",
+    )
     for token in (
-        "needs: fast-checks",
         "actions/upload-artifact@v6",
+        "controller-manager-${{ github.sha }}",
+        "path: capi/.runtime/rendered/controller/manager",
+    ):
+        check(token in fast_checks, f"fast-check artifact wiring is missing {token}")
+    for token in (
         "actions/download-artifact@v7",
         "controller-manager-${{ github.sha }}",
         "CAPI_PREBUILT_CONTROLLER_BINARY",
         "capi/.tools/artifacts/${{ github.sha }}",
     ):
-        check(token in workflow, f"CI controller artifact wiring is missing {token}")
+        check(token in e2e, f"PR E2E artifact wiring is missing {token}")
     high_capacity = workflow.split("  high-capacity:", 1)[1].split(
         "  capi-tests:", 1
     )[0]

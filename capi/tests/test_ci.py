@@ -29,7 +29,7 @@ class CIWorkflowTests(unittest.TestCase):
             job(name) for name in ("fast-checks", "e2e", "high-capacity", "capi-tests")
         )
         self.assertNotIn("    needs:", fast + high)
-        self.assertIn("needs: fast-checks", e2e)
+        self.assertRegex(e2e, r"(?m)^    needs: fast-checks$")
         self.assertNotIn("    if:", fast)
         self.assertIn("if: github.event_name == 'pull_request'", e2e)
         self.assertIn("if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'", high)
