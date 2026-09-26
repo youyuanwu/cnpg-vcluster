@@ -148,6 +148,18 @@ async fn changed_identity_requires_ticket_and_atomically_accepts_clean_state() {
     let server = clean_server();
     server.insert(TICKET, ticket("hash-b", "token-b"));
     let docker = FakeDocker::default();
+    docker
+        .containers
+        .lock()
+        .unwrap()
+        .push(tenant_controller::docker::DockerContainer {
+            id: "registry".into(),
+            name: "offline-registry".into(),
+            state: "running".into(),
+            labels: [("cnpg-vcluster.capi/role".into(), "offline-registry".into())].into(),
+            networks: Default::default(),
+            network_addresses: Default::default(),
+        });
     admit(server.client(), &docker, "hash-b", "token-b")
         .await
         .unwrap();

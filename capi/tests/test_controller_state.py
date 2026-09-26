@@ -163,6 +163,22 @@ class ControllerStateTests(unittest.TestCase):
         ):
             require_clean_controller_state(prepare_root(directory), Client(clean_handler))
 
+    def test_offline_registry_container_is_management_infrastructure(self) -> None:
+        def docker(*args, **_kwargs):
+            command = args[0]
+            if command[:3] == ["docker", "ps", "-aq"] and (
+                "label=cnpg-vcluster.capi/role" in command
+                or "label=cnpg-vcluster.capi/role=offline-registry" in command
+            ):
+                return response("registry-id")
+            return response("")
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "scripts.lib.controller_state.run",
+            side_effect=docker,
+        ):
+            require_clean_controller_state(prepare_root(directory), Client(clean_handler))
+
     def test_provider_tenant_lease_and_host_residue_block(self) -> None:
         cases = ("tenant", "provider", "lease", "volume", "container", "legacy-file")
         for case in cases:

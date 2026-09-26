@@ -246,13 +246,16 @@ async fn require_clean_inventory<D: DockerClient>(
             matches!(
                 container.labels.get(WORKER_ROLE_LABEL).map(String::as_str),
                 Some("worker" | "external-load-balancer")
-            ) || [
-                "cnpg-vcluster.capi/role",
-                "cnpg-vcluster.capi/tenant",
-                "tenancy.cnpg-vcluster.io/tenant-uid",
-            ]
-            .iter()
-            .any(|key| container.labels.contains_key(*key))
+            ) || container
+                .labels
+                .get("cnpg-vcluster.capi/role")
+                .is_some_and(|role| role != "offline-registry")
+                || [
+                    "cnpg-vcluster.capi/tenant",
+                    "tenancy.cnpg-vcluster.io/tenant-uid",
+                ]
+                .iter()
+                .any(|key| container.labels.contains_key(*key))
         })
     {
         return Err(ControllerError::Configuration(

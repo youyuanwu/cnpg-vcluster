@@ -246,6 +246,18 @@ def require_clean_controller_state(
                 timeout=30,
             ).stdout.split()
         )
+    containers.difference_update(
+        run(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                "label=cnpg-vcluster.capi/role=offline-registry",
+            ],
+            timeout=30,
+        ).stdout.split()
+    )
     if containers:
         raise RuntimeError(
             f"CAPD Tenant containers block activation: {sorted(containers)}"
