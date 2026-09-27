@@ -713,20 +713,17 @@ class AzureTenantAdapter:
     @staticmethod
     def intended_resources(spec: TenantSpec) -> Sequence[str]:
         selected = tenant_names(spec)
+        management = tuple(
+            (
+                f"{kind}/{namespace}/{name}"
+                if namespace is not None
+                else f"{kind}/{name}"
+            )
+            for _, namespace, kind, name in _management_resource_specs(spec)
+        )
         return (
-            f"Namespace/{spec.namespace}",
-            f"AzureClusterIdentity/{spec.namespace}/{selected['azureClusterIdentity']}",
-            f"Cluster/{spec.namespace}/{selected['cluster']}",
-            f"AzureCluster/{spec.namespace}/{selected['azureCluster']}",
-            f"KamajiControlPlane/{spec.namespace}/{selected['controlPlane']}",
-            f"KubeadmConfig/{spec.namespace}/{selected['pool']}",
-            f"AzureMachinePool/{spec.namespace}/{selected['pool']}",
-            f"MachinePool/{spec.namespace}/{selected['pool']}",
+            *management,
             f"VirtualMachineScaleSet/{selected['pool']}",
-            f"ConfigMap/{spec.namespace}/{selected['cloudValues']}",
-            f"ConfigMap/{spec.namespace}/{selected['networkValues']}",
-            f"Deployment/{spec.namespace}/{selected['statusProbe']}",
-            f"Job/{spec.namespace}/{selected['addonJob']}",
             f"Credential/{spec.name}",
         )
 
@@ -999,66 +996,10 @@ class AzureTenantAdapter:
         assert identity is not None
         spec = identity.specification
         selected = tenant_names(spec)
-        expected_markers = {
-            "tenant": spec.name,
-            "profile": "azure",
-            "specificationSha256": spec.sha256(),
-            "foundationSha256": foundation_sha256(identity.foundation_identity),
-            "operationId": identity.observed.get("markerOperationId", ""),
-        }
-        resources = (
-            ("namespaceUid", None, f"namespace/{spec.namespace}"),
-            (
-                "azureClusterIdentityUid",
-                spec.namespace,
-                f"azureclusteridentity/{selected['azureClusterIdentity']}",
-            ),
-            ("clusterUid", spec.namespace, f"cluster/{selected['cluster']}"),
-            (
-                "azureClusterUid",
-                spec.namespace,
-                f"azurecluster/{selected['azureCluster']}",
-            ),
-            (
-                "kamajiControlPlaneUid",
-                spec.namespace,
-                f"kamajicontrolplane/{selected['controlPlane']}",
-            ),
-            (
-                "kubeadmConfigUid",
-                spec.namespace,
-                f"kubeadmconfig/{selected['pool']}",
-            ),
-            (
-                "azureMachinePoolUid",
-                spec.namespace,
-                f"azuremachinepool/{selected['pool']}",
-            ),
-            (
-                "machinePoolUid",
-                spec.namespace,
-                f"machinepool/{selected['pool']}",
-            ),
-            (
-                "cloudValuesConfigMapUid",
-                spec.namespace,
-                f"configmap/{selected['cloudValues']}",
-            ),
-            (
-                "networkValuesConfigMapUid",
-                spec.namespace,
-                f"configmap/{selected['networkValues']}",
-            ),
-            (
-                "addonJobUid",
-                spec.namespace,
-                f"job/{selected['addonJob']}",
-            ),
-            (
-                "statusProbeDeploymentUid",
-                spec.namespace,
-                f"deployment/{selected['statusProbe']}",
-            ),
+        expected_markers = _expected_tenant_markers(spec, identity)
+        resources = tuple(
+            (key, namespace, f"{kind.lower()}/{name}")
+            for key, namespace, kind, name in _management_resource_specs(spec)
         )
         blockers = list(foundation_blockers)
         observed_payloads: dict[str, dict[str, object]] = {}

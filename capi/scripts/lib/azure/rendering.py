@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .common import *
+from .contracts import RESOURCE_IDENTITY_KEYS
 from .foundation import _get_management_resource
 
 def _marker_annotations(markers: Mapping[str, str]) -> dict[str, str]:
@@ -609,24 +610,6 @@ def _render_addon_job(
     return _write_manifest(root, spec, "addons", items)
 
 
-RESOURCE_IDENTITY_KEYS = {
-    "Namespace": "namespaceUid",
-    "AzureClusterIdentity": "azureClusterIdentityUid",
-    "Cluster": "clusterUid",
-    "AzureCluster": "azureClusterUid",
-    "KamajiControlPlane": "kamajiControlPlaneUid",
-    "KubeadmConfig": "kubeadmConfigUid",
-    "MachinePool": "machinePoolUid",
-    "AzureMachinePool": "azureMachinePoolUid",
-    "ConfigMap": {
-        "cloud": "cloudValuesConfigMapUid",
-        "network": "networkValuesConfigMapUid",
-    },
-    "Deployment": "statusProbeDeploymentUid",
-    "Job": "addonJobUid",
-}
-
-
 def _resource_ref(item: Mapping[str, object]) -> tuple[str | None, str]:
     metadata = item["metadata"]
     assert isinstance(metadata, dict)
@@ -728,4 +711,3 @@ def _reconcile_manifest(
                 observed={identity_key: uid},
             )
     return current
-

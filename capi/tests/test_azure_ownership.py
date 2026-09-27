@@ -7,7 +7,12 @@ from unittest.mock import patch
 
 from scripts.azure import AzureTenantAdapter
 from scripts.lib.azure.common import load_azure_configuration
-from scripts.lib.azure.contracts import _management_resource_specs
+from scripts.lib.azure.contracts import (
+    MANAGEMENT_RESOURCE_DESCRIPTORS,
+    RESOURCE_IDENTITY_KEYS,
+    _expected_tenant_markers,
+    _management_resource_specs,
+)
 from scripts.lib.azure.ownership import (
     _classify_management_owned_resources,
     _discover_owned_repeatedly,
@@ -25,6 +30,31 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzureOwnershipTests(AzureFixtureMixin, unittest.TestCase):
+    def test_contracts_preserve_markers_and_management_inventory(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, journal = self.start_journal(root, spec)
+        self.assertEqual(
+            _expected_tenant_markers(spec, journal),
+            lifecycle_markers(spec, journal),
+        )
+        specs = _management_resource_specs(spec)
+        self.assertEqual(len(specs), len(MANAGEMENT_RESOURCE_DESCRIPTORS))
+        intended = AzureTenantAdapter.intended_resources(spec)
+        for _, namespace, kind, name in specs:
+            expected = (
+                f"{kind}/{namespace}/{name}"
+                if namespace is not None
+                else f"{kind}/{name}"
+            )
+            self.assertIn(expected, intended)
+        identity_keys = {
+            value
+            for value in RESOURCE_IDENTITY_KEYS.values()
+            if isinstance(value, str)
+        } | set(RESOURCE_IDENTITY_KEYS["ConfigMap"].values())
+        self.assertEqual(identity_keys, {key for key, _, _, _ in specs})
+
     def test_discovery_fails_closed_on_aso_api_failure_and_unknown_kind(self):
         root = self.make_root()
         config = load_azure_configuration(root)

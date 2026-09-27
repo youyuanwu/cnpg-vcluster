@@ -2,6 +2,39 @@ from __future__ import annotations
 
 from .common import *
 
+MANAGEMENT_RESOURCE_DESCRIPTORS = (
+    ("namespaceUid", None, "Namespace", "namespace"),
+    ("azureClusterIdentityUid", "namespace", "AzureClusterIdentity", "azureClusterIdentity"),
+    ("clusterUid", "namespace", "Cluster", "cluster"),
+    ("azureClusterUid", "namespace", "AzureCluster", "azureCluster"),
+    ("kamajiControlPlaneUid", "namespace", "KamajiControlPlane", "controlPlane"),
+    ("kubeadmConfigUid", "namespace", "KubeadmConfig", "pool"),
+    ("azureMachinePoolUid", "namespace", "AzureMachinePool", "pool"),
+    ("machinePoolUid", "namespace", "MachinePool", "pool"),
+    ("cloudValuesConfigMapUid", "namespace", "ConfigMap", "cloudValues"),
+    ("networkValuesConfigMapUid", "namespace", "ConfigMap", "networkValues"),
+    ("statusProbeDeploymentUid", "namespace", "Deployment", "statusProbe"),
+    ("addonJobUid", "namespace", "Job", "addonJob"),
+)
+
+RESOURCE_IDENTITY_KEYS = {
+    "Namespace": "namespaceUid",
+    "AzureClusterIdentity": "azureClusterIdentityUid",
+    "Cluster": "clusterUid",
+    "AzureCluster": "azureClusterUid",
+    "KamajiControlPlane": "kamajiControlPlaneUid",
+    "KubeadmConfig": "kubeadmConfigUid",
+    "MachinePool": "machinePoolUid",
+    "AzureMachinePool": "azureMachinePoolUid",
+    "ConfigMap": {
+        "cloud": "cloudValuesConfigMapUid",
+        "network": "networkValuesConfigMapUid",
+    },
+    "Deployment": "statusProbeDeploymentUid",
+    "Job": "addonJobUid",
+}
+
+
 def _expected_tenant_markers(
     spec: TenantSpec,
     identity: TenantIdentity | OperationJournal,
@@ -21,64 +54,13 @@ def _expected_tenant_markers(
 def _management_resource_specs(
     spec: TenantSpec,
 ) -> tuple[tuple[str, str | None, str, str], ...]:
-    selected = tenant_names(spec)
-    return (
-        ("namespaceUid", None, "Namespace", spec.namespace),
+    selected = {"namespace": spec.namespace, **tenant_names(spec)}
+    return tuple(
         (
-            "azureClusterIdentityUid",
-            spec.namespace,
-            "AzureClusterIdentity",
-            selected["azureClusterIdentity"],
-        ),
-        ("clusterUid", spec.namespace, "Cluster", selected["cluster"]),
-        (
-            "azureClusterUid",
-            spec.namespace,
-            "AzureCluster",
-            selected["azureCluster"],
-        ),
-        (
-            "kamajiControlPlaneUid",
-            spec.namespace,
-            "KamajiControlPlane",
-            selected["controlPlane"],
-        ),
-        (
-            "kubeadmConfigUid",
-            spec.namespace,
-            "KubeadmConfig",
-            selected["pool"],
-        ),
-        (
-            "azureMachinePoolUid",
-            spec.namespace,
-            "AzureMachinePool",
-            selected["pool"],
-        ),
-        (
-            "machinePoolUid",
-            spec.namespace,
-            "MachinePool",
-            selected["pool"],
-        ),
-        (
-            "cloudValuesConfigMapUid",
-            spec.namespace,
-            "ConfigMap",
-            selected["cloudValues"],
-        ),
-        (
-            "networkValuesConfigMapUid",
-            spec.namespace,
-            "ConfigMap",
-            selected["networkValues"],
-        ),
-        (
-            "statusProbeDeploymentUid",
-            spec.namespace,
-            "Deployment",
-            selected["statusProbe"],
-        ),
-        ("addonJobUid", spec.namespace, "Job", selected["addonJob"]),
+            key,
+            selected[namespace_key] if namespace_key is not None else None,
+            kind,
+            selected[name_key],
+        )
+        for key, namespace_key, kind, name_key in MANAGEMENT_RESOURCE_DESCRIPTORS
     )
-
