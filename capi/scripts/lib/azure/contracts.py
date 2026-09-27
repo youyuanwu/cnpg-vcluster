@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from types import MappingProxyType
+
 from .common import *
 
 MANAGEMENT_RESOURCE_DESCRIPTORS = (
@@ -17,7 +19,7 @@ MANAGEMENT_RESOURCE_DESCRIPTORS = (
     ("addonJobUid", "namespace", "Job", "addonJob"),
 )
 
-RESOURCE_IDENTITY_KEYS = {
+RESOURCE_IDENTITY_KEYS = MappingProxyType({
     "Namespace": "namespaceUid",
     "AzureClusterIdentity": "azureClusterIdentityUid",
     "Cluster": "clusterUid",
@@ -26,13 +28,13 @@ RESOURCE_IDENTITY_KEYS = {
     "KubeadmConfig": "kubeadmConfigUid",
     "MachinePool": "machinePoolUid",
     "AzureMachinePool": "azureMachinePoolUid",
-    "ConfigMap": {
+    "ConfigMap": MappingProxyType({
         "cloud": "cloudValuesConfigMapUid",
         "network": "networkValuesConfigMapUid",
-    },
+    }),
     "Deployment": "statusProbeDeploymentUid",
     "Job": "addonJobUid",
-}
+})
 
 
 def _expected_tenant_markers(

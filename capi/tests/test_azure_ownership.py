@@ -39,21 +39,40 @@ class AzureOwnershipTests(AzureFixtureMixin, unittest.TestCase):
             lifecycle_markers(spec, journal),
         )
         specs = _management_resource_specs(spec)
-        self.assertEqual(len(specs), len(MANAGEMENT_RESOURCE_DESCRIPTORS))
-        intended = AzureTenantAdapter.intended_resources(spec)
-        for _, namespace, kind, name in specs:
-            expected = (
+        self.assertEqual(
+            tuple((key, kind) for key, _, kind, _ in specs),
+            tuple(
+                (key, kind)
+                for key, _, kind, _ in MANAGEMENT_RESOURCE_DESCRIPTORS
+            ),
+        )
+        management = tuple(
+            (
                 f"{kind}/{namespace}/{name}"
                 if namespace is not None
                 else f"{kind}/{name}"
             )
-            self.assertIn(expected, intended)
+            for _, namespace, kind, name in specs
+        )
+        self.assertEqual(
+            AzureTenantAdapter.intended_resources(spec),
+            (
+                *management[:8],
+                "VirtualMachineScaleSet/tenant-c-worker",
+                *management[8:],
+                "Credential/tenant-c",
+            ),
+        )
         identity_keys = {
             value
             for value in RESOURCE_IDENTITY_KEYS.values()
             if isinstance(value, str)
         } | set(RESOURCE_IDENTITY_KEYS["ConfigMap"].values())
         self.assertEqual(identity_keys, {key for key, _, _, _ in specs})
+        with self.assertRaises(TypeError):
+            RESOURCE_IDENTITY_KEYS["Cluster"] = "changed"
+        with self.assertRaises(TypeError):
+            RESOURCE_IDENTITY_KEYS["ConfigMap"]["cloud"] = "changed"
 
     def test_discovery_fails_closed_on_aso_api_failure_and_unknown_kind(self):
         root = self.make_root()

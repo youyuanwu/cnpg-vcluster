@@ -722,8 +722,9 @@ class AzureTenantAdapter:
             for _, namespace, kind, name in _management_resource_specs(spec)
         )
         return (
-            *management,
+            *management[:8],
             f"VirtualMachineScaleSet/{selected['pool']}",
+            *management[8:],
             f"Credential/{spec.name}",
         )
 
@@ -997,9 +998,11 @@ class AzureTenantAdapter:
         spec = identity.specification
         selected = tenant_names(spec)
         expected_markers = _expected_tenant_markers(spec, identity)
+        management_specs = _management_resource_specs(spec)
+        status_specs = (*management_specs[:-2], management_specs[-1], management_specs[-2])
         resources = tuple(
             (key, namespace, f"{kind.lower()}/{name}")
-            for key, namespace, kind, name in _management_resource_specs(spec)
+            for key, namespace, kind, name in status_specs
         )
         blockers = list(foundation_blockers)
         observed_payloads: dict[str, dict[str, object]] = {}

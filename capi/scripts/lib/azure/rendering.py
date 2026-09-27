@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from .common import *
-from .contracts import RESOURCE_IDENTITY_KEYS
+from .contracts import RESOURCE_IDENTITY_KEYS, _expected_tenant_markers
 from .foundation import _get_management_resource
 
 def _marker_annotations(markers: Mapping[str, str]) -> dict[str, str]:
@@ -90,7 +90,7 @@ def _render_tenant_control_plane(
     selected = tenant_names(spec)
     outputs = inventory["outputs"]
     assert isinstance(outputs, dict)
-    markers = lifecycle_markers(spec, journal)
+    markers = _expected_tenant_markers(spec, journal)
     namespace = spec.namespace
     items = [
         {
@@ -247,7 +247,7 @@ def _render_worker_pool(
     pool = selected["pool"]
     outputs = inventory["outputs"]
     assert isinstance(outputs, dict)
-    markers = lifecycle_markers(spec, journal)
+    markers = _expected_tenant_markers(spec, journal)
     identity_provider_id = (
         "azure:///subscriptions/"
         f"{config['AZURE_SUBSCRIPTION_ID']}/resourceGroups/"
@@ -386,7 +386,7 @@ def _render_addon_job(
     journal: OperationJournal,
 ) -> Path:
     selected = tenant_names(spec)
-    markers = lifecycle_markers(spec, journal)
+    markers = _expected_tenant_markers(spec, journal)
     cloud_values = {
         "infra": {"clusterName": spec.name},
         "cloudControllerManager": {
@@ -623,7 +623,7 @@ def _resource_ref(item: Mapping[str, object]) -> tuple[str | None, str]:
 def _identity_key(item: Mapping[str, object], spec: TenantSpec) -> str:
     kind = str(item["kind"])
     value = RESOURCE_IDENTITY_KEYS[kind]
-    if isinstance(value, dict):
+    if isinstance(value, Mapping):
         name = str(item["metadata"]["name"])
         return value["cloud" if name == tenant_names(spec)["cloudValues"] else "network"]
     return value
@@ -652,7 +652,7 @@ def _reconcile_manifest(
     if not isinstance(items, list):
         raise RuntimeError(f"invalid Azure tenant manifest: {path.name}")
     current = runtime.load_operation()
-    expected = lifecycle_markers(spec, current)
+    expected = _expected_tenant_markers(spec, current)
     for item in items:
         if not isinstance(item, dict):
             raise RuntimeError(f"invalid Azure tenant manifest item: {path.name}")
