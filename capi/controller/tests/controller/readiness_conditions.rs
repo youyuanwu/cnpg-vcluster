@@ -285,7 +285,7 @@ async fn status_conflict_preserves_concurrent_fields_without_unneeded_initial_ge
 
 #[tokio::test]
 async fn status_conflict_never_writes_a_same_name_replacement_or_new_generation() {
-    for change in ["uid", "generation", "deletion"] {
+    for change in ["uid", "generation", "spec", "deletion"] {
         let server = Server::default();
         let tenant = tenant();
         let mut current = serde_json::to_value(&tenant).unwrap();
@@ -293,6 +293,7 @@ async fn status_conflict_never_writes_a_same_name_replacement_or_new_generation(
         match change {
             "uid" => current["metadata"]["uid"] = json!("successor"),
             "generation" => current["metadata"]["generation"] = json!(3),
+            "spec" => current["spec"]["workers"] = json!(2),
             "deletion" => current["metadata"]["deletionTimestamp"] = json!("2026-09-27T00:00:00Z"),
             _ => unreachable!(),
         }
@@ -306,6 +307,68 @@ async fn status_conflict_never_writes_a_same_name_replacement_or_new_generation(
         assert!(matches!(error, ControllerError::OwnershipInvalid(_)));
         assert_eq!(server.calls().len(), 2);
     }
+}
+
+#[tokio::test]
+async fn metadata_only_status_conflict_refreshes_and_disappearance_stops() {
+    let server = Server::default();
+    let tenant = tenant();
+    let mut current = serde_json::to_value(&tenant).unwrap();
+    current["metadata"]["resourceVersion"] = json!("2");
+    server.insert(TENANT, current);
+    update_status(server.client(), &tenant, |status| {
+        status.phase = Some(TenantPhase::Ready);
+        Ok(())
+    })
+    .await
+    .unwrap();
+    assert_eq!(
+        server
+            .take_calls()
+            .iter()
+            .map(|call| call.method.as_str())
+            .collect::<Vec<_>>(),
+        ["PATCH", "GET", "PATCH"]
+    );
+
+    let server = Server::default();
+    let mut current = serde_json::to_value(&tenant).unwrap();
+    current["metadata"]["resourceVersion"] = json!("2");
+    server.insert(TENANT, current);
+    server.replace_on("GET", TENANT, None);
+    assert!(
+        update_status(server.client(), &tenant, |_| Ok(()))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        server
+            .calls()
+            .iter()
+            .filter(|call| call.method == "PATCH")
+            .count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn status_patch_rejects_a_replacement_response() {
+    let server = Server::default();
+    let tenant = tenant();
+    server.insert(TENANT, serde_json::to_value(&tenant).unwrap());
+    let successor = json!({"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha2",
+        "kind":"Tenant","metadata":{"name":"tenant-a","uid":"successor",
+        "resourceVersion":"2","generation":2},"spec":tenant.spec,"status":{}});
+    server.respond("PATCH", &format!("{TENANT}/status"), 200, successor);
+    assert!(matches!(
+        update_status(server.client(), &tenant, |status| {
+            status.phase = Some(TenantPhase::Ready);
+            Ok(())
+        })
+        .await
+        .unwrap_err(),
+        ControllerError::OwnershipInvalid(_)
+    ));
 }
 
 #[tokio::test]

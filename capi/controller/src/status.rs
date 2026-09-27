@@ -158,16 +158,5 @@ pub async fn replace_status(
     status: &TenantStatus,
     clear_allocation: bool,
 ) -> Result<(), ControllerError> {
-    mutate_status(
-        client,
-        original,
-        current,
-        |value| {
-            value.clone_from(status);
-            Ok(())
-        },
-        0,
-        clear_allocation,
-    )
-    .await
+    patch_status(client, original, current, status, clear_allocation).await
 }

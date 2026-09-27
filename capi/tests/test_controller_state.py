@@ -161,6 +161,7 @@ class ControllerStateTests(unittest.TestCase):
                     "alternateParentKind",
                     "namePolicy",
                     "watched",
+                    "watchByCluster",
                     "inventoryPolicy",
                     "inventoryNamespace",
                     "exemptions",
@@ -174,6 +175,7 @@ class ControllerStateTests(unittest.TestCase):
                 key: by_kind["Namespace"][key]
                 for key in (
                     "namespaced", "role", "namePolicy", "watched",
+                    "watchByCluster",
                     "inventoryPolicy", "inventoryNamespace",
                     "exemptions",
                 )
@@ -183,6 +185,7 @@ class ControllerStateTests(unittest.TestCase):
                 "role": "namespace",
                 "namePolicy": "tenant",
                 "watched": True,
+                "watchByCluster": False,
                 "inventoryPolicy": "tenant-markers",
                 "inventoryNamespace": None,
                 "exemptions": ["management-infrastructure"],
@@ -209,6 +212,7 @@ class ControllerStateTests(unittest.TestCase):
                 key: by_kind["Secret"][key]
                 for key in (
                     "namespaced", "role", "namePolicy", "watched",
+                    "watchByCluster",
                     "inventoryPolicy", "inventoryNamespace",
                     "exemptions",
                 )
@@ -218,6 +222,7 @@ class ControllerStateTests(unittest.TestCase):
                 "role": "tenant-kubeconfig",
                 "namePolicy": "kubeconfig",
                 "watched": True,
+                "watchByCluster": False,
                 "inventoryPolicy": "tenant-markers-or-kamaji-owner",
                 "inventoryNamespace": None,
                 "exemptions": ["controller-installation-secrets"],
@@ -228,6 +233,7 @@ class ControllerStateTests(unittest.TestCase):
                 key: by_kind["Lease"][key]
                 for key in (
                     "namespaced", "role", "namePolicy", "watched",
+                    "watchByCluster",
                     "inventoryPolicy", "inventoryNamespace",
                     "exemptions",
                 )
@@ -237,6 +243,7 @@ class ControllerStateTests(unittest.TestCase):
                 "role": "allocation-lease",
                 "namePolicy": "allocation",
                 "watched": True,
+                "watchByCluster": False,
                 "inventoryPolicy": "allocation-markers",
                 "inventoryNamespace": "tenant-system",
                 "exemptions": ["controller-leader-election"],

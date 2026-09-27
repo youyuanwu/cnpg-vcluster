@@ -10,6 +10,7 @@
     "alternateParentKind": null,
     "namePolicy": "tenant",
     "watched": true,
+    "watchByCluster": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -25,6 +26,7 @@
     "alternateParentKind": null,
     "namePolicy": "tenant",
     "watched": true,
+    "watchByCluster": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -40,6 +42,7 @@
     "alternateParentKind": null,
     "namePolicy": "tenant",
     "watched": true,
+    "watchByCluster": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -55,6 +58,7 @@
     "alternateParentKind": "MachineDeployment",
     "namePolicy": "worker",
     "watched": true,
+    "watchByCluster": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -70,6 +74,7 @@
     "alternateParentKind": "MachineDeployment",
     "namePolicy": "worker",
     "watched": true,
+    "watchByCluster": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -85,6 +90,7 @@
     "alternateParentKind": null,
     "namePolicy": "worker",
     "watched": true,
+    "watchByCluster": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -100,6 +106,7 @@
     "alternateParentKind": null,
     "namePolicy": "observed",
     "watched": true,
+    "watchByCluster": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -115,6 +122,7 @@
     "alternateParentKind": null,
     "namePolicy": "observed",
     "watched": true,
+    "watchByCluster": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -130,6 +138,7 @@
     "alternateParentKind": null,
     "namePolicy": "observed",
     "watched": true,
+    "watchByCluster": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -145,6 +154,7 @@
     "alternateParentKind": null,
     "namePolicy": "observed",
     "watched": false,
+    "watchByCluster": false,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -160,6 +170,7 @@
     "alternateParentKind": null,
     "namePolicy": "observed",
     "watched": false,
+    "watchByCluster": false,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
     "exemptions": []
@@ -175,6 +186,7 @@
     "alternateParentKind": null,
     "namePolicy": "tenant",
     "watched": true,
+    "watchByCluster": false,
     "inventoryPolicy": "tenant-markers",
     "inventoryNamespace": null,
     "exemptions": [
@@ -192,6 +204,7 @@
     "alternateParentKind": null,
     "namePolicy": "kubeconfig",
     "watched": true,
+    "watchByCluster": false,
     "inventoryPolicy": "tenant-markers-or-kamaji-owner",
     "inventoryNamespace": null,
     "exemptions": [
@@ -209,6 +222,7 @@
     "alternateParentKind": null,
     "namePolicy": "allocation",
     "watched": true,
+    "watchByCluster": false,
     "inventoryPolicy": "allocation-markers",
     "inventoryNamespace": "tenant-system",
     "exemptions": [

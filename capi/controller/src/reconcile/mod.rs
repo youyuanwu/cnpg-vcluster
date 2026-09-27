@@ -28,8 +28,7 @@ use crate::{
     docker::{BollardDockerClient, DockerClient, validate_volume},
     error::{ControllerError, ErrorClass},
     foundation::{self, Foundation, ImageArchive, RuntimeFoundation},
-    management::{self, ResourceClass},
-    ownership,
+    management, ownership,
     readiness::{self, Components, set_condition},
     resources::{self, Context as ResourceContext},
     runtime::{LeadershipGate, tenant_controller},
@@ -662,7 +661,7 @@ pub fn map_management_to_tenant(
     if !mapped.is_empty() {
         return mapped;
     }
-    if definition.kind == "Secret" {
+    if definition.name_policy == management::NamePolicy::Kubeconfig {
         object
             .namespace()
             .filter(|namespace| {
@@ -672,7 +671,7 @@ pub fn map_management_to_tenant(
             })
             .map(|namespace| vec![ObjectRef::new(&namespace)])
             .unwrap_or_default()
-    } else if definition.class != ResourceClass::Typed {
+    } else if definition.watch_by_cluster {
         object
             .labels()
             .get("cluster.x-k8s.io/cluster-name")

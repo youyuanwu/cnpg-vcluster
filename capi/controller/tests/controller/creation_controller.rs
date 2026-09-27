@@ -409,11 +409,16 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
 }
 
 #[tokio::test]
-async fn finalizer_conflict_requeues_without_failure_status_patch() {
+async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.management.get(TENANT);
     tenant["metadata"]["deletionTimestamp"] = json!("2026-09-27T00:00:00Z");
     tenant["metadata"]["finalizers"] = json!([FINALIZER]);
+    tenant["status"] = json!({
+        "phase":"Deleting",
+        "foundationHash":fixture.hash,
+        "conditions":[]
+    });
     fixture.management.insert(TENANT, tenant);
     for resource in management::descendants().filter(|resource| resource.role != "provider") {
         let (group, version) = resource.api_version.split_once('/').unwrap();
@@ -424,7 +429,7 @@ async fn finalizer_conflict_requeues_without_failure_status_patch() {
     }
     fixture.management.respond(
         "PATCH",
-        &format!("{TENANT}/status"),
+        TENANT,
         409,
         crate::support::kube::status(409, "Conflict"),
     );
@@ -436,9 +441,16 @@ async fn finalizer_conflict_requeues_without_failure_status_patch() {
             .management
             .calls()
             .iter()
-            .filter(|call| call.method == "PATCH" && call.path == format!("{TENANT}/status"))
+            .filter(|call| call.method == "PATCH" && call.path == TENANT)
             .count(),
         1
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| !(call.method == "PATCH" && call.path == format!("{TENANT}/status")))
     );
 }
 

@@ -304,6 +304,11 @@ async fn exact_cluster_namespace_and_lease_are_deleted_in_order() {
             && call.body["preconditions"]["resourceVersion"].is_string()
             && call.body["propagationPolicy"] == "Background"
     }));
+    assert!(server.calls().iter().any(|call| {
+        call.method == "PATCH"
+            && call.path == format!("{TENANT_PATH}/status")
+            && call.body["status"]["allocation"].is_null()
+    }));
 }
 
 #[tokio::test]
