@@ -214,15 +214,10 @@ class ControllerStateTests(unittest.TestCase):
             "lease-tenant-label",
             "volume",
             "container",
-            "legacy-file",
         )
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = prepare_root(directory)
-                if case == "legacy-file":
-                    path = root / ".runtime/management/tenant-endpoints.json"
-                    path.parent.mkdir(parents=True)
-                    path.write_text("{}")
 
                 def handle(*args, **kwargs):
                     if case == "tenant" and "tenants.tenancy.cnpg-vcluster.io" in args:
@@ -272,6 +267,17 @@ class ControllerStateTests(unittest.TestCase):
                     side_effect=docker,
                 ), self.assertRaises(RuntimeError):
                     require_clean_controller_state(root, Client(handle))
+
+    def test_obsolete_local_files_do_not_define_activation_state(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "scripts.lib.controller_state.run",
+            return_value=response(""),
+        ):
+            root = prepare_root(directory)
+            path = root / ".runtime/management/tenant-endpoints.json"
+            path.parent.mkdir(parents=True)
+            path.write_text("{}")
+            require_clean_controller_state(root, Client(clean_handler))
 
     def test_inventory_errors_never_mean_absence(self) -> None:
         def handle(*args, **kwargs):

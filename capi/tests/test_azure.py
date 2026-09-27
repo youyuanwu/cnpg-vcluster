@@ -49,7 +49,7 @@ from scripts.azure import (
 )
 from scripts.lib.config import ConfigError
 from scripts.lib.files import write_private_file
-from scripts.lib.locking import profile_lock
+from scripts.lib.locking import azure_lock
 from scripts.lib.tenant_runtime import TenantRuntime, foundation_sha256
 from scripts.lib.tenant_spec import TenantSpec, TenantSpecError
 from scripts.lib.tenant_status import TenantStatus
@@ -186,7 +186,7 @@ class AzurePhaseFourTests(unittest.TestCase):
         )
 
     def start_journal(self, root: Path, spec: TenantSpec):
-        runtime = TenantRuntime(root, "azure", spec.name)
+        runtime = TenantRuntime(root, spec.name)
         journal = runtime.start_operation(
             operation="create",
             spec=spec,
@@ -1677,7 +1677,7 @@ class AzurePhaseFourTests(unittest.TestCase):
             status.blockers,
         )
 
-    def test_foundation_mutation_waits_for_generic_azure_profile_lock(self):
+    def test_foundation_mutation_waits_for_azure_lock(self):
         root = self.make_root()
         marker = root / "acquired"
         script = (
@@ -1687,7 +1687,7 @@ class AzurePhaseFourTests(unittest.TestCase):
             "_run_profile_mutation(root, {}, "
             "lambda _root, _config: marker.write_text('yes'))"
         )
-        with profile_lock(root, "azure", exclusive=True, create=True):
+        with azure_lock(root, exclusive=True, create=True):
             process = subprocess.Popen(
                 [sys.executable, "-c", script],
                 cwd=Path(__file__).resolve().parents[1],
@@ -2782,7 +2782,7 @@ class AzurePhaseFiveTests(unittest.TestCase):
     def test_authoritative_absence_ignores_pending_delete_journal(self):
         root = self.make_root()
         spec = self.spec()
-        runtime = TenantRuntime(root, "azure", spec.name)
+        runtime = TenantRuntime(root, spec.name)
         runtime.start_operation(
             operation="delete",
             spec=spec,

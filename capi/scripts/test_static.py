@@ -279,9 +279,35 @@ def check_repository_boundaries() -> None:
     check("--activation-token=${CONTROLLER_ACTIVATION_TOKEN}" in manager,
           "Tenant controller activation token placeholder is missing")
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
+    tenant_spec = (ROOT / "scripts" / "lib" / "tenant_spec.py").read_text(
+        encoding="utf-8"
+    )
+    tenant_runtime = (ROOT / "scripts" / "lib" / "tenant_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    locking = (ROOT / "scripts" / "lib" / "locking.py").read_text(
+        encoding="utf-8"
+    )
     check(
         "from scripts.local_tenant import" not in tenant_dispatch,
         "public tenant dispatch still imports the legacy local mutator",
+    )
+    check(
+        'PROFILE = "azure"' in tenant_spec
+        and '"databaseCount"' not in tenant_spec
+        and '"local"' not in tenant_spec,
+        "schema-1 Tenant specifications must remain Azure-only",
+    )
+    check(
+        '"lifecycle" / PROFILE' in tenant_runtime
+        and '"local"' not in tenant_runtime,
+        "durable Tenant lifecycle paths must remain Azure-only",
+    )
+    check(
+        "def azure_lock(" in locking
+        and "def profile_lock(" not in locking
+        and "local.lock" not in locking,
+        "obsolete local profile locking remains",
     )
     for relative in (
         "scripts/local_tenant.py",

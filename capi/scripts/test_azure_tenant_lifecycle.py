@@ -260,7 +260,7 @@ def main(arguments: list[str]) -> int:
                 require_healthy=True,
             )[0],
         )
-        runtime = TenantRuntime(ROOT, "azure", spec.name)
+        runtime = TenantRuntime(ROOT, spec.name)
         if runtime.operation_exists():
             pending = runtime.load_operation()
             if pending.operation == "delete":

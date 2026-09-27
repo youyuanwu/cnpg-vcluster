@@ -21,7 +21,7 @@ from scripts.lib.controller_client import apply_tenant_document, tenant_manifest
 from scripts.test_e2e import capture_tenant_deletion_identity, verify_tenant_deletion
 from scripts.lib.host import prepare_inotify
 from scripts.lib.kube import ManagementClient, wait_for
-from scripts.lib.locking import profile_lock, tools_lock
+from scripts.lib.locking import tools_lock
 from scripts.lib.redaction import redact
 from scripts.preflight import run_preflight
 
@@ -50,10 +50,7 @@ def main() -> None:
     failure = None
     client = None
     try:
-        with (
-            profile_lock(ROOT, "local", exclusive=True, create=True),
-            tools_lock(ROOT, exclusive=True),
-        ):
+        with tools_lock(ROOT, exclusive=True):
             prepare_inotify(ROOT, config)
             run_preflight(ROOT, config)
             create_management(ROOT, config)

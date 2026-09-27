@@ -66,20 +66,6 @@ def require_clean_controller_state(
     root: Path,
     client: ManagementClient,
 ) -> None:
-    for relative in (
-        ".runtime/lifecycle/local",
-        ".runtime/rendered/tenants",
-        ".runtime/storage",
-        ".runtime/kubeconfigs",
-        ".runtime/tenants",
-        ".runtime/deletions",
-        ".runtime/management/tenant-endpoints.json",
-    ):
-        legacy = root / relative
-        if legacy.is_file() or (legacy.is_dir() and any(legacy.rglob("*"))):
-            raise RuntimeError(
-                f"unsupported local lifecycle state blocks activation: {relative}"
-            )
     tenants = client.kubectl(
         "get",
         "tenants.tenancy.cnpg-vcluster.io",

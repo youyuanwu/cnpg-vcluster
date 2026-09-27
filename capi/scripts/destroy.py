@@ -28,12 +28,57 @@ from scripts.lib.registry import (
 from scripts.lib.controller import delete_controller
 
 
+OBSOLETE_LOCAL_RUNTIME = (
+    "management/tenant-endpoints.json",
+    "lifecycle/.locks/local.lock",
+    "lifecycle/local",
+    "lifecycle/rejected/local",
+)
+
+
+def _remove_obsolete_local_runtime(root: Path) -> None:
+    runtime = root / ".runtime"
+    for relative in OBSOLETE_LOCAL_RUNTIME:
+        path = runtime / relative
+        if not os.path.lexists(path):
+            continue
+        candidates = [path]
+        details = path.lstat()
+        if stat.S_ISDIR(details.st_mode):
+            candidates.extend(path.rglob("*"))
+        for candidate in candidates:
+            candidate_details = candidate.lstat()
+            if stat.S_ISLNK(candidate_details.st_mode):
+                raise RuntimeError(
+                    f"obsolete local runtime path is a symlink: "
+                    f"{candidate.relative_to(runtime)}"
+                )
+            if candidate_details.st_uid != os.getuid() or candidate_details.st_mode & 0o077:
+                raise RuntimeError(
+                    f"obsolete local runtime path is not owner-only: "
+                    f"{candidate.relative_to(runtime)}"
+                )
+            if not (
+                stat.S_ISDIR(candidate_details.st_mode)
+                or stat.S_ISREG(candidate_details.st_mode)
+            ):
+                raise RuntimeError(
+                    f"obsolete local runtime path has unsupported type: "
+                    f"{candidate.relative_to(runtime)}"
+                )
+        if stat.S_ISDIR(details.st_mode):
+            shutil.rmtree(path)
+        else:
+            path.unlink()
+
+
 def _validate_runtime_inventory(
     root: Path,
 ) -> None:
     runtime = root / ".runtime"
     if not runtime.exists():
         return
+    _remove_obsolete_local_runtime(root)
     registry_record = runtime / "management" / "offline-registry.json"
     registry_data = runtime / "management" / "offline-registry-data"
     registry_record_present = os.path.lexists(registry_record)
@@ -47,7 +92,6 @@ def _validate_runtime_inventory(
         "host/.lock",
         "management/identity.json",
         "management/network.json",
-        "management/tenant-endpoints.json",
         "management/kubeconfig",
         "management/offline-registry.json",
         "retained-management.json",
@@ -111,18 +155,8 @@ def _validate_runtime_inventory(
             rf"^tenants/cross-{tenant_pair_pattern}\.kubeconfig$"
         ),
         re.compile(rf"^tenants/cross-{tenant_pattern}-postgres\.env$"),
-        re.compile(r"^lifecycle/\.locks/(local|azure)\.lock$"),
-        re.compile(
-            rf"^lifecycle/local/{tenant_pattern}/"
-            r"(identity|operation|ready)\.json$"
-        ),
-        re.compile(
-            rf"^lifecycle/local/{tenant_pattern}/evidence/"
-            r"(create|delete)-[a-z0-9-]+\.json$"
-        ),
-        re.compile(
-            r"^lifecycle/rejected/(local|azure)/create-[a-z0-9-]+\.json$"
-        ),
+        re.compile(r"^lifecycle/\.locks/azure\.lock$"),
+        re.compile(r"^lifecycle/rejected/azure/create-[a-z0-9-]+\.json$"),
     )
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
@@ -167,16 +201,7 @@ def _remove_local_runtime(root: Path) -> None:
         "deletions",
     ):
         shutil.rmtree(runtime / relative, ignore_errors=True)
-    for path in (
-        runtime / "retained-management.json",
-        runtime / "lifecycle" / ".locks" / "local.lock",
-    ):
-        path.unlink(missing_ok=True)
-    shutil.rmtree(runtime / "lifecycle" / "local", ignore_errors=True)
-    shutil.rmtree(
-        runtime / "lifecycle" / "rejected" / "local",
-        ignore_errors=True,
-    )
+    (runtime / "retained-management.json").unlink(missing_ok=True)
     for directory in (
         runtime / "lifecycle" / ".locks",
         runtime / "lifecycle" / "rejected",

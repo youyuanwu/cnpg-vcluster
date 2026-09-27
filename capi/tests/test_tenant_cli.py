@@ -10,20 +10,17 @@ from scripts.tenant import execute
 
 
 class TenantCLITests(unittest.TestCase):
-    def test_default_dispatch_rejects_legacy_local_commands(self) -> None:
+    def test_default_dispatch_rejects_non_azure_profile(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             cases = (
-                (["create", "local", "local.json"], "local-tenant-apply"),
-                (["status", "local", "tenant-c"], "local-tenant-status"),
-                (
-                    ["delete", "local", "tenant-c", "local/tenant-c"],
-                    "local-tenant-delete",
-                ),
+                ["create", "local", "local.json"],
+                ["status", "local", "tenant-c"],
+                ["delete", "local", "tenant-c", "local/tenant-c"],
             )
-            for arguments, guidance in cases:
+            for arguments in cases:
                 with self.subTest(arguments=arguments):
-                    with self.assertRaisesRegex(TenantSpecError, guidance):
+                    with self.assertRaisesRegex(TenantSpecError, "unsupported tenant profile"):
                         execute(root, arguments)
 
     def test_default_dispatch_constructs_only_azure_adapter(self) -> None:
@@ -34,4 +31,4 @@ class TenantCLITests(unittest.TestCase):
         ):
             result = execute(Path("."), ["status", "azure", "tenant-a"])
         self.assertEqual(0, result)
-        self.assertIs(status.call_args.args[3]["azure"], adapter)
+        self.assertIs(status.call_args.args[2], adapter)

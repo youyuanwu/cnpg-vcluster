@@ -15,9 +15,9 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_env_file
 from scripts.lib.locking import (
+    azure_lock,
+    azure_lock_exists,
     e2e_lock,
-    profile_lock,
-    profile_lock_exists,
     tools_lock,
 )
 from scripts.lib.redaction import redact
@@ -28,7 +28,7 @@ from scripts.lib.tenant_runtime import (
     TenantRuntimeError,
 )
 from scripts.lib.tenant_spec import (
-    PROFILES,
+    PROFILE,
     TenantSpec,
     TenantSpecError,
     load_tenant_spec,
@@ -83,24 +83,10 @@ class TenantAdapter(Protocol):
 
 
 def supported_versions(root: Path) -> dict[str, str]:
-    local = load_env_file(root / "config" / "versions.env")
     azure = load_env_file(root / "config" / "azure" / "defaults.env")
     return {
-        "local": local["KUBERNETES_VERSION"],
-        "azure": azure["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
+        PROFILE: azure["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
     }
-
-
-def _adapter(
-    profile: str,
-    adapters: Mapping[str, TenantAdapter],
-) -> TenantAdapter:
-    try:
-        return adapters[profile]
-    except KeyError as exc:
-        raise RuntimeError(
-            f"tenant profile adapter is not implemented: {profile}"
-        ) from exc
 
 
 def _persist_timings(timings: TenantTimings) -> None:
@@ -174,14 +160,12 @@ def _safe_authoritative_absence(
 
 def create_tenant(
     root: Path,
-    profile: str,
     spec_path: Path,
-    adapters: Mapping[str, TenantAdapter],
+    adapter: TenantAdapter,
 ) -> int:
     with _tenant_e2e_lock(root):
-        with profile_lock(
+        with azure_lock(
             root,
-            profile,
             exclusive=True,
             create=True,
         ) as acquired:
@@ -193,14 +177,14 @@ def create_tenant(
                 try:
                     spec = load_tenant_spec(
                         spec_path,
-                        expected_profile=profile,
+                        expected_profile=PROFILE,
                         supported_versions=supported_versions(root),
                     )
                 except BaseException as exc:
                     try:
                         record_rejected_create(
                             root,
-                            profile=profile,
+                            profile=PROFILE,
                             operation_id=operation_id,
                             seconds=time.monotonic() - validation_started,
                             error=exc,
@@ -211,10 +195,9 @@ def create_tenant(
                             + redact(str(evidence_error))
                         )
                     raise
-                adapter = _adapter(profile, adapters)
                 timings = TenantTimings(
                     root,
-                    profile=profile,
+                    profile=PROFILE,
                     tenant=spec.name,
                     operation="create",
                     operation_id=operation_id,
@@ -223,7 +206,7 @@ def create_tenant(
                     "validation",
                     time.monotonic() - validation_started,
                 )
-                runtime = TenantRuntime(root, profile, spec.name)
+                runtime = TenantRuntime(root, spec.name)
                 primary: BaseException | None = None
                 try:
                     with timings.phase("foundation"):
@@ -257,13 +240,11 @@ def create_tenant(
 
 def status_tenant(
     root: Path,
-    profile: str,
     tenant: str,
-    adapters: Mapping[str, TenantAdapter],
+    adapter: TenantAdapter,
 ) -> int:
     validate_tenant_name(tenant)
-    adapter = _adapter(profile, adapters)
-    runtime = TenantRuntime(root, profile, tenant)
+    runtime = TenantRuntime(root, tenant)
     try:
         identity_present = runtime.identity_exists()
         operation_present = runtime.operation_exists()
@@ -272,18 +253,18 @@ def status_tenant(
         if operation_present:
             runtime.load_operation()
     except BaseException as exc:
-        status = _ownership_invalid(profile, tenant, exc)
+        status = _ownership_invalid(PROFILE, tenant, exc)
     else:
         try:
-            lock_present = profile_lock_exists(root, profile)
+            lock_present = azure_lock_exists(root)
         except BaseException as exc:
-            status = _ownership_invalid(profile, tenant, exc)
+            status = _ownership_invalid(PROFILE, tenant, exc)
         else:
             if not lock_present:
                 inspected = _safe_adapter_status(
                     adapter,
                     root,
-                    profile,
+                    PROFILE,
                     tenant,
                 )
                 if inspected.classification == "ownership-invalid":
@@ -294,7 +275,7 @@ def status_tenant(
                     or inspected.classification != "absent"
                 ):
                     status = _ownership_invalid(
-                        profile,
+                        PROFILE,
                         tenant,
                         "tenant state exists without its profile lock",
                     )
@@ -314,9 +295,8 @@ def status_tenant(
                     with context as e2e_acquired:
                         if not e2e_acquired:
                             raise RuntimeError("tenant E2E status lock is missing")
-                        with profile_lock(
+                        with azure_lock(
                             root,
-                            profile,
                             exclusive=False,
                             create=False,
                         ) as acquired:
@@ -336,44 +316,41 @@ def status_tenant(
                                 status = _safe_adapter_status(
                                     adapter,
                                     root,
-                                    profile,
+                                    PROFILE,
                                     tenant,
                                 )
                 except BaseException as exc:
-                    status = _ownership_invalid(profile, tenant, exc)
+                    status = _ownership_invalid(PROFILE, tenant, exc)
     print(status.to_json())
     return 0 if status.classification in {"ready", "absent"} else 1
 
 
 def delete_tenant(
     root: Path,
-    profile: str,
     tenant: str,
     confirmation: str,
-    adapters: Mapping[str, TenantAdapter],
+    adapter: TenantAdapter,
 ) -> int:
     validate_tenant_name(tenant)
-    expected_confirmation = f"{profile}/{tenant}"
+    expected_confirmation = f"{PROFILE}/{tenant}"
     if confirmation != expected_confirmation:
         raise RuntimeError(
             f"tenant deletion requires confirmation token {expected_confirmation!r}"
         )
-    adapter = _adapter(profile, adapters)
     operation_id = uuid.uuid4().hex
     with _tenant_e2e_lock(root):
-        with profile_lock(
+        with azure_lock(
             root,
-            profile,
             exclusive=True,
             create=True,
         ) as acquired:
             if not acquired:
                 raise RuntimeError("tenant profile mutation lock is unavailable")
             with tools_lock(root, exclusive=True):
-                runtime = TenantRuntime(root, profile, tenant)
+                runtime = TenantRuntime(root, tenant)
                 timings = TenantTimings(
                     root,
-                    profile=profile,
+                    profile=PROFILE,
                     tenant=tenant,
                     operation="delete",
                     operation_id=operation_id,
@@ -398,7 +375,7 @@ def delete_tenant(
                             inspected = _safe_authoritative_absence(
                                 adapter,
                                 root,
-                                profile,
+                                PROFILE,
                                 tenant,
                             )
                             if inspected.classification != "absent":
@@ -415,7 +392,7 @@ def delete_tenant(
                         return 0
                     spec = TenantSpec.from_mapping(
                         identity.specification.to_mapping(),
-                        expected_profile=profile,
+                        expected_profile=PROFILE,
                         supported_versions=supported_versions(root),
                     )
                     with timings.phase("foundation"):
@@ -462,16 +439,12 @@ def execute(
     root: Path,
     arguments: Sequence[str],
     *,
-    adapters: Mapping[str, TenantAdapter] | None = None,
+    adapter: TenantAdapter | None = None,
 ) -> int:
-    if adapters is None:
+    if adapter is None:
         from scripts.azure import AzureTenantAdapter
 
-        available: Mapping[str, TenantAdapter] = {
-            "azure": AzureTenantAdapter(),
-        }
-    else:
-        available = adapters
+        adapter = AzureTenantAdapter()
     if not arguments:
         raise RuntimeError(
             "usage: tenant.py "
@@ -481,36 +454,23 @@ def execute(
     command = arguments[0]
     if command == "create" and len(arguments) == 3:
         profile = arguments[1]
-        if adapters is None and profile == "local":
-            raise TenantSpecError(
-                "local tenant mutation moved to `just local-tenant-apply <manifest.yaml>`"
-            )
-        if profile not in PROFILES:
+        if profile != PROFILE:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
-        return create_tenant(root, profile, Path(arguments[2]), available)
+        return create_tenant(root, Path(arguments[2]), adapter)
     if command == "status" and len(arguments) == 3:
         profile = arguments[1]
-        if adapters is None and profile == "local":
-            raise TenantSpecError(
-                "local tenant status moved to `just local-tenant-status <name>`"
-            )
-        if profile not in PROFILES:
+        if profile != PROFILE:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
-        return status_tenant(root, profile, arguments[2], available)
+        return status_tenant(root, arguments[2], adapter)
     if command == "delete" and len(arguments) == 4:
         profile = arguments[1]
-        if adapters is None and profile == "local":
-            raise TenantSpecError(
-                "local tenant deletion moved to `just local-tenant-delete <name>`"
-            )
-        if profile not in PROFILES:
+        if profile != PROFILE:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
         return delete_tenant(
             root,
-            profile,
             arguments[2],
             arguments[3],
-            available,
+            adapter,
         )
     raise RuntimeError(f"invalid tenant command arguments: {json.dumps(arguments)}")
 

@@ -11,7 +11,7 @@ sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration
 from scripts.lib.controller_client import apply_tenant, delete_tenant
-from scripts.lib.locking import e2e_lock, profile_lock, tools_lock
+from scripts.lib.locking import e2e_lock, tools_lock
 from scripts.lib.redaction import redact
 
 
@@ -29,7 +29,6 @@ def main(arguments: list[str]) -> int:
             if os.environ.get("CAPI_E2E_CHILD") == "1"
             else e2e_lock(ROOT, exclusive=False)
         ),
-        profile_lock(ROOT, "local", exclusive=True, create=True),
         tools_lock(ROOT, exclusive=True),
     ):
         if arguments[0] == "apply":

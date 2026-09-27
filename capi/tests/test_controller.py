@@ -396,7 +396,7 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             data["controllerImage"] = "controller:replacement"
             self.assertEqual(original_hash, _foundation_checksum(data))
 
-    def test_public_apply_uses_all_lifecycle_locks(self) -> None:
+    def test_public_apply_uses_current_local_locks(self) -> None:
         calls = []
 
         @contextmanager
@@ -408,7 +408,6 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         with (
             patch("scripts.controller_tenant.load_configuration", return_value={}),
             patch("scripts.controller_tenant.e2e_lock", side_effect=lambda *_args, **_kwargs: lock("e2e")),
-            patch("scripts.controller_tenant.profile_lock", side_effect=lambda *_args, **_kwargs: lock("profile")),
             patch("scripts.controller_tenant.tools_lock", side_effect=lambda *_args, **_kwargs: lock("tools")),
             patch("scripts.controller_tenant.apply_tenant") as apply,
         ):
@@ -417,16 +416,14 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         self.assertEqual(
             [
                 "enter-e2e",
-                "enter-profile",
                 "enter-tools",
                 "exit-tools",
-                "exit-profile",
                 "exit-e2e",
             ],
             calls,
         )
 
-    def test_public_delete_uses_all_lifecycle_locks(self) -> None:
+    def test_public_delete_uses_current_local_locks(self) -> None:
         calls = []
 
         @contextmanager
@@ -438,7 +435,6 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         with (
             patch("scripts.controller_tenant.load_configuration", return_value={}),
             patch("scripts.controller_tenant.e2e_lock", side_effect=lambda *_args, **_kwargs: lock("e2e")),
-            patch("scripts.controller_tenant.profile_lock", side_effect=lambda *_args, **_kwargs: lock("profile")),
             patch("scripts.controller_tenant.tools_lock", side_effect=lambda *_args, **_kwargs: lock("tools")),
             patch("scripts.controller_tenant.delete_tenant") as delete,
         ):
@@ -447,10 +443,8 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
         self.assertEqual(
             [
                 "enter-e2e",
-                "enter-profile",
                 "enter-tools",
                 "exit-tools",
-                "exit-profile",
                 "exit-e2e",
             ],
             calls,
@@ -461,11 +455,9 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             patch.dict(os.environ, {"CAPI_E2E_CHILD": "1"}),
             patch("scripts.controller_tenant.load_configuration", return_value={}),
             patch("scripts.controller_tenant.e2e_lock") as e2e,
-            patch("scripts.controller_tenant.profile_lock") as profile,
             patch("scripts.controller_tenant.tools_lock") as tools,
             patch("scripts.controller_tenant.apply_tenant"),
         ):
-            profile.return_value = nullcontext()
             tools.return_value = nullcontext()
             self.assertEqual(0, controller_tenant_main(["apply", "fixture.yaml"]))
         e2e.assert_not_called()

@@ -11,7 +11,7 @@ from typing import Mapping
 
 TENANT_NAME_RE = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?$")
 KUBERNETES_VERSION_RE = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
-PROFILES = frozenset({"local", "azure"})
+PROFILE = "azure"
 COMMON_FIELDS = frozenset(
     {
         "schema",
@@ -81,7 +81,6 @@ class TenantSpec:
     workers: int
     pod_network: ipaddress.IPv4Network
     service_network: ipaddress.IPv4Network
-    database_count: int | None
 
     @classmethod
     def from_mapping(
@@ -92,16 +91,14 @@ class TenantSpec:
         supported_versions: Mapping[str, str] | None = None,
     ) -> "TenantSpec":
         profile = _required_string(payload, "profile")
-        if profile not in PROFILES:
+        if profile != PROFILE:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
         if expected_profile is not None and profile != expected_profile:
             raise TenantSpecError(
                 f"tenant specification profile {profile!r} does not match "
                 f"selected profile {expected_profile!r}"
             )
-        expected_fields = COMMON_FIELDS | (
-            frozenset({"databaseCount"}) if profile == "local" else frozenset()
-        )
+        expected_fields = COMMON_FIELDS
         fields = set(payload)
         unknown = sorted(fields - expected_fields)
         missing = sorted(expected_fields - fields)
@@ -142,11 +139,6 @@ class TenantSpec:
             workers=_required_count(payload, "workers"),
             pod_network=pod_network,
             service_network=service_network,
-            database_count=(
-                _required_count(payload, "databaseCount")
-                if profile == "local"
-                else None
-            ),
         )
 
     @property
@@ -159,11 +151,7 @@ class TenantSpec:
 
     @property
     def cluster_domain(self) -> str:
-        return f"{self.name}.capi.local" if self.profile == "local" else "cluster.local"
-
-    @property
-    def database_name(self) -> str | None:
-        return f"{self.name}-postgres" if self.profile == "local" else None
+        return "cluster.local"
 
     def to_mapping(self) -> dict[str, object]:
         result: dict[str, object] = {
@@ -175,8 +163,6 @@ class TenantSpec:
             "podCIDR": str(self.pod_network),
             "serviceCIDR": str(self.service_network),
         }
-        if self.database_count is not None:
-            result["databaseCount"] = self.database_count
         return result
 
     def canonical_json(self) -> str:

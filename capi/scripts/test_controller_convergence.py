@@ -15,7 +15,7 @@ from scripts.lib.controller_state import require_clean_controller_state
 from scripts.lib.controller_client import tenant_manifest_document
 from scripts.lib.controller_scenarios import verify_allocation_lease, verify_allocation_released
 from scripts.lib.kube import ManagementClient, wait_for
-from scripts.lib.locking import profile_lock, tools_lock
+from scripts.lib.locking import tools_lock
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
 from scripts.test_controller_allocation import run_allocation_gate
@@ -151,10 +151,7 @@ def _restore_after_gate(
 def main() -> None:
     config = load_configuration(ROOT)
     client = ManagementClient(ROOT, config)
-    with (
-        profile_lock(ROOT, "local", exclusive=True, create=True),
-        tools_lock(ROOT, exclusive=True),
-    ):
+    with tools_lock(ROOT, exclusive=True):
         _require_clean_state(ROOT, config, client)
         try:
             run_allocation_gate(ROOT, config, client)

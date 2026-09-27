@@ -45,7 +45,7 @@ class TenantTimings:
         operation: str,
         operation_id: str,
     ) -> None:
-        self.runtime = TenantRuntime(root, profile, tenant)
+        self.runtime = TenantRuntime(root, tenant)
         self.profile = profile
         self.tenant = tenant
         self.operation = operation
