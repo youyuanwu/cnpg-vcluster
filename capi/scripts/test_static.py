@@ -342,6 +342,10 @@ def check_repository_boundaries() -> None:
         "devmachinetemplates.infrastructure.cluster.x-k8s.io",
         "machinedeployments.cluster.x-k8s.io",
         "bootstrap.cluster.x-k8s.io/v1beta2",
+        "machinedeployment/",
+        "devmachine/",
+        "kubeadmconfig/",
+        "kamajicontrolplane/",
     ):
         check(
             identity not in catalog_consumers,

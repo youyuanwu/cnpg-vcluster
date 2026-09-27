@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::{
     api::{GROUP, Tenant, VERSION},
-    management::{MANAGEMENT_RESOURCES, ResourceClass},
+    management::{MANAGEMENT_RESOURCES, ResourceClass, by_kind},
 };
 
 pub const TENANT_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/tenant";
@@ -20,9 +20,6 @@ pub const TENANT_UID_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/tenant-uid";
 pub const SPEC_HASH_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/spec-hash";
 pub const FOUNDATION_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/foundation-hash";
 pub const RESOURCE_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/resource";
-pub const CLUSTER_API_VERSION: &str = "cluster.x-k8s.io/v1beta2";
-pub const CONTROL_PLANE_API_VERSION: &str = "controlplane.cluster.x-k8s.io/v1alpha2";
-
 #[derive(Clone, Copy, Debug)]
 pub struct Identity<'a> {
     pub tenant_name: &'a str,
@@ -333,8 +330,9 @@ pub fn validate_provider_owner_for_deletion(
         .as_ref()
         .and_then(|status| status.cluster_uid.as_deref());
     if definition.parent_kind == Some("Cluster")
-        && owner.api_version == CLUSTER_API_VERSION
-        && owner.kind == "Cluster"
+        && by_kind("Cluster").is_some_and(|cluster| {
+            owner.api_version == cluster.api_version && owner.kind == cluster.kind
+        })
         && owner.name == tenant_name
         && !owner.uid.is_empty()
         && cluster_uid == Some(&owner.uid)
@@ -410,9 +408,9 @@ pub fn validate_kubeconfig_secret_for_deletion(
     let Some([owner]) = secret.metadata.owner_references.as_deref() else {
         return Err(OwnershipError::SecretOwner);
     };
-    if owner.api_version != CONTROL_PLANE_API_VERSION
-        || owner.kind != "KamajiControlPlane"
-        || !reference_matches(owner, control_plane)
+    if !by_kind("KamajiControlPlane").is_some_and(|control_plane| {
+        owner.api_version == control_plane.api_version && owner.kind == control_plane.kind
+    }) || !reference_matches(owner, control_plane)
     {
         return Err(OwnershipError::SecretOwner);
     }

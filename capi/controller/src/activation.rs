@@ -282,8 +282,8 @@ fn inventory_blocks(resource: ManagementResource, item: &DynamicObject) -> bool 
         annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
             || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
     });
-    match resource.inventory_policy {
-        InventoryPolicy::BlockAnyInstance => true,
+    let marked = match resource.inventory_policy {
+        InventoryPolicy::BlockAnyInstance => return true,
         InventoryPolicy::TenantMarkers => tenant_marked,
         InventoryPolicy::TenantMarkersOrKamajiOwner => {
             tenant_marked
@@ -311,5 +311,6 @@ fn inventory_blocks(resource: ManagementResource, item: &DynamicObject) -> bool 
                     || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
             })
         }
-    }
+    };
+    marked || resource.exemptions.is_empty()
 }

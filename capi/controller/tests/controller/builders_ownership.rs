@@ -11,6 +11,7 @@ use kube::core::DynamicObject;
 use serde_json::json;
 use tenant_controller::{
     api::{Tenant, TenantSpec, TenantStatus},
+    management::by_kind,
     ownership::*,
 };
 
@@ -26,15 +27,7 @@ fn identity() -> Identity<'static> {
 }
 
 fn object(kind: &str, name: &str, uid: &str) -> DynamicObject {
-    let api = match kind {
-        "Namespace" => "v1",
-        "DevCluster" | "DevMachineTemplate" | "DevMachine" => {
-            "infrastructure.cluster.x-k8s.io/v1beta2"
-        }
-        "KamajiControlPlane" => CONTROL_PLANE_API_VERSION,
-        "KubeadmConfigTemplate" | "KubeadmConfig" => "bootstrap.cluster.x-k8s.io/v1beta2",
-        _ => CLUSTER_API_VERSION,
-    };
+    let api = by_kind(kind).map_or("v1", |resource| resource.api_version);
     serde_json::from_value(json!({
         "apiVersion":api,"kind":kind,
         "metadata":{"name":name,"namespace":"tenant-a","uid":uid},

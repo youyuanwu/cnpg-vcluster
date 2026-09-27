@@ -20,14 +20,20 @@ from scripts.lib.controller_scenarios import (
 from scripts.lib.kube import wait_for
 from scripts.lib.tenants import _tenant_kubectl
 
+MANAGEMENT_CATALOG = load_management_resources(Path(__file__).resolve().parents[1])
+
 
 def _verify_control_plane_active(client, config, tenant) -> None:
+    control_plane = resource_by_kind(MANAGEMENT_CATALOG, "KamajiControlPlane")
+    control_plane_name = control_plane.expected_name(tenant.name)
+    if control_plane_name is None:
+        raise RuntimeError("KamajiControlPlane has no expected name")
     kcp = json.loads(
         client.kubectl(
             "-n",
             tenant.namespace,
             "get",
-            f"kamajicontrolplane/{tenant.name}",
+            f"{control_plane.kubectl_resource}/{control_plane_name}",
             "-o",
             "json",
         ).stdout
@@ -249,7 +255,7 @@ def _drift_machine_deployment_and_wait_for_repair(
     tenant,
 ) -> None:
     deployment = resource_by_kind(
-        load_management_resources(client.root),
+        MANAGEMENT_CATALOG,
         "MachineDeployment",
     )
     deployment_name = deployment.expected_name(tenant.name)

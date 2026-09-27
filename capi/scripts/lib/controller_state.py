@@ -210,17 +210,21 @@ def _inventory(
     client: ManagementClient,
     resource: ManagementResource,
 ) -> list[dict[str, object]]:
-    arguments = []
-    if resource.inventory_namespace is not None:
-        arguments.extend(["-n", resource.inventory_namespace])
-    arguments.extend(["get", resource.kubectl_resource])
-    if resource.namespaced and resource.inventory_namespace is None:
-        arguments.append("-A")
-    try:
-        document = client.json(*arguments)
-    except RuntimeError as exc:
+    response = client.kubectl(
+        "get",
+        f"--raw={resource.inventory_path}",
+        check=False,
+    )
+    if response.returncode != 0:
         raise RuntimeError(
-            f"failed to inspect {resource.api_version} {resource.kind}"
+            f"failed to inspect {resource.api_version} {resource.kind}: "
+            f"{response.stderr}"
+        )
+    try:
+        document = json.loads(response.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"invalid inventory response for {resource.api_version} {resource.kind}"
         ) from exc
     items = document.get("items") if isinstance(document, dict) else None
     if not isinstance(items, list):
@@ -285,15 +289,15 @@ def _inventory_blocks(
     if resource.inventory_policy == "block-any-instance":
         return True
     if resource.inventory_policy == "tenant-markers":
-        return tenant_marked
-    if resource.inventory_policy == "tenant-markers-or-kamaji-owner":
-        return tenant_marked or any(
+        marked = tenant_marked
+    elif resource.inventory_policy == "tenant-markers-or-kamaji-owner":
+        marked = tenant_marked or any(
             isinstance(owner, dict)
             and owner.get("kind") == "KamajiControlPlane"
             for owner in owners
         )
-    if resource.inventory_policy == "allocation-markers":
-        return (
+    elif resource.inventory_policy == "allocation-markers":
+        marked = (
             "tenancy.cnpg-vcluster.io/slot-id" in labels
             or "tenancy.cnpg-vcluster.io/tenant" in labels
             or annotations.get("tenancy.cnpg-vcluster.io/resource")
@@ -302,7 +306,9 @@ def _inventory_blocks(
             or "tenancy.cnpg-vcluster.io/tenant" in annotations
             or "tenancy.cnpg-vcluster.io/tenant-uid" in annotations
         )
-    raise RuntimeError("management resource catalog inventory policy is invalid")
+    else:
+        raise RuntimeError("management resource catalog inventory policy is invalid")
+    return marked or not resource.exemptions
 
 
 def activation_ticket(

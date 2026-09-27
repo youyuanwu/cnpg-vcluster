@@ -726,6 +726,34 @@ where
     unreachable!("bounded status retries return")
 }
 
+pub fn map_management_to_tenant(
+    definition: management::ManagementResource,
+    object: &DynamicObject,
+) -> Vec<ObjectRef<Tenant>> {
+    let mapped = crate::runtime::map_dependent_to_tenant(object);
+    if !mapped.is_empty() {
+        return mapped;
+    }
+    match definition.watch_policy {
+        WatchPolicy::TenantAnnotationOrKubeconfigName => object
+            .namespace()
+            .filter(|namespace| {
+                definition
+                    .expected_name(namespace)
+                    .is_some_and(|name| name == object.name_any())
+            })
+            .map(|namespace| vec![ObjectRef::new(&namespace)])
+            .unwrap_or_default(),
+        WatchPolicy::TenantAnnotationOrClusterLabel => object
+            .labels()
+            .get("cluster.x-k8s.io/cluster-name")
+            .filter(|name| !name.is_empty())
+            .map(|name| vec![ObjectRef::new(name)])
+            .unwrap_or_default(),
+        WatchPolicy::TenantAnnotation | WatchPolicy::None => Vec::new(),
+    }
+}
+
 pub fn controller(client: Client, _config: &Config) -> Controller<Tenant> {
     let mut controller = tenant_controller(client.clone());
     for definition in management::watched() {
@@ -734,30 +762,7 @@ pub fn controller(client: Client, _config: &Config) -> Controller<Tenant> {
             Api::<DynamicObject>::all_with(client.clone(), &resource),
             resource,
             watcher::Config::default(),
-            move |object| {
-                let mapped = crate::runtime::map_dependent_to_tenant(&object);
-                if !mapped.is_empty() {
-                    return mapped;
-                }
-                match definition.watch_policy {
-                    WatchPolicy::TenantAnnotationOrKubeconfigName => object
-                        .namespace()
-                        .filter(|namespace| {
-                            definition
-                                .expected_name(namespace)
-                                .is_some_and(|name| name == object.name_any())
-                        })
-                        .map(|namespace| vec![ObjectRef::new(&namespace)])
-                        .unwrap_or_default(),
-                    WatchPolicy::TenantAnnotationOrClusterLabel => object
-                        .labels()
-                        .get("cluster.x-k8s.io/cluster-name")
-                        .filter(|name| !name.is_empty())
-                        .map(|name| vec![ObjectRef::new(name)])
-                        .unwrap_or_default(),
-                    WatchPolicy::TenantAnnotation | WatchPolicy::None => Vec::new(),
-                }
-            },
+            move |object| map_management_to_tenant(definition, &object),
         );
     }
     controller

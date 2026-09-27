@@ -27,14 +27,21 @@ from scripts.lib.tenants import (
 from scripts.network import run_network_gate
 from scripts.endpoint import _verify_bootstrap_secret
 
+MANAGEMENT_CATALOG = load_management_resources(Path(__file__).resolve().parents[1])
+
+
+def _management_resource(kind: str):
+    return resource_by_kind(MANAGEMENT_CATALOG, kind)
+
 
 def _machine_items(client: ManagementClient, tenant) -> list[dict[str, object]]:
+    machine = _management_resource("Machine")
     return json.loads(
         client.kubectl(
             "-n",
             tenant.namespace,
             "get",
-            "machines",
+            machine.kubectl_resource,
             "-l",
             f"cluster.x-k8s.io/cluster-name={tenant.name}",
             "-o",
@@ -45,12 +52,13 @@ def _machine_items(client: ManagementClient, tenant) -> list[dict[str, object]]:
 
 def _registered(client: ManagementClient, tenant, machine) -> dict[str, object]:
     name = machine["metadata"]["name"]
+    dev_machine = _management_resource("DevMachine")
     devmachine = json.loads(
         client.kubectl(
             "-n",
             tenant.namespace,
             "get",
-            f"devmachine/{name}",
+            f"{dev_machine.kubectl_resource}/{name}",
             "-o",
             "json",
         ).stdout
@@ -79,12 +87,13 @@ def worker_snapshot(
     tenant,
 ) -> dict[str, dict[str, str]]:
     items = _machine_items(client, tenant)
+    dev_machine = _management_resource("DevMachine")
     devmachines = json.loads(
         client.kubectl(
             "-n",
             tenant.namespace,
             "get",
-            "devmachines",
+            dev_machine.kubectl_resource,
             "-l",
             f"cluster.x-k8s.io/cluster-name={tenant.name}",
             "-o",
@@ -151,7 +160,7 @@ def _scale_three(
     tenant,
 ) -> None:
     deployment = resource_by_kind(
-        load_management_resources(root),
+        MANAGEMENT_CATALOG,
         "MachineDeployment",
     )
     deployment_name = deployment.expected_name(tenant.name)
@@ -316,11 +325,13 @@ def _interrupted_machine_deletion(
         "--replicas=0",
     )
     try:
+        machine_definition = _management_resource("Machine")
+        dev_machine_definition = _management_resource("DevMachine")
         client.kubectl(
             "-n",
             tenant.namespace,
             "delete",
-            f"machine/{removed_name}",
+            f"{machine_definition.kubectl_resource}/{removed_name}",
             "--wait=false",
         )
 
@@ -329,7 +340,7 @@ def _interrupted_machine_deletion(
                 "-n",
                 tenant.namespace,
                 "get",
-                f"devmachine/{removed_name}",
+                f"{dev_machine_definition.kubectl_resource}/{removed_name}",
                 "-o",
                 "json",
                 check=False,
@@ -403,13 +414,14 @@ def run_machine_gate(root: Path, config: dict[str, str]) -> None:
         delete_controller_tenant(root, config, tenant)
         if tenant_kubeconfig_path(root, tenant).exists():
             raise RuntimeError("tenant kubeconfig remained after Machine lifecycle cleanup")
+        secret_definition = _management_resource("Secret")
         for secret_name in bootstrap_secrets:
             if (
                 client.kubectl(
                     "-n",
                     tenant.namespace,
                     "get",
-                    f"secret/{secret_name}",
+                    f"{secret_definition.kubectl_resource}/{secret_name}",
                     check=False,
                 ).returncode
                 == 0

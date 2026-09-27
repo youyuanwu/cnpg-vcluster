@@ -436,27 +436,6 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
                     },
                 );
             }
-
-            #[tokio::test]
-            async fn malformed_catalog_inventory_identity_blocks_activation() {
-                let server = clean_server();
-                server.insert(TICKET, ticket("hash-b", "token-b"));
-                server.insert(
-                    &format!("{NAMESPACES}/tenant-a"),
-                    json!({"apiVersion":"v1","kind":"Namespace","metadata":{
-                        "name":"tenant-a"}}),
-                );
-                let error = admit(
-                    server.client(),
-                    &FakeDocker::default(),
-                    "hash-b",
-                    "token-b",
-                    true,
-                )
-                .await
-                .unwrap_err();
-                assert!(error.to_string().contains("inventory identity is invalid"));
-            }
             _ => unreachable!(),
         }
         assert!(
@@ -466,6 +445,64 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
             "{residue}"
         );
     }
+}
+
+#[tokio::test]
+async fn malformed_catalog_inventory_identity_blocks_activation() {
+    let server = clean_server();
+    server.insert(TICKET, ticket("hash-b", "token-b"));
+    server.insert(
+        &format!("{NAMESPACES}/tenant-a"),
+        json!({"apiVersion":"v1","kind":"Namespace","metadata":{
+            "name":"tenant-a"}}),
+    );
+    let error = admit(
+        server.client(),
+        &FakeDocker::default(),
+        "hash-b",
+        "token-b",
+        true,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("inventory identity is invalid"));
+}
+
+#[tokio::test]
+async fn unmarked_typed_infrastructure_is_exempt_from_activation_inventory() {
+    let server = clean_server();
+    server.insert(TICKET, ticket("hash-b", "token-b"));
+    server.insert(
+        &format!("{NAMESPACES}/management"),
+        json!({"apiVersion":"v1","kind":"Namespace","metadata":{
+            "name":"management","uid":"namespace-uid"}}),
+    );
+    server.insert(
+        &format!("{SECRETS}/controller-secret"),
+        json!({"apiVersion":"v1","kind":"Secret","metadata":{
+            "name":"controller-secret","namespace":"tenant-system","uid":"secret-uid"}}),
+    );
+    server.insert(
+        &format!("{LEASES}/tenant-controller.tenancy.cnpg-vcluster.io"),
+        Lease {
+            metadata: ObjectMeta {
+                name: Some("tenant-controller.tenancy.cnpg-vcluster.io".into()),
+                namespace: Some("tenant-system".into()),
+                uid: Some("leader-uid".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    admit(
+        server.client(),
+        &FakeDocker::default(),
+        "hash-b",
+        "token-b",
+        true,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]

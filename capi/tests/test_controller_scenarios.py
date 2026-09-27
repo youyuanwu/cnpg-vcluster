@@ -326,6 +326,38 @@ class ControllerScenarioTests(unittest.TestCase):
             snapshot["workerContainers"],
         )
         self.assertEqual(8, len(snapshot["managementResources"]))
+        self.assertEqual(
+            {
+                ("namespaces", "", "tenant-a"),
+                ("clusters.cluster.x-k8s.io", "tenant-a", "tenant-a"),
+                ("devclusters.infrastructure.cluster.x-k8s.io", "tenant-a", "tenant-a"),
+                (
+                    "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
+                    "tenant-a",
+                    "tenant-a",
+                ),
+                (
+                    "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io",
+                    "tenant-a",
+                    "tenant-a-worker",
+                ),
+                (
+                    "devmachinetemplates.infrastructure.cluster.x-k8s.io",
+                    "tenant-a",
+                    "tenant-a-worker",
+                ),
+                (
+                    "machinedeployments.cluster.x-k8s.io",
+                    "tenant-a",
+                    "tenant-a-worker",
+                ),
+                ("secrets", "tenant-a", "tenant-a-kubeconfig"),
+            },
+            {
+                (resource, namespace, name)
+                for resource, namespace, name, _uid in snapshot["managementResources"]
+            },
+        )
         self.assertIn("tenant-a-lb cccc", snapshot["providerContainers"])
 
     def test_endpoint_gate_cleans_partially_applied_tenant(self) -> None:

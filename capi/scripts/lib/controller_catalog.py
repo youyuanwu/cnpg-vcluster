@@ -1,3 +1,10 @@
+"""Generated local-operator resource identities.
+
+Allocation names, fixed controller infrastructure, provider-only CRDs,
+break-glass allowlists, test fixtures, and tenant-internal resources remain
+owned by their domain modules.
+"""
+
 from __future__ import annotations
 
 import json
@@ -72,6 +79,13 @@ class ManagementResource:
         if self.group:
             return f"/apis/{self.group}/{self.version}"
         return f"/api/{self.version}"
+
+    @property
+    def inventory_path(self) -> str:
+        base = self.discovery_path
+        if self.inventory_namespace is not None:
+            return f"{base}/namespaces/{self.inventory_namespace}/{self.plural}"
+        return f"{base}/{self.plural}"
 
     def expected_name(self, tenant: str) -> str | None:
         if self.name_policy == "tenant":

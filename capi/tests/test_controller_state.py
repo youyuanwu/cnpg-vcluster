@@ -33,6 +33,17 @@ for entry in CATALOG:
     group, separator, version = entry["apiVersion"].partition("/")
     path = f"/apis/{group}/{version}" if separator else f"/api/{group}"
     BY_DISCOVERY.setdefault(path, []).append(entry)
+BY_INVENTORY = {}
+for entry in CATALOG:
+    group, separator, version = entry["apiVersion"].partition("/")
+    base = f"/apis/{group}/{version}" if separator else f"/api/{group}"
+    namespace = entry["inventoryNamespace"]
+    path = (
+        f"{base}/namespaces/{namespace}/{entry['plural']}"
+        if namespace is not None
+        else f"{base}/{entry['plural']}"
+    )
+    BY_INVENTORY[path] = entry
 
 
 def response(value="", code=0, error=""):
@@ -60,6 +71,8 @@ def clean_handler(*args, **_kwargs):
         return response("")
     raw = next((arg.removeprefix("--raw=") for arg in args if arg.startswith("--raw=")), None)
     if raw is not None:
+        if raw in BY_INVENTORY:
+            return response({"items": []})
         return response({
             "resources": [
                 {
@@ -90,6 +103,17 @@ def item(kind: str, metadata: dict[str, object]) -> dict[str, object]:
             **metadata,
         },
     }
+
+
+def raw_path(args) -> str | None:
+    return next(
+        (arg.removeprefix("--raw=") for arg in args if arg.startswith("--raw=")),
+        None,
+    )
+
+
+def inventory_path(kind: str) -> str:
+    return next(path for path, entry in BY_INVENTORY.items() if entry["kind"] == kind)
 
 
 def prepare_root(directory: str) -> Path:
@@ -244,6 +268,28 @@ class ControllerStateTests(unittest.TestCase):
         ):
             require_clean_controller_state(prepare_root(directory), Client(clean_handler))
 
+    def test_inventory_reads_use_exact_declared_api_paths(self) -> None:
+        calls = []
+
+        def handle(*args, **kwargs):
+            calls.append(args)
+            return clean_handler(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "scripts.lib.controller_state.run",
+            return_value=response(""),
+        ):
+            require_clean_controller_state(prepare_root(directory), Client(handle))
+        self.assertTrue(
+            any(
+                f"--raw={inventory_path('Cluster')}" in call
+                for call in calls
+            )
+        )
+        self.assertFalse(
+            any("clusters.cluster.x-k8s.io" in call for call in calls)
+        )
+
     def test_offline_registry_container_is_management_infrastructure(self) -> None:
         def docker(*args, **_kwargs):
             command = args[0]
@@ -299,9 +345,9 @@ class ControllerStateTests(unittest.TestCase):
                 def handle(*args, **kwargs):
                     if case == "tenant" and "tenants.tenancy.cnpg-vcluster.io" in args:
                         return response("tenant.tenancy.cnpg-vcluster.io/tenant-a")
-                    if case == "provider" and "clusters.cluster.x-k8s.io" in args:
+                    if case == "provider" and raw_path(args) == inventory_path("Cluster"):
                         return response({"items": [item("Cluster", {})]})
-                    if case.startswith("lease") and "leases.coordination.k8s.io" in args:
+                    if case.startswith("lease") and raw_path(args) == inventory_path("Lease"):
                         metadata = {
                             "lease": {
                                 "labels": {
@@ -359,11 +405,11 @@ class ControllerStateTests(unittest.TestCase):
 
     def test_unmarked_typed_infrastructure_is_exempt(self) -> None:
         def handle(*args, **kwargs):
-            if "namespaces" in args:
+            if raw_path(args) == inventory_path("Namespace"):
                 return response({"items": [item("Namespace", {})]})
-            if "secrets" in args:
+            if raw_path(args) == inventory_path("Secret"):
                 return response({"items": [item("Secret", {})]})
-            if "leases.coordination.k8s.io" in args:
+            if raw_path(args) == inventory_path("Lease"):
                 return response({
                     "items": [
                         item("Lease", {
@@ -391,13 +437,10 @@ class ControllerStateTests(unittest.TestCase):
                 "ownerReferences": [{"kind": "KamajiControlPlane"}]
             }),
         ):
-            resource = next(
-                name for name, entry in BY_RESOURCE.items()
-                if entry["kind"] == kind
-            )
+            resource = inventory_path(kind)
 
             def handle(*args, **kwargs):
-                if resource in args:
+                if raw_path(args) == resource:
                     return response({"items": [item(kind, metadata)]})
                 return clean_handler(*args, **kwargs)
 
@@ -409,7 +452,7 @@ class ControllerStateTests(unittest.TestCase):
 
     def test_inventory_errors_never_mean_absence(self) -> None:
         def handle(*args, **kwargs):
-            if "clusters.cluster.x-k8s.io" in args:
+            if raw_path(args) == inventory_path("Cluster"):
                 return response(code=1, error="Forbidden")
             return clean_handler(*args, **kwargs)
 
@@ -433,7 +476,7 @@ class ControllerStateTests(unittest.TestCase):
 
     def test_malformed_inventory_never_means_absence(self) -> None:
         def handle(*args, **kwargs):
-            if "clusters.cluster.x-k8s.io" in args:
+            if raw_path(args) == inventory_path("Cluster"):
                 return response({})
             return clean_handler(*args, **kwargs)
 
@@ -449,13 +492,10 @@ class ControllerStateTests(unittest.TestCase):
             ("Lease", {"namespace": "wrong-system"}),
         )
         for kind, metadata in cases:
-            resource = next(
-                name for name, entry in BY_RESOURCE.items()
-                if entry["kind"] == kind
-            )
+            resource = inventory_path(kind)
 
             def handle(*args, **kwargs):
-                if resource in args:
+                if raw_path(args) == resource:
                     return response({"items": [item(kind, metadata)]})
                 return clean_handler(*args, **kwargs)
 
@@ -477,6 +517,25 @@ class ControllerStateTests(unittest.TestCase):
             path.write_text(json.dumps(catalog), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "metadata is invalid"):
                 require_clean_controller_state(root, Client(clean_handler))
+
+    def test_catalog_fixture_changes_named_resource_resolution(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = prepare_root(directory)
+            path = root / "controller/config/management-resources.json"
+            catalog = json.loads(path.read_text())
+            deployment = next(
+                entry for entry in catalog
+                if entry["kind"] == "MachineDeployment"
+            )
+            deployment["namePolicy"] = "tenant"
+            path.write_text(json.dumps(catalog), encoding="utf-8")
+            resources = load_management_resources(root)
+            self.assertEqual(
+                resource_by_kind(resources, "MachineDeployment").expected_name(
+                    "tenant-a"
+                ),
+                "tenant-a",
+            )
 
 
 if __name__ == "__main__":

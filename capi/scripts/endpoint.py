@@ -35,9 +35,11 @@ from scripts.lib.tenants import (
     verify_worker_runtime,
 )
 
+MANAGEMENT_CATALOG = load_management_resources(Path(__file__).resolve().parents[1])
+
 
 def _verify_no_worker_state(client: ManagementClient, tenant) -> None:
-    resources = load_management_resources(client.root)
+    resources = MANAGEMENT_CATALOG
     for kind in ("Machine", "DevMachine", "KubeadmConfig"):
         resource = resource_by_kind(resources, kind)
         payload = json.loads(
@@ -78,16 +80,17 @@ def _verify_bootstrap_secret(
     registered: dict[str, object],
 ) -> None:
     kubeadm_definition = resource_by_kind(
-        load_management_resources(client.root),
+        MANAGEMENT_CATALOG,
         "KubeadmConfig",
     )
+    secret_definition = resource_by_kind(MANAGEMENT_CATALOG, "Secret")
     name = str(registered["secret"])
     secret = json.loads(
         client.kubectl(
             "-n",
             tenant.namespace,
             "get",
-            f"secret/{name}",
+            f"{secret_definition.kubectl_resource}/{name}",
             "-o",
             "json",
         ).stdout
@@ -138,7 +141,7 @@ def _verify_bootstrap_secret(
             "auth",
             "can-i",
             "get",
-            f"secret/{name}",
+            f"{secret_definition.kubectl_resource}/{name}",
             "-n",
             tenant.namespace,
             f"--as={identity}",
@@ -158,7 +161,7 @@ def _verify_bootstrap_secret(
             "auth",
             "can-i",
             "get",
-            f"secret/{name}",
+            f"{secret_definition.kubectl_resource}/{name}",
             "-n",
             tenant.namespace,
             f"--as={denied}",
@@ -217,13 +220,23 @@ def run_endpoint_gate(
         resources = verify_tenant_management_ownership(config, client, tenant)
         verify_tenant_control_plane_contract(config, tenant, resources)
         workers = worker_snapshot(root, config, client, tenant)
+        machine_definition = resource_by_kind(MANAGEMENT_CATALOG, "Machine")
+        dev_machine_definition = resource_by_kind(MANAGEMENT_CATALOG, "DevMachine")
+        control_plane_definition = resource_by_kind(
+            MANAGEMENT_CATALOG,
+            "KamajiControlPlane",
+        )
+        secret_definition = resource_by_kind(MANAGEMENT_CATALOG, "Secret")
+        control_plane_name = control_plane_definition.expected_name(tenant.name)
+        if control_plane_name is None:
+            raise RuntimeError("KamajiControlPlane has no expected name")
         registered = None
         for machine in json.loads(
             client.kubectl(
                 "-n",
                 tenant.namespace,
                 "get",
-                "machines",
+                machine_definition.kubectl_resource,
                 "-l",
                 f"cluster.x-k8s.io/cluster-name={tenant.name}",
                 "-o",
@@ -241,7 +254,7 @@ def run_endpoint_gate(
                         "-n",
                         tenant.namespace,
                         "get",
-                        f"devmachine/{name}",
+                        f"{dev_machine_definition.kubectl_resource}/{name}",
                         "-o",
                         "json",
                     ).stdout
@@ -271,7 +284,7 @@ def run_endpoint_gate(
                 "-n",
                 tenant.namespace,
                 "get",
-                f"kamajicontrolplane/{tenant.name}",
+                f"{control_plane_definition.kubectl_resource}/{control_plane_name}",
                 "-o",
                 "json",
             ).stdout
@@ -309,7 +322,7 @@ def run_endpoint_gate(
                 "-n",
                 tenant.namespace,
                 "get",
-                f"secret/{registered['secret']}",
+                f"{secret_definition.kubectl_resource}/{registered['secret']}",
                 "-o",
                 "json",
             ).stdout
@@ -364,7 +377,7 @@ def run_endpoint_gate(
                             "-n",
                             tenant.namespace,
                             "get",
-                            f"secret/{secret_name}",
+                            f"{secret_definition.kubectl_resource}/{secret_name}",
                             check=False,
                         ).returncode
                         == 0

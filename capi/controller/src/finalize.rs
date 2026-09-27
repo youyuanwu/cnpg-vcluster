@@ -300,8 +300,11 @@ impl<D: DockerClient> Finalizer<D> {
                 checked.map_err(|error| invalid(error.to_string()))?;
             }
         }
+        let secret_name = management::by_kind("Secret")
+            .and_then(|resource| resource.expected_name(name))
+            .ok_or_else(|| invalid("Secret has no declared name"))?;
         let secret = Api::<Secret>::namespaced(self.client.clone(), name)
-            .get_opt(&format!("{name}-kubeconfig"))
+            .get_opt(&secret_name)
             .await?;
         if let Some(secret) = &secret {
             let control_plane = root_kinds

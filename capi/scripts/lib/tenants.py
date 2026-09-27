@@ -45,6 +45,11 @@ LIFECYCLE_MARKERS = {
     "foundationSha256": "lifecycle.cnpg-vcluster.capi/foundation-sha256",
     "operationId": "lifecycle.cnpg-vcluster.capi/operation-id",
 }
+MANAGEMENT_CATALOG = load_management_resources(Path(__file__).resolve().parents[2])
+
+
+def _management_resource(kind: str):
+    return resource_by_kind(MANAGEMENT_CATALOG, kind)
 
 
 @dataclass
@@ -161,7 +166,7 @@ def verify_tenant_management_ownership(
         raise RuntimeError(
             f"tenant namespace inspection failed: {namespace_response.stderr}"
         )
-    resources = load_management_resources(Path(__file__).resolve().parents[2])
+    resources = MANAGEMENT_CATALOG
     for definition in resources:
         if definition.resource_class != "root":
             continue
@@ -340,6 +345,10 @@ def _wait_resource(
     description: str,
     predicate,
 ):
+    cluster = _management_resource("Cluster")
+    cluster_name = cluster.expected_name(tenant.name)
+    if cluster_name is None:
+        raise RuntimeError("Cluster has no expected name")
     return wait_for(
         description,
         parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"]),
@@ -350,7 +359,7 @@ def _wait_resource(
                 "-n",
                 tenant.namespace,
                 "get",
-                f"cluster/{tenant.name}",
+                f"{cluster.kubectl_resource}/{cluster_name}",
                 check=False,
             ).returncode
             == 0
@@ -411,7 +420,7 @@ def validate_tenant_kubeconfig_file(
             "-n",
             tenant.namespace,
             "get",
-            f"secret/{tenant.name}-ca",
+            f"{_management_resource('Secret').kubectl_resource}/{tenant.name}-ca",
             "-o",
             "json",
         ).stdout
@@ -474,12 +483,16 @@ def export_tenant_kubeconfig(
     client: ManagementClient,
     tenant: Tenant,
 ) -> Path:
+    secret = _management_resource("Secret")
+    secret_name = secret.expected_name(tenant.name)
+    if secret_name is None:
+        raise RuntimeError("tenant kubeconfig Secret has no expected name")
     secret = json.loads(
         client.kubectl(
             "-n",
             tenant.namespace,
             "get",
-            f"secret/{tenant.name}-kubeconfig",
+            f"{secret.kubectl_resource}/{secret_name}",
             "-o",
             "json",
         ).stdout
@@ -645,11 +658,12 @@ def read_storage_marker(
 
 
 def _machine(client: ManagementClient, tenant: Tenant) -> dict[str, object] | None:
+    machine = _management_resource("Machine")
     response = client.kubectl(
         "-n",
         tenant.namespace,
         "get",
-        "machines",
+        machine.kubectl_resource,
         "-l",
         f"cluster.x-k8s.io/cluster-name={tenant.name}",
         "-o",
@@ -673,8 +687,18 @@ def wait_for_registered_node(
         if not machine:
             return None
         name = machine["metadata"]["name"]
-        devmachine = _resource(client, tenant, "devmachine", name)
-        kubeadm = _resource(client, tenant, "kubeadmconfig", name)
+        devmachine = _resource(
+            client,
+            tenant,
+            _management_resource("DevMachine").kubectl_resource,
+            name,
+        )
+        kubeadm = _resource(
+            client,
+            tenant,
+            _management_resource("KubeadmConfig").kubectl_resource,
+            name,
+        )
         node_ref = machine.get("status", {}).get("nodeRef", {}).get("name")
         if not devmachine or not kubeadm or not node_ref:
             return None
@@ -743,7 +767,7 @@ def verify_authoritative_endpoint(
             "-n",
             tenant.namespace,
             "get",
-            f"secret/{registered['secret']}",
+            f"{_management_resource('Secret').kubectl_resource}/{registered['secret']}",
             "-o",
             "json",
         ).stdout
@@ -855,7 +879,12 @@ def endpoint_snapshot(
                 "uid": resource["metadata"]["uid"],
             }
     if machine:
-        devmachine = _resource(client, tenant, "devmachine", machine["metadata"]["name"])
+        devmachine = _resource(
+            client,
+            tenant,
+            _management_resource("DevMachine").kubectl_resource,
+            machine["metadata"]["name"],
+        )
         node_name = machine.get("status", {}).get("nodeRef", {}).get("name")
         node = None
         if node_name and tenant_kubeconfig_path(root, tenant).is_file():

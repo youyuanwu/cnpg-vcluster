@@ -9,6 +9,7 @@ use serde_json::Value;
 
 use crate::{
     api::Tenant,
+    management,
     ownership::{self, Identity, RESOURCE_ANNOTATION},
 };
 
@@ -250,12 +251,20 @@ pub async fn ensure_management(
                 .is_some_and(|types| types.kind == "MachineDeployment")
         })
     {
+        let deployment_resource = management::by_kind("MachineDeployment").ok_or_else(|| {
+            ReconcileError::InvalidInput("MachineDeployment is not catalogued".into())
+        })?;
+        let deployment_name = deployment_resource
+            .expected_name(identity.tenant_name)
+            .ok_or_else(|| {
+                ReconcileError::InvalidInput("MachineDeployment has no declared name".into())
+            })?;
         let api = api_for(
             client.clone(),
-            &resource(ownership::CLUSTER_API_VERSION, "MachineDeployment"),
+            &deployment_resource.api_resource(),
             Some(identity.tenant_name),
         );
-        let deployment = api.get(&format!("{}-worker", identity.tenant_name)).await?;
+        let deployment = api.get(&deployment_name).await?;
         ownership::validate_root_ownership(&deployment.metadata, identity, "machine-deployment")?;
         ownership::validate_provider_owner(&deployment, identity.tenant_name, false, inventory)?;
         inventory.push(deployment);

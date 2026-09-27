@@ -320,6 +320,13 @@ pub fn activation_resources() -> impl Iterator<Item = ManagementResource> {
     MANAGEMENT_RESOURCES.iter().copied()
 }
 
+pub fn by_kind(kind: &str) -> Option<ManagementResource> {
+    MANAGEMENT_RESOURCES
+        .iter()
+        .copied()
+        .find(|resource| resource.kind == kind)
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeSet;
