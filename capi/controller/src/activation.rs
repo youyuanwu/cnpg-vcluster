@@ -249,7 +249,7 @@ fn validate_inventory_item(
     resource: ManagementResource,
     item: &DynamicObject,
 ) -> Result<(), ControllerError> {
-    let valid_type = item.types.as_ref().is_some_and(|types| {
+    let valid_type = item.types.as_ref().is_none_or(|types| {
         types.api_version == resource.api_version && types.kind == resource.kind
     });
     let valid_namespace = if resource.namespaced {

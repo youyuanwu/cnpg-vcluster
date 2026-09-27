@@ -33,6 +33,14 @@ do not depend on condition order, cached True conditions, or an internal
 reconciliation stage. The supported local status command owns exit
 classification.
 
+Every status and finalizer write is an exact merge patch containing the
+observed UID and current resourceVersion. The controller revalidates UID,
+generation, literal spec, and deletion timestamp before writing and rejects a
+replacement response. General status conflicts may retry only after a fresh
+exact read; finalizer conflicts wait for another reconciliation pass.
+Unchanged status/finalizer state is a no-op, and clearing allocation emits an
+explicit JSON `null`.
+
 Python resolves the tracked slot catalog and publishes a checksum-verified
 schema-3 foundation. One non-expiring namespaced allocation Lease claims the
 endpoint/Pod CIDR/Service CIDR tuple. Its exact name and markers bind Tenant

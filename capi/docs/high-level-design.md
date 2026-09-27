@@ -200,13 +200,19 @@ The manager loads one immutable foundation snapshot at startup. A stable
 accepted-identity ConfigMap permits same-identity restarts with active Tenants.
 Changed identity requires a candidate-bound activation ticket plus direct
 Tenant, provider, Lease, and Docker inventory. The installer checks host-only
-legacy state, drains the prior controller, and restores it if candidate
-activation fails. Unsupported legacy or foreign residue blocks activation and
-is never deleted automatically.
+inventory, drains the prior controller, and restores it if candidate
+activation fails. Known private local compatibility files are not lifecycle
+identity and are discarded only by explicit cleanup; live unsupported
+Kubernetes, provider, or Docker residue still blocks activation.
 
 Management resource identity is generated once from the Rust catalog and
 consumed by builders, ownership validation, RBAC, watches, activation
-inventory, worker observation, finalization, and Python installation checks.
+inventory, worker observation, finalization, Python installation checks, and
+deletion evidence. The catalog declares exact served API identity, scope,
+naming, watch suffix/label routing, inventory namespace/policy, and
+exemptions. Allocation names, fixed controller infrastructure, provider-only
+CRDs, break-glass allowlists, and tenant-internal resources remain
+domain-owned.
 
 ## Finalization and recovery
 
@@ -216,6 +222,13 @@ not acquire a shared destructive lock.
 The finalizer owns the management Kubernetes client directly; there is no
 test-only Kubernetes adapter in the production path. Allocation release uses
 the same exact live implementation in direct tests and finalization.
+
+Status and finalizer writes use one exact Tenant mutation contract. Every
+write binds UID and resourceVersion after revalidating UID, generation,
+literal spec, and deletion timestamp. General status conflicts refresh and
+retry only while that identity remains exact; finalizer conflicts requeue
+without a failure-status write. Allocation clearing explicitly publishes
+`null` before finalizer removal.
 
 Finalization is ordered:
 
@@ -299,7 +312,9 @@ just local-tenant-delete tenant-example
 ```
 
 The legacy local JSON adapter, imperative create/delete modules, runtime
-journals, and callable local mutators have been removed. Azure commands remain:
+journals, profile lock, and callable local mutators have been removed. The
+schema-1 specification, durable journal, identity, Ready/timing evidence, and
+profile lock are Azure-only. Azure commands remain:
 
 ```bash
 just tenant-create azure config/tenants/examples/azure.json

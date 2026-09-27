@@ -72,7 +72,7 @@ def clean_handler(*args, **_kwargs):
     raw = next((arg.removeprefix("--raw=") for arg in args if arg.startswith("--raw=")), None)
     if raw is not None:
         if raw in BY_INVENTORY:
-            return response({"items": []})
+            return response(inventory(BY_INVENTORY[raw]["kind"], []))
         return response({
             "resources": [
                 {
@@ -85,7 +85,7 @@ def clean_handler(*args, **_kwargs):
         })
     resource = next((arg for arg in args if arg in BY_RESOURCE), None)
     if resource is not None:
-        return response({"items": []})
+        return response(inventory(BY_RESOURCE[resource]["kind"], []))
     if "get" in args:
         return response(code=1, error="NotFound")
     return response()
@@ -102,6 +102,15 @@ def item(kind: str, metadata: dict[str, object]) -> dict[str, object]:
             **({"namespace": "tenant-a"} if entry["namespaced"] else {}),
             **metadata,
         },
+    }
+
+
+def inventory(kind: str, items: list[dict[str, object]]) -> dict[str, object]:
+    entry = next(entry for entry in CATALOG if entry["kind"] == kind)
+    return {
+        "apiVersion": entry["apiVersion"],
+        "kind": f"{kind}List",
+        "items": items,
     }
 
 
@@ -353,7 +362,7 @@ class ControllerStateTests(unittest.TestCase):
                     if case == "tenant" and "tenants.tenancy.cnpg-vcluster.io" in args:
                         return response("tenant.tenancy.cnpg-vcluster.io/tenant-a")
                     if case == "provider" and raw_path(args) == inventory_path("Cluster"):
-                        return response({"items": [item("Cluster", {})]})
+                        return response(inventory("Cluster", [item("Cluster", {})]))
                     if case.startswith("lease") and raw_path(args) == inventory_path("Lease"):
                         metadata = {
                             "lease": {
@@ -378,7 +387,7 @@ class ControllerStateTests(unittest.TestCase):
                             },
                         }[case]
                         metadata["namespace"] = "tenant-system"
-                        return response({"items": [item("Lease", metadata)]})
+                        return response(inventory("Lease", [item("Lease", metadata)]))
                     return clean_handler(*args, **kwargs)
 
                 def docker(*args, **_kwargs):
@@ -413,18 +422,19 @@ class ControllerStateTests(unittest.TestCase):
     def test_unmarked_typed_infrastructure_is_exempt(self) -> None:
         def handle(*args, **kwargs):
             if raw_path(args) == inventory_path("Namespace"):
-                return response({"items": [item("Namespace", {})]})
+                return response(inventory("Namespace", [item("Namespace", {})]))
             if raw_path(args) == inventory_path("Secret"):
-                return response({"items": [item("Secret", {})]})
+                return response(inventory("Secret", [item("Secret", {})]))
             if raw_path(args) == inventory_path("Lease"):
-                return response({
-                    "items": [
+                return response(inventory(
+                    "Lease",
+                    [
                         item("Lease", {
                             "name": "tenant-controller.tenancy.cnpg-vcluster.io",
                             "namespace": "tenant-system",
                         })
-                    ]
-                })
+                    ],
+                ))
             return clean_handler(*args, **kwargs)
 
         with tempfile.TemporaryDirectory() as directory, patch(
@@ -448,7 +458,7 @@ class ControllerStateTests(unittest.TestCase):
 
             def handle(*args, **kwargs):
                 if raw_path(args) == resource:
-                    return response({"items": [item(kind, metadata)]})
+                    return response(inventory(kind, [item(kind, metadata)]))
                 return clean_handler(*args, **kwargs)
 
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory, patch(
@@ -503,7 +513,7 @@ class ControllerStateTests(unittest.TestCase):
 
             def handle(*args, **kwargs):
                 if raw_path(args) == resource:
-                    return response({"items": [item(kind, metadata)]})
+                    return response(inventory(kind, [item(kind, metadata)]))
                 return clean_handler(*args, **kwargs)
 
             with self.subTest(kind=kind), tempfile.TemporaryDirectory() as directory, patch(

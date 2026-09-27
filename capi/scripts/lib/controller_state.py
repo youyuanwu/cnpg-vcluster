@@ -227,7 +227,12 @@ def _inventory(
             f"invalid inventory response for {resource.api_version} {resource.kind}"
         ) from exc
     items = document.get("items") if isinstance(document, dict) else None
-    if not isinstance(items, list):
+    if (
+        not isinstance(document, dict)
+        or document.get("apiVersion") != resource.api_version
+        or document.get("kind") != f"{resource.kind}List"
+        or not isinstance(items, list)
+    ):
         raise RuntimeError(
             f"invalid inventory response for {resource.api_version} {resource.kind}"
         )
@@ -257,8 +262,11 @@ def _inventory(
         )
         if (
             not isinstance(item, dict)
-            or item.get("apiVersion") != resource.api_version
-            or item.get("kind") != resource.kind
+            or (
+                "apiVersion" in item
+                and item["apiVersion"] != resource.api_version
+            )
+            or ("kind" in item and item["kind"] != resource.kind)
             or not isinstance(metadata, dict)
             or not isinstance(metadata.get("name"), str)
             or not metadata["name"]

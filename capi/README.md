@@ -284,8 +284,9 @@ Reconciliation and deletion are fail-closed:
 - tenant-internal resources and bootstrap RBAC are disposable with the
   dedicated tenant cluster; finalization does not contact the tenant API or
   require a cleanup checkpoint. Management/host ownership remains fail-closed.
-  Unsupported legacy controller state blocks installation and is never
-  migrated or deleted automatically.
+  Unsupported live legacy Kubernetes/provider/Docker residue blocks
+  installation and is never migrated. Known private local compatibility files
+  are not lifecycle identity and are removed only by explicit cleanup.
 
 The controller does not persist a creation program counter or child-resource
 UID ledger. Missing children are discovered from live state. Static bootstrap
@@ -306,6 +307,20 @@ compatibility checks. Deletion retains uncached live host ownership checks
 before destructive operations. The resolved slot catalog is part of schema 3;
 its immutable hash excludes only controller image identity. Leader
 election uses a separate renewable Lease, not an allocation slot.
+
+The generated management-resource catalog owns exact API identity, scope,
+Tenant/worker/kubeconfig naming, watch suffix/label routing, activation policy,
+and fixed inventory namespaces. Rust and Python consume the same declaration
+for watches, ownership, clean-state inventory, and deletion evidence.
+Allocation names, fixed controller infrastructure, provider-only CRDs,
+break-glass allowlists, and tenant-internal resources remain domain-owned.
+
+Tenant status and finalizer writes share one exact mutation contract. Patches
+bind UID and resourceVersion after validating UID, generation, literal spec,
+and deletion timestamp. General status conflicts reread and retry only the
+same identity; finalizer conflicts requeue without a failure-status write.
+Finalizer addition/removal are metadata merge patches, and allocation clearing
+publishes explicit JSON `null`.
 
 ## Status, conditions, and exits
 
