@@ -30,6 +30,7 @@ from scripts.lib.azure.deletion import _remove_private_tree
 from scripts.lib.azure.gate import (
     build_worker_snapshot,
     refreshed_observed,
+    require_owned_resource_delta,
     require_replacement,
 )
 from scripts.lib.azure.ownership import discover_azure_owned_resources
@@ -313,6 +314,25 @@ def main(arguments: list[str]) -> int:
         / f"lifecycle-{operation_id}.json"
     )
 
+    def persist_evidence():
+        write_private_file(
+            evidence,
+            json.dumps(
+                redact_value(
+                    {
+                        "schema": 1,
+                        "operationId": operation_id,
+                        "tenant": spec.name,
+                        "specificationSha256": spec.sha256(),
+                        "revision": revision,
+                        "records": records,
+                    }
+                ),
+                sort_keys=True,
+            )
+            + "\n",
+        )
+
     def phase(name, operation):
         started = time.monotonic()
         try:
@@ -326,6 +346,7 @@ def main(arguments: list[str]) -> int:
                     "blocker": redact(str(exc)),
                 }
             )
+            persist_evidence()
             raise
         records.append(
             {
@@ -334,6 +355,7 @@ def main(arguments: list[str]) -> int:
                 "seconds": round(time.monotonic() - started, 3),
             }
         )
+        persist_evidence()
         return value
 
     primary = None
@@ -397,19 +419,48 @@ def main(arguments: list[str]) -> int:
                 )
             identity = runtime.load_identity()
             before = _recorded_worker_snapshot(identity)
-            recovered, blockers = _collect_ready_observations(ROOT, config, spec)
-            if blockers:
-                raise RuntimeError(
-                    "Azure worker recovery is incomplete: " + "; ".join(blockers)
+            deadline = time.monotonic() + parse_duration(
+                config["AZURE_TENANT_TIMEOUT"]
+            )
+            last_blockers = ("worker recovery has not been observed",)
+            while time.monotonic() < deadline:
+                recovered, blockers = _collect_ready_observations(
+                    ROOT,
+                    config,
+                    spec,
                 )
-            instances = _vmss_instances(config, before.vmss_id)
-            after = build_worker_snapshot(recovered, before.vmss_id, instances)
-            require_replacement(before, after)
+                instances = _vmss_instances(config, before.vmss_id)
+                if not blockers:
+                    try:
+                        after = build_worker_snapshot(
+                            recovered,
+                            before.vmss_id,
+                            instances,
+                        )
+                        deleted, replacement = require_replacement(before, after)
+                    except RuntimeError as exc:
+                        last_blockers = (str(exc),)
+                    else:
+                        break
+                else:
+                    last_blockers = blockers
+                time.sleep(10)
+            else:
+                raise RuntimeError(
+                    "Azure worker recovery timed out: "
+                    + "; ".join(last_blockers)
+                )
             discovery = discover_azure_owned_resources(
                 ROOT,
                 config,
                 spec,
                 identity,
+            )
+            require_owned_resource_delta(
+                identity.observed["azureResources"],
+                discovery,
+                deleted,
+                replacement,
             )
             observed = refreshed_observed(
                 identity.observed,
@@ -434,11 +485,14 @@ def main(arguments: list[str]) -> int:
         skip_failure_injection = False
         if prior_gate is not None:
             if "worker-identity-refresh" not in prior_gate:
-                _run_profile_mutation(
-                    ROOT,
-                    config,
-                    lambda _root, _config: resume_worker_refresh(),
-                )
+                try:
+                    _require_status(spec.name, "ready")
+                except RuntimeError:
+                    _run_profile_mutation(
+                        ROOT,
+                        config,
+                        lambda _root, _config: resume_worker_refresh(),
+                    )
             _require_status(spec.name, "ready")
             skip_failure_injection = True
         else:
@@ -451,6 +505,18 @@ def main(arguments: list[str]) -> int:
             )
 
         def verify_and_replace_worker():
+            locked_prior = _incomplete_gate_records(
+                evidence.parent,
+                spec.name,
+                spec.sha256(),
+                revision,
+            )
+            if locked_prior is not None:
+                if "worker-identity-refresh" not in locked_prior:
+                    resume_worker_refresh()
+                    phase("worker-recovery", lambda: None)
+                    phase("worker-identity-refresh", lambda: None)
+                return
             runtime = TenantRuntime(ROOT, spec.name)
             if runtime.operation_exists():
                 raise RuntimeError(
@@ -514,7 +580,7 @@ def main(arguments: list[str]) -> int:
                             vmss_id,
                             instances,
                         )
-                        require_replacement(before, after)
+                        deleted, replacement = require_replacement(before, after)
                     except RuntimeError as exc:
                         last_blockers = (str(exc),)
                     else:
@@ -523,6 +589,12 @@ def main(arguments: list[str]) -> int:
                             config,
                             spec,
                             identity,
+                        )
+                        require_owned_resource_delta(
+                            identity.observed["azureResources"],
+                            discovery,
+                            deleted,
+                            replacement,
                         )
                         observed = refreshed_observed(
                             identity.observed,
@@ -602,19 +674,8 @@ def main(arguments: list[str]) -> int:
         primary = exc
         raise
     finally:
-        payload = {
-            "schema": 1,
-            "operationId": operation_id,
-            "tenant": spec.name,
-            "specificationSha256": spec.sha256(),
-            "revision": revision,
-            "records": records,
-        }
         try:
-            write_private_file(
-                evidence,
-                json.dumps(redact_value(payload), sort_keys=True) + "\n",
-            )
+            persist_evidence()
             print(f"Azure tenant lifecycle evidence: {evidence}")
         except BaseException as evidence_error:
             if primary is None:

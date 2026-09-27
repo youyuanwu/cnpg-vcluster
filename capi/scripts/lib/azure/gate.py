@@ -170,3 +170,56 @@ def refreshed_observed(
         separators=(",", ":"),
     )
     return refreshed
+
+
+def require_owned_resource_delta(
+    recorded_json: str,
+    discovered: Mapping[str, object],
+    deleted: WorkerMapping,
+    replacement: WorkerMapping,
+) -> None:
+    recorded = json.loads(recorded_json)
+    if not isinstance(recorded, dict):
+        raise RuntimeError("recorded Azure resource inventory is invalid")
+    if recorded.get("aso") != discovered.get("aso"):
+        raise RuntimeError("Azure ASO ownership changed during worker recovery")
+    if recorded.get("unknown") != discovered.get("unknown"):
+        raise RuntimeError("unknown Azure ownership changed during worker recovery")
+
+    def resources(payload):
+        return {
+            _normalize_resource_id(str(item["id"])): str(item.get("type", "")).lower()
+            for item in payload.get("azure", [])
+            if isinstance(item, dict) and isinstance(item.get("id"), str)
+        }
+
+    before = resources(recorded)
+    after = resources(discovered)
+    removed = set(before) - set(after)
+    added = set(after) - set(before)
+    deleted_id = _normalize_resource_id(deleted.instance_resource_id)
+    replacement_id = _normalize_resource_id(replacement.instance_resource_id)
+    if deleted_id not in removed or replacement_id not in added:
+        raise RuntimeError("Azure VMSS replacement resource delta is incomplete")
+    allowed_types = {
+        "microsoft.compute/virtualmachinescalesets/virtualmachines",
+        "microsoft.network/networkinterfaces",
+    }
+    if any(before[item] not in allowed_types for item in removed) or any(
+        after[item] not in allowed_types for item in added
+    ):
+        raise RuntimeError("unrelated Azure ownership changed during worker recovery")
+    removed_vms = {
+        item
+        for item in removed
+        if before[item]
+        == "microsoft.compute/virtualmachinescalesets/virtualmachines"
+    }
+    added_vms = {
+        item
+        for item in added
+        if after[item]
+        == "microsoft.compute/virtualmachinescalesets/virtualmachines"
+    }
+    if removed_vms != {deleted_id} or added_vms != {replacement_id}:
+        raise RuntimeError("Azure VMSS replacement ownership delta is ambiguous")
