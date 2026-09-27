@@ -10,8 +10,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.azure import (
-    AzureTenantAdapter,
+from scripts.lib.azure.lifecycle import AzureTenantAdapter
+from scripts.lib.azure.ownership import (
     classify_azure_owned_resources,
     discover_azure_owned_resources,
 )
@@ -348,24 +348,24 @@ class AzureRenderingTests(AzureFixtureMixin, unittest.TestCase):
                 }
                 with (
                     patch.object(adapter, "_config", return_value=load_azure_configuration(root)),
-                    patch("scripts.azure.load_inventory", return_value={}),
-                    patch("scripts.azure._render_tenant_control_plane", return_value=Path("cp")),
-                    patch("scripts.azure._render_worker_pool", return_value=Path("worker")),
-                    patch("scripts.azure._render_addon_job", return_value=Path("addons")),
-                    patch("scripts.azure._reconcile_manifest", side_effect=reconcile),
-                    patch("scripts.azure._retain_external_control_plane_lb"),
-                    patch("scripts.azure._wait_tenant_endpoint", return_value=endpoint),
+                    patch("scripts.lib.azure.lifecycle.load_inventory", return_value={}),
+                    patch("scripts.lib.azure.lifecycle._render_tenant_control_plane", return_value=Path("cp")),
+                    patch("scripts.lib.azure.lifecycle._render_worker_pool", return_value=Path("worker")),
+                    patch("scripts.lib.azure.lifecycle._render_addon_job", return_value=Path("addons")),
+                    patch("scripts.lib.azure.lifecycle._reconcile_manifest", side_effect=reconcile),
+                    patch("scripts.lib.azure.lifecycle._retain_external_control_plane_lb"),
+                    patch("scripts.lib.azure.lifecycle._wait_tenant_endpoint", return_value=endpoint),
                     patch(
-                        "scripts.azure._capture_tenant_kubeconfig",
+                        "scripts.lib.azure.lifecycle._capture_tenant_kubeconfig",
                         side_effect=lambda _r, _s, rt, current: rt.update_operation(
                             current,
                             phase="control-plane-ready",
                             observed={"credentialUid": "credential-uid"},
                         ),
                     ),
-                    patch("scripts.azure._wait_worker_registered"),
+                    patch("scripts.lib.azure.lifecycle._wait_worker_registered"),
                     patch(
-                        "scripts.azure._capture_vmss_identities",
+                        "scripts.lib.azure.lifecycle._capture_vmss_identities",
                         side_effect=lambda _r, _c, _s, rt, current: rt.update_operation(
                             current,
                             phase="workers-registered",

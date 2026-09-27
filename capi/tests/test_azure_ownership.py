@@ -5,7 +5,7 @@ import subprocess
 import unittest
 from unittest.mock import patch
 
-from scripts.azure import AzureTenantAdapter
+from scripts.lib.azure.lifecycle import AzureTenantAdapter
 from scripts.lib.azure.common import load_azure_configuration
 from scripts.lib.azure.contracts import (
     MANAGEMENT_RESOURCE_DESCRIPTORS,
@@ -484,17 +484,17 @@ class AzureOwnershipTests(AzureFixtureMixin, unittest.TestCase):
                 "_config",
                 return_value=load_azure_configuration(root),
             ),
-            patch("scripts.azure._active_subscription"),
+            patch("scripts.lib.azure.lifecycle._active_subscription"),
             patch(
-                "scripts.azure._inspect_foundation",
+                "scripts.lib.azure.lifecycle._inspect_foundation",
                 return_value=(FOUNDATION, True, ()),
             ),
             patch(
-                "scripts.azure.discover_management_owned_resources",
+                "scripts.lib.azure.lifecycle.discover_management_owned_resources",
                 return_value=empty_management,
             ) as management_discovery,
             patch(
-                "scripts.azure._discover_owned_repeatedly",
+                "scripts.lib.azure.lifecycle._discover_owned_repeatedly",
                 return_value=empty_azure,
             ) as azure_discovery,
         ):
@@ -520,12 +520,12 @@ class AzureOwnershipTests(AzureFixtureMixin, unittest.TestCase):
         adapter = AzureTenantAdapter()
         with (
             patch.object(adapter, "_config", return_value=load_azure_configuration(root)),
-            patch("scripts.azure._active_subscription"),
+            patch("scripts.lib.azure.lifecycle._active_subscription"),
             patch(
-                "scripts.azure._inspect_foundation",
+                "scripts.lib.azure.lifecycle._inspect_foundation",
                 return_value=({**FOUNDATION, "aksId": "foreign"}, True, ()),
             ),
-            patch("scripts.azure._exact_delete_management_resource") as mutate,
+            patch("scripts.lib.azure.lifecycle._exact_delete_management_resource") as mutate,
             self.assertRaisesRegex(RuntimeError, "foundation binding changed"),
         ):
             adapter.validate_delete(root, spec, identity)
@@ -621,13 +621,13 @@ class AzureOwnershipTests(AzureFixtureMixin, unittest.TestCase):
             "unknown": [],
         }
         with (
-            patch("scripts.azure.parse_duration", return_value=0),
+            patch("scripts.lib.azure.lifecycle.parse_duration", return_value=0),
             patch(
-                "scripts.azure.discover_management_owned_resources",
+                "scripts.lib.azure.lifecycle.discover_management_owned_resources",
                 return_value=management,
             ),
             patch(
-                "scripts.azure._discover_owned_repeatedly",
+                "scripts.lib.azure.lifecycle._discover_owned_repeatedly",
                 return_value=azure,
             ),
             self.assertRaises(RuntimeError) as raised,

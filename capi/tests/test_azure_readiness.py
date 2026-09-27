@@ -8,7 +8,7 @@ import time
 import unittest
 from unittest.mock import patch
 
-from scripts.azure import AzureTenantAdapter
+from scripts.lib.azure.lifecycle import AzureTenantAdapter
 from scripts.lib.azure.common import (
     azure_tenant_runtime_path,
     load_azure_configuration,
@@ -448,16 +448,16 @@ class AzureReadinessTests(AzureFixtureMixin, unittest.TestCase):
         with (
             patch.object(adapter, "_config", return_value=config),
             patch(
-                "scripts.azure._inspect_foundation",
+                "scripts.lib.azure.lifecycle._inspect_foundation",
                 return_value=(FOUNDATION, True, ()),
             ),
-            patch("scripts.azure._get_management_resource", side_effect=resource),
+            patch("scripts.lib.azure.lifecycle._get_management_resource", side_effect=resource),
             patch(
-                "scripts.azure._collect_ready_observations",
+                "scripts.lib.azure.lifecycle._collect_ready_observations",
                 return_value=(ready, ()),
             ),
             patch(
-                "scripts.azure.discover_azure_owned_resources",
+                "scripts.lib.azure.lifecycle.discover_azure_owned_resources",
                 return_value=discovery,
             ),
         ):
@@ -471,16 +471,16 @@ class AzureReadinessTests(AzureFixtureMixin, unittest.TestCase):
         with (
             patch.object(adapter, "_config", return_value=config),
             patch(
-                "scripts.azure._inspect_foundation",
+                "scripts.lib.azure.lifecycle._inspect_foundation",
                 return_value=(FOUNDATION, True, ()),
             ),
-            patch("scripts.azure._get_management_resource", side_effect=resource),
+            patch("scripts.lib.azure.lifecycle._get_management_resource", side_effect=resource),
             patch(
-                "scripts.azure._collect_ready_observations",
+                "scripts.lib.azure.lifecycle._collect_ready_observations",
                 return_value=(ready, ()),
             ),
             patch(
-                "scripts.azure.discover_azure_owned_resources",
+                "scripts.lib.azure.lifecycle.discover_azure_owned_resources",
                 return_value=discovery,
             ),
         ):
@@ -496,16 +496,16 @@ class AzureReadinessTests(AzureFixtureMixin, unittest.TestCase):
         with (
             patch.object(adapter, "_config", return_value=config),
             patch(
-                "scripts.azure._inspect_foundation",
+                "scripts.lib.azure.lifecycle._inspect_foundation",
                 return_value=(FOUNDATION, True, ()),
             ),
-            patch("scripts.azure._get_management_resource", side_effect=resource),
+            patch("scripts.lib.azure.lifecycle._get_management_resource", side_effect=resource),
             patch(
-                "scripts.azure._collect_ready_observations",
+                "scripts.lib.azure.lifecycle._collect_ready_observations",
                 return_value=(ready, ()),
             ),
             patch(
-                "scripts.azure.discover_azure_owned_resources",
+                "scripts.lib.azure.lifecycle.discover_azure_owned_resources",
                 return_value=discovery,
             ),
         ):
@@ -522,16 +522,16 @@ class AzureReadinessTests(AzureFixtureMixin, unittest.TestCase):
         with (
             patch.object(adapter, "_config", return_value=config),
             patch(
-                "scripts.azure._inspect_foundation",
+                "scripts.lib.azure.lifecycle._inspect_foundation",
                 return_value=(FOUNDATION, True, ()),
             ),
-            patch("scripts.azure._get_management_resource", side_effect=resource),
+            patch("scripts.lib.azure.lifecycle._get_management_resource", side_effect=resource),
             patch(
-                "scripts.azure._collect_ready_observations",
+                "scripts.lib.azure.lifecycle._collect_ready_observations",
                 return_value=(ready, ()),
             ),
             patch(
-                "scripts.azure.discover_azure_owned_resources",
+                "scripts.lib.azure.lifecycle.discover_azure_owned_resources",
                 return_value=discovery,
             ),
         ):

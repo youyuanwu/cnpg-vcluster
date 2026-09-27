@@ -11,7 +11,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-from scripts.azure import _remove_private_tree, _run_profile_mutation
+from scripts.azure import _run_profile_mutation
+from scripts.lib.azure.deletion import _remove_private_tree
 from scripts.lib.azure.common import (
     _foundation_defaults_checksum,
     azure_tenant_runtime_path,

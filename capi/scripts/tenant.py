@@ -439,7 +439,7 @@ def execute(
     adapter: TenantAdapter | None = None,
 ) -> int:
     if adapter is None:
-        from scripts.azure import AzureTenantAdapter
+        from scripts.lib.azure.lifecycle import AzureTenantAdapter
 
         adapter = AzureTenantAdapter()
     if not arguments:

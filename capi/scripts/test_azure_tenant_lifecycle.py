@@ -12,7 +12,6 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.azure import (
-    _remove_private_tree,
     _run_profile_mutation,
 )
 from scripts.lib.azure.common import (
@@ -26,6 +25,7 @@ from scripts.lib.azure.foundation import (
     create_foundation,
     create_management,
 )
+from scripts.lib.azure.deletion import _remove_private_tree
 from scripts.lib.config import parse_duration
 from scripts.lib.files import private_file_exists, read_private_file, write_private_file
 from scripts.lib.process import run
