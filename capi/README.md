@@ -21,8 +21,9 @@ targeted deletion, and recreation behavior over production infrastructure,
 Azure Disk/CNPG workload validation, and operational hardening.
 
 Azure foundation operations use the ignored owner-only
-`config/azure.local.env` selectors. Tenant creation and status use the same
-explicit tenant specification interface as the local profile:
+`config/azure.local.env` selectors. Azure Tenant creation uses a schema-1 JSON
+specification and the Python lifecycle; local Tenant operations instead use
+the Kubernetes resource and its status:
 
 ```bash
 just azure-preflight
@@ -35,9 +36,10 @@ just tenant-delete azure tenant-example azure/tenant-example
 just azure-test-tenant-lifecycle
 ```
 
-The generic lifecycle journals and records the tenant control plane, CAPZ
+The Azure lifecycle journals and records the tenant control plane, CAPZ
 worker pool, Azure resource identities, add-ons, and Ready evidence under
-owner-only tenant-keyed runtime paths. Targeted deletion verifies exact
+owner-only tenant-keyed runtime paths. Local operations do not create these
+records. Targeted Azure deletion verifies exact
 management UIDs and Azure resource IDs, lets CAPI/CAPZ delete the MachinePool
 and VMSS, proves the shared foundation is unchanged, and then removes tenant
 orchestration state. Pre-cutover Azure foundation inventory is rejected and

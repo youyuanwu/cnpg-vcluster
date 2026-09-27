@@ -61,6 +61,11 @@ Tenant/worker/kubeconfig/observed/allocation naming, whether the resource is
 watched, watch-name suffix or cluster-label routing, inventory policy and
 namespace, and narrow exemptions. Rust and Python reject malformed catalogs,
 unserved declared versions, malformed inventory, and ambiguous identity.
+Python inventories exact versioned raw collection paths: the list envelope
+must declare the catalog API version and `<Kind>List`, while items must have
+valid name, UID, and scope. Raw-list items may omit redundant `apiVersion` and
+`kind`; if present, these must match. Rust likewise accepts absent dynamic
+item type metadata but rejects mismatched supplied types.
 Allocation names, fixed controller infrastructure, provider-only CRDs,
 break-glass allowlists, test fixtures, and tenant-internal resources remain
 domain-owned rather than duplicating catalog semantics.
