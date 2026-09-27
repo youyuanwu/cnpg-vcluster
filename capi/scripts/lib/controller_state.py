@@ -221,9 +221,9 @@ def require_clean_controller_state(
         raise RuntimeError(
             f"Tenant storage volumes block activation: {sorted(tenant_volumes)}"
         )
-    containers: set[str] = set()
+    capd_containers: set[str] = set()
     for role in ("worker", "external-load-balancer"):
-        containers.update(
+        capd_containers.update(
             run(
                 [
                     "docker",
@@ -235,18 +235,30 @@ def require_clean_controller_state(
                 timeout=30,
             ).stdout.split()
         )
+    project_role_containers = set(
+        run(
+            [
+                "docker",
+                "ps",
+                "-aq",
+                "--filter",
+                "label=cnpg-vcluster.capi/role",
+            ],
+            timeout=30,
+        ).stdout.split()
+    )
+    tenant_marked_containers: set[str] = set()
     for label in (
-        "cnpg-vcluster.capi/role",
         "cnpg-vcluster.capi/tenant",
         "tenancy.cnpg-vcluster.io/tenant-uid",
     ):
-        containers.update(
+        tenant_marked_containers.update(
             run(
                 ["docker", "ps", "-aq", "--filter", f"label={label}"],
                 timeout=30,
             ).stdout.split()
         )
-    containers.difference_update(
+    offline_registries = set(
         run(
             [
                 "docker",
@@ -257,6 +269,11 @@ def require_clean_controller_state(
             ],
             timeout=30,
         ).stdout.split()
+    )
+    containers = (
+        capd_containers
+        | tenant_marked_containers
+        | (project_role_containers - offline_registries)
     )
     if containers:
         raise RuntimeError(
