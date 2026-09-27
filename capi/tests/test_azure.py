@@ -298,13 +298,13 @@ class AzurePhaseFourTests(unittest.TestCase):
         output = io.StringIO()
         with (
             patch(
-                "scripts.azure._active_subscription",
+                "scripts.lib.azure.foundation._active_subscription",
                 return_value={"id": SUBSCRIPTION, "state": "Enabled"},
             ),
-            patch("scripts.azure._az", return_value=completed("Registered\n")),
-            patch("scripts.azure._sku_available"),
-            patch("scripts.azure._reference_image_available"),
-            patch("scripts.azure.run", return_value=completed()),
+            patch("scripts.lib.azure.foundation._az", return_value=completed("Registered\n")),
+            patch("scripts.lib.azure.foundation._sku_available"),
+            patch("scripts.lib.azure.foundation._reference_image_available"),
+            patch("scripts.lib.azure.foundation.run", return_value=completed()),
             redirect_stdout(output),
         ):
             result = preflight(root, config)
@@ -379,8 +379,8 @@ class AzurePhaseFourTests(unittest.TestCase):
         old["schema"] = 1
         self.write_inventory(root, old)
         with (
-            patch("scripts.azure.preflight", return_value={}),
-            patch("scripts.azure._json") as deploy,
+            patch("scripts.lib.azure.foundation.preflight", return_value={}),
+            patch("scripts.lib.azure.foundation._json") as deploy,
             self.assertRaisesRegex(RuntimeError, "pre-cutover"),
         ):
             create_foundation(root, config)
@@ -503,7 +503,7 @@ class AzurePhaseFourTests(unittest.TestCase):
             serviceCIDR="10.143.0.0/16",
         )
         with patch(
-            "scripts.azure.require_non_overlapping_networks"
+            "scripts.lib.azure.common.require_non_overlapping_networks"
         ) as validate:
             _validate_networks(config, spec, recorded_specs=(recorded,))
         networks = validate.call_args.args[1]
@@ -1452,7 +1452,7 @@ class AzurePhaseFourTests(unittest.TestCase):
             with (
                 self.subTest(stderr=stderr),
                 patch(
-                    "scripts.azure._kubectl",
+                    "scripts.lib.azure.foundation._kubectl",
                     return_value=subprocess.CompletedProcess(
                         [], 1, stdout="", stderr=stderr
                     ),
@@ -1465,7 +1465,7 @@ class AzurePhaseFourTests(unittest.TestCase):
                     "cluster/tenant-c",
                 )
         with patch(
-            "scripts.azure._kubectl",
+            "scripts.lib.azure.foundation._kubectl",
             return_value=subprocess.CompletedProcess(
                 [],
                 1,

@@ -525,7 +525,9 @@ def check_repository_boundaries() -> None:
         *(
             path
             for path in (ROOT / "scripts").rglob("*.py")
-            if path.name not in {"test_static.py", "azure.py"}
+            if path.name != "test_static.py"
+            and path != ROOT / "scripts" / "azure.py"
+            and (ROOT / "scripts" / "lib" / "azure") not in path.parents
         ),
         *(ROOT / "manifests").rglob("*"),
     ]
@@ -541,7 +543,14 @@ def check_repository_boundaries() -> None:
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             check(token not in text, f"{path.relative_to(ROOT)} contains forbidden token {token!r}")
-    azure_source = (ROOT / "scripts" / "azure.py").read_text(encoding="utf-8")
+    azure_sources = [
+        ROOT / "scripts" / "azure.py",
+        *(ROOT / "scripts" / "lib" / "azure").glob("*.py"),
+    ]
+    azure_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in azure_sources
+    )
     check(
         not re.search(
             r"[\"']vmss[\"']\s*,\s*[\"']delete[\"']",
