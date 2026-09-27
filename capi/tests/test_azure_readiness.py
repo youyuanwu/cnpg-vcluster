@@ -17,6 +17,7 @@ from scripts.lib.azure.common import (
 from scripts.lib.azure.readiness import (
     _capture_tenant_kubeconfig,
     _collect_ready_observations,
+    _retain_external_control_plane_lb,
     _tenant_spec_blockers,
     _wait_addon_job,
     _wait_ready_observations,
@@ -40,6 +41,19 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzureReadinessTests(AzureFixtureMixin, unittest.TestCase):
+    def test_external_control_plane_retention_uses_canonical_markers(self):
+        root = self.make_root()
+        spec = self.spec()
+        _, journal = self.start_journal(root, spec)
+        with (
+            patch(
+                "scripts.lib.azure.readiness._get_management_resource",
+                return_value=None,
+            ),
+            self.assertRaisesRegex(RuntimeError, "AzureCluster is absent"),
+        ):
+            _retain_external_control_plane_lb(root, spec, journal)
+
     def test_endpoint_readiness_retains_compatibility_patches(self):
         root = self.make_root()
         config = load_azure_configuration(root)

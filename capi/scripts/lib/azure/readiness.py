@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from .common import *
+from .contracts import _expected_tenant_markers
 from .foundation import _get_management_resource
 from .rendering import (
     _external_azure_cluster_metadata,
@@ -647,4 +648,3 @@ def _tenant_spec_blockers(
     ):
         blockers.append(f"tenant AzureMachinePool specification changed: {selected['pool']}")
     return tuple(blockers)
-
