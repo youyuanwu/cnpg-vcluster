@@ -33,7 +33,7 @@ from scripts.lib.files import (
     read_private_file,
     write_private_file,
 )
-from scripts.lib.locking import e2e_lock, profile_lock, profile_lock_exists, tools_lock
+from scripts.lib.locking import azure_lock, azure_lock_exists, e2e_lock, tools_lock
 from scripts.lib.management import _prepare_kamaji_chart
 from scripts.lib.process import run
 from scripts.lib.redaction import redact, redact_value
@@ -324,10 +324,10 @@ def _validate_foundation_networks(config: Mapping[str, str]) -> None:
 
 def _recorded_azure_specs(root: Path, *, excluding: str) -> tuple[TenantSpec, ...]:
     specs = []
-    for tenant in recorded_tenant_names(root, "azure"):
+    for tenant in recorded_tenant_names(root):
         if tenant == excluding:
             continue
-        runtime = TenantRuntime(root, "azure", tenant)
+        runtime = TenantRuntime(root, tenant)
         if runtime.identity_exists():
             specs.append(runtime.load_identity().specification)
         elif runtime.operation_exists():
@@ -4423,7 +4423,7 @@ class AzureTenantAdapter:
 
     def status(self, root: Path, tenant: str) -> TenantStatus:
         config = self._config(root)
-        runtime = TenantRuntime(root, "azure", tenant)
+        runtime = TenantRuntime(root, tenant)
         identity = runtime.load_identity() if runtime.identity_exists() else None
         operation = runtime.load_operation() if runtime.operation_exists() else None
         try:
@@ -4695,7 +4695,7 @@ class AzureTenantAdapter:
             )
         if foundation != dict(identity.foundation_identity):
             raise RuntimeError("Azure tenant foundation binding changed")
-        runtime = TenantRuntime(root, "azure", spec.name)
+        runtime = TenantRuntime(root, spec.name)
         pending = runtime.load_operation() if runtime.operation_exists() else None
         if pending is not None and (
             pending.operation != "delete"
@@ -5329,9 +5329,8 @@ def destroy(root: Path, config: Mapping[str, str]) -> None:
 
 def _run_profile_mutation(root: Path, config: Mapping[str, str], mutation) -> None:
     with e2e_lock(root, exclusive=False):
-        with profile_lock(
+        with azure_lock(
             root,
-            "azure",
             exclusive=True,
             create=True,
         ) as acquired:
@@ -5342,14 +5341,13 @@ def _run_profile_mutation(root: Path, config: Mapping[str, str], mutation) -> No
 
 
 def _run_profile_status(root: Path, config: Mapping[str, str]) -> int:
-    if not profile_lock_exists(root, "azure"):
+    if not azure_lock_exists(root):
         return foundation_status(root, config)
     with e2e_lock(root, exclusive=False, create=False) as e2e_acquired:
         if not e2e_acquired:
             raise RuntimeError("Azure E2E status lock is missing")
-        with profile_lock(
+        with azure_lock(
             root,
-            "azure",
             exclusive=False,
             create=False,
         ) as acquired:

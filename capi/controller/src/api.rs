@@ -6,6 +6,7 @@ use sha2::{Digest, Sha256};
 pub const GROUP: &str = "tenancy.cnpg-vcluster.io";
 pub const VERSION: &str = "v1alpha2";
 pub const SUPPORTED_KUBERNETES_VERSION: &str = "1.36.4";
+pub const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 
 #[expect(
     clippy::duplicated_attributes,

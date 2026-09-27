@@ -10,6 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
+from scripts.lib.controller_catalog import (
+    load_management_resources,
+    resource_by_kind,
+)
 from scripts.cnpg import _sql, verify_restart_persistence
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.kube import ManagementClient
@@ -27,6 +31,8 @@ from scripts.lib.controller_scenarios import (
     wait_tenant_ready,
 )
 from scripts.lib.tenants import export_tenant_kubeconfig
+
+MANAGEMENT_CATALOG = load_management_resources(ROOT)
 
 
 def run_just(
@@ -125,7 +131,6 @@ def verify_no_local_runtime_residue(root: Path) -> None:
             f"local runtime remained after E2E teardown: {relative}"
         )
 
-
 def _inspect_management_object(
     client: ManagementClient,
     resource: str,
@@ -151,6 +156,37 @@ def _inspect_management_object(
     return document
 
 
+def _inspect_catalog_object(
+    client: ManagementClient,
+    api_version: str,
+    kind: str,
+    namespace: str,
+    name: str,
+) -> dict[str, object] | None:
+    resource = next(
+        resource
+        for resource in MANAGEMENT_CATALOG
+        if resource.api_version == api_version and resource.kind == kind
+    )
+    response = client.kubectl(
+        "get",
+        f"--raw={resource.object_path(namespace or None, name)}",
+        check=False,
+    )
+    if response.returncode != 0:
+        if "NotFound" in response.stderr:
+            return None
+        raise RuntimeError(f"failed to inspect {kind}/{name}: {redact(response.stderr)}")
+    document = json.loads(response.stdout)
+    if (
+        not isinstance(document, dict)
+        or document.get("apiVersion") != api_version
+        or document.get("kind") != kind
+    ):
+        raise RuntimeError(f"invalid inspection response for {kind}/{name}")
+    return document
+
+
 def capture_tenant_deletion_identity(
     config: dict[str, str],
     client: ManagementClient,
@@ -168,10 +204,18 @@ def capture_tenant_deletion_identity(
         raise RuntimeError("Tenant identity changed before deletion")
     identity = tenant_snapshot(config, client, current)
     identity["name"] = name
+    cluster = resource_by_kind(
+        MANAGEMENT_CATALOG,
+        "Cluster",
+    )
     cluster_uids = [
         recorded_uid
-        for resource, namespace, object_name, recorded_uid in identity["managementResources"]
-        if resource == "clusters.cluster.x-k8s.io" and namespace == name and object_name == name
+        for api_version, kind, namespace, object_name, recorded_uid
+        in identity["managementResources"]
+        if api_version == cluster.api_version
+        and kind == cluster.kind
+        and namespace == name
+        and object_name == cluster.expected_name(name)
     ]
     if (
         identity["dockerVolume"]["name"] != f"{config['LAB_PREFIX']}-{name}-storage"
@@ -192,13 +236,13 @@ def verify_tenant_deletion(
     name = identity["name"]
     if _inspect_management_object(client, f"tenant/{name}") is not None:
         raise RuntimeError(f"Tenant remained or was recreated after deletion: {name}")
-    for resource, namespace, object_name, uid in identity["managementResources"]:
-        if _inspect_management_object(
-            client, f"{resource}/{object_name}", namespace,
+    for api_version, kind, namespace, object_name, uid in identity["managementResources"]:
+        if _inspect_catalog_object(
+            client, api_version, kind, namespace, object_name,
         ) is not None:
             raise RuntimeError(
                 f"Tenant management resource remained after deletion: "
-                f"{resource}/{object_name} (recorded UID {uid})"
+                f"{kind}/{object_name} (recorded UID {uid})"
             )
     verify_allocation_released(client, identity)
     containers = set(run(

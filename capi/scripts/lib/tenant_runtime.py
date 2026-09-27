@@ -16,7 +16,7 @@ from .files import (
     unlink_private_file,
     write_private_file,
 )
-from .tenant_spec import TenantSpec, validate_tenant_name
+from .tenant_spec import PROFILE, TenantSpec, validate_tenant_name
 
 
 class TenantRuntimeError(RuntimeError):
@@ -70,11 +70,9 @@ def foundation_sha256(identity: Mapping[str, str]) -> str:
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
-def tenant_runtime_paths(root: Path, profile: str, tenant: str) -> TenantRuntimePaths:
-    if profile not in {"local", "azure"}:
-        raise TenantRuntimeError(f"unsupported tenant profile: {profile}")
+def tenant_runtime_paths(root: Path, tenant: str) -> TenantRuntimePaths:
     validate_tenant_name(tenant)
-    directory = root / ".runtime" / "lifecycle" / profile / tenant
+    directory = root / ".runtime" / "lifecycle" / PROFILE / tenant
     return TenantRuntimePaths(
         directory=directory,
         identity=directory / "identity.json",
@@ -84,10 +82,8 @@ def tenant_runtime_paths(root: Path, profile: str, tenant: str) -> TenantRuntime
     )
 
 
-def recorded_tenant_names(root: Path, profile: str) -> tuple[str, ...]:
-    if profile not in {"local", "azure"}:
-        raise TenantRuntimeError(f"unsupported tenant profile: {profile}")
-    directory = root / ".runtime" / "lifecycle" / profile
+def recorded_tenant_names(root: Path) -> tuple[str, ...]:
+    directory = root / ".runtime" / "lifecycle" / PROFILE
     if not directory.exists():
         return ()
     details = directory.lstat()
@@ -175,7 +171,8 @@ class OperationJournal:
             raise TenantRuntimeError("invalid tenant operation specification")
         specification = TenantSpec.from_mapping(payload["specification"])
         if (
-            specification.profile != strings["profile"]
+            strings["profile"] != PROFILE
+            or specification.profile != strings["profile"]
             or specification.name != strings["tenant"]
             or specification.sha256() != strings["specificationSha256"]
         ):
@@ -250,7 +247,7 @@ class TenantIdentity:
             raise TenantRuntimeError("tenant identity specification checksum changed")
         profile = payload["profile"]
         tenant = payload["tenant"]
-        if profile != spec.profile or tenant != spec.name:
+        if profile != PROFILE or profile != spec.profile or tenant != spec.name:
             raise TenantRuntimeError("tenant identity specification binding changed")
         return cls(
             profile=spec.profile,
@@ -282,9 +279,9 @@ class TenantIdentity:
 
 
 class TenantRuntime:
-    def __init__(self, root: Path, profile: str, tenant: str) -> None:
-        self.paths = tenant_runtime_paths(root, profile, tenant)
-        self.profile = profile
+    def __init__(self, root: Path, tenant: str) -> None:
+        self.paths = tenant_runtime_paths(root, tenant)
+        self.profile = PROFILE
         self.tenant = tenant
 
     def identity_exists(self) -> bool:

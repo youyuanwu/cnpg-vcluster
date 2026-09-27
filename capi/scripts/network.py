@@ -7,6 +7,10 @@ from pathlib import Path
 from scripts.endpoint import run_endpoint_gate
 from scripts.lib.addons import verify_network, wait_network_ready
 from scripts.lib.config import parse_duration
+from scripts.lib.controller_catalog import (
+    load_management_resources,
+    resource_by_kind,
+)
 from scripts.lib.controller_scenarios import (
     delete_controller_tenant,
     tenant_document,
@@ -16,14 +20,20 @@ from scripts.lib.controller_scenarios import (
 from scripts.lib.kube import wait_for
 from scripts.lib.tenants import _tenant_kubectl
 
+MANAGEMENT_CATALOG = load_management_resources(Path(__file__).resolve().parents[1])
+
 
 def _verify_control_plane_active(client, config, tenant) -> None:
+    control_plane = resource_by_kind(MANAGEMENT_CATALOG, "KamajiControlPlane")
+    control_plane_name = control_plane.expected_name(tenant.name)
+    if control_plane_name is None:
+        raise RuntimeError("KamajiControlPlane has no expected name")
     kcp = json.loads(
         client.kubectl(
             "-n",
             tenant.namespace,
             "get",
-            f"kamajicontrolplane/{tenant.name}",
+            f"{control_plane.kubectl_resource}/{control_plane_name}",
             "-o",
             "json",
         ).stdout
@@ -244,11 +254,18 @@ def _drift_machine_deployment_and_wait_for_repair(
     config: dict[str, str],
     tenant,
 ) -> None:
+    deployment = resource_by_kind(
+        MANAGEMENT_CATALOG,
+        "MachineDeployment",
+    )
+    deployment_name = deployment.expected_name(tenant.name)
+    if deployment_name is None:
+        raise RuntimeError("MachineDeployment has no expected name")
     client.kubectl(
         "-n",
         tenant.namespace,
         "patch",
-        f"machinedeployment/{tenant.name}-worker",
+        f"{deployment.kubectl_resource}/{deployment_name}",
         "--type=merge",
         "-p",
         json.dumps({"spec": {"replicas": tenant.workers + 1}}),
@@ -264,7 +281,7 @@ def _drift_machine_deployment_and_wait_for_repair(
                     "-n",
                     tenant.namespace,
                     "get",
-                    f"machinedeployment/{tenant.name}-worker",
+                    f"{deployment.kubectl_resource}/{deployment_name}",
                     "-o",
                     "jsonpath={.spec.replicas}",
                 ).stdout

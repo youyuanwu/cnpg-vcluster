@@ -1,22 +1,17 @@
-//! Resumable, direct-read reconciliation. Every durable identity write is a
-//! return barrier; only CAPI roots and the CNPG Cluster receive bound SSA.
+//! Direct-read reconciliation with durable-write barriers and narrowly bound SSA.
 
 mod error;
 pub mod objects;
 pub mod workers;
 
+pub use crate::api::FINALIZER;
 pub use error::ReconcileError;
 
 use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
 use futures::StreamExt;
-use k8s_openapi::api::{
-    coordination::v1::Lease,
-    core::v1::{Namespace, Secret},
-};
 use kube::{
     Api, Client, ResourceExt,
-    api::{Patch, PatchParams, PostParams},
     core::DynamicObject,
     runtime::{
         controller::{Action, Controller},
@@ -24,28 +19,23 @@ use kube::{
         watcher,
     },
 };
-use serde_json::json;
 
 use crate::{
     allocation::{self, ClaimContext},
     api::{
-        CanonicalSpec, SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase, TenantStatus,
-        canonical_spec, spec_hash,
+        CanonicalSpec, SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase, canonical_spec, spec_hash,
     },
     docker::{BollardDockerClient, DockerClient, validate_volume},
-    error::ControllerError,
+    error::{ControllerError, ErrorClass},
     foundation::{self, Foundation, ImageArchive, RuntimeFoundation},
-    management::{self, ResourceClass},
-    ownership,
+    management, ownership,
     readiness::{self, Components, set_condition},
     resources::{self, Context as ResourceContext},
     runtime::{LeadershipGate, tenant_controller},
-    sanitize,
-    status::plan_status_update,
+    sanitize, status,
     tenant_client::{self, TenantClientError},
 };
 
-pub const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 pub const FOUNDATION_NAMESPACE: &str = "tenant-system";
 pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEPENDENCY_INTERVAL: Duration = Duration::from_secs(5);
@@ -155,7 +145,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
         let spec = match canonical_spec(name, &tenant.spec, &self.config.supported_version) {
             Ok(spec) => spec,
             Err(error) => {
-                update_status(self.client.clone(), &tenant, |status| {
+                status::update_status(self.client.clone(), &tenant, |status| {
                     status.phase = Some(TenantPhase::Failed);
                     set_condition(
                         status,
@@ -193,6 +183,9 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
             .await
             {
                 Ok(action) => Ok(action),
+                Err(error) if error.class() == ErrorClass::Conflict => {
+                    Ok(Action::requeue(PROGRESS_INTERVAL))
+                }
                 Err(error) => self.failure(&tenant, error.into()).await,
             };
         }
@@ -248,10 +241,10 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                 },
             )
         };
-        if matches!(&error, ReconcileError::Kube(kube::Error::Api(status)) if status.code == 409) {
+        if error.conflict() {
             return Ok(Action::requeue(PROGRESS_INTERVAL));
         }
-        update_status(self.client.clone(), tenant, |status| {
+        status::update_status(self.client.clone(), tenant, |status| {
             status.phase = Some(phase);
             set_condition(status, tenant, "Ready", false, reason, &error.to_string());
             if phase == TenantPhase::OwnershipInvalid {
@@ -286,7 +279,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
         tenant: &Tenant,
         interval: Duration,
     ) -> Result<Action, ReconcileError> {
-        update_status(self.client.clone(), tenant, |status| {
+        status::update_status(self.client.clone(), tenant, |status| {
             readiness::progress_status(status, tenant);
             Ok(())
         })
@@ -305,25 +298,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
             .and_then(|status| status.foundation_hash.as_deref());
         let foundation = self.foundation.creation(recorded_hash)?;
         let foundation_hash = &self.foundation.hash;
-        if tenant.uid().is_none_or(|uid| uid.is_empty())
-            || tenant
-                .resource_version()
-                .is_none_or(|version| version.is_empty())
-        {
-            return Err(ReconcileError::OwnershipInvalid(
-                "Tenant UID/resourceVersion is missing".into(),
-            ));
-        }
-        if !tenant.finalizers().iter().any(|value| value == FINALIZER) {
-            let mut updated = tenant.clone();
-            updated
-                .metadata
-                .finalizers
-                .get_or_insert_default()
-                .push(FINALIZER.into());
-            Api::<Tenant>::all(self.client.clone())
-                .replace(&tenant.name_any(), &PostParams::default(), &updated)
-                .await?;
+        if status::set_finalizer(self.client.clone(), tenant, tenant, FINALIZER, true).await? {
             return Ok(Action::requeue(PROGRESS_INTERVAL));
         }
         if tenant
@@ -332,7 +307,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
             .and_then(|status| status.foundation_hash.as_deref())
             .is_none_or(str::is_empty)
         {
-            update_status(self.client.clone(), tenant, |status| {
+            status::update_status(self.client.clone(), tenant, |status| {
                 if status
                     .foundation_hash
                     .as_deref()
@@ -376,7 +351,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
             .and_then(|status| status.allocation.as_ref())
             .is_none()
         {
-            update_status(self.client.clone(), tenant, |status| {
+            status::update_status(self.client.clone(), tenant, |status| {
                 let allocation = claim.status();
                 if status
                     .allocation
@@ -436,7 +411,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                 .object
                 .uid()
                 .ok_or_else(|| ReconcileError::OwnershipInvalid("Cluster UID is missing".into()))?;
-            update_status(self.client.clone(), tenant, |status| {
+            status::update_status(self.client.clone(), tenant, |status| {
                 if status
                     .cluster_uid
                     .as_deref()
@@ -645,7 +620,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                 == Some("kubernetes.io/no-provisioner"),
             database: database_ready,
         };
-        update_status(self.client.clone(), context.tenant, |status| {
+        status::update_status(self.client.clone(), context.tenant, |status| {
             components.publish(status, context.tenant);
             Ok(())
         })
@@ -678,105 +653,41 @@ fn network_images(foundation: &Foundation) -> Result<resources::NetworkImages, R
     })
 }
 
-/// Retry against a fresh direct read only after a conflict. Never transfer
-/// bindings or observations to a same-name replacement or changed generation.
-pub async fn update_status<F>(
-    client: Client,
-    tenant: &Tenant,
-    mutate: F,
-) -> Result<(), ReconcileError>
-where
-    F: Fn(&mut TenantStatus) -> Result<(), ControllerError>,
-{
-    let api = Api::<Tenant>::all(client);
-    let mut current = tenant.clone();
-    for attempt in 0..=4 {
-        if current.uid() != tenant.uid()
-            || current.metadata.generation != tenant.metadata.generation
-            || current.spec != tenant.spec
-            || current.metadata.deletion_timestamp != tenant.metadata.deletion_timestamp
-        {
-            return Err(ReconcileError::OwnershipInvalid(
-                "Tenant identity or lifecycle changed during status update".into(),
-            ));
-        }
-        let plan = plan_status_update(&current, &mutate)?;
-        let Some(mut patch) = plan.merge_patch() else {
-            return Ok(());
-        };
-        patch["metadata"]["uid"] = json!(tenant.uid());
-        match api
-            .patch_status(
-                &tenant.name_any(),
-                &PatchParams::default(),
-                &Patch::Merge(&patch),
-            )
-            .await
-        {
-            Ok(updated) => {
-                if updated.uid() != tenant.uid() {
-                    return Err(ReconcileError::OwnershipInvalid(
-                        "Tenant changed during status update".into(),
-                    ));
-                }
-                return Ok(());
-            }
-            Err(kube::Error::Api(status)) if status.code == 409 && attempt < 4 => {
-                current = api.get(&tenant.name_any()).await?;
-            }
-            Err(error) => return Err(error.into()),
-        }
+pub fn map_management_to_tenant(
+    definition: management::ManagementResource,
+    object: &DynamicObject,
+) -> Vec<ObjectRef<Tenant>> {
+    let mapped = crate::runtime::map_dependent_to_tenant(object);
+    if !mapped.is_empty() {
+        return mapped;
     }
-    unreachable!("bounded status retries return")
+    if let Some(suffix) = definition.watch_name_suffix {
+        object
+            .namespace()
+            .filter(|namespace| object.name_any() == format!("{namespace}{suffix}"))
+            .map(|namespace| vec![ObjectRef::new(&namespace)])
+            .unwrap_or_default()
+    } else if let Some(label) = definition.watch_cluster_label {
+        object
+            .labels()
+            .get(label)
+            .filter(|name| !name.is_empty())
+            .map(|name| vec![ObjectRef::new(name)])
+            .unwrap_or_default()
+    } else {
+        Vec::new()
+    }
 }
 
 pub fn controller(client: Client, _config: &Config) -> Controller<Tenant> {
-    let mut controller = tenant_controller(client.clone())
-        .watches(
-            Api::<Namespace>::all(client.clone()),
-            watcher::Config::default(),
-            |object| crate::runtime::map_dependent_to_tenant(&object),
-        )
-        .watches(
-            Api::<Lease>::all(client.clone()),
-            watcher::Config::default(),
-            |object| crate::runtime::map_dependent_to_tenant(&object),
-        )
-        .watches(
-            Api::<Secret>::all(client.clone()),
-            watcher::Config::default(),
-            |object| {
-                let mapped = crate::runtime::map_dependent_to_tenant(&object);
-                if !mapped.is_empty() {
-                    return mapped;
-                }
-                object
-                    .namespace()
-                    .filter(|namespace| object.name_any() == format!("{namespace}-kubeconfig"))
-                    .map(|namespace| vec![ObjectRef::new(&namespace)])
-                    .unwrap_or_default()
-            },
-        );
-    for definition in
-        management::watched().filter(|resource| resource.class != ResourceClass::Typed)
-    {
+    let mut controller = tenant_controller(client.clone());
+    for definition in management::watched() {
         let resource = definition.api_resource();
         controller = controller.watches_with(
             Api::<DynamicObject>::all_with(client.clone(), &resource),
             resource,
             watcher::Config::default(),
-            |object| {
-                let mapped = crate::runtime::map_dependent_to_tenant(&object);
-                if !mapped.is_empty() {
-                    return mapped;
-                }
-                object
-                    .labels()
-                    .get("cluster.x-k8s.io/cluster-name")
-                    .filter(|name| !name.is_empty())
-                    .map(|name| vec![ObjectRef::new(name)])
-                    .unwrap_or_default()
-            },
+            move |object| map_management_to_tenant(definition, &object),
         );
     }
     controller

@@ -45,19 +45,20 @@ fn management_rule(resource: &crate::management::ManagementResource) -> PolicyRu
         .api_version
         .split_once('/')
         .map_or("", |(group, _)| group);
-    let verbs: &[&str] = match resource.kind {
-        "Namespace" => &["create", "delete", "get", "list", "watch"],
-        "Secret" => &["delete", "get", "list", "watch"],
-        "Lease" => &[
-            "create", "delete", "get", "list", "patch", "update", "watch",
-        ],
-        "KubeadmConfig" | "TenantControlPlane" => &["get", "list"],
+    let mut verbs = match resource.kind {
+        "Namespace" => vec!["create", "delete", "get", "list"],
+        "Secret" => vec!["delete", "get", "list"],
+        "Lease" => vec!["create", "delete", "get", "list", "patch", "update"],
+        "KubeadmConfig" | "TenantControlPlane" => vec!["get", "list"],
         _ if resource.class == ResourceClass::Root => {
-            &["create", "delete", "get", "list", "patch", "watch"]
+            vec!["create", "delete", "get", "list", "patch"]
         }
-        _ => &["create", "delete", "get", "list", "watch"],
+        _ => vec!["create", "delete", "get", "list"],
     };
-    rule(group, &[resource.plural], verbs)
+    if resource.watched && !verbs.contains(&"watch") {
+        verbs.push("watch");
+    }
+    rule(group, &[resource.plural], &verbs)
 }
 
 pub fn controller_role() -> ClusterRole {
@@ -105,6 +106,7 @@ mod tests {
                 .unwrap();
             assert!(rule.verbs.contains(&"get".into()));
             assert!(rule.verbs.contains(&"list".into()));
+            assert_eq!(rule.verbs.contains(&"watch".into()), resource.watched);
         }
         for (kind, expected) in [
             (
@@ -140,5 +142,9 @@ mod tests {
                 .unwrap();
             assert_eq!(rule.verbs, expected);
         }
+        let mut kubeadm = crate::management::by_kind("KubeadmConfig").unwrap();
+        assert!(!management_rule(&kubeadm).verbs.contains(&"watch".into()));
+        kubeadm.watched = true;
+        assert!(management_rule(&kubeadm).verbs.contains(&"watch".into()));
     }
 }

@@ -14,58 +14,40 @@ from scripts.lib.tenant_spec import (
 )
 
 
-LOCAL = {
+AZURE = {
     "schema": 1,
-    "profile": "local",
+    "profile": "azure",
     "name": "tenant-c",
-    "kubernetesVersion": "1.36.4",
+    "kubernetesVersion": "1.32.13",
     "workers": 1,
     "podCIDR": "10.72.0.0/16",
     "serviceCIDR": "10.142.0.0/16",
-    "databaseCount": 3,
 }
 
 
 class TenantSpecTests(unittest.TestCase):
-    def test_parses_local_spec_and_derives_fields(self) -> None:
+    def test_parses_azure_spec_and_derives_fields(self) -> None:
         spec = TenantSpec.from_mapping(
-            LOCAL,
-            supported_versions={"local": "v1.36.4"},
+            AZURE,
+            supported_versions={"azure": "v1.32.13"},
         )
         self.assertEqual(spec.namespace, "tenant-c")
         self.assertEqual(spec.dns_service_ip, "10.142.0.10")
-        self.assertEqual(spec.cluster_domain, "tenant-c.capi.local")
-        self.assertEqual(spec.database_name, "tenant-c-postgres")
-        self.assertEqual(spec.database_count, 3)
+        self.assertEqual(spec.cluster_domain, "cluster.local")
         self.assertEqual(spec, TenantSpec.from_mapping(spec.to_mapping()))
         self.assertEqual(len(spec.sha256()), 64)
 
-    def test_parses_azure_spec_without_database_fields(self) -> None:
-        payload = LOCAL | {
-            "profile": "azure",
-            "kubernetesVersion": "1.32.13",
-        }
-        payload.pop("databaseCount")
-        spec = TenantSpec.from_mapping(
-            payload,
-            expected_profile="azure",
-            supported_versions={"azure": "1.32.13"},
-        )
-        self.assertEqual(spec.cluster_domain, "cluster.local")
-        self.assertIsNone(spec.database_count)
-        self.assertIsNone(spec.database_name)
-
     def test_rejects_unknown_missing_and_duplicate_fields(self) -> None:
         with self.assertRaisesRegex(TenantSpecError, "unknown"):
-            TenantSpec.from_mapping(LOCAL | {"namespace": "tenant-c"})
-        missing = dict(LOCAL)
+            TenantSpec.from_mapping(AZURE | {"namespace": "tenant-c"})
+        missing = dict(AZURE)
         missing.pop("workers")
         with self.assertRaisesRegex(TenantSpecError, "missing"):
             TenantSpec.from_mapping(missing)
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "tenant.json"
             path.write_text(
-                '{"schema":1,"schema":1,"profile":"local"}',
+                '{"schema":1,"schema":1,"profile":"azure"}',
                 encoding="utf-8",
             )
             with self.assertRaisesRegex(TenantSpecError, "duplicate"):
@@ -75,35 +57,37 @@ class TenantSpecTests(unittest.TestCase):
         for name in ("Upper", "-tenant", "tenant-", "a" * 31):
             with self.subTest(name=name):
                 with self.assertRaises(TenantSpecError):
-                    TenantSpec.from_mapping(LOCAL | {"name": name})
+                    TenantSpec.from_mapping(AZURE | {"name": name})
         with self.assertRaisesRegex(TenantSpecError, "Kubernetes version"):
-            TenantSpec.from_mapping(LOCAL | {"kubernetesVersion": "1.36"})
+            TenantSpec.from_mapping(AZURE | {"kubernetesVersion": "1.32"})
         with self.assertRaisesRegex(TenantSpecError, "integer"):
-            TenantSpec.from_mapping(LOCAL | {"workers": 0})
+            TenantSpec.from_mapping(AZURE | {"workers": 0})
         with self.assertRaisesRegex(TenantSpecError, "unsupported"):
-            TenantSpec.from_mapping(LOCAL | {"profile": "other"})
+            TenantSpec.from_mapping(AZURE | {"profile": "other"})
         with self.assertRaisesRegex(TenantSpecError, "does not match"):
-            TenantSpec.from_mapping(LOCAL, expected_profile="azure")
+            TenantSpec.from_mapping(AZURE, expected_profile="local")
 
-    def test_rejects_azure_database_count_and_wrong_supported_version(self) -> None:
+    def test_rejects_local_profile_database_count_and_wrong_supported_version(self) -> None:
+        with self.assertRaisesRegex(TenantSpecError, "unsupported"):
+            TenantSpec.from_mapping(AZURE | {"profile": "local"})
         with self.assertRaisesRegex(TenantSpecError, "unknown"):
-            TenantSpec.from_mapping(LOCAL | {"profile": "azure"})
-        with self.assertRaisesRegex(TenantSpecError, "unsupported local"):
+            TenantSpec.from_mapping(AZURE | {"databaseCount": 3})
+        with self.assertRaisesRegex(TenantSpecError, "unsupported azure"):
             TenantSpec.from_mapping(
-                LOCAL,
-                supported_versions={"local": "1.35.0"},
+                AZURE,
+                supported_versions={"azure": "1.35.0"},
             )
 
     def test_rejects_invalid_or_overlapping_networks(self) -> None:
         with self.assertRaisesRegex(TenantSpecError, "overlap"):
             TenantSpec.from_mapping(
-                LOCAL | {"serviceCIDR": LOCAL["podCIDR"]}
+                AZURE | {"serviceCIDR": AZURE["podCIDR"]}
             )
         with self.assertRaisesRegex(TenantSpecError, "IPv4"):
             TenantSpec.from_mapping(
-                LOCAL | {"podCIDR": "2001:db8::/64"}
+                AZURE | {"podCIDR": "2001:db8::/64"}
             )
-        spec = TenantSpec.from_mapping(LOCAL)
+        spec = TenantSpec.from_mapping(AZURE)
         with self.assertRaisesRegex(TenantSpecError, "shared-pods"):
             require_non_overlapping_networks(
                 spec,
@@ -115,9 +99,9 @@ class TenantSpecTests(unittest.TestCase):
             root = Path(temporary)
             first = root / "first.json"
             second = root / "second.json"
-            first.write_text(json.dumps(LOCAL), encoding="utf-8")
+            first.write_text(json.dumps(AZURE), encoding="utf-8")
             second.write_text(
-                json.dumps(LOCAL, indent=4, sort_keys=True),
+                json.dumps(AZURE, indent=4, sort_keys=True),
                 encoding="utf-8",
             )
             self.assertEqual(

@@ -124,13 +124,6 @@ class HostTests(unittest.TestCase):
             host = root / ".runtime" / "host"
             (root / ".runtime").mkdir(mode=0o700)
             host.mkdir(mode=0o700)
-            lifecycle = root / ".runtime" / "lifecycle" / "local" / "tenant-a"
-            lifecycle.mkdir(parents=True, mode=0o700)
-            for parent in (
-                root / ".runtime" / "lifecycle",
-                root / ".runtime" / "lifecycle" / "local",
-            ):
-                parent.chmod(0o700)
             state = host / "inotify.json"
             state.write_text(
                 json.dumps(
@@ -149,7 +142,7 @@ class HostTests(unittest.TestCase):
 
             def fake_run(command, **kwargs):
                 if command[:3] == ["docker", "ps", "-aq"] and (
-                    "label=io.x-k8s.kind.cluster=tenant-a" in command
+                    "label=io.x-k8s.kind.role=external-load-balancer" in command
                 ):
                     return type(
                         "Result",
@@ -175,4 +168,19 @@ class HostTests(unittest.TestCase):
             with patch("scripts.lib.host.run", side_effect=fake_run):
                 with self.assertRaisesRegex(HostError, "provider-owned"):
                     restore_inotify(root, config)
+            self.assertTrue(state.exists())
+            empty = type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": "", "stderr": ""},
+            )()
+            with (
+                patch("scripts.lib.host.run", return_value=empty),
+                patch(
+                    "scripts.lib.host.tenant_storage_volumes",
+                    return_value={"tenant-a-storage"},
+                ),
+                self.assertRaisesRegex(HostError, "provider-owned"),
+            ):
+                restore_inotify(root, config)
             self.assertTrue(state.exists())

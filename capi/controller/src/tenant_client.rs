@@ -1,5 +1,4 @@
-//! Tenant credentials are read only from the exact provider-owned Secret.
-//! Errors deliberately retain neither Secret data nor API response bodies.
+//! Tenant credentials come only from the exact provider-owned Secret without secret-bearing errors.
 
 use std::collections::BTreeSet;
 use std::time::Duration;
@@ -14,9 +13,8 @@ use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::core::DynamicObject;
 use kube::{Api, Client, Config};
 
-use crate::ownership::{
-    CONTROL_PLANE_API_VERSION, validate_kubeconfig_secret, validate_kubeconfig_secret_for_deletion,
-};
+use crate::management::MANAGEMENT_RESOURCES;
+use crate::ownership::{validate_kubeconfig_secret, validate_kubeconfig_secret_for_deletion};
 use crate::resources::{bootstrap_rbac, bootstrap_subjects_match};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -147,9 +145,17 @@ pub fn parse_owned_kubeconfig(
     tenant_name: &str,
     endpoint: &str,
 ) -> Result<Kubeconfig, TenantClientError> {
+    let secret_definition = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == "Secret")
+        .expect("Secret is catalogued");
+    let control_plane_definition = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == "KamajiControlPlane")
+        .expect("KamajiControlPlane is catalogued");
     if namespace.is_empty()
         || tenant_name.is_empty()
-        || secret.metadata.name.as_deref() != Some(&format!("{tenant_name}-kubeconfig"))
+        || secret.metadata.name != secret_definition.expected_name(tenant_name)
         || secret.metadata.namespace.as_deref() != Some(namespace)
         || secret.metadata.uid.as_deref().is_none_or(str::is_empty)
     {
@@ -158,7 +164,8 @@ pub fn parse_owned_kubeconfig(
     if control_plane.metadata.name.as_deref() != Some(tenant_name)
         || control_plane.metadata.namespace.as_deref() != Some(namespace)
         || !control_plane.types.as_ref().is_some_and(|types| {
-            types.kind == "KamajiControlPlane" && types.api_version == CONTROL_PLANE_API_VERSION
+            types.kind == control_plane_definition.kind
+                && types.api_version == control_plane_definition.api_version
         })
     {
         return Err(TenantClientError::SecretOwnership);
@@ -322,8 +329,13 @@ pub async fn load_tenant_client(
     tenant_name: &str,
     endpoint: &str,
 ) -> Result<(Client, Secret), TenantClientError> {
+    let name = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == "Secret")
+        .and_then(|resource| resource.expected_name(tenant_name))
+        .expect("Secret has a declared name");
     let secret = Api::<Secret>::namespaced(management, namespace)
-        .get_opt(&format!("{tenant_name}-kubeconfig"))
+        .get_opt(&name)
         .await
         .map_err(|error| TenantClientError::request("read kubeconfig Secret", error, false))?
         .ok_or(TenantClientError::SecretPending)?;

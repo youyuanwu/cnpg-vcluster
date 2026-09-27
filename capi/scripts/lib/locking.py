@@ -48,26 +48,23 @@ def _lock_descriptor(path: Path, *, create: bool) -> int | None:
     return descriptor
 
 
-def profile_lock_path(root: Path, profile: str) -> Path:
-    if profile not in {"local", "azure"}:
-        raise RuntimeError(f"unsupported tenant profile lock: {profile}")
-    return root / ".runtime" / "lifecycle" / ".locks" / f"{profile}.lock"
+def azure_lock_path(root: Path) -> Path:
+    return root / ".runtime" / "lifecycle" / ".locks" / "azure.lock"
 
 
-def profile_lock_exists(root: Path, profile: str) -> bool:
-    return private_file_exists(profile_lock_path(root, profile))
+def azure_lock_exists(root: Path) -> bool:
+    return private_file_exists(azure_lock_path(root))
 
 
 @contextmanager
-def profile_lock(
+def azure_lock(
     root: Path,
-    profile: str,
     *,
     exclusive: bool,
     create: bool,
 ) -> Iterator[bool]:
     descriptor = _lock_descriptor(
-        profile_lock_path(root, profile),
+        azure_lock_path(root),
         create=create,
     )
     if descriptor is None:

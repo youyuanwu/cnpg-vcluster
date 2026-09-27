@@ -13,17 +13,20 @@ pub fn namespace(context: &Context<'_>) -> Namespace {
 
 pub fn cluster(context: &Context<'_>) -> Result<DynamicObject, BuildError> {
     let (host, port) = endpoint(context.endpoint)?;
-    let mut object = context.management_object("Cluster", json!({
-        "controlPlaneEndpoint":{"host":host,"port":port},
-        "clusterNetwork":{
-            "apiServerPort":port,
-            "services":{"cidrBlocks":[context.service_cidr]},
-            "pods":{"cidrBlocks":[context.pod_cidr]},
-            "serviceDomain":context.inputs.cluster_domain
-        },
-        "infrastructureRef":{"apiGroup":"infrastructure.cluster.x-k8s.io","kind":"DevCluster","name":context.name()},
-        "controlPlaneRef":{"apiGroup":"controlplane.cluster.x-k8s.io","kind":"KamajiControlPlane","name":context.name()}
-    }));
+    let mut object = context.management_object(
+        "Cluster",
+        json!({
+            "controlPlaneEndpoint":{"host":host,"port":port},
+            "clusterNetwork":{
+                "apiServerPort":port,
+                "services":{"cidrBlocks":[context.service_cidr]},
+                "pods":{"cidrBlocks":[context.pod_cidr]},
+                "serviceDomain":context.inputs.cluster_domain
+            },
+            "infrastructureRef":context.management_ref("DevCluster"),
+            "controlPlaneRef":context.management_ref("KamajiControlPlane")
+        }),
+    );
     object
         .metadata
         .labels

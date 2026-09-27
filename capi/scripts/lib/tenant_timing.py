@@ -9,6 +9,7 @@ from typing import Iterator
 from .files import write_private_file
 from .redaction import redact
 from .tenant_runtime import TenantRuntime
+from .tenant_spec import PROFILE
 
 
 TENANT_PHASES = frozenset(
@@ -40,13 +41,12 @@ class TenantTimings:
         self,
         root: Path,
         *,
-        profile: str,
         tenant: str,
         operation: str,
         operation_id: str,
     ) -> None:
-        self.runtime = TenantRuntime(root, profile, tenant)
-        self.profile = profile
+        self.runtime = TenantRuntime(root, tenant)
+        self.profile = PROFILE
         self.tenant = tenant
         self.operation = operation
         self.operation_id = operation_id
@@ -152,14 +152,13 @@ class TenantTimings:
 def record_rejected_create(
     root: Path,
     *,
-    profile: str,
     operation_id: str,
     seconds: float,
     error: BaseException,
 ) -> None:
     record = {
         "schema": 1,
-        "profile": profile,
+        "profile": PROFILE,
         "tenant": None,
         "operation": "create",
         "operationId": operation_id,
@@ -178,7 +177,7 @@ def record_rejected_create(
         + json.dumps(
             {
                 **record["records"][0],
-                "profile": profile,
+                "profile": PROFILE,
                 "tenant": None,
                 "operation": "create",
                 "operationId": operation_id,
@@ -192,7 +191,7 @@ def record_rejected_create(
         / ".runtime"
         / "lifecycle"
         / "rejected"
-        / profile
+        / PROFILE
         / f"create-{operation_id}.json",
         json.dumps(record, sort_keys=True) + "\n",
     )

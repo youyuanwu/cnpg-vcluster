@@ -7,7 +7,9 @@ use kube::core::DynamicObject;
 use serde_json::{Value, json};
 use tenant_controller::{
     api::{CanonicalSpec, Tenant, TenantSpec},
+    management::by_kind,
     ownership::*,
+    reconcile::map_management_to_tenant,
     resources::*,
 };
 
@@ -15,6 +17,36 @@ struct Fixture {
     tenant: Tenant,
     spec: CanonicalSpec,
     inputs: Inputs,
+}
+
+#[test]
+fn catalog_watch_mapping_preserves_typed_and_dynamic_fallbacks() {
+    let secret: DynamicObject = serde_json::from_value(json!({
+        "apiVersion":"v1","kind":"Secret",
+        "metadata":{"name":"tenant-a-kubeconfig","namespace":"tenant-a"}
+    }))
+    .unwrap();
+    let mut secret_watch = by_kind("Secret").unwrap();
+    secret_watch.name_policy = tenant_controller::management::NamePolicy::Tenant;
+    let mapped = map_management_to_tenant(secret_watch, &secret);
+    assert_eq!(mapped.len(), 1);
+    assert_eq!(mapped[0].name, "tenant-a");
+
+    let machine: DynamicObject = serde_json::from_value(json!({
+        "apiVersion":"cluster.x-k8s.io/v1beta2","kind":"Machine",
+        "metadata":{"name":"generated","namespace":"tenant-a",
+            "labels":{"cluster.x-k8s.io/cluster-name":"tenant-a"}}
+    }))
+    .unwrap();
+    let mapped = map_management_to_tenant(by_kind("Machine").unwrap(), &machine);
+    assert_eq!(mapped.len(), 1);
+    assert_eq!(mapped[0].name, "tenant-a");
+
+    let namespace: DynamicObject = serde_json::from_value(json!({
+        "apiVersion":"v1","kind":"Namespace","metadata":{"name":"unrelated"}
+    }))
+    .unwrap();
+    assert!(map_management_to_tenant(by_kind("Namespace").unwrap(), &namespace).is_empty());
 }
 
 impl Fixture {
@@ -146,7 +178,7 @@ fn control_plane_golden_network_dns_images_and_tolerations() {
     let control = kamaji_control_plane(&context).unwrap();
     assert_eq!(
         control.types.as_ref().unwrap().api_version,
-        CONTROL_PLANE_API_VERSION
+        by_kind("KamajiControlPlane").unwrap().api_version
     );
     assert_eq!(
         control.data,

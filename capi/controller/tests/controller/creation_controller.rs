@@ -10,6 +10,7 @@ use tenant_controller::{
     api::{Tenant, TenantStatus, canonical_spec, spec_hash},
     docker::{DockerContainer, WORKER_CLUSTER_LABEL, WORKER_ROLE_LABEL},
     foundation::{Foundation, FoundationError, canonical_hash, parse_runtime},
+    management,
     ownership::Identity,
     reconcile::{Assets, Config, FINALIZER, PROGRESS_INTERVAL, Reconciler},
 };
@@ -311,12 +312,14 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
             .iter()
             .map(|call| call.method.as_str())
             .collect::<Vec<_>>(),
-        ["GET", "PUT"]
+        ["GET", "PATCH"]
     );
     assert_eq!(
         calls[1].path, TENANT,
         "finalizer uses main resource, not status"
     );
+    assert_eq!(calls[1].body["metadata"]["uid"], "tenant-uid");
+    assert_eq!(calls[1].body["metadata"]["resourceVersion"], "1");
     assert!(
         fixture
             .current()
@@ -403,6 +406,72 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
     ));
     assert!(fixture.workload.calls().is_empty());
     assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn creation_finalizer_conflict_requeues_without_failure_status_patch() {
+    let fixture = Fixture::new(true);
+    fixture.management.respond(
+        "PATCH",
+        TENANT,
+        409,
+        crate::support::kube::status(409, "Conflict"),
+    );
+    fixture.reconciler.reconcile_name("tenant-a").await.unwrap();
+    let calls = fixture.management.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| (call.method.as_str(), call.path.as_str()))
+            .collect::<Vec<_>>(),
+        [("GET", TENANT), ("PATCH", TENANT)]
+    );
+}
+
+#[tokio::test]
+async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
+    let fixture = Fixture::new(true);
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-09-27T00:00:00Z");
+    tenant["metadata"]["finalizers"] = json!([FINALIZER]);
+    tenant["status"] = json!({
+        "phase":"Deleting",
+        "foundationHash":fixture.hash,
+        "conditions":[]
+    });
+    fixture.management.insert(TENANT, tenant);
+    for resource in management::descendants().filter(|resource| resource.role != "provider") {
+        let (group, version) = resource.api_version.split_once('/').unwrap();
+        fixture.management.allow_list(&format!(
+            "/apis/{group}/{version}/namespaces/tenant-a/{}",
+            resource.plural
+        ));
+    }
+    fixture.management.respond(
+        "PATCH",
+        TENANT,
+        409,
+        crate::support::kube::status(409, "Conflict"),
+    );
+
+    fixture.reconciler.reconcile_name("tenant-a").await.unwrap();
+
+    assert_eq!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .filter(|call| call.method == "PATCH" && call.path == TENANT)
+            .count(),
+        1
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| !(call.method == "PATCH" && call.path == format!("{TENANT}/status")))
+    );
 }
 
 #[tokio::test]

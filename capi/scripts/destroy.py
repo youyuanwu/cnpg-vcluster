@@ -6,7 +6,11 @@ import shutil
 import stat
 from pathlib import Path
 
-from scripts.lib.host import restore_inotify, validate_inotify_state
+from scripts.lib.host import (
+    restore_inotify,
+    tenant_storage_volumes,
+    validate_inotify_state,
+)
 from scripts.lib.kube import ManagementClient
 from scripts.lib.management import (
     _render_cert_manager,
@@ -32,8 +36,16 @@ def _validate_runtime_inventory(
     root: Path,
 ) -> None:
     runtime = root / ".runtime"
-    if not runtime.exists():
+    if not os.path.lexists(runtime):
         return
+    root_details = runtime.lstat()
+    if (
+        stat.S_ISLNK(root_details.st_mode)
+        or not stat.S_ISDIR(root_details.st_mode)
+        or root_details.st_uid != os.getuid()
+        or root_details.st_mode & 0o077
+    ):
+        raise RuntimeError("runtime root is not a private owned directory")
     registry_record = runtime / "management" / "offline-registry.json"
     registry_data = runtime / "management" / "offline-registry-data"
     registry_record_present = os.path.lexists(registry_record)
@@ -47,7 +59,6 @@ def _validate_runtime_inventory(
         "host/.lock",
         "management/identity.json",
         "management/network.json",
-        "management/tenant-endpoints.json",
         "management/kubeconfig",
         "management/offline-registry.json",
         "retained-management.json",
@@ -65,6 +76,42 @@ def _validate_runtime_inventory(
     }
     tenant_pattern = r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?"
     tenant_pair_pattern = rf"{tenant_pattern}-to-{tenant_pattern}"
+    obsolete_files = {"management/tenant-endpoints.json", "lifecycle/.locks/local.lock"}
+    obsolete_dynamic = (
+        re.compile(
+            rf"^lifecycle/local/{tenant_pattern}/(identity|operation|ready)\.json$"
+        ),
+        re.compile(
+            rf"^lifecycle/local/{tenant_pattern}/evidence/"
+            r"(create|delete)-[a-z0-9-]+\.json$"
+        ),
+        re.compile(r"^lifecycle/rejected/local/create-[a-z0-9-]+\.json$"),
+    )
+    obsolete_directories = (
+        re.compile(r"^lifecycle/local$"),
+        re.compile(rf"^lifecycle/local/{tenant_pattern}$"),
+        re.compile(rf"^lifecycle/local/{tenant_pattern}/evidence$"),
+        re.compile(r"^lifecycle/rejected/local$"),
+    )
+    known_top_level = {
+        "azure",
+        "azure-gate",
+        "deletions",
+        "evidence",
+        "host",
+        "lifecycle",
+        "management",
+        "rendered",
+        "storage",
+        "tenants",
+    }
+    allowed_directories = (
+        re.compile(r"^(host|management|evidence|rendered|storage|tenants|deletions|lifecycle)$"),
+        re.compile(r"^rendered/(providers|controller|negative|tenants|addons|storage|cnpg)$"),
+        re.compile(rf"^rendered/(tenants|addons|storage|cnpg)/{tenant_pattern}$"),
+        re.compile(rf"^(storage|tenants)/{tenant_pattern}$"),
+        re.compile(r"^lifecycle/(\.locks|rejected|rejected/azure)$"),
+    )
     allowed_dynamic = (
         re.compile(
             rf"^rendered/tenants/{tenant_pattern}/"
@@ -111,19 +158,11 @@ def _validate_runtime_inventory(
             rf"^tenants/cross-{tenant_pair_pattern}\.kubeconfig$"
         ),
         re.compile(rf"^tenants/cross-{tenant_pattern}-postgres\.env$"),
-        re.compile(r"^lifecycle/\.locks/(local|azure)\.lock$"),
-        re.compile(
-            rf"^lifecycle/local/{tenant_pattern}/"
-            r"(identity|operation|ready)\.json$"
-        ),
-        re.compile(
-            rf"^lifecycle/local/{tenant_pattern}/evidence/"
-            r"(create|delete)-[a-z0-9-]+\.json$"
-        ),
-        re.compile(
-            r"^lifecycle/rejected/(local|azure)/create-[a-z0-9-]+\.json$"
-        ),
+        re.compile(r"^lifecycle/\.locks/azure\.lock$"),
+        re.compile(r"^lifecycle/rejected/azure/create-[a-z0-9-]+\.json$"),
     )
+    obsolete = []
+    obsolete_dirs = []
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
         if relative == "azure" or relative.startswith("azure/"):
@@ -144,15 +183,55 @@ def _validate_runtime_inventory(
         if path.is_dir():
             if details.st_uid != os.getuid() or details.st_mode & 0o077:
                 raise RuntimeError(f"runtime directory is not private: {relative}")
+            if "/" not in relative and relative not in known_top_level:
+                raise RuntimeError(
+                    f"unexpected runtime directory blocks cleanup: {relative}"
+                )
+            if relative.startswith(("lifecycle/local", "lifecycle/rejected/local")):
+                if not any(
+                    pattern.fullmatch(relative)
+                    for pattern in obsolete_directories
+                ):
+                    raise RuntimeError(
+                        f"unexpected runtime directory blocks cleanup: {relative}"
+                    )
+                obsolete_dirs.append(path)
+            elif not any(
+                pattern.fullmatch(relative)
+                for pattern in allowed_directories
+            ):
+                raise RuntimeError(
+                    f"unexpected runtime directory blocks cleanup: {relative}"
+                )
             continue
-        if relative not in allowed_files and not any(
-            pattern.fullmatch(relative) for pattern in allowed_dynamic
+        recognized_obsolete = relative in obsolete_files or any(
+            pattern.fullmatch(relative) for pattern in obsolete_dynamic
+        )
+        if (
+            relative not in allowed_files
+            and not recognized_obsolete
+            and not any(pattern.fullmatch(relative) for pattern in allowed_dynamic)
         ):
             raise RuntimeError(f"unexpected runtime file blocks cleanup: {relative}")
         if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
             raise RuntimeError(f"runtime file is not an owned regular file: {relative}")
         if details.st_mode & 0o077:
             raise RuntimeError(f"runtime file is not owner-only: {relative}")
+        if recognized_obsolete:
+            obsolete.append(path)
+    for path in obsolete:
+        path.unlink()
+    parents = set(obsolete_dirs) | {
+        parent
+        for path in obsolete
+        for parent in path.parents
+        if parent == runtime or runtime in parent.parents
+    }
+    for directory in sorted(parents - {runtime}, key=lambda path: len(path.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _remove_local_runtime(root: Path) -> None:
@@ -167,16 +246,7 @@ def _remove_local_runtime(root: Path) -> None:
         "deletions",
     ):
         shutil.rmtree(runtime / relative, ignore_errors=True)
-    for path in (
-        runtime / "retained-management.json",
-        runtime / "lifecycle" / ".locks" / "local.lock",
-    ):
-        path.unlink(missing_ok=True)
-    shutil.rmtree(runtime / "lifecycle" / "local", ignore_errors=True)
-    shutil.rmtree(
-        runtime / "lifecycle" / "rejected" / "local",
-        ignore_errors=True,
-    )
+    (runtime / "retained-management.json").unlink(missing_ok=True)
     for directory in (
         runtime / "lifecycle" / ".locks",
         runtime / "lifecycle" / "rejected",
@@ -278,9 +348,9 @@ def inspect_host_residue(
     tenant_names: tuple[str, ...] = (),
 ) -> dict[str, list[str]]:
     clusters = [config["SPIKE_NAME"], *tenant_names]
-    containers = []
+    containers = set()
     for name in clusters:
-        containers.extend(
+        containers.update(
             run(
                 [
                     "docker",
@@ -288,6 +358,25 @@ def inspect_host_residue(
                     "-aq",
                     "--filter",
                     f"label=io.x-k8s.kind.cluster={name}",
+                ],
+                timeout=30,
+            ).stdout.split()
+        )
+    for label in (
+        "io.x-k8s.kind.role=worker",
+        "io.x-k8s.kind.role=external-load-balancer",
+        "cnpg-vcluster.capi/role",
+        "cnpg-vcluster.capi/tenant",
+        "tenancy.cnpg-vcluster.io/tenant-uid",
+    ):
+        containers.update(
+            run(
+                [
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    f"label={label}",
                 ],
                 timeout=30,
             ).stdout.split()
@@ -314,19 +403,9 @@ def inspect_host_residue(
         ],
         timeout=30,
     ).stdout.split()
-    volumes = run(
-        [
-            "docker",
-            "volume",
-            "ls",
-            "-q",
-            "--filter",
-            f"label={config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
-        ],
-        timeout=30,
-    ).stdout.split()
+    volumes = tenant_storage_volumes(config)
     return {
-        "containers": sorted(set(containers)),
+        "containers": sorted(containers),
         "probes": sorted(set(probes)),
         "registries": sorted(set(registries)),
         "volumes": sorted(volumes),

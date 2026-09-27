@@ -14,6 +14,11 @@ from typing import Mapping
 
 from .conditions import condition_true
 from .config import parse_duration
+from .controller_catalog import (
+    ManagementResource,
+    load_management_resources,
+    resource_by_kind,
+)
 from .files import (
     IntegrityError,
     ensure_private_dir,
@@ -44,6 +49,11 @@ LIFECYCLE_MARKERS = {
     "foundationSha256": "lifecycle.cnpg-vcluster.capi/foundation-sha256",
     "operationId": "lifecycle.cnpg-vcluster.capi/operation-id",
 }
+MANAGEMENT_CATALOG = load_management_resources(Path(__file__).resolve().parents[2])
+
+
+def _management_resource(kind: str):
+    return resource_by_kind(MANAGEMENT_CATALOG, kind)
 
 
 @dataclass
@@ -106,77 +116,38 @@ def _require_resource_markers(
 
 
 NOT_FOUND = re.compile(r"Error from server \(NotFound\):", re.IGNORECASE)
-MANAGEMENT_IDENTITY_KEYS = {
-    "namespace": "namespaceUID",
-    "cluster": "clusterUID",
-    "devcluster": "devClusterUID",
-    "kamajicontrolplane": "controlPlaneUID",
-    "machinedeployment": "machineDeploymentUID",
-    "kubeadmconfigtemplate": "kubeadmTemplateUID",
-    "devmachinetemplate": "devMachineTemplateUID",
-}
-
-
-def management_resource_identities(
-    resources: Mapping[str, object],
-) -> dict[str, str]:
-    return {
-        observed_key: str(resources[kind]["metadata"]["uid"])
-        for kind, observed_key in MANAGEMENT_IDENTITY_KEYS.items()
-        if isinstance(resources.get(kind), dict)
-    }
-
-
-def require_recorded_management_identities(
-    resources: Mapping[str, object],
-    observed: Mapping[str, str],
-    *,
-    require_present: bool,
-) -> None:
-    current = management_resource_identities(resources)
-    changed = []
-    absent = []
-    for observed_key in MANAGEMENT_IDENTITY_KEYS.values():
-        recorded = observed.get(observed_key)
-        if recorded is None:
-            continue
-        actual = current.get(observed_key)
-        if actual is None:
-            if require_present:
-                absent.append(observed_key)
-        elif actual != recorded:
-            changed.append(observed_key)
-    if changed:
-        raise RuntimeError(
-            "tenant management identity changed: " + ", ".join(sorted(changed))
-        )
-    if absent:
-        raise RuntimeError(
-            "recorded tenant management resource is absent: "
-            + ", ".join(sorted(absent))
-        )
-
-
 def inspect_management_resource(
     client: ManagementClient,
     tenant: Tenant,
-    resource: str,
+    resource: ManagementResource,
+    name: str,
 ) -> dict[str, object] | None:
+    namespace = tenant.namespace if resource.namespaced else None
     response = client.kubectl(
-        "-n",
-        tenant.namespace,
         "get",
-        resource,
-        "-o",
-        "json",
+        f"--raw={resource.object_path(namespace, name)}",
         check=False,
     )
     if response.returncode == 0:
-        return json.loads(response.stdout)
+        payload = json.loads(response.stdout)
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("apiVersion") != resource.api_version
+            or payload.get("kind") != resource.kind
+            or not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or not metadata.get("uid")
+            or metadata.get("namespace") not in ((tenant.namespace,) if resource.namespaced else (None, ""))
+        ):
+            raise RuntimeError(
+                f"tenant management identity is invalid: {resource.kind}/{name}"
+            )
+        return payload
     if NOT_FOUND.search(response.stderr):
         return None
     raise RuntimeError(
-        f"tenant management inspection failed for {resource}: {response.stderr}"
+        f"tenant management inspection failed for {resource.kind}/{name}: {response.stderr}"
     )
 
 
@@ -188,15 +159,17 @@ def verify_tenant_management_ownership(
     expected_markers: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, object]]:
     present = {}
-    namespace_response = client.kubectl(
-        "get",
-        f"namespace/{tenant.namespace}",
-        "-o",
-        "json",
-        check=False,
+    namespace_definition = _management_resource("Namespace")
+    namespace_name = namespace_definition.expected_name(tenant.name)
+    if namespace_name is None:
+        raise RuntimeError("Tenant Namespace has no expected name")
+    namespace = inspect_management_resource(
+        client,
+        tenant,
+        namespace_definition,
+        namespace_name,
     )
-    if namespace_response.returncode == 0:
-        namespace = json.loads(namespace_response.stdout)
+    if namespace is not None:
         labels = namespace["metadata"].get("labels") or {}
         if labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]:
             raise RuntimeError(f"tenant namespace ownership mismatch: {tenant.name}")
@@ -204,23 +177,25 @@ def verify_tenant_management_ownership(
             _require_resource_markers(
                 namespace,
                 expected_markers,
-                f"namespace/{tenant.namespace}",
+                f"{namespace_definition.kubectl_resource}/{namespace_name}",
             )
         present["namespace"] = namespace
-    elif not NOT_FOUND.search(namespace_response.stderr):
-        raise RuntimeError(
-            f"tenant namespace inspection failed: {namespace_response.stderr}"
+    resources = MANAGEMENT_CATALOG
+    for definition in resources:
+        if definition.resource_class != "root":
+            continue
+        name = definition.expected_name(tenant.name)
+        if name is None:
+            raise RuntimeError(
+                f"management root has no expected name: {definition.kind}"
+            )
+        kind = definition.kind.lower()
+        payload = inspect_management_resource(
+            client,
+            tenant,
+            definition,
+            name,
         )
-    resources = (
-        ("cluster", tenant.name),
-        ("devcluster", tenant.name),
-        ("kamajicontrolplane", tenant.name),
-        ("machinedeployment", f"{tenant.name}-worker"),
-        ("kubeadmconfigtemplate", f"{tenant.name}-worker"),
-        ("devmachinetemplate", f"{tenant.name}-worker"),
-    )
-    for kind, name in resources:
-        payload = inspect_management_resource(client, tenant, f"{kind}/{name}")
         if payload is None:
             continue
         labels = payload["metadata"].get("labels") or {}
@@ -235,19 +210,36 @@ def verify_tenant_management_ownership(
                 f"{kind}/{name}",
             )
         present[kind] = payload
+    machine_definition = resource_by_kind(resources, "Machine")
+    machine_set_definition = resource_by_kind(resources, "MachineSet")
+    deployment_definition = resource_by_kind(resources, "MachineDeployment")
     machines_response = client.kubectl(
-        "-n",
-        tenant.namespace,
         "get",
-        "machines",
-        "-l",
-        f"cluster.x-k8s.io/cluster-name={tenant.name}",
-        "-o",
-        "json",
+        f"--raw={machine_definition.collection_path(tenant.namespace)}",
         check=False,
     )
     if machines_response.returncode == 0:
-        machines = json.loads(machines_response.stdout)["items"]
+        document = json.loads(machines_response.stdout)
+        machines = document.get("items") if isinstance(document, dict) else None
+        if (
+            not isinstance(document, dict)
+            or document.get("apiVersion") != machine_definition.api_version
+            or document.get("kind") != f"{machine_definition.kind}List"
+            or not isinstance(machines, list)
+            or any(
+                not isinstance(machine, dict)
+                or (
+                    "apiVersion" in machine
+                    and machine["apiVersion"] != machine_definition.api_version
+                )
+                or (
+                    "kind" in machine
+                    and machine["kind"] != machine_definition.kind
+                )
+                for machine in machines
+            )
+        ):
+            raise RuntimeError("tenant Machine inventory is invalid")
         deployment = present.get("machinedeployment")
         for machine in machines:
             labels = machine["metadata"].get("labels") or {}
@@ -262,8 +254,8 @@ def verify_tenant_management_ownership(
                 or labels.get("cnpg-vcluster.capi/nodepool") != "worker"
                 or len(owners) != 1
                 or owners[0].get("apiVersion")
-                != "cluster.x-k8s.io/v1beta2"
-                or owners[0].get("kind") != "MachineSet"
+                != machine_set_definition.api_version
+                or owners[0].get("kind") != machine_set_definition.kind
             ):
                 raise RuntimeError(
                     f"tenant Machine ownership mismatch: "
@@ -272,7 +264,8 @@ def verify_tenant_management_ownership(
             machine_set = inspect_management_resource(
                 client,
                 tenant,
-                f"machineset/{owners[0]['name']}",
+                machine_set_definition,
+                owners[0]["name"],
             )
             set_owners = (
                 machine_set["metadata"].get("ownerReferences") or []
@@ -295,10 +288,10 @@ def verify_tenant_management_ownership(
                 or deployment is None
                 or len(set_controller) != 1
                 or set_controller[0].get("apiVersion")
-                != "cluster.x-k8s.io/v1beta2"
-                or set_controller[0].get("kind") != "MachineDeployment"
+                != deployment_definition.api_version
+                or set_controller[0].get("kind") != deployment_definition.kind
                 or set_controller[0].get("name")
-                != f"{tenant.name}-worker"
+                != deployment_definition.expected_name(tenant.name)
                 or set_controller[0].get("uid")
                 != deployment["metadata"]["uid"]
             ):
@@ -307,7 +300,7 @@ def verify_tenant_management_ownership(
                     f"{owners[0]['name']}"
                 )
         present["machines"] = machines
-    elif not NOT_FOUND.search(machines_response.stderr):
+    else:
         raise RuntimeError(
             f"tenant Machine inspection failed: {machines_response.stderr}"
         )
@@ -382,6 +375,10 @@ def _wait_resource(
     description: str,
     predicate,
 ):
+    cluster = _management_resource("Cluster")
+    cluster_name = cluster.expected_name(tenant.name)
+    if cluster_name is None:
+        raise RuntimeError("Cluster has no expected name")
     return wait_for(
         description,
         parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"]),
@@ -392,7 +389,7 @@ def _wait_resource(
                 "-n",
                 tenant.namespace,
                 "get",
-                f"cluster/{tenant.name}",
+                f"{cluster.kubectl_resource}/{cluster_name}",
                 check=False,
             ).returncode
             == 0
@@ -453,7 +450,7 @@ def validate_tenant_kubeconfig_file(
             "-n",
             tenant.namespace,
             "get",
-            f"secret/{tenant.name}-ca",
+            f"{_management_resource('Secret').kubectl_resource}/{tenant.name}-ca",
             "-o",
             "json",
         ).stdout
@@ -516,12 +513,16 @@ def export_tenant_kubeconfig(
     client: ManagementClient,
     tenant: Tenant,
 ) -> Path:
+    secret = _management_resource("Secret")
+    secret_name = secret.expected_name(tenant.name)
+    if secret_name is None:
+        raise RuntimeError("tenant kubeconfig Secret has no expected name")
     secret = json.loads(
         client.kubectl(
             "-n",
             tenant.namespace,
             "get",
-            f"secret/{tenant.name}-kubeconfig",
+            f"{secret.kubectl_resource}/{secret_name}",
             "-o",
             "json",
         ).stdout
@@ -687,11 +688,12 @@ def read_storage_marker(
 
 
 def _machine(client: ManagementClient, tenant: Tenant) -> dict[str, object] | None:
+    machine = _management_resource("Machine")
     response = client.kubectl(
         "-n",
         tenant.namespace,
         "get",
-        "machines",
+        machine.kubectl_resource,
         "-l",
         f"cluster.x-k8s.io/cluster-name={tenant.name}",
         "-o",
@@ -715,8 +717,18 @@ def wait_for_registered_node(
         if not machine:
             return None
         name = machine["metadata"]["name"]
-        devmachine = _resource(client, tenant, "devmachine", name)
-        kubeadm = _resource(client, tenant, "kubeadmconfig", name)
+        devmachine = _resource(
+            client,
+            tenant,
+            _management_resource("DevMachine").kubectl_resource,
+            name,
+        )
+        kubeadm = _resource(
+            client,
+            tenant,
+            _management_resource("KubeadmConfig").kubectl_resource,
+            name,
+        )
         node_ref = machine.get("status", {}).get("nodeRef", {}).get("name")
         if not devmachine or not kubeadm or not node_ref:
             return None
@@ -785,7 +797,7 @@ def verify_authoritative_endpoint(
             "-n",
             tenant.namespace,
             "get",
-            f"secret/{registered['secret']}",
+            f"{_management_resource('Secret').kubectl_resource}/{registered['secret']}",
             "-o",
             "json",
         ).stdout
@@ -897,7 +909,12 @@ def endpoint_snapshot(
                 "uid": resource["metadata"]["uid"],
             }
     if machine:
-        devmachine = _resource(client, tenant, "devmachine", machine["metadata"]["name"])
+        devmachine = _resource(
+            client,
+            tenant,
+            _management_resource("DevMachine").kubectl_resource,
+            machine["metadata"]["name"],
+        )
         node_name = machine.get("status", {}).get("nodeRef", {}).get("name")
         node = None
         if node_name and tenant_kubeconfig_path(root, tenant).is_file():

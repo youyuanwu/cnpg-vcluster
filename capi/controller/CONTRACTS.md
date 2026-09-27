@@ -55,6 +55,29 @@ restarts resume active Tenants. Changed identity requires a one-time activation
 ticket, clean authoritative inventory, and an atomic accepted-identity update
 before reconciliation opens.
 
+The generated management-resource JSON is the cross-language local operator
+contract. Entries declare exact served API identity and scope,
+Tenant/worker/kubeconfig/observed/allocation naming, whether the resource is
+watched, watch-name suffix or cluster-label routing, inventory policy and
+namespace, evidence participation, and checked narrow exemptions. Rust and
+Python reject malformed catalogs, unserved declared versions, malformed list
+envelopes/items/owner references, and ambiguous identity.
+Python inventories exact versioned raw collection paths: the list envelope
+must declare the catalog API version and `<Kind>List`, while items must have
+valid name, UID, and scope. Raw-list items may omit redundant `apiVersion` and
+`kind`; if present, these must match. Rust likewise accepts absent dynamic
+item type metadata but rejects mismatched supplied types.
+Allocation names, fixed controller infrastructure, provider-only CRDs,
+break-glass allowlists, test fixtures, and tenant-internal resources remain
+domain-owned rather than duplicating catalog semantics.
+
+Tenant status and finalizer writes share exact UID/generation/spec/deletion
+validation. Every patch includes UID and resourceVersion and validates the
+returned UID. General status mutation retries four conflicts through direct
+rereads; finalizer mutation does not retry internally and conflicts requeue
+before failure-status reporting. Allocation removal publishes explicit null
+before finalizer removal.
+
 PR fast checks upload the verified static manager and PR E2E consumes that
 same-revision artifact from `.tools/artifacts`. Scheduled and manually
 dispatched high-capacity validation do not use the artifact and retain a clean

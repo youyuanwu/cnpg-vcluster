@@ -386,12 +386,6 @@ pub fn validate_creation(
     Ok(())
 }
 
-impl AllocationSlot {
-    pub fn api_endpoint(&self, port: u16) -> String {
-        format!("{}:{port}", self.endpoint)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,7 +441,10 @@ mod tests {
         let created = parse_runtime(&raw, &hash, "v1.36.4", "controller:one").unwrap();
         let creation = created.creation(None).unwrap();
         assert_eq!(
-            creation.slots[0].api_endpoint(creation.inputs.api_port),
+            format!(
+                "{}:{}",
+                creation.slots[0].endpoint, creation.inputs.api_port
+            ),
             "172.18.255.223:6443"
         );
         assert_eq!(created.hash, hash);

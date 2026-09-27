@@ -14,7 +14,7 @@ from scripts.lib.controller_scenarios import tenant_snapshot
 from scripts.lib.controller_client import tenant_manifest_document
 from scripts.test_e2e import capture_tenant_deletion_identity, verify_tenant_deletion
 from scripts.lib.kube import ManagementClient, wait_for
-from scripts.lib.locking import profile_lock, tools_lock
+from scripts.lib.locking import tools_lock
 from scripts.lib.redaction import redact
 from scripts.test_controller_convergence import _require_clean_state
 
@@ -67,10 +67,7 @@ def main() -> None:
     config = load_configuration(ROOT)
     client = ManagementClient(ROOT, config)
     primary: BaseException | None = None
-    with (
-        profile_lock(ROOT, "local", exclusive=True, create=True),
-        tools_lock(ROOT, exclusive=True),
-    ):
+    with tools_lock(ROOT, exclusive=True):
         _require_clean_state(ROOT, config, client)
         try:
             manifest = tenant_manifest_document(config, TENANT_NAME, databases=2)

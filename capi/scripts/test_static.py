@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import compileall
+import json
 import re
 import subprocess
 import sys
@@ -74,6 +75,26 @@ class StaticFailure(RuntimeError):
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise StaticFailure(message)
+
+
+def catalog_identity_literals(catalog: list[dict[str, object]]) -> set[str]:
+    result = set()
+    for entry in catalog:
+        api_version = str(entry["apiVersion"])
+        group, separator, _version = api_version.partition("/")
+        if separator or entry["kind"] not in {"Namespace", "Secret"}:
+            result.add(f"{str(entry['kind']).lower()}/")
+        if separator:
+            result.update({
+                api_version,
+                f"{entry['plural']}.{group}",
+            })
+        elif entry["kind"] not in {"Namespace", "Secret"}:
+            result.update({
+                f"{entry['plural']}/",
+                f"/api/{api_version}/{entry['plural']}",
+            })
+    return result
 
 
 def output(*command: str, check_result: bool = True) -> subprocess.CompletedProcess[str]:
@@ -180,6 +201,7 @@ def check_repository_boundaries() -> None:
         "config/tenants/tests/tenant-c.yaml",
         "scripts/controller_tenant.py",
         "scripts/controller_metrics.py",
+        "scripts/lib/controller_catalog.py",
         "scripts/lib/controller_state.py",
     )
     for relative in required_controller_files:
@@ -279,10 +301,87 @@ def check_repository_boundaries() -> None:
     check("--activation-token=${CONTROLLER_ACTIVATION_TOKEN}" in manager,
           "Tenant controller activation token placeholder is missing")
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
+    tenant_spec = (ROOT / "scripts" / "lib" / "tenant_spec.py").read_text(
+        encoding="utf-8"
+    )
+    tenant_runtime = (ROOT / "scripts" / "lib" / "tenant_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    tenant_timing = (ROOT / "scripts" / "lib" / "tenant_timing.py").read_text(
+        encoding="utf-8"
+    )
+    locking = (ROOT / "scripts" / "lib" / "locking.py").read_text(
+        encoding="utf-8"
+    )
     check(
         "from scripts.local_tenant import" not in tenant_dispatch,
         "public tenant dispatch still imports the legacy local mutator",
     )
+    check(
+        'PROFILE = "azure"' in tenant_spec
+        and '"databaseCount"' not in tenant_spec
+        and '"local"' not in tenant_spec,
+        "schema-1 Tenant specifications must remain Azure-only",
+    )
+    check(
+        '"lifecycle" / PROFILE' in tenant_runtime
+        and '"local"' not in tenant_runtime,
+        "durable Tenant lifecycle paths must remain Azure-only",
+    )
+    check(
+        "from .tenant_spec import PROFILE" in tenant_timing
+        and "profile: str" not in tenant_timing
+        and "/ profile" not in tenant_timing,
+        "Tenant timing evidence must remain Azure-only",
+    )
+    check(
+        "def azure_lock(" in locking
+        and "def profile_lock(" not in locking
+        and "local.lock" not in locking,
+        "obsolete local profile locking remains",
+    )
+    catalog_consumers = "\n".join(
+        (ROOT / relative).read_text(encoding="utf-8")
+        for relative in (
+            "controller/src/resources/controlplane.rs",
+            "controller/src/resources/workers.rs",
+            "scripts/lib/controller_state.py",
+            "scripts/lib/tenants.py",
+            "scripts/lib/controller_scenarios.py",
+            "scripts/lib/addons.py",
+            "scripts/network.py",
+            "scripts/machines.py",
+            "scripts/endpoint.py",
+            "scripts/tools.py",
+            "scripts/lib/providers.py",
+            "scripts/test_e2e.py",
+        )
+    )
+    catalog = json.loads(
+        (ROOT / "controller/config/management-resources.json").read_text()
+    )
+    identities = catalog_identity_literals(catalog)
+    check(
+        catalog_identity_literals([{
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "plural": "widgets",
+        }]) == {"example.io/v1", "widgets.example.io", "widget/"},
+        "catalog identity guard does not cover newly added kinds",
+    )
+    check(
+        catalog_identity_literals([{
+            "apiVersion": "v1",
+            "kind": "NewCore",
+            "plural": "newcores",
+        }]) == {"newcore/", "newcores/", "/api/v1/newcores"},
+        "catalog identity guard does not cover new core kinds",
+    )
+    for identity in identities:
+        check(
+            identity not in catalog_consumers,
+            f"catalog-owned management identity remains duplicated: {identity}",
+        )
     for relative in (
         "scripts/local_tenant.py",
         "scripts/create.py",

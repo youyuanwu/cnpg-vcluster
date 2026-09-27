@@ -1,6 +1,4 @@
-//! Desired objects only: no Kubernetes, Docker, filesystem, or process effects.
-//! Management provider objects and CNPG Cluster are dynamic. Namespaces and
-//! other tenant objects are create-or-validate; bootstrap RBAC is content-validated.
+//! Pure desired-object builders with narrow dynamic repair and validated static ownership.
 
 mod access;
 mod bootstrap;
@@ -108,11 +106,22 @@ impl Context<'_> {
         self.object(
             resource.api_version,
             resource.kind,
-            &resource.name(self.name()),
+            &resource
+                .expected_name(self.name())
+                .expect("management roots have declared names"),
             self.name(),
             resource.role,
             spec,
         )
+    }
+
+    fn management_ref(&self, kind: &str) -> Value {
+        let resource = crate::management::by_kind(kind).expect("management resource is catalogued");
+        json!({
+            "apiGroup":resource.api_version.split_once('/').unwrap().0,
+            "kind":resource.kind,
+            "name":resource.expected_name(self.name()).expect("referenced resource has a name")
+        })
     }
 }
 

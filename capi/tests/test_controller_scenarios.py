@@ -7,12 +7,16 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import Mock, patch
 
 from scripts.endpoint import run_endpoint_gate
+from scripts.lib import tenants as tenant_lib
 from scripts.lib.controller_scenarios import (
+    LEASE,
+    MANAGEMENT_CATALOG,
     manifest_tenant_name,
     tenant_from_document,
     tenant_snapshot,
@@ -23,6 +27,7 @@ from scripts.lib.controller_scenarios import (
     verify_allocation_lease,
     wait_tenant_ready,
 )
+from scripts.lib.tenants import Tenant, verify_tenant_management_ownership
 
 
 def tenant_document() -> dict[str, object]:
@@ -56,7 +61,61 @@ def allocation_lease():
     return lease
 
 
+def lease_inventory(leases):
+    return {
+        "apiVersion": LEASE.api_version,
+        "kind": f"{LEASE.kind}List",
+        "items": leases,
+    }
+
+
 class ControllerScenarioTests(unittest.TestCase):
+    def test_management_ownership_uses_declared_machine_version(self) -> None:
+        catalog = tuple(
+            replace(resource, api_version="cluster.x-k8s.io/unavailable")
+            if resource.kind == "Machine"
+            else resource
+            for resource in tenant_lib.MANAGEMENT_CATALOG
+        )
+        calls = []
+
+        class Client:
+            def kubectl(self, *arguments, **_kwargs):
+                calls.append(arguments)
+                error = (
+                    "NotFound"
+                    if any("unavailable" in argument for argument in arguments)
+                    else "Error from server (NotFound): absent"
+                )
+                return CompletedProcess([], 1, stdout="", stderr=error)
+
+        tenant = Tenant(
+            name="tenant-a",
+            namespace="tenant-a",
+            vip="172.18.0.2",
+            pod_cidr="10.0.0.0/16",
+            service_cidr="10.1.0.0/16",
+            dns_ip="10.1.0.10",
+            domain="tenant-a.capi.local",
+            storage_host_path=Path("/tmp/tenant-a"),
+            cnpg_cluster="cluster",
+            workers=1,
+        )
+        with patch.object(tenant_lib, "MANAGEMENT_CATALOG", catalog):
+            with self.assertRaisesRegex(RuntimeError, "Machine inspection failed"):
+                verify_tenant_management_ownership(
+                    {"OWNERSHIP_LABEL": "owner", "LAB_PREFIX": "lab"},
+                    Client(),
+                    tenant,
+                )
+        self.assertTrue(
+            any(
+                "--raw=/apis/cluster.x-k8s.io/unavailable/"
+                "namespaces/tenant-a/machines" in arguments
+                for arguments in calls
+            )
+        )
+
     def test_spec_hash_matches_rust_canonical_contract(self) -> None:
         document = tenant_document()
         expected = hashlib.sha256(
@@ -92,12 +151,16 @@ class ControllerScenarioTests(unittest.TestCase):
 
     def test_lease_name_and_exact_markers_match_rust(self) -> None:
         client = Mock()
-        client.json.return_value = {"items": [allocation_lease()]}
+        client.kubectl.return_value = CompletedProcess(
+            [], 0, stdout=json.dumps(lease_inventory([allocation_lease()]))
+        )
         identity = verify_allocation_lease(CONFIG, client, tenant_document())
         self.assertEqual("lease-uid", identity["uid"])
         self.assertEqual("tenant-slot-" + hashlib.sha256(b"slot-0").hexdigest()[:51],
                          allocation_lease_name("slot-0"))
-        client.json.assert_called_once_with("-n", "tenant-system", "get", "leases.coordination.k8s.io")
+        client.kubectl.assert_called_once_with(
+            "get", f"--raw={LEASE.inventory_path}"
+        )
 
     def test_foreign_replaced_malformed_or_duplicate_claims_are_rejected(self) -> None:
         cases = [[], [allocation_lease(), allocation_lease()]]
@@ -108,6 +171,16 @@ class ControllerScenarioTests(unittest.TestCase):
             lease = allocation_lease()
             lease["metadata"][field] = value
             cases.append([lease])
+        for field, value in (
+            ("apiVersion", "wrong/v1"),
+            ("kind", "Wrong"),
+        ):
+            lease = allocation_lease()
+            lease[field] = value
+            cases.append([lease])
+        lease = allocation_lease()
+        lease["metadata"]["name"] = 7
+        cases.append([lease])
         for field in ("tenant", "tenant-uid", "spec-hash", "foundation-hash", "endpoint", "pod-cidr", "service-cidr"):
             lease = allocation_lease()
             lease["metadata"]["annotations"]["tenancy.cnpg-vcluster.io/" + field] = "foreign"
@@ -118,7 +191,9 @@ class ControllerScenarioTests(unittest.TestCase):
         for leases in cases:
             with self.subTest(leases=leases):
                 client = Mock()
-                client.json.return_value = {"items": leases}
+                client.kubectl.return_value = CompletedProcess(
+                    [], 0, stdout=json.dumps(lease_inventory(leases))
+                )
                 with self.assertRaisesRegex(RuntimeError, "Lease"):
                     verify_allocation_lease(CONFIG, client, tenant_document())
 
@@ -273,28 +348,94 @@ class ControllerScenarioTests(unittest.TestCase):
 
     def test_snapshot_uses_live_management_and_host_identities(self) -> None:
         class Client:
-            def __init__(self) -> None:
+            def __init__(self, wrong_observed: bool = False) -> None:
                 self.index = 0
+                self.wrong_observed = wrong_observed
 
-            def kubectl(self, *_arguments):
+            def kubectl(self, *arguments):
+                path = next(
+                    argument.removeprefix("--raw=")
+                    for argument in arguments
+                    if argument.startswith("--raw=")
+                )
+                if path == LEASE.inventory_path:
+                    return CompletedProcess(
+                        [], 0, stdout=json.dumps(lease_inventory([allocation_lease()])), stderr=""
+                    )
+                definition = next(
+                    definition
+                    for definition in MANAGEMENT_CATALOG
+                    if path
+                    in {
+                        definition.collection_path(
+                            "tenant-a" if definition.namespaced else None
+                        ),
+                        definition.object_path(
+                            "tenant-a" if definition.namespaced else None,
+                            definition.expected_name("tenant-a") or "",
+                        ),
+                    }
+                )
+                if definition.evidence_policy == "observed":
+                    items = (
+                        [{
+                            **({
+                                "apiVersion": "wrong/v1",
+                                "kind": "Wrong",
+                            } if self.wrong_observed else {}),
+                            "metadata": {
+                                "name": "worker-a",
+                                "namespace": "tenant-a",
+                                "uid": "machine-uid",
+                            }
+                        }]
+                        if definition.kind == "Machine"
+                        else []
+                    )
+                    return CompletedProcess(
+                        [],
+                        0,
+                        stdout=json.dumps({
+                            "apiVersion": definition.api_version,
+                            "kind": f"{definition.kind}List",
+                            "items": items,
+                        }),
+                        stderr="",
+                    )
                 self.index += 1
                 return CompletedProcess(
                     [],
                     0,
-                    stdout=(
-                        '{"metadata":{"uid":"resource-'
-                        + str(self.index)
-                        + '"}}'
-                    ),
+                    stdout=json.dumps({
+                        "apiVersion": definition.api_version,
+                        "kind": definition.kind,
+                        "metadata": {
+                            "name": path.rsplit("/", 1)[1],
+                            "namespace": "tenant-a" if definition.namespaced else None,
+                            "uid": f"resource-{self.index}",
+                        },
+                    }),
                     stderr="",
                 )
-
-            def json(self, *_arguments):
-                return {"items": [allocation_lease()]}
 
         with patch(
             "scripts.lib.controller_scenarios.run",
             side_effect=[
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout='[{"Name":"volume","CreatedAt":"now","Mountpoint":"/volume","Labels":{"owned":"true"}}]',
+                    stderr="",
+                ),
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout="worker-b bbbb\nworker-a aaaa\n",
+                    stderr="",
+                ),
+                CompletedProcess(
+                    [], 0, stdout="worker-b bbbb\nworker-a aaaa\ntenant-a-lb cccc\n", stderr="",
+                ),
                 CompletedProcess(
                     [],
                     0,
@@ -325,8 +466,59 @@ class ControllerScenarioTests(unittest.TestCase):
             ],
             snapshot["workerContainers"],
         )
-        self.assertEqual(8, len(snapshot["managementResources"]))
+        self.assertEqual(9, len(snapshot["managementResources"]))
+        self.assertEqual(
+            {
+                (
+                    definition.api_version,
+                    definition.kind,
+                    "tenant-a" if definition.namespaced else "",
+                    definition.expected_name("tenant-a"),
+                )
+                for definition in MANAGEMENT_CATALOG
+                if definition.evidence_policy == "named"
+            },
+            {
+                (api_version, kind, namespace, name)
+                for api_version, kind, namespace, name, _uid
+                in snapshot["managementResources"]
+                if kind in {
+                    definition.kind
+                    for definition in MANAGEMENT_CATALOG
+                    if definition.evidence_policy == "named"
+                }
+            },
+        )
+        self.assertIn(
+            (
+                "cluster.x-k8s.io/v1beta2",
+                "Machine",
+                "tenant-a",
+                "worker-a",
+                "machine-uid",
+            ),
+            snapshot["managementResources"],
+        )
+        self.assertEqual(
+            ("coordination.k8s.io/v1", "Lease"),
+            (
+                snapshot["allocationLease"]["apiVersion"],
+                snapshot["allocationLease"]["kind"],
+            ),
+        )
         self.assertIn("tenant-a-lb cccc", snapshot["providerContainers"])
+        with (
+            patch(
+                "scripts.lib.controller_scenarios.run",
+                side_effect=[
+                    CompletedProcess([], 0, stdout='[{"Name":"volume"}]', stderr=""),
+                    CompletedProcess([], 0, stdout="worker-a aaaa\n", stderr=""),
+                    CompletedProcess([], 0, stdout="tenant-a-lb cccc\n", stderr=""),
+                ],
+            ),
+            self.assertRaisesRegex(RuntimeError, "identity is incomplete"),
+        ):
+            tenant_snapshot(CONFIG, Client(wrong_observed=True), tenant_document())
 
     def test_endpoint_gate_cleans_partially_applied_tenant(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

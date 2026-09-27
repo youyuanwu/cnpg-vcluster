@@ -4,6 +4,7 @@ import json
 from dataclasses import dataclass
 from pathlib import Path
 
+from .controller_catalog import load_management_resources, resource_by_kind
 from .files import IntegrityError
 from .kube import ManagementClient
 from .rendering import render_release_manifest
@@ -28,6 +29,17 @@ class Provider:
     variables: dict[str, str]
 
 
+_CATALOG = load_management_resources(Path(__file__).resolve().parents[2])
+
+
+def _catalog_crd(kind: str) -> str:
+    return resource_by_kind(_CATALOG, kind).kubectl_resource
+
+
+def _catalog_version(kind: str) -> str:
+    return resource_by_kind(_CATALOG, kind).version
+
+
 PROVIDERS = (
     Provider(
         name="capi-core",
@@ -37,8 +49,8 @@ PROVIDERS = (
         image_key="CAPI_CORE_IMAGE",
         namespace="CAPI_NAMESPACE",
         deployment="capi-controller-manager",
-        crds=("clusters.cluster.x-k8s.io", "machines.cluster.x-k8s.io"),
-        storage_version="v1beta2",
+        crds=(_catalog_crd("Cluster"), _catalog_crd("Machine")),
+        storage_version=_catalog_version("Cluster"),
         conversion="Webhook",
         webhook_service="capi-webhook-service",
         version_key="CAPI_VERSION",
@@ -54,10 +66,10 @@ PROVIDERS = (
         namespace="CABPK_NAMESPACE",
         deployment="capi-kubeadm-bootstrap-controller-manager",
         crds=(
-            "kubeadmconfigs.bootstrap.cluster.x-k8s.io",
-            "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io",
+            _catalog_crd("KubeadmConfig"),
+            _catalog_crd("KubeadmConfigTemplate"),
         ),
-        storage_version="v1beta2",
+        storage_version=_catalog_version("KubeadmConfig"),
         conversion="Webhook",
         webhook_service="capi-kubeadm-bootstrap-webhook-service",
         version_key="CAPI_VERSION",
@@ -73,10 +85,10 @@ PROVIDERS = (
         namespace="CAPD_NAMESPACE",
         deployment="capd-controller-manager",
         crds=(
-            "devclusters.infrastructure.cluster.x-k8s.io",
-            "devmachines.infrastructure.cluster.x-k8s.io",
+            _catalog_crd("DevCluster"),
+            _catalog_crd("DevMachine"),
         ),
-        storage_version="v1beta2",
+        storage_version=_catalog_version("DevCluster"),
         conversion="Webhook",
         webhook_service="capd-webhook-service",
         version_key="CAPI_VERSION",
@@ -92,10 +104,10 @@ PROVIDERS = (
         namespace="KAMAJI_CAPI_NAMESPACE",
         deployment="capi-kamaji-controller-manager",
         crds=(
-            "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
+            _catalog_crd("KamajiControlPlane"),
             "kamajicontrolplanetemplates.controlplane.cluster.x-k8s.io",
         ),
-        storage_version="v1alpha2",
+        storage_version=_catalog_version("KamajiControlPlane"),
         conversion=None,
         webhook_service=None,
         version_key="KAMAJI_CAPI_VERSION",
@@ -251,12 +263,15 @@ def _verify_kamaji_provider_flags(client: ManagementClient, config: dict[str, st
     crd = json.loads(
         client.kubectl(
             "get",
-            "crd/kamajicontrolplanes.controlplane.cluster.x-k8s.io",
+            f"crd/{_catalog_crd('KamajiControlPlane')}",
             "-o",
             "json",
         ).stdout
     )
-    if crd["metadata"].get("labels", {}).get("cluster.x-k8s.io/v1beta2") != "v1alpha2":
+    contract_label = f"cluster.x-k8s.io/{_catalog_version('Cluster')}"
+    if crd["metadata"].get("labels", {}).get(contract_label) != _catalog_version(
+        "KamajiControlPlane"
+    ):
         raise RuntimeError("Kamaji provider live CAPI contract label mismatch")
 
 
@@ -303,7 +318,7 @@ def reconcile_providers(root: Path, config: dict[str, str], client: ManagementCl
         "auth",
         "can-i",
         "get",
-        "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
+        _catalog_crd("KamajiControlPlane"),
         "--all-namespaces",
         "--as=system:serviceaccount:capi-kubeadm-bootstrap-system:capi-kubeadm-bootstrap-manager",
     ).stdout.strip()

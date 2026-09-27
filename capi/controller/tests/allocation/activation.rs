@@ -41,15 +41,22 @@ fn config_map(name: &str, data: &[(&str, &str)]) -> ConfigMap {
 
 fn clean_server() -> Server {
     let server = Server::default();
-    for path in [TENANTS, NAMESPACES, SECRETS, LEASES] {
-        server.allow_list(path);
-    }
-    for resource in MANAGEMENT_RESOURCES
-        .iter()
-        .filter(|resource| resource.inventory_policy == InventoryPolicy::BlockAnyInstance)
-    {
-        let (group, version) = resource.api_version.split_once('/').unwrap();
-        server.allow_list(&format!("/apis/{group}/{version}/{}", resource.plural));
+    server.allow_list(TENANTS);
+    for resource in MANAGEMENT_RESOURCES {
+        let (group, version) = resource
+            .api_version
+            .split_once('/')
+            .unwrap_or(("", resource.api_version));
+        let base = if group.is_empty() {
+            format!("/api/{version}")
+        } else {
+            format!("/apis/{group}/{version}")
+        };
+        let path = match resource.inventory_namespace {
+            Some(namespace) => format!("{base}/namespaces/{namespace}/{}", resource.plural),
+            None => format!("{base}/{}", resource.plural),
+        };
+        server.allow_typed_list(&path, resource.api_version, resource.kind);
     }
     server
 }
@@ -390,7 +397,14 @@ async fn stale_or_invalid_consumption_ticket_is_rejected() {
 
 #[tokio::test]
 async fn namespace_secret_lease_and_volume_residue_block_activation() {
-    for residue in ["namespace", "secret", "lease", "volume"] {
+    for residue in [
+        "namespace",
+        "namespace-allocation",
+        "secret",
+        "secret-allocation",
+        "lease",
+        "volume",
+    ] {
         let server = clean_server();
         server.insert(TICKET, ticket("hash-b", "token-b"));
         let docker = FakeDocker::default();
@@ -398,14 +412,29 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
             "namespace" => server.insert(
                 &format!("{NAMESPACES}/tenant-a"),
                 json!({"apiVersion":"v1","kind":"Namespace","metadata":{
-                    "name":"tenant-a","annotations":{"tenancy.cnpg-vcluster.io/tenant":"tenant-a"}}}),
+                    "name":"tenant-a","uid":"namespace-uid",
+                    "annotations":{"tenancy.cnpg-vcluster.io/tenant":"tenant-a"}}}),
+            ),
+            "namespace-allocation" => server.insert(
+                &format!("{NAMESPACES}/tenant-a"),
+                json!({"apiVersion":"v1","kind":"Namespace","metadata":{
+                    "name":"tenant-a","uid":"namespace-uid",
+                    "labels":{"tenancy.cnpg-vcluster.io/slot-id":"slot-a"}}}),
             ),
             "secret" => server.insert(
                 &format!("{SECRETS}/tenant-a-kubeconfig"),
                 json!({"apiVersion":"v1","kind":"Secret","metadata":{
                     "name":"tenant-a-kubeconfig","namespace":"tenant-a",
+                    "uid":"secret-uid",
                     "ownerReferences":[{"apiVersion":"controlplane.cluster.x-k8s.io/v1alpha2",
                         "kind":"KamajiControlPlane","name":"tenant-a","uid":"cp"}]}}),
+            ),
+            "secret-allocation" => server.insert(
+                &format!("{SECRETS}/tenant-a-kubeconfig"),
+                json!({"apiVersion":"v1","kind":"Secret","metadata":{
+                    "name":"tenant-a-kubeconfig","namespace":"tenant-a",
+                    "uid":"secret-uid",
+                    "annotations":{"tenancy.cnpg-vcluster.io/resource":"allocation-lease"}}}),
             ),
             "lease" => server.insert(
                 &format!("{LEASES}/slot-a"),
@@ -413,10 +442,10 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
                     metadata: ObjectMeta {
                         name: Some("slot-a".into()),
                         namespace: Some("tenant-system".into()),
-                        labels: Some([(
-                            "tenancy.cnpg-vcluster.io/slot-id".into(),
-                            "slot-a".into(),
-                        )].into()),
+                        uid: Some("lease-uid".into()),
+                        labels: Some(
+                            [("tenancy.cnpg-vcluster.io/slot-id".into(), "slot-a".into())].into(),
+                        ),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -429,11 +458,8 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
                         name: "project-volume".into(),
                         created_at: "now".into(),
                         mountpoint: "/volume".into(),
-                        labels: [(
-                            "cnpg-vcluster.capi/role".into(),
-                            "unexpected-role".into(),
-                        )]
-                        .into(),
+                        labels: [("cnpg-vcluster.capi/role".into(), "unexpected-role".into())]
+                            .into(),
                     },
                 );
             }
@@ -446,6 +472,110 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
             "{residue}"
         );
     }
+}
+
+#[tokio::test]
+async fn malformed_catalog_inventory_identity_blocks_activation() {
+    for (path, item) in [
+        (
+            format!("{NAMESPACES}/tenant-a"),
+            json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"tenant-a"}}),
+        ),
+        (
+            format!("{SECRETS}/tenant-a"),
+            json!({"apiVersion":"v1","kind":"Secret","metadata":{
+                "name":"tenant-a","namespace":"tenant-a","uid":"uid",
+                "ownerReferences":[{}]}}),
+        ),
+        (
+            format!("{SECRETS}/tenant-b"),
+            json!({"apiVersion":"v1","kind":"Secret","metadata":{
+                "name":"tenant-b","namespace":"tenant-a","uid":"uid",
+                "annotations":null}}),
+        ),
+    ] {
+        let server = clean_server();
+        server.insert(TICKET, ticket("hash-b", "token-b"));
+        server.insert(&path, item);
+        assert!(
+            admit(
+                server.client(),
+                &FakeDocker::default(),
+                "hash-b",
+                "token-b",
+                true,
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn malformed_catalog_inventory_list_blocks_activation() {
+    let resource = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == "Cluster")
+        .unwrap();
+    let path = format!("/apis/cluster.x-k8s.io/v1beta2/{}", resource.plural);
+    for payload in [
+        json!({"apiVersion":"v1","kind":"ClusterList","items":[]}),
+        json!({"apiVersion":resource.api_version,"kind":"WrongList","items":[]}),
+        json!({"apiVersion":resource.api_version,"kind":"ClusterList","items":null}),
+        json!({"apiVersion":resource.api_version,"kind":"ClusterList"}),
+    ] {
+        let server = clean_server();
+        server.insert(TICKET, ticket("hash-b", "token-b"));
+        server.respond("GET", &path, 200, payload);
+        assert!(
+            admit(
+                server.client(),
+                &FakeDocker::default(),
+                "hash-b",
+                "token-b",
+                true,
+            )
+            .await
+            .is_err()
+        );
+    }
+}
+
+#[tokio::test]
+async fn unmarked_typed_infrastructure_is_exempt_from_activation_inventory() {
+    let server = clean_server();
+    server.insert(TICKET, ticket("hash-b", "token-b"));
+    server.insert(
+        &format!("{NAMESPACES}/management"),
+        json!({"apiVersion":"v1","kind":"Namespace","metadata":{
+            "name":"management","uid":"namespace-uid"}}),
+    );
+    server.insert(
+        &format!("{SECRETS}/controller-secret"),
+        json!({"apiVersion":"v1","kind":"Secret","metadata":{
+            "name":"controller-secret","namespace":"tenant-system","uid":"secret-uid"}}),
+    );
+    server.insert(
+        &format!("{LEASES}/tenant-controller.tenancy.cnpg-vcluster.io"),
+        Lease {
+            metadata: ObjectMeta {
+                name: Some("tenant-controller.tenancy.cnpg-vcluster.io".into()),
+                namespace: Some("tenant-system".into()),
+                uid: Some("leader-uid".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    admit(
+        server.client(),
+        &FakeDocker::default(),
+        "hash-b",
+        "token-b",
+        true,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -464,6 +594,7 @@ async fn every_allocation_identity_marker_blocks_but_leader_lease_does_not() {
             metadata: ObjectMeta {
                 name: Some("claim".into()),
                 namespace: Some("tenant-system".into()),
+                uid: Some("claim-uid".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -522,6 +653,7 @@ async fn every_allocation_identity_marker_blocks_but_leader_lease_does_not() {
             metadata: ObjectMeta {
                 name: Some("tenant-controller.tenancy.cnpg-vcluster.io".into()),
                 namespace: Some("tenant-system".into()),
+                uid: Some("leader-uid".into()),
                 ..Default::default()
             },
             ..Default::default()

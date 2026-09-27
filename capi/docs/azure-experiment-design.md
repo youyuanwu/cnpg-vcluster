@@ -261,6 +261,9 @@ records. Local conditions, allocation Leases, Docker ownership, image
 bootstrap, and finalizer semantics must not be copied into Azure without a
 separate CAPZ design and migration plan. Conversely, local deletion never
 uses Azure foundation snapshots, ASO discovery, or VMSS operations.
+The schema-1 parser, durable operation/identity runtime, timing evidence, and
+profile lock are Azure-only; there is no remaining local profile branch in
+that machinery.
 
 Terraform/OpenTofu, Pulumi, Ansible, Crossplane, and Azure Developer CLI are
 not required for the first experiment. Terraform/OpenTofu would introduce a

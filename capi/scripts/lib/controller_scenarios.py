@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from .config import parse_duration
+from .controller_catalog import load_management_resources, resource_by_kind
 from .controller_client import apply_tenant, delete_tenant
 from .kube import ManagementClient, wait_for
 from .process import run
@@ -17,7 +18,9 @@ from scripts.controller_tenant_status import evaluate_tenant
 
 
 MARKER = "tenancy.cnpg-vcluster.io/"
-LEASE_NAMESPACE = "tenant-system"
+MANAGEMENT_CATALOG = load_management_resources(Path(__file__).resolve().parents[2])
+LEASE = resource_by_kind(MANAGEMENT_CATALOG, "Lease")
+LEASE_NAMESPACE = LEASE.inventory_namespace or "tenant-system"
 
 
 def tenant_spec_hash(document: dict[str, object]) -> str:
@@ -76,8 +79,8 @@ def allocation_lease_manifest(
     if not metadata.get("name") or not metadata.get("uid") or not foundation_hash:
         raise RuntimeError("Tenant allocation identity is incomplete")
     return {
-        "apiVersion": "coordination.k8s.io/v1",
-        "kind": "Lease",
+        "apiVersion": LEASE.api_version,
+        "kind": LEASE.kind,
         "metadata": {
             "name": allocation_lease_name(allocation["slotId"]),
             "namespace": LEASE_NAMESPACE,
@@ -102,15 +105,35 @@ def allocation_lease_manifest(
 
 
 def allocation_leases(client: ManagementClient) -> list[dict[str, object]]:
-    payload = client.json("-n", LEASE_NAMESPACE, "get", "leases.coordination.k8s.io")
-    if not isinstance(payload, dict) or not isinstance(payload.get("items"), list):
+    response = client.kubectl("get", f"--raw={LEASE.inventory_path}")
+    payload = json.loads(response.stdout)
+    if (
+        not isinstance(payload, dict)
+        or payload.get("apiVersion") != LEASE.api_version
+        or payload.get("kind") != f"{LEASE.kind}List"
+        or not isinstance(payload.get("items"), list)
+    ):
         raise RuntimeError("invalid allocation Lease inventory")
     if any(
         not isinstance(item, dict)
+        or (
+            "apiVersion" in item
+            and item["apiVersion"] != LEASE.api_version
+        )
+        or ("kind" in item and item["kind"] != LEASE.kind)
         or not isinstance(item.get("metadata"), dict)
-        or not item["metadata"].get("name")
-        or not item["metadata"].get("uid")
+        or not isinstance(item["metadata"].get("name"), str)
+        or not item["metadata"]["name"]
+        or not isinstance(item["metadata"].get("uid"), str)
+        or not item["metadata"]["uid"]
+        or item["metadata"].get("namespace") != LEASE_NAMESPACE
+        or not isinstance(item["metadata"].get("labels", {}), dict)
         or not isinstance(item["metadata"].get("annotations", {}), dict)
+        or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for field in ("labels", "annotations")
+            for key, value in item["metadata"].get(field, {}).items()
+        )
         for item in payload["items"]
     ):
         raise RuntimeError("invalid allocation Lease identity")
@@ -139,6 +162,8 @@ def verify_allocation_lease(
     ):
         raise RuntimeError("Tenant allocation Lease identity changed")
     return {
+        "apiVersion": LEASE.api_version,
+        "kind": LEASE.kind,
         "name": metadata["name"], "uid": metadata["uid"],
         "namespace": metadata["namespace"],
         "labels": metadata["labels"], "annotations": metadata["annotations"],
@@ -397,34 +422,66 @@ def tenant_snapshot(
     if not name:
         raise RuntimeError("Tenant document has no metadata.name")
     management_resources = []
-    for resource, namespace, object_name in (
-        ("namespace", None, name),
-        ("clusters.cluster.x-k8s.io", name, name),
-        ("devclusters.infrastructure.cluster.x-k8s.io", name, name),
-        ("kamajicontrolplanes.controlplane.cluster.x-k8s.io", name, name),
-        ("kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io", name, f"{name}-worker"),
-        ("devmachinetemplates.infrastructure.cluster.x-k8s.io", name, f"{name}-worker"),
-        ("machinedeployments.cluster.x-k8s.io", name, f"{name}-worker"),
-        ("secret", name, f"{name}-kubeconfig"),
-    ):
-        arguments = []
-        if namespace is not None:
-            arguments.extend(["-n", namespace])
-        arguments.extend(["get", f"{resource}/{object_name}", "-o", "json"])
-        payload = json.loads(client.kubectl(*arguments).stdout)
-        item_metadata = payload.get("metadata")
-        if not isinstance(item_metadata, dict) or not item_metadata.get("uid"):
-            raise RuntimeError(
-                f"Tenant management identity is incomplete: {resource}/{object_name}"
-            )
-        management_resources.append(
-            (
-                resource,
-                namespace or "",
-                object_name,
-                item_metadata["uid"],
-            )
+    for definition in MANAGEMENT_CATALOG:
+        if definition.evidence_policy == "allocation":
+            continue
+        namespace = name if definition.namespaced else None
+        expected_name = definition.expected_name(name)
+        path = (
+            definition.object_path(namespace, expected_name)
+            if expected_name is not None
+            else definition.collection_path(namespace)
         )
+        payload = json.loads(client.kubectl("get", f"--raw={path}").stdout)
+        items = [payload] if expected_name is not None else payload.get("items")
+        if (
+            not isinstance(items, list)
+            or (
+                expected_name is None
+                and (
+                    payload.get("apiVersion") != definition.api_version
+                    or payload.get("kind") != f"{definition.kind}List"
+                )
+            )
+        ):
+            raise RuntimeError(
+                f"Tenant management inventory is invalid: {definition.kind}"
+            )
+        for item in items:
+            item_metadata = item.get("metadata") if isinstance(item, dict) else None
+            item_name = item_metadata.get("name") if isinstance(item_metadata, dict) else None
+            if (
+                not isinstance(item_metadata, dict)
+                or not isinstance(item_name, str)
+                or not item_name
+                or not isinstance(item_metadata.get("uid"), str)
+                or not item_metadata["uid"]
+                or item_metadata.get("namespace") not in (
+                    (namespace,) if definition.namespaced else (None, "")
+                )
+                or (
+                    "apiVersion" in item
+                    and item["apiVersion"] != definition.api_version
+                )
+                or ("kind" in item and item["kind"] != definition.kind)
+                or (
+                    expected_name is not None
+                    and item_name != expected_name
+                )
+            ):
+                raise RuntimeError(
+                    f"Tenant management identity is incomplete: "
+                    f"{definition.kind}/{item_name}"
+                )
+            management_resources.append(
+                (
+                    definition.api_version,
+                    definition.kind,
+                    namespace or "",
+                    item_name,
+                    item_metadata["uid"],
+                )
+            )
     volume_name = f"{config['LAB_PREFIX']}-{name}-storage"
     volumes = json.loads(
         run(["docker", "volume", "inspect", volume_name], timeout=30).stdout

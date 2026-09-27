@@ -284,6 +284,27 @@ def validate_inotify_state(root: Path, config: dict[str, str]) -> None:
             _read_state_record(host_fd, _state_path(root), config)
 
 
+def tenant_storage_volumes(config: dict[str, str]) -> set[str]:
+    volumes = {
+        name
+        for name in run(["docker", "volume", "ls", "-q"], timeout=30).stdout.split()
+        if name.endswith("-storage")
+    }
+    for label in (
+        f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
+        "cnpg-vcluster.capi/role",
+        "cnpg-vcluster.capi/tenant",
+        "tenancy.cnpg-vcluster.io/tenant-uid",
+    ):
+        volumes.update(
+            run(
+                ["docker", "volume", "ls", "-q", "--filter", f"label={label}"],
+                timeout=30,
+            ).stdout.split()
+        )
+    return volumes
+
+
 def restore_inotify(root: Path, config: dict[str, str]) -> None:
     with _host_lock(root) as host_fd:
         state_path = _state_path(root)
@@ -291,74 +312,32 @@ def restore_inotify(root: Path, config: dict[str, str]) -> None:
             return
         originals = _read_state_record(host_fd, state_path, config)
 
-        from .files import private_file_exists, read_private_file
-        from .tenant_runtime import recorded_tenant_names
-        from .tenant_spec import validate_tenant_name
-
-        tenant_names = set(recorded_tenant_names(root, "local"))
-        endpoint_path = (
-            root / ".runtime" / "management" / "tenant-endpoints.json"
-        )
-        if private_file_exists(endpoint_path):
-            try:
-                endpoint_payload = json.loads(
-                    read_private_file(endpoint_path).decode()
-                )
-                allocations = endpoint_payload["allocations"]
-                if not isinstance(allocations, dict):
-                    raise ValueError
-                for name in allocations:
-                    validate_tenant_name(name)
-                    tenant_names.add(name)
-            except (UnicodeDecodeError, json.JSONDecodeError, KeyError, ValueError):
-                raise HostError(
-                    "tenant endpoint allocation record is invalid during host restoration"
-                )
-        provider_residue = []
-        for cluster_name in (config["SPIKE_NAME"], *sorted(tenant_names)):
-            provider_residue.extend(
+        provider_residue = set()
+        for label in (
+            f"io.x-k8s.kind.cluster={config['SPIKE_NAME']}",
+            "io.x-k8s.kind.role=worker",
+            "io.x-k8s.kind.role=external-load-balancer",
+            "cnpg-vcluster.capi/role",
+            "cnpg-vcluster.capi/tenant",
+            "tenancy.cnpg-vcluster.io/tenant-uid",
+        ):
+            provider_residue.update(
                 run(
                     [
                         "docker",
                         "ps",
                         "-aq",
                         "--filter",
-                        f"label=io.x-k8s.kind.cluster={cluster_name}",
+                        f"label={label}",
                     ],
                     timeout=30,
                 ).stdout.split()
             )
-        provider_residue.extend(
-            run(
-                [
-                    "docker",
-                    "volume",
-                    "ls",
-                    "-q",
-                    "--filter",
-                    f"label={config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
-                ],
-                timeout=30,
-            ).stdout.split()
-        )
-        provider_residue.extend(
-            run(
-                [
-                    "docker",
-                    "ps",
-                    "-aq",
-                    "--filter",
-                    f"label={config['OWNERSHIP_LABEL']}=true",
-                    "--filter",
-                    "label=cnpg-vcluster.capi/role=probe",
-                ],
-                timeout=30,
-            ).stdout.split()
-        )
+        provider_residue.update(tenant_storage_volumes(config))
         if provider_residue:
             raise HostError(
                 "cannot restore host inotify values while provider-owned "
-                "containers, probes, or volumes exist"
+                "containers or volumes exist"
             )
         management_name = f"{config['KIND_CLUSTER_NAME']}-control-plane"
         management = run(
