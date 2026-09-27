@@ -463,6 +463,21 @@ def main(arguments: list[str]) -> int:
                         _require_status(spec.name, "absent"),
                     ),
                 )
+        if runtime.identity_exists():
+            existing_identity = runtime.load_identity()
+            if existing_identity.specification_sha256 != spec.sha256():
+                phase(
+                    "delete-incompatible-existing-tenant",
+                    lambda: (
+                        _tenant_command(
+                            "delete",
+                            "azure",
+                            spec.name,
+                            f"azure/{spec.name}",
+                        ),
+                        _require_status(spec.name, "absent"),
+                    ),
+                )
         prior_gate = _incomplete_gate_records(
             evidence.parent,
             spec.name,
