@@ -172,19 +172,33 @@ impl Server {
                                 }
                             }
                         }
-                        "PUT" => {
-                            let current = state.objects.get(&path).unwrap();
-                            assert_eq!(body["metadata"]["uid"], current["metadata"]["uid"]);
-                            assert_eq!(
-                                body["metadata"]["resourceVersion"],
-                                current["metadata"]["resourceVersion"]
-                            );
-                            state.revision += 1;
-                            let mut body = body;
-                            body["metadata"]["resourceVersion"] = json!(state.revision.to_string());
-                            state.objects.insert(path, body.clone());
-                            (200, body)
-                        }
+                        "PUT" => match state.objects.get(&path).cloned() {
+                            None => (404, status(404, "NotFound")),
+                            Some(current) => {
+                                let uid = &body["metadata"]["uid"];
+                                if (!uid.is_null() && uid != &current["metadata"]["uid"])
+                                    || body["metadata"]["resourceVersion"]
+                                        != current["metadata"]["resourceVersion"]
+                                {
+                                    (409, status(409, "Conflict"))
+                                } else {
+                                    let current_revision = current["metadata"]["resourceVersion"]
+                                        .as_str()
+                                        .and_then(|value| value.parse::<u32>().ok())
+                                        .unwrap_or_default();
+                                    state.revision = state.revision.max(current_revision) + 1;
+                                    let mut body = body;
+                                    if body["metadata"]["uid"].is_null() {
+                                        body["metadata"]["uid"] =
+                                            current["metadata"]["uid"].clone();
+                                    }
+                                    body["metadata"]["resourceVersion"] =
+                                        json!(state.revision.to_string());
+                                    state.objects.insert(path, body.clone());
+                                    (200, body)
+                                }
+                            }
+                        },
                         "DELETE" => match state.objects.get(&path).cloned() {
                             None => (404, status(404, "NotFound")),
                             Some(current) => {

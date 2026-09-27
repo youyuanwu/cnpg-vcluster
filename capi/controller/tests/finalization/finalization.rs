@@ -175,6 +175,7 @@ struct Docker {
     volume: Arc<Mutex<Option<DockerVolume>>>,
     containers: Arc<Mutex<Vec<DockerContainer>>>,
     fail: Arc<Mutex<bool>>,
+    fail_remove: Arc<Mutex<bool>>,
     calls: Arc<Mutex<Vec<String>>>,
 }
 
@@ -197,6 +198,11 @@ impl DockerClient for Docker {
         panic!("finalization cannot create a volume")
     }
     async fn remove_volume(&self, _: &str) -> Result<(), DockerError> {
+        if *self.fail_remove.lock().unwrap() {
+            return Err(DockerError::Transport {
+                operation: "remove volume",
+            });
+        }
         self.calls.lock().unwrap().push("remove volume".into());
         *self.volume.lock().unwrap() = None;
         Ok(())
@@ -207,10 +213,35 @@ impl DockerClient for Docker {
                 operation: "list containers",
             });
         }
+
         Ok(self.containers.lock().unwrap().clone())
     }
+
     async fn list_volumes(&self) -> Result<Vec<DockerVolume>, DockerError> {
         Ok(self.volume.lock().unwrap().iter().cloned().collect())
+    }
+}
+
+fn volume(hash: &str) -> DockerVolume {
+    DockerVolume {
+        name: "example-tenant-a-storage".into(),
+        created_at: "now".into(),
+        mountpoint: "/volume".into(),
+        labels: [
+            ("example.io/owned".into(), "example".into()),
+            ("cnpg-vcluster.capi/role".into(), "tenant-storage".into()),
+            ("cnpg-vcluster.capi/tenant".into(), NAME.into()),
+            ("tenancy.cnpg-vcluster.io/tenant-uid".into(), UID.into()),
+            (
+                "tenancy.cnpg-vcluster.io/spec-hash".into(),
+                identity(hash).spec_hash.into(),
+            ),
+            (
+                "tenancy.cnpg-vcluster.io/foundation-hash".into(),
+                hash.into(),
+            ),
+        ]
+        .into(),
     }
 }
 
@@ -404,7 +435,103 @@ async fn discovery_failure_and_successor_race_retain_finalizer() {
         }
         let current: Tenant = serde_json::from_value(server.get(TENANT_PATH)).unwrap();
         assert!(current.finalizers().iter().any(|value| value == FINALIZER));
-        assert!(current.status.unwrap().allocation.is_some());
+        assert!(current.status.as_ref().unwrap().allocation.is_some());
+        assert!(server.calls().iter().all(|call| call.method != "DELETE"));
+    }
+}
+
+#[tokio::test]
+async fn successor_between_initial_and_release_lists_requires_next_pass() {
+    let (foundation, hash, slot) = fixture();
+    let mut original = tenant(&hash);
+    original.status.as_mut().unwrap().allocation = Some((&slot).into());
+    let server = server(&original);
+    let old = lease(&hash, &slot);
+    let lease_path = format!("{LEASES}/{}", old.name_any());
+    server.insert(&lease_path, &old);
+    server.mutate_on(
+        "GET",
+        LEASES,
+        &lease_path,
+        Some(serde_json::to_value(&old).unwrap()),
+    );
+    server.mutate_on(
+        "GET",
+        LEASES,
+        &lease_path,
+        Some(serde_json::to_value(successor_lease(&hash, &slot)).unwrap()),
+    );
+    Finalizer::with_docker(
+        server.client(),
+        Docker::default(),
+        SUPPORTED_KUBERNETES_VERSION,
+        foundation,
+    )
+    .reconcile(&original)
+    .await
+    .unwrap();
+    let current: Tenant = serde_json::from_value(server.get(TENANT_PATH)).unwrap();
+    assert!(current.status.as_ref().unwrap().allocation.is_some());
+    assert!(current.finalizers().iter().any(|value| value == FINALIZER));
+    assert!(server.calls().iter().all(|call| call.method != "DELETE"));
+}
+
+#[tokio::test]
+async fn malformed_descendant_and_failed_volume_removal_hold_all_roots() {
+    let (foundation, hash, _) = fixture();
+    for volume_failure in [false, true] {
+        let server = server(&tenant(&hash));
+        let docker = Docker::default();
+        if volume_failure {
+            *docker.volume.lock().unwrap() = Some(volume(&hash));
+            *docker.fail_remove.lock().unwrap() = true;
+        } else {
+            let deployment_resource = MANAGEMENT_RESOURCES
+                .iter()
+                .find(|resource| resource.kind == "MachineDeployment")
+                .unwrap();
+            let mut deployment = crate::creation_support::object(
+                deployment_resource.api_version,
+                deployment_resource.kind,
+                NAME,
+                &deployment_resource.name(NAME),
+                deployment_resource.role,
+            );
+            deployment.metadata.annotations =
+                Some(identity(&hash).annotations(deployment_resource.role));
+            server.insert(&path(&deployment), deployment);
+            let set_resource = MANAGEMENT_RESOURCES
+                .iter()
+                .find(|resource| resource.kind == "MachineSet")
+                .unwrap();
+            let mut set = crate::creation_support::object(
+                set_resource.api_version,
+                set_resource.kind,
+                NAME,
+                "set-a",
+                set_resource.role,
+            );
+            set.metadata.owner_references = None;
+            let (group, version) = set_resource.api_version.split_once('/').unwrap();
+            server.insert(
+                &format!(
+                    "/apis/{group}/{version}/namespaces/{NAME}/{}/set-a",
+                    set_resource.plural
+                ),
+                set,
+            );
+        }
+        assert!(
+            Finalizer::with_docker(
+                server.client(),
+                docker,
+                SUPPORTED_KUBERNETES_VERSION,
+                foundation.clone(),
+            )
+            .reconcile(&tenant(&hash))
+            .await
+            .is_err()
+        );
         assert!(server.calls().iter().all(|call| call.method != "DELETE"));
     }
 }

@@ -406,6 +406,7 @@ impl<D: DockerClient> Finalizer<D> {
             || volume.is_some();
         let lease_decision = decide_release(&claim_context, &lease_inventory, bound, !residue)
             .map_err(|error| invalid(error.to_string()))?;
+        let observed_old_claim = matches!(lease_decision, ReleaseDecision::Delete(_));
 
         let current = Api::<Tenant>::all(self.client.clone())
             .get_opt(name)
@@ -513,6 +514,9 @@ impl<D: DockerClient> Finalizer<D> {
         let decision = release(self.client.clone(), &claim_context, bound, true)
             .await
             .map_err(|error| invalid(error.to_string()))?;
+        if observed_old_claim {
+            return Ok(pending());
+        }
         match decision {
             ReleaseDecision::Delete(_) | ReleaseDecision::Pending => return Ok(pending()),
             ReleaseDecision::Complete => {}

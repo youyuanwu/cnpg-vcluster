@@ -51,10 +51,15 @@ fn clean_server() -> Server {
 }
 
 fn ticket(hash: &str, token: &str) -> ConfigMap {
+    ticket_with_previous(hash, token, "")
+}
+
+fn ticket_with_previous(hash: &str, token: &str, previous: &str) -> ConfigMap {
     config_map(
         TICKET_NAME,
         &[
             ("configurationHash", hash),
+            ("previousConfigurationHash", previous),
             ("token", token),
             ("hostClean", "true"),
             ("createdAt", &chrono::Utc::now().to_rfc3339()),
@@ -70,7 +75,9 @@ async fn same_identity_restart_needs_no_ticket_or_inventory() {
         config_map(STATE_NAME, &[("configurationHash", "hash-a")]),
     );
     let docker = FakeDocker::default();
-    admit(server.client(), &docker, "hash-a", "").await.unwrap();
+    admit(server.client(), &docker, "hash-a", "", false)
+        .await
+        .unwrap();
     assert_eq!(server.calls().len(), 1);
     assert!(docker.calls.lock().unwrap().is_empty());
 }
@@ -97,6 +104,7 @@ async fn rollback_lock_blocks_same_and_changed_identity_admission() {
             &FakeDocker::default(),
             hash,
             if hash == "hash-b" { "token-b" } else { "" },
+            true,
         )
         .await
         .unwrap_err();
@@ -160,7 +168,7 @@ async fn changed_identity_requires_ticket_and_atomically_accepts_clean_state() {
             networks: Default::default(),
             network_addresses: Default::default(),
         });
-    admit(server.client(), &docker, "hash-b", "token-b")
+    admit(server.client(), &docker, "hash-b", "token-b", true)
         .await
         .unwrap();
     let state: ConfigMap = serde_json::from_value(server.get(STATE)).unwrap();
@@ -176,6 +184,103 @@ async fn changed_identity_requires_ticket_and_atomically_accepts_clean_state() {
 }
 
 #[tokio::test]
+async fn existing_state_is_replaced_with_uid_preserved_and_conflicts_fail_closed() {
+    for conflict in [false, true] {
+        let server = clean_server();
+        server.insert(
+            STATE,
+            config_map(STATE_NAME, &[("configurationHash", "hash-a")]),
+        );
+        server.insert(TICKET, ticket_with_previous("hash-b", "token-b", "hash-a"));
+        if conflict {
+            server.respond(
+                "PUT",
+                STATE,
+                409,
+                crate::support::kube::status(409, "Conflict"),
+            );
+        }
+        let result = admit(
+            server.client(),
+            &FakeDocker::default(),
+            "hash-b",
+            "token-b",
+            true,
+        )
+        .await;
+        let state: ConfigMap = serde_json::from_value(server.get(STATE)).unwrap();
+        if conflict {
+            assert!(result.is_err());
+            assert_eq!(state.data.unwrap()["configurationHash"], "hash-a");
+        } else {
+            result.unwrap();
+            assert_eq!(state.data.unwrap()["configurationHash"], "hash-b");
+            assert_eq!(
+                state.metadata.uid.as_deref(),
+                Some("tenant-controller-state-uid")
+            );
+        }
+    }
+}
+
+#[tokio::test]
+async fn creation_invalid_configuration_cannot_replace_accepted_identity() {
+    let server = clean_server();
+    server.insert(
+        STATE,
+        config_map(STATE_NAME, &[("configurationHash", "hash-a")]),
+    );
+    server.insert(TICKET, ticket("hash-b", "token-b"));
+    assert!(
+        admit(
+            server.client(),
+            &FakeDocker::default(),
+            "hash-b",
+            "token-b",
+            false,
+        )
+        .await
+        .is_err()
+    );
+    let state: ConfigMap = serde_json::from_value(server.get(STATE)).unwrap();
+    assert_eq!(state.data.unwrap()["configurationHash"], "hash-a");
+    let ticket: ConfigMap = serde_json::from_value(server.get(TICKET)).unwrap();
+    assert!(!ticket.data.unwrap().contains_key("consumed"));
+}
+
+#[tokio::test]
+async fn consumed_ticket_resumes_only_from_its_recorded_previous_identity() {
+    for current in ["hash-a", "hash-c"] {
+        let server = clean_server();
+        server.insert(
+            STATE,
+            config_map(STATE_NAME, &[("configurationHash", current)]),
+        );
+        let mut value = ticket_with_previous("hash-b", "token-b", "hash-a");
+        value
+            .data
+            .get_or_insert_default()
+            .insert("consumed".into(), "true".into());
+        server.insert(TICKET, value);
+        let result = admit(
+            server.client(),
+            &FakeDocker::default(),
+            "hash-b",
+            "token-b",
+            true,
+        )
+        .await;
+        if current == "hash-a" {
+            result.unwrap();
+            let state: ConfigMap = serde_json::from_value(server.get(STATE)).unwrap();
+            assert_eq!(state.data.unwrap()["configurationHash"], "hash-b");
+        } else {
+            assert!(result.is_err());
+        }
+    }
+}
+
+#[tokio::test]
 async fn active_tenant_or_invalid_ticket_blocks_identity_change() {
     for invalid_ticket in [false, true] {
         let server = clean_server();
@@ -186,9 +291,15 @@ async fn active_tenant_or_invalid_ticket_blocks_identity_change() {
         if !invalid_ticket {
             server.insert(&format!("{TENANTS}/tenant-a"), tenant());
         }
-        let error = admit(server.client(), &FakeDocker::default(), "hash-b", "token-b")
-            .await
-            .unwrap_err();
+        let error = admit(
+            server.client(),
+            &FakeDocker::default(),
+            "hash-b",
+            "token-b",
+            true,
+        )
+        .await
+        .unwrap_err();
         assert!(matches!(
             error,
             tenant_controller::error::ControllerError::Configuration(_)
@@ -199,7 +310,7 @@ async fn active_tenant_or_invalid_ticket_blocks_identity_change() {
 }
 
 #[tokio::test]
-async fn stale_or_consumed_ticket_cannot_be_replayed() {
+async fn stale_or_invalid_consumption_ticket_is_rejected() {
     for field in ["createdAt", "consumed"] {
         let server = clean_server();
         let mut value = ticket("hash-b", "token-b");
@@ -208,14 +319,20 @@ async fn stale_or_consumed_ticket_cannot_be_replayed() {
             if field == "createdAt" {
                 "2020-01-01T00:00:00Z".into()
             } else {
-                "true".into()
+                "invalid".into()
             },
         );
         server.insert(TICKET, value);
         assert!(
-            admit(server.client(), &FakeDocker::default(), "hash-b", "token-b")
-                .await
-                .is_err()
+            admit(
+                server.client(),
+                &FakeDocker::default(),
+                "hash-b",
+                "token-b",
+                true,
+            )
+            .await
+            .is_err()
         );
     }
 }
@@ -272,12 +389,87 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
             _ => unreachable!(),
         }
         assert!(
-            admit(server.client(), &docker, "hash-b", "token-b")
+            admit(server.client(), &docker, "hash-b", "token-b", true)
                 .await
                 .is_err(),
             "{residue}"
         );
     }
+}
+
+#[tokio::test]
+async fn every_allocation_identity_marker_blocks_but_leader_lease_does_not() {
+    for marker in ["slot", "resource", "tenant", "tenant-uid"] {
+        let server = clean_server();
+        server.insert(TICKET, ticket("hash-b", "token-b"));
+        let mut lease = Lease {
+            metadata: ObjectMeta {
+                name: Some("claim".into()),
+                namespace: Some("tenant-system".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        match marker {
+            "slot" => {
+                lease.metadata.labels =
+                    Some([("tenancy.cnpg-vcluster.io/slot-id".into(), "slot-a".into())].into())
+            }
+            "resource" => {
+                lease.metadata.annotations = Some(
+                    [(
+                        "tenancy.cnpg-vcluster.io/resource".into(),
+                        "allocation-lease".into(),
+                    )]
+                    .into(),
+                )
+            }
+            "tenant" => {
+                lease.metadata.annotations =
+                    Some([("tenancy.cnpg-vcluster.io/tenant".into(), "tenant-a".into())].into())
+            }
+            "tenant-uid" => {
+                lease.metadata.annotations =
+                    Some([("tenancy.cnpg-vcluster.io/tenant-uid".into(), "uid-a".into())].into())
+            }
+            _ => unreachable!(),
+        }
+        server.insert(&format!("{LEASES}/claim"), lease);
+        assert!(
+            admit(
+                server.client(),
+                &FakeDocker::default(),
+                "hash-b",
+                "token-b",
+                true,
+            )
+            .await
+            .is_err(),
+            "{marker}"
+        );
+    }
+    let server = clean_server();
+    server.insert(TICKET, ticket("hash-b", "token-b"));
+    server.insert(
+        &format!("{LEASES}/tenant-controller.tenancy.cnpg-vcluster.io"),
+        Lease {
+            metadata: ObjectMeta {
+                name: Some("tenant-controller.tenancy.cnpg-vcluster.io".into()),
+                namespace: Some("tenant-system".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+    );
+    admit(
+        server.client(),
+        &FakeDocker::default(),
+        "hash-b",
+        "token-b",
+        true,
+    )
+    .await
+    .unwrap();
 }
 
 #[tokio::test]
@@ -292,13 +484,15 @@ async fn accepted_state_survives_ticket_delete_failure_without_replay() {
     );
     let docker = FakeDocker::default();
     assert!(
-        admit(server.client(), &docker, "hash-b", "token-b")
+        admit(server.client(), &docker, "hash-b", "token-b", true)
             .await
             .is_err()
     );
     let ticket: ConfigMap = serde_json::from_value(server.get(TICKET)).unwrap();
     assert_eq!(ticket.data.unwrap()["consumed"], "true");
-    admit(server.client(), &docker, "hash-b", "").await.unwrap();
+    admit(server.client(), &docker, "hash-b", "", true)
+        .await
+        .unwrap();
 }
 
 #[tokio::test]
@@ -318,8 +512,14 @@ async fn provider_discovery_uncertainty_is_not_absence() {
         crate::support::kube::status(404, "NotFound"),
     );
     assert!(
-        admit(server.client(), &FakeDocker::default(), "hash-b", "token-b")
-            .await
-            .is_err()
+        admit(
+            server.client(),
+            &FakeDocker::default(),
+            "hash-b",
+            "token-b",
+            true,
+        )
+        .await
+        .is_err()
     );
 }

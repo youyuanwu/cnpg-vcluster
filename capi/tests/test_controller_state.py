@@ -147,12 +147,16 @@ class ControllerStateTests(unittest.TestCase):
         )
 
     def test_activation_ticket_is_bound_to_candidate_and_time(self) -> None:
-        ticket = activation_ticket("hash-a", "token-a")
+        ticket = activation_ticket("hash-a", "token-a", "hash-old")
         self.assertEqual(
             ticket["data"]["configurationHash"],
             "hash-a",
         )
         self.assertEqual(ticket["data"]["token"], "token-a")
+        self.assertEqual(
+            ticket["data"]["previousConfigurationHash"],
+            "hash-old",
+        )
         self.assertEqual(ticket["data"]["hostClean"], "true")
         self.assertTrue(ticket["data"]["createdAt"].endswith("Z"))
 
@@ -201,7 +205,15 @@ class ControllerStateTests(unittest.TestCase):
                 require_clean_controller_state(prepare_root(directory), Client(clean_handler))
 
     def test_provider_tenant_lease_and_host_residue_block(self) -> None:
-        cases = ("tenant", "provider", "lease", "volume", "container", "legacy-file")
+        cases = (
+            "tenant",
+            "provider",
+            "lease",
+            "lease-tenant",
+            "volume",
+            "container",
+            "legacy-file",
+        )
         for case in cases:
             with self.subTest(case=case), tempfile.TemporaryDirectory() as directory:
                 root = prepare_root(directory)
@@ -215,10 +227,15 @@ class ControllerStateTests(unittest.TestCase):
                         return response("tenant.tenancy.cnpg-vcluster.io/tenant-a")
                     if case == "provider" and "clusters.cluster.x-k8s.io" in args:
                         return response("cluster.cluster.x-k8s.io/tenant-a")
-                    if case == "lease" and "leases.coordination.k8s.io" in args:
-                        return response({"items": [{"metadata": {
-                            "labels": {"tenancy.cnpg-vcluster.io/slot-id": "slot-a"}
-                        }}]})
+                    if case in {"lease", "lease-tenant"} and "leases.coordination.k8s.io" in args:
+                        metadata = (
+                            {"labels": {"tenancy.cnpg-vcluster.io/slot-id": "slot-a"}}
+                            if case == "lease"
+                            else {"annotations": {
+                                "tenancy.cnpg-vcluster.io/tenant-uid": "uid-a"
+                            }}
+                        )
+                        return response({"items": [{"metadata": metadata}]})
                     return clean_handler(*args, **kwargs)
 
                 def docker(*args, **_kwargs):

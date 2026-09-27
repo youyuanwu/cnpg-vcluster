@@ -29,6 +29,7 @@ pub async fn admit<D: DockerClient>(
     docker: &D,
     configuration_hash: &str,
     activation_token: &str,
+    creation_valid: bool,
 ) -> Result<(), ControllerError> {
     let config_maps = Api::<ConfigMap>::namespaced(client.clone(), NAMESPACE);
     let state = config_maps.get_opt(STATE_NAME).await?;
@@ -49,20 +50,34 @@ pub async fn admit<D: DockerClient>(
     {
         return Ok(());
     }
+    if !creation_valid {
+        return Err(ControllerError::Configuration(
+            "changed configuration is invalid for Tenant creation".into(),
+        ));
+    }
     let ticket = config_maps
         .get_opt(TICKET_NAME)
         .await?
         .ok_or_else(|| ControllerError::Configuration("activation ticket is missing".into()))?;
-    validate_ticket(&ticket, configuration_hash, activation_token)?;
+    let current_hash = state
+        .as_ref()
+        .and_then(|state| state.data.as_ref())
+        .and_then(|data| data.get("configurationHash"))
+        .map(String::as_str);
+    let consumed = validate_ticket(&ticket, configuration_hash, activation_token, current_hash)?;
     require_clean_inventory(client, docker).await?;
-    let mut consumed = ticket.clone();
-    consumed
-        .data
-        .get_or_insert_default()
-        .insert("consumed".into(), "true".into());
-    let consumed = config_maps
-        .replace(TICKET_NAME, &PostParams::default(), &consumed)
-        .await?;
+    let consumed = if consumed {
+        ticket
+    } else {
+        let mut consumed = ticket;
+        consumed
+            .data
+            .get_or_insert_default()
+            .insert("consumed".into(), "true".into());
+        config_maps
+            .replace(TICKET_NAME, &PostParams::default(), &consumed)
+            .await?
+    };
     let replacement = ConfigMap {
         metadata: ObjectMeta {
             name: Some(STATE_NAME.into()),
@@ -113,7 +128,8 @@ fn validate_ticket(
     ticket: &ConfigMap,
     configuration_hash: &str,
     activation_token: &str,
-) -> Result<(), ControllerError> {
+    current_hash: Option<&str>,
+) -> Result<bool, ControllerError> {
     let data = ticket
         .data
         .as_ref()
@@ -122,7 +138,8 @@ fn validate_ticket(
         || data.get("configurationHash").map(String::as_str) != Some(configuration_hash)
         || data.get("token").map(String::as_str) != Some(activation_token)
         || data.get("hostClean").map(String::as_str) != Some("true")
-        || data.get("consumed").is_some_and(|value| value != "false")
+        || data.get("previousConfigurationHash").map(String::as_str)
+            != Some(current_hash.unwrap_or(""))
     {
         return Err(ControllerError::Configuration(
             "activation ticket identity is invalid".into(),
@@ -139,7 +156,13 @@ fn validate_ticket(
             "activation ticket is stale".into(),
         ));
     }
-    Ok(())
+    match data.get("consumed").map(String::as_str) {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        _ => Err(ControllerError::Configuration(
+            "activation ticket consumption state is invalid".into(),
+        )),
+    }
 }
 
 async fn require_clean_inventory<D: DockerClient>(
@@ -228,6 +251,8 @@ async fn require_clean_inventory<D: DockerClient>(
                         .get("tenancy.cnpg-vcluster.io/resource")
                         .map(String::as_str)
                         == Some("allocation-lease")
+                        || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
+                        || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
                 })
         {
             return Err(ControllerError::Configuration(

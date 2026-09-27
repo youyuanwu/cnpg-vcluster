@@ -154,6 +154,22 @@ pub async fn observe_workers<D: DockerClient>(
         .await?
         .items;
     for node in &mut nodes {
+        if node
+            .types
+            .as_ref()
+            .is_some_and(|types| types.api_version != "v1" || types.kind != "Node")
+            || node
+                .metadata
+                .namespace
+                .as_deref()
+                .is_some_and(|namespace| !namespace.is_empty())
+            || node.metadata.name.as_deref().is_none_or(str::is_empty)
+            || node.metadata.uid.as_deref().is_none_or(str::is_empty)
+        {
+            return Err(ReconcileError::OwnershipInvalid(
+                "Node inventory identity is invalid".into(),
+            ));
+        }
         node.types.get_or_insert(kube::core::TypeMeta {
             api_version: "v1".into(),
             kind: "Node".into(),

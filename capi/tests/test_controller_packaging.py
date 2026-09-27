@@ -349,6 +349,87 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             )
         )
 
+    def test_first_install_rollback_lock_handles_shutdown_failure(self):
+        desired = self.foundation()
+        state = None
+        deleted = []
+
+        def handle(*args, **kwargs):
+            nonlocal state
+            if "get" in args and "configmap/tenant-controller-state" in args:
+                return response(state) if state is not None else response()
+            if args[:2] == ("create", "-f"):
+                state = json.loads(kwargs["input_text"])
+                state["metadata"].update(
+                    uid="rollback-state", resourceVersion="1"
+                )
+                return response(state)
+            return response()
+
+        def remove(_config, _client, _namespace, resource):
+            nonlocal state
+            deleted.append(resource)
+            if resource == "configmap/tenant-controller-state":
+                state = None
+
+        with (
+            patch.object(packaging, "build_controller_image", return_value="rust:image"),
+            patch.object(packaging, "_foundation_payload", return_value=desired),
+            patch.object(packaging, "run"),
+            patch.object(packaging, "verify_controller_crd"),
+            patch.object(
+                packaging,
+                "stop_controller",
+                side_effect=[None, RuntimeError("Pod wait failed")],
+            ),
+            patch.object(
+                packaging,
+                "require_clean_controller_state",
+                side_effect=[None, RuntimeError("second inventory failed")],
+            ),
+            patch.object(packaging, "delete_named", side_effect=remove),
+            self.assertRaisesRegex(RuntimeError, "second inventory failed"),
+        ):
+            packaging.reconcile_controller(
+                Path("."), CONFIG, Client(handle), {}, Mock(), None
+            )
+        self.assertIsNone(state)
+        self.assertIn("configmap/tenant-controller-state", deleted)
+
+    def test_first_install_rollback_loses_to_concurrent_acceptance(self):
+        desired = self.foundation()
+        deleted = []
+
+        def handle(*args, **kwargs):
+            if "get" in args and "configmap/tenant-controller-state" in args:
+                return response()
+            if args[:2] == ("create", "-f"):
+                return response(code=1, error="AlreadyExists")
+            return response()
+
+        with (
+            patch.object(packaging, "build_controller_image", return_value="rust:image"),
+            patch.object(packaging, "_foundation_payload", return_value=desired),
+            patch.object(packaging, "run"),
+            patch.object(packaging, "verify_controller_crd"),
+            patch.object(packaging, "stop_controller"),
+            patch.object(
+                packaging,
+                "require_clean_controller_state",
+                side_effect=[None, RuntimeError("second inventory failed")],
+            ),
+            patch.object(
+                packaging,
+                "delete_named",
+                side_effect=lambda *_args: deleted.append(_args[-1]),
+            ),
+            self.assertRaisesRegex(RuntimeError, "acceptance changed"),
+        ):
+            packaging.reconcile_controller(
+                Path("."), CONFIG, Client(handle), {}, Mock(), None
+            )
+        self.assertEqual(deleted, [])
+
     def test_post_acceptance_failure_never_restores_previous_controller(self):
         desired = self.foundation()
         desired_hash = desired["data"]["foundation.sha256"]

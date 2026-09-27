@@ -167,6 +167,10 @@ def require_clean_controller_state(
                         "tenancy.cnpg-vcluster.io/resource"
                     )
                     == "allocation-lease"
+                    or "tenancy.cnpg-vcluster.io/tenant"
+                    in metadata.get("annotations", {})
+                    or "tenancy.cnpg-vcluster.io/tenant-uid"
+                    in metadata.get("annotations", {})
                 ):
                     raise RuntimeError(
                         "allocation Lease residue blocks activation"
@@ -283,7 +287,11 @@ def require_clean_controller_state(
         verify_absent(client, namespace, resource)
 
 
-def activation_ticket(configuration_hash: str, token: str) -> dict[str, object]:
+def activation_ticket(
+    configuration_hash: str,
+    token: str,
+    previous_hash: str | None,
+) -> dict[str, object]:
     if not configuration_hash or not token:
         raise ValueError("activation ticket identity is incomplete")
     return {
@@ -295,6 +303,7 @@ def activation_ticket(configuration_hash: str, token: str) -> dict[str, object]:
         },
         "data": {
             "configurationHash": configuration_hash,
+            "previousConfigurationHash": previous_hash or "",
             "token": token,
             "hostClean": "true",
             "createdAt": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),

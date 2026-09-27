@@ -128,6 +128,7 @@ async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
         &docker,
         &foundation.hash,
         &config.activation_token,
+        foundation.creation(None).is_ok(),
     )
     .await?;
     let reconciler = Reconciler::new(

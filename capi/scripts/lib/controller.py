@@ -641,7 +641,9 @@ def reconcile_controller(
                 "--force-conflicts",
                 "-f",
                 "-",
-                input_text=json.dumps(activation_ticket(desired_hash, token)),
+                input_text=json.dumps(
+                    activation_ticket(desired_hash, token, accepted_hash)
+                ),
             )
         client.kubectl(
             "apply",
@@ -660,7 +662,7 @@ def reconcile_controller(
             f"--timeout={timeout}",
         )
         verify_running_controller(client, image, activation_token=token)
-    except Exception:
+    except Exception as failure:
         if replacement:
             accepted = client.kubectl(
                 "-n",
@@ -684,8 +686,29 @@ def reconcile_controller(
                     "controller acceptance changed during failed replacement; "
                     "refusing to restore an older identity"
                 )
-            if accepted_document is not None:
-                rollback_token = uuid.uuid4().hex
+            rollback_token = uuid.uuid4().hex
+            if accepted_document is None:
+                lock = {
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "tenant-controller-state",
+                        "namespace": CONTROLLER_NAMESPACE,
+                    },
+                    "data": {"rollbackToken": rollback_token},
+                }
+                created = client.kubectl(
+                    "create",
+                    "-f",
+                    "-",
+                    input_text=json.dumps(lock),
+                    check=False,
+                )
+                if created.returncode != 0:
+                    raise RuntimeError(
+                        "controller acceptance changed before first-install rollback"
+                    )
+            else:
                 client.kubectl(
                     "-n",
                     CONTROLLER_NAMESPACE,
@@ -702,22 +725,26 @@ def reconcile_controller(
                         "data": {"rollbackToken": rollback_token},
                     }),
                 )
+            drain_error = None
+            try:
                 stop_controller(config, client)
-                locked = client.json(
-                    "-n",
-                    CONTROLLER_NAMESPACE,
-                    "get",
-                    "configmap/tenant-controller-state",
+            except RuntimeError as error:
+                drain_error = error
+            locked = client.json(
+                "-n",
+                CONTROLLER_NAMESPACE,
+                "get",
+                "configmap/tenant-controller-state",
+            )
+            if (
+                locked.get("data", {}).get("configurationHash")
+                != accepted_hash
+                or locked.get("data", {}).get("rollbackToken")
+                != rollback_token
+            ):
+                raise RuntimeError(
+                    "controller acceptance changed while acquiring rollback lock"
                 )
-                if (
-                    locked.get("data", {}).get("configurationHash")
-                    != accepted_hash
-                    or locked.get("data", {}).get("rollbackToken")
-                    != rollback_token
-                ):
-                    raise RuntimeError(
-                        "controller acceptance changed while acquiring rollback lock"
-                    )
             for name, document in previous.items():
                 if name == "configmap/tenant-controller-state":
                     continue
@@ -747,7 +774,14 @@ def reconcile_controller(
                 CONTROLLER_NAMESPACE,
                 "configmap/tenant-controller-activation",
             )
-            if accepted_document is not None:
+            if accepted_document is None:
+                delete_named(
+                    config,
+                    client,
+                    CONTROLLER_NAMESPACE,
+                    "configmap/tenant-controller-state",
+                )
+            else:
                 client.kubectl(
                     "-n",
                     CONTROLLER_NAMESPACE,
@@ -761,6 +795,10 @@ def reconcile_controller(
                         },
                         "data": {"rollbackToken": None},
                     }),
+                )
+            if drain_error is not None:
+                failure.add_note(
+                    f"candidate shutdown failed during rollback: {drain_error}"
                 )
         raise
     verify_controller_image(config, client, image)
