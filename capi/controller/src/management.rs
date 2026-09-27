@@ -102,6 +102,11 @@ impl ManagementResource {
             )
         )
     }
+
+    #[rustfmt::skip]
+    pub fn valid_inventory_contract(self) -> bool {
+        if self.inventory_policy == InventoryPolicy::BlockAnyInstance { self.exemptions.is_empty() } else { self.exempts_unmarked() }
+    }
 }
 
 macro_rules! entry {
@@ -350,6 +355,9 @@ mod tests {
             .find(|resource| resource.kind == "Lease")
             .unwrap();
         assert_eq!(lease.inventory_namespace, Some("tenant-system"));
+        let mut invalid = by_kind("Secret").unwrap();
+        invalid.inventory_policy = InventoryPolicy::TenantMarkers;
+        assert!(!invalid.valid_inventory_contract());
         assert_eq!(
             descendants()
                 .filter(|resource| resource.role != "provider")

@@ -105,6 +105,13 @@ def _validate_runtime_inventory(
         "storage",
         "tenants",
     }
+    allowed_directories = (
+        re.compile(r"^(host|management|evidence|rendered|storage|tenants|deletions|lifecycle)$"),
+        re.compile(r"^rendered/(providers|controller|negative|tenants|addons|storage|cnpg)$"),
+        re.compile(rf"^rendered/(tenants|addons|storage|cnpg)/{tenant_pattern}$"),
+        re.compile(rf"^(storage|tenants)/{tenant_pattern}$"),
+        re.compile(r"^lifecycle/(\.locks|rejected|rejected/azure)$"),
+    )
     allowed_dynamic = (
         re.compile(
             rf"^rendered/tenants/{tenant_pattern}/"
@@ -189,6 +196,13 @@ def _validate_runtime_inventory(
                         f"unexpected runtime directory blocks cleanup: {relative}"
                     )
                 obsolete_dirs.append(path)
+            elif not any(
+                pattern.fullmatch(relative)
+                for pattern in allowed_directories
+            ):
+                raise RuntimeError(
+                    f"unexpected runtime directory blocks cleanup: {relative}"
+                )
             continue
         recognized_obsolete = relative in obsolete_files or any(
             pattern.fullmatch(relative) for pattern in obsolete_dynamic

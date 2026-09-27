@@ -133,6 +133,19 @@ class HostOwnershipTests(unittest.TestCase):
             self.assertTrue(identity.exists())
             self.assertTrue(unexpected.exists())
 
+    def test_unknown_directory_outside_obsolete_tree_blocks_cleanup(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            unexpected = root / ".runtime/management/foreign"
+            unexpected.mkdir(parents=True, mode=0o700)
+            for parent in unexpected.parents:
+                if parent == root:
+                    break
+                parent.chmod(0o700)
+            with self.assertRaisesRegex(RuntimeError, "unexpected runtime directory"):
+                _validate_runtime_inventory(root)
+            self.assertTrue(unexpected.exists())
+
     def test_empty_obsolete_directories_are_removed(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

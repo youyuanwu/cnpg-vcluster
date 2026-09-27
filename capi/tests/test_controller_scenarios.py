@@ -7,11 +7,13 @@ import json
 import tempfile
 import unittest
 from contextlib import redirect_stdout
+from dataclasses import replace
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import Mock, patch
 
 from scripts.endpoint import run_endpoint_gate
+from scripts.lib import tenants as tenant_lib
 from scripts.lib.controller_scenarios import (
     LEASE,
     MANAGEMENT_CATALOG,
@@ -25,6 +27,7 @@ from scripts.lib.controller_scenarios import (
     verify_allocation_lease,
     wait_tenant_ready,
 )
+from scripts.lib.tenants import Tenant, verify_tenant_management_ownership
 
 
 def tenant_document() -> dict[str, object]:
@@ -67,6 +70,52 @@ def lease_inventory(leases):
 
 
 class ControllerScenarioTests(unittest.TestCase):
+    def test_management_ownership_uses_declared_machine_version(self) -> None:
+        catalog = tuple(
+            replace(resource, api_version="cluster.x-k8s.io/unavailable")
+            if resource.kind == "Machine"
+            else resource
+            for resource in tenant_lib.MANAGEMENT_CATALOG
+        )
+        calls = []
+
+        class Client:
+            def kubectl(self, *arguments, **_kwargs):
+                calls.append(arguments)
+                error = (
+                    "NotFound"
+                    if any("unavailable" in argument for argument in arguments)
+                    else "Error from server (NotFound): absent"
+                )
+                return CompletedProcess([], 1, stdout="", stderr=error)
+
+        tenant = Tenant(
+            name="tenant-a",
+            namespace="tenant-a",
+            vip="172.18.0.2",
+            pod_cidr="10.0.0.0/16",
+            service_cidr="10.1.0.0/16",
+            dns_ip="10.1.0.10",
+            domain="tenant-a.capi.local",
+            storage_host_path=Path("/tmp/tenant-a"),
+            cnpg_cluster="cluster",
+            workers=1,
+        )
+        with patch.object(tenant_lib, "MANAGEMENT_CATALOG", catalog):
+            with self.assertRaisesRegex(RuntimeError, "Machine inspection failed"):
+                verify_tenant_management_ownership(
+                    {"OWNERSHIP_LABEL": "owner", "LAB_PREFIX": "lab"},
+                    Client(),
+                    tenant,
+                )
+        self.assertTrue(
+            any(
+                "--raw=/apis/cluster.x-k8s.io/unavailable/"
+                "namespaces/tenant-a/machines" in arguments
+                for arguments in calls
+            )
+        )
+
     def test_spec_hash_matches_rust_canonical_contract(self) -> None:
         document = tenant_document()
         expected = hashlib.sha256(

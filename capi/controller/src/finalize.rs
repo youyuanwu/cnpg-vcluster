@@ -7,7 +7,7 @@ use std::time::Duration;
 use crate::allocation::{
     ClaimContext, ReleaseDecision, decide_release, recover_allocation, release,
 };
-use crate::api::{FINALIZER, Tenant, TenantPhase, canonical_spec, spec_hash};
+use crate::api::{FINALIZER, Tenant, TenantPhase, TenantStatus, canonical_spec, spec_hash};
 use crate::docker::{
     DockerClient, DockerError, DockerVolume, WorkerIdentity, validate_volume, worker_containers,
 };
@@ -127,21 +127,9 @@ impl<D: DockerClient> Finalizer<D> {
         }
     }
 
-    async fn status(
-        &self,
-        original: &Tenant,
-        current: &Tenant,
-        status: &crate::api::TenantStatus,
-        clear_allocation: bool,
-    ) -> Result<(), ReconcileError> {
-        tenant_status::replace_status(
-            self.client.clone(),
-            original,
-            current,
-            status,
-            clear_allocation,
-        )
-        .await
+    #[rustfmt::skip]
+    async fn status(&self, original: &Tenant, current: &Tenant, status: &TenantStatus, clear_allocation: bool) -> Result<(), ReconcileError> {
+        tenant_status::replace_status(self.client.clone(), original, current, status, clear_allocation).await
     }
 
     pub async fn reconcile(&self, tenant: &Tenant) -> Result<Action, ReconcileError> {

@@ -179,6 +179,11 @@ async fn require_clean_inventory<D: DockerClient>(
         ));
     }
     for &resource in MANAGEMENT_RESOURCES {
+        if !resource.valid_inventory_contract() {
+            return Err(ControllerError::Configuration(
+                "management resource inventory contract is invalid".into(),
+            ));
+        }
         for item in inventory(client.clone(), resource).await? {
             if inventory_blocks(resource, &item) {
                 return Err(ControllerError::Configuration(format!(

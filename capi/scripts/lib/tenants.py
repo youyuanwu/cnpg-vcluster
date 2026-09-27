@@ -300,7 +300,7 @@ def verify_tenant_management_ownership(
                     f"{owners[0]['name']}"
                 )
         present["machines"] = machines
-    elif not NOT_FOUND.search(machines_response.stderr):
+    else:
         raise RuntimeError(
             f"tenant Machine inspection failed: {machines_response.stderr}"
         )

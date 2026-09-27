@@ -7,11 +7,16 @@ use tenant_controller::{
 type GenerateResult<T> = Result<T, Box<dyn std::error::Error>>;
 type GeneratedFiles = [(&'static str, Vec<u8>); 3];
 
-fn render<T: serde::Serialize>(value: &T) -> GenerateResult<Vec<u8>> {
-    Ok(format!("---\n{}", serde_yaml::to_string(value)?).into_bytes())
-}
+#[rustfmt::skip]
+fn render<T: serde::Serialize>(value: &T) -> GenerateResult<Vec<u8>> { Ok(format!("---\n{}", serde_yaml::to_string(value)?).into_bytes()) }
 
 fn generated_files() -> GenerateResult<GeneratedFiles> {
+    if MANAGEMENT_RESOURCES
+        .iter()
+        .any(|resource| !resource.valid_inventory_contract())
+    {
+        return Err("invalid management resource inventory contract".into());
+    }
     let mut resources = serde_json::to_vec_pretty(MANAGEMENT_RESOURCES)?;
     resources.push(b'\n');
     Ok([

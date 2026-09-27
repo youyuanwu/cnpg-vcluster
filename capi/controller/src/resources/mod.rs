@@ -1,6 +1,4 @@
-//! Desired objects only: no Kubernetes, Docker, filesystem, or process effects.
-//! Management provider objects and CNPG Cluster are dynamic. Namespaces and
-//! other tenant objects are create-or-validate; bootstrap RBAC is content-validated.
+//! Pure desired-object builders with narrow dynamic repair and validated static ownership.
 
 mod access;
 mod bootstrap;
