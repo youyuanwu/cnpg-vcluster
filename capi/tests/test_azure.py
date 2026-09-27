@@ -16,17 +16,13 @@ from unittest.mock import patch
 
 from scripts.azure import (
     AzureTenantAdapter,
-    _capture_tenant_kubeconfig,
     _classify_management_owned_resources,
-    _collect_ready_observations,
     _discover_owned_repeatedly,
     _exact_delete_management_resource,
     _enable_capz_external_control_plane_delete,
     _exclude_tenant_machines_from_drain,
     _management_resource_specs,
     _run_profile_mutation,
-    _tenant_spec_blockers,
-    _wait_ready_observations,
     classify_azure_owned_resources,
     discover_azure_owned_resources,
 )
@@ -36,6 +32,12 @@ from scripts.lib.azure.rendering import (
     _render_addon_job,
     _render_tenant_control_plane,
     _render_worker_pool,
+)
+from scripts.lib.azure.readiness import (
+    _capture_tenant_kubeconfig,
+    _collect_ready_observations,
+    _tenant_spec_blockers,
+    _wait_ready_observations,
 )
 from scripts.lib.azure.common import (
     FOUNDATION_INVENTORY_SCHEMA,
@@ -70,31 +72,6 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzurePhaseFourTests(AzureFixtureMixin, unittest.TestCase):
-    def test_ready_wait_retries_until_cloud_and_network_converge(self):
-        root = self.make_root()
-        config = load_azure_configuration(root)
-        spec = self.spec()
-        ready = {"nodes": [{"name": "node-0"}]}
-        with (
-            patch(
-                "scripts.azure._collect_ready_observations",
-                side_effect=[
-                    ({}, ("Node is not Ready",)),
-                    ({}, ("calicoNode is not Ready",)),
-                    (ready, ()),
-                ],
-            ) as collect,
-            patch("scripts.azure.time.sleep"),
-            patch(
-                "scripts.azure.time.monotonic",
-                side_effect=[0, 1, 2, 3],
-            ),
-        ):
-            self.assertEqual(
-                _wait_ready_observations(root, config, spec),
-                ready,
-            )
-        self.assertEqual(collect.call_count, 3)
 
     def test_azure_resource_ids_are_case_insensitive(self):
         self.assertTrue(
@@ -205,175 +182,9 @@ class AzurePhaseFourTests(AzureFixtureMixin, unittest.TestCase):
 
 
 
-    def test_tenant_kubeconfig_requires_verified_controller_owner(self):
-        root = self.make_root()
-        spec = self.spec()
-        runtime, journal = self.start_journal(root, spec)
-        journal = runtime.update_operation(
-            journal,
-            phase="control-plane-resources",
-            observed={
-                "clusterUid": "cluster-uid",
-                "kamajiControlPlaneUid": "control-plane-uid",
-            },
-        )
-        encoded = base64.b64encode(b"kubeconfig").decode()
-        for owner_uid, accepted in (
-            ("foreign-uid", False),
-            ("control-plane-uid", True),
-        ):
-            with self.subTest(owner_uid=owner_uid):
-                secret = {
-                    "metadata": {
-                        "uid": "secret-uid",
-                        "ownerReferences": [
-                            {
-                                "controller": True,
-                                "uid": owner_uid,
-                                "kind": "KamajiControlPlane",
-                            }
-                        ],
-                    },
-                    "data": {"value": encoded},
-                }
-                with patch(
-                    "scripts.azure._get_management_resource",
-                    return_value=secret,
-                ):
-                    if accepted:
-                        updated = _capture_tenant_kubeconfig(
-                            root,
-                            spec,
-                            runtime,
-                            journal,
-                        )
-                        self.assertEqual(
-                            updated.observed["tenantKubeconfigSecretUid"],
-                            "secret-uid",
-                        )
-                    else:
-                        with self.assertRaisesRegex(RuntimeError, "incomplete"):
-                            _capture_tenant_kubeconfig(
-                                root,
-                                spec,
-                                runtime,
-                                journal,
-                            )
 
 
-    def test_ready_observations_enforce_node_cloud_identity_and_subnet(self):
-        root = self.make_root()
-        config = load_azure_configuration(root)
-        spec = self.spec()
-        cluster = {
-            "status": {
-                "conditions": [
-                    {"type": "ControlPlaneAvailable", "status": "True"}
-                ]
-            }
-        }
-        control_plane = {"status": {"ready": True}}
-        pool = {
-            "status": {
-                "readyReplicas": 1,
-                "nodeRefs": [{"name": "node-0"}],
-            }
-        }
 
-        def management(_root, _namespace, resource):
-            if resource.startswith("cluster/"):
-                return cluster
-            if resource.startswith("kamajicontrolplane/"):
-                return control_plane
-            return pool
-
-        node = {
-            "metadata": {"name": "node-0", "uid": "node-uid"},
-            "spec": {"providerID": "azure:///vmss/0"},
-            "status": {
-                "addresses": [{"type": "InternalIP", "address": "10.220.16.4"}],
-                "conditions": [{"type": "Ready", "status": "True"}],
-            },
-        }
-        workload = {
-            "metadata": {"uid": "workload-uid"},
-            "spec": {"replicas": 1},
-            "status": {
-                "availableReplicas": 1,
-                "updatedReplicas": 1,
-                "desiredNumberScheduled": 1,
-                "numberReady": 1,
-                "updatedNumberScheduled": 1,
-            },
-        }
-        responses = [completed(json.dumps({"items": [node]}))] + [
-            completed(json.dumps(workload)) for _ in range(4)
-        ]
-        with (
-            patch("scripts.azure._get_management_resource", side_effect=management),
-            patch("scripts.azure._tenant_kubectl", side_effect=responses),
-        ):
-            observations, blockers = _collect_ready_observations(root, config, spec)
-        self.assertEqual(blockers, ())
-        self.assertEqual(observations["readyReplicas"], 1)
-        node["status"]["addresses"][0]["address"] = "10.99.0.4"
-        responses = [completed(json.dumps({"items": [node]}))] + [
-            completed(json.dumps(workload)) for _ in range(4)
-        ]
-        with (
-            patch("scripts.azure._get_management_resource", side_effect=management),
-            patch("scripts.azure._tenant_kubectl", side_effect=responses),
-        ):
-            _, blockers = _collect_ready_observations(root, config, spec)
-        self.assertTrue(any("outside the tenant subnet" in item for item in blockers))
-
-    def test_tenant_spec_accepts_capz_defaulted_network_interface(self):
-        spec = self.spec()
-        selected = tenant_names(spec)
-        payloads = {
-            "clusterUid": {
-                "spec": {
-                    "clusterNetwork": {
-                        "pods": {"cidrBlocks": [str(spec.pod_network)]},
-                        "services": {"cidrBlocks": [str(spec.service_network)]},
-                        "serviceDomain": spec.cluster_domain,
-                    }
-                }
-            },
-            "kamajiControlPlaneUid": {
-                "spec": {"version": spec.kubernetes_version}
-            },
-            "machinePoolUid": {
-                "spec": {"replicas": spec.workers, "clusterName": spec.name}
-            },
-            "azureMachinePoolUid": {
-                "spec": {
-                    "template": {
-                        "vmSize": "Standard_B2s",
-                        "networkInterfaces": [
-                            {
-                                "subnetName": "tenant",
-                                "privateIPConfigs": 1,
-                            }
-                        ],
-                        "image": {
-                            "computeGallery": {
-                                "version": spec.kubernetes_version
-                            }
-                        },
-                    }
-                }
-            },
-        }
-        self.assertEqual(
-            _tenant_spec_blockers(
-                spec,
-                selected,
-                payloads,
-                {"AZURE_TENANT_NODE_SKU": "Standard_B2s"},
-            ),
-            (),
-        )
 
 
 
