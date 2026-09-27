@@ -237,7 +237,10 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 "spec-sha",
                 "revision",
             ),
-            {"worker-instance-deletion"},
+            {
+                "worker-instance-deletion",
+                "worker-instance-deletion-started",
+            },
         )
         payload["operationId"] = "operation-2"
         write_private_file(
@@ -274,14 +277,47 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             evidence / "lifecycle-operation-1.json",
             json.dumps(payload),
         )
-        self.assertIsNone(
+        with self.assertRaisesRegex(RuntimeError, "invalid Azure lifecycle"):
             _incomplete_gate_records(
                 evidence,
                 "tenant-c",
                 "spec-sha",
                 "revision",
             )
+
+    def test_completed_gate_cannot_reinject_same_revision(self):
+        root = self.make_root()
+        evidence = root / ".runtime" / "azure-gate" / "evidence"
+        payload = {
+            "schema": 1,
+            "operationId": "operation-1",
+            "tenant": "tenant-c",
+            "specificationSha256": "spec-sha",
+            "revision": "revision",
+            "records": [
+                {
+                    "phase": phase,
+                    "status": "passed",
+                    "seconds": 1.0,
+                }
+                for phase in (
+                    "worker-instance-deletion",
+                    "targeted-delete-absent",
+                    "recreation",
+                )
+            ],
+        }
+        write_private_file(
+            evidence / "lifecycle-operation-1.json",
+            json.dumps(payload),
         )
+        with self.assertRaisesRegex(RuntimeError, "already completed"):
+            _incomplete_gate_records(
+                evidence,
+                "tenant-c",
+                "spec-sha",
+                "revision",
+            )
 
     def test_live_gate_recipe_exists_but_is_not_invoked_by_tests(self):
         root = Path(__file__).resolve().parents[1]

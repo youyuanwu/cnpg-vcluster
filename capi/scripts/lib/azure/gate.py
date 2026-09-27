@@ -187,14 +187,27 @@ def require_owned_resource_delta(
         raise RuntimeError("unknown Azure ownership changed during worker recovery")
 
     def resources(payload):
-        return {
-            _normalize_resource_id(str(item["id"])): (
+        items = payload.get("azure")
+        if not isinstance(items, list):
+            raise RuntimeError("Azure resource inventory is invalid")
+        result = {}
+        for item in items:
+            if (
+                not isinstance(item, dict)
+                or not isinstance(item.get("id"), str)
+                or not item["id"]
+                or not isinstance(item.get("type"), str)
+                or not item["type"]
+            ):
+                raise RuntimeError("Azure resource inventory entry is invalid")
+            key = _normalize_resource_id(item["id"])
+            if key in result:
+                raise RuntimeError("Azure resource inventory contains duplicate IDs")
+            result[key] = (
                 str(item.get("type", "")).lower(),
                 json.dumps(item, sort_keys=True, separators=(",", ":")),
             )
-            for item in payload.get("azure", [])
-            if isinstance(item, dict) and isinstance(item.get("id"), str)
-        }
+        return result
 
     before = resources(recorded)
     after = resources(discovered)

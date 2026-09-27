@@ -241,7 +241,9 @@ def _incomplete_gate_records(
                 or payload.get("revision") != revision
                 or not isinstance(payload.get("records"), list)
             ):
-                continue
+                raise RuntimeError(
+                    f"invalid Azure lifecycle gate evidence: {path.name}"
+                )
             valid_records = True
             for record in payload["records"]:
                 if not isinstance(record, dict):
@@ -274,18 +276,27 @@ def _incomplete_gate_records(
                     valid_records = False
                     break
             if not valid_records:
-                continue
+                raise RuntimeError(
+                    f"invalid Azure lifecycle gate evidence records: {path.name}"
+                )
             passed = {
                 record.get("phase")
                 for record in payload["records"]
                 if isinstance(record, dict) and record.get("status") == "passed"
             }
+            seen = {
+                record.get("phase")
+                for record in payload["records"]
+                if isinstance(record, dict)
+            }
+            if "recreation" in passed:
+                raise RuntimeError(
+                    "Azure lifecycle gate already completed for this revision"
+                )
             if (
-                "worker-instance-deletion" in passed
-                and "targeted-delete-absent" not in passed
-                and "recreation" not in passed
+                "worker-instance-deletion" in seen
             ):
-                candidates.append(passed)
+                candidates.append(passed | {"worker-instance-deletion-started"})
     if len(candidates) > 1:
         raise RuntimeError("multiple incomplete Azure lifecycle gate attempts exist")
     return candidates[0] if candidates else None
@@ -448,6 +459,15 @@ def main(arguments: list[str]) -> int:
         )
 
         def resume_worker_refresh():
+            if _incomplete_gate_records(
+                evidence.parent,
+                spec.name,
+                spec.sha256(),
+                revision,
+            ) is None:
+                raise RuntimeError(
+                    "Azure worker recovery evidence changed before resume"
+                )
             runtime = TenantRuntime(ROOT, spec.name)
             if runtime.operation_exists():
                 raise RuntimeError(
@@ -519,18 +539,21 @@ def main(arguments: list[str]) -> int:
             runtime.compare_and_replace_identity(identity, observed)
 
         skip_failure_injection = False
+        skip_targeted_delete = False
         if prior_gate is not None:
-            if "worker-identity-refresh" not in prior_gate:
-                try:
-                    _require_status(spec.name, "ready")
-                except RuntimeError:
-                    _run_profile_mutation(
-                        ROOT,
-                        config,
-                        lambda _root, _config: resume_worker_refresh(),
-                    )
-            _require_status(spec.name, "ready")
+            if "targeted-delete-absent" not in prior_gate:
+                if "worker-identity-refresh" not in prior_gate:
+                    try:
+                        _require_status(spec.name, "ready")
+                    except RuntimeError:
+                        _run_profile_mutation(
+                            ROOT,
+                            config,
+                            lambda _root, _config: resume_worker_refresh(),
+                        )
+                _require_status(spec.name, "ready")
             skip_failure_injection = True
+            skip_targeted_delete = "targeted-delete-absent" in prior_gate
         else:
             phase(
                 "create-ready",
@@ -581,6 +604,15 @@ def main(arguments: list[str]) -> int:
                 )
             target = before.target
             phase("worker-identity-verification", lambda: before)
+            records.append(
+                {
+                    "phase": "worker-instance-deletion",
+                    "status": "failed",
+                    "seconds": 0.0,
+                    "blocker": "failure injection in progress",
+                }
+            )
+            persist_evidence()
             phase(
                 "worker-instance-deletion",
                 lambda: _az(
@@ -674,18 +706,19 @@ def main(arguments: list[str]) -> int:
                 lambda _root, _config: verify_and_replace_worker(),
             )
             _require_status(spec.name, "ready")
-        phase(
-            "targeted-delete-absent",
-            lambda: (
-                _tenant_command(
-                    "delete",
-                    "azure",
-                    spec.name,
-                    f"azure/{spec.name}",
+        if not skip_targeted_delete:
+            phase(
+                "targeted-delete-absent",
+                lambda: (
+                    _tenant_command(
+                        "delete",
+                        "azure",
+                        spec.name,
+                        f"azure/{spec.name}",
+                    ),
+                    _require_status(spec.name, "absent"),
                 ),
-                _require_status(spec.name, "absent"),
-            ),
-        )
+            )
 
         def verify_foundation():
             foundation_after, _, _ = _inspect_foundation(
