@@ -1,15 +1,15 @@
 //! Go parity: tenant_controller, phase2, readiness, reconcile_cnpg and status.
 //! This Tower service drives the real creation pipeline across every barrier.
-mod creation_support;
+use std::sync::Arc;
 
-use creation_support::*;
+use crate::creation_support::*;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{ResourceExt, core::DynamicObject, runtime::controller::Action};
 use serde_json::{Value, json};
 use tenant_controller::{
     api::{Tenant, TenantStatus, canonical_spec, spec_hash},
     docker::{DockerContainer, WORKER_CLUSTER_LABEL, WORKER_ROLE_LABEL},
-    foundation::{Foundation, canonical_hash},
+    foundation::{Foundation, FoundationError, canonical_hash, parse_runtime},
     ownership::Identity,
     reconcile::{Assets, Config, FINALIZER, PROGRESS_INTERVAL, Reconciler},
 };
@@ -24,18 +24,18 @@ const DEPLOYMENT: &str =
 struct Fixture {
     management: Server,
     workload: Server,
-    reconciler: Reconciler<FakeDocker, FakeAccess, FakeDeletion>,
+    reconciler: Reconciler<FakeDocker, FakeAccess>,
     foundation: Foundation,
     hash: String,
 }
 
 impl Fixture {
-    fn new(mutation: bool) -> Self {
+    fn new(_mutation: bool) -> Self {
         let management = Server::default();
         let workload = Server::default();
         management.insert(TENANT, tenant());
         let mut raw: Value =
-            serde_json::from_str::<Value>(include_str!("fixtures/foundation-schema3.json"))
+            serde_json::from_str::<Value>(include_str!("../fixtures/foundation-schema3.json"))
                 .unwrap()["foundation"]
                 .clone();
         raw["inputs"]["cacheHostPath"] = json!("/cache");
@@ -44,6 +44,8 @@ impl Fixture {
         let encoded = serde_json::to_string(&raw).unwrap();
         let hash = canonical_hash(&encoded).unwrap();
         let foundation: Foundation = serde_json::from_value(raw).unwrap();
+        let runtime_foundation =
+            Arc::new(parse_runtime(&encoded, &hash, "1.36.4", "controller:one").unwrap());
         management.insert(FOUNDATION, json!({"apiVersion":"v1","kind":"ConfigMap",
             "metadata":{"name":"tenant-foundation","namespace":"tenant-system","uid":"foundation","resourceVersion":"1"},
             "data":{"foundation.json":encoded,"foundation.sha256":hash}}));
@@ -61,13 +63,9 @@ impl Fixture {
             client: management.client(),
             docker: FakeDocker::default(),
             access: FakeAccess(workload.client()),
-            deletion: FakeDeletion::default(),
-            config: Config {
-                mutation_enabled: mutation,
-                controller_image: "controller:one".into(),
-                ..Default::default()
-            },
+            config: Config::default(),
             assets: Assets { calico, cnpg },
+            foundation: runtime_foundation,
         };
         Self {
             management,
@@ -264,39 +262,31 @@ async fn absent_tenant_only_uses_one_uncached_get() {
 }
 
 #[tokio::test]
-async fn mutation_disabled_and_invalid_spec_have_no_foundation_or_external_calls() {
-    for invalid in [false, true] {
-        let fixture = Fixture::new(false);
-        if invalid {
-            let mut tenant = fixture.current();
-            tenant.spec.workers = 4;
-            fixture.management.insert(TENANT, tenant);
-        }
-        fixture.step().await;
-        let calls = fixture.management.calls();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].path, TENANT);
-        assert_eq!(calls[1].path, format!("{TENANT}/status"));
-        assert!(fixture.current().finalizers().is_empty());
-        assert_eq!(
-            fixture
-                .current()
-                .status
-                .unwrap()
-                .conditions
-                .iter()
-                .find(|condition| condition.type_ == "Ready")
-                .unwrap()
-                .reason,
-            if invalid {
-                "InvalidSpec"
-            } else {
-                "MutationDisabled"
-            }
-        );
-        assert!(fixture.workload.calls().is_empty());
-        assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
-    }
+async fn invalid_spec_has_no_foundation_or_external_calls() {
+    let fixture = Fixture::new(true);
+    let mut tenant = fixture.current();
+    tenant.spec.workers = 4;
+    fixture.management.insert(TENANT, tenant);
+    fixture.step().await;
+    let calls = fixture.management.calls();
+    assert_eq!(calls.len(), 2);
+    assert_eq!(calls[0].path, TENANT);
+    assert_eq!(calls[1].path, format!("{TENANT}/status"));
+    assert!(fixture.current().finalizers().is_empty());
+    assert_eq!(
+        fixture
+            .current()
+            .status
+            .unwrap()
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap()
+            .reason,
+        "InvalidSpec"
+    );
+    assert!(fixture.workload.calls().is_empty());
+    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -312,52 +302,6 @@ async fn validation_uses_runtime_supported_version_not_a_compiled_literal() {
 }
 
 #[tokio::test]
-async fn deletion_receives_the_runtime_supported_version() {
-    let mut fixture = Fixture::new(false);
-    fixture.reconciler.config.supported_version = "1.36.5".into();
-    let mut tenant = fixture.current();
-    tenant.spec.kubernetes_version = "v1.36.5".into();
-    tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
-    tenant.metadata.deletion_timestamp =
-        Some(serde_json::from_value(json!("2026-09-25T00:00:00Z")).unwrap());
-    fixture.management.insert(TENANT, tenant);
-    fixture.step().await;
-    assert_eq!(
-        *fixture.reconciler.deletion.0.lock().unwrap(),
-        [("tenant-a".into(), "1.36.5".into())]
-    );
-}
-
-#[tokio::test]
-async fn managed_deletion_bypasses_both_creation_mutation_gates_and_assets() {
-    for managed in [false, true] {
-        let mut fixture = Fixture::new(false);
-        let mut tenant = fixture.current();
-        tenant.metadata.deletion_timestamp =
-            Some(serde_json::from_value(json!("2026-09-25T00:00:00Z")).unwrap());
-        if managed {
-            tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
-        }
-        fixture.management.insert(TENANT, tenant);
-        fixture
-            .management
-            .0
-            .lock()
-            .unwrap()
-            .objects
-            .remove(FOUNDATION);
-        fixture.reconciler.assets = Assets::default();
-        fixture.step().await;
-        assert_eq!(
-            fixture.reconciler.deletion.0.lock().unwrap().len(),
-            usize::from(managed)
-        );
-        assert_eq!(fixture.management.calls().len(), 1);
-        assert!(fixture.workload.calls().is_empty());
-    }
-}
-
-#[tokio::test]
 async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_separate_barriers() {
     let fixture = Fixture::new(true);
     fixture.step().await;
@@ -367,10 +311,10 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
             .iter()
             .map(|call| call.method.as_str())
             .collect::<Vec<_>>(),
-        ["GET", "GET", "PUT"]
+        ["GET", "PUT"]
     );
     assert_eq!(
-        calls[2].path, TENANT,
+        calls[1].path, TENANT,
         "finalizer uses main resource, not status"
     );
     assert!(
@@ -388,7 +332,7 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
             .iter()
             .map(|call| call.method.as_str())
             .collect::<Vec<_>>(),
-        ["GET", "GET", "PATCH"]
+        ["GET", "PATCH"]
     );
     assert_eq!(
         fixture
@@ -407,9 +351,9 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
             .iter()
             .map(|call| call.method.as_str())
             .collect::<Vec<_>>(),
-        ["GET", "GET", "GET", "POST", "GET", "PATCH"]
+        ["GET", "GET", "POST", "GET", "PATCH"]
     );
-    assert_eq!(calls[3].path, LEASES);
+    assert_eq!(calls[2].path, LEASES);
     assert!(
         fixture
             .current()
@@ -462,30 +406,19 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
 }
 
 #[tokio::test]
-async fn foundation_replacement_or_disabled_foundation_never_adds_finalizer_or_claims() {
-    for changed in [false, true] {
-        let fixture = Fixture::new(true);
-        if changed {
-            let mut tenant = fixture.current();
-            tenant.status = Some(TenantStatus {
-                foundation_hash: Some("old-foundation".into()),
-                ..Default::default()
-            });
-            fixture.management.insert(TENANT, tenant);
-        } else {
-            let mut config = fixture.management.get(FOUNDATION);
-            let mut raw: Value =
-                serde_json::from_str(config["data"]["foundation.json"].as_str().unwrap()).unwrap();
-            raw["mutationEnabled"] = json!(false);
-            config["data"]["foundation.json"] = json!(raw.to_string());
-            fixture.management.insert(FOUNDATION, config);
-        }
-        fixture.step().await;
-        assert!(fixture.current().finalizers().is_empty());
-        assert_eq!(fixture.management.calls().len(), 3);
-        assert!(fixture.workload.calls().is_empty());
-        assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
-    }
+async fn foundation_replacement_never_adds_finalizer_or_claims() {
+    let fixture = Fixture::new(true);
+    let mut tenant = fixture.current();
+    tenant.status = Some(TenantStatus {
+        foundation_hash: Some("old-foundation".into()),
+        ..Default::default()
+    });
+    fixture.management.insert(TENANT, tenant);
+    fixture.step().await;
+    assert!(fixture.current().finalizers().is_empty());
+    assert_eq!(fixture.management.calls().len(), 2);
+    assert!(fixture.workload.calls().is_empty());
+    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]
@@ -839,29 +772,27 @@ async fn root_apply_conflict_requeues_without_external_mutation_or_terminal_fail
 }
 
 #[tokio::test]
-async fn foundation_read_failures_are_classified_without_external_mutation() {
-    for code in [404, 403, 503] {
-        let fixture = Fixture::new(true);
-        fixture
-            .management
-            .respond("GET", FOUNDATION, code, status(code, "Unavailable"));
-        fixture.step().await;
-        let tenant = fixture.current();
-        assert!(tenant.finalizers().is_empty());
-        assert_eq!(
-            tenant
-                .status
-                .unwrap()
-                .conditions
-                .iter()
-                .find(|condition| condition.type_ == "Ready")
-                .unwrap()
-                .reason,
-            "FoundationInvalid"
-        );
-        assert!(fixture.workload.calls().is_empty());
-        assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
-    }
+async fn creation_invalid_snapshot_is_classified_without_external_mutation() {
+    let mut fixture = Fixture::new(true);
+    Arc::make_mut(&mut fixture.reconciler.foundation).creation = Err(FoundationError::Invalid(
+        "creation inputs are invalid".into(),
+    ));
+    fixture.step().await;
+    let tenant = fixture.current();
+    assert!(tenant.finalizers().is_empty());
+    assert_eq!(
+        tenant
+            .status
+            .unwrap()
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap()
+            .reason,
+        "FoundationInvalid"
+    );
+    assert!(fixture.workload.calls().is_empty());
+    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
 }
 
 #[tokio::test]

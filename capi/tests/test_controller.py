@@ -13,19 +13,15 @@ from scripts.cache import VerifiedCache
 from scripts.controller_tenant import main as controller_tenant_main
 from scripts.test_controller_convergence import _restore_after_gate
 from scripts.lib.controller import (
-    CONTROLLER_LIFECYCLE_EPOCH,
     _foundation_payload,
     _foundation_checksum,
     build_controller_image,
-    controller_requires_cutover,
     controller_source_digest,
     delete_controller_tenants,
     delete_tenant_resource,
     delete_controller,
     render_controller_manager,
-    set_controller_mutation,
-    stop_controller_for_cutover,
-    verify_running_controller_epoch,
+    stop_controller,
 )
 from scripts.lib.ownership import IdentityRecord
 from scripts.lib.images import WORKER_IMAGE_KEYS
@@ -48,13 +44,7 @@ class FakeManagementClient:
 
 
 class ControllerIntegrationUnitTests(unittest.TestCase):
-    def test_lifecycle_epoch_decides_cutover(self) -> None:
-        self.assertFalse(controller_requires_cutover(CONTROLLER_LIFECYCLE_EPOCH))
-        self.assertTrue(controller_requires_cutover(None))
-        self.assertTrue(controller_requires_cutover("legacy-status-v1"))
-        self.assertTrue(controller_requires_cutover("desired-state-v2"))
-
-    def test_rendered_manager_contains_epoch_and_mutation_mode(self) -> None:
+    def test_rendered_manager_contains_activation_token(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             template = root / "controller" / "config" / "manager"
@@ -62,21 +52,19 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             (template / "manager.yaml.tpl").write_text(
                 "image: ${TENANT_CONTROLLER_IMAGE}\n"
                 "version: ${SUPPORTED_KUBERNETES_VERSION}\n"
-                "epoch: ${CONTROLLER_LIFECYCLE_EPOCH}\n"
-                "mutation: ${CONTROLLER_MUTATION_ENABLED}\n",
+                "activation: ${CONTROLLER_ACTIVATION_TOKEN}\n",
                 encoding="utf-8",
             )
             rendered = render_controller_manager(
                 root,
                 {"KUBERNETES_VERSION": "v1.36.4"},
                 "example/controller:test",
-                mutation_enabled=False,
+                activation_token="token-a",
             )
             content = rendered.read_text(encoding="utf-8")
-            self.assertIn(f"epoch: {CONTROLLER_LIFECYCLE_EPOCH}", content)
-            self.assertIn("mutation: false", content)
+            self.assertIn("activation: token-a", content)
 
-    def test_cutover_stops_old_controller_before_returning(self) -> None:
+    def test_shutdown_stops_old_controller_before_returning(self) -> None:
         client = FakeManagementClient(
             [
                 CompletedProcess([], 0, stdout="deployment", stderr=""),
@@ -84,7 +72,7 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 CompletedProcess([], 0, stdout='{"items":[]}', stderr=""),
             ]
         )
-        stop_controller_for_cutover(
+        stop_controller(
             {"CONDITION_TIMEOUT": "1s"},
             client,
         )
@@ -99,89 +87,6 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             ),
             arguments[1],
         )
-
-    def test_running_controller_epoch_checks_deployment_and_pod(self) -> None:
-        deployment = {
-            "spec": {
-                "template": {
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "manager",
-                                "args": [
-                                    f"--lifecycle-epoch={CONTROLLER_LIFECYCLE_EPOCH}"
-                                ],
-                            }
-                        ]
-                    }
-                }
-            }
-        }
-        pods = {
-            "items": [
-                {
-                    "metadata": {"name": "tenant-controller-1"},
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "manager",
-                                "args": [
-                                    f"--lifecycle-epoch={CONTROLLER_LIFECYCLE_EPOCH}"
-                                ],
-                            }
-                        ]
-                    },
-                }
-            ]
-        }
-        client = FakeManagementClient(
-            [
-                CompletedProcess([], 0, stdout=json.dumps(deployment), stderr=""),
-                CompletedProcess([], 0, stdout=json.dumps(pods), stderr=""),
-            ]
-        )
-        verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
-
-    def test_running_controller_epoch_rejects_partial_rollout(self) -> None:
-        deployment = {
-            "spec": {
-                "template": {
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "manager",
-                                "args": [
-                                    f"--lifecycle-epoch={CONTROLLER_LIFECYCLE_EPOCH}"
-                                ],
-                            }
-                        ]
-                    }
-                }
-            }
-        }
-        pods = {
-            "items": [
-                {
-                    "metadata": {"name": "tenant-controller-old"},
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "manager",
-                                "args": ["--lifecycle-epoch=legacy-status-v1"],
-                            }
-                        ]
-                    },
-                }
-            ]
-        }
-        client = FakeManagementClient(
-            [
-                CompletedProcess([], 0, stdout=json.dumps(deployment), stderr=""),
-                CompletedProcess([], 0, stdout=json.dumps(pods), stderr=""),
-            ]
-        )
-        with self.assertRaisesRegex(RuntimeError, "Pod .* lifecycle epoch mismatch"):
-            verify_running_controller_epoch(client, CONTROLLER_LIFECYCLE_EPOCH)
 
     def test_delete_tenant_resource_uses_ordinary_kubernetes_delete(self) -> None:
         client = FakeManagementClient(
@@ -487,10 +392,7 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 data["cache"]["imageArchives"][0]["tagged"],
             )
             self.assertEqual("/var/lib/example", data["inputs"]["storageContainerPath"])
-            self.assertTrue(data["mutationEnabled"])
             original_hash = payload["data"]["foundation.sha256"]
-            data["mutationEnabled"] = not data["mutationEnabled"]
-            self.assertEqual(original_hash, _foundation_checksum(data))
             data["controllerImage"] = "controller:replacement"
             self.assertEqual(original_hash, _foundation_checksum(data))
 
@@ -568,70 +470,7 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             self.assertEqual(0, controller_tenant_main(["apply", "fixture.yaml"]))
         e2e.assert_not_called()
 
-    def test_temporary_mutation_updates_foundation_before_manager(self) -> None:
-        foundation = json.dumps(
-            {"schema": 3, "mutationEnabled": False, "controllerImage": "rust:image"},
-            sort_keys=True,
-            separators=(",", ":"),
-        )
-        deployment = {
-            "spec": {
-                "template": {
-                    "spec": {
-                        "containers": [
-                            {
-                                "name": "manager",
-                                "args": [
-                                    "--leader-elect=true",
-                                    "--mutation-enabled=false",
-                                ],
-                            }
-                        ]
-                    }
-                }
-            }
-        }
-        client = FakeManagementClient(
-            [
-                CompletedProcess(
-                    [],
-                    0,
-                    stdout=json.dumps(
-                        {"data": {
-                            "foundation.json": foundation,
-                            "foundation.sha256": _foundation_checksum(json.loads(foundation)),
-                        }}
-                    ),
-                    stderr="",
-                ),
-                CompletedProcess([], 0, stdout=json.dumps(deployment), stderr=""),
-                CompletedProcess([], 0, stdout="", stderr=""),
-                CompletedProcess([], 0, stdout="", stderr=""),
-                CompletedProcess([], 0, stdout="", stderr=""),
-                CompletedProcess([], 0, stdout="", stderr=""),
-            ]
-        )
-        with patch("scripts.lib.controller.verify_running_controller"):
-            set_controller_mutation(
-                {
-                    "CONDITION_TIMEOUT": "1s",
-                    "KUBERNETES_VERSION": "v1.36.4",
-                },
-                client,
-                enabled=True,
-            )
-        arguments = [call[0] for call in client.calls]
-        self.assertIn("configmap/tenant-foundation", arguments[2])
-        self.assertIn("deployment/tenant-controller", arguments[3])
-        deployment_patch = json.loads(
-            client.calls[3][0][client.calls[3][0].index("-p") + 1]
-        )
-        self.assertIn(
-            "--mutation-enabled=true",
-            deployment_patch["spec"]["template"]["spec"]["containers"][0]["args"],
-        )
-
-    def test_gate_cleanup_failure_still_disables_mutation(self) -> None:
+    def test_gate_cleanup_failure_is_attached_to_primary_error(self) -> None:
         client = FakeManagementClient(
             [CompletedProcess([], 1, stdout="", stderr="cleanup blocked")]
         )
@@ -642,9 +481,6 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 side_effect=[{"metadata": {"name": "controller-phase2"}}, {"metadata": {"name": "controller-phase2"}}],
             ),
             patch(
-                "scripts.test_controller_convergence.set_controller_mutation"
-            ) as mutation,
-            patch(
                 "scripts.test_controller_convergence.delete_tenant_resource",
                 return_value=CompletedProcess([], 1, stdout="", stderr="cleanup blocked"),
             ),
@@ -654,16 +490,11 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 client,
                 primary,
             )
-        mutation.assert_called_once_with(
-            {"DELETE_TIMEOUT": "1s"},
-            client,
-            enabled=False,
-        )
         self.assertTrue(
             any("cleanup is incomplete" in note for note in primary.__notes__)
         )
 
-    def test_gate_inspection_failure_still_disables_mutation(self) -> None:
+    def test_gate_inspection_failure_is_attached_to_primary_error(self) -> None:
         client = FakeManagementClient([])
         primary = RuntimeError("primary failure")
         with (
@@ -671,16 +502,12 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 "scripts.test_controller_convergence._tenant",
                 side_effect=RuntimeError("inspection failed"),
             ),
-            patch(
-                "scripts.test_controller_convergence.set_controller_mutation"
-            ) as mutation,
         ):
             _restore_after_gate(
                 {"DELETE_TIMEOUT": "1s"},
                 client,
                 primary,
             )
-        mutation.assert_called_once()
         self.assertTrue(
             any("inspection failed" in note for note in primary.__notes__)
         )

@@ -35,6 +35,7 @@ EXPECTED_RECIPES = {
     "controller-fetch",
     "controller-verify",
     "controller-test",
+    "controller-metrics",
     "controller-lint",
     "controller-build",
     "controller-image",
@@ -172,16 +173,36 @@ def check_repository_boundaries() -> None:
         "controller/API_COMPATIBILITY.md",
         "controller/config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml",
         "controller/config/rbac/role.yaml",
+        "controller/config/management-resources.json",
         "config/tenants/examples/local.yaml",
         "config/tenants/tests/tenant-a.yaml",
         "config/tenants/tests/tenant-b.yaml",
         "config/tenants/tests/tenant-c.yaml",
         "scripts/controller_tenant.py",
-        "scripts/lib/controller_cutover.py",
+        "scripts/controller_metrics.py",
+        "scripts/lib/controller_state.py",
     )
     for relative in required_controller_files:
         check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
+    justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
+    check("controller-metrics:" in justfile, "controller metrics recipe is missing")
+    check(
+        "scripts/controller_metrics.py --max 8050" in justfile,
+        "controller production-line threshold is not enforced",
+    )
     controller = ROOT / "controller"
+    integration_targets = sorted(
+        path.name for path in (controller / "tests").glob("*.rs")
+    )
+    check(
+        integration_targets
+        == ["adapters.rs", "allocation.rs", "controller.rs", "finalization.rs"],
+        f"unexpected controller integration targets: {integration_targets}",
+    )
+    check(
+        (controller / "tests/support/kube.rs").is_file(),
+        "shared controller Kubernetes test support is missing",
+    )
     check(not list(controller.rglob("*.go")), "local controller Go source remains")
     check(not list(controller.rglob("go.mod")) and not list(controller.rglob("go.sum")),
           "local controller Go module remains")
@@ -210,7 +231,7 @@ def check_repository_boundaries() -> None:
         paths = (ROOT / relative).rglob("*.py") if relative == "scripts" else (ROOT / relative,)
         for path in paths:
             text = path.read_text(encoding="utf-8")
-            if path.name == "test_static.py" or path.name == "controller_cutover.py":
+            if path.name == "test_static.py":
                 continue
             check(not re.search(r"GO_VERSION|GO_URL|GO_SHA256|ENVTEST_|controller-gen\b|"
                                 r"GOCACHE|GOMODCACHE|KUBEBUILDER_ASSETS|"
@@ -228,18 +249,35 @@ def check_repository_boundaries() -> None:
                         r"controller-tools|controller-vet|go-mod-cache|"
                         r"go-linux-amd64|GO_VERSION|GOCACHE|GOMODCACHE", workflow),
           "CI still references local Go tooling")
+    jobs = workflow.split("jobs:\n", 1)[1]
+    fast_checks = jobs.split("  fast-checks:", 1)[1].split("  e2e:", 1)[0]
+    e2e = jobs.split("  e2e:", 1)[1].split("  high-capacity:", 1)[0]
     check(
-        "--mutation-enabled=${CONTROLLER_MUTATION_ENABLED}" in manager,
-        "Tenant controller mutation template placeholder is missing",
+        re.search(r"(?m)^    needs: fast-checks$", e2e) is not None,
+        "PR E2E must depend exactly on fast-checks",
     )
-    lifecycle_epoch = "rust-operator-v1"
+    for token in (
+        "actions/upload-artifact@v6",
+        "controller-manager-${{ github.sha }}",
+        "path: capi/.runtime/rendered/controller/manager",
+    ):
+        check(token in fast_checks, f"fast-check artifact wiring is missing {token}")
+    for token in (
+        "actions/download-artifact@v7",
+        "controller-manager-${{ github.sha }}",
+        "CAPI_PREBUILT_CONTROLLER_BINARY",
+        "capi/.tools/artifacts/${{ github.sha }}",
+    ):
+        check(token in e2e, f"PR E2E artifact wiring is missing {token}")
+    high_capacity = workflow.split("  high-capacity:", 1)[1].split(
+        "  capi-tests:", 1
+    )[0]
     check(
-        f'CONTROLLER_LIFECYCLE_EPOCH = "{lifecycle_epoch}"'
-        in (ROOT / "scripts" / "lib" / "controller.py").read_text(
-            encoding="utf-8"
-        ),
-        "controller installer lifecycle epoch is inconsistent",
+        "CAPI_PREBUILT_CONTROLLER_BINARY" not in high_capacity,
+        "high-capacity validation must retain an independent controller build",
     )
+    check("--activation-token=${CONTROLLER_ACTIVATION_TOKEN}" in manager,
+          "Tenant controller activation token placeholder is missing")
     tenant_dispatch = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
     check(
         "from scripts.local_tenant import" not in tenant_dispatch,

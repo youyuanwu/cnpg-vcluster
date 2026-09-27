@@ -4,7 +4,9 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 
 use bollard::models::{ContainerInspectResponse, Volume, VolumeCreateRequest};
-use bollard::query_parameters::{ListContainersOptionsBuilder, RemoveVolumeOptions};
+use bollard::query_parameters::{
+    ListContainersOptionsBuilder, ListVolumesOptionsBuilder, RemoveVolumeOptions,
+};
 use bollard::{API_DEFAULT_VERSION, Docker};
 
 pub const WORKER_CLUSTER_LABEL: &str = "io.x-k8s.kind.cluster";
@@ -84,6 +86,7 @@ pub trait DockerClient: Send + Sync {
     fn list_containers(
         &self,
     ) -> impl Future<Output = Result<Vec<DockerContainer>, DockerError>> + Send;
+    fn list_volumes(&self) -> impl Future<Output = Result<Vec<DockerVolume>, DockerError>> + Send;
 
     fn list_worker_containers(
         &self,
@@ -355,60 +358,24 @@ impl DockerClient for BollardDockerClient {
         }
         Ok(result)
     }
-}
 
-impl crate::effects::DockerEffects for BollardDockerClient {
-    type Error = DockerError;
-
-    async fn inspect_volume(
-        &self,
-        name: &str,
-    ) -> Result<Option<crate::effects::DockerVolume>, Self::Error> {
-        Ok(DockerClient::inspect_volume(self, name)
-            .await?
-            .map(|volume| crate::effects::DockerVolume {
-                name: volume.name,
-                mountpoint: volume.mountpoint,
-                labels: volume.labels,
-            }))
-    }
-
-    async fn remove_volume(&self, name: &str) -> Result<(), Self::Error> {
-        DockerClient::remove_volume(self, name).await
-    }
-
-    async fn list_worker_containers(
-        &self,
-    ) -> Result<Vec<crate::effects::DockerContainer>, Self::Error> {
-        // This legacy narrow seam has no Tenant identity. Never use it as an
-        // ownership proof; the richer DockerClient seam validates names/network.
-        Ok(self
-            .list_containers()
-            .await?
+    async fn list_volumes(&self) -> Result<Vec<DockerVolume>, DockerError> {
+        let listed = self
+            .docker
+            .list_volumes(Some(ListVolumesOptionsBuilder::default().build()))
+            .await
+            .map_err(|error| DockerError::request("list volumes", error))?;
+        listed
+            .volumes
+            .unwrap_or_default()
             .into_iter()
-            .filter(|container| {
-                container.labels.get(WORKER_ROLE_LABEL).map(String::as_str) == Some("worker")
+            .map(|volume| {
+                let name = volume.name.clone();
+                if name.is_empty() {
+                    return Err(DockerError::Identity("listed volume has no name"));
+                }
+                volume_identity(volume, &name)
             })
-            .map(Into::into)
-            .collect())
-    }
-
-    async fn inspect_container(
-        &self,
-        id: &str,
-    ) -> Result<Option<crate::effects::DockerContainer>, Self::Error> {
-        Ok(DockerClient::inspect_container(self, id)
-            .await?
-            .map(Into::into))
-    }
-}
-
-impl From<DockerContainer> for crate::effects::DockerContainer {
-    fn from(container: DockerContainer) -> Self {
-        Self {
-            id: container.id,
-            name: container.name,
-            labels: container.labels,
-        }
+            .collect()
     }
 }

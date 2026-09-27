@@ -10,7 +10,10 @@ use k8s_openapi::{
 use kube::core::DynamicObject;
 use thiserror::Error;
 
-use crate::api::{GROUP, Tenant, VERSION};
+use crate::{
+    api::{GROUP, Tenant, VERSION},
+    management::{MANAGEMENT_RESOURCES, ResourceClass},
+};
 
 pub const TENANT_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/tenant";
 pub const TENANT_UID_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/tenant-uid";
@@ -249,20 +252,20 @@ pub fn validate_provider_owner(
     inventory: &[DynamicObject],
 ) -> Result<(), OwnershipError> {
     let references = owners(object);
-    if matches!(kind(object), "Namespace" | "Cluster") {
+    let definition = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == kind(object));
+    let Some(definition) = definition else {
+        return Ok(());
+    };
+    if definition.parent_kind.is_none() {
         return if references.is_empty() {
             Ok(())
         } else {
             Err(OwnershipError::ProviderOwner(description(object)))
         };
     }
-    let template = matches!(kind(object), "KubeadmConfigTemplate" | "DevMachineTemplate");
-    if !template
-        && !matches!(
-            kind(object),
-            "DevCluster" | "KamajiControlPlane" | "MachineDeployment"
-        )
-    {
+    if definition.class != ResourceClass::Root {
         return Ok(());
     }
     if references.is_empty() {
@@ -275,25 +278,22 @@ pub fn validate_provider_owner(
     let [owner] = references else {
         return Err(OwnershipError::ProviderOwner(description(object)));
     };
-    let cluster = lookup(
-        inventory,
-        Some(tenant_name),
-        CLUSTER_API_VERSION,
-        "Cluster",
-        tenant_name,
-    )?;
-    if cluster.is_some_and(|cluster| reference_matches(owner, cluster)) {
-        return Ok(());
-    }
-    if template {
-        let deployment = lookup(
+    for parent_kind in [definition.parent_kind, definition.alternate_parent_kind]
+        .into_iter()
+        .flatten()
+    {
+        let parent = MANAGEMENT_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == parent_kind)
+            .ok_or(OwnershipError::ApiVersion)?;
+        let observed = lookup(
             inventory,
             Some(tenant_name),
-            CLUSTER_API_VERSION,
-            "MachineDeployment",
-            &format!("{tenant_name}-worker"),
+            parent.api_version,
+            parent.kind,
+            &parent.name(tenant_name),
         )?;
-        if deployment.is_some_and(|deployment| reference_matches(owner, deployment)) {
+        if observed.is_some_and(|observed| reference_matches(owner, observed)) {
             return Ok(());
         }
     }
@@ -313,16 +313,16 @@ pub fn validate_provider_owner_for_deletion(
     let [owner] = references else {
         return Err(OwnershipError::ProviderOwner(description(object)));
     };
-    if matches!(kind(object), "Namespace" | "Cluster") {
+    let definition = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == kind(object));
+    let Some(definition) = definition else {
+        return Ok(());
+    };
+    if definition.parent_kind.is_none() {
         return Err(OwnershipError::ProviderOwner(description(object)));
     }
-    let template = matches!(kind(object), "KubeadmConfigTemplate" | "DevMachineTemplate");
-    if !template
-        && !matches!(
-            kind(object),
-            "DevCluster" | "KamajiControlPlane" | "MachineDeployment"
-        )
-    {
+    if definition.class != ResourceClass::Root {
         return Ok(());
     }
     let tenant_name = tenant.metadata.name.as_deref().unwrap_or("");
@@ -330,7 +330,8 @@ pub fn validate_provider_owner_for_deletion(
         .status
         .as_ref()
         .and_then(|status| status.cluster_uid.as_deref());
-    if owner.api_version == CLUSTER_API_VERSION
+    if definition.parent_kind == Some("Cluster")
+        && owner.api_version == CLUSTER_API_VERSION
         && owner.kind == "Cluster"
         && owner.name == tenant_name
         && !owner.uid.is_empty()
@@ -338,20 +339,26 @@ pub fn validate_provider_owner_for_deletion(
     {
         return Ok(());
     }
-    if template
-        && owner.api_version == CLUSTER_API_VERSION
-        && owner.kind == "MachineDeployment"
-        && owner.name == format!("{tenant_name}-worker")
-    {
-        let deployment = lookup(
+    if let Some(parent_kind) = definition.alternate_parent_kind {
+        let parent = MANAGEMENT_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == parent_kind)
+            .ok_or(OwnershipError::ApiVersion)?;
+        if owner.api_version != parent.api_version
+            || owner.kind != parent.kind
+            || owner.name != parent.name(tenant_name)
+        {
+            return Err(OwnershipError::ProviderOwner(description(object)));
+        }
+        let observed = lookup(
             inventory,
             Some(tenant_name),
-            CLUSTER_API_VERSION,
-            "MachineDeployment",
+            parent.api_version,
+            parent.kind,
             &owner.name,
         )?
-        .ok_or_else(|| OwnershipError::MissingOwner(format!("MachineDeployment/{}", owner.name)))?;
-        if reference_matches(owner, deployment) {
+        .ok_or_else(|| OwnershipError::MissingOwner(format!("{parent_kind}/{}", owner.name)))?;
+        if reference_matches(owner, observed) {
             return Ok(());
         }
     }

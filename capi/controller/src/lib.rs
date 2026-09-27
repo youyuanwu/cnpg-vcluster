@@ -1,10 +1,11 @@
+pub mod activation;
 pub mod allocation;
 pub mod api;
 pub mod docker;
-pub mod effects;
 pub mod error;
 pub mod finalize;
 pub mod foundation;
+pub mod management;
 pub mod ownership;
 pub mod permissions;
 pub mod readiness;

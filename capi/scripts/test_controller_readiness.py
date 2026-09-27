@@ -9,14 +9,14 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
-from scripts.lib.controller import delete_tenant_resource, set_controller_mutation
+from scripts.lib.controller import delete_tenant_resource
 from scripts.lib.controller_scenarios import tenant_snapshot
 from scripts.lib.controller_client import tenant_manifest_document
 from scripts.test_e2e import capture_tenant_deletion_identity, verify_tenant_deletion
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.locking import profile_lock, tools_lock
 from scripts.lib.redaction import redact
-from scripts.test_controller_convergence import _require_clean_cutover
+from scripts.test_controller_convergence import _require_clean_state
 
 
 TENANT_NAME = "controller-phase3"
@@ -71,9 +71,8 @@ def main() -> None:
         profile_lock(ROOT, "local", exclusive=True, create=True),
         tools_lock(ROOT, exclusive=True),
     ):
-        _require_clean_cutover(ROOT, config, client)
+        _require_clean_state(ROOT, config, client)
         try:
-            set_controller_mutation(config, client, enabled=True)
             manifest = tenant_manifest_document(config, TENANT_NAME, databases=2)
             client.kubectl(
                 "apply",
@@ -158,7 +157,6 @@ def main() -> None:
                 )
                 if cleanup.returncode != 0 and primary is not None:
                     primary.add_note("readiness Tenant cleanup is incomplete")
-            set_controller_mutation(config, client, enabled=False)
 
 
 if __name__ == "__main__":

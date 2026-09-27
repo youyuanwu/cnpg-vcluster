@@ -21,7 +21,7 @@ def canonical_hash(payload: str | dict[str, object]) -> str:
     if not isinstance(raw, dict):
         raise ValueError("foundation must be a JSON object")
     immutable = {key: value for key, value in raw.items()
-                 if key not in {"mutationEnabled", "controllerImage"}}
+                 if key != "controllerImage"}
     encoded = json.dumps(immutable, sort_keys=True, separators=(",", ":"),
                          ensure_ascii=False, allow_nan=False)
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
@@ -126,7 +126,6 @@ def resolve_slots(
 def foundation_payload(
     root: Path, config: dict[str, str], network: dict[str, object],
     image: str, verified_cache: VerifiedCache, registry: dict[str, object] | None,
-    *, mutation_enabled: bool = True,
 ) -> dict[str, object]:
     from scripts.lib.management import require_management_ownership
 
@@ -175,7 +174,6 @@ def foundation_payload(
         "allowedSubnets": sorted({"127.0.0.0/8", str(network["subnet"]), *reserved}),
         "kubernetesVersion": config["KUBERNETES_VERSION"],
         "controllerImage": image,
-        "mutationEnabled": mutation_enabled,
         "offlineEnforced": offline,
         "slots": slots,
         "cache": {

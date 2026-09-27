@@ -1,21 +1,24 @@
 use std::net::SocketAddr;
+use std::sync::Arc;
 
-use k8s_openapi::api::core::v1::Namespace;
+use k8s_openapi::api::core::v1::{ConfigMap, Namespace};
 use kube::Api;
+use tenant_controller::activation;
 use tenant_controller::api::SUPPORTED_KUBERNETES_VERSION;
 use tenant_controller::docker::BollardDockerClient;
 use tenant_controller::error::ControllerError;
+use tenant_controller::foundation;
 use tenant_controller::reconcile::{Assets, Config as ReconcileConfig, Reconciler, run_controller};
 use tenant_controller::runtime::{
     DEFAULT_LEADER_ELECTION_ID, DEFAULT_LEADER_ELECTION_NAMESPACE, DEFAULT_LEASE_DURATION_SECONDS,
-    DEFAULT_LEASE_GRACE_SECONDS, DirectKubeClient, HealthState, LeaderConfig, LeadershipContext,
-    LeadershipGate, bind_health, run_leader_elected, serve_health, shutdown_signal,
-    wait_for_shutdown,
+    DEFAULT_LEASE_GRACE_SECONDS, HealthState, LeaderConfig, LeadershipContext, LeadershipGate,
+    bind_health, run_leader_elected, serve_health, shutdown_signal, wait_for_shutdown,
 };
 use tokio::sync::watch;
 
 const DEFAULT_HEALTH_ADDRESS: &str = "0.0.0.0:8081";
-const DEFAULT_LIFECYCLE_EPOCH: &str = "rust-operator-v1";
+const FOUNDATION_NAMESPACE: &str = "tenant-system";
+const FOUNDATION_NAME: &str = "tenant-foundation";
 
 struct AbortControllerOnDrop(tokio::task::AbortHandle);
 
@@ -31,10 +34,9 @@ struct ManagerConfig {
     leader_elect: bool,
     health_address: SocketAddr,
     leader: LeaderConfig,
-    mutation_enabled: bool,
     supported_kubernetes_version: String,
     controller_image: String,
-    lifecycle_epoch: String,
+    activation_token: String,
 }
 
 impl Default for ManagerConfig {
@@ -57,10 +59,9 @@ impl Default for ManagerConfig {
                 duration_seconds: DEFAULT_LEASE_DURATION_SECONDS,
                 grace_seconds: DEFAULT_LEASE_GRACE_SECONDS,
             },
-            mutation_enabled: false,
             supported_kubernetes_version: SUPPORTED_KUBERNETES_VERSION.into(),
             controller_image: String::new(),
-            lifecycle_epoch: DEFAULT_LIFECYCLE_EPOCH.into(),
+            activation_token: String::new(),
         }
     }
 }
@@ -97,23 +98,47 @@ async fn probe_in_cluster() -> Result<(), ControllerError> {
 async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
     config.leader.validate()?;
     let client = kube::Client::try_default().await?;
-    let direct = DirectKubeClient::new(client.clone());
-    direct
-        .namespace("default")
+    Api::<Namespace>::all(client.clone())
+        .get_opt("default")
         .await?
         .ok_or_else(|| ControllerError::DependencyPending("default Namespace".into()))?;
     let docker = BollardDockerClient::connect("/var/run/docker.sock")
         .map_err(|error| ControllerError::Configuration(error.to_string()))?;
+    let foundation_config = Api::<ConfigMap>::namespaced(client.clone(), FOUNDATION_NAMESPACE)
+        .get(FOUNDATION_NAME)
+        .await?;
+    let data = foundation_config.data.as_ref().ok_or_else(|| {
+        ControllerError::Configuration("foundation ConfigMap data is missing".into())
+    })?;
+    let foundation = Arc::new(
+        foundation::parse_runtime(
+            data.get("foundation.json")
+                .map(String::as_str)
+                .unwrap_or(""),
+            data.get("foundation.sha256")
+                .map(String::as_str)
+                .unwrap_or(""),
+            &config.supported_kubernetes_version,
+            &config.controller_image,
+        )
+        .map_err(|error| ControllerError::Configuration(error.to_string()))?,
+    );
+    activation::admit(
+        client.clone(),
+        &docker,
+        &foundation.hash,
+        &config.activation_token,
+        foundation.creation(None).is_ok(),
+    )
+    .await?;
     let reconciler = Reconciler::new(
         client.clone(),
         docker,
         ReconcileConfig {
-            mutation_enabled: config.mutation_enabled,
             supported_version: config.supported_kubernetes_version.clone(),
-            controller_image: config.controller_image.clone(),
-            ..Default::default()
         },
         Assets::load(std::path::Path::new("/assets"))?,
+        foundation,
     );
 
     let health = HealthState::default();
@@ -228,12 +253,11 @@ where
             "--leader-renew-grace-seconds" => {
                 config.leader.grace_seconds = parse_u64(flag, value)?;
             }
-            "--mutation-enabled" => config.mutation_enabled = parse_bool(flag, value)?,
             "--supported-kubernetes-version" => {
                 config.supported_kubernetes_version = value.into();
             }
             "--controller-image" => config.controller_image = value.into(),
-            "--lifecycle-epoch" => config.lifecycle_epoch = value.into(),
+            "--activation-token" => config.activation_token = value.into(),
             "--metrics-bind-address" => {}
             _ => {
                 return Err(ControllerError::Configuration(format!(
@@ -273,7 +297,7 @@ mod tests {
     fn defaults_are_safe_and_non_reconciling() {
         let config = parse_args(Vec::<String>::new()).unwrap();
         assert!(config.leader_elect);
-        assert!(!config.mutation_enabled);
+        assert!(config.activation_token.is_empty());
         assert_eq!(
             config.health_address,
             DEFAULT_HEALTH_ADDRESS.parse().unwrap()
@@ -298,10 +322,9 @@ mod tests {
             "--leader-election-identity=pod-a",
             "--leader-lease-duration-seconds=20",
             "--leader-renew-grace-seconds=4",
-            "--mutation-enabled=true",
             "--supported-kubernetes-version=1.36.5",
             "--controller-image=controller:test",
-            "--lifecycle-epoch=epoch-a",
+            "--activation-token=token-a",
             "--metrics-bind-address=0",
         ])
         .unwrap();
@@ -313,8 +336,8 @@ mod tests {
         assert_eq!(config.leader.identity, "pod-a");
         assert_eq!(config.leader.duration_seconds, 20);
         assert_eq!(config.leader.grace_seconds, 4);
-        assert!(config.mutation_enabled);
         assert_eq!(config.controller_image, "controller:test");
+        assert_eq!(config.activation_token, "token-a");
     }
 
     #[test]

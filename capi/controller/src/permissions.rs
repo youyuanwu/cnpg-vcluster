@@ -1,113 +1,77 @@
 use k8s_openapi::api::rbac::v1::{ClusterRole, PolicyRule};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
+use crate::management::{MANAGEMENT_RESOURCES, ResourceClass};
+
 pub const ROLE_NAME: &str = "tenant-controller-role";
 
-struct Permission {
-    group: &'static str,
-    resources: &'static [&'static str],
-    verbs: &'static [&'static str],
-}
-
-const PERMISSIONS: &[Permission] = &[
-    Permission {
-        group: "",
-        resources: &["configmaps"],
-        verbs: &[
+const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
+    (
+        "",
+        &["configmaps"],
+        &[
             "create", "delete", "get", "list", "patch", "update", "watch",
         ],
-    },
-    Permission {
-        group: "",
-        resources: &["events"],
-        verbs: &["create", "patch", "update"],
-    },
-    Permission {
-        group: "",
-        resources: &["namespaces"],
-        verbs: &["create", "delete", "get", "list", "watch"],
-    },
-    Permission {
-        group: "",
-        resources: &["secrets"],
-        verbs: &["delete", "get", "list", "watch"],
-    },
-    Permission {
-        group: "bootstrap.cluster.x-k8s.io",
-        resources: &["kubeadmconfigs"],
-        verbs: &["get", "list"],
-    },
-    Permission {
-        group: "bootstrap.cluster.x-k8s.io",
-        resources: &["kubeadmconfigtemplates"],
-        verbs: &["create", "delete", "get", "list", "patch", "watch"],
-    },
-    Permission {
-        group: "cluster.x-k8s.io",
-        resources: &["clusters", "machinedeployments"],
-        verbs: &["create", "delete", "get", "list", "patch", "watch"],
-    },
-    Permission {
-        group: "cluster.x-k8s.io",
-        resources: &["machines", "machinesets"],
-        verbs: &["create", "delete", "get", "list", "watch"],
-    },
-    Permission {
-        group: "controlplane.cluster.x-k8s.io",
-        resources: &["kamajicontrolplanes"],
-        verbs: &["create", "delete", "get", "list", "patch", "watch"],
-    },
-    Permission {
-        group: "coordination.k8s.io",
-        resources: &["leases"],
-        verbs: &[
-            "create", "delete", "get", "list", "patch", "update", "watch",
-        ],
-    },
-    Permission {
-        group: "infrastructure.cluster.x-k8s.io",
-        resources: &["devclusters", "devmachinetemplates"],
-        verbs: &["create", "delete", "get", "list", "patch", "watch"],
-    },
-    Permission {
-        group: "infrastructure.cluster.x-k8s.io",
-        resources: &["devmachines"],
-        verbs: &["create", "delete", "get", "list", "watch"],
-    },
-    Permission {
-        group: "tenancy.cnpg-vcluster.io",
-        resources: &["tenants"],
-        verbs: &["get", "list", "patch", "update", "watch"],
-    },
-    Permission {
-        group: "tenancy.cnpg-vcluster.io",
-        resources: &["tenants/finalizers"],
-        verbs: &["update"],
-    },
-    Permission {
-        group: "tenancy.cnpg-vcluster.io",
-        resources: &["tenants/status"],
-        verbs: &["get", "patch", "update"],
-    },
+    ),
+    ("", &["events"], &["create", "patch", "update"]),
+    (
+        "tenancy.cnpg-vcluster.io",
+        &["tenants"],
+        &["get", "list", "patch", "update", "watch"],
+    ),
+    (
+        "tenancy.cnpg-vcluster.io",
+        &["tenants/finalizers"],
+        &["update"],
+    ),
+    (
+        "tenancy.cnpg-vcluster.io",
+        &["tenants/status"],
+        &["get", "patch", "update"],
+    ),
 ];
 
+fn rule(group: &str, resources: &[&str], verbs: &[&str]) -> PolicyRule {
+    PolicyRule {
+        api_groups: Some(vec![group.into()]),
+        resources: Some(resources.iter().map(|value| (*value).into()).collect()),
+        verbs: verbs.iter().map(|value| (*value).into()).collect(),
+        ..Default::default()
+    }
+}
+
+fn management_rule(resource: &crate::management::ManagementResource) -> PolicyRule {
+    let group = resource
+        .api_version
+        .split_once('/')
+        .map_or("", |(group, _)| group);
+    let verbs: &[&str] = match resource.kind {
+        "Namespace" => &["create", "delete", "get", "list", "watch"],
+        "Secret" => &["delete", "get", "list", "watch"],
+        "Lease" => &[
+            "create", "delete", "get", "list", "patch", "update", "watch",
+        ],
+        "KubeadmConfig" | "TenantControlPlane" => &["get", "list"],
+        _ if resource.class == ResourceClass::Root => {
+            &["create", "delete", "get", "list", "patch", "watch"]
+        }
+        _ => &["create", "delete", "get", "list", "watch"],
+    };
+    rule(group, &[resource.plural], verbs)
+}
+
 pub fn controller_role() -> ClusterRole {
+    let rules = BASE_PERMISSIONS
+        .iter()
+        .map(|(group, resources, verbs)| rule(group, resources, verbs))
+        .chain(MANAGEMENT_RESOURCES.iter().map(management_rule))
+        .collect();
     ClusterRole {
         metadata: ObjectMeta {
             name: Some(ROLE_NAME.into()),
             ..Default::default()
         },
-        rules: Some(
-            PERMISSIONS
-                .iter()
-                .map(|permission| PolicyRule {
-                    api_groups: Some(vec![permission.group.into()]),
-                    resources: Some(permission.resources.iter().map(|s| (*s).into()).collect()),
-                    verbs: permission.verbs.iter().map(|s| (*s).into()).collect(),
-                    ..Default::default()
-                })
-                .collect(),
-        ),
+        rules: Some(rules),
         ..Default::default()
     }
 }
@@ -117,37 +81,64 @@ mod tests {
     use super::*;
 
     #[test]
-    fn role_grants_exact_controller_permissions_without_wildcards() {
+    fn role_grants_catalogued_resources_without_wildcards() {
         let role = controller_role();
         assert_eq!(role.metadata.name.as_deref(), Some(ROLE_NAME));
         let rules = role.rules.unwrap();
-        assert_eq!(rules.len(), 15);
-        assert!(rules.iter().all(|r| !r.verbs.contains(&"*".to_string())));
-        let lease = rules
-            .iter()
-            .find(|r| r.resources.as_ref().unwrap() == &["leases"])
-            .unwrap();
-        assert_eq!(lease.api_groups.as_ref().unwrap(), &["coordination.k8s.io"]);
         assert_eq!(
-            lease.verbs,
-            [
-                "create", "delete", "get", "list", "patch", "update", "watch"
-            ]
+            rules.len(),
+            BASE_PERMISSIONS.len() + MANAGEMENT_RESOURCES.len()
         );
-        let status = rules
-            .iter()
-            .find(|r| r.resources.as_ref().unwrap() == &["tenants/status"])
-            .unwrap();
-        assert_eq!(status.verbs, ["get", "patch", "update"]);
-        let tenants = rules
-            .iter()
-            .find(|r| r.resources.as_ref().unwrap() == &["tenants"])
-            .unwrap();
-        assert_eq!(tenants.verbs, ["get", "list", "patch", "update", "watch"]);
-        let finalizers = rules
-            .iter()
-            .find(|r| r.resources.as_ref().unwrap() == &["tenants/finalizers"])
-            .unwrap();
-        assert_eq!(finalizers.verbs, ["update"]);
+        assert!(
+            rules
+                .iter()
+                .all(|rule| !rule.verbs.contains(&"*".to_string()))
+        );
+        for resource in MANAGEMENT_RESOURCES {
+            let rule = rules
+                .iter()
+                .find(|rule| {
+                    rule.resources
+                        .as_ref()
+                        .is_some_and(|values| values == &vec![resource.plural.to_string()])
+                })
+                .unwrap();
+            assert!(rule.verbs.contains(&"get".into()));
+            assert!(rule.verbs.contains(&"list".into()));
+        }
+        for (kind, expected) in [
+            (
+                "Cluster",
+                &["create", "delete", "get", "list", "patch", "watch"][..],
+            ),
+            ("Machine", &["create", "delete", "get", "list", "watch"][..]),
+            ("KubeadmConfig", &["get", "list"][..]),
+            (
+                "Namespace",
+                &["create", "delete", "get", "list", "watch"][..],
+            ),
+            ("Secret", &["delete", "get", "list", "watch"][..]),
+            (
+                "Lease",
+                &[
+                    "create", "delete", "get", "list", "patch", "update", "watch",
+                ][..],
+            ),
+            ("TenantControlPlane", &["get", "list"][..]),
+        ] {
+            let resource = MANAGEMENT_RESOURCES
+                .iter()
+                .find(|resource| resource.kind == kind)
+                .unwrap();
+            let rule = rules
+                .iter()
+                .find(|rule| {
+                    rule.resources
+                        .as_ref()
+                        .is_some_and(|values| values == &vec![resource.plural.to_string()])
+                })
+                .unwrap();
+            assert_eq!(rule.verbs, expected);
+        }
     }
 }

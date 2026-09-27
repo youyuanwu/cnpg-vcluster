@@ -64,18 +64,40 @@ jobs:
           path: capi/.tools/cargo-home
           key: controller-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('capi/controller/Cargo.lock') }}
 
+      - name: Cache controller build outputs
+        uses: actions/cache@v4
+        with:
+          path: capi/.tools/cargo-target
+          key: controller-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('capi/controller/Cargo.lock') }}
+
       - name: Fetch locked controller dependencies
         run: just controller-fetch
 
-      - name: Verify and test Tenant controller
+      - name: Verify generated controller artifacts
+        run: just controller-verify
+
+      - name: Lint Tenant controller
+        run: just controller-lint
+
+      - name: Test Tenant controller
         run: |
-          just controller-verify
-          just controller-lint
           just controller-test
-          just controller-build
+          just controller-metrics
+
+      - name: Build static Tenant controller
+        run: just controller-build
+
+      - name: Upload static Tenant controller
+        uses: actions/upload-artifact@v6
+        with:
+          name: controller-manager-${{ github.sha }}
+          path: capi/.runtime/rendered/controller/manager
+          if-no-files-found: error
+          retention-days: 1
 
   e2e:
     name: CAPI end-to-end
+    needs: fast-checks
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 90
@@ -84,6 +106,7 @@ jobs:
       MIN_DOCKER_MEMORY_GIB: "6"
       MIN_DOCKER_STORAGE_GIB: "10"
       PYTHONUNBUFFERED: "1"
+      CAPI_PREBUILT_CONTROLLER_BINARY: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/manager
     defaults:
       run:
         working-directory: capi
@@ -119,6 +142,12 @@ jobs:
         with:
           path: capi/.tools/cargo-home
           key: controller-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('capi/controller/Cargo.lock') }}
+
+      - name: Download static Tenant controller
+        uses: actions/download-artifact@v7
+        with:
+          name: controller-manager-${{ github.sha }}
+          path: capi/.tools/artifacts/${{ github.sha }}
 
       - name: Show Docker capacity
         run: docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}} DockerRoot={{.DockerRootDir}}'

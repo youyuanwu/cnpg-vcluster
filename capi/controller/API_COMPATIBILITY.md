@@ -4,10 +4,10 @@
 Tenant version. It is experimental; incompatible changes require an explicit
 version transition with updated CRD, examples, tests and documentation.
 There is no conversion or migration of `v1alpha1` Go-managed objects. The
-`rust-operator-v1` lifecycle epoch requires old controller Pods and all
-Tenant/provider/host state to be absent before the old CRD/webhook stack is
-removed and v1alpha2 installed mutation-disabled. The installer verifies
-both `spec.versions` and `status.storedVersions` before enabling creation.
+current installer requires unsupported legacy state to be removed manually.
+It verifies both `spec.versions` and `status.storedVersions`, then starts the
+manager with one immutable foundation snapshot and accepted configuration
+identity.
 
 A Tenant is cluster-scoped. Its immutable spec has exactly
 `kubernetesVersion`, `workers`, and `databases`. OpenAPI requires all three
@@ -50,7 +50,8 @@ identity-bound repair. Foundation and root Cluster bindings precede external
 mutation and root replacement is refused after its UID is recorded.
 
 Deletion is ordinary Kubernetes DELETE guarded by
-`tenancy.cnpg-vcluster.io/finalizer`, even when creation mutation is disabled.
+`tenancy.cnpg-vcluster.io/finalizer`, even when creation-only foundation
+validation is blocked.
 No tenant API access or tenant-resource cleanup checkpoint is needed: the
 dedicated cluster's contents are disposable. The finalizer verifies
 management/host/provider/Lease ownership from live reads; deletes the exact

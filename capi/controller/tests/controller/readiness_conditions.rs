@@ -1,8 +1,6 @@
 //! Go parity: readiness_test.go, tenantresources_test.go, status_test.go,
 //! reconcile_cnpg_test.go. No Pod/PVC readiness inventory is required.
-mod creation_support;
-
-use creation_support::*;
+use crate::creation_support::*;
 use serde_json::json;
 use tenant_controller::{
     api::{TenantPhase, TenantStatus},

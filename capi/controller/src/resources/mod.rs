@@ -28,6 +28,7 @@ use thiserror::Error;
 
 use crate::{
     api::{CanonicalSpec, Tenant},
+    management::MANAGEMENT_RESOURCES,
     ownership::Identity,
 };
 
@@ -97,6 +98,21 @@ impl Context<'_> {
                 json!({"spec":spec})
             },
         }
+    }
+
+    fn management_object(&self, kind: &str, spec: Value) -> DynamicObject {
+        let resource = MANAGEMENT_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == kind)
+            .expect("management resource kind is catalogued");
+        self.object(
+            resource.api_version,
+            resource.kind,
+            &resource.name(self.name()),
+            self.name(),
+            resource.role,
+            spec,
+        )
     }
 }
 

@@ -10,8 +10,8 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
-from scripts.lib.controller import delete_tenant_resource, set_controller_mutation
-from scripts.lib.controller_cutover import require_clean_controller_cutover
+from scripts.lib.controller import delete_tenant_resource
+from scripts.lib.controller_state import require_clean_controller_state
 from scripts.lib.controller_client import tenant_manifest_document
 from scripts.lib.controller_scenarios import verify_allocation_lease, verify_allocation_released
 from scripts.lib.kube import ManagementClient, wait_for
@@ -24,12 +24,12 @@ from scripts.test_controller_allocation import run_allocation_gate
 TENANT_NAME = "controller-phase2"
 
 
-def _require_clean_cutover(
+def _require_clean_state(
     root: Path,
     config: dict[str, str],
     client: ManagementClient,
 ) -> None:
-    require_clean_controller_cutover(root, config, client)
+    require_clean_controller_state(root, client)
 
 
 def _tenant_manifest(config: dict[str, str]) -> dict[str, object]:
@@ -141,15 +141,6 @@ def _restore_after_gate(
                 )
     except RuntimeError as exc:
         cleanup_error = f"convergence cleanup inspection failed: {exc}"
-    try:
-        set_controller_mutation(config, client, enabled=False)
-    except RuntimeError as disable_error:
-        if active_error is not None:
-            active_error.add_note(
-                f"failed to restore validation-only mode: {disable_error}"
-            )
-        else:
-            raise
     if cleanup_error is not None:
         if active_error is not None:
             active_error.add_note(cleanup_error)
@@ -164,9 +155,8 @@ def main() -> None:
         profile_lock(ROOT, "local", exclusive=True, create=True),
         tools_lock(ROOT, exclusive=True),
     ):
-        _require_clean_cutover(ROOT, config, client)
+        _require_clean_state(ROOT, config, client)
         try:
-            set_controller_mutation(config, client, enabled=True)
             run_allocation_gate(ROOT, config, client)
             manifest = _tenant_manifest(config)
             client.kubectl(

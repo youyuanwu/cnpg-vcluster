@@ -1,8 +1,6 @@
 //! Go parity: postcni_test.go. Also rejects unlabeled/extra inventory before
 //! count-based pending and verifies that the complete pass lists Nodes once.
-mod creation_support;
-
-use creation_support::*;
+use crate::creation_support::*;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{ResourceExt, core::DynamicObject};
 use serde_json::json;
@@ -270,10 +268,13 @@ async fn provider_name_uid_owner_version_and_node_names_must_match_exactly() {
         "owner-version",
         "owner-kind",
         "node-name",
+        "node-uid",
+        "node-namespace",
+        "node-type",
         "machine-markers",
     ] {
         let fixture = Fixture::new();
-        if mutation == "node-name" {
+        if mutation.starts_with("node-") {
             fixture
                 .tenant
                 .0
@@ -282,8 +283,19 @@ async fn provider_name_uid_owner_version_and_node_names_must_match_exactly() {
                 .objects
                 .remove(&path(&fixture.node));
             let mut node = fixture.node.clone();
-            node.metadata.name = Some("wrong".into());
-            fixture.tenant.insert(&path(&node), node);
+            match mutation {
+                "node-name" => node.metadata.name = Some("wrong".into()),
+                "node-uid" => node.metadata.uid = None,
+                "node-namespace" => node.metadata.namespace = Some("foreign".into()),
+                "node-type" => node.types.as_mut().unwrap().api_version = "v2".into(),
+                _ => unreachable!(),
+            }
+            let node_path = if matches!(mutation, "node-namespace" | "node-type") {
+                "/api/v1/nodes/worker-a".into()
+            } else {
+                path(&node)
+            };
+            fixture.tenant.insert(&node_path, node);
         } else if mutation == "machine-markers" {
             let mut machine = fixture.machine.clone();
             machine.metadata.annotations = None;
@@ -308,13 +320,12 @@ async fn provider_name_uid_owner_version_and_node_names_must_match_exactly() {
                 .remove(&path(&fixture.dev));
             fixture.management.insert(&path(&dev), dev);
         }
+        let result = fixture.observe(2, &[]).await;
         assert!(
-            fixture
-                .observe(2, &[])
-                .await
-                .unwrap_err()
-                .ownership_invalid(),
-            "{mutation}"
+            result
+                .as_ref()
+                .is_err_and(|error| error.ownership_invalid()),
+            "{mutation}: {result:?}"
         );
     }
 }

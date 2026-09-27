@@ -598,14 +598,14 @@ pub async fn release(
             let live = api.get_opt(&intent.name).await?;
             let Some(live) = live else {
                 return if all_old_residue_absent {
-                    Ok(ReleaseDecision::Complete)
+                    Ok(ReleaseDecision::Pending)
                 } else {
                     Err(AllocationError::Missing)
                 };
             };
             let fresh = decide_release(context, &[live], bound, all_old_residue_absent)?;
             let ReleaseDecision::Delete(fresh) = fresh else {
-                return Ok(fresh);
+                return Ok(ReleaseDecision::Pending);
             };
             if fresh.uid != intent.uid {
                 return Err(AllocationError::Claim(intent.name));
@@ -615,6 +615,7 @@ pub async fn release(
                     uid: Some(fresh.uid),
                     resource_version: Some(fresh.resource_version),
                 }),
+                propagation_policy: Some(kube::api::PropagationPolicy::Background),
                 ..DeleteParams::default()
             };
             api.delete(&fresh.name, &params).await?;

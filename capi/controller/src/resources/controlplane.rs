@@ -3,7 +3,6 @@ use kube::core::DynamicObject;
 use serde_json::json;
 
 use super::{BuildError, Context, dns_service_ip, endpoint, split_image};
-use crate::ownership::{CLUSTER_API_VERSION, CONTROL_PLANE_API_VERSION};
 
 pub fn namespace(context: &Context<'_>) -> Namespace {
     Namespace {
@@ -14,7 +13,7 @@ pub fn namespace(context: &Context<'_>) -> Namespace {
 
 pub fn cluster(context: &Context<'_>) -> Result<DynamicObject, BuildError> {
     let (host, port) = endpoint(context.endpoint)?;
-    let mut object = context.object(CLUSTER_API_VERSION, "Cluster", context.name(), context.name(), "cluster", json!({
+    let mut object = context.management_object("Cluster", json!({
         "controlPlaneEndpoint":{"host":host,"port":port},
         "clusterNetwork":{
             "apiServerPort":port,
@@ -35,12 +34,8 @@ pub fn cluster(context: &Context<'_>) -> Result<DynamicObject, BuildError> {
 
 pub fn dev_cluster(context: &Context<'_>) -> Result<DynamicObject, BuildError> {
     let (host, port) = endpoint(context.endpoint)?;
-    Ok(context.object(
-        "infrastructure.cluster.x-k8s.io/v1beta2",
+    Ok(context.management_object(
         "DevCluster",
-        context.name(),
-        context.name(),
-        "dev-cluster",
         json!({
             "controlPlaneEndpoint":{"host":host,"port":port},
             "backend":{"docker":{"loadBalancer":{}}}
@@ -53,7 +48,7 @@ pub fn kamaji_control_plane(context: &Context<'_>) -> Result<DynamicObject, Buil
     let dns = dns_service_ip(context.service_cidr)?;
     let (server, server_version) = split_image(&context.inputs.konnectivity_server_image)?;
     let (agent, agent_version) = split_image(&context.inputs.konnectivity_agent_image)?;
-    Ok(context.object(CONTROL_PLANE_API_VERSION, "KamajiControlPlane", context.name(), context.name(), "kamaji-control-plane", json!({
+    Ok(context.management_object("KamajiControlPlane", json!({
         "version":format!("v{}",context.spec.kubernetes_version),"replicas":1,"dataStoreName":"default",
         "network":{
             "serviceType":"LoadBalancer","serviceAddress":host,

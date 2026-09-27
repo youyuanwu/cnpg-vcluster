@@ -98,7 +98,7 @@ management teardown restores a clean host:
 just test-e2e
 ```
 
-## Tenant specifications and clean cutover
+## Tenant specifications and runtime configuration
 
 The local cluster-scoped `tenancy.cnpg-vcluster.io/v1alpha2` API requires a
 name and an immutable three-field spec: `kubernetesVersion`, `workers`, and
@@ -113,13 +113,13 @@ continues to use schema `1` JSON specifications. Safe examples are in
 [`config/tenants/examples/`](config/tenants/examples/).
 
 The lifecycle does not infer a singleton tenant from environment variables.
-The former Go-managed `v1alpha1` objects and their provider/host state must
-be removed before installing v1alpha2. The installer stops old manager Pods,
-proves clean state, removes the old CRD/webhook stack, checks v1alpha2 served
-and stored versions, and verifies the new manager mutation-disabled before
-enabling creation. There is no migration or in-place upgrade. Removed fixed
-tenant commands, old Azure foundation inventories, and legacy local runtime
-layouts are not migrated or adopted. Local retries reapply the
+The current installer supports only v1alpha2 and does not migrate or delete
+legacy controller state. The manager loads one foundation snapshot at startup.
+Same-identity restarts resume active Tenants; changed configuration requires
+an empty Tenant/provider/host inventory and a candidate-bound activation
+ticket. Failed pre-activation replacement restores the prior controller.
+Removed fixed tenant commands, old Azure foundation inventories, and legacy
+local runtime layouts are not migrated or adopted. Local retries reapply the
 same immutable Tenant manifest; Azure retries use the same JSON specification
 and recorded foundation identity.
 
@@ -284,8 +284,8 @@ Reconciliation and deletion are fail-closed:
 - tenant-internal resources and bootstrap RBAC are disposable with the
   dedicated tenant cluster; finalization does not contact the tenant API or
   require a cleanup checkpoint. Management/host ownership remains fail-closed.
-  The `rust-operator-v1` epoch requires a clean cutover from the Go controller;
-  existing Tenants are not migrated.
+  Unsupported legacy controller state blocks installation and is never
+  migrated or deleted automatically.
 
 The controller does not persist a creation program counter or child-resource
 UID ledger. Missing children are discovered from live state. Static bootstrap
@@ -297,14 +297,14 @@ roots and the CNPG `Cluster` retain targeted repair.
 Expected progress uses a fixed poll interval rather than rate-limited requeue
 backoff.
 
-Each normal reconciliation reads the foundation ConfigMap directly and checks
-its immutable checksum, lifecycle hash, controller image, mutation gate, and
-the network, path, image-archive, and offline-registry values consumed by
-reconciliation. Installer-owned tool versions and cache-state digests are not
-controller compatibility checks. Normal reconciliation does not probe Docker
-foundation health; deletion retains uncached live host ownership checks before
-destructive operations. The resolved slot catalog is part of schema 3; its
-immutable hash excludes only mutation mode and controller image. Leader
+The manager reads and validates the foundation ConfigMap once at startup.
+Reconciliation uses that immutable snapshot and each Tenant's recorded
+foundation hash. Creation-only slot, image-archive, cache, and registry errors
+do not prevent deletion through the validated identity/storage core.
+Installer-owned tool versions and cache-state digests are not controller
+compatibility checks. Deletion retains uncached live host ownership checks
+before destructive operations. The resolved slot catalog is part of schema 3;
+its immutable hash excludes only controller image identity. Leader
 election uses a separate renewable Lease, not an allocation slot.
 
 ## Status, conditions, and exits
