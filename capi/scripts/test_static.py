@@ -6,6 +6,7 @@ import json
 import re
 import subprocess
 import sys
+import tomllib
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -186,9 +187,48 @@ def check_repository_boundaries() -> None:
     check(not (repository / "Makefile").exists(), "obsolete root Makefile remains")
     check(not (repository / "vcluster").exists(), "obsolete vcluster lab remains")
     check(not (repository / "kamaji").exists(), "obsolete standalone Kamaji lab remains")
+    check((repository / "Cargo.toml").is_file(), "root Cargo workspace is missing")
+    check((repository / "Cargo.lock").is_file(), "root Cargo lockfile is missing")
+    check(
+        (repository / "rust-toolchain.toml").is_file(),
+        "root Rust toolchain file is missing",
+    )
+    toolchain = tomllib.loads(
+        (repository / "rust-toolchain.toml").read_text(encoding="utf-8")
+    ).get("toolchain", {})
+    check(
+        toolchain.get("channel") == "1.98.1"
+        and toolchain.get("profile") == "minimal"
+        and set(toolchain.get("components", [])) == {"clippy", "rustfmt"},
+        "root Rust toolchain must select minimal Rust 1.98.1 with clippy and rustfmt",
+    )
+    workspace_manifest = tomllib.loads(
+        (repository / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    controller_manifest = tomllib.loads(
+        (ROOT / "controller" / "Cargo.toml").read_text(encoding="utf-8")
+    )
+    check(
+        "capi/controller" in workspace_manifest.get("workspace", {}).get("members", []),
+        "controller is not a root Cargo workspace member",
+    )
+    workspace_dependencies = workspace_manifest.get("workspace", {}).get(
+        "dependencies", {}
+    )
+    for section in ("dependencies", "dev-dependencies"):
+        for name, declaration in controller_manifest.get(section, {}).items():
+            check(
+                declaration == {"workspace": True}
+                and name in workspace_dependencies,
+                f"controller {section} dependency is not workspace-owned: {name}",
+            )
+    check(
+        "profile" not in controller_manifest
+        and "release" in workspace_manifest.get("profile", {}),
+        "release profile must be owned by the root Cargo workspace",
+    )
     required_controller_files = (
         "controller/Cargo.toml",
-        "controller/Cargo.lock",
         "controller/src/bin/manager.rs",
         "controller/Dockerfile",
         "controller/API_COMPATIBILITY.md",

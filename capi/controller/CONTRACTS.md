@@ -8,11 +8,17 @@ against generation without rewriting them. The v1alpha1 CRD, Go manager and
 admission webhook are not installation inputs; unsupported legacy state blocks
 the current installer and is not migrated or deleted. See
 [`API_COMPATIBILITY.md`](API_COMPATIBILITY.md) for the public contract.
+The repository-root Cargo workspace owns the shared dependency versions,
+release profile, and lockfile; this crate inherits its dependencies from that
+workspace.
 
-Use the system-installed Rust/Cargo >= 1.89; the Python wrappers keep Cargo
-home, target and temporary build files under private `../.tools/`, disable
-rustup auto-install, and never acquire a compiler. From `capi/`, fetch the
-locked dependency graph online before offline checks:
+The root `rust-toolchain.toml` selects Rust/Cargo 1.98.1 with the
+minimal profile, Clippy, and rustfmt; the crate retains an MSRV of 1.89. The
+Python wrappers leave Cargo home, target, temporary, compiler, flag, wrapper,
+profile, and configuration selection to Cargo's defaults. CI consumes the
+same toolchain file through `actions-rust-lang/setup-rust-toolchain`, including
+its integrated `Swatinem/rust-cache`. From `capi/`, fetch the locked dependency
+graph online before offline checks:
 
 ```sh
 just controller-fetch
@@ -23,9 +29,7 @@ just controller-metrics
 just controller-build
 ```
 
-For direct Cargo usage from `capi/controller/`, set `CARGO_HOME` to
-`../.tools/cargo-home` and `CARGO_TARGET_DIR` to
-`../.tools/cargo-target`, then run `cargo fetch --locked` and
+For direct Cargo usage from `capi/controller/`, run `cargo fetch --locked` and
 `cargo run --locked --offline --bin generate -- --check`. Check mode
 compares the authoritative CRD/RBAC paths without writing. `cargo fmt
 --all --check`, `cargo clippy --locked --offline --all-targets
@@ -33,11 +37,12 @@ compares the authoritative CRD/RBAC paths without writing. `cargo fmt
 --all-targets --all-features` are the equivalent direct validation commands.
 
 `CAPI_OFFLINE_ENFORCED=1` makes the fetch itself offline. The release wrapper
-then builds from a fresh private target with `--locked --offline` and
-`CARGO_NET_OFFLINE=true`. Static CRT flags apply to the final manager binary,
-not proc-macro dependencies; packaging rejects dynamic ELF dependencies and
-stages the static manager with verified Calico/CNPG assets in a scratch image.
-An empty Cargo home cannot satisfy the offline build.
+builds with Cargo's selected target and explicit `--locked --offline`.
+Static CRT flags apply to the final manager binary, not proc-macro
+dependencies; Cargo's JSON artifact output identifies the executable, and
+packaging rejects dynamic ELF dependencies before staging it with verified
+Calico/CNPG assets in a scratch image. An empty Cargo home cannot satisfy the
+offline build.
 
 Cargo discovers four integration targets: `controller`, `adapters`,
 `allocation`, and `finalization`. They share the Kubernetes API simulator

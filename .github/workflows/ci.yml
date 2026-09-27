@@ -12,9 +12,6 @@ on:
 permissions:
   contents: read
 
-env:
-  TMPDIR: ${{ github.workspace }}/capi/.tools/cargo-work
-
 concurrency:
   group: capi-tests-${{ github.workflow }}-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
@@ -41,34 +38,16 @@ jobs:
         with:
           just-version: "1.58.0"
 
+      - name: Set up Rust and Cargo
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+
       - name: Prepare repository-local working directory
-        run: install -d -m 700 .tools .runtime .tools/cargo-home .tools/cargo-work
+        run: install -d -m 700 .tools .runtime
 
       - name: Run unit and static tests
         run: |
           just test-unit
           just test-static
-
-      - name: Identify system Rust compiler
-        id: compiler
-        run: echo "identity=$(rustc -vV | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-
-      - name: Prepare owner-only Cargo cache
-        run: |
-          umask 077
-          mkdir -p .tools/cargo-home
-
-      - name: Cache locked Cargo dependencies
-        uses: actions/cache@v4
-        with:
-          path: capi/.tools/cargo-home
-          key: controller-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('capi/controller/Cargo.lock') }}
-
-      - name: Cache controller build outputs
-        uses: actions/cache@v4
-        with:
-          path: capi/.tools/cargo-target
-          key: controller-target-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('capi/controller/Cargo.lock') }}
 
       - name: Fetch locked controller dependencies
         run: just controller-fetch
@@ -125,23 +104,11 @@ jobs:
         with:
           just-version: "1.58.0"
 
+      - name: Set up Rust and Cargo
+        uses: actions-rust-lang/setup-rust-toolchain@v2
+
       - name: Prepare repository-local working directory
-        run: install -d -m 700 .tools .runtime .tools/cargo-home .tools/cargo-work
-
-      - name: Identify system Rust compiler
-        id: compiler
-        run: echo "identity=$(rustc -vV | sha256sum | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
-
-      - name: Prepare owner-only Cargo cache
-        run: |
-          umask 077
-          mkdir -p .tools/cargo-home
-
-      - name: Restore locked Cargo dependencies
-        uses: actions/cache/restore@v4
-        with:
-          path: capi/.tools/cargo-home
-          key: controller-cargo-v1-${{ runner.os }}-${{ runner.arch }}-${{ steps.compiler.outputs.identity }}-${{ hashFiles('capi/controller/Cargo.lock') }}
+        run: install -d -m 700 .tools .runtime
 
       - name: Download static Tenant controller
         uses: actions/download-artifact@v7
@@ -182,8 +149,10 @@ jobs:
         uses: extractions/setup-just@v4
         with:
           just-version: "1.58.0"
+      - name: Set up Rust and Cargo
+        uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: Prepare repository-local working directory
-        run: install -d -m 700 .tools .runtime .tools/cargo-home .tools/cargo-work
+        run: install -d -m 700 .tools .runtime
       - name: Show Docker capacity
         run: docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}} DockerRoot={{.DockerRootDir}}'
       - name: Acquire complete cache including locked Cargo inputs

@@ -34,68 +34,40 @@ TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
 STATIC_MANAGER_FLAGS = ("-C", "target-feature=+crt-static")
 
 
-def cargo_environment(root: Path, *, offline: bool = True) -> dict[str, str]:
-    root = root.resolve()
-    environment = {
-        key: value for key, value in os.environ.items()
-        if key not in {
-            "RUSTFLAGS", "CARGO_ENCODED_RUSTFLAGS", "RUSTC", "RUSTC_WRAPPER",
-            "RUSTC_WORKSPACE_WRAPPER", "CARGO_BUILD_TARGET",
-            "CARGO_BUILD_RUSTFLAGS", "CARGO_BUILD_RUSTC",
-            "CARGO_BUILD_RUSTC_WRAPPER", "CARGO_BUILD_RUSTC_WORKSPACE_WRAPPER",
-        } and not key.startswith(("CARGO_TARGET_", "CARGO_PROFILE_", "GO", "KUBEBUILDER_"))
-    }
-    for key, directory in (
-        ("CARGO_HOME", root / ".tools" / "cargo-home"),
-        ("CARGO_TARGET_DIR", root / ".tools" / "cargo-target"),
-        ("TMPDIR", root / ".tools" / "cargo-work"),
-    ):
-        ensure_private_dir(directory)
-        environment[key] = str(directory)
-    environment["CARGO_NET_OFFLINE"] = str(
-        offline or os.environ.get("CAPI_OFFLINE_ENFORCED") == "1"
-    ).lower()
-    environment["RUSTUP_AUTO_INSTALL"] = "0"
-    return environment
-
-
-def rust_toolchain(root: Path) -> tuple[str, dict[str, str], str]:
-    environment = cargo_environment(root)
+def rust_toolchain(root: Path) -> tuple[str, str]:
     binaries = {name: shutil.which(name) for name in ("rustc", "cargo")}
     if not all(binaries.values()):
-        raise RuntimeError("installed rustc >= 1.89 and Cargo are required; no toolchain is downloaded")
-    environment["RUSTC"] = binaries["rustc"]
+        raise RuntimeError("rustc >= 1.89 and Cargo are required")
     identities = [
         run(
             [binaries[name], "--version", "--verbose"],
-            cwd=root / "controller", env=environment, timeout=30,
+            cwd=root / "controller", timeout=30,
         ).stdout.strip()
         for name in ("rustc", "cargo")
     ]
     version = re.search(r"^rustc (\d+)\.(\d+)\.(\d+)", identities[0])
     if not version or tuple(map(int, version.groups())) < (1, 89, 0):
         raise RuntimeError(f"installed rustc >= 1.89 is required: {identities[0]}")
-    return binaries["cargo"], environment, "\n".join(identities)
+    return binaries["cargo"], "\n".join(identities)
 
 
 def fetch_controller_dependencies(
     root: Path, config: dict[str, str], *, offline: bool | None = None,
 ) -> None:
-    cargo, environment, _ = rust_toolchain(root)
+    cargo, _ = rust_toolchain(root)
     if offline is None:
         offline = os.environ.get("CAPI_OFFLINE_ENFORCED") == "1"
-    environment["CARGO_NET_OFFLINE"] = str(offline).lower()
     run(
         [cargo, "fetch", "--locked", *(["--offline"] if offline else [])],
-        cwd=root / "controller", env=environment,
+        cwd=root / "controller",
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,
     )
 
 
 def _cargo(root: Path, config: dict[str, str], arguments: list[str]) -> None:
-    cargo, environment, _ = rust_toolchain(root)
+    cargo, _ = rust_toolchain(root)
     run(
-        [cargo, *arguments], cwd=root / "controller", env=environment,
+        [cargo, *arguments], cwd=root / "controller",
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,
     )
 
@@ -127,10 +99,13 @@ def vet_controller(root: Path, config: dict[str, str]) -> None:
 def controller_source_digest(root: Path, config: dict[str, str]) -> str:
     digest = hashlib.sha256()
     controller = root / "controller"
+    repository = root.parent
     inputs = [
         *controller.joinpath("src").rglob("*.rs"),
+        repository / "Cargo.toml",
+        repository / "Cargo.lock",
+        repository / "rust-toolchain.toml",
         controller / "Cargo.toml",
-        controller / "Cargo.lock",
         controller / "Dockerfile",
         *controller.joinpath("config", "crd").rglob("*.yaml"),
         *controller.joinpath("config", "rbac").rglob("*.yaml"),
@@ -139,20 +114,21 @@ def controller_source_digest(root: Path, config: dict[str, str]) -> str:
         root / ".tools" / "inputs" / "cnpg.yaml",
     ]
     for path in sorted(inputs):
-        relative = (
-            path.relative_to(root).as_posix()
-            if path.is_relative_to(root)
-            else str(path)
-        )
+        relative = path.relative_to(
+            root if path.is_relative_to(root) else repository
+        ).as_posix()
         digest.update(relative.encode())
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
-    _, _, identity = rust_toolchain(root)
+    _, identity = rust_toolchain(root)
     digest.update(json.dumps({
         "compiler": identity,
-        "command": ["cargo", "rustc", "--locked", "--offline", "--release",
-                    "--bin", "manager", "--", *STATIC_MANAGER_FLAGS],
+        "command": [
+            "cargo", "rustc", "--locked", "--offline", "--release",
+            "--bin", "manager", "--message-format=json-render-diagnostics",
+            "--", *STATIC_MANAGER_FLAGS,
+        ],
         "kubernetesVersion": config["KUBERNETES_VERSION"],
     }, sort_keys=True).encode())
     return digest.hexdigest()
@@ -188,22 +164,30 @@ def build_controller_binary(
         output.chmod(0o700)
         return output
     fetch_controller_dependencies(root, config)
-    cargo, environment, _ = rust_toolchain(root)
-    target = root.resolve() / ".tools" / "cargo-target" / "offline-verification"
-    shutil.rmtree(target, ignore_errors=True)
-    ensure_private_dir(target)
-    environment["CARGO_TARGET_DIR"] = str(target)
-    run(
+    cargo, _ = rust_toolchain(root)
+    result = run(
         [
             cargo, "rustc", "--locked", "--offline", "--release", "--bin", "manager",
+            "--message-format=json-render-diagnostics",
             "--", *STATIC_MANAGER_FLAGS,
         ],
         cwd=root / "controller",
-        env=environment,
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,
     )
-    verify_static_manager(target / "release" / "manager")
-    shutil.copy2(target / "release" / "manager", output)
+    executables = [
+        Path(message["executable"])
+        for line in result.stdout.splitlines()
+        for message in [json.loads(line)]
+        if (
+            message.get("reason") == "compiler-artifact"
+            and message.get("target", {}).get("name") == "manager"
+            and isinstance(message.get("executable"), str)
+        )
+    ]
+    if len(executables) != 1 or not executables[0].is_file():
+        raise RuntimeError("Cargo did not report exactly one manager executable")
+    verify_static_manager(executables[0])
+    shutil.copy2(executables[0], output)
     output.chmod(0o700)
     return output
 

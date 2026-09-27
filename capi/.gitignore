@@ -1,6 +1,5 @@
 .tools/
 .runtime/
-controller/target/
 config/azure.local.env
 __pycache__/
 *.pyc

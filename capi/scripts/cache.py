@@ -157,15 +157,23 @@ def _requirements(config: dict[str, str], root: Path | None = None) -> dict[str,
         "provenance": provenance,
         "images": images,
     }
-    if root is not None and (root / "controller" / "Cargo.toml").is_file():
+    if (
+        root is not None
+        and (root.parent / "Cargo.toml").is_file()
+        and (root / "controller" / "Cargo.toml").is_file()
+    ):
         from scripts.lib.controller import rust_toolchain
 
-        lock = root / "controller" / "Cargo.lock"
+        lock = root.parent / "Cargo.lock"
         if not lock.is_file():
-            raise IntegrityError("controller Cargo.lock is missing")
-        _, _, compiler = rust_toolchain(root)
+            raise IntegrityError("workspace Cargo.lock is missing")
+        toolchain = root.parent / "rust-toolchain.toml"
+        if not toolchain.is_file():
+            raise IntegrityError("workspace rust-toolchain.toml is missing")
+        _, compiler = rust_toolchain(root)
         requirements["cargo"] = {
             "lockSha256": sha256_file(lock),
+            "toolchainSha256": sha256_file(toolchain),
             "compiler": compiler,
         }
     return requirements
@@ -808,7 +816,10 @@ def verify_cache(
     inventory = _load_inventory_header(generation, requirements)
     requirements_sha256 = _requirements_sha256(requirements)
     state_sha256 = _cache_state_sha256(root, generation, requirements)
-    if (root / "controller" / "Cargo.toml").is_file():
+    if (
+        (root.parent / "Cargo.toml").is_file()
+        and (root / "controller" / "Cargo.toml").is_file()
+    ):
         from scripts.lib.controller import fetch_controller_dependencies
 
         fetch_controller_dependencies(root, config, offline=True)
@@ -930,7 +941,10 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
     published = False
     try:
         acquire_tools(root, config, tools_dir=generation)
-        if (root / "controller" / "Cargo.toml").is_file():
+        if (
+            (root.parent / "Cargo.toml").is_file()
+            and (root / "controller" / "Cargo.toml").is_file()
+        ):
             from scripts.lib.controller import fetch_controller_dependencies
 
             fetch_controller_dependencies(root, config)

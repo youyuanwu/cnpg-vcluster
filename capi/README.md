@@ -62,8 +62,9 @@ a production worker substrate.
 - Permission to raise the runtime-only host inotify limits to
   `fs.inotify.max_user_instances=1024` and
   `fs.inotify.max_user_watches=524288`.
-- `git`, `python3`, `curl`, `tar`, host-installed `just` 1.58.0, and
-  system-installed `rustc`/Cargo >= 1.89 (no toolchain download).
+- `git`, `python3`, `curl`, `tar`, host-installed `just` 1.58.0, and Rustup
+  or compatible system `rustc`/Cargo honoring the repository's Rust 1.98.1
+  `rust-toolchain.toml` declaration.
 
 The lab caches its own pinned kind, kubectl, Helm, clusterctl, charts,
 manifests, source provenance, and OCI images under ignored owner-only
@@ -437,12 +438,13 @@ Pushes to `main` run fast checks only, avoiding an immediate repeat of the PR's
 destructive E2E. Concurrency cancels superseded runs of the same event/ref,
 without a `main` push cancelling a scheduled or manually dispatched full gate.
 
-Fast checks use the system Rust toolchain and `just controller-fetch` to
-acquire locked Cargo dependencies into owner-only `.tools/cargo-home`.
-The optional Cargo cache is keyed by OS, architecture, compiler identity,
-and `Cargo.lock`; cache misses fetch the locked inputs. Python wrappers put
-Cargo home, target, and temporary work in `.tools`, and offline builds use
-`CARGO_NET_OFFLINE=true` with `--locked --offline` from a fresh target.
+CI installs stable Rust/Cargo with
+`actions-rust-lang/setup-rust-toolchain`, including its integrated
+`Swatinem/rust-cache` for Cargo's shared home and default controller target.
+Cache misses are filled by `just controller-fetch`. Python wrappers leave
+Cargo configuration, environment, home, target, and temporary locations at
+their system defaults; enforced-offline commands use explicit `--locked
+--offline`.
 `Cargo.lock` checksums are the dependency integrity authority. No Go or
 controller-gen tool acquisition is needed. For Docker-free local checks:
 

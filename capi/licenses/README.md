@@ -4,8 +4,8 @@ The lab does not commit third-party binaries, charts, source archives,
 manifests, images, or vendored Rust crates. Non-Rust inputs are downloaded
 into ignored local state from the pinned upstream locations in
 `../config/versions.env`; Cargo resolves the Rust crates in
-[`../controller/Cargo.lock`](../controller/Cargo.lock) into ignored
-`../.tools/cargo-home`. The manager image includes a statically linked binary
+[`Cargo.lock`](../../Cargo.lock) through the system
+shared Cargo home. The manager image includes a statically linked binary
 built from that locked crate graph.
 
 The authoritative license texts are maintained by the upstream projects:
