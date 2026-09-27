@@ -233,11 +233,12 @@ def _replace_machine(
 ) -> dict[str, dict[str, str]]:
     removed_name = sorted(before)[0]
     removed_uid = before[removed_name]["machineUID"]
+    machine_definition = _management_resource("Machine")
     client.kubectl(
         "-n",
         tenant.namespace,
         "delete",
-        f"machine/{removed_name}",
+        f"{machine_definition.kubectl_resource}/{removed_name}",
         "--wait=true",
         f"--timeout={config['DELETE_TIMEOUT']}",
     )

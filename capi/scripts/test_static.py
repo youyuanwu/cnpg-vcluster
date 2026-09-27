@@ -343,6 +343,7 @@ def check_repository_boundaries() -> None:
         "machinedeployments.cluster.x-k8s.io",
         "bootstrap.cluster.x-k8s.io/v1beta2",
         "machinedeployment/",
+        "machine/",
         "devmachine/",
         "kubeadmconfig/",
         "kamajicontrolplane/",

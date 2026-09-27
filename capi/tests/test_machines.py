@@ -7,7 +7,7 @@ from subprocess import CompletedProcess
 
 from unittest.mock import patch
 
-from scripts.machines import _bootstrap_secrets, worker_snapshot
+from scripts.machines import _bootstrap_secrets, _replace_machine, worker_snapshot
 
 
 class FakeClient:
@@ -155,3 +155,51 @@ class MachineTests(unittest.TestCase):
                 ),
                 {"worker-a", "worker-b", "worker-c"},
             )
+
+    def test_machine_replacement_uses_catalog_resource_identity(self) -> None:
+        calls = []
+        client = type("Client", (), {})()
+        client.kubectl = lambda *args, **kwargs: calls.append(args) or CompletedProcess(
+            [], 0, stdout=""
+        )
+        tenant = type(
+            "Tenant",
+            (),
+            {"namespace": "tenant-a", "name": "tenant-a", "workers": 1},
+        )()
+        before = {"worker-a": {"machineUID": "old-uid"}}
+        after = {"worker-b": {"machineUID": "new-uid"}}
+        with (
+            patch("scripts.machines.wait_network_ready"),
+            patch("scripts.machines.worker_snapshot", return_value=after),
+            patch(
+                "scripts.machines.wait_for",
+                side_effect=lambda _description, _timeout, _interval, predicate: predicate(),
+            ),
+            patch(
+                "scripts.machines.run",
+                return_value=CompletedProcess([], 1, stdout=""),
+            ),
+            patch(
+                "scripts.machines.read_storage_marker",
+                return_value="phase3-marker\n",
+            ),
+        ):
+            self.assertEqual(
+                _replace_machine(
+                    Path("."),
+                    {
+                        "DELETE_TIMEOUT": "1s",
+                        "WORKER_REGISTRATION_TIMEOUT": "1s",
+                        "WAIT_POLL_INTERVAL": "1s",
+                    },
+                    client,
+                    tenant,
+                    before,
+                ),
+                after,
+            )
+        self.assertIn(
+            "machines.cluster.x-k8s.io/worker-a",
+            calls[0],
+        )
