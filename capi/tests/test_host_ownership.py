@@ -103,3 +103,24 @@ class HostOwnershipTests(unittest.TestCase):
             residue = inspect_host_residue(config)
 
         self.assertEqual(residue["containers"], ["worker-id"])
+
+    def test_host_residue_includes_project_labeled_volume(self) -> None:
+        config = {
+            "SPIKE_NAME": "spike",
+            "OWNERSHIP_LABEL": "owner",
+            "LAB_PREFIX": "lab",
+        }
+
+        def docker(command, **_kwargs):
+            output = (
+                "volume-id\n"
+                if command[:4] == ["docker", "volume", "ls", "-q"]
+                and "label=cnpg-vcluster.capi/role" in command
+                else ""
+            )
+            return type("Result", (), {"stdout": output})()
+
+        with patch("scripts.destroy.run", side_effect=docker):
+            residue = inspect_host_residue(config)
+
+        self.assertEqual(residue["volumes"], ["volume-id"])

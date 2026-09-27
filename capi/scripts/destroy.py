@@ -380,17 +380,33 @@ def inspect_host_residue(
         ],
         timeout=30,
     ).stdout.split()
-    volumes = run(
-        [
-            "docker",
-            "volume",
-            "ls",
-            "-q",
-            "--filter",
-            f"label={config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
-        ],
-        timeout=30,
-    ).stdout.split()
+    volumes = {
+        name
+        for name in run(
+            ["docker", "volume", "ls", "-q"],
+            timeout=30,
+        ).stdout.split()
+        if name.endswith("-storage")
+    }
+    for label in (
+        f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
+        "cnpg-vcluster.capi/role",
+        "cnpg-vcluster.capi/tenant",
+        "tenancy.cnpg-vcluster.io/tenant-uid",
+    ):
+        volumes.update(
+            run(
+                [
+                    "docker",
+                    "volume",
+                    "ls",
+                    "-q",
+                    "--filter",
+                    f"label={label}",
+                ],
+                timeout=30,
+            ).stdout.split()
+        )
     return {
         "containers": sorted(containers),
         "probes": sorted(set(probes)),
