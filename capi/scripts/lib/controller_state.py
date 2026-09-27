@@ -163,10 +163,14 @@ def require_clean_controller_state(
                 if (
                     "tenancy.cnpg-vcluster.io/slot-id"
                     in metadata.get("labels", {})
+                    or "tenancy.cnpg-vcluster.io/tenant"
+                    in metadata.get("labels", {})
                     or metadata.get("annotations", {}).get(
                         "tenancy.cnpg-vcluster.io/resource"
                     )
                     == "allocation-lease"
+                    or "tenancy.cnpg-vcluster.io/slot-id"
+                    in metadata.get("annotations", {})
                     or "tenancy.cnpg-vcluster.io/tenant"
                     in metadata.get("annotations", {})
                     or "tenancy.cnpg-vcluster.io/tenant-uid"

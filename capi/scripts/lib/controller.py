@@ -623,6 +623,27 @@ def reconcile_controller(
         if replacement:
             stop_controller(config, client)
             require_clean_controller_state(root, client)
+            if previous["configmap/tenant-controller-state"]:
+                previous_state = json.loads(
+                    previous["configmap/tenant-controller-state"]
+                )
+                if "rollbackToken" in previous_state.get("data", {}):
+                    client.kubectl(
+                        "-n",
+                        CONTROLLER_NAMESPACE,
+                        "patch",
+                        "configmap/tenant-controller-state",
+                        "--type=merge",
+                        "-p",
+                        json.dumps({
+                            "metadata": {
+                                "resourceVersion": previous_state["metadata"][
+                                    "resourceVersion"
+                                ]
+                            },
+                            "data": {"rollbackToken": None},
+                        }),
+                    )
         manager = render_controller_manager(
             root,
             config,
@@ -774,14 +795,7 @@ def reconcile_controller(
                 CONTROLLER_NAMESPACE,
                 "configmap/tenant-controller-activation",
             )
-            if accepted_document is None:
-                delete_named(
-                    config,
-                    client,
-                    CONTROLLER_NAMESPACE,
-                    "configmap/tenant-controller-state",
-                )
-            else:
+            if accepted_document is not None:
                 client.kubectl(
                     "-n",
                     CONTROLLER_NAMESPACE,

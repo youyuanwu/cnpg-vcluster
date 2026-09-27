@@ -359,6 +359,8 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             if "get" in args and "configmap/tenant-controller-state" in args:
                 return response(state) if state is not None else response()
             if args[:2] == ("create", "-f"):
+                if state is not None:
+                    return response(code=1, error="AlreadyExists")
                 state = json.loads(kwargs["input_text"])
                 state["metadata"].update(
                     uid="rollback-state", resourceVersion="1"
@@ -372,6 +374,7 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             if resource == "configmap/tenant-controller-state":
                 state = None
 
+        client = Client(handle)
         with (
             patch.object(packaging, "build_controller_image", return_value="rust:image"),
             patch.object(packaging, "_foundation_payload", return_value=desired),
@@ -391,10 +394,26 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "second inventory failed"),
         ):
             packaging.reconcile_controller(
-                Path("."), CONFIG, Client(handle), {}, Mock(), None
+                Path("."), CONFIG, client, {}, Mock(), None
             )
-        self.assertIsNone(state)
-        self.assertIn("configmap/tenant-controller-state", deleted)
+        self.assertIsNotNone(state)
+        self.assertIn("rollbackToken", state["data"])
+        self.assertNotIn("configmap/tenant-controller-state", deleted)
+        self.assertNotEqual(
+            client.kubectl(
+                "create",
+                "-f",
+                "-",
+                input_text=json.dumps({
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {"name": "tenant-controller-state"},
+                    "data": {"configurationHash": desired["data"]["foundation.sha256"]},
+                }),
+                check=False,
+            ).returncode,
+            0,
+        )
 
     def test_first_install_rollback_loses_to_concurrent_acceptance(self):
         desired = self.foundation()

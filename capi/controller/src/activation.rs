@@ -237,23 +237,22 @@ async fn require_clean_inventory<D: DockerClient>(
         .list(&ListParams::default())
         .await?
     {
-        if lease
+        if lease.metadata.labels.as_ref().is_some_and(|labels| {
+            labels.contains_key("tenancy.cnpg-vcluster.io/slot-id")
+                || labels.contains_key("tenancy.cnpg-vcluster.io/tenant")
+        }) || lease
             .metadata
-            .labels
+            .annotations
             .as_ref()
-            .is_some_and(|labels| labels.contains_key("tenancy.cnpg-vcluster.io/slot-id"))
-            || lease
-                .metadata
-                .annotations
-                .as_ref()
-                .is_some_and(|annotations| {
-                    annotations
-                        .get("tenancy.cnpg-vcluster.io/resource")
-                        .map(String::as_str)
-                        == Some("allocation-lease")
-                        || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
-                        || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
-                })
+            .is_some_and(|annotations| {
+                annotations
+                    .get("tenancy.cnpg-vcluster.io/resource")
+                    .map(String::as_str)
+                    == Some("allocation-lease")
+                    || annotations.contains_key("tenancy.cnpg-vcluster.io/slot-id")
+                    || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
+                    || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
+            })
         {
             return Err(ControllerError::Configuration(
                 "allocation Lease residue blocks configuration activation".into(),

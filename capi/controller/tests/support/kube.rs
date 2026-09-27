@@ -162,8 +162,13 @@ impl Server {
                                     if !uid_matches || !version_matches {
                                         (409, status(409, "Conflict"))
                                     } else {
+                                        let current_revision =
+                                            current["metadata"]["resourceVersion"]
+                                                .as_str()
+                                                .and_then(|value| value.parse::<u32>().ok())
+                                                .unwrap_or_default();
                                         merge(&mut current, &body);
-                                        state.revision += 1;
+                                        state.revision = state.revision.max(current_revision) + 1;
                                         current["metadata"]["resourceVersion"] =
                                             json!(state.revision.to_string());
                                         state.objects.insert(key.into(), current.clone());

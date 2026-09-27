@@ -3,6 +3,10 @@ use crate::support::Server;
 use k8s_openapi::api::coordination::v1::Lease;
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
+use kube::{
+    Api,
+    api::{Patch, PatchParams, PostParams},
+};
 use serde_json::json;
 use tenant_controller::{
     activation::{STATE_NAME, TICKET_NAME, admit},
@@ -224,28 +228,75 @@ async fn existing_state_is_replaced_with_uid_preserved_and_conflicts_fail_closed
 }
 
 #[tokio::test]
+async fn rollback_patch_advances_revision_and_rejects_stale_state_put() {
+    let server = Server::default();
+    server.insert(
+        STATE,
+        config_map(STATE_NAME, &[("configurationHash", "hash-a")]),
+    );
+    let api = Api::<ConfigMap>::namespaced(server.client(), "tenant-system");
+    let stale = api.get(STATE_NAME).await.unwrap();
+    api.patch(
+        STATE_NAME,
+        &PatchParams::default(),
+        &Patch::Merge(json!({
+            "metadata":{"resourceVersion":"1"},
+            "data":{"rollbackToken":"rollback-a"}
+        })),
+    )
+    .await
+    .unwrap();
+    let mut replacement = stale;
+    replacement
+        .data
+        .get_or_insert_default()
+        .insert("configurationHash".into(), "hash-b".into());
+    assert!(
+        api.replace(STATE_NAME, &PostParams::default(), &replacement)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn creation_invalid_configuration_cannot_replace_accepted_identity() {
     let server = clean_server();
     server.insert(
         STATE,
         config_map(STATE_NAME, &[("configurationHash", "hash-a")]),
     );
-    server.insert(TICKET, ticket("hash-b", "token-b"));
+    server.insert(TICKET, ticket_with_previous("hash-b", "token-b", "hash-a"));
+    let error = admit(
+        server.client(),
+        &FakeDocker::default(),
+        "hash-b",
+        "token-b",
+        false,
+    )
+    .await
+    .unwrap_err();
+    assert!(error.to_string().contains("invalid for Tenant creation"));
+    let state: ConfigMap = serde_json::from_value(server.get(STATE)).unwrap();
+    assert_eq!(state.data.unwrap()["configurationHash"], "hash-a");
+    let observed_ticket: ConfigMap = serde_json::from_value(server.get(TICKET)).unwrap();
+    assert!(!observed_ticket.data.unwrap().contains_key("consumed"));
+
+    let first = clean_server();
+    first.insert(TICKET, ticket("hash-b", "token-b"));
     assert!(
         admit(
-            server.client(),
+            first.client(),
             &FakeDocker::default(),
             "hash-b",
             "token-b",
             false,
         )
         .await
-        .is_err()
+        .unwrap_err()
+        .to_string()
+        .contains("invalid for Tenant creation")
     );
-    let state: ConfigMap = serde_json::from_value(server.get(STATE)).unwrap();
-    assert_eq!(state.data.unwrap()["configurationHash"], "hash-a");
-    let ticket: ConfigMap = serde_json::from_value(server.get(TICKET)).unwrap();
-    assert!(!ticket.data.unwrap().contains_key("consumed"));
+    assert!(!first.0.lock().unwrap().objects.contains_key(STATE));
 }
 
 #[tokio::test]
@@ -399,7 +450,14 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
 
 #[tokio::test]
 async fn every_allocation_identity_marker_blocks_but_leader_lease_does_not() {
-    for marker in ["slot", "resource", "tenant", "tenant-uid"] {
+    for marker in [
+        "slot-label",
+        "tenant-label",
+        "resource",
+        "slot-annotation",
+        "tenant",
+        "tenant-uid",
+    ] {
         let server = clean_server();
         server.insert(TICKET, ticket("hash-b", "token-b"));
         let mut lease = Lease {
@@ -411,9 +469,13 @@ async fn every_allocation_identity_marker_blocks_but_leader_lease_does_not() {
             ..Default::default()
         };
         match marker {
-            "slot" => {
+            "slot-label" => {
                 lease.metadata.labels =
                     Some([("tenancy.cnpg-vcluster.io/slot-id".into(), "slot-a".into())].into())
+            }
+            "tenant-label" => {
+                lease.metadata.labels =
+                    Some([("tenancy.cnpg-vcluster.io/tenant".into(), "tenant-a".into())].into())
             }
             "resource" => {
                 lease.metadata.annotations = Some(
@@ -423,6 +485,10 @@ async fn every_allocation_identity_marker_blocks_but_leader_lease_does_not() {
                     )]
                     .into(),
                 )
+            }
+            "slot-annotation" => {
+                lease.metadata.annotations =
+                    Some([("tenancy.cnpg-vcluster.io/slot-id".into(), "slot-a".into())].into())
             }
             "tenant" => {
                 lease.metadata.annotations =

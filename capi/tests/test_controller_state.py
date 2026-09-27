@@ -210,6 +210,8 @@ class ControllerStateTests(unittest.TestCase):
             "provider",
             "lease",
             "lease-tenant",
+            "lease-slot-annotation",
+            "lease-tenant-label",
             "volume",
             "container",
             "legacy-file",
@@ -227,14 +229,29 @@ class ControllerStateTests(unittest.TestCase):
                         return response("tenant.tenancy.cnpg-vcluster.io/tenant-a")
                     if case == "provider" and "clusters.cluster.x-k8s.io" in args:
                         return response("cluster.cluster.x-k8s.io/tenant-a")
-                    if case in {"lease", "lease-tenant"} and "leases.coordination.k8s.io" in args:
-                        metadata = (
-                            {"labels": {"tenancy.cnpg-vcluster.io/slot-id": "slot-a"}}
-                            if case == "lease"
-                            else {"annotations": {
-                                "tenancy.cnpg-vcluster.io/tenant-uid": "uid-a"
-                            }}
-                        )
+                    if case.startswith("lease") and "leases.coordination.k8s.io" in args:
+                        metadata = {
+                            "lease": {
+                                "labels": {
+                                    "tenancy.cnpg-vcluster.io/slot-id": "slot-a"
+                                }
+                            },
+                            "lease-tenant": {
+                                "annotations": {
+                                    "tenancy.cnpg-vcluster.io/tenant-uid": "uid-a"
+                                }
+                            },
+                            "lease-slot-annotation": {
+                                "annotations": {
+                                    "tenancy.cnpg-vcluster.io/slot-id": "slot-a"
+                                }
+                            },
+                            "lease-tenant-label": {
+                                "labels": {
+                                    "tenancy.cnpg-vcluster.io/tenant": "tenant-a"
+                                }
+                            },
+                        }[case]
                         return response({"items": [{"metadata": metadata}]})
                     return clean_handler(*args, **kwargs)
 
