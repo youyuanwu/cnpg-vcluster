@@ -156,7 +156,7 @@ def check_configuration() -> None:
     check(config["KAMAJI_CAPI_CONTRACT"] == "v1beta2", "Kamaji provider contract must be v1beta2")
     from scripts.lib.tenant_spec import load_tenant_spec
 
-    load_tenant_spec(
+    azure_example = load_tenant_spec(
         ROOT / "config" / "tenants" / "examples" / "azure.json",
         expected_profile="azure",
         supported_versions={
@@ -164,6 +164,10 @@ def check_configuration() -> None:
                 ROOT / "config" / "azure" / "defaults.env"
             )["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
         },
+    )
+    check(
+        azure_example.workers == 3,
+        "Azure lifecycle example must request exactly three workers",
     )
     for key in (
         "VIP_POOL_START_OFFSET_FROM_BROADCAST",

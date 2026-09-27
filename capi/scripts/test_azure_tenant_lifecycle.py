@@ -17,6 +17,7 @@ from scripts.azure import (
 from scripts.lib.azure.common import (
     _active_subscription,
     _az,
+    _json,
     load_azure_configuration,
     names,
 )
@@ -26,6 +27,13 @@ from scripts.lib.azure.foundation import (
     create_management,
 )
 from scripts.lib.azure.deletion import _remove_private_tree
+from scripts.lib.azure.gate import (
+    build_worker_snapshot,
+    refreshed_observed,
+    require_replacement,
+)
+from scripts.lib.azure.ownership import discover_azure_owned_resources
+from scripts.lib.azure.readiness import _collect_ready_observations
 from scripts.lib.config import parse_duration
 from scripts.lib.files import private_file_exists, read_private_file, write_private_file
 from scripts.lib.process import run
@@ -172,6 +180,96 @@ def _require_status(tenant: str, classification: str) -> dict[str, object]:
     return payload
 
 
+def _vmss_instances(config: dict[str, str], vmss_id: str) -> list[str]:
+    pool = vmss_id.rstrip("/").split("/")[-1]
+    payload = _json(
+        [
+            "az",
+            "vmss",
+            "list-instances",
+            "--resource-group",
+            names(config)["resourceGroup"],
+            "--name",
+            pool,
+            "--query",
+            "[].{id:id,instanceId:instanceId}",
+            "--output",
+            "json",
+        ]
+    )
+    if not isinstance(payload, list):
+        raise RuntimeError("Azure VMSS instance inventory is invalid")
+    identities = [
+        str(item["id"])
+        for item in payload
+        if isinstance(item, dict)
+        and isinstance(item.get("id"), str)
+        and item.get("instanceId") is not None
+    ]
+    if len(identities) != len(payload):
+        raise RuntimeError("Azure VMSS instance inventory is incomplete")
+    return identities
+
+
+def _incomplete_gate_records(
+    evidence_dir: Path,
+    tenant: str,
+    specification_sha256: str,
+    revision: str,
+) -> set[str] | None:
+    candidates = []
+    if evidence_dir.is_dir():
+        for path in evidence_dir.glob("lifecycle-*.json"):
+            payload = json.loads(read_private_file(path))
+            if (
+                set(payload)
+                != {
+                    "schema",
+                    "operationId",
+                    "tenant",
+                    "specificationSha256",
+                    "revision",
+                    "records",
+                }
+                or payload.get("schema") != 1
+                or payload.get("tenant") != tenant
+                or payload.get("specificationSha256") != specification_sha256
+                or payload.get("revision") != revision
+                or not isinstance(payload.get("records"), list)
+            ):
+                continue
+            passed = {
+                record.get("phase")
+                for record in payload["records"]
+                if isinstance(record, dict) and record.get("status") == "passed"
+            }
+            if (
+                "worker-instance-deletion" in passed
+                and "targeted-delete-absent" not in passed
+                and "recreation" not in passed
+            ):
+                candidates.append(passed)
+    if len(candidates) > 1:
+        raise RuntimeError("multiple incomplete Azure lifecycle gate attempts exist")
+    return candidates[0] if candidates else None
+
+
+def _recorded_worker_snapshot(identity) -> object:
+    try:
+        nodes = json.loads(identity.observed["nodeIdentities"])
+        instances = json.loads(identity.observed["vmssInstanceIds"])
+        vmss_id = identity.observed["vmssId"]
+    except (KeyError, json.JSONDecodeError) as exc:
+        raise RuntimeError("recorded Azure worker identities are invalid") from exc
+    readiness = {
+        "requestedWorkers": 3,
+        "readyReplicas": 3,
+        "nodeRefs": [item.get("name") for item in nodes if isinstance(item, dict)],
+        "nodes": nodes,
+    }
+    return build_worker_snapshot(readiness, vmss_id, instances)
+
+
 def main(arguments: list[str]) -> int:
     os.umask(0o077)
     revision = run(
@@ -201,6 +299,10 @@ def main(arguments: list[str]) -> int:
         expected_profile="azure",
         supported_versions=supported_versions(ROOT),
     )
+    if spec.workers != 3:
+        raise RuntimeError(
+            "Azure lifecycle gate requires exactly three workers"
+        )
     operation_id = uuid.uuid4().hex
     records = []
     evidence = (
@@ -280,13 +382,190 @@ def main(arguments: list[str]) -> int:
                         _require_status(spec.name, "absent"),
                     ),
                 )
-        phase(
-            "create-ready",
-            lambda: (
-                _tenant_command("create", "azure", str(spec_path)),
-                _require_status(spec.name, "ready"),
-            ),
+        prior_gate = _incomplete_gate_records(
+            evidence.parent,
+            spec.name,
+            spec.sha256(),
+            revision,
         )
+
+        def resume_worker_refresh():
+            runtime = TenantRuntime(ROOT, spec.name)
+            if runtime.operation_exists():
+                raise RuntimeError(
+                    "Azure worker recovery cannot resume with a pending operation"
+                )
+            identity = runtime.load_identity()
+            before = _recorded_worker_snapshot(identity)
+            recovered, blockers = _collect_ready_observations(ROOT, config, spec)
+            if blockers:
+                raise RuntimeError(
+                    "Azure worker recovery is incomplete: " + "; ".join(blockers)
+                )
+            instances = _vmss_instances(config, before.vmss_id)
+            after = build_worker_snapshot(recovered, before.vmss_id, instances)
+            require_replacement(before, after)
+            discovery = discover_azure_owned_resources(
+                ROOT,
+                config,
+                spec,
+                identity,
+            )
+            observed = refreshed_observed(
+                identity.observed,
+                recovered,
+                instances,
+                discovery,
+            )
+            runtime.write_ready_evidence(
+                {
+                    "schema": 1,
+                    "profile": "azure",
+                    "tenant": spec.name,
+                    "specificationSha256": spec.sha256(),
+                    "foundationIdentity": dict(identity.foundation_identity),
+                    "observed": observed,
+                    "verifiedAt": time.time(),
+                    "ready": recovered,
+                }
+            )
+            runtime.compare_and_replace_identity(identity, observed)
+
+        skip_failure_injection = False
+        if prior_gate is not None:
+            if "worker-identity-refresh" not in prior_gate:
+                _run_profile_mutation(
+                    ROOT,
+                    config,
+                    lambda _root, _config: resume_worker_refresh(),
+                )
+            _require_status(spec.name, "ready")
+            skip_failure_injection = True
+        else:
+            phase(
+                "create-ready",
+                lambda: (
+                    _tenant_command("create", "azure", str(spec_path)),
+                    _require_status(spec.name, "ready"),
+                ),
+            )
+
+        def verify_and_replace_worker():
+            runtime = TenantRuntime(ROOT, spec.name)
+            if runtime.operation_exists():
+                raise RuntimeError(
+                    "Azure worker failure injection requires no pending operation"
+                )
+            identity = runtime.load_identity()
+            vmss_id = identity.observed.get("vmssId")
+            if not vmss_id:
+                raise RuntimeError("Azure tenant VMSS identity is absent")
+            readiness, blockers = _collect_ready_observations(ROOT, config, spec)
+            if blockers:
+                raise RuntimeError(
+                    "Azure tenant is not Ready: " + "; ".join(blockers)
+                )
+            before_instances = _vmss_instances(config, vmss_id)
+            before = build_worker_snapshot(readiness, vmss_id, before_instances)
+            reread, blockers = _collect_ready_observations(ROOT, config, spec)
+            reread_instances = _vmss_instances(config, vmss_id)
+            if blockers or build_worker_snapshot(
+                reread,
+                vmss_id,
+                reread_instances,
+            ) != before:
+                raise RuntimeError(
+                    "Azure worker identities changed before failure injection"
+                )
+            target = before.target
+            phase("worker-identity-verification", lambda: before)
+            phase(
+                "worker-instance-deletion",
+                lambda: _az(
+                    "vmss",
+                    "delete-instances",
+                    "--resource-group",
+                    names(config)["resourceGroup"],
+                    "--name",
+                    vmss_id.rstrip("/").split("/")[-1],
+                    "--instance-ids",
+                    target.instance_id,
+                    "--output",
+                    "none",
+                    timeout=parse_duration(config["AZURE_TENANT_TIMEOUT"]) + 60,
+                ),
+            )
+            deadline = (
+                time.monotonic()
+                + parse_duration(config["AZURE_TENANT_TIMEOUT"])
+            )
+            last_blockers = ("worker recovery has not been observed",)
+            while time.monotonic() < deadline:
+                recovered, blockers = _collect_ready_observations(
+                    ROOT,
+                    config,
+                    spec,
+                )
+                instances = _vmss_instances(config, vmss_id)
+                if not blockers:
+                    try:
+                        after = build_worker_snapshot(
+                            recovered,
+                            vmss_id,
+                            instances,
+                        )
+                        require_replacement(before, after)
+                    except RuntimeError as exc:
+                        last_blockers = (str(exc),)
+                    else:
+                        discovery = discover_azure_owned_resources(
+                            ROOT,
+                            config,
+                            spec,
+                            identity,
+                        )
+                        observed = refreshed_observed(
+                            identity.observed,
+                            recovered,
+                            instances,
+                            discovery,
+                        )
+                        runtime.write_ready_evidence(
+                            {
+                                "schema": 1,
+                                "profile": "azure",
+                                "tenant": spec.name,
+                                "specificationSha256": spec.sha256(),
+                                "foundationIdentity": dict(
+                                    identity.foundation_identity
+                                ),
+                                "observed": observed,
+                                "verifiedAt": time.time(),
+                                "ready": recovered,
+                            }
+                        )
+                        runtime.compare_and_replace_identity(
+                            identity,
+                            observed,
+                        )
+                        phase("worker-recovery", lambda: after)
+                        phase("worker-identity-refresh", lambda: None)
+                        return
+                else:
+                    last_blockers = blockers
+                time.sleep(10)
+            raise RuntimeError(
+                "Azure worker recovery timed out: "
+                + "; ".join(last_blockers)
+            )
+
+        if not skip_failure_injection:
+            _run_profile_mutation(
+                ROOT,
+                config,
+                lambda _root, _config: verify_and_replace_worker(),
+            )
+            _require_status(spec.name, "ready")
         phase(
             "targeted-delete-absent",
             lambda: (
