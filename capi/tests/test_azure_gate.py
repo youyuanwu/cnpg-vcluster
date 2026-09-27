@@ -12,7 +12,10 @@ from scripts.lib.azure.gate import (
 )
 from scripts.lib.files import write_private_file
 from scripts.lib.tenant_runtime import TenantRuntimeError
-from scripts.test_azure_tenant_lifecycle import _incomplete_gate_records
+from scripts.test_azure_tenant_lifecycle import (
+    _incomplete_gate_records,
+    _require_authenticated_worker_deletion,
+)
 from tests.azure_fixtures import AzureFixtureMixin
 
 
@@ -318,6 +321,18 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 "spec-sha",
                 "revision",
             )
+
+    def test_started_but_unconfirmed_deletion_fails_closed(self):
+        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+            _require_authenticated_worker_deletion(
+                {"worker-instance-deletion-started"}
+            )
+        _require_authenticated_worker_deletion(
+            {
+                "worker-instance-deletion-started",
+                "worker-instance-deletion",
+            }
+        )
 
     def test_live_gate_recipe_exists_but_is_not_invoked_by_tests(self):
         root = Path(__file__).resolve().parents[1]

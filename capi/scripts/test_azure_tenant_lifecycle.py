@@ -318,6 +318,13 @@ def _recorded_worker_snapshot(identity) -> object:
     return build_worker_snapshot(readiness, vmss_id, instances)
 
 
+def _require_authenticated_worker_deletion(phases: set[str]) -> None:
+    if "worker-instance-deletion" not in phases:
+        raise RuntimeError(
+            "Azure worker deletion outcome is ambiguous; refusing to continue"
+        )
+
+
 def main(arguments: list[str]) -> int:
     os.umask(0o077)
     revision = run(
@@ -541,6 +548,7 @@ def main(arguments: list[str]) -> int:
         skip_failure_injection = False
         skip_targeted_delete = False
         if prior_gate is not None:
+            _require_authenticated_worker_deletion(prior_gate)
             if "targeted-delete-absent" not in prior_gate:
                 if "worker-identity-refresh" not in prior_gate:
                     try:
@@ -571,6 +579,7 @@ def main(arguments: list[str]) -> int:
                 revision,
             )
             if locked_prior is not None:
+                _require_authenticated_worker_deletion(locked_prior)
                 if "worker-identity-refresh" not in locked_prior:
                     resume_worker_refresh()
                     phase("worker-recovery", lambda: None)
