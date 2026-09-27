@@ -291,7 +291,9 @@ pub fn validate_provider_owner(
             Some(tenant_name),
             parent.api_version,
             parent.kind,
-            &parent.name(tenant_name),
+            &parent
+                .expected_name(tenant_name)
+                .ok_or(OwnershipError::ApiVersion)?,
         )?;
         if observed.is_some_and(|observed| reference_matches(owner, observed)) {
             return Ok(());
@@ -346,7 +348,7 @@ pub fn validate_provider_owner_for_deletion(
             .ok_or(OwnershipError::ApiVersion)?;
         if owner.api_version != parent.api_version
             || owner.kind != parent.kind
-            || owner.name != parent.name(tenant_name)
+            || Some(owner.name.clone()) != parent.expected_name(tenant_name)
         {
             return Err(OwnershipError::ProviderOwner(description(object)));
         }

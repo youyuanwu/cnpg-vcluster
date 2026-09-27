@@ -7,6 +7,10 @@ from pathlib import Path
 from scripts.endpoint import run_endpoint_gate
 from scripts.lib.addons import verify_network, wait_network_ready
 from scripts.lib.config import parse_duration
+from scripts.lib.controller_catalog import (
+    load_management_resources,
+    resource_by_kind,
+)
 from scripts.lib.controller_scenarios import (
     delete_controller_tenant,
     tenant_document,
@@ -244,11 +248,18 @@ def _drift_machine_deployment_and_wait_for_repair(
     config: dict[str, str],
     tenant,
 ) -> None:
+    deployment = resource_by_kind(
+        load_management_resources(client.root),
+        "MachineDeployment",
+    )
+    deployment_name = deployment.expected_name(tenant.name)
+    if deployment_name is None:
+        raise RuntimeError("MachineDeployment has no expected name")
     client.kubectl(
         "-n",
         tenant.namespace,
         "patch",
-        f"machinedeployment/{tenant.name}-worker",
+        f"{deployment.kubectl_resource}/{deployment_name}",
         "--type=merge",
         "-p",
         json.dumps({"spec": {"replicas": tenant.workers + 1}}),
@@ -264,7 +275,7 @@ def _drift_machine_deployment_and_wait_for_repair(
                     "-n",
                     tenant.namespace,
                     "get",
-                    f"machinedeployment/{tenant.name}-worker",
+                    f"{deployment.kubectl_resource}/{deployment_name}",
                     "-o",
                     "jsonpath={.spec.replicas}",
                 ).stdout

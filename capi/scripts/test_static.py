@@ -180,6 +180,7 @@ def check_repository_boundaries() -> None:
         "config/tenants/tests/tenant-c.yaml",
         "scripts/controller_tenant.py",
         "scripts/controller_metrics.py",
+        "scripts/lib/controller_catalog.py",
         "scripts/lib/controller_state.py",
     )
     for relative in required_controller_files:
@@ -318,6 +319,34 @@ def check_repository_boundaries() -> None:
         and "local.lock" not in locking,
         "obsolete local profile locking remains",
     )
+    catalog_consumers = "\n".join(
+        (ROOT / relative).read_text(encoding="utf-8")
+        for relative in (
+            "scripts/lib/controller_state.py",
+            "scripts/lib/tenants.py",
+            "scripts/lib/controller_scenarios.py",
+            "scripts/lib/addons.py",
+            "scripts/network.py",
+            "scripts/machines.py",
+            "scripts/endpoint.py",
+            "scripts/tools.py",
+            "scripts/lib/providers.py",
+            "scripts/test_e2e.py",
+        )
+    )
+    for identity in (
+        "clusters.cluster.x-k8s.io",
+        "devclusters.infrastructure.cluster.x-k8s.io",
+        "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
+        "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io",
+        "devmachinetemplates.infrastructure.cluster.x-k8s.io",
+        "machinedeployments.cluster.x-k8s.io",
+        "bootstrap.cluster.x-k8s.io/v1beta2",
+    ):
+        check(
+            identity not in catalog_consumers,
+            f"catalog-owned management identity remains duplicated: {identity}",
+        )
     for relative in (
         "scripts/local_tenant.py",
         "scripts/create.py",

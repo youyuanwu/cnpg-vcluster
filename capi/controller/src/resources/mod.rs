@@ -108,7 +108,9 @@ impl Context<'_> {
         self.object(
             resource.api_version,
             resource.kind,
-            &resource.name(self.name()),
+            &resource
+                .expected_name(self.name())
+                .expect("management roots have declared names"),
             self.name(),
             resource.role,
             spec,

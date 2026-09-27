@@ -10,10 +10,6 @@ pub use error::ReconcileError;
 use std::{future::Future, path::Path, sync::Arc, time::Duration};
 
 use futures::StreamExt;
-use k8s_openapi::api::{
-    coordination::v1::Lease,
-    core::v1::{Namespace, Secret},
-};
 use kube::{
     Api, Client, ResourceExt,
     api::{Patch, PatchParams, PostParams},
@@ -35,7 +31,7 @@ use crate::{
     docker::{BollardDockerClient, DockerClient, validate_volume},
     error::ControllerError,
     foundation::{self, Foundation, ImageArchive, RuntimeFoundation},
-    management::{self, ResourceClass},
+    management::{self, WatchPolicy},
     ownership,
     readiness::{self, Components, set_condition},
     resources::{self, Context as ResourceContext},
@@ -731,51 +727,36 @@ where
 }
 
 pub fn controller(client: Client, _config: &Config) -> Controller<Tenant> {
-    let mut controller = tenant_controller(client.clone())
-        .watches(
-            Api::<Namespace>::all(client.clone()),
-            watcher::Config::default(),
-            |object| crate::runtime::map_dependent_to_tenant(&object),
-        )
-        .watches(
-            Api::<Lease>::all(client.clone()),
-            watcher::Config::default(),
-            |object| crate::runtime::map_dependent_to_tenant(&object),
-        )
-        .watches(
-            Api::<Secret>::all(client.clone()),
-            watcher::Config::default(),
-            |object| {
-                let mapped = crate::runtime::map_dependent_to_tenant(&object);
-                if !mapped.is_empty() {
-                    return mapped;
-                }
-                object
-                    .namespace()
-                    .filter(|namespace| object.name_any() == format!("{namespace}-kubeconfig"))
-                    .map(|namespace| vec![ObjectRef::new(&namespace)])
-                    .unwrap_or_default()
-            },
-        );
-    for definition in
-        management::watched().filter(|resource| resource.class != ResourceClass::Typed)
-    {
+    let mut controller = tenant_controller(client.clone());
+    for definition in management::watched() {
         let resource = definition.api_resource();
         controller = controller.watches_with(
             Api::<DynamicObject>::all_with(client.clone(), &resource),
             resource,
             watcher::Config::default(),
-            |object| {
+            move |object| {
                 let mapped = crate::runtime::map_dependent_to_tenant(&object);
                 if !mapped.is_empty() {
                     return mapped;
                 }
-                object
-                    .labels()
-                    .get("cluster.x-k8s.io/cluster-name")
-                    .filter(|name| !name.is_empty())
-                    .map(|name| vec![ObjectRef::new(name)])
-                    .unwrap_or_default()
+                match definition.watch_policy {
+                    WatchPolicy::TenantAnnotationOrKubeconfigName => object
+                        .namespace()
+                        .filter(|namespace| {
+                            definition
+                                .expected_name(namespace)
+                                .is_some_and(|name| name == object.name_any())
+                        })
+                        .map(|namespace| vec![ObjectRef::new(&namespace)])
+                        .unwrap_or_default(),
+                    WatchPolicy::TenantAnnotationOrClusterLabel => object
+                        .labels()
+                        .get("cluster.x-k8s.io/cluster-name")
+                        .filter(|name| !name.is_empty())
+                        .map(|name| vec![ObjectRef::new(name)])
+                        .unwrap_or_default(),
+                    WatchPolicy::TenantAnnotation | WatchPolicy::None => Vec::new(),
+                }
             },
         );
     }

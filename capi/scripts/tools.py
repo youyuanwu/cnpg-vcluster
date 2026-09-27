@@ -13,6 +13,10 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from scripts.lib.config import parse_duration, require
+from scripts.lib.controller_catalog import (
+    load_management_resources,
+    resource_by_kind,
+)
 from scripts.lib.files import (
     IntegrityError,
     ensure_private_dir,
@@ -283,41 +287,45 @@ def _verify_crd_text(
     return document
 
 
-def _verify_provider_schema_contents(contents: dict[str, bytes]) -> None:
+def _verify_provider_schema_contents(root: Path, contents: dict[str, bytes]) -> None:
+    resources = load_management_resources(root)
+    cluster = resource_by_kind(resources, "Cluster")
+    kubeadm = resource_by_kind(resources, "KubeadmConfig")
+    dev_cluster = resource_by_kind(resources, "DevCluster")
+    dev_machine = resource_by_kind(resources, "DevMachine")
+    control_plane = resource_by_kind(resources, "KamajiControlPlane")
+    tenant_control_plane = resource_by_kind(resources, "TenantControlPlane")
     _verify_crd_text(
         contents["capi-core-components.yaml"].decode(),
         "capi-core-components.yaml",
-        "clusters.cluster.x-k8s.io",
-        "v1beta2",
+        cluster.kubectl_resource,
+        cluster.version,
         conversion="Webhook",
     )
     _verify_crd_text(
         contents["capi-bootstrap-components.yaml"].decode(),
         "capi-bootstrap-components.yaml",
-        "kubeadmconfigs.bootstrap.cluster.x-k8s.io",
-        "v1beta2",
+        kubeadm.kubectl_resource,
+        kubeadm.version,
         conversion="Webhook",
     )
-    for resource_name in (
-        "devclusters.infrastructure.cluster.x-k8s.io",
-        "devmachines.infrastructure.cluster.x-k8s.io",
-    ):
+    for resource in (dev_cluster, dev_machine):
         _verify_crd_text(
             contents["capd-components.yaml"].decode(),
             "capd-components.yaml",
-            resource_name,
-            "v1beta2",
+            resource.kubectl_resource,
+            resource.version,
             conversion="Webhook",
         )
     kamaji = _verify_crd_text(
         contents["kamaji-capi-components.yaml"].decode(),
         "kamaji-capi-components.yaml",
-        "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
-        "v1alpha2",
+        control_plane.kubectl_resource,
+        control_plane.version,
         conversion=None,
     )
     for marker in (
-        "cluster.x-k8s.io/v1beta2: v1alpha2",
+        f"cluster.x-k8s.io/{cluster.version}: {control_plane.version}",
         "conditions:",
         "observedGeneration:",
         "reason:",
@@ -330,7 +338,7 @@ def _verify_provider_schema_contents(contents: dict[str, bytes]) -> None:
         if marker not in kamaji:
             raise IntegrityError(f"KamajiControlPlane CRD is missing {marker!r}")
     components = contents["kamaji-capi-components.yaml"].decode()
-    for marker in ("kamaji.clastix.io", "tenantcontrolplanes"):
+    for marker in (tenant_control_plane.group, tenant_control_plane.plural):
         if marker not in components:
             raise IntegrityError(f"Kamaji provider components are missing {marker!r}")
 
@@ -455,7 +463,7 @@ def verify_all_inputs(
             raise IntegrityError(
                 f"{filename} does not contain exactly one {config[image_key]} image"
             )
-    _verify_provider_schema_contents(contents)
+    _verify_provider_schema_contents(root, contents)
     for relative, checksum_key in AUTHORED_INPUTS:
         verify_sha256(root / relative, config[checksum_key])
 

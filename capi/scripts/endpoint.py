@@ -8,6 +8,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from scripts.create_management import create_management
+from scripts.lib.controller_catalog import (
+    load_management_resources,
+    resource_by_kind,
+)
 from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient
 from scripts.lib.management import management_status
@@ -33,13 +37,15 @@ from scripts.lib.tenants import (
 
 
 def _verify_no_worker_state(client: ManagementClient, tenant) -> None:
-    for resource in ("machines", "devmachines", "kubeadmconfigs"):
+    resources = load_management_resources(client.root)
+    for kind in ("Machine", "DevMachine", "KubeadmConfig"):
+        resource = resource_by_kind(resources, kind)
         payload = json.loads(
             client.kubectl(
                 "-n",
                 tenant.namespace,
                 "get",
-                resource,
+                resource.kubectl_resource,
                 "-o",
                 "json",
             ).stdout
@@ -56,9 +62,10 @@ def _verify_no_worker_state(client: ManagementClient, tenant) -> None:
             "json",
         ).stdout
     )
+    kubeconfig_name = resource_by_kind(resources, "Secret").expected_name(tenant.name)
     if any(
         item.get("type") == "cluster.x-k8s.io/secret"
-        and item["metadata"]["name"] not in {f"{tenant.name}-ca", f"{tenant.name}-kubeconfig"}
+        and item["metadata"]["name"] not in {f"{tenant.name}-ca", kubeconfig_name}
         for item in secrets["items"]
     ):
         raise RuntimeError("worker bootstrap Secret existed before worker declaration")
@@ -70,6 +77,10 @@ def _verify_bootstrap_secret(
     tenant,
     registered: dict[str, object],
 ) -> None:
+    kubeadm_definition = resource_by_kind(
+        load_management_resources(client.root),
+        "KubeadmConfig",
+    )
     name = str(registered["secret"])
     secret = json.loads(
         client.kubectl(
@@ -87,15 +98,15 @@ def _verify_bootstrap_secret(
             "-n",
             tenant.namespace,
             "get",
-            f"kubeadmconfig/{name}",
+            f"{kubeadm_definition.kubectl_resource}/{name}",
             "-o",
             "json",
         ).stdout
     )
     owner = owners[0] if len(owners) == 1 else {}
     if (
-        owner.get("apiVersion") != "bootstrap.cluster.x-k8s.io/v1beta2"
-        or owner.get("kind") != "KubeadmConfig"
+        owner.get("apiVersion") != kubeadm_definition.api_version
+        or owner.get("kind") != kubeadm_definition.kind
         or owner.get("name") != name
         or owner.get("uid") != kubeadm["metadata"]["uid"]
         or owner.get("controller") is not True

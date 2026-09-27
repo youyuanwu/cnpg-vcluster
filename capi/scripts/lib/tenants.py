@@ -14,6 +14,7 @@ from typing import Mapping
 
 from .conditions import condition_true
 from .config import parse_duration
+from .controller_catalog import load_management_resources, resource_by_kind
 from .files import (
     IntegrityError,
     ensure_private_dir,
@@ -106,57 +107,6 @@ def _require_resource_markers(
 
 
 NOT_FOUND = re.compile(r"Error from server \(NotFound\):", re.IGNORECASE)
-MANAGEMENT_IDENTITY_KEYS = {
-    "namespace": "namespaceUID",
-    "cluster": "clusterUID",
-    "devcluster": "devClusterUID",
-    "kamajicontrolplane": "controlPlaneUID",
-    "machinedeployment": "machineDeploymentUID",
-    "kubeadmconfigtemplate": "kubeadmTemplateUID",
-    "devmachinetemplate": "devMachineTemplateUID",
-}
-
-
-def management_resource_identities(
-    resources: Mapping[str, object],
-) -> dict[str, str]:
-    return {
-        observed_key: str(resources[kind]["metadata"]["uid"])
-        for kind, observed_key in MANAGEMENT_IDENTITY_KEYS.items()
-        if isinstance(resources.get(kind), dict)
-    }
-
-
-def require_recorded_management_identities(
-    resources: Mapping[str, object],
-    observed: Mapping[str, str],
-    *,
-    require_present: bool,
-) -> None:
-    current = management_resource_identities(resources)
-    changed = []
-    absent = []
-    for observed_key in MANAGEMENT_IDENTITY_KEYS.values():
-        recorded = observed.get(observed_key)
-        if recorded is None:
-            continue
-        actual = current.get(observed_key)
-        if actual is None:
-            if require_present:
-                absent.append(observed_key)
-        elif actual != recorded:
-            changed.append(observed_key)
-    if changed:
-        raise RuntimeError(
-            "tenant management identity changed: " + ", ".join(sorted(changed))
-        )
-    if absent:
-        raise RuntimeError(
-            "recorded tenant management resource is absent: "
-            + ", ".join(sorted(absent))
-        )
-
-
 def inspect_management_resource(
     client: ManagementClient,
     tenant: Tenant,
@@ -211,16 +161,21 @@ def verify_tenant_management_ownership(
         raise RuntimeError(
             f"tenant namespace inspection failed: {namespace_response.stderr}"
         )
-    resources = (
-        ("cluster", tenant.name),
-        ("devcluster", tenant.name),
-        ("kamajicontrolplane", tenant.name),
-        ("machinedeployment", f"{tenant.name}-worker"),
-        ("kubeadmconfigtemplate", f"{tenant.name}-worker"),
-        ("devmachinetemplate", f"{tenant.name}-worker"),
-    )
-    for kind, name in resources:
-        payload = inspect_management_resource(client, tenant, f"{kind}/{name}")
+    resources = load_management_resources(Path(__file__).resolve().parents[2])
+    for definition in resources:
+        if definition.resource_class != "root":
+            continue
+        name = definition.expected_name(tenant.name)
+        if name is None:
+            raise RuntimeError(
+                f"management root has no expected name: {definition.kind}"
+            )
+        kind = definition.kind.lower()
+        payload = inspect_management_resource(
+            client,
+            tenant,
+            f"{definition.kubectl_resource}/{name}",
+        )
         if payload is None:
             continue
         labels = payload["metadata"].get("labels") or {}
@@ -235,11 +190,14 @@ def verify_tenant_management_ownership(
                 f"{kind}/{name}",
             )
         present[kind] = payload
+    machine_definition = resource_by_kind(resources, "Machine")
+    machine_set_definition = resource_by_kind(resources, "MachineSet")
+    deployment_definition = resource_by_kind(resources, "MachineDeployment")
     machines_response = client.kubectl(
         "-n",
         tenant.namespace,
         "get",
-        "machines",
+        machine_definition.kubectl_resource,
         "-l",
         f"cluster.x-k8s.io/cluster-name={tenant.name}",
         "-o",
@@ -262,8 +220,8 @@ def verify_tenant_management_ownership(
                 or labels.get("cnpg-vcluster.capi/nodepool") != "worker"
                 or len(owners) != 1
                 or owners[0].get("apiVersion")
-                != "cluster.x-k8s.io/v1beta2"
-                or owners[0].get("kind") != "MachineSet"
+                != machine_set_definition.api_version
+                or owners[0].get("kind") != machine_set_definition.kind
             ):
                 raise RuntimeError(
                     f"tenant Machine ownership mismatch: "
@@ -272,7 +230,7 @@ def verify_tenant_management_ownership(
             machine_set = inspect_management_resource(
                 client,
                 tenant,
-                f"machineset/{owners[0]['name']}",
+                f"{machine_set_definition.kubectl_resource}/{owners[0]['name']}",
             )
             set_owners = (
                 machine_set["metadata"].get("ownerReferences") or []
@@ -295,10 +253,10 @@ def verify_tenant_management_ownership(
                 or deployment is None
                 or len(set_controller) != 1
                 or set_controller[0].get("apiVersion")
-                != "cluster.x-k8s.io/v1beta2"
-                or set_controller[0].get("kind") != "MachineDeployment"
+                != deployment_definition.api_version
+                or set_controller[0].get("kind") != deployment_definition.kind
                 or set_controller[0].get("name")
-                != f"{tenant.name}-worker"
+                != deployment_definition.expected_name(tenant.name)
                 or set_controller[0].get("uid")
                 != deployment["metadata"]["uid"]
             ):

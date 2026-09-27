@@ -8,9 +8,11 @@
     "class": "root",
     "parentKind": null,
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": true,
+    "namePolicy": "tenant",
+    "watchPolicy": "tenant-annotation-or-cluster-label",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -22,9 +24,11 @@
     "class": "root",
     "parentKind": "Cluster",
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": true,
+    "namePolicy": "tenant",
+    "watchPolicy": "tenant-annotation-or-cluster-label",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -36,9 +40,11 @@
     "class": "root",
     "parentKind": "Cluster",
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": true,
+    "namePolicy": "tenant",
+    "watchPolicy": "tenant-annotation-or-cluster-label",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -50,9 +56,11 @@
     "class": "root",
     "parentKind": "Cluster",
     "alternateParentKind": "MachineDeployment",
-    "workerSuffix": true,
-    "watched": true,
+    "namePolicy": "worker",
+    "watchPolicy": "tenant-annotation-or-cluster-label",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -64,9 +72,11 @@
     "class": "root",
     "parentKind": "Cluster",
     "alternateParentKind": "MachineDeployment",
-    "workerSuffix": true,
-    "watched": true,
+    "namePolicy": "worker",
+    "watchPolicy": "tenant-annotation-or-cluster-label",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -78,9 +88,11 @@
     "class": "root",
     "parentKind": "Cluster",
     "alternateParentKind": null,
-    "workerSuffix": true,
-    "watched": true,
+    "namePolicy": "worker",
+    "watchPolicy": "tenant-annotation-or-cluster-label",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -92,9 +104,11 @@
     "class": "descendant",
     "parentKind": "MachineDeployment",
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": true,
+    "namePolicy": "observed",
+    "watchPolicy": "tenant-annotation-or-cluster-label",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -106,9 +120,11 @@
     "class": "descendant",
     "parentKind": "MachineSet",
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": true,
+    "namePolicy": "observed",
+    "watchPolicy": "tenant-annotation-or-cluster-label",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -120,9 +136,11 @@
     "class": "descendant",
     "parentKind": "Machine",
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": true,
+    "namePolicy": "observed",
+    "watchPolicy": "tenant-annotation-or-cluster-label",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -134,9 +152,11 @@
     "class": "descendant",
     "parentKind": "Machine",
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": false,
+    "namePolicy": "observed",
+    "watchPolicy": "none",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -148,9 +168,11 @@
     "class": "descendant",
     "parentKind": "KamajiControlPlane",
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": false,
+    "namePolicy": "observed",
+    "watchPolicy": "none",
     "inventoryPolicy": "block-any-instance",
+    "inventoryNamespace": null,
+    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -162,9 +184,11 @@
     "class": "typed",
     "parentKind": null,
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": true,
+    "namePolicy": "tenant",
+    "watchPolicy": "tenant-annotation",
     "inventoryPolicy": "tenant-markers",
+    "inventoryNamespace": null,
+    "evidencePolicy": "named",
     "exemptions": [
       "management-infrastructure"
     ]
@@ -178,9 +202,11 @@
     "class": "typed",
     "parentKind": "KamajiControlPlane",
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": true,
+    "namePolicy": "kubeconfig",
+    "watchPolicy": "tenant-annotation-or-kubeconfig-name",
     "inventoryPolicy": "tenant-markers-or-kamaji-owner",
+    "inventoryNamespace": null,
+    "evidencePolicy": "named",
     "exemptions": [
       "controller-installation-secrets"
     ]
@@ -194,9 +220,11 @@
     "class": "typed",
     "parentKind": null,
     "alternateParentKind": null,
-    "workerSuffix": false,
-    "watched": true,
+    "namePolicy": "allocation",
+    "watchPolicy": "tenant-annotation",
     "inventoryPolicy": "allocation-markers",
+    "inventoryNamespace": "tenant-system",
+    "evidencePolicy": "allocation",
     "exemptions": [
       "controller-leader-election"
     ]

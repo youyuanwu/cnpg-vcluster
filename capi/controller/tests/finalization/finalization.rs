@@ -494,7 +494,7 @@ async fn malformed_descendant_and_failed_volume_removal_hold_all_roots() {
                 deployment_resource.api_version,
                 deployment_resource.kind,
                 NAME,
-                &deployment_resource.name(NAME),
+                &deployment_resource.expected_name(NAME).unwrap(),
                 deployment_resource.role,
             );
             deployment.metadata.annotations =

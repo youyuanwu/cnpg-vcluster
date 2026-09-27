@@ -5,6 +5,10 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
+from scripts.lib.controller_catalog import (
+    ManagementResource,
+    load_management_resources,
+)
 from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
 
@@ -79,121 +83,13 @@ def require_clean_controller_state(
         )
     if tenants.returncode != 0:
         raise RuntimeError(f"failed to inspect Tenant resources: {tenants.stderr}")
-    catalog = json.loads(
-        (root / "controller/config/management-resources.json").read_text(
-            encoding="utf-8"
-        )
-    )
-    if not isinstance(catalog, list) or not catalog:
-        raise RuntimeError("management resource catalog is invalid")
-    for entry in catalog:
-        if not isinstance(entry, dict) or set(entry) != {
-            "apiVersion",
-            "kind",
-            "plural",
-            "namespaced",
-            "role",
-            "class",
-            "parentKind",
-            "alternateParentKind",
-            "workerSuffix",
-            "watched",
-            "inventoryPolicy",
-            "exemptions",
-        }:
-            raise RuntimeError("management resource catalog is invalid")
-        if (
-            not isinstance(entry["namespaced"], bool)
-            or not isinstance(entry["role"], str)
-            or not entry["role"]
-            or entry["class"] not in {"root", "descendant", "typed"}
-            or (
-                entry["parentKind"] is not None
-                and not isinstance(entry["parentKind"], str)
-            )
-            or (
-                entry["alternateParentKind"] is not None
-                and not isinstance(entry["alternateParentKind"], str)
-            )
-            or not isinstance(entry["workerSuffix"], bool)
-            or not isinstance(entry["watched"], bool)
-            or not isinstance(entry["exemptions"], list)
-            or not all(isinstance(value, str) for value in entry["exemptions"])
-        ):
-            raise RuntimeError("management resource catalog metadata is invalid")
-        policy = entry["inventoryPolicy"]
-        group, separator, _version = entry["apiVersion"].partition("/")
-        resource = (
-            f"{entry['plural']}.{group}" if separator else entry["plural"]
-        )
-        if policy == "block-any-instance":
-            response = client.kubectl(
-                "get", resource, "-A", "-o", "name", check=False
-            )
-            if response.returncode != 0:
+    for resource in load_management_resources(root):
+        _verify_discovery(client, resource)
+        for item in _inventory(client, resource):
+            if _inventory_blocks(resource, item["metadata"]):
                 raise RuntimeError(
-                    f"failed to inspect provider resource {resource}: "
-                    f"{response.stderr}"
-                )
-            if response.stdout.strip():
-                raise RuntimeError(
-                    f"provider residue blocks activation: {response.stdout.strip()}"
-                )
-            continue
-        if policy == "allocation-markers":
-            document = client.json(
-                "-n", "tenant-system", "get", resource
-            )
-            for item in document.get("items", []):
-                metadata = item.get("metadata", {})
-                if (
-                    "tenancy.cnpg-vcluster.io/slot-id"
-                    in metadata.get("labels", {})
-                    or "tenancy.cnpg-vcluster.io/tenant"
-                    in metadata.get("labels", {})
-                    or metadata.get("annotations", {}).get(
-                        "tenancy.cnpg-vcluster.io/resource"
-                    )
-                    == "allocation-lease"
-                    or "tenancy.cnpg-vcluster.io/slot-id"
-                    in metadata.get("annotations", {})
-                    or "tenancy.cnpg-vcluster.io/tenant"
-                    in metadata.get("annotations", {})
-                    or "tenancy.cnpg-vcluster.io/tenant-uid"
-                    in metadata.get("annotations", {})
-                ):
-                    raise RuntimeError(
-                        "allocation Lease residue blocks activation"
-                    )
-            continue
-        arguments = ["get", resource]
-        if entry["namespaced"]:
-            arguments.append("-A")
-        document = client.json(*arguments)
-        for item in document.get("items", []):
-            metadata = item.get("metadata", {})
-            annotations = metadata.get("annotations", {})
-            owners = metadata.get("ownerReferences", [])
-            marked = (
-                "tenancy.cnpg-vcluster.io/tenant" in annotations
-                or "tenancy.cnpg-vcluster.io/tenant-uid" in annotations
-            )
-            if policy == "tenant-markers-or-kamaji-owner":
-                marked = marked or any(
-                    owner.get("kind") == "KamajiControlPlane"
-                    for owner in owners
-                )
-            if policy not in {
-                "tenant-markers",
-                "tenant-markers-or-kamaji-owner",
-            }:
-                raise RuntimeError(
-                    "management resource catalog inventory policy is invalid"
-                )
-            if marked:
-                raise RuntimeError(
-                    f"{resource} residue blocks activation: "
-                    f"{metadata.get('name', '<unknown>')}"
+                    f"{resource.kubectl_resource} residue blocks activation: "
+                    f"{item['metadata']['name']}"
                 )
     volumes = set(run(
         ["docker", "volume", "ls", "-q"],
@@ -275,6 +171,138 @@ def require_clean_controller_state(
         )
     for namespace, resource in LEGACY_RESOURCES:
         verify_absent(client, namespace, resource)
+
+
+def _verify_discovery(
+    client: ManagementClient,
+    resource: ManagementResource,
+) -> None:
+    response = client.kubectl(
+        "get",
+        f"--raw={resource.discovery_path}",
+        check=False,
+    )
+    if response.returncode != 0:
+        raise RuntimeError(
+            f"failed to discover {resource.api_version} {resource.kind}: "
+            f"{response.stderr}"
+        )
+    try:
+        document = json.loads(response.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(
+            f"invalid discovery response for {resource.api_version} {resource.kind}"
+        ) from exc
+    entries = document.get("resources") if isinstance(document, dict) else None
+    if not isinstance(entries, list) or not any(
+        isinstance(entry, dict)
+        and entry.get("name") == resource.plural
+        and entry.get("kind") == resource.kind
+        and entry.get("namespaced") is resource.namespaced
+        for entry in entries
+    ):
+        raise RuntimeError(
+            f"catalog resource is not served: {resource.api_version} {resource.kind}"
+        )
+
+
+def _inventory(
+    client: ManagementClient,
+    resource: ManagementResource,
+) -> list[dict[str, object]]:
+    arguments = []
+    if resource.inventory_namespace is not None:
+        arguments.extend(["-n", resource.inventory_namespace])
+    arguments.extend(["get", resource.kubectl_resource])
+    if resource.namespaced and resource.inventory_namespace is None:
+        arguments.append("-A")
+    try:
+        document = client.json(*arguments)
+    except RuntimeError as exc:
+        raise RuntimeError(
+            f"failed to inspect {resource.api_version} {resource.kind}"
+        ) from exc
+    items = document.get("items") if isinstance(document, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError(
+            f"invalid inventory response for {resource.api_version} {resource.kind}"
+        )
+    for item in items:
+        metadata = item.get("metadata") if isinstance(item, dict) else None
+        namespace = metadata.get("namespace") if isinstance(metadata, dict) else None
+        if isinstance(metadata, dict):
+            for field, expected in (
+                ("annotations", dict),
+                ("labels", dict),
+                ("ownerReferences", list),
+            ):
+                if field in metadata and not isinstance(metadata[field], expected):
+                    raise RuntimeError(
+                        f"invalid inventory identity for "
+                        f"{resource.api_version} {resource.kind}"
+                    )
+        valid_namespace = (
+            isinstance(namespace, str)
+            and bool(namespace)
+            and (
+                resource.inventory_namespace is None
+                or namespace == resource.inventory_namespace
+            )
+            if resource.namespaced
+            else namespace in (None, "")
+        )
+        if (
+            not isinstance(item, dict)
+            or item.get("apiVersion") != resource.api_version
+            or item.get("kind") != resource.kind
+            or not isinstance(metadata, dict)
+            or not isinstance(metadata.get("name"), str)
+            or not metadata["name"]
+            or not isinstance(metadata.get("uid"), str)
+            or not metadata["uid"]
+            or not valid_namespace
+        ):
+            raise RuntimeError(
+                f"invalid inventory identity for {resource.api_version} {resource.kind}"
+            )
+    return items
+
+
+def _inventory_blocks(
+    resource: ManagementResource,
+    metadata: dict[str, object],
+) -> bool:
+    annotations = metadata.get("annotations")
+    labels = metadata.get("labels")
+    owners = metadata.get("ownerReferences")
+    annotations = annotations if isinstance(annotations, dict) else {}
+    labels = labels if isinstance(labels, dict) else {}
+    owners = owners if isinstance(owners, list) else []
+    tenant_marked = (
+        "tenancy.cnpg-vcluster.io/tenant" in annotations
+        or "tenancy.cnpg-vcluster.io/tenant-uid" in annotations
+    )
+    if resource.inventory_policy == "block-any-instance":
+        return True
+    if resource.inventory_policy == "tenant-markers":
+        return tenant_marked
+    if resource.inventory_policy == "tenant-markers-or-kamaji-owner":
+        return tenant_marked or any(
+            isinstance(owner, dict)
+            and owner.get("kind") == "KamajiControlPlane"
+            for owner in owners
+        )
+    if resource.inventory_policy == "allocation-markers":
+        return (
+            "tenancy.cnpg-vcluster.io/slot-id" in labels
+            or "tenancy.cnpg-vcluster.io/tenant" in labels
+            or annotations.get("tenancy.cnpg-vcluster.io/resource")
+            == "allocation-lease"
+            or "tenancy.cnpg-vcluster.io/slot-id" in annotations
+            or "tenancy.cnpg-vcluster.io/tenant" in annotations
+            or "tenancy.cnpg-vcluster.io/tenant-uid" in annotations
+        )
+    raise RuntimeError("management resource catalog inventory policy is invalid")
 
 
 def activation_ticket(

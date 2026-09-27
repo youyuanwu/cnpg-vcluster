@@ -8,6 +8,7 @@ import time
 from pathlib import Path
 
 from .config import parse_duration
+from .controller_catalog import load_management_resources
 from .controller_client import apply_tenant, delete_tenant
 from .kube import ManagementClient, wait_for
 from .process import run
@@ -397,16 +398,16 @@ def tenant_snapshot(
     if not name:
         raise RuntimeError("Tenant document has no metadata.name")
     management_resources = []
-    for resource, namespace, object_name in (
-        ("namespace", None, name),
-        ("clusters.cluster.x-k8s.io", name, name),
-        ("devclusters.infrastructure.cluster.x-k8s.io", name, name),
-        ("kamajicontrolplanes.controlplane.cluster.x-k8s.io", name, name),
-        ("kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io", name, f"{name}-worker"),
-        ("devmachinetemplates.infrastructure.cluster.x-k8s.io", name, f"{name}-worker"),
-        ("machinedeployments.cluster.x-k8s.io", name, f"{name}-worker"),
-        ("secret", name, f"{name}-kubeconfig"),
-    ):
+    for definition in load_management_resources(root=Path(__file__).resolve().parents[2]):
+        if definition.evidence_policy != "named":
+            continue
+        object_name = definition.expected_name(name)
+        if object_name is None:
+            raise RuntimeError(
+                f"named management evidence has no name: {definition.kind}"
+            )
+        resource = definition.kubectl_resource
+        namespace = name if definition.namespaced else None
         arguments = []
         if namespace is not None:
             arguments.extend(["-n", namespace])

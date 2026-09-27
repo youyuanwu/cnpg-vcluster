@@ -10,6 +10,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration, parse_duration
+from scripts.lib.controller_catalog import (
+    load_management_resources,
+    resource_by_kind,
+)
 from scripts.cnpg import _sql, verify_restart_persistence
 from scripts.lib.host import read_inotify, resolve_host_just
 from scripts.lib.kube import ManagementClient
@@ -168,10 +172,16 @@ def capture_tenant_deletion_identity(
         raise RuntimeError("Tenant identity changed before deletion")
     identity = tenant_snapshot(config, client, current)
     identity["name"] = name
+    cluster = resource_by_kind(
+        load_management_resources(ROOT),
+        "Cluster",
+    )
     cluster_uids = [
         recorded_uid
         for resource, namespace, object_name, recorded_uid in identity["managementResources"]
-        if resource == "clusters.cluster.x-k8s.io" and namespace == name and object_name == name
+        if resource == cluster.kubectl_resource
+        and namespace == name
+        and object_name == cluster.expected_name(name)
     ]
     if (
         identity["dockerVolume"]["name"] != f"{config['LAB_PREFIX']}-{name}-storage"

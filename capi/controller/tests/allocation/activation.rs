@@ -398,12 +398,14 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
             "namespace" => server.insert(
                 &format!("{NAMESPACES}/tenant-a"),
                 json!({"apiVersion":"v1","kind":"Namespace","metadata":{
-                    "name":"tenant-a","annotations":{"tenancy.cnpg-vcluster.io/tenant":"tenant-a"}}}),
+                    "name":"tenant-a","uid":"namespace-uid",
+                    "annotations":{"tenancy.cnpg-vcluster.io/tenant":"tenant-a"}}}),
             ),
             "secret" => server.insert(
                 &format!("{SECRETS}/tenant-a-kubeconfig"),
                 json!({"apiVersion":"v1","kind":"Secret","metadata":{
                     "name":"tenant-a-kubeconfig","namespace":"tenant-a",
+                    "uid":"secret-uid",
                     "ownerReferences":[{"apiVersion":"controlplane.cluster.x-k8s.io/v1alpha2",
                         "kind":"KamajiControlPlane","name":"tenant-a","uid":"cp"}]}}),
             ),
@@ -413,10 +415,10 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
                     metadata: ObjectMeta {
                         name: Some("slot-a".into()),
                         namespace: Some("tenant-system".into()),
-                        labels: Some([(
-                            "tenancy.cnpg-vcluster.io/slot-id".into(),
-                            "slot-a".into(),
-                        )].into()),
+                        uid: Some("lease-uid".into()),
+                        labels: Some(
+                            [("tenancy.cnpg-vcluster.io/slot-id".into(), "slot-a".into())].into(),
+                        ),
                         ..Default::default()
                     },
                     ..Default::default()
@@ -429,13 +431,31 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
                         name: "project-volume".into(),
                         created_at: "now".into(),
                         mountpoint: "/volume".into(),
-                        labels: [(
-                            "cnpg-vcluster.capi/role".into(),
-                            "unexpected-role".into(),
-                        )]
-                        .into(),
+                        labels: [("cnpg-vcluster.capi/role".into(), "unexpected-role".into())]
+                            .into(),
                     },
                 );
+            }
+
+            #[tokio::test]
+            async fn malformed_catalog_inventory_identity_blocks_activation() {
+                let server = clean_server();
+                server.insert(TICKET, ticket("hash-b", "token-b"));
+                server.insert(
+                    &format!("{NAMESPACES}/tenant-a"),
+                    json!({"apiVersion":"v1","kind":"Namespace","metadata":{
+                        "name":"tenant-a"}}),
+                );
+                let error = admit(
+                    server.client(),
+                    &FakeDocker::default(),
+                    "hash-b",
+                    "token-b",
+                    true,
+                )
+                .await
+                .unwrap_err();
+                assert!(error.to_string().contains("inventory identity is invalid"));
             }
             _ => unreachable!(),
         }
@@ -464,6 +484,7 @@ async fn every_allocation_identity_marker_blocks_but_leader_lease_does_not() {
             metadata: ObjectMeta {
                 name: Some("claim".into()),
                 namespace: Some("tenant-system".into()),
+                uid: Some("claim-uid".into()),
                 ..Default::default()
             },
             ..Default::default()
@@ -522,6 +543,7 @@ async fn every_allocation_identity_marker_blocks_but_leader_lease_does_not() {
             metadata: ObjectMeta {
                 name: Some("tenant-controller.tenancy.cnpg-vcluster.io".into()),
                 namespace: Some("tenant-system".into()),
+                uid: Some("leader-uid".into()),
                 ..Default::default()
             },
             ..Default::default()

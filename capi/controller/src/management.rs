@@ -19,6 +19,33 @@ pub enum InventoryPolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum NamePolicy {
+    Tenant,
+    Worker,
+    Kubeconfig,
+    Observed,
+    Allocation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum WatchPolicy {
+    None,
+    TenantAnnotation,
+    TenantAnnotationOrKubeconfigName,
+    TenantAnnotationOrClusterLabel,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidencePolicy {
+    Named,
+    Observed,
+    Allocation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagementResource {
     pub api_version: &'static str,
@@ -29,9 +56,11 @@ pub struct ManagementResource {
     pub class: ResourceClass,
     pub parent_kind: Option<&'static str>,
     pub alternate_parent_kind: Option<&'static str>,
-    pub worker_suffix: bool,
-    pub watched: bool,
+    pub name_policy: NamePolicy,
+    pub watch_policy: WatchPolicy,
     pub inventory_policy: InventoryPolicy,
+    pub inventory_namespace: Option<&'static str>,
+    pub evidence_policy: EvidencePolicy,
     pub exemptions: &'static [&'static str],
 }
 
@@ -40,17 +69,18 @@ impl ManagementResource {
         let (group, version) = self
             .api_version
             .split_once('/')
-            .expect("dynamic management resources use grouped API versions");
+            .unwrap_or(("", self.api_version));
         let mut resource = ApiResource::from_gvk(&GroupVersionKind::gvk(group, version, self.kind));
         resource.plural = self.plural.into();
         resource
     }
 
-    pub fn name(self, tenant: &str) -> String {
-        if self.worker_suffix {
-            format!("{tenant}-worker")
-        } else {
-            tenant.into()
+    pub fn expected_name(self, tenant: &str) -> Option<String> {
+        match self.name_policy {
+            NamePolicy::Tenant => Some(tenant.into()),
+            NamePolicy::Worker => Some(format!("{tenant}-worker")),
+            NamePolicy::Kubeconfig => Some(format!("{tenant}-kubeconfig")),
+            NamePolicy::Observed | NamePolicy::Allocation => None,
         }
     }
 }
@@ -63,7 +93,7 @@ const fn dynamic(
     role: &'static str,
     class: ResourceClass,
     parent_kind: Option<&'static str>,
-    worker_suffix: bool,
+    name_policy: NamePolicy,
     watched: bool,
 ) -> ManagementResource {
     ManagementResource {
@@ -75,9 +105,19 @@ const fn dynamic(
         class,
         parent_kind,
         alternate_parent_kind: None,
-        worker_suffix,
-        watched,
+        name_policy,
+        watch_policy: if watched {
+            WatchPolicy::TenantAnnotationOrClusterLabel
+        } else {
+            WatchPolicy::None
+        },
         inventory_policy: InventoryPolicy::BlockAnyInstance,
+        inventory_namespace: None,
+        evidence_policy: if matches!(class, ResourceClass::Root) {
+            EvidencePolicy::Named
+        } else {
+            EvidencePolicy::Observed
+        },
         exemptions: &[],
     }
 }
@@ -95,7 +135,7 @@ const fn template(
         role,
         ResourceClass::Root,
         Some("Cluster"),
-        true,
+        NamePolicy::Worker,
         true,
     );
     resource.alternate_parent_kind = Some("MachineDeployment");
@@ -110,7 +150,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         "cluster",
         ResourceClass::Root,
         None,
-        false,
+        NamePolicy::Tenant,
         true,
     ),
     dynamic(
@@ -120,7 +160,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         "dev-cluster",
         ResourceClass::Root,
         Some("Cluster"),
-        false,
+        NamePolicy::Tenant,
         true,
     ),
     dynamic(
@@ -130,7 +170,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         "kamaji-control-plane",
         ResourceClass::Root,
         Some("Cluster"),
-        false,
+        NamePolicy::Tenant,
         true,
     ),
     template(
@@ -152,7 +192,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         "machine-deployment",
         ResourceClass::Root,
         Some("Cluster"),
-        true,
+        NamePolicy::Worker,
         true,
     ),
     dynamic(
@@ -162,7 +202,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         "machine",
         ResourceClass::Descendant,
         Some("MachineDeployment"),
-        false,
+        NamePolicy::Observed,
         true,
     ),
     dynamic(
@@ -172,7 +212,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         "machine",
         ResourceClass::Descendant,
         Some("MachineSet"),
-        false,
+        NamePolicy::Observed,
         true,
     ),
     dynamic(
@@ -182,7 +222,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         "machine",
         ResourceClass::Descendant,
         Some("Machine"),
-        false,
+        NamePolicy::Observed,
         true,
     ),
     dynamic(
@@ -192,7 +232,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         "machine",
         ResourceClass::Descendant,
         Some("Machine"),
-        false,
+        NamePolicy::Observed,
         false,
     ),
     dynamic(
@@ -202,7 +242,7 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         "provider",
         ResourceClass::Descendant,
         Some("KamajiControlPlane"),
-        false,
+        NamePolicy::Observed,
         false,
     ),
     ManagementResource {
@@ -214,9 +254,11 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         class: ResourceClass::Typed,
         parent_kind: None,
         alternate_parent_kind: None,
-        worker_suffix: false,
-        watched: true,
+        name_policy: NamePolicy::Tenant,
+        watch_policy: WatchPolicy::TenantAnnotation,
         inventory_policy: InventoryPolicy::TenantMarkers,
+        inventory_namespace: None,
+        evidence_policy: EvidencePolicy::Named,
         exemptions: &["management-infrastructure"],
     },
     ManagementResource {
@@ -228,9 +270,11 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         class: ResourceClass::Typed,
         parent_kind: Some("KamajiControlPlane"),
         alternate_parent_kind: None,
-        worker_suffix: false,
-        watched: true,
+        name_policy: NamePolicy::Kubeconfig,
+        watch_policy: WatchPolicy::TenantAnnotationOrKubeconfigName,
         inventory_policy: InventoryPolicy::TenantMarkersOrKamajiOwner,
+        inventory_namespace: None,
+        evidence_policy: EvidencePolicy::Named,
         exemptions: &["controller-installation-secrets"],
     },
     ManagementResource {
@@ -242,9 +286,11 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         class: ResourceClass::Typed,
         parent_kind: None,
         alternate_parent_kind: None,
-        worker_suffix: false,
-        watched: true,
+        name_policy: NamePolicy::Allocation,
+        watch_policy: WatchPolicy::TenantAnnotation,
         inventory_policy: InventoryPolicy::AllocationMarkers,
+        inventory_namespace: Some("tenant-system"),
+        evidence_policy: EvidencePolicy::Allocation,
         exemptions: &["controller-leader-election"],
     },
 ];
@@ -267,7 +313,7 @@ pub fn watched() -> impl Iterator<Item = ManagementResource> {
     MANAGEMENT_RESOURCES
         .iter()
         .copied()
-        .filter(|resource| resource.watched)
+        .filter(|resource| resource.watch_policy != WatchPolicy::None)
 }
 
 pub fn activation_resources() -> impl Iterator<Item = ManagementResource> {
@@ -311,11 +357,9 @@ mod tests {
             ]
         );
         for kind in ["Namespace", "Secret", "Lease"] {
-            assert!(
-                MANAGEMENT_RESOURCES
-                    .iter()
-                    .any(|resource| resource.kind == kind && resource.watched)
-            );
+            assert!(MANAGEMENT_RESOURCES.iter().any(|resource| {
+                resource.kind == kind && resource.watch_policy != WatchPolicy::None
+            }));
         }
         const CREATED_ROOTS: &[&str] = &[
             "Cluster",
@@ -343,12 +387,58 @@ mod tests {
             CREATED_ROOTS
         );
         assert_eq!(
+            watched().map(|resource| resource.kind).collect::<Vec<_>>(),
+            [
+                "Cluster",
+                "DevCluster",
+                "KamajiControlPlane",
+                "KubeadmConfigTemplate",
+                "DevMachineTemplate",
+                "MachineDeployment",
+                "MachineSet",
+                "Machine",
+                "DevMachine",
+                "Namespace",
+                "Secret",
+                "Lease",
+            ]
+        );
+        assert_eq!(
             watched()
                 .filter(|resource| resource.class != ResourceClass::Typed)
                 .map(|resource| resource.kind)
                 .collect::<Vec<_>>(),
             DYNAMIC_WATCHES
         );
+        assert_eq!(
+            MANAGEMENT_RESOURCES
+                .iter()
+                .find(|resource| resource.kind == "Secret")
+                .and_then(|resource| resource.expected_name("tenant-a"))
+                .as_deref(),
+            Some("tenant-a-kubeconfig")
+        );
+        assert_eq!(
+            MANAGEMENT_RESOURCES
+                .iter()
+                .find(|resource| resource.kind == "Machine")
+                .and_then(|resource| resource.expected_name("tenant-a")),
+            None
+        );
+        let namespace = MANAGEMENT_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == "Namespace")
+            .unwrap();
+        let namespace_api = namespace.api_resource();
+        assert_eq!(namespace_api.group, "");
+        assert_eq!(namespace_api.version, "v1");
+        assert_eq!(namespace_api.plural, "namespaces");
+        let lease = MANAGEMENT_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == "Lease")
+            .unwrap();
+        assert_eq!(lease.inventory_namespace, Some("tenant-system"));
+        assert_eq!(lease.evidence_policy, EvidencePolicy::Allocation);
         assert_eq!(
             descendants()
                 .filter(|resource| resource.role != "provider")

@@ -257,9 +257,12 @@ impl<D: DockerClient> Finalizer<D> {
         let root_kinds: Vec<_> = management::roots().collect();
         let mut roots = Vec::with_capacity(root_kinds.len());
         for root in &root_kinds {
-            let object = dynamic_get(self.client.clone(), *root, name, &root.name(name)).await?;
+            let expected_name = root
+                .expected_name(name)
+                .ok_or_else(|| invalid("management root has no declared name"))?;
+            let object = dynamic_get(self.client.clone(), *root, name, &expected_name).await?;
             if let Some(object) = &object {
-                if object.metadata.name.as_deref() != Some(root.name(name).as_str())
+                if object.metadata.name.as_deref() != Some(expected_name.as_str())
                     || object.metadata.namespace.as_deref() != Some(name)
                     || object.types.as_ref().is_none_or(|types| {
                         types.kind != root.kind || types.api_version != root.api_version
@@ -553,7 +556,9 @@ impl<D: DockerClient> Finalizer<D> {
                 &kind.api_resource(),
             )
             .delete(
-                &kind.name(namespace),
+                &kind
+                    .expected_name(namespace)
+                    .ok_or_else(|| invalid("management root has no declared name"))?,
                 &exact_delete(uid(&observed.metadata)?, version(&observed.metadata)?),
             )
             .await?;

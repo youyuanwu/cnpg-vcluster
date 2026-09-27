@@ -11,6 +11,7 @@ from .kube import ManagementClient, wait_for
 from .tenants import NOT_FOUND, Tenant, _tenant_kubectl
 from .config import parse_duration
 from .conditions import condition_true
+from .controller_catalog import load_management_resources, resource_by_kind
 
 
 SOURCE_LIMIT = 900 * 1024
@@ -154,6 +155,13 @@ def wait_network_ready(
     timeout = parse_duration(config["TENANT_CONTROL_PLANE_TIMEOUT"])
     interval = parse_duration(config["WAIT_POLL_INTERVAL"])
     client = ManagementClient(root, config)
+    deployment = resource_by_kind(
+        load_management_resources(root),
+        "MachineDeployment",
+    )
+    deployment_name = deployment.expected_name(tenant.name)
+    if deployment_name is None:
+        raise RuntimeError("MachineDeployment has no expected name")
 
     def ready():
         node = json.loads(
@@ -164,7 +172,7 @@ def wait_network_ready(
                 "-n",
                 tenant.namespace,
                 "get",
-                f"machinedeployment/{tenant.name}-worker",
+                f"{deployment.kubectl_resource}/{deployment_name}",
                 "-o",
                 "json",
             ).stdout
@@ -349,6 +357,13 @@ def network_status(
     strict: bool = False,
 ) -> dict[str, object]:
     result: dict[str, object] = {"ready": False}
+    deployment_definition = resource_by_kind(
+        load_management_resources(root),
+        "MachineDeployment",
+    )
+    deployment_name = deployment_definition.expected_name(tenant.name)
+    if deployment_name is None:
+        raise RuntimeError("MachineDeployment has no expected name")
     if not (root / ".runtime" / "tenants" / tenant.name / "kubeconfig").is_file():
         result["reason"] = "kubeconfig-missing"
         return result
@@ -375,7 +390,7 @@ def network_status(
                 "-n",
                 tenant.namespace,
                 "get",
-                f"machinedeployment/{tenant.name}-worker",
+                f"{deployment_definition.kubectl_resource}/{deployment_name}",
                 "-o",
                 "json",
             ).stdout

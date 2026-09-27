@@ -1,10 +1,7 @@
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
-use k8s_openapi::api::{
-    coordination::v1::Lease,
-    core::v1::{ConfigMap, Namespace, Secret},
-};
+use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::{
     Api, Client, ResourceExt,
@@ -16,7 +13,7 @@ use crate::{
     api::Tenant,
     docker::{DockerClient, WORKER_ROLE_LABEL},
     error::ControllerError,
-    management::{InventoryPolicy, activation_resources},
+    management::{InventoryPolicy, ManagementResource, activation_resources},
 };
 
 pub const STATE_NAME: &str = "tenant-controller-state";
@@ -179,84 +176,23 @@ async fn require_clean_inventory<D: DockerClient>(
             "Tenant resources block configuration activation".into(),
         ));
     }
-    for resource in activation_resources()
-        .filter(|resource| resource.inventory_policy == InventoryPolicy::BlockAnyInstance)
-    {
-        let items = Api::<DynamicObject>::all_with(client.clone(), &resource.api_resource())
-            .list(&ListParams::default())
-            .await;
-        match items {
-            Ok(items) if items.items.is_empty() => {}
-            Ok(_) => {
+    for resource in activation_resources() {
+        let api = match resource.inventory_namespace {
+            Some(namespace) => Api::<DynamicObject>::namespaced_with(
+                client.clone(),
+                namespace,
+                &resource.api_resource(),
+            ),
+            None => Api::<DynamicObject>::all_with(client.clone(), &resource.api_resource()),
+        };
+        for item in api.list(&ListParams::default()).await? {
+            validate_inventory_item(resource, &item)?;
+            if inventory_blocks(resource, &item) {
                 return Err(ControllerError::Configuration(format!(
                     "{} resources block configuration activation",
                     resource.kind
                 )));
             }
-            Err(error) => return Err(error.into()),
-        }
-    }
-    for namespace in Api::<Namespace>::all(client.clone())
-        .list(&ListParams::default())
-        .await?
-    {
-        let annotations = namespace.metadata.annotations.as_ref();
-        if annotations.is_some_and(|annotations| {
-            annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
-                || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
-        }) {
-            return Err(ControllerError::Configuration(
-                "Tenant Namespace residue blocks configuration activation".into(),
-            ));
-        }
-    }
-    for secret in Api::<Secret>::all(client.clone())
-        .list(&ListParams::default())
-        .await?
-    {
-        let annotations = secret.metadata.annotations.as_ref();
-        if annotations.is_some_and(|annotations| {
-            annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
-                || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
-        }) || secret
-            .metadata
-            .owner_references
-            .as_ref()
-            .is_some_and(|owners| {
-                owners
-                    .iter()
-                    .any(|owner| owner.kind == "KamajiControlPlane")
-            })
-        {
-            return Err(ControllerError::Configuration(
-                "Tenant credential residue blocks configuration activation".into(),
-            ));
-        }
-    }
-    for lease in Api::<Lease>::namespaced(client.clone(), NAMESPACE)
-        .list(&ListParams::default())
-        .await?
-    {
-        if lease.metadata.labels.as_ref().is_some_and(|labels| {
-            labels.contains_key("tenancy.cnpg-vcluster.io/slot-id")
-                || labels.contains_key("tenancy.cnpg-vcluster.io/tenant")
-        }) || lease
-            .metadata
-            .annotations
-            .as_ref()
-            .is_some_and(|annotations| {
-                annotations
-                    .get("tenancy.cnpg-vcluster.io/resource")
-                    .map(String::as_str)
-                    == Some("allocation-lease")
-                    || annotations.contains_key("tenancy.cnpg-vcluster.io/slot-id")
-                    || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
-                    || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
-            })
-        {
-            return Err(ControllerError::Configuration(
-                "allocation Lease residue blocks configuration activation".into(),
-            ));
         }
     }
     if docker
@@ -307,4 +243,73 @@ async fn require_clean_inventory<D: DockerClient>(
         ));
     }
     Ok(())
+}
+
+fn validate_inventory_item(
+    resource: ManagementResource,
+    item: &DynamicObject,
+) -> Result<(), ControllerError> {
+    let valid_type = item.types.as_ref().is_some_and(|types| {
+        types.api_version == resource.api_version && types.kind == resource.kind
+    });
+    let valid_namespace = if resource.namespaced {
+        item.metadata.namespace.as_deref().is_some_and(|namespace| {
+            !namespace.is_empty()
+                && resource
+                    .inventory_namespace
+                    .is_none_or(|expected| namespace == expected)
+        })
+    } else {
+        item.metadata.namespace.as_deref().is_none_or(str::is_empty)
+    };
+    if !valid_type
+        || !valid_namespace
+        || item.metadata.name.as_deref().is_none_or(str::is_empty)
+        || item.metadata.uid.as_deref().is_none_or(str::is_empty)
+    {
+        return Err(ControllerError::Configuration(format!(
+            "{} inventory identity is invalid",
+            resource.kind
+        )));
+    }
+    Ok(())
+}
+
+fn inventory_blocks(resource: ManagementResource, item: &DynamicObject) -> bool {
+    let annotations = item.metadata.annotations.as_ref();
+    let labels = item.metadata.labels.as_ref();
+    let tenant_marked = annotations.is_some_and(|annotations| {
+        annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
+            || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
+    });
+    match resource.inventory_policy {
+        InventoryPolicy::BlockAnyInstance => true,
+        InventoryPolicy::TenantMarkers => tenant_marked,
+        InventoryPolicy::TenantMarkersOrKamajiOwner => {
+            tenant_marked
+                || item
+                    .metadata
+                    .owner_references
+                    .as_ref()
+                    .is_some_and(|owners| {
+                        owners
+                            .iter()
+                            .any(|owner| owner.kind == "KamajiControlPlane")
+                    })
+        }
+        InventoryPolicy::AllocationMarkers => {
+            labels.is_some_and(|labels| {
+                labels.contains_key("tenancy.cnpg-vcluster.io/slot-id")
+                    || labels.contains_key("tenancy.cnpg-vcluster.io/tenant")
+            }) || annotations.is_some_and(|annotations| {
+                annotations
+                    .get("tenancy.cnpg-vcluster.io/resource")
+                    .map(String::as_str)
+                    == Some("allocation-lease")
+                    || annotations.contains_key("tenancy.cnpg-vcluster.io/slot-id")
+                    || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
+                    || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
+            })
+        }
+    }
 }
