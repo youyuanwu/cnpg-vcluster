@@ -1,3 +1,17 @@
+import json
+import tempfile
+from pathlib import Path
+
+from scripts.lib.azure.common import (
+    FOUNDATION_INVENTORY_SCHEMA,
+    _foundation_defaults_checksum,
+    names,
+)
+from scripts.lib.files import write_private_file
+from scripts.lib.tenant_runtime import TenantRuntime
+from scripts.lib.tenant_spec import TenantSpec
+
+
 DEFAULTS = """\
 AZURE_AKS_KUBERNETES_VERSION=1.35.7
 AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION=1.32.13
@@ -44,3 +58,104 @@ FOUNDATION = {
     "controller:kamaji-system/kamaji": "kamaji-uid",
     "controller:kamaji-system/capi-kamaji-controller-manager": "provider-uid",
 }
+
+
+class AzureFixtureMixin:
+    def make_root(self) -> Path:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / "config" / "azure").mkdir(parents=True)
+        (root / "config" / "azure" / "defaults.env").write_text(
+            DEFAULTS,
+            encoding="utf-8",
+        )
+        local = root / "config" / "azure.local.env"
+        local.write_text(
+            f"AZURE_SUBSCRIPTION_ID={SUBSCRIPTION}\n"
+            "AZURE_LOCATION=westus2\n"
+            "AZURE_PREFIX=yy-cv\n",
+            encoding="utf-8",
+        )
+        local.chmod(0o600)
+        return root
+
+    @staticmethod
+    def spec(name: str = "tenant-c", **overrides) -> TenantSpec:
+        payload = {
+            "schema": 1,
+            "profile": "azure",
+            "name": name,
+            "kubernetesVersion": "1.32.13",
+            "workers": 1,
+            "podCIDR": "10.72.0.0/16",
+            "serviceCIDR": "10.142.0.0/16",
+        }
+        payload.update(overrides)
+        return TenantSpec.from_mapping(
+            payload,
+            expected_profile="azure",
+            supported_versions={"azure": "1.32.13"},
+        )
+
+    def start_journal(self, root: Path, spec: TenantSpec):
+        runtime = TenantRuntime(root, spec.name)
+        journal = runtime.start_operation(
+            operation="create",
+            spec=spec,
+            foundation_identity=FOUNDATION,
+            intended_resources=(f"Cluster/{spec.name}",),
+            operation_id="operation-1",
+        )
+        journal = runtime.update_operation(
+            journal,
+            phase="markers-recorded",
+            observed={"markerOperationId": journal.operation_id},
+        )
+        return runtime, journal
+
+    def inventory(self, root: Path, config: dict[str, str]) -> dict[str, object]:
+        outputs = {
+            "resourceGroupName": "yy-cv-rg",
+            "resourceGroupId": FOUNDATION["resourceGroupId"],
+            "aksName": "yy-cv-mgmt",
+            "aksId": FOUNDATION["aksId"],
+            "aksNodeResourceGroup": FOUNDATION["aksNodeResourceGroup"],
+            "aksOidcIssuer": FOUNDATION["aksOidcIssuer"],
+            "vnetName": "yy-cv-vnet",
+            "vnetId": FOUNDATION["vnetId"],
+            "aksSubnetName": "aks",
+            "aksSubnetId": FOUNDATION["aksSubnetId"],
+            "tenantSubnetName": "tenant",
+            "tenantSubnetId": FOUNDATION["tenantSubnetId"],
+            "identityName": "yy-cv-identity",
+            "identityId": FOUNDATION["identityId"],
+            "identityClientId": "client-id",
+            "tenantId": "tenant-id",
+            "roleAssignmentId": FOUNDATION["roleAssignmentId"],
+            "aksRoleAssignmentId": FOUNDATION["aksRoleAssignmentId"],
+            "capzFederationId": FOUNDATION["capzFederationId"],
+            "asoFederationId": FOUNDATION["asoFederationId"],
+        }
+        controllers = {
+            key.removeprefix("controller:"): value
+            for key, value in FOUNDATION.items()
+            if key.startswith("controller:")
+        }
+        return {
+            "schema": FOUNDATION_INVENTORY_SCHEMA,
+            "subscriptionId": SUBSCRIPTION,
+            "location": "westus2",
+            "prefix": "yy-cv",
+            "names": names(config),
+            "foundationDefaultsSha256": _foundation_defaults_checksum(root, config),
+            "deploymentId": "/subscriptions/redacted/providers/Microsoft.Resources/deployments/yy-cv-foundation",
+            "deploymentName": "yy-cv-foundation",
+            "outputs": outputs,
+            "controllers": controllers,
+        }
+
+    def write_inventory(self, root: Path, payload: dict[str, object]) -> Path:
+        path = root / ".runtime" / "azure" / "resources.json"
+        write_private_file(path, json.dumps(payload))
+        return path

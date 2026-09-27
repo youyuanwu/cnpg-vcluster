@@ -61,57 +61,13 @@ from scripts.lib.tenant_timing import TenantTimings, record_rejected_create
 from scripts.lib.tenants import LIFECYCLE_MARKERS, lifecycle_markers
 
 
-DEFAULTS = """\
-AZURE_AKS_KUBERNETES_VERSION=1.35.7
-AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION=1.32.13
-AZURE_AKS_NODE_SKU=Standard_D4as_v5
-AZURE_TENANT_NODE_SKU=Standard_B2s
-AZURE_AKS_NODE_COUNT=2
-AZURE_VNET_CIDR=10.220.0.0/16
-AZURE_AKS_SUBNET_CIDR=10.220.0.0/20
-AZURE_TENANT_SUBNET_CIDR=10.220.16.0/20
-AZURE_AKS_POD_CIDR=10.221.0.0/16
-AZURE_AKS_SERVICE_CIDR=10.222.0.0/16
-AZURE_AKS_DNS_SERVICE_IP=10.222.0.10
-AZURE_CAPI_VERSION=v1.10.7
-AZURE_CAPZ_VERSION=v1.21.1
-AZURE_KAMAJI_CAPI_VERSION=v0.19.0
-AZURE_KAMAJI_CHART_VERSION=26.8.6-edge
-AZURE_CLOUD_PROVIDER_VERSION=v1.32.3
-AZURE_CALICO_VERSION=v3.32.2
-AZURE_DEPLOY_TIMEOUT=30m
-AZURE_CONTROLLER_TIMEOUT=15m
-AZURE_TENANT_TIMEOUT=20m
-"""
-SUBSCRIPTION = "00000000-0000-0000-0000-000000000000"
-FOUNDATION = {
-    "foundationDefaultsSha256": "foundation-checksum",
-    "resourceGroupId": "/subscriptions/redacted/resourceGroups/yy-cv-rg",
-    "aksId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ContainerService/managedClusters/yy-cv-mgmt",
-    "aksNodeResourceGroup": "MC_yy-cv-rg_yy-cv-mgmt_westus2",
-    "aksOidcIssuer": "https://example.invalid/issuer",
-    "vnetId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.Network/virtualNetworks/yy-cv-vnet",
-    "aksSubnetId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.Network/virtualNetworks/yy-cv-vnet/subnets/aks",
-    "tenantSubnetId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.Network/virtualNetworks/yy-cv-vnet/subnets/tenant",
-    "identityId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/yy-cv-identity",
-    "roleAssignmentId": "/subscriptions/redacted/providers/Microsoft.Authorization/roleAssignments/role",
-    "aksRoleAssignmentId": "/subscriptions/redacted/providers/Microsoft.Authorization/roleAssignments/aks-role",
-    "capzFederationId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/yy-cv-identity/federatedIdentityCredentials/capz-manager",
-    "asoFederationId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/yy-cv-identity/federatedIdentityCredentials/azureserviceoperator-default",
-    "controller:capi-system/capi-controller-manager": "capi-uid",
-    "controller:capi-kubeadm-bootstrap-system/capi-kubeadm-bootstrap-controller-manager": "cabpk-uid",
-    "controller:capz-system/capz-controller-manager": "capz-uid",
-    "controller:capz-system/azureserviceoperator-controller-manager": "aso-uid",
-    "controller:kamaji-system/kamaji": "kamaji-uid",
-    "controller:kamaji-system/capi-kamaji-controller-manager": "provider-uid",
-}
-
+from tests.azure_fixtures import AzureFixtureMixin, DEFAULTS, FOUNDATION, SUBSCRIPTION
 
 def completed(stdout: str = "", returncode: int = 0):
     return subprocess.CompletedProcess([], returncode, stdout=stdout, stderr="")
 
 
-class AzurePhaseFourTests(unittest.TestCase):
+class AzurePhaseFourTests(AzureFixtureMixin, unittest.TestCase):
     def test_ready_wait_retries_until_cloud_and_network_converge(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -151,60 +107,6 @@ class AzurePhaseFourTests(unittest.TestCase):
                 "/subscriptions/x/resourceGroups/b",
             )
         )
-
-    def make_root(self) -> Path:
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        root = Path(temporary.name)
-        (root / "config" / "azure").mkdir(parents=True)
-        (root / "config" / "azure" / "defaults.env").write_text(
-            DEFAULTS,
-            encoding="utf-8",
-        )
-        local = root / "config" / "azure.local.env"
-        local.write_text(
-            f"AZURE_SUBSCRIPTION_ID={SUBSCRIPTION}\n"
-            "AZURE_LOCATION=westus2\n"
-            "AZURE_PREFIX=yy-cv\n",
-            encoding="utf-8",
-        )
-        local.chmod(0o600)
-        return root
-
-    @staticmethod
-    def spec(name: str = "tenant-c", **overrides) -> TenantSpec:
-        payload = {
-            "schema": 1,
-            "profile": "azure",
-            "name": name,
-            "kubernetesVersion": "1.32.13",
-            "workers": 1,
-            "podCIDR": "10.72.0.0/16",
-            "serviceCIDR": "10.142.0.0/16",
-        }
-        payload.update(overrides)
-        return TenantSpec.from_mapping(
-            payload,
-            expected_profile="azure",
-            supported_versions={"azure": "1.32.13"},
-        )
-
-    def start_journal(self, root: Path, spec: TenantSpec):
-        runtime = TenantRuntime(root, spec.name)
-        journal = runtime.start_operation(
-            operation="create",
-            spec=spec,
-            foundation_identity=FOUNDATION,
-            intended_resources=(f"Cluster/{spec.name}",),
-            operation_id="operation-1",
-        )
-        journal = runtime.update_operation(
-            journal,
-            phase="markers-recorded",
-            observed={"markerOperationId": journal.operation_id},
-        )
-        return runtime, journal
-
     def test_tenant_timing_evidence_is_azure_only(self):
         root = self.make_root()
         timings = TenantTimings(
@@ -234,184 +136,19 @@ class AzurePhaseFourTests(unittest.TestCase):
         )
         self.assertFalse((root / ".runtime/lifecycle/rejected/local").exists())
 
-    def inventory(self, root: Path, config: dict[str, str]) -> dict[str, object]:
-        outputs = {
-            "resourceGroupName": "yy-cv-rg",
-            "resourceGroupId": FOUNDATION["resourceGroupId"],
-            "aksName": "yy-cv-mgmt",
-            "aksId": FOUNDATION["aksId"],
-            "aksNodeResourceGroup": FOUNDATION["aksNodeResourceGroup"],
-            "aksOidcIssuer": FOUNDATION["aksOidcIssuer"],
-            "vnetName": "yy-cv-vnet",
-            "vnetId": FOUNDATION["vnetId"],
-            "aksSubnetName": "aks",
-            "aksSubnetId": FOUNDATION["aksSubnetId"],
-            "tenantSubnetName": "tenant",
-            "tenantSubnetId": FOUNDATION["tenantSubnetId"],
-            "identityName": "yy-cv-identity",
-            "identityId": FOUNDATION["identityId"],
-            "identityClientId": "client-id",
-            "tenantId": "tenant-id",
-            "roleAssignmentId": FOUNDATION["roleAssignmentId"],
-            "aksRoleAssignmentId": FOUNDATION["aksRoleAssignmentId"],
-            "capzFederationId": FOUNDATION["capzFederationId"],
-            "asoFederationId": FOUNDATION["asoFederationId"],
-        }
-        controllers = {
-            key.removeprefix("controller:"): value
-            for key, value in FOUNDATION.items()
-            if key.startswith("controller:")
-        }
-        return {
-            "schema": FOUNDATION_INVENTORY_SCHEMA,
-            "subscriptionId": SUBSCRIPTION,
-            "location": "westus2",
-            "prefix": "yy-cv",
-            "names": names(config),
-            "foundationDefaultsSha256": _foundation_defaults_checksum(root, config),
-            "deploymentId": "/subscriptions/redacted/providers/Microsoft.Resources/deployments/yy-cv-foundation",
-            "deploymentName": "yy-cv-foundation",
-            "outputs": outputs,
-            "controllers": controllers,
-        }
 
-    def write_inventory(self, root: Path, payload: dict[str, object]) -> Path:
-        path = root / ".runtime" / "azure" / "resources.json"
-        write_private_file(path, json.dumps(payload))
-        return path
 
-    def test_configuration_contains_only_foundation_and_profile_limits(self):
-        root = self.make_root()
-        config = load_azure_configuration(root)
-        self.assertEqual(config["AZURE_PREFIX"], "yy-cv")
-        for removed in (
-            "AZURE_TENANT_NODE_COUNT",
-            "AZURE_TENANT_POD_CIDR",
-            "AZURE_TENANT_SERVICE_CIDR",
-            "AZURE_TENANT_DNS_SERVICE_IP",
-        ):
-            self.assertNotIn(removed, config)
-        self.assertEqual(
-            config["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
-            "1.32.13",
-        )
 
-    def test_preflight_output_does_not_expose_subscription_id(self):
-        root = self.make_root()
-        config = load_azure_configuration(root)
-        output = io.StringIO()
-        with (
-            patch(
-                "scripts.lib.azure.foundation._active_subscription",
-                return_value={"id": SUBSCRIPTION, "state": "Enabled"},
-            ),
-            patch("scripts.lib.azure.foundation._az", return_value=completed("Registered\n")),
-            patch("scripts.lib.azure.foundation._sku_available"),
-            patch("scripts.lib.azure.foundation._reference_image_available"),
-            patch("scripts.lib.azure.foundation.run", return_value=completed()),
-            redirect_stdout(output),
-        ):
-            result = preflight(root, config)
-        self.assertEqual(result["subscriptionId"], SUBSCRIPTION)
-        self.assertNotIn(SUBSCRIPTION, output.getvalue())
 
-    def test_rejects_broad_local_parameter_permissions(self):
-        root = self.make_root()
-        (root / "config" / "azure.local.env").chmod(0o644)
-        with self.assertRaisesRegex(ConfigError, "owner-only"):
-            load_azure_configuration(root)
 
-    def test_rejects_invalid_prefix(self):
-        root = self.make_root()
-        path = root / "config" / "azure.local.env"
-        path.write_text(
-            f"AZURE_SUBSCRIPTION_ID={SUBSCRIPTION}\n"
-            "AZURE_LOCATION=westus2\nAZURE_PREFIX=YY_cv\n",
-            encoding="utf-8",
-        )
-        path.chmod(0o600)
-        with self.assertRaisesRegex(ConfigError, "AZURE_PREFIX"):
-            load_azure_configuration(root)
 
-    def test_rejects_pre_cutover_tenant_configuration(self):
-        root = self.make_root()
-        path = root / "config" / "azure.local.env"
-        with path.open("a", encoding="utf-8") as output:
-            output.write("AZURE_TENANT_NODE_COUNT=1\n")
-        with self.assertRaisesRegex(ConfigError, "pre-cutover Azure tenant configuration"):
-            load_azure_configuration(root)
 
-    def test_azure_database_count_is_rejected(self):
-        with self.assertRaisesRegex(TenantSpecError, "unknown.*databaseCount"):
-            self.spec(databaseCount=1)
 
-    def test_foundation_checksum_ignores_tenant_profile_limits(self):
-        root = self.make_root()
-        config = load_azure_configuration(root)
-        baseline = _foundation_defaults_checksum(root, config)
-        changed = dict(config)
-        changed["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"] = "9.9.9"
-        changed["AZURE_TENANT_NODE_SKU"] = "different"
-        changed["AZURE_TENANT_TIMEOUT"] = "1m"
-        self.assertEqual(baseline, _foundation_defaults_checksum(root, changed))
-        changed["AZURE_AKS_NODE_COUNT"] = "3"
-        self.assertNotEqual(baseline, _foundation_defaults_checksum(root, changed))
 
-    def test_old_foundation_inventory_requires_clean_redeploy(self):
-        root = self.make_root()
-        config = load_azure_configuration(root)
-        old = self.inventory(root, config)
-        old["schema"] = 1
-        old["defaultsSha256"] = old.pop("foundationDefaultsSha256")
-        self.write_inventory(root, old)
-        with self.assertRaisesRegex(RuntimeError, "pre-cutover.*clean foundation redeploy"):
-            load_inventory(root, config)
 
-    def test_foundation_checksum_mismatch_requires_clean_redeploy(self):
-        root = self.make_root()
-        config = load_azure_configuration(root)
-        payload = self.inventory(root, config)
-        payload["foundationDefaultsSha256"] = "stale"
-        self.write_inventory(root, payload)
-        with self.assertRaisesRegex(RuntimeError, "checksum changed.*clean foundation"):
-            load_inventory(root, config)
 
-    def test_foundation_create_refuses_old_inventory_before_deployment(self):
-        root = self.make_root()
-        config = load_azure_configuration(root)
-        old = self.inventory(root, config)
-        old["schema"] = 1
-        self.write_inventory(root, old)
-        with (
-            patch("scripts.lib.azure.foundation.preflight", return_value={}),
-            patch("scripts.lib.azure.foundation._json") as deploy,
-            self.assertRaisesRegex(RuntimeError, "pre-cutover"),
-        ):
-            create_foundation(root, config)
-        deploy.assert_not_called()
 
-    def test_tenant_names_and_artifacts_are_tenant_keyed(self):
-        root = self.make_root()
-        spec = self.spec("blue")
-        selected = tenant_names(spec)
-        self.assertEqual(selected["cluster"], "blue")
-        self.assertEqual(selected["pool"], "blue-worker")
-        path = azure_tenant_runtime_path(root, "blue")
-        self.assertEqual(path, root / ".runtime" / "azure" / "tenants" / "blue")
-        self.assertNotIn("yy-cv-tenant", json.dumps(selected))
 
-    def test_tenant_runtime_removal_cannot_remove_foundation_files(self):
-        root = self.make_root()
-        foundation = root / ".runtime" / "azure"
-        tenant = azure_tenant_runtime_path(root, "blue")
-        write_private_file(foundation / "resources.json", "{}")
-        write_private_file(foundation / "management.kubeconfig", "foundation")
-        write_private_file(tenant / "endpoint.json", "{}")
-        for child in tenant.iterdir():
-            child.unlink()
-        tenant.rmdir()
-        self.assertTrue((foundation / "resources.json").is_file())
-        self.assertTrue((foundation / "management.kubeconfig").is_file())
 
     def test_rendered_resources_use_spec_and_all_have_markers(self):
         root = self.make_root()
@@ -1443,7 +1180,7 @@ class AzurePhaseFourTests(unittest.TestCase):
         self.assertEqual(status.classification, "ownership-invalid")
 
     def test_management_get_only_accepts_kubernetes_object_not_found(self):
-        from scripts.azure import _get_management_resource
+        from scripts.lib.azure.foundation import _get_management_resource
 
         failures = (
             "Unable to connect to the server: getting credentials: "
@@ -1709,30 +1446,6 @@ class AzurePhaseFourTests(unittest.TestCase):
             status.blockers,
         )
 
-    def test_foundation_mutation_waits_for_azure_lock(self):
-        root = self.make_root()
-        marker = root / "acquired"
-        script = (
-            "from pathlib import Path; "
-            "from scripts.azure import _run_profile_mutation; "
-            f"root=Path({str(root)!r}); marker=Path({str(marker)!r}); "
-            "_run_profile_mutation(root, {}, "
-            "lambda _root, _config: marker.write_text('yes'))"
-        )
-        with azure_lock(root, exclusive=True, create=True):
-            process = subprocess.Popen(
-                [sys.executable, "-c", script],
-                cwd=Path(__file__).resolve().parents[1],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                text=True,
-            )
-            time.sleep(0.2)
-            self.assertIsNone(process.poll())
-            self.assertFalse(marker.exists())
-        _, stderr = process.communicate(timeout=5)
-        self.assertEqual(process.returncode, 0, stderr)
-        self.assertEqual(marker.read_text(encoding="utf-8"), "yes")
 
     def test_staged_commands_are_removed(self):
         root = Path(__file__).resolve().parents[1]
