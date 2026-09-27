@@ -32,6 +32,7 @@ pub struct Call {
 pub struct State {
     pub objects: BTreeMap<String, Value>,
     pub lists: BTreeSet<String>,
+    pub list_types: BTreeMap<String, (String, String)>,
     pub discoveries: BTreeMap<String, Value>,
     pub calls: Vec<Call>,
     pub queued_responses: VecDeque<(u16, Value)>,
@@ -117,11 +118,16 @@ impl Server {
                                 })
                                 .map(|(_, value)| value.clone())
                                 .collect();
+                            let (api_version, kind) = state
+                                .list_types
+                                .get(&path)
+                                .cloned()
+                                .unwrap_or_else(|| ("v1".into(), "List".into()));
                             (
                                 200,
                                 json!({
-                                    "apiVersion":"v1",
-                                    "kind":"List",
+                                    "apiVersion":api_version,
+                                    "kind":kind,
                                     "metadata":{"resourceVersion":"1"},
                                     "items":items
                                 }),
@@ -246,6 +252,14 @@ impl Server {
 
     pub fn allow_list(&self, path: &str) {
         self.0.lock().unwrap().lists.insert(path.into());
+    }
+
+    pub fn allow_typed_list(&self, path: &str, api_version: &str, kind: &str) {
+        let mut state = self.0.lock().unwrap();
+        state.lists.insert(path.into());
+        state
+            .list_types
+            .insert(path.into(), (api_version.into(), format!("{kind}List")));
     }
 
     pub fn discover(&self, api_version: &str, resources: Value) {

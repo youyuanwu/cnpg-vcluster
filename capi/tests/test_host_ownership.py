@@ -84,6 +84,37 @@ class HostOwnershipTests(unittest.TestCase):
                 _validate_runtime_inventory(root)
             self.assertEqual(endpoint.read_text(encoding="utf-8"), "outside\n")
 
+    def test_runtime_inventory_rejects_symlinked_root_without_obsolete_state(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as target:
+            root = Path(temporary)
+            external = Path(target)
+            marker = external / "foreign"
+            marker.write_text("outside\n", encoding="utf-8")
+            (root / ".runtime").symlink_to(external, target_is_directory=True)
+            with self.assertRaisesRegex(RuntimeError, "runtime root"):
+                _validate_runtime_inventory(root)
+            self.assertEqual(marker.read_text(encoding="utf-8"), "outside\n")
+
+    def test_unknown_file_inside_obsolete_tree_blocks_without_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy = root / ".runtime/lifecycle/local/tenant-a"
+            legacy.mkdir(parents=True, mode=0o700)
+            for parent in legacy.parents:
+                if parent == root:
+                    break
+                parent.chmod(0o700)
+            identity = legacy / "identity.json"
+            identity.write_text("{}\n", encoding="utf-8")
+            identity.chmod(0o600)
+            unknown = legacy / "unrelated.json"
+            unknown.write_text("{}\n", encoding="utf-8")
+            unknown.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "unexpected runtime file"):
+                _validate_runtime_inventory(root)
+            self.assertTrue(identity.exists())
+            self.assertTrue(unknown.exists())
+
     def test_host_residue_includes_unrecorded_capd_worker_role(self) -> None:
         config = {
             "SPIKE_NAME": "spike",
@@ -120,7 +151,13 @@ class HostOwnershipTests(unittest.TestCase):
             )
             return type("Result", (), {"stdout": output})()
 
-        with patch("scripts.destroy.run", side_effect=docker):
+        with (
+            patch("scripts.destroy.run", side_effect=docker),
+            patch(
+                "scripts.destroy.tenant_storage_volumes",
+                return_value={"volume-id"},
+            ),
+        ):
             residue = inspect_host_residue(config)
 
         self.assertEqual(residue["volumes"], ["volume-id"])

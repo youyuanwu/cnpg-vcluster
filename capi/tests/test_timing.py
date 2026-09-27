@@ -9,6 +9,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import Mock, patch
 
+from scripts.lib.controller_scenarios import LEASE, MANAGEMENT_CATALOG
 from scripts.lib.timing import PHASES, PhaseTimings
 from scripts.test_e2e import run_e2e, verify_no_local_runtime_residue, verify_tenant_deletion
 
@@ -201,8 +202,14 @@ class TimingTests(unittest.TestCase):
             "uid": "tenant-uid",
             "allocationLease": {"name": "tenant-slot-test", "uid": "lease-uid"},
             "managementResources": [
-                ("namespace", "", "tenant-example", "namespace-uid"),
-                ("clusters.cluster.x-k8s.io", "tenant-example", "tenant-example", "cluster-uid"),
+                ("v1", "Namespace", "", "tenant-example", "namespace-uid"),
+                (
+                    "cluster.x-k8s.io/v1beta2",
+                    "Cluster",
+                    "tenant-example",
+                    "tenant-example",
+                    "cluster-uid",
+                ),
             ],
             "workerContainers": ["tenant-worker " + "a" * 64],
             "providerContainers": ["tenant-worker " + "a" * 64],
@@ -210,20 +217,64 @@ class TimingTests(unittest.TestCase):
         }
 
         def inspect(*arguments, **_kwargs):
-            resource = arguments[arguments.index("get") + 1]
-            payload = ""
-            if resource == "namespace/tenant-example":
+            raw = next(
+                (
+                    argument.removeprefix("--raw=")
+                    for argument in arguments
+                    if argument.startswith("--raw=")
+                ),
+                None,
+            )
+            if raw == LEASE.inventory_path:
+                items = (
+                    [{"metadata": {
+                        "name": "tenant-slot-test",
+                        "uid": "lease-uid",
+                        "annotations": {},
+                    }}]
+                    if residue == "allocation"
+                    else []
+                )
+                return CompletedProcess(
+                    [],
+                    0,
+                    stdout=json.dumps({
+                        "apiVersion": LEASE.api_version,
+                        "kind": f"{LEASE.kind}List",
+                        "items": items,
+                    }),
+                    stderr="",
+                )
+            namespace = next(
+                resource for resource in MANAGEMENT_CATALOG
+                if resource.kind == "Namespace"
+            )
+            if raw == namespace.object_path(None, "tenant-example"):
                 if residue == "namespace":
-                    payload = '{"metadata":{"uid":"namespace-uid"}}'
+                    return CompletedProcess(
+                        [],
+                        0,
+                        stdout=json.dumps({
+                            "apiVersion": namespace.api_version,
+                            "kind": namespace.kind,
+                            "metadata": {
+                                "name": "tenant-example",
+                                "uid": "namespace-uid",
+                            },
+                        }),
+                        stderr="",
+                    )
                 if residue == "inspection-error":
                     return CompletedProcess([], 1, stdout="", stderr="inspection unavailable")
-            return CompletedProcess([], 0, stdout=payload, stderr="")
+            return CompletedProcess(
+                [],
+                1 if raw is not None else 0,
+                stdout="",
+                stderr="NotFound" if raw is not None else "",
+            )
 
         client = Mock()
         client.kubectl.side_effect = inspect
-        client.json.return_value = {"items": [
-            {"metadata": {"name": "tenant-slot-test", "uid": "lease-uid"}}
-        ] if residue == "allocation" else []}
 
         def capture(*args):
             self.assertEqual(({}, client, document), args)

@@ -174,6 +174,7 @@ class ControllerStateTests(unittest.TestCase):
                     "watchClusterLabel",
                     "inventoryPolicy",
                     "inventoryNamespace",
+                    "evidencePolicy",
                     "exemptions",
                 }
                 for entry in catalog
@@ -187,6 +188,7 @@ class ControllerStateTests(unittest.TestCase):
                     "namespaced", "role", "namePolicy", "watched",
                     "watchNameSuffix", "watchClusterLabel",
                     "inventoryPolicy", "inventoryNamespace",
+                    "evidencePolicy",
                     "exemptions",
                 )
             },
@@ -199,6 +201,7 @@ class ControllerStateTests(unittest.TestCase):
                 "watchClusterLabel": None,
                 "inventoryPolicy": "tenant-markers",
                 "inventoryNamespace": None,
+                "evidencePolicy": "named",
                 "exemptions": ["management-infrastructure"],
             },
         )
@@ -225,6 +228,7 @@ class ControllerStateTests(unittest.TestCase):
                     "namespaced", "role", "namePolicy", "watched",
                     "watchNameSuffix", "watchClusterLabel",
                     "inventoryPolicy", "inventoryNamespace",
+                    "evidencePolicy",
                     "exemptions",
                 )
             },
@@ -237,6 +241,7 @@ class ControllerStateTests(unittest.TestCase):
                 "watchClusterLabel": None,
                 "inventoryPolicy": "tenant-markers-or-kamaji-owner",
                 "inventoryNamespace": None,
+                "evidencePolicy": "named",
                 "exemptions": ["controller-installation-secrets"],
             },
         )
@@ -247,6 +252,7 @@ class ControllerStateTests(unittest.TestCase):
                     "namespaced", "role", "namePolicy", "watched",
                     "watchNameSuffix", "watchClusterLabel",
                     "inventoryPolicy", "inventoryNamespace",
+                    "evidencePolicy",
                     "exemptions",
                 )
             },
@@ -259,6 +265,7 @@ class ControllerStateTests(unittest.TestCase):
                 "watchClusterLabel": None,
                 "inventoryPolicy": "allocation-markers",
                 "inventoryNamespace": "tenant-system",
+                "evidencePolicy": "allocation",
                 "exemptions": ["controller-leader-election"],
             },
         )
@@ -451,7 +458,20 @@ class ControllerStateTests(unittest.TestCase):
                 }
             }),
             ("Secret", {
-                "ownerReferences": [{"kind": "KamajiControlPlane"}]
+                "ownerReferences": [{
+                    "apiVersion": "controlplane.cluster.x-k8s.io/v1alpha2",
+                    "kind": "KamajiControlPlane",
+                    "name": "tenant-a",
+                    "uid": "control-plane-uid",
+                }]
+            }),
+            ("Namespace", {
+                "labels": {"tenancy.cnpg-vcluster.io/slot-id": "slot-a"}
+            }),
+            ("Secret", {
+                "annotations": {
+                    "tenancy.cnpg-vcluster.io/resource": "allocation-lease"
+                }
             }),
         ):
             resource = inventory_path(kind)
@@ -465,6 +485,24 @@ class ControllerStateTests(unittest.TestCase):
                 "scripts.lib.controller_state.run",
                 return_value=response(""),
             ), self.assertRaisesRegex(RuntimeError, "blocks activation"):
+                require_clean_controller_state(prepare_root(directory), Client(handle))
+
+    def test_malformed_owner_and_marker_content_never_mean_exempt(self) -> None:
+        for metadata in (
+            {"ownerReferences": [None]},
+            {"ownerReferences": [{}]},
+            {"ownerReferences": [{"apiVersion": "v1", "kind": 3, "name": "x", "uid": "u"}]},
+            {"labels": {"tenancy.cnpg-vcluster.io/tenant": {"nested": "bad"}}},
+        ):
+            def handle(*args, **kwargs):
+                if raw_path(args) == inventory_path("Secret"):
+                    return response(inventory("Secret", [item("Secret", metadata)]))
+                return clean_handler(*args, **kwargs)
+
+            with self.subTest(metadata=metadata), tempfile.TemporaryDirectory() as directory, patch(
+                "scripts.lib.controller_state.run",
+                return_value=response(""),
+            ), self.assertRaisesRegex(RuntimeError, "invalid inventory identity"):
                 require_clean_controller_state(prepare_root(directory), Client(handle))
 
     def test_inventory_errors_never_mean_absence(self) -> None:
@@ -533,6 +571,21 @@ class ControllerStateTests(unittest.TestCase):
             catalog[0]["inventoryPolicy"] = "unknown"
             path.write_text(json.dumps(catalog), encoding="utf-8")
             with self.assertRaisesRegex(RuntimeError, "metadata is invalid"):
+                require_clean_controller_state(root, Client(clean_handler))
+
+    def test_unknown_exemption_is_rejected_before_empty_inventory(self) -> None:
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "scripts.lib.controller_state.run",
+            return_value=response(""),
+        ):
+            root = prepare_root(directory)
+            path = root / "controller/config/management-resources.json"
+            catalog = json.loads(path.read_text())
+            next(entry for entry in catalog if entry["kind"] == "Secret")[
+                "exemptions"
+            ] = ["unknown-exemption"]
+            path.write_text(json.dumps(catalog), encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "exemptions are invalid"):
                 require_clean_controller_state(root, Client(clean_handler))
 
     def test_catalog_fixture_changes_named_resource_resolution(self) -> None:

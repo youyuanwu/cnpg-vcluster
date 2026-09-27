@@ -6,7 +6,11 @@ import shutil
 import stat
 from pathlib import Path
 
-from scripts.lib.host import restore_inotify, validate_inotify_state
+from scripts.lib.host import (
+    restore_inotify,
+    tenant_storage_volumes,
+    validate_inotify_state,
+)
 from scripts.lib.kube import ManagementClient
 from scripts.lib.management import (
     _render_cert_manager,
@@ -28,79 +32,20 @@ from scripts.lib.registry import (
 from scripts.lib.controller import delete_controller
 
 
-OBSOLETE_LOCAL_RUNTIME = (
-    "management/tenant-endpoints.json",
-    "lifecycle/.locks/local.lock",
-    "lifecycle/local",
-    "lifecycle/rejected/local",
-)
-
-
-def _private_runtime_details(runtime: Path, path: Path) -> os.stat_result:
-    current = runtime
-    for part in path.relative_to(runtime).parts:
-        details = current.lstat()
-        if stat.S_ISLNK(details.st_mode):
-            raise RuntimeError(
-                f"obsolete local runtime ancestor is a symlink: "
-                f"{current.relative_to(runtime.parent)}"
-            )
-        if (
-            not stat.S_ISDIR(details.st_mode)
-            or details.st_uid != os.getuid()
-            or details.st_mode & 0o077
-        ):
-            raise RuntimeError(
-                f"obsolete local runtime ancestor is unsafe: "
-                f"{current.relative_to(runtime.parent)}"
-            )
-        current /= part
-    return path.lstat()
-
-
-def _remove_obsolete_local_runtime(root: Path) -> None:
-    runtime = root / ".runtime"
-    for relative in OBSOLETE_LOCAL_RUNTIME:
-        path = runtime / relative
-        if not os.path.lexists(path):
-            continue
-        candidates = [path]
-        details = _private_runtime_details(runtime, path)
-        if stat.S_ISDIR(details.st_mode):
-            candidates.extend(path.rglob("*"))
-        for candidate in candidates:
-            candidate_details = candidate.lstat()
-            if stat.S_ISLNK(candidate_details.st_mode):
-                raise RuntimeError(
-                    f"obsolete local runtime path is a symlink: "
-                    f"{candidate.relative_to(runtime)}"
-                )
-            if candidate_details.st_uid != os.getuid() or candidate_details.st_mode & 0o077:
-                raise RuntimeError(
-                    f"obsolete local runtime path is not owner-only: "
-                    f"{candidate.relative_to(runtime)}"
-                )
-            if not (
-                stat.S_ISDIR(candidate_details.st_mode)
-                or stat.S_ISREG(candidate_details.st_mode)
-            ):
-                raise RuntimeError(
-                    f"obsolete local runtime path has unsupported type: "
-                    f"{candidate.relative_to(runtime)}"
-                )
-        if stat.S_ISDIR(details.st_mode):
-            shutil.rmtree(path)
-        else:
-            path.unlink()
-
-
 def _validate_runtime_inventory(
     root: Path,
 ) -> None:
     runtime = root / ".runtime"
-    if not runtime.exists():
+    if not os.path.lexists(runtime):
         return
-    _remove_obsolete_local_runtime(root)
+    root_details = runtime.lstat()
+    if (
+        stat.S_ISLNK(root_details.st_mode)
+        or not stat.S_ISDIR(root_details.st_mode)
+        or root_details.st_uid != os.getuid()
+        or root_details.st_mode & 0o077
+    ):
+        raise RuntimeError("runtime root is not a private owned directory")
     registry_record = runtime / "management" / "offline-registry.json"
     registry_data = runtime / "management" / "offline-registry-data"
     registry_record_present = os.path.lexists(registry_record)
@@ -131,6 +76,17 @@ def _validate_runtime_inventory(
     }
     tenant_pattern = r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?"
     tenant_pair_pattern = rf"{tenant_pattern}-to-{tenant_pattern}"
+    obsolete_files = {"management/tenant-endpoints.json", "lifecycle/.locks/local.lock"}
+    obsolete_dynamic = (
+        re.compile(
+            rf"^lifecycle/local/{tenant_pattern}/(identity|operation|ready)\.json$"
+        ),
+        re.compile(
+            rf"^lifecycle/local/{tenant_pattern}/evidence/"
+            r"(create|delete)-[a-z0-9-]+\.json$"
+        ),
+        re.compile(r"^lifecycle/rejected/local/create-[a-z0-9-]+\.json$"),
+    )
     allowed_dynamic = (
         re.compile(
             rf"^rendered/tenants/{tenant_pattern}/"
@@ -180,6 +136,7 @@ def _validate_runtime_inventory(
         re.compile(r"^lifecycle/\.locks/azure\.lock$"),
         re.compile(r"^lifecycle/rejected/azure/create-[a-z0-9-]+\.json$"),
     )
+    obsolete = []
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
         if relative == "azure" or relative.startswith("azure/"):
@@ -201,14 +158,34 @@ def _validate_runtime_inventory(
             if details.st_uid != os.getuid() or details.st_mode & 0o077:
                 raise RuntimeError(f"runtime directory is not private: {relative}")
             continue
-        if relative not in allowed_files and not any(
-            pattern.fullmatch(relative) for pattern in allowed_dynamic
+        recognized_obsolete = relative in obsolete_files or any(
+            pattern.fullmatch(relative) for pattern in obsolete_dynamic
+        )
+        if (
+            relative not in allowed_files
+            and not recognized_obsolete
+            and not any(pattern.fullmatch(relative) for pattern in allowed_dynamic)
         ):
             raise RuntimeError(f"unexpected runtime file blocks cleanup: {relative}")
         if not stat.S_ISREG(details.st_mode) or details.st_uid != os.getuid():
             raise RuntimeError(f"runtime file is not an owned regular file: {relative}")
         if details.st_mode & 0o077:
             raise RuntimeError(f"runtime file is not owner-only: {relative}")
+        if recognized_obsolete:
+            obsolete.append(path)
+    for path in obsolete:
+        path.unlink()
+    parents = {
+        parent
+        for path in obsolete
+        for parent in path.parents
+        if parent == runtime or runtime in parent.parents
+    }
+    for directory in sorted(parents - {runtime}, key=lambda path: len(path.parts), reverse=True):
+        try:
+            directory.rmdir()
+        except OSError:
+            pass
 
 
 def _remove_local_runtime(root: Path) -> None:
@@ -380,33 +357,7 @@ def inspect_host_residue(
         ],
         timeout=30,
     ).stdout.split()
-    volumes = {
-        name
-        for name in run(
-            ["docker", "volume", "ls", "-q"],
-            timeout=30,
-        ).stdout.split()
-        if name.endswith("-storage")
-    }
-    for label in (
-        f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
-        "cnpg-vcluster.capi/role",
-        "cnpg-vcluster.capi/tenant",
-        "tenancy.cnpg-vcluster.io/tenant-uid",
-    ):
-        volumes.update(
-            run(
-                [
-                    "docker",
-                    "volume",
-                    "ls",
-                    "-q",
-                    "--filter",
-                    f"label={label}",
-                ],
-                timeout=30,
-            ).stdout.split()
-        )
+    volumes = tenant_storage_volumes(config)
     return {
         "containers": sorted(containers),
         "probes": sorted(set(probes)),

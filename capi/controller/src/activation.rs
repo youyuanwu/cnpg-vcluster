@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 
+use axum::http::Request;
 use chrono::{DateTime, Utc};
 use k8s_openapi::api::core::v1::ConfigMap;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -8,6 +9,7 @@ use kube::{
     api::{DeleteParams, ListParams, PostParams, Preconditions},
     core::DynamicObject,
 };
+use serde_json::Value;
 
 use crate::{
     api::Tenant,
@@ -177,15 +179,7 @@ async fn require_clean_inventory<D: DockerClient>(
         ));
     }
     for &resource in MANAGEMENT_RESOURCES {
-        let api = match resource.inventory_namespace {
-            Some(namespace) => Api::<DynamicObject>::namespaced_with(
-                client.clone(),
-                namespace,
-                &resource.api_resource(),
-            ),
-            None => Api::<DynamicObject>::all_with(client.clone(), &resource.api_resource()),
-        };
-        for item in api.list(&ListParams::default()).await? {
+        for item in inventory(client.clone(), resource).await? {
             validate_inventory_item(resource, &item)?;
             if inventory_blocks(resource, &item) {
                 return Err(ControllerError::Configuration(format!(
@@ -245,6 +239,55 @@ async fn require_clean_inventory<D: DockerClient>(
     Ok(())
 }
 
+async fn inventory(
+    client: Client,
+    resource: ManagementResource,
+) -> Result<Vec<DynamicObject>, ControllerError> {
+    let (group, version) = resource
+        .api_version
+        .split_once('/')
+        .unwrap_or(("", resource.api_version));
+    let base = if group.is_empty() {
+        format!("/api/{version}")
+    } else {
+        format!("/apis/{group}/{version}")
+    };
+    let path = match resource.inventory_namespace {
+        Some(namespace) => format!("{base}/namespaces/{namespace}/{}", resource.plural),
+        None => format!("{base}/{}", resource.plural),
+    };
+    let request = Request::get(path)
+        .body(Vec::new())
+        .map_err(|error| ControllerError::Configuration(error.to_string()))?;
+    let document: Value = client.request(request).await?;
+    let items = document
+        .get("items")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            ControllerError::Configuration(format!("{} inventory list is invalid", resource.kind))
+        })?;
+    if document["apiVersion"] != resource.api_version
+        || document["kind"] != format!("{}List", resource.kind)
+    {
+        return Err(ControllerError::Configuration(format!(
+            "{} inventory list identity is invalid",
+            resource.kind
+        )));
+    }
+    items
+        .iter()
+        .cloned()
+        .map(|item| {
+            serde_json::from_value(item).map_err(|error| {
+                ControllerError::Configuration(format!(
+                    "{} inventory item is invalid: {error}",
+                    resource.kind
+                ))
+            })
+        })
+        .collect()
+}
+
 fn validate_inventory_item(
     resource: ManagementResource,
     item: &DynamicObject,
@@ -282,35 +325,32 @@ fn inventory_blocks(resource: ManagementResource, item: &DynamicObject) -> bool 
         annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
             || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
     });
+    let allocation_marked = labels.is_some_and(|labels| {
+        labels.contains_key("tenancy.cnpg-vcluster.io/slot-id")
+            || labels.contains_key("tenancy.cnpg-vcluster.io/tenant")
+    }) || annotations.is_some_and(|annotations| {
+        annotations
+            .get("tenancy.cnpg-vcluster.io/resource")
+            .map(String::as_str)
+            == Some("allocation-lease")
+            || annotations.contains_key("tenancy.cnpg-vcluster.io/slot-id")
+    });
+    if tenant_marked || allocation_marked {
+        return true;
+    }
     let marked = match resource.inventory_policy {
         InventoryPolicy::BlockAnyInstance => return true,
-        InventoryPolicy::TenantMarkers => tenant_marked,
-        InventoryPolicy::TenantMarkersOrKamajiOwner => {
-            tenant_marked
-                || item
-                    .metadata
-                    .owner_references
-                    .as_ref()
-                    .is_some_and(|owners| {
-                        owners
-                            .iter()
-                            .any(|owner| owner.kind == "KamajiControlPlane")
-                    })
-        }
-        InventoryPolicy::AllocationMarkers => {
-            labels.is_some_and(|labels| {
-                labels.contains_key("tenancy.cnpg-vcluster.io/slot-id")
-                    || labels.contains_key("tenancy.cnpg-vcluster.io/tenant")
-            }) || annotations.is_some_and(|annotations| {
-                annotations
-                    .get("tenancy.cnpg-vcluster.io/resource")
-                    .map(String::as_str)
-                    == Some("allocation-lease")
-                    || annotations.contains_key("tenancy.cnpg-vcluster.io/slot-id")
-                    || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant")
-                    || annotations.contains_key("tenancy.cnpg-vcluster.io/tenant-uid")
-            })
-        }
+        InventoryPolicy::TenantMarkers => false,
+        InventoryPolicy::TenantMarkersOrKamajiOwner => item
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|owners| {
+                owners
+                    .iter()
+                    .any(|owner| owner.kind == "KamajiControlPlane")
+            }),
+        InventoryPolicy::AllocationMarkers => false,
     };
     marked || resource.exemptions.is_empty()
 }

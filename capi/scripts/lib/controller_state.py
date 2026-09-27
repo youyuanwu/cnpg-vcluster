@@ -250,6 +250,33 @@ def _inventory(
                         f"invalid inventory identity for "
                         f"{resource.api_version} {resource.kind}"
                     )
+            for field in ("annotations", "labels"):
+                values = metadata.get(field, {})
+                if not all(
+                    isinstance(key, str) and isinstance(value, str)
+                    for key, value in values.items()
+                ):
+                    raise RuntimeError(
+                        f"invalid inventory identity for "
+                        f"{resource.api_version} {resource.kind}"
+                    )
+            for owner in metadata.get("ownerReferences", []):
+                if (
+                    not isinstance(owner, dict)
+                    or any(
+                        not isinstance(owner.get(field), str)
+                        or not owner[field]
+                        for field in ("apiVersion", "kind", "name", "uid")
+                    )
+                    or any(
+                        field in owner and not isinstance(owner[field], bool)
+                        for field in ("controller", "blockOwnerDeletion")
+                    )
+                ):
+                    raise RuntimeError(
+                        f"invalid inventory identity for "
+                        f"{resource.api_version} {resource.kind}"
+                    )
         valid_namespace = (
             isinstance(namespace, str)
             and bool(namespace)
@@ -294,26 +321,26 @@ def _inventory_blocks(
         "tenancy.cnpg-vcluster.io/tenant" in annotations
         or "tenancy.cnpg-vcluster.io/tenant-uid" in annotations
     )
+    allocation_marked = (
+        "tenancy.cnpg-vcluster.io/slot-id" in labels
+        or "tenancy.cnpg-vcluster.io/tenant" in labels
+        or annotations.get("tenancy.cnpg-vcluster.io/resource")
+        == "allocation-lease"
+        or "tenancy.cnpg-vcluster.io/slot-id" in annotations
+    )
+    if tenant_marked or allocation_marked:
+        return True
     if resource.inventory_policy == "block-any-instance":
         return True
     if resource.inventory_policy == "tenant-markers":
-        marked = tenant_marked
+        marked = False
     elif resource.inventory_policy == "tenant-markers-or-kamaji-owner":
-        marked = tenant_marked or any(
-            isinstance(owner, dict)
-            and owner.get("kind") == "KamajiControlPlane"
+        marked = any(
+            owner.get("kind") == "KamajiControlPlane"
             for owner in owners
         )
     elif resource.inventory_policy == "allocation-markers":
-        marked = (
-            "tenancy.cnpg-vcluster.io/slot-id" in labels
-            or "tenancy.cnpg-vcluster.io/tenant" in labels
-            or annotations.get("tenancy.cnpg-vcluster.io/resource")
-            == "allocation-lease"
-            or "tenancy.cnpg-vcluster.io/slot-id" in annotations
-            or "tenancy.cnpg-vcluster.io/tenant" in annotations
-            or "tenancy.cnpg-vcluster.io/tenant-uid" in annotations
-        )
+        marked = False
     else:
         raise RuntimeError("management resource catalog inventory policy is invalid")
     return marked or not resource.exemptions

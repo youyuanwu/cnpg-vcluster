@@ -169,3 +169,18 @@ class HostTests(unittest.TestCase):
                 with self.assertRaisesRegex(HostError, "provider-owned"):
                     restore_inotify(root, config)
             self.assertTrue(state.exists())
+            empty = type(
+                "Result",
+                (),
+                {"returncode": 0, "stdout": "", "stderr": ""},
+            )()
+            with (
+                patch("scripts.lib.host.run", return_value=empty),
+                patch(
+                    "scripts.lib.host.tenant_storage_volumes",
+                    return_value={"tenant-a-storage"},
+                ),
+                self.assertRaisesRegex(HostError, "provider-owned"),
+            ):
+                restore_inotify(root, config)
+            self.assertTrue(state.exists())

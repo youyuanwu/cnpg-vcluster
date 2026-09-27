@@ -7,7 +7,7 @@ use tenant_controller::{
     error::ControllerError,
     readiness::*,
     reconcile::READY_INTERVAL,
-    status::{set_finalizer, update_status},
+    status::{replace_status, set_finalizer, update_status},
 };
 
 #[test]
@@ -412,6 +412,18 @@ async fn finalizer_patch_is_exact_noop_aware_and_rejects_replacement_response() 
             .unwrap_err(),
         ControllerError::OwnershipInvalid(_)
     ));
+}
+
+#[tokio::test]
+async fn finalization_status_replacement_is_a_zero_request_noop() {
+    let server = Server::default();
+    let tenant = tenant();
+    let status = tenant.status.clone().unwrap_or_default();
+    server.insert(TENANT, serde_json::to_value(&tenant).unwrap());
+    replace_status(server.client(), &tenant, &tenant, &status, false)
+        .await
+        .unwrap();
+    assert!(server.calls().is_empty());
 }
 
 #[tokio::test]

@@ -28,7 +28,6 @@ pub fn dev_machine_template(context: &Context<'_>) -> DynamicObject {
 }
 
 pub fn machine_deployment(context: &Context<'_>) -> DynamicObject {
-    let name = format!("{}-worker", context.name());
     let mut labels = context.identity().labels();
     labels.insert(
         "cluster.x-k8s.io/cluster-name".into(),
@@ -43,8 +42,8 @@ pub fn machine_deployment(context: &Context<'_>) -> DynamicObject {
             "metadata":{"labels":labels,"annotations":context.identity().annotations("machine")},
             "spec":{
                 "clusterName":context.name(),"version":format!("v{}",context.spec.kubernetes_version),
-                "bootstrap":{"configRef":{"apiGroup":"bootstrap.cluster.x-k8s.io","kind":"KubeadmConfigTemplate","name":name}},
-                "infrastructureRef":{"apiGroup":"infrastructure.cluster.x-k8s.io","kind":"DevMachineTemplate","name":name}
+                "bootstrap":{"configRef":context.management_ref("KubeadmConfigTemplate")},
+                "infrastructureRef":context.management_ref("DevMachineTemplate")
             }
         }
     }))

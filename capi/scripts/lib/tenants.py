@@ -14,7 +14,11 @@ from typing import Mapping
 
 from .conditions import condition_true
 from .config import parse_duration
-from .controller_catalog import load_management_resources, resource_by_kind
+from .controller_catalog import (
+    ManagementResource,
+    load_management_resources,
+    resource_by_kind,
+)
 from .files import (
     IntegrityError,
     ensure_private_dir,
@@ -115,23 +119,35 @@ NOT_FOUND = re.compile(r"Error from server \(NotFound\):", re.IGNORECASE)
 def inspect_management_resource(
     client: ManagementClient,
     tenant: Tenant,
-    resource: str,
+    resource: ManagementResource,
+    name: str,
 ) -> dict[str, object] | None:
+    namespace = tenant.namespace if resource.namespaced else None
     response = client.kubectl(
-        "-n",
-        tenant.namespace,
         "get",
-        resource,
-        "-o",
-        "json",
+        f"--raw={resource.object_path(namespace, name)}",
         check=False,
     )
     if response.returncode == 0:
-        return json.loads(response.stdout)
+        payload = json.loads(response.stdout)
+        metadata = payload.get("metadata") if isinstance(payload, dict) else None
+        if (
+            not isinstance(payload, dict)
+            or payload.get("apiVersion") != resource.api_version
+            or payload.get("kind") != resource.kind
+            or not isinstance(metadata, dict)
+            or metadata.get("name") != name
+            or not metadata.get("uid")
+            or metadata.get("namespace") not in ((tenant.namespace,) if resource.namespaced else (None, ""))
+        ):
+            raise RuntimeError(
+                f"tenant management identity is invalid: {resource.kind}/{name}"
+            )
+        return payload
     if NOT_FOUND.search(response.stderr):
         return None
     raise RuntimeError(
-        f"tenant management inspection failed for {resource}: {response.stderr}"
+        f"tenant management inspection failed for {resource.kind}/{name}: {response.stderr}"
     )
 
 
@@ -143,15 +159,17 @@ def verify_tenant_management_ownership(
     expected_markers: Mapping[str, str] | None = None,
 ) -> dict[str, dict[str, object]]:
     present = {}
-    namespace_response = client.kubectl(
-        "get",
-        f"namespace/{tenant.namespace}",
-        "-o",
-        "json",
-        check=False,
+    namespace_definition = _management_resource("Namespace")
+    namespace_name = namespace_definition.expected_name(tenant.name)
+    if namespace_name is None:
+        raise RuntimeError("Tenant Namespace has no expected name")
+    namespace = inspect_management_resource(
+        client,
+        tenant,
+        namespace_definition,
+        namespace_name,
     )
-    if namespace_response.returncode == 0:
-        namespace = json.loads(namespace_response.stdout)
+    if namespace is not None:
         labels = namespace["metadata"].get("labels") or {}
         if labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]:
             raise RuntimeError(f"tenant namespace ownership mismatch: {tenant.name}")
@@ -159,13 +177,9 @@ def verify_tenant_management_ownership(
             _require_resource_markers(
                 namespace,
                 expected_markers,
-                f"namespace/{tenant.namespace}",
+                f"{namespace_definition.kubectl_resource}/{namespace_name}",
             )
         present["namespace"] = namespace
-    elif not NOT_FOUND.search(namespace_response.stderr):
-        raise RuntimeError(
-            f"tenant namespace inspection failed: {namespace_response.stderr}"
-        )
     resources = MANAGEMENT_CATALOG
     for definition in resources:
         if definition.resource_class != "root":
@@ -179,7 +193,8 @@ def verify_tenant_management_ownership(
         payload = inspect_management_resource(
             client,
             tenant,
-            f"{definition.kubectl_resource}/{name}",
+            definition,
+            name,
         )
         if payload is None:
             continue
@@ -235,7 +250,8 @@ def verify_tenant_management_ownership(
             machine_set = inspect_management_resource(
                 client,
                 tenant,
-                f"{machine_set_definition.kubectl_resource}/{owners[0]['name']}",
+                machine_set_definition,
+                owners[0]["name"],
             )
             set_owners = (
                 machine_set["metadata"].get("ownerReferences") or []

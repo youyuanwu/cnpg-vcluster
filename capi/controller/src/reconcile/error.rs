@@ -5,7 +5,7 @@ use kube::runtime::controller::Action;
 use crate::{
     allocation::AllocationError,
     docker::DockerError,
-    error::ControllerError,
+    error::{ControllerError, ErrorClass},
     foundation::FoundationError,
     ownership::OwnershipError,
     resources::BuildError,
@@ -44,6 +44,11 @@ pub enum ReconcileError {
 }
 
 impl ReconcileError {
+    pub fn conflict(&self) -> bool {
+        matches!(self, Self::Kube(kube::Error::Api(status)) if status.code == 409)
+            || matches!(self, Self::Runtime(error) if error.class() == ErrorClass::Conflict)
+    }
+
     pub fn ownership_invalid(&self) -> bool {
         matches!(
             self,

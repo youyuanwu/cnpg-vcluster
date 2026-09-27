@@ -158,5 +158,11 @@ pub async fn replace_status(
     status: &TenantStatus,
     clear_allocation: bool,
 ) -> Result<(), ControllerError> {
+    if (current.status.as_ref() == Some(status)
+        || (current.status.is_none() && status == &TenantStatus::default()))
+        && (!clear_allocation || status.allocation.is_none())
+    {
+        return Ok(());
+    }
     patch_status(client, original, current, status, clear_allocation).await
 }

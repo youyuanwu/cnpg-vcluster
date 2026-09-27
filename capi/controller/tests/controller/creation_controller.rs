@@ -409,6 +409,26 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
 }
 
 #[tokio::test]
+async fn creation_finalizer_conflict_requeues_without_failure_status_patch() {
+    let fixture = Fixture::new(true);
+    fixture.management.respond(
+        "PATCH",
+        TENANT,
+        409,
+        crate::support::kube::status(409, "Conflict"),
+    );
+    fixture.reconciler.reconcile_name("tenant-a").await.unwrap();
+    let calls = fixture.management.calls();
+    assert_eq!(
+        calls
+            .iter()
+            .map(|call| (call.method.as_str(), call.path.as_str()))
+            .collect::<Vec<_>>(),
+        [("GET", TENANT), ("PATCH", TENANT)]
+    );
+}
+
+#[tokio::test]
 async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.management.get(TENANT);

@@ -41,15 +41,22 @@ fn config_map(name: &str, data: &[(&str, &str)]) -> ConfigMap {
 
 fn clean_server() -> Server {
     let server = Server::default();
-    for path in [TENANTS, NAMESPACES, SECRETS, LEASES] {
-        server.allow_list(path);
-    }
-    for resource in MANAGEMENT_RESOURCES
-        .iter()
-        .filter(|resource| resource.inventory_policy == InventoryPolicy::BlockAnyInstance)
-    {
-        let (group, version) = resource.api_version.split_once('/').unwrap();
-        server.allow_list(&format!("/apis/{group}/{version}/{}", resource.plural));
+    server.allow_list(TENANTS);
+    for resource in MANAGEMENT_RESOURCES {
+        let (group, version) = resource
+            .api_version
+            .split_once('/')
+            .unwrap_or(("", resource.api_version));
+        let base = if group.is_empty() {
+            format!("/api/{version}")
+        } else {
+            format!("/apis/{group}/{version}")
+        };
+        let path = match resource.inventory_namespace {
+            Some(namespace) => format!("{base}/namespaces/{namespace}/{}", resource.plural),
+            None => format!("{base}/{}", resource.plural),
+        };
+        server.allow_typed_list(&path, resource.api_version, resource.kind);
     }
     server
 }
@@ -390,7 +397,14 @@ async fn stale_or_invalid_consumption_ticket_is_rejected() {
 
 #[tokio::test]
 async fn namespace_secret_lease_and_volume_residue_block_activation() {
-    for residue in ["namespace", "secret", "lease", "volume"] {
+    for residue in [
+        "namespace",
+        "namespace-allocation",
+        "secret",
+        "secret-allocation",
+        "lease",
+        "volume",
+    ] {
         let server = clean_server();
         server.insert(TICKET, ticket("hash-b", "token-b"));
         let docker = FakeDocker::default();
@@ -401,6 +415,12 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
                     "name":"tenant-a","uid":"namespace-uid",
                     "annotations":{"tenancy.cnpg-vcluster.io/tenant":"tenant-a"}}}),
             ),
+            "namespace-allocation" => server.insert(
+                &format!("{NAMESPACES}/tenant-a"),
+                json!({"apiVersion":"v1","kind":"Namespace","metadata":{
+                    "name":"tenant-a","uid":"namespace-uid",
+                    "labels":{"tenancy.cnpg-vcluster.io/slot-id":"slot-a"}}}),
+            ),
             "secret" => server.insert(
                 &format!("{SECRETS}/tenant-a-kubeconfig"),
                 json!({"apiVersion":"v1","kind":"Secret","metadata":{
@@ -408,6 +428,13 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
                     "uid":"secret-uid",
                     "ownerReferences":[{"apiVersion":"controlplane.cluster.x-k8s.io/v1alpha2",
                         "kind":"KamajiControlPlane","name":"tenant-a","uid":"cp"}]}}),
+            ),
+            "secret-allocation" => server.insert(
+                &format!("{SECRETS}/tenant-a-kubeconfig"),
+                json!({"apiVersion":"v1","kind":"Secret","metadata":{
+                    "name":"tenant-a-kubeconfig","namespace":"tenant-a",
+                    "uid":"secret-uid",
+                    "annotations":{"tenancy.cnpg-vcluster.io/resource":"allocation-lease"}}}),
             ),
             "lease" => server.insert(
                 &format!("{LEASES}/slot-a"),
@@ -466,6 +493,36 @@ async fn malformed_catalog_inventory_identity_blocks_activation() {
     .await
     .unwrap_err();
     assert!(error.to_string().contains("inventory identity is invalid"));
+}
+
+#[tokio::test]
+async fn malformed_catalog_inventory_list_blocks_activation() {
+    let resource = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == "Cluster")
+        .unwrap();
+    let path = format!("/apis/cluster.x-k8s.io/v1beta2/{}", resource.plural);
+    for payload in [
+        json!({"apiVersion":"v1","kind":"ClusterList","items":[]}),
+        json!({"apiVersion":resource.api_version,"kind":"WrongList","items":[]}),
+        json!({"apiVersion":resource.api_version,"kind":"ClusterList","items":null}),
+        json!({"apiVersion":resource.api_version,"kind":"ClusterList"}),
+    ] {
+        let server = clean_server();
+        server.insert(TICKET, ticket("hash-b", "token-b"));
+        server.respond("GET", &path, 200, payload);
+        assert!(
+            admit(
+                server.client(),
+                &FakeDocker::default(),
+                "hash-b",
+                "token-b",
+                true,
+            )
+            .await
+            .is_err()
+        );
+    }
 }
 
 #[tokio::test]

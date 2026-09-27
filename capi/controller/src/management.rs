@@ -29,6 +29,14 @@ pub enum NamePolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EvidencePolicy {
+    Named,
+    Observed,
+    Allocation,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagementResource {
     pub api_version: &'static str,
@@ -45,6 +53,7 @@ pub struct ManagementResource {
     pub watch_cluster_label: Option<&'static str>,
     pub inventory_policy: InventoryPolicy,
     pub inventory_namespace: Option<&'static str>,
+    pub evidence_policy: EvidencePolicy,
     pub exemptions: &'static [&'static str],
 }
 
@@ -91,6 +100,11 @@ macro_rules! entry {
             },
             inventory_policy: InventoryPolicy::BlockAnyInstance,
             inventory_namespace: None,
+            evidence_policy: if matches!(ResourceClass::$class, ResourceClass::Root) {
+                EvidencePolicy::Named
+            } else {
+                EvidencePolicy::Observed
+            },
             exemptions: &[],
         }
     };
@@ -120,152 +134,46 @@ macro_rules! descendant {
     };
 }
 
+macro_rules! typed {
+    ($api:expr, $kind:expr, $plural:expr, $namespaced:expr, $role:expr, $parent:expr,
+     $name:ident, $suffix:expr, $policy:ident, $namespace:expr, $evidence:ident, $exemption:expr) => {
+        ManagementResource {
+            api_version: $api,
+            kind: $kind,
+            plural: $plural,
+            namespaced: $namespaced,
+            role: $role,
+            class: ResourceClass::Typed,
+            parent_kind: $parent,
+            alternate_parent_kind: None,
+            name_policy: NamePolicy::$name,
+            watched: true,
+            watch_name_suffix: $suffix,
+            watch_cluster_label: None,
+            inventory_policy: InventoryPolicy::$policy,
+            inventory_namespace: $namespace,
+            evidence_policy: EvidencePolicy::$evidence,
+            exemptions: &[$exemption],
+        }
+    };
+}
+
+#[rustfmt::skip]
 pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
-    root!(
-        "cluster.x-k8s.io/v1beta2",
-        "Cluster",
-        "clusters",
-        "cluster",
-        None,
-        Tenant
-    ),
-    root!(
-        "infrastructure.cluster.x-k8s.io/v1beta2",
-        "DevCluster",
-        "devclusters",
-        "dev-cluster",
-        Some("Cluster"),
-        Tenant
-    ),
-    root!(
-        "controlplane.cluster.x-k8s.io/v1alpha2",
-        "KamajiControlPlane",
-        "kamajicontrolplanes",
-        "kamaji-control-plane",
-        Some("Cluster"),
-        Tenant
-    ),
-    entry!(
-        "bootstrap.cluster.x-k8s.io/v1beta2",
-        "KubeadmConfigTemplate",
-        "kubeadmconfigtemplates",
-        "kubeadm-config-template",
-        Root,
-        Some("Cluster"),
-        Some("MachineDeployment"),
-        Worker,
-        true
-    ),
-    entry!(
-        "infrastructure.cluster.x-k8s.io/v1beta2",
-        "DevMachineTemplate",
-        "devmachinetemplates",
-        "dev-machine-template",
-        Root,
-        Some("Cluster"),
-        Some("MachineDeployment"),
-        Worker,
-        true
-    ),
-    root!(
-        "cluster.x-k8s.io/v1beta2",
-        "MachineDeployment",
-        "machinedeployments",
-        "machine-deployment",
-        Some("Cluster"),
-        Worker
-    ),
-    descendant!(
-        "cluster.x-k8s.io/v1beta2",
-        "MachineSet",
-        "machinesets",
-        "machine",
-        "MachineDeployment",
-        true
-    ),
-    descendant!(
-        "cluster.x-k8s.io/v1beta2",
-        "Machine",
-        "machines",
-        "machine",
-        "MachineSet",
-        true
-    ),
-    descendant!(
-        "infrastructure.cluster.x-k8s.io/v1beta2",
-        "DevMachine",
-        "devmachines",
-        "machine",
-        "Machine",
-        true
-    ),
-    descendant!(
-        "bootstrap.cluster.x-k8s.io/v1beta2",
-        "KubeadmConfig",
-        "kubeadmconfigs",
-        "machine",
-        "Machine",
-        false
-    ),
-    descendant!(
-        "kamaji.clastix.io/v1alpha1",
-        "TenantControlPlane",
-        "tenantcontrolplanes",
-        "provider",
-        "KamajiControlPlane",
-        false
-    ),
-    ManagementResource {
-        api_version: "v1",
-        kind: "Namespace",
-        plural: "namespaces",
-        namespaced: false,
-        role: "namespace",
-        class: ResourceClass::Typed,
-        parent_kind: None,
-        alternate_parent_kind: None,
-        name_policy: NamePolicy::Tenant,
-        watched: true,
-        watch_name_suffix: None,
-        watch_cluster_label: None,
-        inventory_policy: InventoryPolicy::TenantMarkers,
-        inventory_namespace: None,
-        exemptions: &["management-infrastructure"],
-    },
-    ManagementResource {
-        api_version: "v1",
-        kind: "Secret",
-        plural: "secrets",
-        namespaced: true,
-        role: "tenant-kubeconfig",
-        class: ResourceClass::Typed,
-        parent_kind: Some("KamajiControlPlane"),
-        alternate_parent_kind: None,
-        name_policy: NamePolicy::Kubeconfig,
-        watched: true,
-        watch_name_suffix: Some("-kubeconfig"),
-        watch_cluster_label: None,
-        inventory_policy: InventoryPolicy::TenantMarkersOrKamajiOwner,
-        inventory_namespace: None,
-        exemptions: &["controller-installation-secrets"],
-    },
-    ManagementResource {
-        api_version: "coordination.k8s.io/v1",
-        kind: "Lease",
-        plural: "leases",
-        namespaced: true,
-        role: "allocation-lease",
-        class: ResourceClass::Typed,
-        parent_kind: None,
-        alternate_parent_kind: None,
-        name_policy: NamePolicy::Allocation,
-        watched: true,
-        watch_name_suffix: None,
-        watch_cluster_label: None,
-        inventory_policy: InventoryPolicy::AllocationMarkers,
-        inventory_namespace: Some("tenant-system"),
-        exemptions: &["controller-leader-election"],
-    },
+    root!("cluster.x-k8s.io/v1beta2", "Cluster", "clusters", "cluster", None, Tenant),
+    root!("infrastructure.cluster.x-k8s.io/v1beta2", "DevCluster", "devclusters", "dev-cluster", Some("Cluster"), Tenant),
+    root!("controlplane.cluster.x-k8s.io/v1alpha2", "KamajiControlPlane", "kamajicontrolplanes", "kamaji-control-plane", Some("Cluster"), Tenant),
+    entry!("bootstrap.cluster.x-k8s.io/v1beta2", "KubeadmConfigTemplate", "kubeadmconfigtemplates", "kubeadm-config-template", Root, Some("Cluster"), Some("MachineDeployment"), Worker, true),
+    entry!("infrastructure.cluster.x-k8s.io/v1beta2", "DevMachineTemplate", "devmachinetemplates", "dev-machine-template", Root, Some("Cluster"), Some("MachineDeployment"), Worker, true),
+    root!("cluster.x-k8s.io/v1beta2", "MachineDeployment", "machinedeployments", "machine-deployment", Some("Cluster"), Worker),
+    descendant!("cluster.x-k8s.io/v1beta2", "MachineSet", "machinesets", "machine", "MachineDeployment", true),
+    descendant!("cluster.x-k8s.io/v1beta2", "Machine", "machines", "machine", "MachineSet", true),
+    descendant!("infrastructure.cluster.x-k8s.io/v1beta2", "DevMachine", "devmachines", "machine", "Machine", true),
+    descendant!("bootstrap.cluster.x-k8s.io/v1beta2", "KubeadmConfig", "kubeadmconfigs", "machine", "Machine", false),
+    descendant!("kamaji.clastix.io/v1alpha1", "TenantControlPlane", "tenantcontrolplanes", "provider", "KamajiControlPlane", false),
+    typed!("v1", "Namespace", "namespaces", false, "namespace", None, Tenant, None, TenantMarkers, None, Named, "management-infrastructure"),
+    typed!("v1", "Secret", "secrets", true, "tenant-kubeconfig", Some("KamajiControlPlane"), Kubeconfig, Some("-kubeconfig"), TenantMarkersOrKamajiOwner, None, Named, "controller-installation-secrets"),
+    typed!("coordination.k8s.io/v1", "Lease", "leases", true, "allocation-lease", None, Allocation, None, AllocationMarkers, Some("tenant-system"), Allocation, "controller-leader-election"),
 ];
 
 pub fn roots() -> impl Iterator<Item = ManagementResource> {

@@ -59,8 +59,9 @@ The generated management-resource JSON is the cross-language local operator
 contract. Entries declare exact served API identity and scope,
 Tenant/worker/kubeconfig/observed/allocation naming, whether the resource is
 watched, watch-name suffix or cluster-label routing, inventory policy and
-namespace, and narrow exemptions. Rust and Python reject malformed catalogs,
-unserved declared versions, malformed inventory, and ambiguous identity.
+namespace, evidence participation, and checked narrow exemptions. Rust and
+Python reject malformed catalogs, unserved declared versions, malformed list
+envelopes/items/owner references, and ambiguous identity.
 Python inventories exact versioned raw collection paths: the list envelope
 must declare the catalog API version and `<Kind>List`, while items must have
 valid name, UID, and scope. Raw-list items may omit redundant `apiVersion` and

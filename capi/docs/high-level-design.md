@@ -210,9 +210,9 @@ consumed by builders, ownership validation, RBAC, watches, activation
 inventory, worker observation, finalization, Python installation checks, and
 deletion evidence. The catalog declares exact served API identity, scope,
 naming, watch suffix/label routing, inventory namespace/policy, and
-exemptions. Allocation names, fixed controller infrastructure, provider-only
-CRDs, break-glass allowlists, and tenant-internal resources remain
-domain-owned.
+named/observed/allocation evidence participation with checked exemptions.
+Allocation names, fixed controller infrastructure, provider-only CRDs,
+break-glass allowlists, and tenant-internal resources remain domain-owned.
 
 ## Finalization and recovery
 

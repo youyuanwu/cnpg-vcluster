@@ -13,6 +13,8 @@ from unittest.mock import Mock, patch
 
 from scripts.endpoint import run_endpoint_gate
 from scripts.lib.controller_scenarios import (
+    LEASE,
+    MANAGEMENT_CATALOG,
     manifest_tenant_name,
     tenant_from_document,
     tenant_snapshot,
@@ -56,6 +58,14 @@ def allocation_lease():
     return lease
 
 
+def lease_inventory(leases):
+    return {
+        "apiVersion": LEASE.api_version,
+        "kind": f"{LEASE.kind}List",
+        "items": leases,
+    }
+
+
 class ControllerScenarioTests(unittest.TestCase):
     def test_spec_hash_matches_rust_canonical_contract(self) -> None:
         document = tenant_document()
@@ -92,12 +102,16 @@ class ControllerScenarioTests(unittest.TestCase):
 
     def test_lease_name_and_exact_markers_match_rust(self) -> None:
         client = Mock()
-        client.json.return_value = {"items": [allocation_lease()]}
+        client.kubectl.return_value = CompletedProcess(
+            [], 0, stdout=json.dumps(lease_inventory([allocation_lease()]))
+        )
         identity = verify_allocation_lease(CONFIG, client, tenant_document())
         self.assertEqual("lease-uid", identity["uid"])
         self.assertEqual("tenant-slot-" + hashlib.sha256(b"slot-0").hexdigest()[:51],
                          allocation_lease_name("slot-0"))
-        client.json.assert_called_once_with("-n", "tenant-system", "get", "leases.coordination.k8s.io")
+        client.kubectl.assert_called_once_with(
+            "get", f"--raw={LEASE.inventory_path}"
+        )
 
     def test_foreign_replaced_malformed_or_duplicate_claims_are_rejected(self) -> None:
         cases = [[], [allocation_lease(), allocation_lease()]]
@@ -118,7 +132,9 @@ class ControllerScenarioTests(unittest.TestCase):
         for leases in cases:
             with self.subTest(leases=leases):
                 client = Mock()
-                client.json.return_value = {"items": leases}
+                client.kubectl.return_value = CompletedProcess(
+                    [], 0, stdout=json.dumps(lease_inventory(leases))
+                )
                 with self.assertRaisesRegex(RuntimeError, "Lease"):
                     verify_allocation_lease(CONFIG, client, tenant_document())
 
@@ -276,21 +292,67 @@ class ControllerScenarioTests(unittest.TestCase):
             def __init__(self) -> None:
                 self.index = 0
 
-            def kubectl(self, *_arguments):
+            def kubectl(self, *arguments):
+                path = next(
+                    argument.removeprefix("--raw=")
+                    for argument in arguments
+                    if argument.startswith("--raw=")
+                )
+                if path == LEASE.inventory_path:
+                    return CompletedProcess(
+                        [], 0, stdout=json.dumps(lease_inventory([allocation_lease()])), stderr=""
+                    )
+                definition = next(
+                    definition
+                    for definition in MANAGEMENT_CATALOG
+                    if path
+                    in {
+                        definition.collection_path(
+                            "tenant-a" if definition.namespaced else None
+                        ),
+                        definition.object_path(
+                            "tenant-a" if definition.namespaced else None,
+                            definition.expected_name("tenant-a") or "",
+                        ),
+                    }
+                )
+                if definition.evidence_policy == "observed":
+                    items = (
+                        [{
+                            "metadata": {
+                                "name": "worker-a",
+                                "namespace": "tenant-a",
+                                "uid": "machine-uid",
+                            }
+                        }]
+                        if definition.kind == "Machine"
+                        else []
+                    )
+                    return CompletedProcess(
+                        [],
+                        0,
+                        stdout=json.dumps({
+                            "apiVersion": definition.api_version,
+                            "kind": f"{definition.kind}List",
+                            "items": items,
+                        }),
+                        stderr="",
+                    )
                 self.index += 1
                 return CompletedProcess(
                     [],
                     0,
-                    stdout=(
-                        '{"metadata":{"uid":"resource-'
-                        + str(self.index)
-                        + '"}}'
-                    ),
+                    stdout=json.dumps({
+                        "apiVersion": definition.api_version,
+                        "kind": definition.kind,
+                        "metadata": {
+                            "name": path.rsplit("/", 1)[1],
+                            "namespace": "tenant-a" if definition.namespaced else None,
+                            "uid": f"resource-{self.index}",
+                        },
+                    }),
                     stderr="",
                 )
-
-            def json(self, *_arguments):
-                return {"items": [allocation_lease()]}
 
         with patch(
             "scripts.lib.controller_scenarios.run",
@@ -325,38 +387,45 @@ class ControllerScenarioTests(unittest.TestCase):
             ],
             snapshot["workerContainers"],
         )
-        self.assertEqual(8, len(snapshot["managementResources"]))
+        self.assertEqual(9, len(snapshot["managementResources"]))
         self.assertEqual(
             {
-                ("namespaces", "", "tenant-a"),
-                ("clusters.cluster.x-k8s.io", "tenant-a", "tenant-a"),
-                ("devclusters.infrastructure.cluster.x-k8s.io", "tenant-a", "tenant-a"),
                 (
-                    "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
-                    "tenant-a",
-                    "tenant-a",
-                ),
-                (
-                    "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io",
-                    "tenant-a",
-                    "tenant-a-worker",
-                ),
-                (
-                    "devmachinetemplates.infrastructure.cluster.x-k8s.io",
-                    "tenant-a",
-                    "tenant-a-worker",
-                ),
-                (
-                    "machinedeployments.cluster.x-k8s.io",
-                    "tenant-a",
-                    "tenant-a-worker",
-                ),
-                ("secrets", "tenant-a", "tenant-a-kubeconfig"),
+                    definition.api_version,
+                    definition.kind,
+                    "tenant-a" if definition.namespaced else "",
+                    definition.expected_name("tenant-a"),
+                )
+                for definition in MANAGEMENT_CATALOG
+                if definition.evidence_policy == "named"
             },
             {
-                (resource, namespace, name)
-                for resource, namespace, name, _uid in snapshot["managementResources"]
+                (api_version, kind, namespace, name)
+                for api_version, kind, namespace, name, _uid
+                in snapshot["managementResources"]
+                if kind in {
+                    definition.kind
+                    for definition in MANAGEMENT_CATALOG
+                    if definition.evidence_policy == "named"
+                }
             },
+        )
+        self.assertIn(
+            (
+                "cluster.x-k8s.io/v1beta2",
+                "Machine",
+                "tenant-a",
+                "worker-a",
+                "machine-uid",
+            ),
+            snapshot["managementResources"],
+        )
+        self.assertEqual(
+            ("coordination.k8s.io/v1", "Lease"),
+            (
+                snapshot["allocationLease"]["apiVersion"],
+                snapshot["allocationLease"]["kind"],
+            ),
         )
         self.assertIn("tenant-a-lb cccc", snapshot["providerContainers"])
 

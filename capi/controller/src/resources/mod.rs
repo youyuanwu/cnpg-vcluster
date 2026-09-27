@@ -116,6 +116,15 @@ impl Context<'_> {
             spec,
         )
     }
+
+    fn management_ref(&self, kind: &str) -> Value {
+        let resource = crate::management::by_kind(kind).expect("management resource is catalogued");
+        json!({
+            "apiGroup":resource.api_version.split_once('/').unwrap().0,
+            "kind":resource.kind,
+            "name":resource.expected_name(self.name()).expect("referenced resource has a name")
+        })
+    }
 }
 
 #[derive(Debug, Error)]

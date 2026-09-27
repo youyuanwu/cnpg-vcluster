@@ -241,7 +241,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                 },
             )
         };
-        if matches!(&error, ReconcileError::Kube(kube::Error::Api(status)) if status.code == 409) {
+        if error.conflict() {
             return Ok(Action::requeue(PROGRESS_INTERVAL));
         }
         status::update_status(self.client.clone(), tenant, |status| {

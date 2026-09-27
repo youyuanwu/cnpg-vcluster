@@ -27,6 +27,7 @@ FIELDS = {
     "watchClusterLabel",
     "inventoryPolicy",
     "inventoryNamespace",
+    "evidencePolicy",
     "exemptions",
 }
 CLASSES = {"root", "descendant", "typed"}
@@ -36,6 +37,12 @@ INVENTORY_POLICIES = {
     "tenant-markers",
     "tenant-markers-or-kamaji-owner",
     "allocation-markers",
+}
+EVIDENCE_POLICIES = {"named", "observed", "allocation"}
+EXPECTED_EXEMPTIONS = {
+    "Namespace": ("management-infrastructure",),
+    "Secret": ("controller-installation-secrets",),
+    "Lease": ("controller-leader-election",),
 }
 
 
@@ -55,6 +62,7 @@ class ManagementResource:
     watch_cluster_label: str | None
     inventory_policy: str
     inventory_namespace: str | None
+    evidence_policy: str
     exemptions: tuple[str, ...]
 
     @property
@@ -81,6 +89,14 @@ class ManagementResource:
         if self.inventory_namespace is not None:
             return f"{base}/namespaces/{self.inventory_namespace}/{self.plural}"
         return f"{base}/{self.plural}"
+
+    def collection_path(self, namespace: str | None = None) -> str:
+        if namespace is not None:
+            return f"{self.discovery_path}/namespaces/{namespace}/{self.plural}"
+        return self.inventory_path
+
+    def object_path(self, namespace: str | None, name: str) -> str:
+        return f"{self.collection_path(namespace)}/{name}"
 
     def expected_name(self, tenant: str) -> str | None:
         if self.name_policy == "tenant":
@@ -143,6 +159,7 @@ def _parse_resource(entry: object) -> ManagementResource:
         or entry["class"] not in CLASSES
         or entry["namePolicy"] not in NAME_POLICIES
         or entry["inventoryPolicy"] not in INVENTORY_POLICIES
+        or entry["evidencePolicy"] not in EVIDENCE_POLICIES
         or not isinstance(exemptions, list)
         or not all(isinstance(value, str) and value for value in exemptions)
     ):
@@ -152,13 +169,7 @@ def _parse_resource(entry: object) -> ManagementResource:
         and not entry["namespaced"]
     ):
         raise RuntimeError("cluster-scoped catalog resource has an inventory namespace")
-    if (
-        entry["inventoryPolicy"] == "block-any-instance"
-        and exemptions
-    ) or (
-        entry["inventoryPolicy"] != "block-any-instance"
-        and not exemptions
-    ):
+    if tuple(exemptions) != EXPECTED_EXEMPTIONS.get(entry["kind"], ()):
         raise RuntimeError("management resource catalog exemptions are invalid")
     return ManagementResource(
         api_version=entry["apiVersion"],
@@ -175,6 +186,7 @@ def _parse_resource(entry: object) -> ManagementResource:
         watch_cluster_label=entry["watchClusterLabel"],
         inventory_policy=entry["inventoryPolicy"],
         inventory_namespace=entry["inventoryNamespace"],
+        evidence_policy=entry["evidencePolicy"],
         exemptions=tuple(exemptions),
     )
 

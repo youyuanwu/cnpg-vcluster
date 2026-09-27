@@ -284,6 +284,27 @@ def validate_inotify_state(root: Path, config: dict[str, str]) -> None:
             _read_state_record(host_fd, _state_path(root), config)
 
 
+def tenant_storage_volumes(config: dict[str, str]) -> set[str]:
+    volumes = {
+        name
+        for name in run(["docker", "volume", "ls", "-q"], timeout=30).stdout.split()
+        if name.endswith("-storage")
+    }
+    for label in (
+        f"{config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
+        "cnpg-vcluster.capi/role",
+        "cnpg-vcluster.capi/tenant",
+        "tenancy.cnpg-vcluster.io/tenant-uid",
+    ):
+        volumes.update(
+            run(
+                ["docker", "volume", "ls", "-q", "--filter", f"label={label}"],
+                timeout=30,
+            ).stdout.split()
+        )
+    return volumes
+
+
 def restore_inotify(root: Path, config: dict[str, str]) -> None:
     with _host_lock(root) as host_fd:
         state_path = _state_path(root)
@@ -312,19 +333,7 @@ def restore_inotify(root: Path, config: dict[str, str]) -> None:
                     timeout=30,
                 ).stdout.split()
             )
-        provider_residue.update(
-            run(
-                [
-                    "docker",
-                    "volume",
-                    "ls",
-                    "-q",
-                    "--filter",
-                    f"label={config['OWNERSHIP_LABEL']}={config['LAB_PREFIX']}",
-                ],
-                timeout=30,
-            ).stdout.split()
-        )
+        provider_residue.update(tenant_storage_volumes(config))
         if provider_residue:
             raise HostError(
                 "cannot restore host inotify values while provider-owned "

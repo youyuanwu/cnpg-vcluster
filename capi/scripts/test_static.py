@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import compileall
+import json
 import re
 import subprocess
 import sys
@@ -74,6 +75,20 @@ class StaticFailure(RuntimeError):
 def check(condition: bool, message: str) -> None:
     if not condition:
         raise StaticFailure(message)
+
+
+def catalog_identity_literals(catalog: list[dict[str, object]]) -> set[str]:
+    result = set()
+    for entry in catalog:
+        api_version = str(entry["apiVersion"])
+        group, separator, _version = api_version.partition("/")
+        if separator:
+            result.update({
+                api_version,
+                f"{entry['plural']}.{group}",
+                f"{str(entry['kind']).lower()}/",
+            })
+    return result
 
 
 def output(*command: str, check_result: bool = True) -> subprocess.CompletedProcess[str]:
@@ -322,6 +337,8 @@ def check_repository_boundaries() -> None:
     catalog_consumers = "\n".join(
         (ROOT / relative).read_text(encoding="utf-8")
         for relative in (
+            "controller/src/resources/controlplane.rs",
+            "controller/src/resources/workers.rs",
             "scripts/lib/controller_state.py",
             "scripts/lib/tenants.py",
             "scripts/lib/controller_scenarios.py",
@@ -334,20 +351,19 @@ def check_repository_boundaries() -> None:
             "scripts/test_e2e.py",
         )
     )
-    for identity in (
-        "clusters.cluster.x-k8s.io",
-        "devclusters.infrastructure.cluster.x-k8s.io",
-        "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
-        "kubeadmconfigtemplates.bootstrap.cluster.x-k8s.io",
-        "devmachinetemplates.infrastructure.cluster.x-k8s.io",
-        "machinedeployments.cluster.x-k8s.io",
-        "bootstrap.cluster.x-k8s.io/v1beta2",
-        "machinedeployment/",
-        "machine/",
-        "devmachine/",
-        "kubeadmconfig/",
-        "kamajicontrolplane/",
-    ):
+    catalog = json.loads(
+        (ROOT / "controller/config/management-resources.json").read_text()
+    )
+    identities = catalog_identity_literals(catalog)
+    check(
+        catalog_identity_literals([{
+            "apiVersion": "example.io/v1",
+            "kind": "Widget",
+            "plural": "widgets",
+        }]) == {"example.io/v1", "widgets.example.io", "widget/"},
+        "catalog identity guard does not cover newly added kinds",
+    )
+    for identity in identities:
         check(
             identity not in catalog_consumers,
             f"catalog-owned management identity remains duplicated: {identity}",
