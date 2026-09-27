@@ -26,7 +26,9 @@ fn catalog_watch_mapping_preserves_typed_and_dynamic_fallbacks() {
         "metadata":{"name":"tenant-a-kubeconfig","namespace":"tenant-a"}
     }))
     .unwrap();
-    let mapped = map_management_to_tenant(by_kind("Secret").unwrap(), &secret);
+    let mut secret_watch = by_kind("Secret").unwrap();
+    secret_watch.name_policy = tenant_controller::management::NamePolicy::Tenant;
+    let mapped = map_management_to_tenant(secret_watch, &secret);
     assert_eq!(mapped.len(), 1);
     assert_eq!(mapped[0].name, "tenant-a");
 

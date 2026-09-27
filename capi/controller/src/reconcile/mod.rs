@@ -661,20 +661,16 @@ pub fn map_management_to_tenant(
     if !mapped.is_empty() {
         return mapped;
     }
-    if definition.name_policy == management::NamePolicy::Kubeconfig {
+    if let Some(suffix) = definition.watch_name_suffix {
         object
             .namespace()
-            .filter(|namespace| {
-                definition
-                    .expected_name(namespace)
-                    .is_some_and(|name| name == object.name_any())
-            })
+            .filter(|namespace| object.name_any() == format!("{namespace}{suffix}"))
             .map(|namespace| vec![ObjectRef::new(&namespace)])
             .unwrap_or_default()
-    } else if definition.watch_by_cluster {
+    } else if let Some(label) = definition.watch_cluster_label {
         object
             .labels()
-            .get("cluster.x-k8s.io/cluster-name")
+            .get(label)
             .filter(|name| !name.is_empty())
             .map(|name| vec![ObjectRef::new(name)])
             .unwrap_or_default()

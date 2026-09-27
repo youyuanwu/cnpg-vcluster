@@ -305,9 +305,12 @@ async fn exact_cluster_namespace_and_lease_are_deleted_in_order() {
             && call.body["propagationPolicy"] == "Background"
     }));
     assert!(server.calls().iter().any(|call| {
+        let status = call.body["status"].as_object();
         call.method == "PATCH"
             && call.path == format!("{TENANT_PATH}/status")
-            && call.body["status"]["allocation"].is_null()
+            && status.is_some_and(|status| {
+                status.contains_key("allocation") && status["allocation"].is_null()
+            })
     }));
 }
 

@@ -23,7 +23,8 @@ FIELDS = {
     "alternateParentKind",
     "namePolicy",
     "watched",
-    "watchByCluster",
+    "watchNameSuffix",
+    "watchClusterLabel",
     "inventoryPolicy",
     "inventoryNamespace",
     "exemptions",
@@ -50,7 +51,8 @@ class ManagementResource:
     alternate_parent_kind: str | None
     name_policy: str
     watched: bool
-    watch_by_cluster: bool
+    watch_name_suffix: str | None
+    watch_cluster_label: str | None
     inventory_policy: str
     inventory_namespace: str | None
     exemptions: tuple[str, ...]
@@ -121,7 +123,13 @@ def _parse_resource(entry: object) -> ManagementResource:
     strings = ("apiVersion", "kind", "plural", "role")
     if any(not isinstance(entry[field], str) or not entry[field] for field in strings):
         raise RuntimeError("management resource catalog metadata is invalid")
-    optional_strings = ("parentKind", "alternateParentKind", "inventoryNamespace")
+    optional_strings = (
+        "parentKind",
+        "alternateParentKind",
+        "inventoryNamespace",
+        "watchNameSuffix",
+        "watchClusterLabel",
+    )
     if any(
         entry[field] is not None
         and (not isinstance(entry[field], str) or not entry[field])
@@ -132,7 +140,6 @@ def _parse_resource(entry: object) -> ManagementResource:
     if (
         not isinstance(entry["namespaced"], bool)
         or not isinstance(entry["watched"], bool)
-        or not isinstance(entry["watchByCluster"], bool)
         or entry["class"] not in CLASSES
         or entry["namePolicy"] not in NAME_POLICIES
         or entry["inventoryPolicy"] not in INVENTORY_POLICIES
@@ -164,7 +171,8 @@ def _parse_resource(entry: object) -> ManagementResource:
         alternate_parent_kind=entry["alternateParentKind"],
         name_policy=entry["namePolicy"],
         watched=entry["watched"],
-        watch_by_cluster=entry["watchByCluster"],
+        watch_name_suffix=entry["watchNameSuffix"],
+        watch_cluster_label=entry["watchClusterLabel"],
         inventory_policy=entry["inventoryPolicy"],
         inventory_namespace=entry["inventoryNamespace"],
         exemptions=tuple(exemptions),
