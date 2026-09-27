@@ -84,16 +84,14 @@ class CIWorkflowTests(unittest.TestCase):
                           "MIN_DOCKER_STORAGE_GIB", "timeout-minutes:"):
                 self.assertIn(token, live)
 
-    def test_cargo_work_directory_is_cleanup_safe(self) -> None:
-        self.assertEqual(4, WORKFLOW.count(".tools/cargo-work"))
-        self.assertNotIn(".runtime/cargo-work", WORKFLOW)
-        self.assertIn(
-            "TMPDIR: ${{ github.workspace }}/capi/.tools/cargo-work",
-            WORKFLOW,
-        )
+    def test_cargo_uses_default_system_locations(self) -> None:
+        self.assertNotIn("TMPDIR:", WORKFLOW)
+        self.assertNotIn("CARGO_HOME", WORKFLOW)
+        self.assertNotIn("CARGO_TARGET_DIR", WORKFLOW)
+        self.assertNotIn(".tools/cargo-", WORKFLOW)
         for name in ("fast-checks", "e2e", "high-capacity"):
             self.assertIn(
-                "run: install -d -m 700 .tools .runtime .tools/cargo-home .tools/cargo-work",
+                "run: install -d -m 700 .tools .runtime",
                 job(name),
             )
 
@@ -107,19 +105,22 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("${{ github.event_name }}-${{ github.ref }}", WORKFLOW)
         self.assertIn("cancel-in-progress: true", WORKFLOW)
 
-    def test_optional_cargo_cache_uses_lock_compiler_and_platform(self) -> None:
-        fast, e2e, high = (job(name) for name in ("fast-checks", "e2e", "high-capacity"))
-        keys = re.findall(r"(?m)^\s+key: (controller-cargo-.*)$", WORKFLOW)
-        self.assertEqual(2, len(keys))
-        self.assertEqual(keys[0], keys[1])
-        for token in ("runner.os", "runner.arch", "steps.compiler.outputs.identity",
-                      "hashFiles('capi/controller/Cargo.lock')"):
-            self.assertIn(token, keys[0])
-        self.assertEqual(2, WORKFLOW.count("path: capi/.tools/cargo-home"))
-        self.assertNotIn("restore-keys:", WORKFLOW)
-        self.assertIn("path: capi/.tools/cargo-target", fast)
-        self.assertNotIn("path: capi/.tools/cargo-target", e2e + high)
-        self.assertNotIn("rustup", WORKFLOW)
+    def test_standard_rust_setup_and_cache_actions(self) -> None:
+        self.assertEqual(
+            3,
+            WORKFLOW.count("uses: actions-rust-lang/setup-rust-toolchain@v2"),
+        )
+        self.assertNotIn("components:", WORKFLOW)
+        for option in (
+            "build-warnings:",
+            "cache-workspaces:",
+            "cache-shared-key:",
+            "cache-bin:",
+        ):
+            self.assertNotIn(option, WORKFLOW)
+        self.assertNotIn("Swatinem/rust-cache@", WORKFLOW)
+        self.assertNotIn("dtolnay/rust-toolchain@", WORKFLOW)
+        self.assertNotIn("actions/cache@", WORKFLOW)
         self.assertNotRegex(WORKFLOW, r"go\.mod|go\.sum|envtest|controller-gen|"
                             r"controller-tools|controller-vet|go-mod-cache|"
                             r"GO_VERSION|GOCACHE|GOMODCACHE")

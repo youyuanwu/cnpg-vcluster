@@ -47,31 +47,25 @@ class PackagingTests(unittest.TestCase):
         (ROOT / ".runtime").mkdir(exist_ok=True)
         self.directory = tempfile.TemporaryDirectory(dir=ROOT / ".runtime")
         self.addCleanup(self.directory.cleanup)
-        self.root = Path(self.directory.name)
-        packaging.cargo_environment(self.root)
+        self.repository = Path(self.directory.name)
+        self.root = self.repository / "capi"
+        self.root.mkdir(mode=0o700)
+        (self.root / "controller").mkdir(mode=0o700)
 
     def toolchain(self, *_args):
-        return ("/installed/cargo", packaging.cargo_environment(self.root), "rustc 1.96\ncargo 1.96")
+        return ("/installed/cargo", "rustc 1.96\ncargo 1.96")
 
-    def test_environment_is_local_offline_and_not_global_static_flags(self):
-        with patch.dict(os.environ, {
-            "CARGO_HOME": "/foreign", "CARGO_TARGET_DIR": "/foreign",
-            "RUSTFLAGS": "-C target-feature=+crt-static", "RUSTC_WRAPPER": "untrusted",
-            "CARGO_ENCODED_RUSTFLAGS": "foreign", "CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS": "foreign",
-            "GOCACHE": "/foreign", "GOMODCACHE": "/foreign",
-            "KUBEBUILDER_ASSETS": "/foreign",
-        }):
-            env = packaging.cargo_environment(self.root)
-        self.assertEqual(env["CARGO_HOME"], str(self.root / ".tools/cargo-home"))
-        self.assertEqual(env["CARGO_TARGET_DIR"], str(self.root / ".tools/cargo-target"))
-        self.assertEqual(env["CARGO_NET_OFFLINE"], "true")
-        self.assertEqual(env["RUSTUP_AUTO_INSTALL"], "0")
-        self.assertNotIn("RUSTFLAGS", env)
-        self.assertNotIn("CARGO_ENCODED_RUSTFLAGS", env)
-        self.assertNotIn("RUSTC_WRAPPER", env)
-        for legacy in ("GOCACHE", "GOMODCACHE", "KUBEBUILDER_ASSETS"):
-            self.assertNotIn(legacy, env)
-        self.assertEqual(Path(env["TMPDIR"]), self.root / ".tools" / "cargo-work")
+    def test_cargo_commands_use_process_environment_defaults(self):
+        with (
+            patch.object(packaging, "rust_toolchain", side_effect=self.toolchain),
+            patch.object(packaging, "run") as run,
+        ):
+            packaging._cargo(self.root, CONFIG, ["metadata", "--no-deps"])
+        self.assertEqual(
+            run.call_args.args[0],
+            ["/installed/cargo", "metadata", "--no-deps"],
+        )
+        self.assertNotIn("env", run.call_args.kwargs)
 
     def test_system_compiler_floor_and_missing_tools_never_install(self):
         for version, valid in (("1.88.9", False), ("1.89.0", True), ("1.96.0", True)):
@@ -84,9 +78,8 @@ class PackagingTests(unittest.TestCase):
                 ]) as run,
             ):
                 if valid:
-                    cargo, env, identity = packaging.rust_toolchain(self.root)
+                    cargo, identity = packaging.rust_toolchain(self.root)
                     self.assertEqual(cargo, "/installed/cargo")
-                    self.assertEqual(env["RUSTC"], "/installed/rustc")
                     self.assertIn(version, identity)
                 else:
                     with self.assertRaisesRegex(RuntimeError, ">= 1.89"):
@@ -94,8 +87,9 @@ class PackagingTests(unittest.TestCase):
                 self.assertEqual(len(run.call_args_list), 2)
                 self.assertTrue(all(call.args[0][1:] == ["--version", "--verbose"]
                                     for call in run.call_args_list))
+                self.assertTrue(all("env" not in call.kwargs for call in run.call_args_list))
         with patch.object(packaging.shutil, "which", return_value=None):
-            with self.assertRaisesRegex(RuntimeError, "no toolchain is downloaded"):
+            with self.assertRaisesRegex(RuntimeError, "rustc >= 1.89"):
                 packaging.rust_toolchain(self.root)
 
     def test_fetch_is_locked_and_enforced_offline_cannot_download(self):
@@ -110,25 +104,27 @@ class PackagingTests(unittest.TestCase):
                 command = run.call_args.args[0]
                 self.assertEqual(command[:3], ["/installed/cargo", "fetch", "--locked"])
                 self.assertEqual("--offline" in command, offline == "1")
-                self.assertEqual(run.call_args.kwargs["env"]["CARGO_NET_OFFLINE"], str(offline == "1").lower())
+                self.assertNotIn("env", run.call_args.kwargs)
 
-    def test_empty_target_offline_static_final_manager_build(self):
-        target = self.root / ".tools/cargo-target/offline-verification"
-        target.mkdir(parents=True)
-        (target / "stale").touch()
+    def test_default_target_offline_static_final_manager_build(self):
+        binary = self.root / "shared-target" / "release" / "manager"
 
         def build(command, **kwargs):
-            self.assertFalse((target / "stale").exists())
-            self.assertEqual(list(target.iterdir()), [])
             self.assertEqual(command, [
                 "/installed/cargo", "rustc", "--locked", "--offline", "--release",
-                "--bin", "manager", "--", "-C", "target-feature=+crt-static",
+                "--bin", "manager", "--message-format=json-render-diagnostics",
+                "--", "-C", "target-feature=+crt-static",
             ])
-            self.assertEqual(kwargs["env"]["CARGO_NET_OFFLINE"], "true")
-            self.assertNotIn("RUSTFLAGS", kwargs["env"])
-            (target / "release").mkdir()
-            (target / "release/manager").write_bytes(b"\x7fELFstatic")
-            return response()
+            self.assertNotIn("env", kwargs)
+            binary.parent.mkdir(parents=True)
+            binary.write_bytes(b"\x7fELFstatic")
+            return response(
+                json.dumps({
+                    "reason": "compiler-artifact",
+                    "target": {"name": "manager"},
+                    "executable": str(binary),
+                })
+            )
 
         with (
             patch.object(packaging, "fetch_controller_dependencies") as fetch,
@@ -138,7 +134,7 @@ class PackagingTests(unittest.TestCase):
         ):
             output = packaging.build_controller_binary(self.root, CONFIG)
         fetch.assert_called_once_with(self.root, CONFIG)
-        verify.assert_called_once_with(target / "release/manager")
+        verify.assert_called_once_with(binary)
         self.assertEqual(output.read_bytes(), b"\x7fELFstatic")
         self.assertEqual(output.stat().st_mode & 0o777, 0o700)
 
@@ -206,7 +202,9 @@ class PackagingTests(unittest.TestCase):
 
     def test_source_identity_tracks_rust_compiler_flags_assets_not_go_or_target(self):
         files = {
-            "controller/Cargo.toml": "[package]", "controller/Cargo.lock": "lock",
+            "../Cargo.toml": "[workspace]", "../Cargo.lock": "lock",
+            "../rust-toolchain.toml": '[toolchain]\nchannel = "stable"',
+            "controller/Cargo.toml": "[package]",
             "controller/src/lib.rs": "source", "controller/Dockerfile": "FROM scratch",
             "controller/config/manager/manager.yaml.tpl": "manager",
             "controller/config/crd/bases/tenant.yaml": "crd",
@@ -228,7 +226,7 @@ class PackagingTests(unittest.TestCase):
             self.assertEqual(original, packaging.controller_source_digest(self.root, {**CONFIG, "UNRELATED": "99"}))
             with patch.object(packaging, "STATIC_MANAGER_FLAGS", ("changed",)):
                 self.assertNotEqual(original, packaging.controller_source_digest(self.root, CONFIG))
-        with patch.object(packaging, "rust_toolchain", return_value=("cargo", {}, "different compiler")):
+        with patch.object(packaging, "rust_toolchain", return_value=("cargo", "different compiler")):
             self.assertNotEqual(original, packaging.controller_source_digest(self.root, CONFIG))
 
     def test_foundation_wires_the_schema_three_producer(self):

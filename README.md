@@ -41,4 +41,5 @@ neither profile is a production hostile-tenant isolation boundary.
 
 See [`capi/README.md`](capi/README.md) and
 [`capi/docs/high-level-design.md`](capi/docs/high-level-design.md). The local
-operator requires system-installed Rust/Cargo; no Go tool downloads are needed.
+operator uses the Rust 1.98.1 toolchain declared in
+[`rust-toolchain.toml`](rust-toolchain.toml); no Go tool downloads are needed.

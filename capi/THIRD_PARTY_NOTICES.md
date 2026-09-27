@@ -8,7 +8,7 @@ or container image is committed to this repository.
 Exact versions, source commits, URLs, checksums, image tags, and OCI digests
 for the non-Rust lab inputs are recorded in
 [`config/versions.env`](config/versions.env). Rust crate versions and
-checksums are pinned in [`controller/Cargo.lock`](controller/Cargo.lock);
+checksums are pinned in the repository [`Cargo.lock`](../Cargo.lock);
 the license expressions below come from the resolved crates' Cargo metadata.
 Upstream copyright, license, and NOTICE files remain authoritative.
 

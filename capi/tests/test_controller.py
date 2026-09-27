@@ -270,12 +270,22 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
                 (root / ".runtime" / "rendered" / "controller-build").exists()
             )
 
-    @patch("scripts.lib.controller.rust_toolchain", return_value=("cargo", {}, "rustc 1.96"))
+    @patch("scripts.lib.controller.rust_toolchain", return_value=("cargo", "rustc 1.96"))
     def test_controller_digest_includes_assets_and_versions(self, _toolchain) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "controller").mkdir()
-            for filename in ("Cargo.toml", "Cargo.lock", "Dockerfile"):
+            repository = Path(temporary)
+            root = repository / "capi"
+            (root / "controller").mkdir(parents=True)
+            repository.joinpath("Cargo.toml").write_text(
+                "[workspace]", encoding="utf-8",
+            )
+            repository.joinpath("Cargo.lock").write_text(
+                "lock", encoding="utf-8",
+            )
+            repository.joinpath("rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "stable"\n', encoding="utf-8",
+            )
+            for filename in ("Cargo.toml", "Dockerfile"):
                 (root / "controller" / filename).write_text(filename, encoding="utf-8")
             manager = root / "controller/config/manager/manager.yaml.tpl"
             manager.parent.mkdir(parents=True)

@@ -111,32 +111,49 @@ def write_archive(
 class CacheTests(unittest.TestCase):
     def test_cargo_lock_and_compiler_are_cache_requirements(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
+            repository = Path(temporary)
+            root = repository / "capi"
             controller = root / "controller"
-            controller.mkdir()
+            controller.mkdir(parents=True)
+            (repository / "Cargo.toml").write_text("[workspace]\n")
             (controller / "Cargo.toml").write_text("[package]\n")
-            (controller / "Cargo.lock").write_text("locked inputs")
+            (repository / "Cargo.lock").write_text("locked inputs")
+            (repository / "rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "stable"\n'
+            )
             config = load_configuration(Path(__file__).resolve().parents[1])
             with patch("scripts.lib.controller.rust_toolchain",
-                       return_value=("cargo", {}, "compiler A")):
+                       return_value=("cargo", "compiler A")):
                 original = _requirements(config, root)
                 self.assertEqual(original["cargo"]["lockSha256"],
                                  hashlib.sha256(b"locked inputs").hexdigest())
             with patch("scripts.lib.controller.rust_toolchain",
-                       return_value=("cargo", {}, "compiler B")):
+                       return_value=("cargo", "compiler B")):
                 self.assertNotEqual(original, _requirements(config, root))
-            (controller / "Cargo.lock").write_text("changed")
+            (repository / "Cargo.lock").write_text("changed")
             with patch("scripts.lib.controller.rust_toolchain",
-                       return_value=("cargo", {}, "compiler A")):
+                       return_value=("cargo", "compiler A")):
                 self.assertNotEqual(original, _requirements(config, root))
-            (controller / "Cargo.lock").unlink()
+            (repository / "Cargo.lock").write_text("locked inputs")
+            (repository / "rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "beta"\n'
+            )
+            with patch("scripts.lib.controller.rust_toolchain",
+                       return_value=("cargo", "compiler A")):
+                self.assertNotEqual(original, _requirements(config, root))
+            (repository / "Cargo.lock").unlink()
             with self.assertRaisesRegex(IntegrityError, "Cargo.lock"):
                 _requirements(config, root)
 
     def test_verified_cache_rejects_missing_offline_cargo_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "controller").mkdir()
+            repository = Path(temporary)
+            root = repository / "capi"
+            (root / "controller").mkdir(parents=True)
+            (repository / "Cargo.toml").write_text("[workspace]\n")
+            (repository / "rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "stable"\n'
+            )
             (root / "controller/Cargo.toml").write_text("[package]\n")
             with (
                 patch("scripts.cache.active_generation", return_value=root),
@@ -152,8 +169,13 @@ class CacheTests(unittest.TestCase):
 
     def test_online_cache_does_not_publish_before_locked_cargo_fetch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            (root / "controller").mkdir()
+            repository = Path(temporary)
+            root = repository / "capi"
+            (root / "controller").mkdir(parents=True)
+            (repository / "Cargo.toml").write_text("[workspace]\n")
+            (repository / "rust-toolchain.toml").write_text(
+                '[toolchain]\nchannel = "stable"\n'
+            )
             (root / "controller/Cargo.toml").write_text("[package]\n")
             with (
                 patch("scripts.cache.acquire_tools"),
