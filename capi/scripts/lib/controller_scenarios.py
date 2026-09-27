@@ -116,10 +116,24 @@ def allocation_leases(client: ManagementClient) -> list[dict[str, object]]:
         raise RuntimeError("invalid allocation Lease inventory")
     if any(
         not isinstance(item, dict)
+        or (
+            "apiVersion" in item
+            and item["apiVersion"] != LEASE.api_version
+        )
+        or ("kind" in item and item["kind"] != LEASE.kind)
         or not isinstance(item.get("metadata"), dict)
-        or not item["metadata"].get("name")
-        or not item["metadata"].get("uid")
+        or not isinstance(item["metadata"].get("name"), str)
+        or not item["metadata"]["name"]
+        or not isinstance(item["metadata"].get("uid"), str)
+        or not item["metadata"]["uid"]
+        or item["metadata"].get("namespace") != LEASE_NAMESPACE
+        or not isinstance(item["metadata"].get("labels", {}), dict)
         or not isinstance(item["metadata"].get("annotations", {}), dict)
+        or not all(
+            isinstance(key, str) and isinstance(value, str)
+            for field in ("labels", "annotations")
+            for key, value in item["metadata"].get(field, {}).items()
+        )
         for item in payload["items"]
     ):
         raise RuntimeError("invalid allocation Lease identity")
@@ -440,17 +454,19 @@ def tenant_snapshot(
                 not isinstance(item_metadata, dict)
                 or not isinstance(item_name, str)
                 or not item_name
-                or not item_metadata.get("uid")
+                or not isinstance(item_metadata.get("uid"), str)
+                or not item_metadata["uid"]
                 or item_metadata.get("namespace") not in (
                     (namespace,) if definition.namespaced else (None, "")
                 )
                 or (
+                    "apiVersion" in item
+                    and item["apiVersion"] != definition.api_version
+                )
+                or ("kind" in item and item["kind"] != definition.kind)
+                or (
                     expected_name is not None
-                    and (
-                        item.get("apiVersion") != definition.api_version
-                        or item.get("kind") != definition.kind
-                        or item_name != expected_name
-                    )
+                    and item_name != expected_name
                 )
             ):
                 raise RuntimeError(

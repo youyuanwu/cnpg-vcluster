@@ -115,6 +115,41 @@ class HostOwnershipTests(unittest.TestCase):
             self.assertTrue(identity.exists())
             self.assertTrue(unknown.exists())
 
+    def test_unknown_directory_inside_obsolete_tree_blocks_without_deletion(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            legacy = root / ".runtime/lifecycle/local/tenant-a"
+            unexpected = legacy / "unexpected"
+            unexpected.mkdir(parents=True, mode=0o700)
+            for parent in unexpected.parents:
+                if parent == root:
+                    break
+                parent.chmod(0o700)
+            identity = legacy / "ready.json"
+            identity.write_text("{}\n", encoding="utf-8")
+            identity.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "unexpected runtime directory"):
+                _validate_runtime_inventory(root)
+            self.assertTrue(identity.exists())
+            self.assertTrue(unexpected.exists())
+
+    def test_empty_obsolete_directories_are_removed(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            for relative in (
+                ".runtime/lifecycle/local",
+                ".runtime/lifecycle/rejected/local",
+            ):
+                directory = root / relative
+                directory.mkdir(parents=True, mode=0o700)
+                for parent in directory.parents:
+                    if parent == root:
+                        break
+                    parent.chmod(0o700)
+            _validate_runtime_inventory(root)
+            self.assertFalse((root / ".runtime/lifecycle/local").exists())
+            self.assertFalse((root / ".runtime/lifecycle/rejected/local").exists())
+
     def test_host_residue_includes_unrecorded_capd_worker_role(self) -> None:
         config = {
             "SPIKE_NAME": "spike",

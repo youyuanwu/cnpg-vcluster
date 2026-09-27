@@ -180,7 +180,6 @@ async fn require_clean_inventory<D: DockerClient>(
     }
     for &resource in MANAGEMENT_RESOURCES {
         for item in inventory(client.clone(), resource).await? {
-            validate_inventory_item(resource, &item)?;
             if inventory_blocks(resource, &item) {
                 return Err(ControllerError::Configuration(format!(
                     "{} resources block configuration activation",
@@ -243,20 +242,7 @@ async fn inventory(
     client: Client,
     resource: ManagementResource,
 ) -> Result<Vec<DynamicObject>, ControllerError> {
-    let (group, version) = resource
-        .api_version
-        .split_once('/')
-        .unwrap_or(("", resource.api_version));
-    let base = if group.is_empty() {
-        format!("/api/{version}")
-    } else {
-        format!("/apis/{group}/{version}")
-    };
-    let path = match resource.inventory_namespace {
-        Some(namespace) => format!("{base}/namespaces/{namespace}/{}", resource.plural),
-        None => format!("{base}/{}", resource.plural),
-    };
-    let request = Request::get(path)
+    let request = Request::get(resource.inventory_path())
         .body(Vec::new())
         .map_err(|error| ControllerError::Configuration(error.to_string()))?;
     let document: Value = client.request(request).await?;
@@ -278,44 +264,85 @@ async fn inventory(
         .iter()
         .cloned()
         .map(|item| {
-            serde_json::from_value(item).map_err(|error| {
+            validate_raw_inventory_item(resource, &item)?;
+            let item = serde_json::from_value(item).map_err(|error| {
                 ControllerError::Configuration(format!(
                     "{} inventory item is invalid: {error}",
                     resource.kind
                 ))
-            })
+            })?;
+            validate_inventory_item(resource, &item)?;
+            Ok(item)
         })
         .collect()
+}
+
+fn validate_raw_inventory_item(
+    resource: ManagementResource,
+    item: &Value,
+) -> Result<(), ControllerError> {
+    let metadata = item.get("metadata").and_then(Value::as_object);
+    if metadata.is_some()
+        && ["annotations", "labels", "ownerReferences"]
+            .iter()
+            .all(|field| {
+                metadata
+                    .unwrap()
+                    .get(*field)
+                    .is_none_or(|value| !value.is_null())
+            })
+    {
+        Ok(())
+    } else {
+        Err(ControllerError::Configuration(format!(
+            "{} inventory item is invalid",
+            resource.kind
+        )))
+    }
 }
 
 fn validate_inventory_item(
     resource: ManagementResource,
     item: &DynamicObject,
 ) -> Result<(), ControllerError> {
-    let valid_type = item.types.as_ref().is_none_or(|types| {
-        types.api_version == resource.api_version && types.kind == resource.kind
-    });
+    let namespace = item.metadata.namespace.as_deref();
     let valid_namespace = if resource.namespaced {
-        item.metadata.namespace.as_deref().is_some_and(|namespace| {
+        namespace.is_some_and(|namespace| {
             !namespace.is_empty()
                 && resource
                     .inventory_namespace
                     .is_none_or(|expected| namespace == expected)
         })
     } else {
-        item.metadata.namespace.as_deref().is_none_or(str::is_empty)
+        namespace.is_none_or(str::is_empty)
     };
-    if !valid_type
-        || !valid_namespace
-        || item.metadata.name.as_deref().is_none_or(str::is_empty)
-        || item.metadata.uid.as_deref().is_none_or(str::is_empty)
-    {
-        return Err(ControllerError::Configuration(format!(
-            "{} inventory identity is invalid",
-            resource.kind
-        )));
-    }
-    Ok(())
+    let valid = item.types.as_ref().is_none_or(|types| {
+        types.api_version == resource.api_version && types.kind == resource.kind
+    }) && item
+        .metadata
+        .name
+        .as_deref()
+        .is_some_and(|value| !value.is_empty())
+        && item
+            .metadata
+            .uid
+            .as_deref()
+            .is_some_and(|value| !value.is_empty())
+        && item
+            .metadata
+            .owner_references
+            .iter()
+            .flatten()
+            .all(|owner| {
+                !owner.api_version.is_empty()
+                    && !owner.kind.is_empty()
+                    && !owner.name.is_empty()
+                    && !owner.uid.is_empty()
+            })
+        && valid_namespace;
+    valid.then_some(()).ok_or_else(|| {
+        ControllerError::Configuration(format!("{} inventory identity is invalid", resource.kind))
+    })
 }
 
 fn inventory_blocks(resource: ManagementResource, item: &DynamicObject) -> bool {
@@ -352,5 +379,5 @@ fn inventory_blocks(resource: ManagementResource, item: &DynamicObject) -> bool 
             }),
         InventoryPolicy::AllocationMarkers => false,
     };
-    marked || resource.exemptions.is_empty()
+    marked || !resource.exempts_unmarked()
 }

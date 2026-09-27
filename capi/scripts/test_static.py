@@ -82,11 +82,12 @@ def catalog_identity_literals(catalog: list[dict[str, object]]) -> set[str]:
     for entry in catalog:
         api_version = str(entry["apiVersion"])
         group, separator, _version = api_version.partition("/")
+        if separator or entry["kind"] not in {"Namespace", "Secret"}:
+            result.add(f"{str(entry['kind']).lower()}/")
         if separator:
             result.update({
                 api_version,
                 f"{entry['plural']}.{group}",
-                f"{str(entry['kind']).lower()}/",
             })
     return result
 
@@ -362,6 +363,14 @@ def check_repository_boundaries() -> None:
             "plural": "widgets",
         }]) == {"example.io/v1", "widgets.example.io", "widget/"},
         "catalog identity guard does not cover newly added kinds",
+    )
+    check(
+        catalog_identity_literals([{
+            "apiVersion": "v1",
+            "kind": "NewCore",
+            "plural": "newcores",
+        }]) == {"newcore/"},
+        "catalog identity guard does not cover new core kinds",
     )
     for identity in identities:
         check(

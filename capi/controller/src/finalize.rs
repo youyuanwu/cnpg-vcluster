@@ -9,8 +9,7 @@ use crate::allocation::{
 };
 use crate::api::{FINALIZER, Tenant, TenantPhase, canonical_spec, spec_hash};
 use crate::docker::{
-    BollardDockerClient, DockerClient, DockerError, DockerVolume, WorkerIdentity, validate_volume,
-    worker_containers,
+    DockerClient, DockerError, DockerVolume, WorkerIdentity, validate_volume, worker_containers,
 };
 use crate::error::ControllerError as ReconcileError;
 use crate::foundation::RuntimeFoundation;
@@ -106,27 +105,11 @@ fn version(
         .ok_or_else(|| invalid("missing resourceVersion"))
 }
 
-pub struct Finalizer<D = BollardDockerClient> {
+pub struct Finalizer<D> {
     client: Client,
     docker: D,
     supported_version: String,
     foundation: Arc<RuntimeFoundation>,
-}
-
-impl Finalizer<BollardDockerClient> {
-    pub fn new(
-        client: Client,
-        docker: BollardDockerClient,
-        supported_version: impl Into<String>,
-        foundation: Arc<RuntimeFoundation>,
-    ) -> Self {
-        Self {
-            client,
-            docker,
-            supported_version: supported_version.into(),
-            foundation,
-        }
-    }
 }
 
 impl<D: DockerClient> Finalizer<D> {

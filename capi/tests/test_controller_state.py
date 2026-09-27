@@ -574,19 +574,23 @@ class ControllerStateTests(unittest.TestCase):
                 require_clean_controller_state(root, Client(clean_handler))
 
     def test_unknown_exemption_is_rejected_before_empty_inventory(self) -> None:
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "scripts.lib.controller_state.run",
-            return_value=response(""),
+        for field, value in (
+            ("exemptions", ["unknown-exemption"]),
+            ("inventoryPolicy", "tenant-markers"),
         ):
-            root = prepare_root(directory)
-            path = root / "controller/config/management-resources.json"
-            catalog = json.loads(path.read_text())
-            next(entry for entry in catalog if entry["kind"] == "Secret")[
-                "exemptions"
-            ] = ["unknown-exemption"]
-            path.write_text(json.dumps(catalog), encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "exemptions are invalid"):
-                require_clean_controller_state(root, Client(clean_handler))
+            with self.subTest(field=field), tempfile.TemporaryDirectory() as directory, patch(
+                "scripts.lib.controller_state.run",
+                return_value=response(""),
+            ):
+                root = prepare_root(directory)
+                path = root / "controller/config/management-resources.json"
+                catalog = json.loads(path.read_text())
+                next(entry for entry in catalog if entry["kind"] == "Secret")[
+                    field
+                ] = value
+                path.write_text(json.dumps(catalog), encoding="utf-8")
+                with self.assertRaisesRegex(RuntimeError, "exemptions are invalid"):
+                    require_clean_controller_state(root, Client(clean_handler))
 
     def test_catalog_fixture_changes_named_resource_resolution(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

@@ -87,6 +87,24 @@ def _validate_runtime_inventory(
         ),
         re.compile(r"^lifecycle/rejected/local/create-[a-z0-9-]+\.json$"),
     )
+    obsolete_directories = (
+        re.compile(r"^lifecycle/local$"),
+        re.compile(rf"^lifecycle/local/{tenant_pattern}$"),
+        re.compile(rf"^lifecycle/local/{tenant_pattern}/evidence$"),
+        re.compile(r"^lifecycle/rejected/local$"),
+    )
+    known_top_level = {
+        "azure",
+        "azure-gate",
+        "deletions",
+        "evidence",
+        "host",
+        "lifecycle",
+        "management",
+        "rendered",
+        "storage",
+        "tenants",
+    }
     allowed_dynamic = (
         re.compile(
             rf"^rendered/tenants/{tenant_pattern}/"
@@ -137,6 +155,7 @@ def _validate_runtime_inventory(
         re.compile(r"^lifecycle/rejected/azure/create-[a-z0-9-]+\.json$"),
     )
     obsolete = []
+    obsolete_dirs = []
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
         if relative == "azure" or relative.startswith("azure/"):
@@ -157,6 +176,19 @@ def _validate_runtime_inventory(
         if path.is_dir():
             if details.st_uid != os.getuid() or details.st_mode & 0o077:
                 raise RuntimeError(f"runtime directory is not private: {relative}")
+            if "/" not in relative and relative not in known_top_level:
+                raise RuntimeError(
+                    f"unexpected runtime directory blocks cleanup: {relative}"
+                )
+            if relative.startswith(("lifecycle/local", "lifecycle/rejected/local")):
+                if not any(
+                    pattern.fullmatch(relative)
+                    for pattern in obsolete_directories
+                ):
+                    raise RuntimeError(
+                        f"unexpected runtime directory blocks cleanup: {relative}"
+                    )
+                obsolete_dirs.append(path)
             continue
         recognized_obsolete = relative in obsolete_files or any(
             pattern.fullmatch(relative) for pattern in obsolete_dynamic
@@ -175,7 +207,7 @@ def _validate_runtime_inventory(
             obsolete.append(path)
     for path in obsolete:
         path.unlink()
-    parents = {
+    parents = set(obsolete_dirs) | {
         parent
         for path in obsolete
         for parent in path.parents

@@ -68,6 +68,13 @@ impl ManagementResource {
         resource
     }
 
+    #[rustfmt::skip]
+    pub fn inventory_path(self) -> String {
+        let (group, version) = self.api_version.split_once('/').unwrap_or(("", self.api_version));
+        let base = if group.is_empty() { format!("/api/{version}") } else { format!("/apis/{group}/{version}") };
+        self.inventory_namespace.map_or_else(|| format!("{base}/{}", self.plural), |namespace| format!("{base}/namespaces/{namespace}/{}", self.plural))
+    }
+
     pub fn expected_name(self, tenant: &str) -> Option<String> {
         match self.name_policy {
             NamePolicy::Tenant => Some(tenant.into()),
@@ -75,6 +82,25 @@ impl ManagementResource {
             NamePolicy::Kubeconfig => Some(format!("{tenant}-kubeconfig")),
             NamePolicy::Observed | NamePolicy::Allocation => None,
         }
+    }
+
+    pub fn exempts_unmarked(self) -> bool {
+        matches!(
+            (self.kind, self.inventory_policy, self.exemptions),
+            (
+                "Namespace",
+                InventoryPolicy::TenantMarkers,
+                ["management-infrastructure"]
+            ) | (
+                "Secret",
+                InventoryPolicy::TenantMarkersOrKamajiOwner,
+                ["controller-installation-secrets"]
+            ) | (
+                "Lease",
+                InventoryPolicy::AllocationMarkers,
+                ["controller-leader-election"]
+            )
+        )
     }
 }
 

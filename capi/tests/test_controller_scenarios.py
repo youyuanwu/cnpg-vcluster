@@ -122,6 +122,16 @@ class ControllerScenarioTests(unittest.TestCase):
             lease = allocation_lease()
             lease["metadata"][field] = value
             cases.append([lease])
+        for field, value in (
+            ("apiVersion", "wrong/v1"),
+            ("kind", "Wrong"),
+        ):
+            lease = allocation_lease()
+            lease[field] = value
+            cases.append([lease])
+        lease = allocation_lease()
+        lease["metadata"]["name"] = 7
+        cases.append([lease])
         for field in ("tenant", "tenant-uid", "spec-hash", "foundation-hash", "endpoint", "pod-cidr", "service-cidr"):
             lease = allocation_lease()
             lease["metadata"]["annotations"]["tenancy.cnpg-vcluster.io/" + field] = "foreign"
@@ -289,8 +299,9 @@ class ControllerScenarioTests(unittest.TestCase):
 
     def test_snapshot_uses_live_management_and_host_identities(self) -> None:
         class Client:
-            def __init__(self) -> None:
+            def __init__(self, wrong_observed: bool = False) -> None:
                 self.index = 0
+                self.wrong_observed = wrong_observed
 
             def kubectl(self, *arguments):
                 path = next(
@@ -319,6 +330,10 @@ class ControllerScenarioTests(unittest.TestCase):
                 if definition.evidence_policy == "observed":
                     items = (
                         [{
+                            **({
+                                "apiVersion": "wrong/v1",
+                                "kind": "Wrong",
+                            } if self.wrong_observed else {}),
                             "metadata": {
                                 "name": "worker-a",
                                 "namespace": "tenant-a",
@@ -357,6 +372,21 @@ class ControllerScenarioTests(unittest.TestCase):
         with patch(
             "scripts.lib.controller_scenarios.run",
             side_effect=[
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout='[{"Name":"volume","CreatedAt":"now","Mountpoint":"/volume","Labels":{"owned":"true"}}]',
+                    stderr="",
+                ),
+                CompletedProcess(
+                    [],
+                    0,
+                    stdout="worker-b bbbb\nworker-a aaaa\n",
+                    stderr="",
+                ),
+                CompletedProcess(
+                    [], 0, stdout="worker-b bbbb\nworker-a aaaa\ntenant-a-lb cccc\n", stderr="",
+                ),
                 CompletedProcess(
                     [],
                     0,
@@ -428,6 +458,18 @@ class ControllerScenarioTests(unittest.TestCase):
             ),
         )
         self.assertIn("tenant-a-lb cccc", snapshot["providerContainers"])
+        with (
+            patch(
+                "scripts.lib.controller_scenarios.run",
+                side_effect=[
+                    CompletedProcess([], 0, stdout='[{"Name":"volume"}]', stderr=""),
+                    CompletedProcess([], 0, stdout="worker-a aaaa\n", stderr=""),
+                    CompletedProcess([], 0, stdout="tenant-a-lb cccc\n", stderr=""),
+                ],
+            ),
+            self.assertRaisesRegex(RuntimeError, "identity is incomplete"),
+        ):
+            tenant_snapshot(CONFIG, Client(wrong_observed=True), tenant_document())
 
     def test_endpoint_gate_cleans_partially_applied_tenant(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

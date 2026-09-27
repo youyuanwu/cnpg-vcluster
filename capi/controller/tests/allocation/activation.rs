@@ -476,23 +476,39 @@ async fn namespace_secret_lease_and_volume_residue_block_activation() {
 
 #[tokio::test]
 async fn malformed_catalog_inventory_identity_blocks_activation() {
-    let server = clean_server();
-    server.insert(TICKET, ticket("hash-b", "token-b"));
-    server.insert(
-        &format!("{NAMESPACES}/tenant-a"),
-        json!({"apiVersion":"v1","kind":"Namespace","metadata":{
-            "name":"tenant-a"}}),
-    );
-    let error = admit(
-        server.client(),
-        &FakeDocker::default(),
-        "hash-b",
-        "token-b",
-        true,
-    )
-    .await
-    .unwrap_err();
-    assert!(error.to_string().contains("inventory identity is invalid"));
+    for (path, item) in [
+        (
+            format!("{NAMESPACES}/tenant-a"),
+            json!({"apiVersion":"v1","kind":"Namespace","metadata":{"name":"tenant-a"}}),
+        ),
+        (
+            format!("{SECRETS}/tenant-a"),
+            json!({"apiVersion":"v1","kind":"Secret","metadata":{
+                "name":"tenant-a","namespace":"tenant-a","uid":"uid",
+                "ownerReferences":[{}]}}),
+        ),
+        (
+            format!("{SECRETS}/tenant-b"),
+            json!({"apiVersion":"v1","kind":"Secret","metadata":{
+                "name":"tenant-b","namespace":"tenant-a","uid":"uid",
+                "annotations":null}}),
+        ),
+    ] {
+        let server = clean_server();
+        server.insert(TICKET, ticket("hash-b", "token-b"));
+        server.insert(&path, item);
+        assert!(
+            admit(
+                server.client(),
+                &FakeDocker::default(),
+                "hash-b",
+                "token-b",
+                true,
+            )
+            .await
+            .is_err()
+        );
+    }
 }
 
 #[tokio::test]

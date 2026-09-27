@@ -40,9 +40,11 @@ INVENTORY_POLICIES = {
 }
 EVIDENCE_POLICIES = {"named", "observed", "allocation"}
 EXPECTED_EXEMPTIONS = {
-    "Namespace": ("management-infrastructure",),
-    "Secret": ("controller-installation-secrets",),
-    "Lease": ("controller-leader-election",),
+    ("Namespace", "tenant-markers"): ("management-infrastructure",),
+    ("Secret", "tenant-markers-or-kamaji-owner"): (
+        "controller-installation-secrets",
+    ),
+    ("Lease", "allocation-markers"): ("controller-leader-election",),
 }
 
 
@@ -169,7 +171,10 @@ def _parse_resource(entry: object) -> ManagementResource:
         and not entry["namespaced"]
     ):
         raise RuntimeError("cluster-scoped catalog resource has an inventory namespace")
-    if tuple(exemptions) != EXPECTED_EXEMPTIONS.get(entry["kind"], ()):
+    if tuple(exemptions) != EXPECTED_EXEMPTIONS.get(
+        (entry["kind"], entry["inventoryPolicy"]),
+        (),
+    ):
         raise RuntimeError("management resource catalog exemptions are invalid")
     return ManagementResource(
         api_version=entry["apiVersion"],

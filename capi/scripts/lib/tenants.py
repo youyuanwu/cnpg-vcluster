@@ -214,18 +214,32 @@ def verify_tenant_management_ownership(
     machine_set_definition = resource_by_kind(resources, "MachineSet")
     deployment_definition = resource_by_kind(resources, "MachineDeployment")
     machines_response = client.kubectl(
-        "-n",
-        tenant.namespace,
         "get",
-        machine_definition.kubectl_resource,
-        "-l",
-        f"cluster.x-k8s.io/cluster-name={tenant.name}",
-        "-o",
-        "json",
+        f"--raw={machine_definition.collection_path(tenant.namespace)}",
         check=False,
     )
     if machines_response.returncode == 0:
-        machines = json.loads(machines_response.stdout)["items"]
+        document = json.loads(machines_response.stdout)
+        machines = document.get("items") if isinstance(document, dict) else None
+        if (
+            not isinstance(document, dict)
+            or document.get("apiVersion") != machine_definition.api_version
+            or document.get("kind") != f"{machine_definition.kind}List"
+            or not isinstance(machines, list)
+            or any(
+                not isinstance(machine, dict)
+                or (
+                    "apiVersion" in machine
+                    and machine["apiVersion"] != machine_definition.api_version
+                )
+                or (
+                    "kind" in machine
+                    and machine["kind"] != machine_definition.kind
+                )
+                for machine in machines
+            )
+        ):
+            raise RuntimeError("tenant Machine inventory is invalid")
         deployment = present.get("machinedeployment")
         for machine in machines:
             labels = machine["metadata"].get("labels") or {}
