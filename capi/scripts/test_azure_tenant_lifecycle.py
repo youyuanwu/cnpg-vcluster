@@ -223,6 +223,14 @@ def _incomplete_gate_records(
     if evidence_dir.is_dir():
         for path in evidence_dir.glob("lifecycle-*.json"):
             payload = json.loads(read_private_file(path))
+            if not isinstance(payload, dict):
+                continue
+            if (
+                payload.get("tenant") != tenant
+                or payload.get("specificationSha256") != specification_sha256
+                or payload.get("revision") != revision
+            ):
+                continue
             if (
                 set(payload)
                 != {
@@ -236,9 +244,6 @@ def _incomplete_gate_records(
                 or payload.get("schema") != 1
                 or not isinstance(payload.get("operationId"), str)
                 or not payload["operationId"]
-                or payload.get("tenant") != tenant
-                or payload.get("specificationSha256") != specification_sha256
-                or payload.get("revision") != revision
                 or not isinstance(payload.get("records"), list)
             ):
                 raise RuntimeError(
