@@ -171,7 +171,7 @@ just test-tenant-lifecycle
 | `just tenant-create azure <spec.json>` | Reconcile one explicit Azure tenant on the recorded AKS/CAPZ foundation. |
 | `just tenant-status azure <name>` | Inspect one Azure tenant without mutating state. |
 | `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through CAPI/CAPZ and verify foundation preservation. |
-| `just azure-test-tenant-lifecycle` | Destructively prove Azure create, Ready, targeted absence, foundation preservation, and recreation for the example tenant. |
+| `just azure-test-tenant-lifecycle` | Destructively prove three distinct VMSS-backed workers, exact non-primary instance replacement, targeted absence, foundation preservation, and recreation for the example tenant. |
 | `just diagnose management` | Print management status, workloads, CRDs, and events without mutation. |
 | `just destroy` | Remove recorded tenants, controllers, the management cluster, runtime state, and restore host settings. |
 
