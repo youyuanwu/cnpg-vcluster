@@ -160,10 +160,9 @@ class ControllerStateTests(unittest.TestCase):
                     "parentKind",
                     "alternateParentKind",
                     "namePolicy",
-                    "watchPolicy",
+                    "watched",
                     "inventoryPolicy",
                     "inventoryNamespace",
-                    "evidencePolicy",
                     "exemptions",
                 }
                 for entry in catalog
@@ -174,19 +173,18 @@ class ControllerStateTests(unittest.TestCase):
             {
                 key: by_kind["Namespace"][key]
                 for key in (
-                    "namespaced", "role", "namePolicy", "watchPolicy",
+                    "namespaced", "role", "namePolicy", "watched",
                     "inventoryPolicy", "inventoryNamespace",
-                    "evidencePolicy", "exemptions",
+                    "exemptions",
                 )
             },
             {
                 "namespaced": False,
                 "role": "namespace",
                 "namePolicy": "tenant",
-                "watchPolicy": "tenant-annotation",
+                "watched": True,
                 "inventoryPolicy": "tenant-markers",
                 "inventoryNamespace": None,
-                "evidencePolicy": "named",
                 "exemptions": ["management-infrastructure"],
             },
         )
@@ -210,19 +208,18 @@ class ControllerStateTests(unittest.TestCase):
             {
                 key: by_kind["Secret"][key]
                 for key in (
-                    "namespaced", "role", "namePolicy", "watchPolicy",
+                    "namespaced", "role", "namePolicy", "watched",
                     "inventoryPolicy", "inventoryNamespace",
-                    "evidencePolicy", "exemptions",
+                    "exemptions",
                 )
             },
             {
                 "namespaced": True,
                 "role": "tenant-kubeconfig",
                 "namePolicy": "kubeconfig",
-                "watchPolicy": "tenant-annotation-or-kubeconfig-name",
+                "watched": True,
                 "inventoryPolicy": "tenant-markers-or-kamaji-owner",
                 "inventoryNamespace": None,
-                "evidencePolicy": "named",
                 "exemptions": ["controller-installation-secrets"],
             },
         )
@@ -230,19 +227,18 @@ class ControllerStateTests(unittest.TestCase):
             {
                 key: by_kind["Lease"][key]
                 for key in (
-                    "namespaced", "role", "namePolicy", "watchPolicy",
+                    "namespaced", "role", "namePolicy", "watched",
                     "inventoryPolicy", "inventoryNamespace",
-                    "evidencePolicy", "exemptions",
+                    "exemptions",
                 )
             },
             {
                 "namespaced": True,
                 "role": "allocation-lease",
                 "namePolicy": "allocation",
-                "watchPolicy": "tenant-annotation",
+                "watched": True,
                 "inventoryPolicy": "allocation-markers",
                 "inventoryNamespace": "tenant-system",
-                "evidencePolicy": "allocation",
                 "exemptions": ["controller-leader-election"],
             },
         )

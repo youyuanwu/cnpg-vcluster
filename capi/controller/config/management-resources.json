@@ -9,10 +9,9 @@
     "parentKind": null,
     "alternateParentKind": null,
     "namePolicy": "tenant",
-    "watchPolicy": "tenant-annotation-or-cluster-label",
+    "watched": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -25,10 +24,9 @@
     "parentKind": "Cluster",
     "alternateParentKind": null,
     "namePolicy": "tenant",
-    "watchPolicy": "tenant-annotation-or-cluster-label",
+    "watched": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -41,10 +39,9 @@
     "parentKind": "Cluster",
     "alternateParentKind": null,
     "namePolicy": "tenant",
-    "watchPolicy": "tenant-annotation-or-cluster-label",
+    "watched": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -57,10 +54,9 @@
     "parentKind": "Cluster",
     "alternateParentKind": "MachineDeployment",
     "namePolicy": "worker",
-    "watchPolicy": "tenant-annotation-or-cluster-label",
+    "watched": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -73,10 +69,9 @@
     "parentKind": "Cluster",
     "alternateParentKind": "MachineDeployment",
     "namePolicy": "worker",
-    "watchPolicy": "tenant-annotation-or-cluster-label",
+    "watched": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -89,10 +84,9 @@
     "parentKind": "Cluster",
     "alternateParentKind": null,
     "namePolicy": "worker",
-    "watchPolicy": "tenant-annotation-or-cluster-label",
+    "watched": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "named",
     "exemptions": []
   },
   {
@@ -105,10 +99,9 @@
     "parentKind": "MachineDeployment",
     "alternateParentKind": null,
     "namePolicy": "observed",
-    "watchPolicy": "tenant-annotation-or-cluster-label",
+    "watched": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -121,10 +114,9 @@
     "parentKind": "MachineSet",
     "alternateParentKind": null,
     "namePolicy": "observed",
-    "watchPolicy": "tenant-annotation-or-cluster-label",
+    "watched": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -137,10 +129,9 @@
     "parentKind": "Machine",
     "alternateParentKind": null,
     "namePolicy": "observed",
-    "watchPolicy": "tenant-annotation-or-cluster-label",
+    "watched": true,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -153,10 +144,9 @@
     "parentKind": "Machine",
     "alternateParentKind": null,
     "namePolicy": "observed",
-    "watchPolicy": "none",
+    "watched": false,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -169,10 +159,9 @@
     "parentKind": "KamajiControlPlane",
     "alternateParentKind": null,
     "namePolicy": "observed",
-    "watchPolicy": "none",
+    "watched": false,
     "inventoryPolicy": "block-any-instance",
     "inventoryNamespace": null,
-    "evidencePolicy": "observed",
     "exemptions": []
   },
   {
@@ -185,10 +174,9 @@
     "parentKind": null,
     "alternateParentKind": null,
     "namePolicy": "tenant",
-    "watchPolicy": "tenant-annotation",
+    "watched": true,
     "inventoryPolicy": "tenant-markers",
     "inventoryNamespace": null,
-    "evidencePolicy": "named",
     "exemptions": [
       "management-infrastructure"
     ]
@@ -203,10 +191,9 @@
     "parentKind": "KamajiControlPlane",
     "alternateParentKind": null,
     "namePolicy": "kubeconfig",
-    "watchPolicy": "tenant-annotation-or-kubeconfig-name",
+    "watched": true,
     "inventoryPolicy": "tenant-markers-or-kamaji-owner",
     "inventoryNamespace": null,
-    "evidencePolicy": "named",
     "exemptions": [
       "controller-installation-secrets"
     ]
@@ -221,10 +208,9 @@
     "parentKind": null,
     "alternateParentKind": null,
     "namePolicy": "allocation",
-    "watchPolicy": "tenant-annotation",
+    "watched": true,
     "inventoryPolicy": "allocation-markers",
     "inventoryNamespace": "tenant-system",
-    "evidencePolicy": "allocation",
     "exemptions": [
       "controller-leader-election"
     ]

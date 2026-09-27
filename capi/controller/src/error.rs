@@ -32,8 +32,6 @@ impl Requeue {
 pub enum ControllerError {
     #[error("Kubernetes API request failed: {0}")]
     Kube(#[from] kube::Error),
-    #[error("status update for {resource} remained conflicted after {attempts} attempts")]
-    StatusConflict { resource: String, attempts: usize },
     #[error("resource ownership is invalid: {0}")]
     OwnershipInvalid(String),
     #[error("input is invalid: {0}")]
@@ -56,7 +54,6 @@ impl ControllerError {
     #[must_use]
     pub fn class(&self) -> ErrorClass {
         match self {
-            Self::StatusConflict { .. } => ErrorClass::Conflict,
             Self::OwnershipInvalid(_) | Self::InvalidInput(_) | Self::Configuration(_) => {
                 ErrorClass::Terminal
             }

@@ -25,7 +25,6 @@ pub const DEFAULT_LEADER_ELECTION_ID: &str = "tenant-controller.tenancy.cnpg-vcl
 pub const DEFAULT_LEADER_ELECTION_NAMESPACE: &str = "default";
 pub const DEFAULT_LEASE_DURATION_SECONDS: u64 = 30;
 pub const DEFAULT_LEASE_GRACE_SECONDS: u64 = 5;
-pub const DEFAULT_STATUS_CONFLICT_RETRIES: usize = 4;
 pub const RECONCILE_CONCURRENCY: u16 = 1;
 pub const TENANT_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/tenant";
 

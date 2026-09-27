@@ -29,23 +29,6 @@ pub enum NamePolicy {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum WatchPolicy {
-    None,
-    TenantAnnotation,
-    TenantAnnotationOrKubeconfigName,
-    TenantAnnotationOrClusterLabel,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "kebab-case")]
-pub enum EvidencePolicy {
-    Named,
-    Observed,
-    Allocation,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ManagementResource {
     pub api_version: &'static str,
@@ -57,10 +40,9 @@ pub struct ManagementResource {
     pub parent_kind: Option<&'static str>,
     pub alternate_parent_kind: Option<&'static str>,
     pub name_policy: NamePolicy,
-    pub watch_policy: WatchPolicy,
+    pub watched: bool,
     pub inventory_policy: InventoryPolicy,
     pub inventory_namespace: Option<&'static str>,
-    pub evidence_policy: EvidencePolicy,
     pub exemptions: &'static [&'static str],
 }
 
@@ -85,165 +67,145 @@ impl ManagementResource {
     }
 }
 
-#[allow(clippy::too_many_arguments)]
-const fn dynamic(
-    api_version: &'static str,
-    kind: &'static str,
-    plural: &'static str,
-    role: &'static str,
-    class: ResourceClass,
-    parent_kind: Option<&'static str>,
-    name_policy: NamePolicy,
-    watched: bool,
-) -> ManagementResource {
-    ManagementResource {
-        api_version,
-        kind,
-        plural,
-        namespaced: true,
-        role,
-        class,
-        parent_kind,
-        alternate_parent_kind: None,
-        name_policy,
-        watch_policy: if watched {
-            WatchPolicy::TenantAnnotationOrClusterLabel
-        } else {
-            WatchPolicy::None
-        },
-        inventory_policy: InventoryPolicy::BlockAnyInstance,
-        inventory_namespace: None,
-        evidence_policy: if matches!(class, ResourceClass::Root) {
-            EvidencePolicy::Named
-        } else {
-            EvidencePolicy::Observed
-        },
-        exemptions: &[],
-    }
+macro_rules! entry {
+    ($api:expr, $kind:expr, $plural:expr, $role:expr, $class:ident, $parent:expr,
+     $alternate:expr, $name:ident, $watched:expr) => {
+        ManagementResource {
+            api_version: $api,
+            kind: $kind,
+            plural: $plural,
+            namespaced: true,
+            role: $role,
+            class: ResourceClass::$class,
+            parent_kind: $parent,
+            alternate_parent_kind: $alternate,
+            name_policy: NamePolicy::$name,
+            watched: $watched,
+            inventory_policy: InventoryPolicy::BlockAnyInstance,
+            inventory_namespace: None,
+            exemptions: &[],
+        }
+    };
 }
 
-const fn template(
-    api_version: &'static str,
-    kind: &'static str,
-    plural: &'static str,
-    role: &'static str,
-) -> ManagementResource {
-    let mut resource = dynamic(
-        api_version,
-        kind,
-        plural,
-        role,
-        ResourceClass::Root,
-        Some("Cluster"),
-        NamePolicy::Worker,
-        true,
-    );
-    resource.alternate_parent_kind = Some("MachineDeployment");
-    resource
+macro_rules! root {
+    ($api:expr, $kind:expr, $plural:expr, $role:expr, $parent:expr, $name:ident) => {
+        entry!(
+            $api, $kind, $plural, $role, Root, $parent, None, $name, true
+        )
+    };
+}
+
+macro_rules! descendant {
+    ($api:expr, $kind:expr, $plural:expr, $role:expr, $parent:expr, $watched:expr) => {
+        entry!(
+            $api,
+            $kind,
+            $plural,
+            $role,
+            Descendant,
+            Some($parent),
+            None,
+            Observed,
+            $watched
+        )
+    };
 }
 
 pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
-    dynamic(
+    root!(
         "cluster.x-k8s.io/v1beta2",
         "Cluster",
         "clusters",
         "cluster",
-        ResourceClass::Root,
         None,
-        NamePolicy::Tenant,
-        true,
+        Tenant
     ),
-    dynamic(
+    root!(
         "infrastructure.cluster.x-k8s.io/v1beta2",
         "DevCluster",
         "devclusters",
         "dev-cluster",
-        ResourceClass::Root,
         Some("Cluster"),
-        NamePolicy::Tenant,
-        true,
+        Tenant
     ),
-    dynamic(
+    root!(
         "controlplane.cluster.x-k8s.io/v1alpha2",
         "KamajiControlPlane",
         "kamajicontrolplanes",
         "kamaji-control-plane",
-        ResourceClass::Root,
         Some("Cluster"),
-        NamePolicy::Tenant,
-        true,
+        Tenant
     ),
-    template(
+    entry!(
         "bootstrap.cluster.x-k8s.io/v1beta2",
         "KubeadmConfigTemplate",
         "kubeadmconfigtemplates",
         "kubeadm-config-template",
+        Root,
+        Some("Cluster"),
+        Some("MachineDeployment"),
+        Worker,
+        true
     ),
-    template(
+    entry!(
         "infrastructure.cluster.x-k8s.io/v1beta2",
         "DevMachineTemplate",
         "devmachinetemplates",
         "dev-machine-template",
+        Root,
+        Some("Cluster"),
+        Some("MachineDeployment"),
+        Worker,
+        true
     ),
-    dynamic(
+    root!(
         "cluster.x-k8s.io/v1beta2",
         "MachineDeployment",
         "machinedeployments",
         "machine-deployment",
-        ResourceClass::Root,
         Some("Cluster"),
-        NamePolicy::Worker,
-        true,
+        Worker
     ),
-    dynamic(
+    descendant!(
         "cluster.x-k8s.io/v1beta2",
         "MachineSet",
         "machinesets",
         "machine",
-        ResourceClass::Descendant,
-        Some("MachineDeployment"),
-        NamePolicy::Observed,
-        true,
+        "MachineDeployment",
+        true
     ),
-    dynamic(
+    descendant!(
         "cluster.x-k8s.io/v1beta2",
         "Machine",
         "machines",
         "machine",
-        ResourceClass::Descendant,
-        Some("MachineSet"),
-        NamePolicy::Observed,
-        true,
+        "MachineSet",
+        true
     ),
-    dynamic(
+    descendant!(
         "infrastructure.cluster.x-k8s.io/v1beta2",
         "DevMachine",
         "devmachines",
         "machine",
-        ResourceClass::Descendant,
-        Some("Machine"),
-        NamePolicy::Observed,
-        true,
+        "Machine",
+        true
     ),
-    dynamic(
+    descendant!(
         "bootstrap.cluster.x-k8s.io/v1beta2",
         "KubeadmConfig",
         "kubeadmconfigs",
         "machine",
-        ResourceClass::Descendant,
-        Some("Machine"),
-        NamePolicy::Observed,
-        false,
+        "Machine",
+        false
     ),
-    dynamic(
+    descendant!(
         "kamaji.clastix.io/v1alpha1",
         "TenantControlPlane",
         "tenantcontrolplanes",
         "provider",
-        ResourceClass::Descendant,
-        Some("KamajiControlPlane"),
-        NamePolicy::Observed,
-        false,
+        "KamajiControlPlane",
+        false
     ),
     ManagementResource {
         api_version: "v1",
@@ -255,10 +217,9 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         parent_kind: None,
         alternate_parent_kind: None,
         name_policy: NamePolicy::Tenant,
-        watch_policy: WatchPolicy::TenantAnnotation,
+        watched: true,
         inventory_policy: InventoryPolicy::TenantMarkers,
         inventory_namespace: None,
-        evidence_policy: EvidencePolicy::Named,
         exemptions: &["management-infrastructure"],
     },
     ManagementResource {
@@ -271,10 +232,9 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         parent_kind: Some("KamajiControlPlane"),
         alternate_parent_kind: None,
         name_policy: NamePolicy::Kubeconfig,
-        watch_policy: WatchPolicy::TenantAnnotationOrKubeconfigName,
+        watched: true,
         inventory_policy: InventoryPolicy::TenantMarkersOrKamajiOwner,
         inventory_namespace: None,
-        evidence_policy: EvidencePolicy::Named,
         exemptions: &["controller-installation-secrets"],
     },
     ManagementResource {
@@ -287,10 +247,9 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
         parent_kind: None,
         alternate_parent_kind: None,
         name_policy: NamePolicy::Allocation,
-        watch_policy: WatchPolicy::TenantAnnotation,
+        watched: true,
         inventory_policy: InventoryPolicy::AllocationMarkers,
         inventory_namespace: Some("tenant-system"),
-        evidence_policy: EvidencePolicy::Allocation,
         exemptions: &["controller-leader-election"],
     },
 ];
@@ -313,11 +272,7 @@ pub fn watched() -> impl Iterator<Item = ManagementResource> {
     MANAGEMENT_RESOURCES
         .iter()
         .copied()
-        .filter(|resource| resource.watch_policy != WatchPolicy::None)
-}
-
-pub fn activation_resources() -> impl Iterator<Item = ManagementResource> {
-    MANAGEMENT_RESOURCES.iter().copied()
+        .filter(|resource| resource.watched)
 }
 
 pub fn by_kind(kind: &str) -> Option<ManagementResource> {
@@ -364,9 +319,11 @@ mod tests {
             ]
         );
         for kind in ["Namespace", "Secret", "Lease"] {
-            assert!(MANAGEMENT_RESOURCES.iter().any(|resource| {
-                resource.kind == kind && resource.watch_policy != WatchPolicy::None
-            }));
+            assert!(
+                MANAGEMENT_RESOURCES
+                    .iter()
+                    .any(|resource| resource.kind == kind && resource.watched)
+            );
         }
         const CREATED_ROOTS: &[&str] = &[
             "Cluster",
@@ -445,7 +402,6 @@ mod tests {
             .find(|resource| resource.kind == "Lease")
             .unwrap();
         assert_eq!(lease.inventory_namespace, Some("tenant-system"));
-        assert_eq!(lease.evidence_policy, EvidencePolicy::Allocation);
         assert_eq!(
             descendants()
                 .filter(|resource| resource.role != "provider")

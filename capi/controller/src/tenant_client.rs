@@ -1,5 +1,4 @@
-//! Tenant credentials are read only from the exact provider-owned Secret.
-//! Errors deliberately retain neither Secret data nor API response bodies.
+//! Tenant credentials come only from the exact provider-owned Secret without secret-bearing errors.
 
 use std::collections::BTreeSet;
 use std::time::Duration;

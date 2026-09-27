@@ -1,22 +1,13 @@
-//! Fail-closed management-plane teardown. Every pass reads authoritative
-//! state; only exact, observed identities may be mutated.
+//! Fail-closed teardown from authoritative reads and exact observed identities.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-use k8s_openapi::api::coordination::v1::Lease;
-use k8s_openapi::api::core::v1::{Namespace, Secret};
-use kube::api::{DeleteParams, ListParams, Patch, PatchParams, Preconditions};
-use kube::core::DynamicObject;
-use kube::runtime::controller::Action;
-use kube::{Api, Client, ResourceExt};
-use serde_json::{Value, json};
-
 use crate::allocation::{
     ClaimContext, ReleaseDecision, decide_release, recover_allocation, release,
 };
-use crate::api::{Tenant, TenantPhase, canonical_spec, spec_hash};
+use crate::api::{FINALIZER, Tenant, TenantPhase, canonical_spec, spec_hash};
 use crate::docker::{
     BollardDockerClient, DockerClient, DockerError, DockerVolume, WorkerIdentity, validate_volume,
     worker_containers,
@@ -28,9 +19,15 @@ use crate::ownership::{
     Identity, validate_cluster_uid, validate_kubeconfig_secret_for_deletion, validate_owner_chain,
     validate_provider_owner, validate_provider_owner_for_deletion, validate_root_ownership,
 };
+use crate::status as tenant_status;
+use k8s_openapi::api::coordination::v1::Lease;
+use k8s_openapi::api::core::v1::{Namespace, Secret};
+use kube::api::{DeleteParams, ListParams, Preconditions};
+use kube::core::DynamicObject;
+use kube::runtime::controller::Action;
+use kube::{Api, Client};
 
 const FOUNDATION_NAMESPACE: &str = "tenant-system";
-const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 const RETRY: Duration = Duration::from_secs(5);
 
 fn invalid(message: impl Into<String>) -> ReconcileError {
@@ -91,50 +88,6 @@ fn exact_delete(uid: &str, rv: &str) -> DeleteParams {
     }
 }
 
-async fn patch_status(
-    client: Client,
-    tenant: &Tenant,
-    status: Value,
-) -> Result<(), ReconcileError> {
-    Api::<Tenant>::all(client)
-        .patch_status(
-            &tenant.name_any(),
-            &PatchParams::default(),
-            &Patch::Merge(&json!({
-                "metadata":{
-                    "resourceVersion":version(&tenant.metadata)?,
-                    "uid":uid(&tenant.metadata)?
-                },
-                "status":status
-            })),
-        )
-        .await?;
-    Ok(())
-}
-
-async fn remove_finalizer(client: Client, tenant: &Tenant) -> Result<(), ReconcileError> {
-    let finalizers: Vec<_> = tenant
-        .metadata
-        .finalizers
-        .as_deref()
-        .unwrap_or_default()
-        .iter()
-        .filter(|value| value.as_str() != FINALIZER)
-        .collect();
-    Api::<Tenant>::all(client)
-        .patch(
-            &tenant.name_any(),
-            &PatchParams::default(),
-            &Patch::Merge(&json!({"metadata":{
-                "resourceVersion":version(&tenant.metadata)?,
-                "uid":uid(&tenant.metadata)?,
-                "finalizers":finalizers
-            }})),
-        )
-        .await?;
-    Ok(())
-}
-
 fn uid(
     meta: &k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta,
 ) -> Result<&str, ReconcileError> {
@@ -189,6 +142,23 @@ impl<D: DockerClient> Finalizer<D> {
             supported_version: supported_version.into(),
             foundation,
         }
+    }
+
+    async fn status(
+        &self,
+        original: &Tenant,
+        current: &Tenant,
+        status: &crate::api::TenantStatus,
+        clear_allocation: bool,
+    ) -> Result<(), ReconcileError> {
+        tenant_status::replace_status(
+            self.client.clone(),
+            original,
+            current,
+            status,
+            clear_allocation,
+        )
+        .await
     }
 
     pub async fn reconcile(&self, tenant: &Tenant) -> Result<Action, ReconcileError> {
@@ -418,49 +388,28 @@ impl<D: DockerClient> Finalizer<D> {
             .get_opt(name)
             .await?
             .ok_or_else(|| invalid("Tenant disappeared during deletion"))?;
-        if current.metadata.uid.as_deref() != Some(tenant_uid)
-            || current.metadata.generation != tenant.metadata.generation
-            || current.metadata.deletion_timestamp.is_none()
-            || current.spec != tenant.spec
-        {
-            return Err(invalid("Tenant identity changed during deletion"));
-        }
+        tenant_status::validate_identity(tenant, &current)?;
         if current.status != tenant.status {
             return Ok(pending());
         }
         let mut status = current.status.clone().unwrap_or_default();
         if status.phase != Some(TenantPhase::Deleting) {
             status.phase = Some(TenantPhase::Deleting);
-            patch_status(
-                self.client.clone(),
-                &current,
-                serde_json::to_value(status).map_err(|error| invalid(error.to_string()))?,
-            )
-            .await?;
+            self.status(tenant, &current, &status, false).await?;
             return Ok(pending());
         }
         if status.foundation_hash.as_deref().is_none_or(str::is_empty)
             && (residue || matches!(lease_decision, ReleaseDecision::Delete(_)))
         {
             status.foundation_hash = Some(foundation_hash.clone());
-            patch_status(
-                self.client.clone(),
-                &current,
-                serde_json::to_value(status).map_err(|error| invalid(error.to_string()))?,
-            )
-            .await?;
+            self.status(tenant, &current, &status, false).await?;
             return Ok(pending());
         }
         if let Some(cluster) = cluster
             && cluster_uid.is_none()
         {
             status.cluster_uid = Some(uid(&cluster.metadata)?.into());
-            patch_status(
-                self.client.clone(),
-                &current,
-                serde_json::to_value(status).map_err(|error| invalid(error.to_string()))?,
-            )
-            .await?;
+            self.status(tenant, &current, &status, false).await?;
             return Ok(pending());
         }
         if status.allocation.is_none()
@@ -469,12 +418,7 @@ impl<D: DockerClient> Finalizer<D> {
                 .map_err(|error| invalid(error.to_string()))?
         {
             status.allocation = Some(allocation);
-            patch_status(
-                self.client.clone(),
-                &current,
-                serde_json::to_value(status).map_err(|error| invalid(error.to_string()))?,
-            )
-            .await?;
+            self.status(tenant, &current, &status, false).await?;
             return Ok(pending());
         }
         if let Some(cluster) = cluster {
@@ -529,20 +473,11 @@ impl<D: DockerClient> Finalizer<D> {
         }
         if status.allocation.is_some() {
             status.allocation = None;
-            let mut value =
-                serde_json::to_value(status).map_err(|error| invalid(error.to_string()))?;
-            value["allocation"] = Value::Null;
-            patch_status(self.client.clone(), &current, value).await?;
+            self.status(tenant, &current, &status, true).await?;
             return Ok(pending());
         }
-        if current
-            .metadata
-            .finalizers
-            .as_ref()
-            .is_some_and(|values| values.iter().any(|value| value == FINALIZER))
-        {
-            remove_finalizer(self.client.clone(), &current).await?;
-        }
+        tenant_status::set_finalizer(self.client.clone(), tenant, &current, FINALIZER, false)
+            .await?;
         Ok(Action::await_change())
     }
 

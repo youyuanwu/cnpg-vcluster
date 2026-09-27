@@ -22,27 +22,19 @@ FIELDS = {
     "parentKind",
     "alternateParentKind",
     "namePolicy",
-    "watchPolicy",
+    "watched",
     "inventoryPolicy",
     "inventoryNamespace",
-    "evidencePolicy",
     "exemptions",
 }
 CLASSES = {"root", "descendant", "typed"}
 NAME_POLICIES = {"tenant", "worker", "kubeconfig", "observed", "allocation"}
-WATCH_POLICIES = {
-    "none",
-    "tenant-annotation",
-    "tenant-annotation-or-kubeconfig-name",
-    "tenant-annotation-or-cluster-label",
-}
 INVENTORY_POLICIES = {
     "block-any-instance",
     "tenant-markers",
     "tenant-markers-or-kamaji-owner",
     "allocation-markers",
 }
-EVIDENCE_POLICIES = {"named", "observed", "allocation"}
 
 
 @dataclass(frozen=True)
@@ -56,10 +48,9 @@ class ManagementResource:
     parent_kind: str | None
     alternate_parent_kind: str | None
     name_policy: str
-    watch_policy: str
+    watched: bool
     inventory_policy: str
     inventory_namespace: str | None
-    evidence_policy: str
     exemptions: tuple[str, ...]
 
     @property
@@ -138,11 +129,10 @@ def _parse_resource(entry: object) -> ManagementResource:
     exemptions = entry["exemptions"]
     if (
         not isinstance(entry["namespaced"], bool)
+        or not isinstance(entry["watched"], bool)
         or entry["class"] not in CLASSES
         or entry["namePolicy"] not in NAME_POLICIES
-        or entry["watchPolicy"] not in WATCH_POLICIES
         or entry["inventoryPolicy"] not in INVENTORY_POLICIES
-        or entry["evidencePolicy"] not in EVIDENCE_POLICIES
         or not isinstance(exemptions, list)
         or not all(isinstance(value, str) and value for value in exemptions)
     ):
@@ -160,11 +150,6 @@ def _parse_resource(entry: object) -> ManagementResource:
         and not exemptions
     ):
         raise RuntimeError("management resource catalog exemptions are invalid")
-    if (
-        entry["evidencePolicy"] == "named"
-        and entry["namePolicy"] not in {"tenant", "worker", "kubeconfig"}
-    ):
-        raise RuntimeError("named catalog evidence has no expected name")
     return ManagementResource(
         api_version=entry["apiVersion"],
         kind=entry["kind"],
@@ -175,10 +160,9 @@ def _parse_resource(entry: object) -> ManagementResource:
         parent_kind=entry["parentKind"],
         alternate_parent_kind=entry["alternateParentKind"],
         name_policy=entry["namePolicy"],
-        watch_policy=entry["watchPolicy"],
+        watched=entry["watched"],
         inventory_policy=entry["inventoryPolicy"],
         inventory_namespace=entry["inventoryNamespace"],
-        evidence_policy=entry["evidencePolicy"],
         exemptions=tuple(exemptions),
     )
 

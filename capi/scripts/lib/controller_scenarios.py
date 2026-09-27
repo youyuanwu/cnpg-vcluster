@@ -399,13 +399,9 @@ def tenant_snapshot(
         raise RuntimeError("Tenant document has no metadata.name")
     management_resources = []
     for definition in load_management_resources(root=Path(__file__).resolve().parents[2]):
-        if definition.evidence_policy != "named":
-            continue
         object_name = definition.expected_name(name)
         if object_name is None:
-            raise RuntimeError(
-                f"named management evidence has no name: {definition.kind}"
-            )
+            continue
         resource = definition.kubectl_resource
         namespace = name if definition.namespaced else None
         arguments = []

@@ -1,5 +1,4 @@
-//! Pure ownership checks. Inventories must come from uncached, unfiltered reads;
-//! an incomplete inventory is an error, never proof that a descendant is owned.
+//! Ownership checks require complete, uncached, unfiltered inventories.
 
 use std::collections::{BTreeMap, BTreeSet};
 
