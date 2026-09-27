@@ -16,10 +16,7 @@ from unittest.mock import patch
 
 from scripts.azure import (
     AzureTenantAdapter,
-    FOUNDATION_INVENTORY_SCHEMA,
-    _azure_id_equal,
     _azure_tags,
-    _capz_external_control_plane_webhook_ready,
     _capture_tenant_kubeconfig,
     _classify_management_owned_resources,
     _collect_ready_observations,
@@ -27,7 +24,6 @@ from scripts.azure import (
     _exact_delete_management_resource,
     _enable_capz_external_control_plane_delete,
     _exclude_tenant_machines_from_drain,
-    _foundation_defaults_checksum,
     _management_resource_specs,
     _reconcile_manifest,
     _render_addon_job,
@@ -36,16 +32,24 @@ from scripts.azure import (
     _run_profile_mutation,
     _tenant_spec_blockers,
     _wait_ready_observations,
+    classify_azure_owned_resources,
+    discover_azure_owned_resources,
+)
+from scripts.lib.azure.common import (
+    FOUNDATION_INVENTORY_SCHEMA,
+    _azure_id_equal,
+    _foundation_defaults_checksum,
     _validate_networks,
     azure_tenant_runtime_path,
-    classify_azure_owned_resources,
-    create_foundation,
-    discover_azure_owned_resources,
     load_azure_configuration,
-    load_inventory,
     names,
-    preflight,
     tenant_names,
+)
+from scripts.lib.azure.foundation import (
+    _capz_external_control_plane_webhook_ready,
+    create_foundation,
+    load_inventory,
+    preflight,
 )
 from scripts.lib.config import ConfigError
 from scripts.lib.files import write_private_file

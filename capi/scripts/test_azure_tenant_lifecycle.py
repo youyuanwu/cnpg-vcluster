@@ -12,15 +12,19 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.azure import (
-    _active_subscription,
-    _az,
-    _inspect_foundation,
     _remove_private_tree,
     _run_profile_mutation,
-    create_foundation,
-    create_management,
+)
+from scripts.lib.azure.common import (
+    _active_subscription,
+    _az,
     load_azure_configuration,
     names,
+)
+from scripts.lib.azure.foundation import (
+    _inspect_foundation,
+    create_foundation,
+    create_management,
 )
 from scripts.lib.config import parse_duration
 from scripts.lib.files import private_file_exists, read_private_file, write_private_file

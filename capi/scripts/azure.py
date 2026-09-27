@@ -54,8 +54,53 @@ from scripts.lib.tenants import LIFECYCLE_MARKERS, lifecycle_markers, resource_l
 
 
 
-from scripts.lib.azure.common import *
-from scripts.lib.azure.foundation import *
+from scripts.lib.azure.common import (
+    CAPZ_AZURECLUSTER_WEBHOOK,
+    CAPZ_EXTERNAL_CONTROL_PLANE_LABEL,
+    CONTROLLER_DEPLOYMENTS,
+    FOUNDATION_DEFAULT_KEYS,
+    FOUNDATION_INVENTORY_SCHEMA,
+    KNOWN_ASO_FOUNDATION_REFERENCE_OUTPUTS,
+    KNOWN_ASO_TENANT_KINDS,
+    KNOWN_AZURE_TENANT_TYPES,
+    KNOWN_CONTROLLER_MANAGEMENT_KINDS,
+    KNOWN_NAMESPACE_CHILD_KINDS,
+    KNOWN_ORCHESTRATION_MANAGEMENT_KINDS,
+    MANAGEMENT_RESOURCE_PLURALS,
+    READY_EVIDENCE_MAX_AGE_SECONDS,
+    AzureDeletionError,
+    _active_subscription,
+    _az,
+    _azure_id_equal,
+    _foundation_defaults_checksum,
+    _foundation_networks,
+    _helm,
+    _json,
+    _kubectl,
+    _management_kubeconfig,
+    _recorded_azure_specs,
+    _runtime_dir,
+    _tenant_kubeconfig,
+    _tenant_kubectl,
+    _tenant_runtime_dir,
+    _validate_networks,
+    azure_tenant_runtime_path,
+    load_azure_configuration,
+    names,
+    tenant_names,
+)
+from scripts.lib.azure.foundation import (
+    _capz_external_control_plane_webhook_ready,
+    _foundation_identity,
+    _get_management_resource,
+    _inspect_foundation,
+    create_foundation,
+    create_management,
+    destroy,
+    foundation_status,
+    load_inventory,
+    preflight,
+)
 
 def _marker_annotations(markers: Mapping[str, str]) -> dict[str, str]:
     return {LIFECYCLE_MARKERS[key]: value for key, value in markers.items()}

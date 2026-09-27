@@ -545,7 +545,7 @@ def check_repository_boundaries() -> None:
             check(token not in text, f"{path.relative_to(ROOT)} contains forbidden token {token!r}")
     azure_sources = [
         ROOT / "scripts" / "azure.py",
-        *(ROOT / "scripts" / "lib" / "azure").glob("*.py"),
+        *(ROOT / "scripts" / "lib" / "azure").rglob("*.py"),
     ]
     azure_source = "\n".join(
         path.read_text(encoding="utf-8")
