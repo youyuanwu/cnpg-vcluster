@@ -188,7 +188,10 @@ def require_owned_resource_delta(
 
     def resources(payload):
         return {
-            _normalize_resource_id(str(item["id"])): str(item.get("type", "")).lower()
+            _normalize_resource_id(str(item["id"])): (
+                str(item.get("type", "")).lower(),
+                json.dumps(item, sort_keys=True, separators=(",", ":")),
+            )
             for item in payload.get("azure", [])
             if isinstance(item, dict) and isinstance(item.get("id"), str)
         }
@@ -197,6 +200,13 @@ def require_owned_resource_delta(
     after = resources(discovered)
     removed = set(before) - set(after)
     added = set(after) - set(before)
+    changed = {
+        item
+        for item in set(before) & set(after)
+        if before[item][1] != after[item][1]
+    }
+    if changed:
+        raise RuntimeError("retained Azure ownership changed during worker recovery")
     deleted_id = _normalize_resource_id(deleted.instance_resource_id)
     replacement_id = _normalize_resource_id(replacement.instance_resource_id)
     if deleted_id not in removed or replacement_id not in added:
@@ -205,21 +215,33 @@ def require_owned_resource_delta(
         "microsoft.compute/virtualmachinescalesets/virtualmachines",
         "microsoft.network/networkinterfaces",
     }
-    if any(before[item] not in allowed_types for item in removed) or any(
-        after[item] not in allowed_types for item in added
+    if any(before[item][0] not in allowed_types for item in removed) or any(
+        after[item][0] not in allowed_types for item in added
     ):
         raise RuntimeError("unrelated Azure ownership changed during worker recovery")
     removed_vms = {
         item
         for item in removed
-        if before[item]
+        if before[item][0]
         == "microsoft.compute/virtualmachinescalesets/virtualmachines"
     }
     added_vms = {
         item
         for item in added
-        if after[item]
+        if after[item][0]
         == "microsoft.compute/virtualmachinescalesets/virtualmachines"
     }
     if removed_vms != {deleted_id} or added_vms != {replacement_id}:
         raise RuntimeError("Azure VMSS replacement ownership delta is ambiguous")
+    removed_nics = {
+        item
+        for item in removed
+        if before[item][0] == "microsoft.network/networkinterfaces"
+    }
+    added_nics = {
+        item
+        for item in added
+        if after[item][0] == "microsoft.network/networkinterfaces"
+    }
+    if len(removed_nics) != len(added_nics) or len(removed_nics) > 1:
+        raise RuntimeError("Azure VMSS replacement NIC delta is ambiguous")

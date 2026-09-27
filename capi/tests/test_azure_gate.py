@@ -140,6 +140,11 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
         recorded = {
             "azure": [
                 {
+                    "id": VMSS,
+                    "type": "Microsoft.Compute/virtualMachineScaleSets",
+                    "tags": {"tenant": "tenant-c"},
+                },
+                {
                     "id": instance(2),
                     "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
                 }
@@ -149,6 +154,11 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
         }
         discovered = {
             "azure": [
+                {
+                    "id": VMSS,
+                    "type": "Microsoft.Compute/virtualMachineScaleSets",
+                    "tags": {"tenant": "tenant-c"},
+                },
                 {
                     "id": instance(3),
                     "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
@@ -170,6 +180,28 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             }
         )
         with self.assertRaisesRegex(RuntimeError, "unrelated"):
+            require_owned_resource_delta(
+                json.dumps(recorded),
+                discovered,
+                deleted,
+                replacement,
+            )
+        discovered = {
+            "azure": [
+                {
+                    "id": VMSS,
+                    "type": "Microsoft.Compute/virtualMachineScaleSets",
+                    "tags": {"tenant": "changed"},
+                },
+                {
+                    "id": instance(3),
+                    "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
+                },
+            ],
+            "aso": [],
+            "unknown": [],
+        }
+        with self.assertRaisesRegex(RuntimeError, "retained"):
             require_owned_resource_delta(
                 json.dumps(recorded),
                 discovered,
@@ -219,6 +251,37 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 "spec-sha",
                 "revision",
             )
+
+    def test_evidence_classifier_rejects_malformed_record_shapes(self):
+        root = self.make_root()
+        evidence = root / ".runtime" / "azure-gate" / "evidence"
+        payload = {
+            "schema": 1,
+            "operationId": "operation-1",
+            "tenant": "tenant-c",
+            "specificationSha256": "spec-sha",
+            "revision": "revision",
+            "records": [
+                {
+                    "phase": "worker-instance-deletion",
+                    "status": "passed",
+                    "seconds": -1,
+                    "extra": True,
+                }
+            ],
+        }
+        write_private_file(
+            evidence / "lifecycle-operation-1.json",
+            json.dumps(payload),
+        )
+        self.assertIsNone(
+            _incomplete_gate_records(
+                evidence,
+                "tenant-c",
+                "spec-sha",
+                "revision",
+            )
+        )
 
     def test_live_gate_recipe_exists_but_is_not_invoked_by_tests(self):
         root = Path(__file__).resolve().parents[1]

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 import time
@@ -233,11 +234,46 @@ def _incomplete_gate_records(
                     "records",
                 }
                 or payload.get("schema") != 1
+                or not isinstance(payload.get("operationId"), str)
+                or not payload["operationId"]
                 or payload.get("tenant") != tenant
                 or payload.get("specificationSha256") != specification_sha256
                 or payload.get("revision") != revision
                 or not isinstance(payload.get("records"), list)
             ):
+                continue
+            valid_records = True
+            for record in payload["records"]:
+                if not isinstance(record, dict):
+                    valid_records = False
+                    break
+                status = record.get("status")
+                expected_keys = (
+                    {"phase", "status", "seconds"}
+                    if status == "passed"
+                    else {"phase", "status", "seconds", "blocker"}
+                )
+                seconds = record.get("seconds")
+                if (
+                    status not in {"passed", "failed"}
+                    or set(record) != expected_keys
+                    or not isinstance(record.get("phase"), str)
+                    or not record["phase"]
+                    or isinstance(seconds, bool)
+                    or not isinstance(seconds, (int, float))
+                    or not math.isfinite(seconds)
+                    or seconds < 0
+                    or (
+                        status == "failed"
+                        and (
+                            not isinstance(record.get("blocker"), str)
+                            or not record["blocker"]
+                        )
+                    )
+                ):
+                    valid_records = False
+                    break
+            if not valid_records:
                 continue
             passed = {
                 record.get("phase")
