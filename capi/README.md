@@ -297,14 +297,14 @@ roots and the CNPG `Cluster` retain targeted repair.
 Expected progress uses a fixed poll interval rather than rate-limited requeue
 backoff.
 
-Each normal reconciliation reads the foundation ConfigMap directly and checks
-its immutable checksum, lifecycle hash, controller image, mutation gate, and
-the network, path, image-archive, and offline-registry values consumed by
-reconciliation. Installer-owned tool versions and cache-state digests are not
-controller compatibility checks. Normal reconciliation does not probe Docker
-foundation health; deletion retains uncached live host ownership checks before
-destructive operations. The resolved slot catalog is part of schema 3; its
-immutable hash excludes only mutation mode and controller image. Leader
+The manager reads and validates the foundation ConfigMap once at startup.
+Reconciliation uses that immutable snapshot and each Tenant's recorded
+foundation hash. Creation-only slot, image-archive, cache, and registry errors
+do not prevent deletion through the validated identity/storage core.
+Installer-owned tool versions and cache-state digests are not controller
+compatibility checks. Deletion retains uncached live host ownership checks
+before destructive operations. The resolved slot catalog is part of schema 3;
+its immutable hash excludes only controller image identity. Leader
 election uses a separate renewable Lease, not an allocation slot.
 
 ## Status, conditions, and exits

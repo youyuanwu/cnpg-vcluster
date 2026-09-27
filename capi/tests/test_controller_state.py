@@ -180,21 +180,25 @@ class ControllerStateTests(unittest.TestCase):
             require_clean_controller_state(prepare_root(directory), Client(clean_handler))
 
     def test_offline_registry_with_tenant_role_still_blocks(self) -> None:
-        def docker(*args, **_kwargs):
-            command = args[0]
-            if command[:3] == ["docker", "ps", "-aq"] and (
-                "label=cnpg-vcluster.capi/role" in command
-                or "label=cnpg-vcluster.capi/role=offline-registry" in command
-                or "label=io.x-k8s.kind.role=worker" in command
-            ):
-                return response("mixed-id")
-            return response("")
+        for extra_label in (
+            "label=io.x-k8s.kind.role=worker",
+            "label=cnpg-vcluster.capi/tenant",
+        ):
+            def docker(*args, **_kwargs):
+                command = args[0]
+                if command[:3] == ["docker", "ps", "-aq"] and (
+                    "label=cnpg-vcluster.capi/role" in command
+                    or "label=cnpg-vcluster.capi/role=offline-registry" in command
+                    or extra_label in command
+                ):
+                    return response("mixed-id")
+                return response("")
 
-        with tempfile.TemporaryDirectory() as directory, patch(
-            "scripts.lib.controller_state.run",
-            side_effect=docker,
-        ), self.assertRaisesRegex(RuntimeError, "CAPD Tenant containers"):
-            require_clean_controller_state(prepare_root(directory), Client(clean_handler))
+            with self.subTest(extra_label=extra_label), tempfile.TemporaryDirectory() as directory, patch(
+                "scripts.lib.controller_state.run",
+                side_effect=docker,
+            ), self.assertRaisesRegex(RuntimeError, "CAPD Tenant containers"):
+                require_clean_controller_state(prepare_root(directory), Client(clean_handler))
 
     def test_provider_tenant_lease_and_host_residue_block(self) -> None:
         cases = ("tenant", "provider", "lease", "volume", "container", "legacy-file")
