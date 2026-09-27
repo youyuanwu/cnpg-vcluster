@@ -285,6 +285,9 @@ def check_repository_boundaries() -> None:
     tenant_runtime = (ROOT / "scripts" / "lib" / "tenant_runtime.py").read_text(
         encoding="utf-8"
     )
+    tenant_timing = (ROOT / "scripts" / "lib" / "tenant_timing.py").read_text(
+        encoding="utf-8"
+    )
     locking = (ROOT / "scripts" / "lib" / "locking.py").read_text(
         encoding="utf-8"
     )
@@ -302,6 +305,12 @@ def check_repository_boundaries() -> None:
         '"lifecycle" / PROFILE' in tenant_runtime
         and '"local"' not in tenant_runtime,
         "durable Tenant lifecycle paths must remain Azure-only",
+    )
+    check(
+        "from .tenant_spec import PROFILE" in tenant_timing
+        and "profile: str" not in tenant_timing
+        and "/ profile" not in tenant_timing,
+        "Tenant timing evidence must remain Azure-only",
     )
     check(
         "def azure_lock(" in locking

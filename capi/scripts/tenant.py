@@ -184,7 +184,6 @@ def create_tenant(
                     try:
                         record_rejected_create(
                             root,
-                            profile=PROFILE,
                             operation_id=operation_id,
                             seconds=time.monotonic() - validation_started,
                             error=exc,
@@ -197,7 +196,6 @@ def create_tenant(
                     raise
                 timings = TenantTimings(
                     root,
-                    profile=PROFILE,
                     tenant=spec.name,
                     operation="create",
                     operation_id=operation_id,
@@ -350,7 +348,6 @@ def delete_tenant(
                 runtime = TenantRuntime(root, tenant)
                 timings = TenantTimings(
                     root,
-                    profile=PROFILE,
                     tenant=tenant,
                     operation="delete",
                     operation_id=operation_id,

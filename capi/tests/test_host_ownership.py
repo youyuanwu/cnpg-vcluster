@@ -3,8 +3,9 @@ from __future__ import annotations
 import unittest
 import tempfile
 from pathlib import Path
+from unittest.mock import patch
 
-from scripts.destroy import _validate_runtime_inventory
+from scripts.destroy import _validate_runtime_inventory, inspect_host_residue
 from scripts.lib.ownership import IdentityRecord, OwnershipError
 
 
@@ -73,8 +74,32 @@ class HostOwnershipTests(unittest.TestCase):
     def test_runtime_inventory_rejects_symlinked_obsolete_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as target:
             root = Path(temporary)
-            lifecycle = root / ".runtime" / "lifecycle"
-            lifecycle.mkdir(parents=True, mode=0o700)
-            (lifecycle / "local").symlink_to(target, target_is_directory=True)
+            runtime = root / ".runtime"
+            runtime.mkdir(mode=0o700)
+            external = Path(target)
+            endpoint = external / "tenant-endpoints.json"
+            endpoint.write_text("outside\n", encoding="utf-8")
+            (runtime / "management").symlink_to(external, target_is_directory=True)
             with self.assertRaisesRegex(RuntimeError, "symlink"):
                 _validate_runtime_inventory(root)
+            self.assertEqual(endpoint.read_text(encoding="utf-8"), "outside\n")
+
+    def test_host_residue_includes_unrecorded_capd_worker_role(self) -> None:
+        config = {
+            "SPIKE_NAME": "spike",
+            "OWNERSHIP_LABEL": "owner",
+            "LAB_PREFIX": "lab",
+        }
+
+        def docker(command, **_kwargs):
+            output = (
+                "worker-id\n"
+                if "label=io.x-k8s.kind.role=worker" in command
+                else ""
+            )
+            return type("Result", (), {"stdout": output})()
+
+        with patch("scripts.destroy.run", side_effect=docker):
+            residue = inspect_host_residue(config)
+
+        self.assertEqual(residue["containers"], ["worker-id"])

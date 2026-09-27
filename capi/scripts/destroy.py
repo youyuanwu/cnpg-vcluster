@@ -36,6 +36,28 @@ OBSOLETE_LOCAL_RUNTIME = (
 )
 
 
+def _private_runtime_details(runtime: Path, path: Path) -> os.stat_result:
+    current = runtime
+    for part in path.relative_to(runtime).parts:
+        details = current.lstat()
+        if stat.S_ISLNK(details.st_mode):
+            raise RuntimeError(
+                f"obsolete local runtime ancestor is a symlink: "
+                f"{current.relative_to(runtime.parent)}"
+            )
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise RuntimeError(
+                f"obsolete local runtime ancestor is unsafe: "
+                f"{current.relative_to(runtime.parent)}"
+            )
+        current /= part
+    return path.lstat()
+
+
 def _remove_obsolete_local_runtime(root: Path) -> None:
     runtime = root / ".runtime"
     for relative in OBSOLETE_LOCAL_RUNTIME:
@@ -43,7 +65,7 @@ def _remove_obsolete_local_runtime(root: Path) -> None:
         if not os.path.lexists(path):
             continue
         candidates = [path]
-        details = path.lstat()
+        details = _private_runtime_details(runtime, path)
         if stat.S_ISDIR(details.st_mode):
             candidates.extend(path.rglob("*"))
         for candidate in candidates:
@@ -303,9 +325,9 @@ def inspect_host_residue(
     tenant_names: tuple[str, ...] = (),
 ) -> dict[str, list[str]]:
     clusters = [config["SPIKE_NAME"], *tenant_names]
-    containers = []
+    containers = set()
     for name in clusters:
-        containers.extend(
+        containers.update(
             run(
                 [
                     "docker",
@@ -313,6 +335,25 @@ def inspect_host_residue(
                     "-aq",
                     "--filter",
                     f"label=io.x-k8s.kind.cluster={name}",
+                ],
+                timeout=30,
+            ).stdout.split()
+        )
+    for label in (
+        "io.x-k8s.kind.role=worker",
+        "io.x-k8s.kind.role=external-load-balancer",
+        "cnpg-vcluster.capi/role",
+        "cnpg-vcluster.capi/tenant",
+        "tenancy.cnpg-vcluster.io/tenant-uid",
+    ):
+        containers.update(
+            run(
+                [
+                    "docker",
+                    "ps",
+                    "-aq",
+                    "--filter",
+                    f"label={label}",
                 ],
                 timeout=30,
             ).stdout.split()
@@ -351,7 +392,7 @@ def inspect_host_residue(
         timeout=30,
     ).stdout.split()
     return {
-        "containers": sorted(set(containers)),
+        "containers": sorted(containers),
         "probes": sorted(set(probes)),
         "registries": sorted(set(registries)),
         "volumes": sorted(volumes),

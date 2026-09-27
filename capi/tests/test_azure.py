@@ -53,7 +53,7 @@ from scripts.lib.locking import azure_lock
 from scripts.lib.tenant_runtime import TenantRuntime, foundation_sha256
 from scripts.lib.tenant_spec import TenantSpec, TenantSpecError
 from scripts.lib.tenant_status import TenantStatus
-from scripts.lib.tenant_timing import TenantTimings
+from scripts.lib.tenant_timing import TenantTimings, record_rejected_create
 from scripts.lib.tenants import LIFECYCLE_MARKERS, lifecycle_markers
 
 
@@ -200,6 +200,35 @@ class AzurePhaseFourTests(unittest.TestCase):
             observed={"markerOperationId": journal.operation_id},
         )
         return runtime, journal
+
+    def test_tenant_timing_evidence_is_azure_only(self):
+        root = self.make_root()
+        timings = TenantTimings(
+            root,
+            tenant="tenant-c",
+            operation="create",
+            operation_id="operation-1",
+        )
+        timings.record_passed("validation", 0.25)
+        evidence = timings.persist()
+        self.assertEqual(
+            evidence.relative_to(root).as_posix(),
+            ".runtime/lifecycle/azure/tenant-c/evidence/create-operation-1.json",
+        )
+
+        record_rejected_create(
+            root,
+            operation_id="operation-2",
+            seconds=0.5,
+            error=RuntimeError("rejected"),
+        )
+        self.assertTrue(
+            (
+                root
+                / ".runtime/lifecycle/rejected/azure/create-operation-2.json"
+            ).is_file()
+        )
+        self.assertFalse((root / ".runtime/lifecycle/rejected/local").exists())
 
     def inventory(self, root: Path, config: dict[str, str]) -> dict[str, object]:
         outputs = {
@@ -773,7 +802,6 @@ class AzurePhaseFourTests(unittest.TestCase):
                 adapter = AzureTenantAdapter()
                 timings = TenantTimings(
                     root,
-                    profile="azure",
                     tenant=spec.name,
                     operation="create",
                     operation_id=journal.operation_id,
@@ -2487,7 +2515,6 @@ class AzurePhaseFiveTests(unittest.TestCase):
 
         timings = TenantTimings(
             root,
-            profile="azure",
             tenant=spec.name,
             operation="delete",
             operation_id=journal.operation_id,
@@ -2601,7 +2628,6 @@ class AzurePhaseFiveTests(unittest.TestCase):
         }
         timings = TenantTimings(
             root,
-            profile="azure",
             tenant=spec.name,
             operation="delete",
             operation_id=journal.operation_id,
@@ -2735,7 +2761,6 @@ class AzurePhaseFiveTests(unittest.TestCase):
         }
         timings = TenantTimings(
             root,
-            profile="azure",
             tenant=spec.name,
             operation="delete",
             operation_id=journal.operation_id,
