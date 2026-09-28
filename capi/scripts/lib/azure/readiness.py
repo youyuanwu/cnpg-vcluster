@@ -4,6 +4,7 @@ from .common import *
 from .contracts import _expected_tenant_markers
 from .foundation import _get_management_resource
 from .rendering import (
+    _azure_tags,
     _external_azure_cluster_metadata,
     _require_markers,
 )
@@ -298,7 +299,7 @@ def _capture_vmss_identities(
     if vmss.returncode != 0:
         raise RuntimeError("Azure tenant VMSS is absent")
     payload = json.loads(vmss.stdout)
-    expected = _azure_tags(lifecycle_markers(spec, journal))
+    expected = _azure_tags(_expected_tenant_markers(spec, journal))
     if not _azure_tags_match(payload.get("tags"), expected):
         raise RuntimeError("foreign Azure tenant VMSS markers")
     vmss_id = payload.get("id")
