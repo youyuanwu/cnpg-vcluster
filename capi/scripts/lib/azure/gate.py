@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from typing import Mapping, Sequence
+
+
+VMSS_ID_RE = re.compile(
+    r"^/subscriptions/[^/]+/resourcegroups/[^/]+/providers/"
+    r"microsoft\.compute/virtualmachinescalesets/[^/]+$"
+)
 
 
 def _normalize_resource_id(value: str) -> str:
@@ -18,6 +25,13 @@ def _provider_resource_id(value: str) -> str:
     if not value.lower().startswith("azure://"):
         raise RuntimeError("Azure worker provider ID is invalid")
     return _normalize_resource_id(value)
+
+
+def _vmss_resource_id(value: str) -> str:
+    normalized = _normalize_resource_id(value)
+    if not VMSS_ID_RE.fullmatch(normalized):
+        raise RuntimeError("Azure VMSS resource ID is invalid")
+    return normalized
 
 
 @dataclass(frozen=True)
@@ -49,7 +63,7 @@ def build_worker_snapshot(
     vmss_id: str,
     instance_resource_ids: Sequence[str],
 ) -> WorkerSnapshot:
-    canonical_vmss = _normalize_resource_id(vmss_id)
+    canonical_vmss = _vmss_resource_id(vmss_id)
     nodes = readiness.get("nodes")
     node_refs = readiness.get("nodeRefs")
     if (

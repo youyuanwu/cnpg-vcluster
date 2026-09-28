@@ -389,7 +389,20 @@ def classify_azure_owned_resources(
                 {"kind": "AzureResource", "id": identifier, "reason": "foreign markers"}
             )
         else:
-            owned.append({"id": identifier, "type": resource_type})
+            owned_resource = {"id": identifier, "type": resource_type}
+            if resource_type == "microsoft.network/networkinterfaces":
+                virtual_machine_id = resource.get("virtualMachineId")
+                if not isinstance(virtual_machine_id, str) or not virtual_machine_id:
+                    unknown.append(
+                        {
+                            "kind": "AzureResource",
+                            "id": identifier,
+                            "reason": "missing VMSS instance association",
+                        }
+                    )
+                    continue
+                owned_resource["virtualMachineId"] = virtual_machine_id
+            owned.append(owned_resource)
     parent_uid_set = set(parent_uids)
     aso_owned = []
     for payload in aso_objects:

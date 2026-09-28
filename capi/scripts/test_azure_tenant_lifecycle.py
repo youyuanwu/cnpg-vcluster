@@ -223,7 +223,7 @@ def _vmss_instances(config: dict[str, str], vmss_id: str) -> list[str]:
     return identities
 
 
-def _require_three_worker_pool(spec) -> None:
+def _require_three_worker_pool(spec, *, require_ready: bool) -> None:
     pool = _get_management_resource(
         ROOT,
         spec.namespace,
@@ -232,7 +232,10 @@ def _require_three_worker_pool(spec) -> None:
     if (
         pool is None
         or pool.get("spec", {}).get("replicas") != 3
-        or pool.get("status", {}).get("readyReplicas") != 3
+        or (
+            require_ready
+            and pool.get("status", {}).get("readyReplicas") != 3
+        )
     ):
         raise RuntimeError(
             "Azure lifecycle gate requires a three-replica Ready MachinePool"
@@ -315,6 +318,10 @@ def _incomplete_gate_records(
                 raise RuntimeError(
                     f"invalid Azure lifecycle gate evidence records: {path.name}"
                 )
+            if path.stem != f"lifecycle-{payload['operationId']}":
+                raise RuntimeError(
+                    f"Azure lifecycle gate evidence identity changed: {path.name}"
+                )
             passed = {
                 record.get("phase")
                 for record in payload["records"]
@@ -325,12 +332,33 @@ def _incomplete_gate_records(
                 for record in payload["records"]
                 if isinstance(record, dict)
             }
+            if "targeted-delete-absent" in passed and not {
+                "worker-instance-deletion",
+                "worker-recovery",
+                "worker-identity-refresh",
+            }.issubset(passed):
+                raise RuntimeError(
+                    f"Azure lifecycle gate evidence phase order is invalid: {path.name}"
+                )
+            if "recreation" in passed and not {
+                "targeted-delete-absent",
+                "foundation-verification",
+            }.issubset(passed):
+                raise RuntimeError(
+                    f"Azure lifecycle gate evidence completion is invalid: {path.name}"
+                )
             if "recreation" in passed:
                 continue
             if (
                 "worker-instance-deletion" in seen
             ):
-                candidates.append(passed | {"worker-instance-deletion-started"})
+                candidates.append(
+                    passed
+                    | {
+                        "worker-instance-deletion-started",
+                        f"gate-operation:{payload['operationId']}",
+                    }
+                )
     if len(candidates) > 1:
         raise RuntimeError("multiple incomplete Azure lifecycle gate attempts exist")
     return candidates[0] if candidates else None
@@ -360,6 +388,45 @@ def _require_authenticated_worker_deletion(phases: set[str]) -> None:
         raise RuntimeError(
             "Azure worker deletion outcome is ambiguous; refusing to continue"
         )
+
+
+def _gate_attempt_id(phases: set[str]) -> str:
+    values = {
+        value.removeprefix("gate-operation:")
+        for value in phases
+        if value.startswith("gate-operation:")
+    }
+    if len(values) != 1 or not next(iter(values)):
+        raise RuntimeError("Azure lifecycle gate attempt identity is ambiguous")
+    return next(iter(values))
+
+
+def _complete_prior_gate_attempt(
+    evidence_dir: Path,
+    phases: set[str],
+    continuation_records: list[dict[str, object]],
+) -> None:
+    attempt_id = _gate_attempt_id(phases)
+    path = evidence_dir / f"lifecycle-{attempt_id}.json"
+    payload = json.loads(read_private_file(path))
+    records = payload["records"]
+    passed = {
+        record.get("phase")
+        for record in records
+        if isinstance(record, dict) and record.get("status") == "passed"
+    }
+    for record in continuation_records:
+        if (
+            isinstance(record, dict)
+            and record.get("status") == "passed"
+            and record.get("phase") not in passed
+        ):
+            records.append(dict(record))
+            passed.add(record.get("phase"))
+    write_private_file(
+        path,
+        json.dumps(redact_value(payload), sort_keys=True) + "\n",
+    )
 
 
 def _incompatible_existing_identity(runtime: TenantRuntime, spec):
@@ -462,11 +529,20 @@ def main(arguments: list[str]) -> int:
         persist_evidence()
         return value
 
-    initial_prior_gate = _incomplete_gate_records(
-        evidence.parent,
-        spec.name,
-        spec.sha256(),
-        revision,
+    initial_prior_gate = _run_profile_mutation(
+        ROOT,
+        config,
+        lambda _root, _config: _incomplete_gate_records(
+            evidence.parent,
+            spec.name,
+            spec.sha256(),
+            revision,
+        ),
+    )
+    active_gate_operation_id = (
+        _gate_attempt_id(initial_prior_gate)
+        if initial_prior_gate is not None
+        else operation_id
     )
     primary = None
     try:
@@ -509,6 +585,21 @@ def main(arguments: list[str]) -> int:
             if pending.operation == "delete":
                 if prior_gate is not None:
                     _require_authenticated_worker_deletion(prior_gate)
+                    if not private_file_exists(foundation_checkpoint):
+                        raise RuntimeError(
+                            "Azure foundation checkpoint is absent during delete resume"
+                        )
+                    checkpoint = json.loads(
+                        read_private_file(foundation_checkpoint)
+                    )
+                    if (
+                        checkpoint.get("gateOperationId")
+                        != active_gate_operation_id
+                        or checkpoint.get("foundation") != foundation_before
+                    ):
+                        raise RuntimeError(
+                            "Azure foundation changed before delete resume"
+                        )
                 phase(
                     "resume-pending-delete",
                     lambda: (
@@ -580,6 +671,7 @@ def main(arguments: list[str]) -> int:
                     "tenant",
                     "specificationSha256",
                     "revision",
+                    "gateOperationId",
                     "markerOperationId",
                     "observed",
                 }
@@ -587,6 +679,16 @@ def main(arguments: list[str]) -> int:
                 or checkpoint.get("tenant") != spec.name
                 or checkpoint.get("specificationSha256") != spec.sha256()
                 or checkpoint.get("revision") != revision
+                or checkpoint.get("gateOperationId")
+                != _gate_attempt_id(
+                    _incomplete_gate_records(
+                        evidence.parent,
+                        spec.name,
+                        spec.sha256(),
+                        revision,
+                    )
+                    or set()
+                )
                 or checkpoint.get("markerOperationId")
                 != identity.observed.get("markerOperationId")
                 or not isinstance(checkpoint.get("observed"), dict)
@@ -607,15 +709,17 @@ def main(arguments: list[str]) -> int:
             )
             last_blockers = ("worker recovery has not been observed",)
             while time.monotonic() < deadline:
-                _require_three_worker_pool(spec)
-                recovered, blockers = _collect_ready_observations(
-                    ROOT,
-                    config,
-                    spec,
-                )
-                instances = _vmss_instances(config, before.vmss_id)
-                if not blockers:
-                    try:
+                try:
+                    _require_three_worker_pool(spec, require_ready=False)
+                    recovered, blockers = _collect_ready_observations(
+                        ROOT,
+                        config,
+                        spec,
+                    )
+                    instances = _vmss_instances(config, before.vmss_id)
+                    if blockers:
+                        raise RuntimeError("; ".join(blockers))
+                    else:
                         after = build_worker_snapshot(
                             recovered,
                             before.vmss_id,
@@ -634,12 +738,9 @@ def main(arguments: list[str]) -> int:
                             deleted,
                             replacement,
                         )
-                    except RuntimeError as exc:
-                        last_blockers = (str(exc),)
-                    else:
                         break
-                else:
-                    last_blockers = blockers
+                except RuntimeError as exc:
+                    last_blockers = (str(exc),)
                 time.sleep(10)
             else:
                 raise RuntimeError(
@@ -719,7 +820,7 @@ def main(arguments: list[str]) -> int:
             vmss_id = identity.observed.get("vmssId")
             if not vmss_id:
                 raise RuntimeError("Azure tenant VMSS identity is absent")
-            _require_three_worker_pool(spec)
+            _require_three_worker_pool(spec, require_ready=True)
             readiness, blockers = _collect_ready_observations(ROOT, config, spec)
             if blockers:
                 raise RuntimeError(
@@ -742,7 +843,7 @@ def main(arguments: list[str]) -> int:
                 raise RuntimeError(
                     "Azure owned resources changed before failure injection"
                 )
-            _require_three_worker_pool(spec)
+            _require_three_worker_pool(spec, require_ready=True)
             reread, blockers = _collect_ready_observations(ROOT, config, spec)
             reread_instances = _vmss_instances(config, vmss_id)
             if blockers or build_worker_snapshot(
@@ -752,6 +853,18 @@ def main(arguments: list[str]) -> int:
             ) != before:
                 raise RuntimeError(
                     "Azure worker identities changed before failure injection"
+                )
+            if (
+                discover_azure_owned_resources(
+                    ROOT,
+                    config,
+                    spec,
+                    identity,
+                )
+                != live_resources
+            ):
+                raise RuntimeError(
+                    "Azure owned resources changed before failure injection"
                 )
             target = before.target
             phase("worker-identity-verification", lambda: before)
@@ -763,6 +876,7 @@ def main(arguments: list[str]) -> int:
                         "tenant": spec.name,
                         "specificationSha256": spec.sha256(),
                         "revision": revision,
+                        "gateOperationId": active_gate_operation_id,
                         "markerOperationId": identity.observed[
                             "markerOperationId"
                         ],
@@ -818,15 +932,17 @@ def main(arguments: list[str]) -> int:
             )
             last_blockers = ("worker recovery has not been observed",)
             while time.monotonic() < deadline:
-                _require_three_worker_pool(spec)
-                recovered, blockers = _collect_ready_observations(
-                    ROOT,
-                    config,
-                    spec,
-                )
-                instances = _vmss_instances(config, vmss_id)
-                if not blockers:
-                    try:
+                try:
+                    _require_three_worker_pool(spec, require_ready=False)
+                    recovered, blockers = _collect_ready_observations(
+                        ROOT,
+                        config,
+                        spec,
+                    )
+                    instances = _vmss_instances(config, vmss_id)
+                    if blockers:
+                        raise RuntimeError("; ".join(blockers))
+                    else:
                         after = build_worker_snapshot(
                             recovered,
                             vmss_id,
@@ -845,9 +961,6 @@ def main(arguments: list[str]) -> int:
                             deleted,
                             replacement,
                         )
-                    except RuntimeError as exc:
-                        last_blockers = (str(exc),)
-                    else:
                         observed = refreshed_observed(
                             identity.observed,
                             recovered,
@@ -875,8 +988,8 @@ def main(arguments: list[str]) -> int:
                         phase("worker-recovery", lambda: after)
                         phase("worker-identity-refresh", lambda: None)
                         return
-                else:
-                    last_blockers = blockers
+                except RuntimeError as exc:
+                    last_blockers = (str(exc),)
                 time.sleep(10)
             raise RuntimeError(
                 "Azure worker recovery timed out: "
@@ -891,10 +1004,29 @@ def main(arguments: list[str]) -> int:
             )
             _require_status(spec.name, "ready")
         if not skip_targeted_delete:
-            write_private_file(
-                foundation_checkpoint,
-                json.dumps(foundation_before, sort_keys=True) + "\n",
-            )
+            if private_file_exists(foundation_checkpoint):
+                checkpoint = json.loads(read_private_file(foundation_checkpoint))
+                if (
+                    checkpoint.get("gateOperationId")
+                    != active_gate_operation_id
+                    or checkpoint.get("foundation") != foundation_before
+                ):
+                    raise RuntimeError(
+                        "Azure foundation checkpoint conflicts with gate attempt"
+                    )
+            else:
+                write_private_file(
+                    foundation_checkpoint,
+                    json.dumps(
+                        {
+                            "schema": 1,
+                            "gateOperationId": active_gate_operation_id,
+                            "foundation": foundation_before,
+                        },
+                        sort_keys=True,
+                    )
+                    + "\n",
+                )
             phase(
                 "targeted-delete-absent",
                 lambda: (
@@ -913,9 +1045,19 @@ def main(arguments: list[str]) -> int:
                 raise RuntimeError(
                     "Azure foundation checkpoint is absent during gate resume"
                 )
-            expected_foundation = json.loads(
+            checkpoint = json.loads(
                 read_private_file(foundation_checkpoint)
             )
+            if (
+                set(checkpoint)
+                != {"schema", "gateOperationId", "foundation"}
+                or checkpoint.get("schema") != 1
+                or checkpoint.get("gateOperationId")
+                != active_gate_operation_id
+                or not isinstance(checkpoint.get("foundation"), dict)
+            ):
+                raise RuntimeError("Azure foundation checkpoint is invalid")
+            expected_foundation = checkpoint["foundation"]
             foundation_after, _, _ = _inspect_foundation(
                 ROOT,
                 config,
@@ -934,6 +1076,12 @@ def main(arguments: list[str]) -> int:
                 _require_status(spec.name, "ready"),
             ),
         )
+        if initial_prior_gate is not None:
+            _complete_prior_gate_attempt(
+                evidence.parent,
+                initial_prior_gate,
+                records,
+            )
         foundation_checkpoint.unlink(missing_ok=True)
         worker_checkpoint.unlink(missing_ok=True)
     except BaseException as exc:

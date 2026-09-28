@@ -23,7 +23,7 @@ from scripts.lib.locking import azure_lock, azure_lock_exists, e2e_lock, tools_l
 from scripts.lib.redaction import redact
 
 
-def _run_profile_mutation(root: Path, config: Mapping[str, str], mutation) -> None:
+def _run_profile_mutation(root: Path, config: Mapping[str, str], mutation):
     with e2e_lock(root, exclusive=False):
         with azure_lock(
             root,
@@ -33,7 +33,7 @@ def _run_profile_mutation(root: Path, config: Mapping[str, str], mutation) -> No
             if not acquired:
                 raise RuntimeError("Azure profile mutation lock is unavailable")
             with tools_lock(root, exclusive=True):
-                mutation(root, config)
+                return mutation(root, config)
 
 
 def _run_profile_status(root: Path, config: Mapping[str, str]) -> int:

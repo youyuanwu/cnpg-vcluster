@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.lib.azure.gate import (
     build_worker_snapshot,
@@ -10,12 +11,15 @@ from scripts.lib.azure.gate import (
     require_owned_resource_delta,
     require_replacement,
 )
+from scripts.lib.azure.ownership import classify_azure_owned_resources
 from scripts.lib.files import write_private_file
 from scripts.lib.tenant_runtime import TenantRuntimeError
 from scripts.test_azure_tenant_lifecycle import (
+    _complete_prior_gate_attempt,
     _incompatible_existing_identity,
     _incomplete_gate_records,
     _require_authenticated_worker_deletion,
+    _require_three_worker_pool,
 )
 from tests.azure_fixtures import AzureFixtureMixin
 
@@ -160,6 +164,64 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             readiness(),
             VMSS,
             [instance(0), instance(1), instance(2)],
+        )
+
+    def test_real_classifier_preserves_nic_instance_association(self):
+        markers = {
+            "tenant": "tenant-c",
+            "profile": "azure",
+            "specificationSha256": "spec-sha",
+            "foundationSha256": "foundation-sha",
+            "operationId": "operation-1",
+        }
+        old_nic = {
+        "id": f"{VMSS}/virtualMachines/2/networkInterfaces/old",
+        "type": "Microsoft.Network/networkInterfaces",
+        "virtualMachineId": instance(2),
+        }
+        new_nic = {
+        "id": f"{VMSS}/virtualMachines/3/networkInterfaces/new",
+        "type": "Microsoft.Network/networkInterfaces",
+        "virtualMachineId": instance(3),
+        }
+        recorded = classify_azure_owned_resources(
+        [
+            {
+                "id": instance(2),
+                "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
+            },
+            old_nic,
+        ],
+        markers,
+        verified_ids=(instance(2), old_nic["id"]),
+        )
+        discovered = classify_azure_owned_resources(
+        [
+            {
+                "id": instance(3),
+                "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
+            },
+            new_nic,
+        ],
+        markers,
+        verified_ids=(instance(3), new_nic["id"]),
+        )
+        before = build_worker_snapshot(
+        readiness(),
+        VMSS,
+        [instance(0), instance(1), instance(2)],
+        )
+        after = build_worker_snapshot(
+        readiness((0, 1, 3)),
+        VMSS,
+        [instance(0), instance(1), instance(3)],
+        )
+        deleted, replacement = require_replacement(before, after)
+        require_owned_resource_delta(
+        json.dumps(recorded),
+        discovered,
+        deleted,
+        replacement,
         )
         after = build_worker_snapshot(
             readiness((0, 1, 3)),
@@ -307,6 +369,7 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             {
                 "worker-instance-deletion",
                 "worker-instance-deletion-started",
+                "gate-operation:operation-1",
             },
         )
         payload["operationId"] = "operation-2"
@@ -321,6 +384,80 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 "spec-sha",
                 "revision",
             )
+
+    def test_continuation_retires_original_attempt(self):
+        root = self.make_root()
+        evidence = root / ".runtime" / "azure-gate" / "evidence"
+        payload = {
+            "schema": 1,
+            "operationId": "operation-1",
+            "tenant": "tenant-c",
+            "specificationSha256": "spec-sha",
+            "revision": "revision",
+            "records": [
+                {
+                    "phase": "worker-instance-deletion",
+                    "status": "passed",
+                    "seconds": 1.0,
+                }
+            ],
+        }
+        write_private_file(
+            evidence / "lifecycle-operation-1.json",
+            json.dumps(payload),
+        )
+        phases = _incomplete_gate_records(
+            evidence,
+            "tenant-c",
+            "spec-sha",
+            "revision",
+        )
+        _complete_prior_gate_attempt(
+            evidence,
+            phases,
+            [
+                {"phase": "worker-recovery", "status": "passed", "seconds": 1.0},
+                {
+                    "phase": "worker-identity-refresh",
+                    "status": "passed",
+                    "seconds": 1.0,
+                },
+                {
+                    "phase": "targeted-delete-absent",
+                    "status": "passed",
+                    "seconds": 1.0,
+                },
+                {
+                    "phase": "foundation-verification",
+                    "status": "passed",
+                    "seconds": 1.0,
+                },
+                {"phase": "recreation", "status": "passed", "seconds": 1.0},
+            ],
+        )
+        self.assertIsNone(
+            _incomplete_gate_records(
+                evidence,
+                "tenant-c",
+                "spec-sha",
+                "revision",
+            )
+        )
+
+    def test_pool_desired_replicas_survive_transient_readiness(self):
+        with patch(
+            "scripts.test_azure_tenant_lifecycle._get_management_resource",
+            return_value={
+                "spec": {"replicas": 3},
+                "status": {"readyReplicas": 2},
+            },
+        ):
+            _require_three_worker_pool(self.spec(workers=3), require_ready=False)
+            with self.assertRaisesRegex(RuntimeError, "three-replica Ready"):
+                _require_three_worker_pool(
+                    self.spec(workers=3),
+                    require_ready=True,
+                )
 
     def test_evidence_classifier_rejects_malformed_record_shapes(self):
         root = self.make_root()
@@ -369,7 +506,10 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 }
                 for phase in (
                     "worker-instance-deletion",
+                    "worker-recovery",
+                    "worker-identity-refresh",
                     "targeted-delete-absent",
+                    "foundation-verification",
                     "recreation",
                 )
             ],

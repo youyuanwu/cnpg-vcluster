@@ -419,6 +419,7 @@ class AzureRenderingTests(AzureFixtureMixin, unittest.TestCase):
                 "id": "/subscriptions/x/resourceGroups/rg/providers/Microsoft.Network/networkInterfaces/nic-0",
                 "type": "Microsoft.Network/networkInterfaces",
                 "tags": tags,
+                "virtualMachineId": vmss + "/virtualMachines/0",
             },
             {
                 "id": "/subscriptions/x/resourceGroups/rg/providers/Microsoft.Network/natGateways/nat",
