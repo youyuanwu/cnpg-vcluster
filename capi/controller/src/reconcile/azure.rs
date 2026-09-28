@@ -32,7 +32,6 @@ use super::{
 };
 
 pub use crate::azure::CONFIG_NAME;
-const PHASE_FOUR_PENDING: &str = "Azure tenant finalization is pending Phase 4 implementation";
 
 #[derive(Clone)]
 pub struct AzureProvider<A = LiveTenantAccess> {
@@ -326,10 +325,16 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
 
     async fn finalize(
         &self,
-        _tenant: &Tenant,
-        _supported_version: &str,
+        tenant: &Tenant,
+        supported_version: &str,
     ) -> Result<Action, ReconcileError> {
-        Err(ReconcileError::Pending(PHASE_FOUR_PENDING.into()))
+        super::azure_finalize::finalize(
+            self.client.clone(),
+            &self.configuration,
+            tenant,
+            supported_version,
+        )
+        .await
     }
 }
 
@@ -544,7 +549,7 @@ fn has_durable_state(status: &AzureProviderStatus) -> bool {
         || status.deletion.is_some()
 }
 
-fn operation_id(tenant_uid: &str, specification_sha256: &str) -> String {
+pub(super) fn operation_id(tenant_uid: &str, specification_sha256: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"azure-tenant-operation-v1\0");
     digest.update(tenant_uid.as_bytes());
@@ -577,7 +582,7 @@ fn validate_status_binding(
     }
 }
 
-fn record_uid(
+pub(super) fn record_uid(
     status: &mut AzureManagementStatus,
     kind: &str,
     object_name: &str,
@@ -623,7 +628,7 @@ fn record_uid(
     Ok(())
 }
 
-fn validate_parent(
+pub(super) fn validate_parent(
     object: &DynamicObject,
     management: &AzureManagementStatus,
     tenant: &str,
@@ -1101,6 +1106,9 @@ async fn observe_provider_resources(
             .types
             .as_ref()
             .ok_or_else(|| ownership("Azure provider resource GVK is missing"))?;
+        if matches!(types.kind.as_str(), "Pod" | "ReplicaSet" | "EndpointSlice") {
+            continue;
+        }
         let uid = object
             .uid()
             .ok_or_else(|| ownership("provider UID is missing"))?;
@@ -1165,7 +1173,7 @@ async fn observe_provider_resources(
     Ok(result)
 }
 
-fn markers_match(object: &DynamicObject, binding: &AzureBindingStatus) -> bool {
+pub(super) fn markers_match(object: &DynamicObject, binding: &AzureBindingStatus) -> bool {
     let annotations = object.annotations();
     annotations.get(TENANT_ANNOTATION) == Some(&object.namespace().unwrap_or_default())
         && annotations.get(ANNOTATION_PROFILE).map(String::as_str) == Some("azure")

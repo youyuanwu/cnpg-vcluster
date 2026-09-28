@@ -469,13 +469,9 @@ def delete_tenant(
 def execute(
     root: Path,
     arguments: Sequence[str],
-    *,
-    adapter: TenantAdapter | None = None,
 ) -> int:
-    if adapter is None:
-        from scripts.lib.azure.lifecycle import AzureTenantAdapter
+    from scripts.lib.azure import operator
 
-        adapter = AzureTenantAdapter()
     if not arguments:
         raise RuntimeError(
             "usage: tenant.py "
@@ -487,22 +483,47 @@ def execute(
         profile = arguments[1]
         if profile != PROFILE:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
-        return create_tenant(root, Path(arguments[2]), adapter)
+        spec = load_tenant_spec(
+            Path(arguments[2]),
+            expected_profile=PROFILE,
+            supported_versions=supported_versions(root),
+        )
+        with _tenant_e2e_lock(root):
+            with azure_lock(root, exclusive=True, create=True) as acquired:
+                if not acquired:
+                    raise RuntimeError(
+                        "tenant profile mutation lock is unavailable"
+                    )
+                with tools_lock(root, exclusive=True):
+                    operator.create_tenant(root, spec)
+        return 0
     if command == "status" and len(arguments) == 3:
         profile = arguments[1]
         if profile != PROFILE:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
-        return status_tenant(root, arguments[2], adapter)
+        validate_tenant_name(arguments[2])
+        status = operator.status_tenant(root, arguments[2])
+        print(status.to_json())
+        return 0 if status.classification in {"ready", "absent"} else 1
     if command == "delete" and len(arguments) == 4:
         profile = arguments[1]
         if profile != PROFILE:
             raise TenantSpecError(f"unsupported tenant profile: {profile}")
-        return delete_tenant(
-            root,
-            arguments[2],
-            arguments[3],
-            adapter,
-        )
+        tenant = validate_tenant_name(arguments[2])
+        expected = f"{PROFILE}/{tenant}"
+        if arguments[3] != expected:
+            raise RuntimeError(
+                f"tenant deletion requires confirmation token {expected!r}"
+            )
+        with _tenant_e2e_lock(root):
+            with azure_lock(root, exclusive=True, create=True) as acquired:
+                if not acquired:
+                    raise RuntimeError(
+                        "tenant profile mutation lock is unavailable"
+                    )
+                with tools_lock(root, exclusive=True):
+                    operator.delete_tenant(root, tenant)
+        return 0
     raise RuntimeError(f"invalid tenant command arguments: {json.dumps(arguments)}")
 
 

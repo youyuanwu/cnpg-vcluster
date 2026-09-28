@@ -331,6 +331,14 @@ rules:
   - list
   - watch
 - apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinesets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
   - azuremachinepoolmachines
@@ -397,6 +405,27 @@ rules:
   - get
   - list
 - apiGroups:
+  - ''
+  resources:
+  - pods
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - apps
+  resources:
+  - replicasets
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - discovery.k8s.io
+  resources:
+  - endpointslices
+  verbs:
+  - get
+  - list
+- apiGroups:
   - policy
   resources:
   - poddisruptionbudgets
@@ -442,6 +471,13 @@ rules:
   - network.azure.com
   resources:
   - natgateways
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - network.azure.com
+  resources:
+  - publicipaddresses
   verbs:
   - get
   - list

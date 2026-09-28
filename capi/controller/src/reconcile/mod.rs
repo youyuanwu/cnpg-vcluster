@@ -1,6 +1,7 @@
 //! Direct-read reconciliation with durable-write barriers and narrowly bound SSA.
 
 mod azure;
+mod azure_finalize;
 mod error;
 mod local;
 pub mod objects;

@@ -39,9 +39,11 @@ impl Fixture {
         tenant.metadata.resource_version = Some("1".into());
         tenant.metadata.generation = Some(1);
         management.insert(TENANT_PATH, tenant);
+        let mut lists = std::collections::BTreeSet::new();
         for resource in AZURE_MANAGEMENT_RESOURCES
             .iter()
-            .filter(|resource| resource.class == ResourceClass::Descendant)
+            .filter(|resource| resource.namespaced)
+            .filter(|resource| lists.insert((resource.api_version, resource.plural)))
         {
             management.allow_typed_list(
                 &list_path(resource.api_version, resource.plural, "tenant-a"),
@@ -172,6 +174,14 @@ impl Fixture {
         };
         let pool_owner = json!({"apiVersion":"cluster.x-k8s.io/v1beta1","kind":"MachinePool",
             "name":"tenant-a-worker","uid":pool_uid,"controller":true});
+        let binding = status.binding.as_ref().unwrap();
+        let markers = json!({
+            "lifecycle.cnpg-vcluster.capi/tenant":"tenant-a",
+            "lifecycle.cnpg-vcluster.capi/profile":"azure",
+            "lifecycle.cnpg-vcluster.capi/specification-sha256":binding.specification_sha256,
+            "lifecycle.cnpg-vcluster.capi/foundation-sha256":binding.foundation_sha256,
+            "lifecycle.cnpg-vcluster.capi/operation-id":binding.operation_id,
+        });
         let azure_owner = azure_pool
             .and_then(|value| {
                 value
@@ -191,6 +201,7 @@ impl Fixture {
                 json!({"apiVersion":"cluster.x-k8s.io/v1beta1","kind":"Machine",
                     "metadata":{"name":format!("machine-{index}"),"namespace":"tenant-a",
                         "uid":format!("machine-{index}-uid"),"resourceVersion":"1",
+                        "annotations":markers.clone(),
                         "ownerReferences":[pool_owner.clone()]}}),
             );
             self.management.insert(
@@ -262,6 +273,35 @@ impl Fixture {
             "Azure fixture did not converge: {:?}",
             self.current().status
         );
+    }
+
+    fn mark_deleting(&self) {
+        let mut tenant = self.management.get(TENANT_PATH);
+        tenant["metadata"]["deletionTimestamp"] = json!("2026-09-28T00:00:00Z");
+        self.management.insert(TENANT_PATH, tenant);
+    }
+
+    fn remove_kinds(&self, kinds: &[&str]) {
+        let mut state = self.management.0.lock().unwrap();
+        state.objects.retain(|_, value| {
+            !value["kind"]
+                .as_str()
+                .is_some_and(|kind| kinds.contains(&kind))
+        });
+    }
+
+    fn start_azure_cluster_deletion_without_lb(&self) {
+        let mut state = self.management.0.lock().unwrap();
+        let value = state
+            .objects
+            .values_mut()
+            .find(|value| value["kind"] == "AzureCluster")
+            .unwrap();
+        value["metadata"]["deletionTimestamp"] = json!("2026-09-28T00:00:01Z");
+        value["spec"]["networkSpec"]
+            .as_object_mut()
+            .unwrap()
+            .remove("apiServerLB");
     }
 }
 
@@ -421,4 +461,329 @@ fn catalog_represents_twelve_writes_with_two_named_configmaps() {
         1
     );
     assert!(management::azure_by_kind("AzureMachinePool").is_some());
+}
+
+#[tokio::test]
+async fn finalization_records_then_deletes_in_exact_order() {
+    let fixture = Fixture::new();
+    fixture.until_ready().await;
+    let management = fixture
+        .current()
+        .status
+        .as_ref()
+        .unwrap()
+        .azure()
+        .unwrap()
+        .management
+        .as_ref()
+        .unwrap()
+        .clone();
+    fixture.management.insert(
+        "/apis/apps/v1/namespaces/tenant-a/replicasets/status-probe-rs",
+        json!({"apiVersion":"apps/v1","kind":"ReplicaSet","metadata":{
+            "name":"status-probe-rs","namespace":"tenant-a","uid":"status-probe-rs-uid",
+            "resourceVersion":"1","ownerReferences":[{
+                "apiVersion":"apps/v1","kind":"Deployment","name":"tenant-a-status-probe",
+                "uid":management.status_probe_deployment_uid.unwrap(),"controller":true
+            }]
+        }}),
+    );
+    fixture.management.insert(
+        "/api/v1/namespaces/tenant-a/pods/status-probe-pod",
+        json!({"apiVersion":"v1","kind":"Pod","metadata":{
+            "name":"status-probe-pod","namespace":"tenant-a","uid":"status-probe-pod-uid",
+            "resourceVersion":"1","ownerReferences":[{
+                "apiVersion":"apps/v1","kind":"ReplicaSet","name":"status-probe-rs",
+                "uid":"status-probe-rs-uid","controller":true
+            }]
+        }}),
+    );
+    fixture.management.insert(
+        "/api/v1/namespaces/tenant-a/pods/addon-pod",
+        json!({"apiVersion":"v1","kind":"Pod","metadata":{
+            "name":"addon-pod","namespace":"tenant-a","uid":"addon-pod-uid",
+            "resourceVersion":"1","ownerReferences":[{
+                "apiVersion":"batch/v1","kind":"Job","name":"tenant-a-install-addons",
+                "uid":management.addon_job_uid.unwrap(),"controller":true
+            }]
+        }}),
+    );
+    fixture.mark_deleting();
+    fixture.management.take_calls();
+
+    fixture.step().await;
+    let current = fixture.current();
+    let status = current.status.as_ref().unwrap();
+    let azure = status.azure().unwrap();
+    let pool_uid = azure
+        .management
+        .as_ref()
+        .unwrap()
+        .machine_pool_uid
+        .clone()
+        .unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Deleting));
+    assert!(azure.deletion.is_some());
+    assert!(
+        fixture
+            .management
+            .take_calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
+
+    for _ in 0..4 {
+        fixture.step().await;
+    }
+    let first = fixture.management.take_calls();
+    let machine_patches: Vec<_> = first
+        .iter()
+        .filter(|call| call.method == "PATCH" && call.path.contains("/machines/"))
+        .collect();
+    assert_eq!(machine_patches.len(), 3);
+    assert!(machine_patches.iter().all(|call| {
+        call.body["metadata"]["annotations"]["machine.cluster.x-k8s.io/exclude-node-draining"]
+            == "true"
+    }));
+    let pool_delete = first
+        .iter()
+        .find(|call| call.method == "DELETE" && call.path.contains("/machinepools/"))
+        .unwrap();
+    assert_eq!(pool_delete.body["preconditions"]["uid"], pool_uid);
+    assert!(pool_delete.body["preconditions"]["resourceVersion"].is_string());
+
+    fixture.remove_kinds(&["Machine", "AzureMachinePool", "AzureMachinePoolMachine"]);
+    fixture.step().await;
+    let cluster_delete = fixture
+        .management
+        .take_calls()
+        .into_iter()
+        .find(|call| call.method == "DELETE" && call.path.ends_with("/clusters/tenant-a"))
+        .unwrap();
+    assert!(cluster_delete.body["preconditions"]["uid"].is_string());
+    assert!(cluster_delete.body["preconditions"]["resourceVersion"].is_string());
+
+    fixture.remove_kinds(&["Cluster"]);
+    fixture.start_azure_cluster_deletion_without_lb();
+    fixture.step().await;
+    let workaround = fixture
+        .management
+        .take_calls()
+        .into_iter()
+        .find(|call| call.method == "PATCH" && call.path.ends_with("/azureclusters/tenant-a"))
+        .unwrap();
+    assert_eq!(
+        workaround.body["spec"]["networkSpec"]["apiServerLB"]["type"],
+        "Public"
+    );
+
+    fixture.remove_kinds(&[
+        "AzureCluster",
+        "KamajiControlPlane",
+        "KubeadmConfig",
+        "TenantControlPlane",
+        "Certificate",
+        "CertificateRequest",
+        "Issuer",
+        "Service",
+        "Endpoints",
+        "StatefulSet",
+        "PersistentVolumeClaim",
+        "PodDisruptionBudget",
+        "Role",
+        "RoleBinding",
+        "ResourceGroup",
+        "VirtualNetwork",
+        "VirtualNetworksSubnet",
+        "NatGateway",
+        "PublicIPAddress",
+        "Secret",
+    ]);
+    fixture.management.take_calls();
+    for _ in 0..4 {
+        fixture.step().await;
+    }
+    fixture.remove_kinds(&["Pod", "ReplicaSet"]);
+    for _ in 0..5 {
+        fixture.step().await;
+        if !fixture
+            .current()
+            .metadata
+            .finalizers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|value| value == tenant_controller::api::FINALIZER)
+        {
+            break;
+        }
+    }
+    let calls = fixture.management.take_calls();
+    let deletes: Vec<_> = calls
+        .iter()
+        .filter(|call| call.method == "DELETE")
+        .map(|call| call.path.as_str())
+        .collect();
+    assert_eq!(
+        deletes,
+        [
+            "/api/v1/namespaces/tenant-a/configmaps/tenant-a-azure-cloud-provider-values",
+            "/api/v1/namespaces/tenant-a/configmaps/tenant-a-calico-values",
+            "/apis/batch/v1/namespaces/tenant-a/jobs/tenant-a-install-addons",
+            "/apis/apps/v1/namespaces/tenant-a/deployments/tenant-a-status-probe",
+            "/apis/infrastructure.cluster.x-k8s.io/v1beta1/namespaces/tenant-a/azureclusteridentities/tenant-a-identity",
+            "/api/v1/namespaces/tenant-a",
+        ]
+    );
+    let finalizer_patch = calls
+        .iter()
+        .rposition(|call| call.method == "PATCH" && call.path == TENANT_PATH)
+        .unwrap();
+    let namespace_delete = calls
+        .iter()
+        .position(|call| call.method == "DELETE" && call.path == "/api/v1/namespaces/tenant-a")
+        .unwrap();
+    assert!(finalizer_patch > namespace_delete);
+    assert!(
+        !fixture
+            .current()
+            .metadata
+            .finalizers
+            .unwrap_or_default()
+            .iter()
+            .any(|value| value == tenant_controller::api::FINALIZER)
+    );
+}
+
+#[tokio::test]
+async fn finalization_blocks_foreign_residue_and_same_name_recreation() {
+    let fixture = Fixture::new();
+    fixture.until_ready().await;
+    fixture.mark_deleting();
+    fixture.step().await;
+    fixture.management.insert(
+        "/api/v1/namespaces/tenant-a/configmaps/foreign",
+        json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{
+            "name":"foreign","namespace":"tenant-a","uid":"foreign-uid","resourceVersion":"1"
+        }}),
+    );
+    fixture.step().await;
+    assert_eq!(
+        fixture.current().status.unwrap().phase,
+        Some(TenantPhase::OwnershipInvalid)
+    );
+    fixture
+        .management
+        .remove("/api/v1/namespaces/tenant-a/configmaps/foreign");
+    let path = "/apis/cluster.x-k8s.io/v1beta1/namespaces/tenant-a/machinepools/tenant-a-worker";
+    let mut pool = fixture.management.get(path);
+    pool["metadata"]["uid"] = json!("recreated-pool");
+    fixture.management.insert(path, pool);
+    fixture.step().await;
+    assert_eq!(
+        fixture.current().status.unwrap().phase,
+        Some(TenantPhase::OwnershipInvalid)
+    );
+}
+
+#[tokio::test]
+async fn finalization_recovers_missing_identity_in_one_barrier() {
+    let fixture = Fixture::new();
+    fixture.until_ready().await;
+    let mut tenant = fixture.current();
+    let azure = tenant.status.as_mut().unwrap().azure_mut().unwrap();
+    azure.management.as_mut().unwrap().machine_pool_uid = None;
+    azure.kubeconfig = None;
+    tenant.metadata.deletion_timestamp =
+        Some(serde_json::from_value(json!("2026-09-28T00:00:00Z")).unwrap());
+    fixture.management.insert(TENANT_PATH, tenant);
+    fixture.management.take_calls();
+    fixture.step().await;
+    let current = fixture.current();
+    let azure = current.status.as_ref().unwrap().azure().unwrap();
+    assert!(
+        azure
+            .management
+            .as_ref()
+            .unwrap()
+            .machine_pool_uid
+            .is_some()
+    );
+    assert!(azure.kubeconfig.is_some());
+    assert!(azure.deletion.is_some());
+    let calls = fixture.management.take_calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.method == "PATCH" && call.path.ends_with("/status"))
+            .count(),
+        1
+    );
+    assert!(calls.iter().all(|call| call.method != "DELETE"));
+}
+
+#[tokio::test]
+async fn finalization_never_strips_provider_finalizers() {
+    let fixture = Fixture::new();
+    fixture.until_ready().await;
+    fixture.mark_deleting();
+    fixture.step().await;
+    fixture.remove_kinds(&[
+        "MachinePool",
+        "Machine",
+        "AzureMachinePool",
+        "AzureMachinePoolMachine",
+        "Cluster",
+    ]);
+    fixture.start_azure_cluster_deletion_without_lb();
+    {
+        let mut state = fixture.management.0.lock().unwrap();
+        let azure_cluster = state
+            .objects
+            .values_mut()
+            .find(|value| value["kind"] == "AzureCluster")
+            .unwrap();
+        azure_cluster["metadata"]["finalizers"] = json!(["infrastructure.cluster.x-k8s.io"]);
+        azure_cluster["spec"]["networkSpec"]["apiServerLB"] = json!({"type":"Public"});
+    }
+    fixture.management.take_calls();
+    fixture.step().await;
+    let calls = fixture.management.take_calls();
+    assert!(
+        calls
+            .iter()
+            .all(|call| { call.body.pointer("/metadata/finalizers").is_none() })
+    );
+    let state = fixture.management.0.lock().unwrap();
+    let azure_cluster = state
+        .objects
+        .values()
+        .find(|value| value["kind"] == "AzureCluster")
+        .unwrap();
+    assert_eq!(
+        azure_cluster["metadata"]["finalizers"],
+        json!(["infrastructure.cluster.x-k8s.io"])
+    );
+}
+
+#[tokio::test]
+async fn finalization_refuses_missing_recorded_provider_descendant() {
+    let fixture = Fixture::new();
+    fixture.until_ready().await;
+    fixture
+        .management
+        .remove("/apis/cluster.x-k8s.io/v1beta1/namespaces/tenant-a/machines/machine-0");
+    fixture.mark_deleting();
+    fixture.step().await;
+    assert_eq!(
+        fixture.current().status.unwrap().phase,
+        Some(TenantPhase::OwnershipInvalid)
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
 }
