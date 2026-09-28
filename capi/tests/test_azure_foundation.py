@@ -19,10 +19,12 @@ from scripts.lib.azure.common import (
 )
 from scripts.lib.azure.foundation import (
     ACR_PULL_ROLE_DEFINITION_ID,
+    CAPI_CAPZ_DEPLOYMENTS,
     TENANT_CONTROLLER_CONFIG,
     TENANT_CONTROLLER_CONFIG_KEY,
     _azure_provider_configuration,
     _foundation_identity,
+    _install_capi_capz,
     _inspect_foundation,
     _push_controller_image,
     create_foundation,
@@ -44,6 +46,40 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
+    def test_existing_complete_capi_stack_skips_clusterctl_init(self) -> None:
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value={"metadata": {"uid": "existing"}},
+            ),
+            patch("scripts.lib.azure.foundation.run") as run_command,
+            patch("scripts.lib.azure.foundation._patch_capz_identity"),
+            patch(
+                "scripts.lib.azure.foundation._configure_capz_external_control_plane_webhook"
+            ),
+            patch("scripts.lib.azure.foundation._kubectl"),
+        ):
+            _install_capi_capz(root, config, inventory)
+        run_command.assert_not_called()
+
+    def test_partial_capi_stack_is_rejected(self) -> None:
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        observed = iter(
+            [{"metadata": {"uid": "existing"}}, None]
+            + [{"metadata": {"uid": "existing"}}] * (len(CAPI_CAPZ_DEPLOYMENTS) - 2)
+        )
+        with patch(
+            "scripts.lib.azure.foundation._get_management_resource",
+            side_effect=lambda *_: next(observed),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "installation is incomplete"):
+                _install_capi_capz(root, config, inventory)
+
     def test_configuration_contains_only_foundation_and_profile_limits(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -293,7 +329,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ) as build,
             patch(
                 "scripts.lib.azure.foundation.run",
-                return_value=completed(),
+                return_value=completed(f"v1alpha2: digest: {digest} size: 123\n"),
             ) as run_command,
             patch(
                 "scripts.lib.azure.foundation._az",
@@ -328,6 +364,76 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "manifest digest"),
         ):
             _push_controller_image(root, config, self.inventory(root, config))
+    def test_controller_push_rejects_mutable_tag_digest_race(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        pushed = "sha256:" + "a" * 64
+        raced = "sha256:" + "b" * 64
+        with (
+            patch("scripts.lib.azure.foundation.load_configuration", return_value={}),
+            patch("scripts.lib.azure.foundation.build_azure_controller_image"),
+            patch(
+                "scripts.lib.azure.foundation.run",
+                return_value=completed(f"digest: {pushed} size: 123\n"),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._az",
+                side_effect=[completed(), completed(raced + "\n")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "changed before deployment"),
+        ):
+            _push_controller_image(root, config, self.inventory(root, config))
+    def test_controller_push_uses_unique_tag_when_push_digest_is_ambiguous(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        digest = "sha256:" + "c" * 64
+        with (
+            patch("scripts.lib.azure.foundation.load_configuration", return_value={}),
+            patch("scripts.lib.azure.foundation.build_azure_controller_image"),
+            patch(
+                "scripts.lib.azure.foundation.uuid.uuid4",
+                return_value=type("Uuid", (), {"hex": "operation123"})(),
+            ),
+            patch(
+                "scripts.lib.azure.foundation.run",
+                side_effect=[
+                    completed("push output without one digest"),
+                    completed(),
+                    completed("still ambiguous"),
+                ],
+            ) as run_command,
+            patch(
+                "scripts.lib.azure.foundation._az",
+                side_effect=[completed(), completed(digest + "\n")],
+            ) as az,
+        ):
+            image = _push_controller_image(
+                root,
+                config,
+                self.inventory(root, config),
+            )
+        unique = "yycvacr.azurecr.io/tenant-controller:publish-operation123"
+        self.assertEqual(
+            run_command.call_args_list[1].args[0],
+            [
+                "docker",
+                "tag",
+                "yycvacr.azurecr.io/tenant-controller:v1alpha2",
+                unique,
+            ],
+        )
+        self.assertEqual(
+            run_command.call_args_list[2].args[0],
+            ["docker", "push", unique],
+        )
+        self.assertIn(
+            "tenant-controller:publish-operation123",
+            az.call_args_list[1].args,
+        )
+        self.assertEqual(
+            image,
+            f"yycvacr.azurecr.io/tenant-controller@{digest}",
+        )
     def test_preflight_output_does_not_expose_subscription_id(self):
         root = self.make_root()
         config = load_azure_configuration(root)

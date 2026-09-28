@@ -187,7 +187,7 @@ just test-tenant-lifecycle
 | `just local-tenant-delete <name>` | Delete one local Tenant and wait for finalization. |
 | `just tenant-create azure <spec.json>` | Reconcile one explicit Azure tenant on the recorded AKS/CAPZ foundation. |
 | `just tenant-status azure <name>` | Inspect one Azure tenant without mutating state. |
-| `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through CAPI/CAPZ and verify foundation preservation. |
+| `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through CAPI/CAPZ and durably retry Azure absence/foundation proof. |
 | `just azure-test-tenant-lifecycle` | Destructively prove three distinct VMSS-backed workers, exact non-primary instance replacement, targeted absence, foundation preservation, and recreation for the example tenant. |
 | `just diagnose management` | Print management status, workloads, CRDs, and events without mutation. |
 | `just destroy` | Remove recorded tenants, controllers, the management cluster, runtime state, and restore host settings. |
@@ -196,9 +196,12 @@ All mutating tenant paths validate pinned inputs and tenant networks before
 changing state. Local lifecycle state is held in the Tenant resource, schema-3 foundation
 ConfigMap, per-slot allocation Leases, provider resources, and exact Docker identities;
 the public local commands do not maintain a second filesystem journal or
-readiness evaluator. Azure lifecycle identity is held in the Tenant resource;
-only foundation inventory, management kubeconfig, and destructive-gate
-evidence remain below ignored owner-only `.runtime/`. Commands use explicit
+readiness evaluator. Azure lifecycle identity is held in the Tenant resource.
+The public delete command persists an exact owner-only proof checkpoint before
+DELETE and resumes it when the Tenant is already absent; destructive-gate
+checkpoints are exact/private while published evidence is redacted. Foundation
+inventory, management kubeconfig, delete proof, and gate evidence remain below
+ignored owner-only `.runtime/`. Commands use explicit
 kubeconfig paths and do not depend on the user's current Kubernetes context.
 
 Azure implementation responsibilities live under `scripts/lib/azure/`:
@@ -207,6 +210,12 @@ Azure implementation responsibilities live under `scripts/lib/azure/`:
 absence, `ownership` observes Azure/tag identity, and `gate` owns destructive
 three-worker replacement validation. `scripts/azure.py` remains only the
 foundation command facade.
+
+Azure reconciliation re-reads `tenant-system/tenant-azure-provider` before
+every mutation and requires the exact startup UID and canonical typed values.
+Generated RBAC is provider-specific: local installs `role.yaml`, while Azure
+installs `role-azure.yaml`; neither role grants the other provider's root
+permissions.
 
 The retained workflow is a development optimization, not a final gate. It
 retains only the explicitly bound management foundation:

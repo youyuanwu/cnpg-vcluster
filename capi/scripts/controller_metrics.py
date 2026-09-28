@@ -6,7 +6,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER_SRC = ROOT / "controller" / "src"
+PYTHON_SRC = ROOT / "scripts"
 MAX_PRODUCTION_LINES = 12000
+RUST_BASELINE_LINES = 8049
+PYTHON_BASELINE_LINES = 25094
 
 
 def production_lines(path: Path) -> int:
@@ -28,6 +31,13 @@ def source_metrics(source: Path = CONTROLLER_SRC) -> list[tuple[Path, int]]:
     ]
 
 
+def python_source_metrics(source: Path = PYTHON_SRC) -> list[tuple[Path, int]]:
+    return [
+        (path, len(path.read_text(encoding="utf-8").splitlines()))
+        for path in sorted(source.rglob("*.py"))
+    ]
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Report Rust production lines before test-only modules."
@@ -41,9 +51,21 @@ def main() -> int:
     args = parse_args()
     metrics = source_metrics()
     total = sum(lines for _, lines in metrics)
+    python_total = sum(lines for _, lines in python_source_metrics())
+    rust_delta = total - RUST_BASELINE_LINES
+    python_delta = python_total - PYTHON_BASELINE_LINES
     for path, lines in metrics:
         print(f"{lines:5} {path.relative_to(ROOT)}")
     print(f"{total:5} production Rust lines")
+    print(
+        f"Rust: baseline={RUST_BASELINE_LINES} current={total} "
+        f"delta={rust_delta:+d}"
+    )
+    print(
+        f"Python (scripts/**/*.py): baseline={PYTHON_BASELINE_LINES} "
+        f"current={python_total} delta={python_delta:+d}"
+    )
+    print(f"Combined Rust/Python net delta: {rust_delta + python_delta:+d}")
     if args.expect is not None and total != args.expect:
         raise SystemExit(
             f"production Rust line count {total} does not match {args.expect}"

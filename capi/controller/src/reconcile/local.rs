@@ -49,6 +49,9 @@ impl TenantAccess for LiveTenantAccess {
 }
 pub trait ProviderLifecycle: Send + Sync {
     fn supports(&self, provider: &TenantProviderSpec) -> bool;
+    fn validate_mutation(&self) -> impl Future<Output = Result<(), ReconcileError>> + Send {
+        async { Ok(()) }
+    }
     fn reconcile<'a>(
         &'a self,
         tenant: &'a Tenant,

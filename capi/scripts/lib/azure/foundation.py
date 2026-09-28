@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import uuid
 
 from .common import *
 from scripts.lib.controller import (
@@ -14,6 +15,19 @@ ACR_PULL_ROLE_DEFINITION_ID = (
 )
 TENANT_CONTROLLER_CONFIG = "tenant-azure-provider"
 TENANT_CONTROLLER_CONFIG_KEY = "provider.json"
+CAPI_CAPZ_DEPLOYMENTS = (
+    ("capi-system", "capi-controller-manager"),
+    (
+        "capi-kubeadm-bootstrap-system",
+        "capi-kubeadm-bootstrap-controller-manager",
+    ),
+    (
+        "capi-kubeadm-control-plane-system",
+        "capi-kubeadm-control-plane-controller-manager",
+    ),
+    ("capz-system", "capz-controller-manager"),
+    ("capz-system", "azureserviceoperator-controller-manager"),
+)
 
 def preflight(
     root: Path,
@@ -211,6 +225,14 @@ def _install_capi_capz(
     config: Mapping[str, str],
     inventory: Mapping[str, object],
 ) -> None:
+    existing = [
+        _get_management_resource(root, namespace, f"deployment/{deployment}")
+        for namespace, deployment in CAPI_CAPZ_DEPLOYMENTS
+    ]
+    if any(value is not None for value in existing) and not all(
+        value is not None for value in existing
+    ):
+        raise RuntimeError("Azure CAPI/CAPZ management installation is incomplete")
     environment = {
         **os.environ,
         "AZURE_SUBSCRIPTION_ID_B64": base64.b64encode(
@@ -218,25 +240,26 @@ def _install_capi_capz(
         ).decode(),
         "EXP_MACHINE_POOL": "true",
     }
-    run(
-        [
-            str(root / ".tools" / "bin" / "clusterctl"),
-            "init",
-            "--kubeconfig",
-            str(_management_kubeconfig(root)),
-            "--core",
-            f"cluster-api:{config['AZURE_CAPI_VERSION']}",
-            "--bootstrap",
-            f"kubeadm:{config['AZURE_CAPI_VERSION']}",
-            "--control-plane",
-            f"kubeadm:{config['AZURE_CAPI_VERSION']}",
-            "--infrastructure",
-            f"azure:{config['AZURE_CAPZ_VERSION']}",
-            "--wait-providers",
-        ],
-        timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]),
-        env=environment,
-    )
+    if not all(value is not None for value in existing):
+        run(
+            [
+                str(root / ".tools" / "bin" / "clusterctl"),
+                "init",
+                "--kubeconfig",
+                str(_management_kubeconfig(root)),
+                "--core",
+                f"cluster-api:{config['AZURE_CAPI_VERSION']}",
+                "--bootstrap",
+                f"kubeadm:{config['AZURE_CAPI_VERSION']}",
+                "--control-plane",
+                f"kubeadm:{config['AZURE_CAPI_VERSION']}",
+                "--infrastructure",
+                f"azure:{config['AZURE_CAPZ_VERSION']}",
+                "--wait-providers",
+            ],
+            timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]),
+            env=environment,
+        )
     _patch_capz_identity(root, config, inventory)
     _configure_capz_external_control_plane_webhook(root)
     for deployment in (
@@ -461,27 +484,63 @@ def _push_controller_image(
     controller_config = load_configuration(root)
     build_azure_controller_image(root, controller_config, tagged_image)
     _az("acr", "login", "--name", str(outputs["acrName"]), timeout=120)
-    run(
+    pushed = run(
         ["docker", "push", tagged_image],
         timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]),
     )
-    digest = _az(
+    local_digests = {
+        value.lower()
+        for value in re.findall(
+            r"\bdigest:\s*(sha256:[0-9a-fA-F]{64})\b",
+            f"{pushed.stdout}\n{pushed.stderr}",
+        )
+    }
+    local_digest = (
+        next(iter(local_digests)) if len(local_digests) == 1 else None
+    )
+    resolved_tag = tag
+    if local_digest is None:
+        resolved_tag = f"publish-{uuid.uuid4().hex}"
+        unique_image = f"{login_server}/{repository}:{resolved_tag}"
+        run(
+            ["docker", "tag", tagged_image, unique_image],
+            timeout=120,
+        )
+        unique_push = run(
+            ["docker", "push", unique_image],
+            timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]),
+        )
+        unique_digests = {
+            value.lower()
+            for value in re.findall(
+                r"\bdigest:\s*(sha256:[0-9a-fA-F]{64})\b",
+                f"{unique_push.stdout}\n{unique_push.stderr}",
+            )
+        }
+        local_digest = (
+            next(iter(unique_digests)) if len(unique_digests) == 1 else None
+        )
+    registry_digest = _az(
         "acr",
         "manifest",
         "show-metadata",
         "--registry",
         str(outputs["acrName"]),
         "--name",
-        f"{repository}:{tag}",
+        f"{repository}:{resolved_tag}",
         "--query",
         "digest",
         "--output",
         "tsv",
         timeout=120,
     ).stdout.strip().lower()
-    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", registry_digest):
         raise RuntimeError("pushed Azure controller manifest digest is invalid")
-    return f"{login_server}/{repository}@{digest}"
+    if local_digest is not None and registry_digest != local_digest:
+        raise RuntimeError(
+            "pushed Azure controller manifest digest changed before deployment"
+        )
+    return f"{login_server}/{repository}@{registry_digest}"
 
 
 def _azure_provider_configuration(
@@ -541,7 +600,7 @@ def _install_tenant_controller(
     for path in (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
         root / "controller" / "config" / "crd" / "bases",
-        root / "controller" / "config" / "rbac" / "role.yaml",
+        root / "controller" / "config" / "rbac" / "role-azure.yaml",
         root / "controller" / "config" / "rbac" / "service-account.yaml",
         root / "controller" / "config" / "rbac" / "role-binding.yaml",
     ):

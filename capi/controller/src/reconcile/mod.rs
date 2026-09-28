@@ -83,6 +83,10 @@ impl<P: ProviderLifecycle> Reconciler<P> {
         if tenant.metadata.deletion_timestamp.is_some() && !has_finalizer {
             return Ok(Action::await_change());
         }
+        let provider_supported = self.provider.supports(&tenant.spec.provider);
+        if provider_supported && let Err(guard) = self.provider.validate_mutation().await {
+            return Ok(guard.action());
+        }
         let spec = match canonical_spec(name, &tenant.spec, &self.config.supported_version) {
             Ok(spec) => spec,
             Err(error) => {
@@ -102,11 +106,14 @@ impl<P: ProviderLifecycle> Reconciler<P> {
             }
         };
         if let Err(error) = crate::api::validate_provider_status(&spec, tenant.status.as_ref()) {
+            if let Err(guard) = self.provider.validate_mutation().await {
+                return Ok(guard.action());
+            }
             return self
                 .failure(&tenant, ReconcileError::OwnershipInvalid(error.to_string()))
                 .await;
         }
-        if !self.provider.supports(&spec.provider) {
+        if !provider_supported {
             return self.unsupported_provider(&tenant).await;
         }
         let deleting = tenant.metadata.deletion_timestamp.is_some();
@@ -120,9 +127,20 @@ impl<P: ProviderLifecycle> Reconciler<P> {
         match result {
             Ok(action) => Ok(action),
             Err(error) if !deleting && error.pending() => {
+                if let Err(guard) = self.provider.validate_mutation().await {
+                    return Ok(guard.action());
+                }
                 progress(self.client.clone(), &tenant, DEPENDENCY_INTERVAL).await
             }
-            Err(error) => self.failure(&tenant, error).await,
+            Err(error) => {
+                if matches!(error, ReconcileError::MutationGuard(_)) {
+                    return Ok(error.action());
+                }
+                if let Err(guard) = self.provider.validate_mutation().await {
+                    return Ok(guard.action());
+                }
+                self.failure(&tenant, error).await
+            }
         }
     }
     async fn unsupported_provider(&self, tenant: &Tenant) -> Result<Action, ReconcileError> {

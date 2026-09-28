@@ -18,7 +18,7 @@ use crate::{
     },
     azure::{
         AzureConfiguration, AzureContext, EXTERNAL_CONTROL_PLANE_LABEL, desired_objects,
-        validate_binding, validate_live_identity,
+        validate_binding, validate_desired_object, validate_live_identity,
     },
     error::ControllerError,
     management,
@@ -27,7 +27,9 @@ use crate::{
 };
 
 use super::{
-    DEPENDENCY_INTERVAL, FINALIZER, PROGRESS_INTERVAL, ReconcileError, azure::operation_id, objects,
+    DEPENDENCY_INTERVAL, FINALIZER, PROGRESS_INTERVAL, ReconcileError,
+    azure::{operation_id, require_current_configuration},
+    objects,
 };
 
 const DRAIN: &str = "machine.cluster.x-k8s.io/exclude-node-draining";
@@ -157,12 +159,32 @@ fn validate_identity(
     desired: &DynamicObject,
     live: &DynamicObject,
     recorded_uid: Option<&str>,
+    deletion_recorded: bool,
 ) -> Result<(), ReconcileError> {
     let mut observed = live.clone();
     observed.metadata.deletion_timestamp = None;
     validate_live_identity(desired, &observed, recorded_uid)
-        .map(|_| ())
-        .map_err(|error| blocked(error.to_string()))
+        .map_err(|error| blocked(error.to_string()))?;
+    if live.metadata.deletion_timestamp.is_some() {
+        if !deletion_recorded {
+            return Err(blocked(
+                "Azure explicit object began deletion before its identity barrier",
+            ));
+        }
+        if desired
+            .types
+            .as_ref()
+            .is_some_and(|types| types.kind == "AzureCluster")
+            && observed
+                .data
+                .pointer("/spec/networkSpec/apiServerLB")
+                .is_none()
+        {
+            observed.data["spec"]["networkSpec"]["apiServerLB"] =
+                desired.data["spec"]["networkSpec"]["apiServerLB"].clone();
+        }
+    }
+    validate_desired_object(desired, &observed).map_err(|error| blocked(error.to_string()))
 }
 
 fn record_uid(
@@ -328,10 +350,15 @@ fn descends_from(
     }
 }
 
-async fn patch_drain(client: Client, machine: &DynamicObject) -> Result<bool, ReconcileError> {
+async fn patch_drain(
+    client: Client,
+    configuration: &AzureConfiguration,
+    machine: &DynamicObject,
+) -> Result<bool, ReconcileError> {
     if machine.annotations().get(DRAIN).map(String::as_str) == Some("true") {
         return Ok(false);
     }
+    require_current_configuration(client.clone(), configuration).await?;
     let updated = objects::object_api(client, machine)?
         .patch(
             &machine.name_any(),
@@ -350,7 +377,11 @@ async fn patch_drain(client: Client, machine: &DynamicObject) -> Result<bool, Re
     Ok(true)
 }
 
-async fn retain_lb(client: Client, azure_cluster: &DynamicObject) -> Result<bool, ReconcileError> {
+async fn retain_lb(
+    client: Client,
+    configuration: &AzureConfiguration,
+    azure_cluster: &DynamicObject,
+) -> Result<bool, ReconcileError> {
     if azure_cluster
         .data
         .pointer("/spec/controlPlaneEnabled")
@@ -374,6 +405,7 @@ async fn retain_lb(client: Client, azure_cluster: &DynamicObject) -> Result<bool
     {
         return Ok(false);
     }
+    require_current_configuration(client.clone(), configuration).await?;
     let updated = objects::object_api(client, azure_cluster)?
         .patch(
             &azure_cluster.name_any(),
@@ -401,6 +433,7 @@ pub async fn finalize(
     tenant: &Tenant,
     supported_version: &str,
 ) -> Result<Action, ReconcileError> {
+    require_current_configuration(client.clone(), configuration).await?;
     let name = tenant.name_any();
     let tenant_uid = tenant
         .uid()
@@ -450,6 +483,7 @@ pub async fn finalize(
                 desired,
                 &live,
                 management.uid_for(&types.kind, &desired.name_any(), &name),
+                azure_status.deletion.is_some(),
             )?;
             record_uid(&mut management, &live, &name)?;
             explicit
@@ -655,6 +689,7 @@ pub async fn finalize(
                 .map(|item| item.uid.clone())
                 .collect(),
         };
+        require_current_configuration(client.clone(), configuration).await?;
         status::update_status(client, tenant, |status| {
             let azure = status.azure_mut()?;
             validate_binding(
@@ -711,11 +746,12 @@ pub async fn finalize(
             if owners.len() != 1 || owners[0].uid != pool_uid {
                 return Err(blocked("Machine has no exact MachinePool owner"));
             }
-            if patch_drain(client.clone(), machine).await? {
+            if patch_drain(client.clone(), configuration, machine).await? {
                 return Ok(Action::requeue(PROGRESS_INTERVAL));
             }
         }
         if pool.metadata.deletion_timestamp.is_none() {
+            require_current_configuration(client.clone(), configuration).await?;
             objects::object_api(client, pool)?
                 .delete(&pool.name_any(), &recorded_delete(pool, deletion)?)
                 .await?;
@@ -735,6 +771,7 @@ pub async fn finalize(
     }
     if let Some(cluster) = explicit.get("Cluster").and_then(|objects| objects.first()) {
         if cluster.metadata.deletion_timestamp.is_none() {
+            require_current_configuration(client.clone(), configuration).await?;
             objects::object_api(client, cluster)?
                 .delete(&cluster.name_any(), &recorded_delete(cluster, deletion)?)
                 .await?;
@@ -748,7 +785,7 @@ pub async fn finalize(
         if azure_cluster.metadata.deletion_timestamp.is_none() {
             return Ok(Action::requeue(DEPENDENCY_INTERVAL));
         }
-        if retain_lb(client.clone(), azure_cluster).await? {
+        if retain_lb(client.clone(), configuration, azure_cluster).await? {
             return Ok(Action::requeue(PROGRESS_INTERVAL));
         }
     }
@@ -774,9 +811,25 @@ pub async fn finalize(
     {
         return Ok(Action::requeue(DEPENDENCY_INTERVAL));
     }
-    for kind in ["ConfigMap", "Job", "Deployment", "AzureClusterIdentity"] {
+    if let Some(config_maps) = explicit.get("ConfigMap") {
+        let mut deleted = false;
+        for object in config_maps {
+            if object.metadata.deletion_timestamp.is_none() {
+                require_current_configuration(client.clone(), configuration).await?;
+                objects::object_api(client.clone(), object)?
+                    .delete(&object.name_any(), &recorded_delete(object, deletion)?)
+                    .await?;
+                deleted = true;
+            }
+        }
+        if deleted || !config_maps.is_empty() {
+            return Ok(Action::requeue(DEPENDENCY_INTERVAL));
+        }
+    }
+    for kind in ["Job", "Deployment", "AzureClusterIdentity"] {
         if let Some(object) = explicit.get(kind).and_then(|objects| objects.first()) {
             if object.metadata.deletion_timestamp.is_none() {
+                require_current_configuration(client.clone(), configuration).await?;
                 objects::object_api(client.clone(), object)?
                     .delete(&object.name_any(), &recorded_delete(object, deletion)?)
                     .await?;
@@ -792,6 +845,7 @@ pub async fn finalize(
         .and_then(|objects| objects.first())
     {
         if namespace.metadata.deletion_timestamp.is_none() {
+            require_current_configuration(client.clone(), configuration).await?;
             objects::object_api(client.clone(), namespace)?
                 .delete(
                     &namespace.name_any(),
@@ -805,6 +859,7 @@ pub async fn finalize(
         .get_opt(&name)
         .await?
         .ok_or_else(|| blocked("Tenant disappeared during Azure finalization"))?;
+    require_current_configuration(client.clone(), configuration).await?;
     status::set_finalizer(client, tenant, &current, FINALIZER, false).await?;
     Ok(Action::await_change())
 }

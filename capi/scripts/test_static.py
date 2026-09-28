@@ -240,6 +240,7 @@ def check_repository_boundaries() -> None:
         "controller/API_COMPATIBILITY.md",
         "controller/config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml",
         "controller/config/rbac/role.yaml",
+        "controller/config/rbac/role-azure.yaml",
         "controller/config/management-resources.json",
         "controller/config/azure-management-resources.json",
         "config/tenants/examples/local.yaml",
@@ -253,12 +254,43 @@ def check_repository_boundaries() -> None:
     )
     for relative in required_controller_files:
         check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
+    local_role = (ROOT / "controller/config/rbac/role.yaml").read_text(
+        encoding="utf-8"
+    )
+    azure_role = (ROOT / "controller/config/rbac/role-azure.yaml").read_text(
+        encoding="utf-8"
+    )
+    for resource in ("azureclusteridentities", "azureclusters", "azuremachinepools"):
+        check(
+            f"- {resource}" not in local_role,
+            f"local controller role grants Azure root permission: {resource}",
+        )
+    for resource in ("devclusters", "devmachinetemplates", "machinedeployments"):
+        check(
+            f"- {resource}" not in azure_role,
+            f"Azure controller role grants local root permission: {resource}",
+        )
+    check(
+        "- clusters/status" not in local_role
+        and "- clusters/status" in azure_role,
+        "Cluster status patch permission must be Azure-only",
+    )
     justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
     check("controller-metrics:" in justfile, "controller metrics recipe is missing")
     check(
         "scripts/controller_metrics.py --max 12000" in justfile,
         "controller production-line threshold is not enforced",
     )
+    metrics_source = (ROOT / "scripts/controller_metrics.py").read_text(
+        encoding="utf-8"
+    )
+    for contract in (
+        "RUST_BASELINE_LINES = 8049",
+        "PYTHON_BASELINE_LINES = 25094",
+        'PYTHON_SRC = ROOT / "scripts"',
+        "Combined Rust/Python net delta",
+    ):
+        check(contract in metrics_source, f"controller metric contract missing: {contract}")
     controller = ROOT / "controller"
     integration_targets = sorted(
         path.name for path in (controller / "tests").glob("*.rs")

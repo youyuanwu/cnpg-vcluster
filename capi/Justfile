@@ -83,7 +83,7 @@ controller-verify:
 controller-test:
     @python3 scripts/test_controller.py
 
-# Report Rust production lines before test-only modules.
+# Report reviewed Rust/Python source baselines, deltas, and the Rust ceiling.
 controller-metrics:
     @python3 scripts/controller_metrics.py --max 12000
 

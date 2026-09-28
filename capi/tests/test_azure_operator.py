@@ -9,6 +9,8 @@ from subprocess import CompletedProcess
 from unittest.mock import patch
 
 from scripts.lib.azure.operator import (
+    _deletion_checkpoint_path,
+    _write_deletion_checkpoint,
     create_tenant,
     delete_tenant,
     tenant_document,
@@ -19,7 +21,9 @@ from scripts.lib.azure.proof import (
     _specification_sha256,
     capture_operator_deletion_proof,
     prove_operator_deletion,
+    validate_operator_deletion_proof,
 )
+from scripts.lib.files import write_private_file
 from tests.azure_fixtures import AzureFixtureMixin, CONTROLLER_IMAGE, FOUNDATION
 
 
@@ -136,6 +140,100 @@ class AzureOperatorTests(AzureFixtureMixin, unittest.TestCase):
         self.assertIn("--wait=false", kubectl.call_args.args)
         prove.assert_called_once()
         self.assertEqual(["proved"], events)
+        self.assertFalse(_deletion_checkpoint_path(root, "tenant-c").exists())
+
+    def test_delete_retry_completes_durable_proof_after_transient_failure(self) -> None:
+        root = self.make_root()
+        payload = {"metadata": {"name": "tenant-c"}}
+        proof = AzureDeletionProof(
+            "tenant-c",
+            {"tenantUID": "uid", "specificationSha256": "sha", "operationId": "op"},
+            FOUNDATION,
+            "vmss",
+            ("vmss",),
+        )
+        with (
+            patch(
+                "scripts.lib.azure.operator.read_tenant",
+                side_effect=[payload, None],
+            ),
+            patch(
+                "scripts.lib.azure.operator.capture_operator_deletion_proof",
+                return_value=proof,
+            ),
+            patch(
+                "scripts.lib.azure.operator._kubectl",
+                return_value=CompletedProcess([], 0, stdout="", stderr=""),
+            ),
+            patch(
+                "scripts.lib.azure.operator.prove_operator_deletion",
+                side_effect=RuntimeError("transient proof failure"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "transient proof failure"),
+        ):
+            delete_tenant(root, "tenant-c")
+        checkpoint = _deletion_checkpoint_path(root, "tenant-c")
+        self.assertTrue(checkpoint.exists())
+
+        with (
+            patch("scripts.lib.azure.operator.read_tenant", return_value=None),
+            patch(
+                "scripts.lib.azure.operator.validate_operator_deletion_proof"
+            ) as validate,
+            patch("scripts.lib.azure.operator.prove_operator_deletion") as prove,
+        ):
+            delete_tenant(root, "tenant-c")
+        validate.assert_called_once()
+        prove.assert_called_once()
+        self.assertFalse(checkpoint.exists())
+
+    def test_delete_rejects_checkpoint_mismatch_before_delete(self) -> None:
+        root = self.make_root()
+        stored = AzureDeletionProof(
+            "tenant-c",
+            {"tenantUID": "old", "specificationSha256": "sha", "operationId": "op"},
+            FOUNDATION,
+            None,
+            (),
+        )
+        _write_deletion_checkpoint(root, "tenant-c", stored)
+        with (
+            patch(
+                "scripts.lib.azure.operator.read_tenant",
+                return_value={
+                    "metadata": {"name": "tenant-c", "uid": "new"},
+                    "status": {
+                        "provider": {
+                            "binding": {
+                                "tenantUID": "new",
+                                "specificationSha256": "sha",
+                                "operationId": "op",
+                            }
+                        }
+                    },
+                },
+            ),
+            patch(
+                "scripts.lib.azure.operator.validate_operator_deletion_proof"
+            ),
+            patch("scripts.lib.azure.operator._kubectl") as kubectl,
+            self.assertRaisesRegex(RuntimeError, "does not match"),
+        ):
+            delete_tenant(root, "tenant-c")
+        kubectl.assert_not_called()
+
+    def test_delete_rejects_invalid_checkpoint_schema_when_tenant_is_absent(self) -> None:
+        root = self.make_root()
+        checkpoint = _deletion_checkpoint_path(root, "tenant-c")
+        write_private_file(
+            checkpoint,
+            json.dumps({"schema": 2, "proof": {}}),
+        )
+        with (
+            patch("scripts.lib.azure.operator.read_tenant", return_value=None),
+            self.assertRaisesRegex(RuntimeError, "checkpoint is invalid"),
+        ):
+            delete_tenant(root, "tenant-c")
 
 
 class AzureProofTests(AzureFixtureMixin, unittest.TestCase):
@@ -212,7 +310,13 @@ class AzureProofTests(AzureFixtureMixin, unittest.TestCase):
                         "tenantSubnetId": foundation["tenantSubnetId"],
                         "identityId": foundation["identityId"],
                     },
-                    "vmss": {"id": "/tenant/vmss"},
+                    "vmss": {
+                        "id": "/tenant/vmss",
+                        "instanceIds": [
+                            "/tenant/vmss/virtualMachines/0",
+                            "/tenant/vmss/virtualMachines/1",
+                        ],
+                    },
                     "providerResources": [
                         {"resourceId": "/tenant/public-ip"},
                         {"resourceId": foundation["vnetId"]},
@@ -233,7 +337,12 @@ class AzureProofTests(AzureFixtureMixin, unittest.TestCase):
         ):
             proof = capture_operator_deletion_proof(root, config, tenant)
         self.assertEqual(
-            ("/tenant/public-ip", "/tenant/vmss"),
+            (
+                "/tenant/public-ip",
+                "/tenant/vmss",
+                "/tenant/vmss/virtualmachines/0",
+                "/tenant/vmss/virtualmachines/1",
+            ),
             proof.resource_ids,
         )
 
@@ -276,3 +385,59 @@ class AzureProofTests(AzureFixtureMixin, unittest.TestCase):
             AzureDeletionProof.from_mapping(
                 {**proof.to_mapping(), "unexpected": True}
             )
+
+    def test_deletion_proof_checkpoint_validates_tenant_foundation_and_binding(self) -> None:
+        root = self.make_root()
+        foundation = dict(FOUNDATION)
+        foundation["controllerImage"] = CONTROLLER_IMAGE
+        foundation["azureProviderConfigUid"] = "config-uid"
+        provider_config = {"foundationSha256": "foundation-sha"}
+        provider_config_sha = hashlib.sha256(
+            json.dumps(
+                provider_config,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode()
+        ).hexdigest()
+        binding = {
+            "tenantUID": "uid",
+            "specificationSha256": "spec",
+            "operationId": "operation",
+            "foundationSha256": "foundation-sha",
+            "foundationDefaultsSha256": foundation["foundationDefaultsSha256"],
+            "controllerImage": foundation["controllerImage"],
+            "providerConfigUID": foundation["azureProviderConfigUid"],
+            "providerConfigSha256": provider_config_sha,
+            "resourceGroupId": foundation["resourceGroupId"],
+            "virtualNetworkId": foundation["vnetId"],
+            "tenantSubnetId": foundation["tenantSubnetId"],
+            "identityId": foundation["identityId"],
+        }
+        proof = AzureDeletionProof("tenant-c", binding, foundation, None, ())
+        with (
+            patch(
+                "scripts.lib.azure.proof._inspect_foundation",
+                return_value=(foundation, True, ()),
+            ),
+            patch("scripts.lib.azure.proof.load_inventory", return_value={}),
+            patch(
+                "scripts.lib.azure.proof._azure_provider_configuration",
+                return_value=provider_config,
+            ),
+        ):
+            validate_operator_deletion_proof(root, {}, "tenant-c", proof)
+            with self.assertRaisesRegex(RuntimeError, "Tenant changed"):
+                validate_operator_deletion_proof(root, {}, "other", proof)
+            with self.assertRaisesRegex(RuntimeError, "binding changed"):
+                validate_operator_deletion_proof(
+                    root,
+                    {},
+                    "tenant-c",
+                    AzureDeletionProof(
+                        "tenant-c",
+                        {**binding, "identityId": "/different"},
+                        foundation,
+                        None,
+                        (),
+                    ),
+                )

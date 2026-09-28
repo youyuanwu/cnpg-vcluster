@@ -3,11 +3,11 @@ use std::path::PathBuf;
 use tenant_controller::{
     api::tenant_crd,
     management::{AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES},
-    permissions::controller_role,
+    permissions::{azure_controller_role, controller_role},
 };
 
 type GenerateResult<T> = Result<T, Box<dyn std::error::Error>>;
-type GeneratedFiles = [(&'static str, Vec<u8>); 4];
+type GeneratedFiles = [(&'static str, Vec<u8>); 5];
 
 #[rustfmt::skip]
 fn render<T: serde::Serialize>(value: &T) -> GenerateResult<Vec<u8>> { Ok(format!("---\n{}", serde_yaml::to_string(value)?).into_bytes()) }
@@ -30,6 +30,7 @@ fn generated_files() -> GenerateResult<GeneratedFiles> {
             render(&tenant_crd())?,
         ),
         ("rbac/role.yaml", render(&controller_role())?),
+        ("rbac/role-azure.yaml", render(&azure_controller_role())?),
         ("management-resources.json", resources),
         ("azure-management-resources.json", azure_resources),
     ])

@@ -27,8 +27,8 @@ use crate::{
 };
 
 use super::{
-    DEPENDENCY_INTERVAL, FINALIZER, PROGRESS_INTERVAL, ProviderLifecycle, READY_INTERVAL,
-    ReconcileError, TenantAccess, local::LiveTenantAccess, objects, progress,
+    DEPENDENCY_INTERVAL, FINALIZER, FOUNDATION_NAMESPACE, PROGRESS_INTERVAL, ProviderLifecycle,
+    READY_INTERVAL, ReconcileError, TenantAccess, local::LiveTenantAccess, objects,
 };
 
 pub use crate::azure::CONFIG_NAME;
@@ -56,11 +56,16 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
         matches!(provider, TenantProviderSpec::Azure { .. })
     }
 
+    async fn validate_mutation(&self) -> Result<(), ReconcileError> {
+        require_current_configuration(self.client.clone(), &self.configuration).await
+    }
+
     async fn reconcile(
         &self,
         tenant: &Tenant,
         spec: &CanonicalSpec,
     ) -> Result<Action, ReconcileError> {
+        self.validate_mutation().await?;
         let name = tenant.name_any();
         let tenant_uid = tenant
             .uid()
@@ -83,10 +88,11 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
                 Ok(())
             })
             .await?;
-            return progress(self.client.clone(), tenant, PROGRESS_INTERVAL).await;
+            return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
+        self.validate_mutation().await?;
         if status::set_finalizer(self.client.clone(), tenant, tenant, FINALIZER, true).await? {
-            return progress(self.client.clone(), tenant, PROGRESS_INTERVAL).await;
+            return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
 
         let context = AzureContext {
@@ -105,7 +111,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
                 .write_barrier(tenant, &binding, object, &mut live)
                 .await?
             {
-                return progress(self.client.clone(), tenant, PROGRESS_INTERVAL).await;
+                return self.progress(tenant, PROGRESS_INTERVAL).await;
             }
         }
 
@@ -156,8 +162,9 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
                 )
                 .await;
         }
+        self.validate_mutation().await?;
         if patch_cluster_bridge(self.client.clone(), &cluster, &azure_cluster, &endpoint).await? {
-            return progress(self.client.clone(), tenant, PROGRESS_INTERVAL).await;
+            return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
         self.record_endpoint(tenant, &binding, &endpoint).await?;
         if tenant
@@ -167,13 +174,13 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             .and_then(|status| status.endpoint.as_deref())
             .is_none()
         {
-            return progress(self.client.clone(), tenant, PROGRESS_INTERVAL).await;
+            return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
         if self
             .record_kubeconfig(tenant, &binding, &cluster, &control_plane)
             .await?
         {
-            return progress(self.client.clone(), tenant, PROGRESS_INTERVAL).await;
+            return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
 
         for object in &desired[8..11] {
@@ -181,7 +188,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
                 .write_barrier(tenant, &binding, object, &mut live)
                 .await?
             {
-                return progress(self.client.clone(), tenant, PROGRESS_INTERVAL).await;
+                return self.progress(tenant, PROGRESS_INTERVAL).await;
             }
         }
         let probe = find(&live, "Deployment")?;
@@ -198,7 +205,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             .write_barrier(tenant, &binding, &desired[11], &mut live)
             .await?
         {
-            return progress(self.client.clone(), tenant, PROGRESS_INTERVAL).await;
+            return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
         let job = find(&live, "Job")?;
         if job_failed(job) {
@@ -283,6 +290,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             &components,
             &provider_resources,
         )?;
+        self.validate_mutation().await?;
         status::update_status(self.client.clone(), tenant, |status| {
             let azure = status.azure_mut()?;
             validate_status_binding(azure, &binding)?;
@@ -328,6 +336,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
         tenant: &Tenant,
         supported_version: &str,
     ) -> Result<Action, ReconcileError> {
+        self.validate_mutation().await?;
         super::azure_finalize::finalize(
             self.client.clone(),
             &self.configuration,
@@ -339,11 +348,26 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
 }
 
 impl<A: TenantAccess> AzureProvider<A> {
+    async fn progress(
+        &self,
+        tenant: &Tenant,
+        interval: std::time::Duration,
+    ) -> Result<Action, ReconcileError> {
+        self.validate_mutation().await?;
+        status::update_status(self.client.clone(), tenant, |status| {
+            readiness::progress_status(status, tenant);
+            Ok(())
+        })
+        .await?;
+        Ok(Action::requeue(interval))
+    }
+
     async fn update(
         &self,
         tenant: &Tenant,
         mutate: impl Fn(&mut AzureProviderStatus) -> Result<(), ControllerError>,
     ) -> Result<(), ReconcileError> {
+        self.validate_mutation().await?;
         status::update_status(self.client.clone(), tenant, |status| {
             mutate(status.azure_mut()?)?;
             readiness::progress_status(status, tenant);
@@ -375,6 +399,7 @@ impl<A: TenantAccess> AzureProvider<A> {
             .cloned()
             .unwrap_or_default();
         let recorded = management.uid_for(kind, &object_name, &name);
+        self.validate_mutation().await?;
         let mut ensured =
             objects::read_or_create(self.client.clone(), desired, None, recorded.is_some()).await?;
         if !ensured.created {
@@ -385,6 +410,7 @@ impl<A: TenantAccess> AzureProvider<A> {
                 if !matches!(error, AzureOwnershipError::Desired(_)) {
                     return Err(azure_ownership(error));
                 }
+                self.validate_mutation().await?;
                 ensured.object =
                     objects::apply_exact(self.client.clone(), desired, &ensured.object).await?;
                 azure::validate_live_object(desired, &ensured.object, recorded)
@@ -528,6 +554,7 @@ impl<A: TenantAccess> AzureProvider<A> {
         condition: &str,
         message: &str,
     ) -> Result<Action, ReconcileError> {
+        self.validate_mutation().await?;
         status::update_status(self.client.clone(), tenant, |status| {
             readiness::progress_status(status, tenant);
             set_condition(status, tenant, condition, false, "NotReady", message);
@@ -536,6 +563,31 @@ impl<A: TenantAccess> AzureProvider<A> {
         .await?;
         Ok(Action::requeue(DEPENDENCY_INTERVAL))
     }
+}
+
+pub(super) async fn require_current_configuration(
+    client: Client,
+    expected: &AzureConfiguration,
+) -> Result<(), ReconcileError> {
+    let live = Api::<ConfigMap>::namespaced(client, FOUNDATION_NAMESPACE)
+        .get(CONFIG_NAME)
+        .await
+        .map_err(|error| {
+            ReconcileError::MutationGuard(format!(
+                "cannot read {FOUNDATION_NAMESPACE}/{CONFIG_NAME}: {error}"
+            ))
+        })?;
+    let actual = AzureConfiguration::from_config_map(&live).map_err(|error| {
+        ReconcileError::MutationGuard(format!(
+            "{FOUNDATION_NAMESPACE}/{CONFIG_NAME} is invalid: {error}"
+        ))
+    })?;
+    if &actual != expected {
+        return Err(ReconcileError::MutationGuard(format!(
+            "{FOUNDATION_NAMESPACE}/{CONFIG_NAME} differs from the startup configuration"
+        )));
+    }
+    Ok(())
 }
 
 fn has_durable_state(status: &AzureProviderStatus) -> bool {

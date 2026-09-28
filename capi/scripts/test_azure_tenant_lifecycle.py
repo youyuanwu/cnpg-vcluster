@@ -41,23 +41,18 @@ from scripts.lib.azure.proof import (
     prove_operator_deletion,
 )
 from scripts.lib.config import parse_duration
-from scripts.lib.files import private_file_exists, read_private_file, write_private_file
+from scripts.lib.files import (
+    private_file_exists,
+    read_private_file,
+    unlink_private_file,
+    write_private_file,
+)
 from scripts.lib.process import run
 from scripts.lib.redaction import redact, redact_value
 from scripts.lib.tenant_spec import load_tenant_spec
 from scripts.tenant import supported_versions
 
 
-SOURCE_PATHS = (
-    "scripts/test_azure_tenant_lifecycle.py",
-    "scripts/tenant.py",
-    "scripts/lib/azure/common.py",
-    "scripts/lib/azure/foundation.py",
-    "scripts/lib/azure/gate.py",
-    "scripts/lib/azure/operator.py",
-    "scripts/lib/azure/ownership.py",
-    "scripts/lib/azure/proof.py",
-)
 ORDERED_PHASES = (
     "foundation-readiness",
     "create-ready",
@@ -207,6 +202,15 @@ def _wait_ready_snapshot(
 
 
 def _source_sha256(spec_path: Path) -> str:
+    tracked = run(
+        ["git", "status", "--porcelain", "--untracked-files=no"],
+        timeout=30,
+        cwd=ROOT.parent,
+    ).stdout
+    if tracked.strip():
+        raise RuntimeError(
+            "Azure lifecycle gate requires a clean tracked worktree"
+        )
     digest = hashlib.sha256()
     revision = run(
         ["git", "rev-parse", "HEAD"],
@@ -214,12 +218,9 @@ def _source_sha256(spec_path: Path) -> str:
         cwd=ROOT.parent,
     ).stdout.strip()
     digest.update(revision.encode())
-    for relative in SOURCE_PATHS:
-        path = ROOT / relative
-        digest.update(relative.encode())
-        digest.update(b"\0")
-        digest.update(path.read_bytes())
-        digest.update(b"\0")
+    digest.update(b"\0")
+    digest.update(str(spec_path.resolve()).encode())
+    digest.update(b"\0")
     digest.update(spec_path.read_bytes())
     return digest.hexdigest()
 
@@ -274,7 +275,6 @@ def _incomplete_gate(
             if (
                 payload.get("tenant") != tenant
                 or payload.get("specificationSha256") != specification_sha256
-                or payload.get("sourceSha256") != source_sha256
             ):
                 continue
             if (
@@ -318,6 +318,11 @@ def _incomplete_gate(
                 for record in records
             )
             if touched and "recreation" not in passed:
+                if payload.get("sourceSha256") != source_sha256:
+                    raise RuntimeError(
+                        "incomplete Azure lifecycle gate source changed; "
+                        "refusing ambiguous failure injection"
+                    )
                 candidates.append(payload)
     if len(candidates) > 1:
         raise RuntimeError("multiple incomplete Azure lifecycle gate attempts exist")
@@ -358,7 +363,7 @@ def _checkpoint(
     }
     write_private_file(
         path,
-        json.dumps(redact_value(payload), sort_keys=True) + "\n",
+        json.dumps(payload, sort_keys=True) + "\n",
     )
     return payload
 
@@ -406,7 +411,35 @@ def _load_checkpoint(
     ):
         raise RuntimeError("Azure lifecycle gate checkpoint is invalid")
     WorkerSnapshot.from_mapping(payload["before"])
+    proof_payload = payload.get("deletionProof")
+    if proof_payload is not None:
+        proof = AzureDeletionProof.from_mapping(proof_payload)
+        if (
+            proof.tenant != spec.name
+            or dict(proof.foundation) != dict(foundation)
+            or proof.binding.get("tenantUID") != payload["tenantUid"]
+            or proof.binding.get("operationId")
+            != payload["providerOperationId"]
+        ):
+            raise RuntimeError("Azure lifecycle gate deletion proof is invalid")
     return payload
+
+
+def _absent_tenant_proof(
+    checkpoint: Mapping[str, object],
+    *,
+    worker_recovery_passed: bool,
+) -> AzureDeletionProof | None:
+    proof_payload = checkpoint.get("deletionProof")
+    if proof_payload is None:
+        return None
+    if not worker_recovery_passed:
+        raise RuntimeError(
+            "Azure Tenant is absent before worker recovery was recorded"
+        )
+    if not isinstance(proof_payload, dict):
+        raise RuntimeError("Azure deletion proof checkpoint is invalid")
+    return AzureDeletionProof.from_mapping(proof_payload)
 
 
 def main(arguments: list[str]) -> int:
@@ -595,7 +628,14 @@ def main(arguments: list[str]) -> int:
             owned_before = checkpoint["ownedBefore"]
 
         proof_payload = checkpoint.get("deletionProof")
-        if passed("ordinary-tenant-deletion"):
+        tenant_after_finalization = read_tenant(ROOT, spec.name)
+        if tenant_after_finalization is None and proof_payload is not None:
+            proof = _absent_tenant_proof(
+                checkpoint,
+                worker_recovery_passed=passed("worker-recovery"),
+            )
+            assert proof is not None
+        elif passed("ordinary-tenant-deletion"):
             if proof_payload is None:
                 raise RuntimeError(
                     "Azure deletion proof checkpoint is absent after finalization"
@@ -687,7 +727,7 @@ def main(arguments: list[str]) -> int:
                 _ready_snapshot(config, spec),
             ),
         )
-        state_path.unlink(missing_ok=True)
+        unlink_private_file(state_path)
     except BaseException as exc:
         primary = exc
         raise

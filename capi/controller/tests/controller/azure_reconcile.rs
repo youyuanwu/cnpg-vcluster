@@ -13,6 +13,8 @@ use tenant_controller::{
 use crate::creation_support::{FakeAccess, Server};
 
 const TENANT_PATH: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a";
+const PROVIDER_CONFIG_PATH: &str =
+    "/api/v1/namespaces/tenant-system/configmaps/tenant-azure-provider";
 
 struct Fixture {
     management: Server,
@@ -53,6 +55,7 @@ impl Fixture {
         }
         workload.allow_typed_list("/api/v1/nodes", "v1", "Node");
         let config = provider_config();
+        management.insert(PROVIDER_CONFIG_PATH, config.clone());
         let configuration = AzureConfiguration::from_config_map(&config).unwrap();
         Self {
             management,
@@ -329,7 +332,10 @@ fn provider_config() -> ConfigMap {
     value["foundationSha256"] = json!(hash);
     ConfigMap {
         metadata: kube::core::ObjectMeta {
+            name: Some("tenant-azure-provider".into()),
+            namespace: Some("tenant-system".into()),
             uid: Some("provider-config-uid".into()),
+            resource_version: Some("1".into()),
             ..Default::default()
         },
         data: Some(BTreeMap::from([(
@@ -338,6 +344,23 @@ fn provider_config() -> ConfigMap {
         )])),
         ..Default::default()
     }
+}
+
+fn changed_provider_config(uid: &str) -> ConfigMap {
+    let mut config = provider_config();
+    let mut value: Value =
+        serde_json::from_str(config.data.as_ref().unwrap().get(CONFIG_KEY).unwrap()).unwrap();
+    value["workerSku"] = json!("Standard_D2s_v5");
+    value.as_object_mut().unwrap().remove("foundationSha256");
+    let hash = hex::encode(Sha256::digest(serde_json::to_vec(&value).unwrap()));
+    value["foundationSha256"] = json!(hash);
+    config.metadata.uid = Some(uid.into());
+    config
+        .data
+        .as_mut()
+        .unwrap()
+        .insert(CONFIG_KEY.into(), serde_json::to_string(&value).unwrap());
+    config
 }
 
 fn list_path(api_version: &str, plural: &str, namespace: &str) -> String {
@@ -426,6 +449,46 @@ async fn foreign_uid_or_marker_fails_closed() {
     assert_eq!(
         fixture.current().status.unwrap().phase,
         Some(TenantPhase::OwnershipInvalid)
+    );
+}
+
+#[tokio::test]
+async fn rollout_window_config_change_blocks_before_first_mutation() {
+    let fixture = Fixture::new();
+    fixture.management.insert(
+        PROVIDER_CONFIG_PATH,
+        changed_provider_config("replacement-provider-config-uid"),
+    );
+    fixture.management.take_calls();
+    fixture.step().await;
+    assert!(fixture.current().status.is_none());
+    assert!(
+        fixture
+            .management
+            .take_calls()
+            .iter()
+            .all(|call| !matches!(call.method.as_str(), "PATCH" | "POST" | "PUT" | "DELETE"))
+    );
+}
+
+#[tokio::test]
+async fn out_of_band_config_change_blocks_ready_tenant_without_status_or_resource_writes() {
+    let fixture = Fixture::new();
+    fixture.until_ready().await;
+    let before = fixture.current().status;
+    fixture.management.insert(
+        PROVIDER_CONFIG_PATH,
+        changed_provider_config("provider-config-uid"),
+    );
+    fixture.management.take_calls();
+    fixture.step().await;
+    assert_eq!(fixture.current().status, before);
+    assert!(
+        fixture
+            .management
+            .take_calls()
+            .iter()
+            .all(|call| !matches!(call.method.as_str(), "PATCH" | "POST" | "PUT" | "DELETE"))
     );
 }
 
@@ -602,7 +665,15 @@ async fn finalization_records_then_deletes_in_exact_order() {
         "Secret",
     ]);
     fixture.management.take_calls();
-    for _ in 0..4 {
+    fixture.step().await;
+    let config_map_deletes: Vec<_> = fixture
+        .management
+        .calls()
+        .into_iter()
+        .filter(|call| call.method == "DELETE" && call.path.contains("/configmaps/"))
+        .collect();
+    assert_eq!(config_map_deletes.len(), 2);
+    for _ in 0..3 {
         fixture.step().await;
     }
     fixture.remove_kinds(&["Pod", "ReplicaSet"]);
@@ -686,6 +757,68 @@ async fn finalization_blocks_foreign_residue_and_same_name_recreation() {
         fixture.current().status.unwrap().phase,
         Some(TenantPhase::OwnershipInvalid)
     );
+}
+
+#[tokio::test]
+async fn finalization_rejects_explicit_desired_spec_drift_before_record_or_delete() {
+    let cases = [
+        (
+            "AzureCluster",
+            "/spec/networkSpec/vnet/resourceGroup",
+            json!("foreign-network-group"),
+        ),
+        (
+            "AzureCluster",
+            "/spec/resourceGroup",
+            json!("foreign-foundation-group"),
+        ),
+        ("MachinePool", "/spec/replicas", json!(4)),
+        (
+            "MachinePool",
+            "/spec/template/spec/infrastructureRef/name",
+            json!("foreign-pool"),
+        ),
+        (
+            "AzureMachinePool",
+            "/spec/template/vmSize",
+            json!("Standard_D8s_v5"),
+        ),
+    ];
+    for (kind, pointer, replacement) in cases {
+        let fixture = Fixture::new();
+        fixture.until_ready().await;
+        {
+            let mut state = fixture.management.0.lock().unwrap();
+            let object = state
+                .objects
+                .values_mut()
+                .find(|value| value["kind"] == kind)
+                .unwrap();
+            *object.pointer_mut(pointer).unwrap() = replacement;
+        }
+        fixture.mark_deleting();
+        fixture.management.take_calls();
+        fixture.step().await;
+        let tenant = fixture.current();
+        let status = tenant.status.unwrap();
+        assert_eq!(
+            status.phase,
+            Some(TenantPhase::OwnershipInvalid),
+            "{kind} {pointer}"
+        );
+        assert!(
+            status.azure().unwrap().deletion.is_none(),
+            "{kind} {pointer}"
+        );
+        assert!(
+            fixture
+                .management
+                .take_calls()
+                .iter()
+                .all(|call| call.method != "DELETE"),
+            "{kind} {pointer}"
+        );
+    }
 }
 
 #[tokio::test]

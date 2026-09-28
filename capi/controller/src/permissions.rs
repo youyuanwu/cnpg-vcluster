@@ -17,6 +17,13 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
     ),
     ("", &["events"], &["create", "patch", "update"]),
     (
+        "coordination.k8s.io",
+        &["leases"],
+        &[
+            "create", "delete", "get", "list", "patch", "update", "watch",
+        ],
+    ),
+    (
         "tenancy.cnpg-vcluster.io",
         &["tenants"],
         &["get", "list", "patch", "update", "watch"],
@@ -31,8 +38,9 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
         &["tenants/status"],
         &["get", "patch", "update"],
     ),
-    ("cluster.x-k8s.io", &["clusters/status"], &["get", "patch"]),
 ];
+const AZURE_EXTRA_PERMISSIONS: &[(&str, &[&str], &[&str])] =
+    &[("cluster.x-k8s.io", &["clusters/status"], &["get", "patch"])];
 
 fn rule(group: &str, resources: &[&str], verbs: &[&str]) -> PolicyRule {
     PolicyRule {
@@ -84,13 +92,7 @@ fn azure_management_rule(resource: &ManagementResource) -> PolicyRule {
     rule(group, &[resource.plural], &verbs)
 }
 
-pub fn controller_role() -> ClusterRole {
-    let rules = BASE_PERMISSIONS
-        .iter()
-        .map(|(group, resources, verbs)| rule(group, resources, verbs))
-        .chain(MANAGEMENT_RESOURCES.iter().map(management_rule))
-        .chain(AZURE_MANAGEMENT_RESOURCES.iter().map(azure_management_rule))
-        .collect();
+fn role(rules: Vec<PolicyRule>) -> ClusterRole {
     ClusterRole {
         metadata: ObjectMeta {
             name: Some(ROLE_NAME.into()),
@@ -101,39 +103,63 @@ pub fn controller_role() -> ClusterRole {
     }
 }
 
+pub fn controller_role() -> ClusterRole {
+    let rules = BASE_PERMISSIONS
+        .iter()
+        .map(|(group, resources, verbs)| rule(group, resources, verbs))
+        .chain(MANAGEMENT_RESOURCES.iter().map(management_rule))
+        .collect();
+    role(rules)
+}
+
+pub fn azure_controller_role() -> ClusterRole {
+    let rules = BASE_PERMISSIONS
+        .iter()
+        .chain(AZURE_EXTRA_PERMISSIONS)
+        .map(|(group, resources, verbs)| rule(group, resources, verbs))
+        .chain(AZURE_MANAGEMENT_RESOURCES.iter().map(azure_management_rule))
+        .collect();
+    role(rules)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn role_grants_catalogued_resources_without_wildcards() {
-        let role = controller_role();
-        assert_eq!(role.metadata.name.as_deref(), Some(ROLE_NAME));
-        let rules = role.rules.unwrap();
+    fn provider_roles_grant_only_their_catalogued_resources() {
+        let local = controller_role();
+        let azure = azure_controller_role();
+        assert_eq!(local.metadata.name.as_deref(), Some(ROLE_NAME));
+        assert_eq!(azure.metadata.name.as_deref(), Some(ROLE_NAME));
+        let local_rules = local.rules.unwrap();
+        let azure_rules = azure.rules.unwrap();
         assert_eq!(
-            rules.len(),
-            BASE_PERMISSIONS.len() + MANAGEMENT_RESOURCES.len() + AZURE_MANAGEMENT_RESOURCES.len()
+            local_rules.len(),
+            BASE_PERMISSIONS.len() + MANAGEMENT_RESOURCES.len()
+        );
+        assert_eq!(
+            azure_rules.len(),
+            BASE_PERMISSIONS.len()
+                + AZURE_EXTRA_PERMISSIONS.len()
+                + AZURE_MANAGEMENT_RESOURCES.len()
         );
         assert!(
-            rules
+            local_rules
                 .iter()
+                .chain(&azure_rules)
                 .all(|rule| !rule.verbs.contains(&"*".to_string()))
         );
+        assert!(azure_rules.iter().any(|rule| {
+            rule.api_groups.as_deref() == Some(&["coordination.k8s.io".into()])
+                && rule.resources.as_deref() == Some(&["leases".into()])
+                && rule.verbs.contains(&"watch".into())
+        }));
         for resource in MANAGEMENT_RESOURCES {
-            let rule = rules
-                .iter()
-                .find(|rule| {
-                    rule.resources
-                        .as_ref()
-                        .is_some_and(|values| values == &vec![resource.plural.to_string()])
-                })
-                .unwrap();
-            assert!(rule.verbs.contains(&"get".into()));
-            assert!(rule.verbs.contains(&"list".into()));
-            assert_eq!(rule.verbs.contains(&"watch".into()), resource.watched);
+            assert!(local_rules.contains(&management_rule(resource)));
         }
         for resource in AZURE_MANAGEMENT_RESOURCES {
-            assert!(rules.contains(&azure_management_rule(resource)));
+            assert!(azure_rules.contains(&azure_management_rule(resource)));
             if resource.class == ResourceClass::Descendant {
                 let verbs = &azure_management_rule(resource).verbs;
                 assert!(!verbs.contains(&"create".into()));
@@ -150,7 +176,7 @@ mod tests {
                 .verbs
                 .contains(&"create".into())
         );
-        assert!(rules.iter().any(|rule| {
+        assert!(azure_rules.iter().any(|rule| {
             rule.api_groups.as_deref() == Some(&["cluster.x-k8s.io".into()])
                 && rule.resources.as_deref() == Some(&["clusters/status".into()])
                 && rule.verbs == ["get", "patch"]
@@ -179,7 +205,7 @@ mod tests {
                 .iter()
                 .find(|resource| resource.kind == kind)
                 .unwrap();
-            let rule = rules
+            let rule = local_rules
                 .iter()
                 .find(|rule| {
                     rule.resources
@@ -193,5 +219,17 @@ mod tests {
         assert!(!management_rule(&kubeadm).verbs.contains(&"watch".into()));
         kubeadm.watched = true;
         assert!(management_rule(&kubeadm).verbs.contains(&"watch".into()));
+        assert!(!local_rules.iter().any(|rule| {
+            rule.resources
+                .as_ref()
+                .is_some_and(|resources| resources.iter().any(|value| value == "azureclusters"))
+        }));
+        assert!(!azure_rules.iter().any(|rule| {
+            rule.resources.as_ref().is_some_and(|resources| {
+                resources
+                    .iter()
+                    .any(|value| matches!(value.as_str(), "devclusters" | "devmachines"))
+            })
+        }));
     }
 }

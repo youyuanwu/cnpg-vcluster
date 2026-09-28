@@ -209,6 +209,7 @@ class PackagingTests(unittest.TestCase):
             "controller/config/manager/manager.yaml.tpl": "manager",
             "controller/config/crd/bases/tenant.yaml": "crd",
             "controller/config/rbac/role.yaml": "role",
+            "controller/config/rbac/role-azure.yaml": "azure-role",
             ".tools/inputs/calico.yaml": "calico", ".tools/inputs/cnpg.yaml": "cnpg",
         }
         for name, content in files.items():

@@ -3,7 +3,11 @@
 `tenancy.cnpg-vcluster.io/v1alpha2` is the only installed Tenant API.
 Rust `src/bin/generate.rs` produces the checked-in
 `config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml` and
-`config/rbac/role.yaml`. `just controller-verify` compares those artifacts
+provider-specific `config/rbac/role.yaml` and
+`config/rbac/role-azure.yaml`. Local RBAC contains common plus local catalog
+permissions; Azure RBAC contains common plus Azure catalog permissions and its
+Cluster status/Machine patch extras. Both roles keep the same name because
+they are installed in separate clusters. `just controller-verify` compares those artifacts
 against generation without rewriting them. The v1alpha1 CRD, Go manager and
 admission webhook are not installation inputs; unsupported legacy state blocks
 the current installer and is not migrated or deleted. See
@@ -53,8 +57,12 @@ Installation uses one `Recreate` replica, a separate leader-election Lease,
 and HTTP `/healthz` and `/readyz`, without admission ports or TLS mounts.
 Local mode additionally uses Docker, the schema-3 local foundation, and staged
 assets. Azure mode uses the schema-1 Azure provider ConfigMap and no Docker
-socket or Azure credentials. The same binary accepts `--provider=local|azure`;
-one deployment installs exactly one lifecycle implementation.
+socket or Azure credentials. Before every Azure mutation, the manager re-reads
+the ConfigMap and requires its UID and canonical typed content to equal the
+startup snapshot; drift or an unreadable replacement blocks without status,
+finalizer, or resource writes. The same binary accepts
+`--provider=local|azure`; one deployment installs exactly one lifecycle
+implementation.
 
 The generated management-resource JSON is the cross-language local operator
 contract. Entries declare exact served API identity and scope,

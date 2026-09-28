@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 
 from scripts.lib.azure.gate import (
     WorkerSnapshot,
@@ -11,7 +12,13 @@ from scripts.lib.azure.gate import (
     require_replacement,
 )
 from scripts.lib.files import write_private_file
-from scripts.test_azure_tenant_lifecycle import _incomplete_gate
+from scripts.lib.azure.proof import AzureDeletionProof
+from scripts.test_azure_tenant_lifecycle import (
+    _absent_tenant_proof,
+    _checkpoint,
+    _incomplete_gate,
+    _load_checkpoint,
+)
 
 
 VMSS = (
@@ -225,9 +232,123 @@ class AzureGateTests(unittest.TestCase):
                 )
             )
 
+    def test_incomplete_destructive_attempt_rejects_changed_source(self) -> None:
+        root = Path(self._testMethodName)
+        path = root / "lifecycle-operation-1.json"
+        self.addCleanup(
+            lambda: (
+                path.unlink(missing_ok=True),
+                root.rmdir() if root.exists() else None,
+            )
+        )
+        write_private_file(
+            path,
+            json.dumps(
+                {
+                    "schema": 2,
+                    "operationId": "operation-1",
+                    "tenant": "tenant-c",
+                    "specificationSha256": "spec-sha",
+                    "sourceSha256": "old-source",
+                    "records": [
+                        {
+                            "phase": "worker-instance-deletion",
+                            "status": "started",
+                            "seconds": 0.0,
+                        }
+                    ],
+                }
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "refusing ambiguous"):
+            _incomplete_gate(
+                root,
+                "tenant-c",
+                "spec-sha",
+                "new-source",
+            )
+
     def test_gate_source_contains_only_explicit_failure_injection(self) -> None:
         root = Path(__file__).resolve().parents[1]
         source = (root / "scripts" / "test_azure_tenant_lifecycle.py").read_text()
         self.assertEqual(1, source.count('"delete-instances"'))
         self.assertIn("ordinary-tenant-deletion", source)
         self.assertIn("external-absence-proof", source)
+
+    def test_private_checkpoint_preserves_subscription_ids_and_resumes_after_finalization(
+        self,
+    ) -> None:
+        root = Path(self._testMethodName)
+        path = root / "state.json"
+        self.addCleanup(
+            lambda: (
+                path.unlink(missing_ok=True),
+                root.rmdir() if root.exists() else None,
+            )
+        )
+        spec = SimpleNamespace(name="tenant-c", sha256=lambda: "spec-sha")
+        snapshot = build_worker_snapshot(
+            readiness(),
+            VMSS,
+            [instance(0), instance(1), instance(2)],
+        )
+        foundation = {
+            "resourceGroupId": (
+                "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                "resourceGroups/rg"
+            )
+        }
+        binding = {
+            "tenantUID": "tenant-uid",
+            "operationId": "provider-operation",
+        }
+        tenant = {
+            "metadata": {"uid": "tenant-uid"},
+            "status": {
+                "provider": {
+                    "type": "azure",
+                    "binding": binding,
+                }
+            },
+        }
+        proof = AzureDeletionProof(
+            "tenant-c",
+            binding,
+            foundation,
+            VMSS,
+            (instance(0), instance(1), instance(2)),
+        )
+        _checkpoint(
+            path,
+            operation_id="gate-operation",
+            spec=spec,
+            source_sha256="source-sha",
+            tenant=tenant,
+            foundation=foundation,
+            before=snapshot,
+            owned_before={"azure": [], "provider": []},
+            deletion_proof=proof,
+        )
+        self.assertIn(
+            "00000000-0000-0000-0000-000000000000",
+            path.read_text(encoding="utf-8"),
+        )
+        loaded = _load_checkpoint(
+            path,
+            operation_id="gate-operation",
+            spec=spec,
+            source_sha256="source-sha",
+            foundation=foundation,
+        )
+        self.assertEqual(
+            proof,
+            _absent_tenant_proof(
+                loaded,
+                worker_recovery_passed=True,
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "before worker recovery"):
+            _absent_tenant_proof(
+                loaded,
+                worker_recovery_passed=False,
+            )

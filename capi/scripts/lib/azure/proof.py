@@ -160,6 +160,11 @@ def capture_operator_deletion_proof(
         resource_ids.add(vmss_id)
     else:
         vmss_id = None
+    instance_ids = vmss.get("instanceIds") if isinstance(vmss, dict) else None
+    if isinstance(instance_ids, list):
+        resource_ids.update(
+            value for value in instance_ids if isinstance(value, str) and value
+        )
     resources = provider.get("providerResources") if isinstance(provider, dict) else None
     if isinstance(resources, list):
         for resource in resources:
@@ -203,6 +208,49 @@ def capture_operator_deletion_proof(
             )
         ),
     )
+
+
+def validate_operator_deletion_proof(
+    root: Path,
+    config: Mapping[str, str],
+    tenant: str,
+    proof: AzureDeletionProof,
+) -> None:
+    if proof.tenant != tenant:
+        raise RuntimeError("Azure deletion proof checkpoint Tenant changed")
+    foundation, _, _ = _inspect_foundation(root, config, require_healthy=True)
+    if dict(proof.foundation) != foundation:
+        raise RuntimeError("Azure deletion proof checkpoint foundation changed")
+    inventory = load_inventory(root, config)
+    provider_config = _azure_provider_configuration(config, inventory)
+    provider_config_sha256 = hashlib.sha256(
+        json.dumps(
+            provider_config,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    expected = {
+        "foundationSha256": provider_config["foundationSha256"],
+        "foundationDefaultsSha256": foundation["foundationDefaultsSha256"],
+        "controllerImage": foundation["controllerImage"],
+        "providerConfigUID": foundation["azureProviderConfigUid"],
+        "providerConfigSha256": provider_config_sha256,
+        "resourceGroupId": foundation["resourceGroupId"],
+        "virtualNetworkId": foundation["vnetId"],
+        "tenantSubnetId": foundation["tenantSubnetId"],
+        "identityId": foundation["identityId"],
+    }
+    for key, value in expected.items():
+        if proof.binding.get(key) != value:
+            raise RuntimeError(
+                f"Azure deletion proof checkpoint binding changed: {key}"
+            )
+    for key in ("tenantUID", "specificationSha256", "operationId"):
+        if not proof.binding.get(key):
+            raise RuntimeError(
+                f"Azure deletion proof checkpoint binding is incomplete: {key}"
+            )
 
 
 def prove_operator_deletion(

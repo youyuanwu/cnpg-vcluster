@@ -267,30 +267,6 @@ def require_replacement(
     return deleted, replacement
 
 
-def refreshed_observed(
-    observed: Mapping[str, str],
-    readiness: Mapping[str, object],
-    instance_resource_ids: Sequence[str],
-    discovery: Mapping[str, object],
-) -> dict[str, str]:
-    refreshed = dict(observed)
-    refreshed["vmssInstanceIds"] = json.dumps(
-        sorted(str(value) for value in instance_resource_ids),
-        separators=(",", ":"),
-    )
-    refreshed["nodeIdentities"] = json.dumps(
-        readiness["nodes"],
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    refreshed["azureResources"] = json.dumps(
-        dict(discovery),
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return refreshed
-
-
 def require_owned_resource_delta(
     recorded: Mapping[str, object],
     discovered: Mapping[str, object],

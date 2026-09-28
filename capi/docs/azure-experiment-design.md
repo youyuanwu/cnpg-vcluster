@@ -291,7 +291,8 @@ Bicep, Python, or `just` recipes. Configuration is split into:
 | Explicit Azure TenantSpec JSON | Tenant name, Kubernetes version, worker count, Pod CIDR, and Service CIDR. | Yes when stored as a non-secret example |
 | Active `az` login | Tenant identity and authentication tokens. | No |
 | `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, ACR and AcrPull identity, immutable controller digest, deployment/configuration identities, and foundation checksum. | No |
-| `.runtime/azure-gate/` | Redacted destructive-gate evidence and a source/spec/tenant-bound resumable checkpoint. | No |
+| `.runtime/azure/deletion-proofs/` | Exact owner-only public-delete proof checkpoints, removed only after Azure absence and foundation proof succeeds. | No |
+| `.runtime/azure-gate/` | Redacted destructive-gate evidence plus an exact owner-only commit/spec/tenant-bound resumable checkpoint. | No |
 
 The local file contains only non-secret selectors:
 
@@ -502,7 +503,7 @@ The proposed interface remains `just`:
 | `just azure-foundation-status` | Report only shared Azure foundation health. |
 | `just tenant-create azure <spec.json>` | Strictly submit the JSON-derived Azure Tenant and wait for operator Ready. |
 | `just tenant-status azure <tenant>` | Report generation-aware operator status through the provider-neutral envelope. |
-| `just tenant-delete azure <tenant> azure/<tenant>` | Capture external proof identity, issue ordinary Tenant deletion, wait for finalization, and prove Azure/tag absence plus foundation preservation. |
+| `just tenant-delete azure <tenant> azure/<tenant>` | Persist exact external proof identity, issue ordinary Tenant deletion, wait for finalization, and durably retry Azure/tag absence plus foundation preservation. |
 | `just azure-test-tenant-lifecycle` | Destructively prove three-worker readiness, exact non-primary VMSS instance replacement, targeted tenant deletion, absence, foundation preservation, and recreation. |
 | `just azure-destroy` | Delete the entire recorded Azure foundation resource group. |
 
