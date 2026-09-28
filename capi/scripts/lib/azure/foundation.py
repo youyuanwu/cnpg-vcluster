@@ -485,10 +485,14 @@ def _push_controller_image(
 def _azure_provider_configuration(
     config: Mapping[str, str],
     inventory: Mapping[str, object],
+    controller_image: str | None = None,
 ) -> dict[str, object]:
     outputs = inventory["outputs"]
     assert isinstance(outputs, dict)
-    return {
+    image = controller_image or inventory.get("controllerImage")
+    if not isinstance(image, str) or not image:
+        raise RuntimeError("Azure controller image identity is absent")
+    provider = {
         "schema": 1,
         "subscriptionId": config["AZURE_SUBSCRIPTION_ID"],
         "tenantId": outputs["tenantId"],
@@ -506,9 +510,24 @@ def _azure_provider_configuration(
             "AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"
         ],
         "workerSku": config["AZURE_TENANT_NODE_SKU"],
+        "capiVersion": config["AZURE_CAPI_VERSION"],
+        "capzVersion": config["AZURE_CAPZ_VERSION"],
+        "kamajiCapiVersion": config["AZURE_KAMAJI_CAPI_VERSION"],
+        "kamajiChartVersion": config["AZURE_KAMAJI_CHART_VERSION"],
+        "asoVersion": "v2.11.0",
         "cloudProviderVersion": config["AZURE_CLOUD_PROVIDER_VERSION"],
         "calicoVersion": config["AZURE_CALICO_VERSION"],
+        "controllerImage": image,
+        "foundationDefaultsSha256": inventory["foundationDefaultsSha256"],
     }
+    provider["foundationSha256"] = hashlib.sha256(
+        json.dumps(
+            provider,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+    ).hexdigest()
+    return provider
 
 
 def _install_tenant_controller(
@@ -541,7 +560,7 @@ def _install_tenant_controller(
         f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
         timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
     )
-    provider_config = _azure_provider_configuration(config, inventory)
+    provider_config = _azure_provider_configuration(config, inventory, image)
     config_map = {
         "apiVersion": "v1",
         "kind": "ConfigMap",

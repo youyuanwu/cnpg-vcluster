@@ -189,7 +189,14 @@ async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
                 Assets::load(std::path::Path::new("/assets"))?,
                 foundation,
             );
-            run_runtime(config, client, provider, dependencies.management_watches).await
+            run_runtime(
+                config,
+                client,
+                provider,
+                dependencies.management_watches,
+                tenant_controller::management::MANAGEMENT_RESOURCES,
+            )
+            .await
         }
         ProviderMode::Azure => {
             debug_assert!(
@@ -203,7 +210,30 @@ async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
                     .get(AZURE_CONFIG_NAME)
                     .await?;
             let provider = AzureProvider::from_config_map(&provider_config)?;
-            run_runtime(config, client, provider, dependencies.management_watches).await
+            let configured_version = provider
+                .configuration
+                .values
+                .supported_kubernetes_version
+                .trim_start_matches('v');
+            if configured_version != config.supported_kubernetes_version.trim_start_matches('v') {
+                return Err(ControllerError::Configuration(
+                    "Azure provider supported Kubernetes version differs from manager arguments"
+                        .into(),
+                ));
+            }
+            if provider.configuration.values.controller_image != config.controller_image {
+                return Err(ControllerError::Configuration(
+                    "Azure provider controller image differs from manager arguments".into(),
+                ));
+            }
+            run_runtime(
+                config,
+                client,
+                provider,
+                dependencies.management_watches,
+                tenant_controller::management::AZURE_MANAGEMENT_RESOURCES,
+            )
+            .await
         }
     }
 }
@@ -213,12 +243,14 @@ async fn run_runtime<P: ProviderLifecycle + 'static>(
     client: kube::Client,
     provider: P,
     watch_management_resources: bool,
+    management_resources: &'static [tenant_controller::management::ManagementResource],
 ) -> Result<(), ControllerError> {
     let reconciler = Reconciler::new(
         client.clone(),
         ReconcileConfig {
             supported_version: config.supported_kubernetes_version.clone(),
             watch_management_resources,
+            management_resources,
         },
         provider,
     );

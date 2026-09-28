@@ -240,6 +240,7 @@ def check_repository_boundaries() -> None:
         "controller/config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml",
         "controller/config/rbac/role.yaml",
         "controller/config/management-resources.json",
+        "controller/config/azure-management-resources.json",
         "config/tenants/examples/local.yaml",
         "config/tenants/tests/tenant-a.yaml",
         "config/tenants/tests/tenant-b.yaml",
@@ -412,6 +413,45 @@ def check_repository_boundaries() -> None:
     )
     catalog = json.loads(
         (ROOT / "controller/config/management-resources.json").read_text()
+    )
+    azure_catalog = json.loads(
+        (ROOT / "controller/config/azure-management-resources.json").read_text()
+    )
+    azure_coordinates = {
+        (entry["apiVersion"], entry["kind"], entry["plural"])
+        for entry in azure_catalog
+    }
+    for coordinate in {
+        ("cluster.x-k8s.io/v1beta1", "Cluster", "clusters"),
+        (
+            "infrastructure.cluster.x-k8s.io/v1beta1",
+            "AzureCluster",
+            "azureclusters",
+        ),
+        (
+            "controlplane.cluster.x-k8s.io/v1alpha1",
+            "KamajiControlPlane",
+            "kamajicontrolplanes",
+        ),
+        (
+            "resources.azure.com/v1api20200601",
+            "ResourceGroup",
+            "resourcegroups",
+        ),
+        (
+            "network.azure.com/v1api20220701",
+            "NatGateway",
+            "natgateways",
+        ),
+    }:
+        check(
+            coordinate in azure_coordinates,
+            f"Azure provider catalog is missing {coordinate}",
+        )
+    check(
+        ("cluster.x-k8s.io/v1beta2", "Cluster", "clusters")
+        not in azure_coordinates,
+        "Azure provider catalog conflates the local CAPI contract",
     )
     identities = catalog_identity_literals(catalog)
     check(

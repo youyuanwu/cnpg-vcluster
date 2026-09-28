@@ -24,6 +24,11 @@ pub enum NamePolicy {
     Tenant,
     Worker,
     Kubeconfig,
+    Identity,
+    CloudValues,
+    NetworkValues,
+    StatusProbe,
+    AddonJob,
     Observed,
     Allocation,
 }
@@ -80,6 +85,11 @@ impl ManagementResource {
             NamePolicy::Tenant => Some(tenant.into()),
             NamePolicy::Worker => Some(format!("{tenant}-worker")),
             NamePolicy::Kubeconfig => Some(format!("{tenant}-kubeconfig")),
+            NamePolicy::Identity => Some(format!("{tenant}-identity")),
+            NamePolicy::CloudValues => Some(format!("{tenant}-azure-cloud-provider-values")),
+            NamePolicy::NetworkValues => Some(format!("{tenant}-calico-values")),
+            NamePolicy::StatusProbe => Some(format!("{tenant}-status-probe")),
+            NamePolicy::AddonJob => Some(format!("{tenant}-install-addons")),
             NamePolicy::Observed | NamePolicy::Allocation => None,
         }
     }
@@ -207,6 +217,107 @@ pub const MANAGEMENT_RESOURCES: &[ManagementResource] = &[
     typed!("coordination.k8s.io/v1", "Lease", "leases", true, "allocation-lease", None, Allocation, None, AllocationMarkers, Some("tenant-system"), Allocation, "controller-leader-election"),
 ];
 
+macro_rules! azure_entry {
+    ($api:expr, $kind:expr, $plural:expr, $namespaced:expr, $role:expr, $class:ident,
+     $parent:expr, $name:ident, $watched:expr, $suffix:expr, $label:expr) => {
+        ManagementResource {
+            api_version: $api,
+            kind: $kind,
+            plural: $plural,
+            namespaced: $namespaced,
+            role: $role,
+            class: ResourceClass::$class,
+            parent_kind: $parent,
+            alternate_parent_kind: None,
+            name_policy: NamePolicy::$name,
+            watched: $watched,
+            watch_name_suffix: $suffix,
+            watch_cluster_label: $label,
+            inventory_policy: InventoryPolicy::BlockAnyInstance,
+            inventory_namespace: None,
+            evidence_policy: if matches!(ResourceClass::$class, ResourceClass::Root) {
+                EvidencePolicy::Named
+            } else {
+                EvidencePolicy::Observed
+            },
+            exemptions: &[],
+        }
+    };
+}
+
+macro_rules! azure_root {
+    ($api:expr, $kind:expr, $plural:expr, $namespaced:expr, $role:expr, $parent:expr, $name:ident) => {
+        azure_entry!(
+            $api,
+            $kind,
+            $plural,
+            $namespaced,
+            $role,
+            Root,
+            $parent,
+            $name,
+            true,
+            None,
+            Some("cluster.x-k8s.io/cluster-name")
+        )
+    };
+}
+
+macro_rules! azure_descendant {
+    ($api:expr, $kind:expr, $plural:expr, $namespaced:expr, $role:expr, $parent:expr, $watched:expr) => {
+        azure_entry!(
+            $api,
+            $kind,
+            $plural,
+            $namespaced,
+            $role,
+            Descendant,
+            Some($parent),
+            Observed,
+            $watched,
+            None,
+            if $watched {
+                Some("cluster.x-k8s.io/cluster-name")
+            } else {
+                None
+            }
+        )
+    };
+}
+
+#[rustfmt::skip]
+pub const AZURE_MANAGEMENT_RESOURCES: &[ManagementResource] = &[
+    azure_entry!("v1", "Namespace", "namespaces", false, "namespace", Typed, None, Tenant, true, None, None),
+    azure_root!("infrastructure.cluster.x-k8s.io/v1beta1", "AzureClusterIdentity", "azureclusteridentities", true, "azure-cluster-identity", None, Identity),
+    azure_root!("cluster.x-k8s.io/v1beta1", "Cluster", "clusters", true, "cluster", None, Tenant),
+    azure_root!("infrastructure.cluster.x-k8s.io/v1beta1", "AzureCluster", "azureclusters", true, "azure-cluster", Some("Cluster"), Tenant),
+    azure_root!("controlplane.cluster.x-k8s.io/v1alpha1", "KamajiControlPlane", "kamajicontrolplanes", true, "kamaji-control-plane", Some("Cluster"), Tenant),
+    azure_root!("bootstrap.cluster.x-k8s.io/v1beta1", "KubeadmConfig", "kubeadmconfigs", true, "kubeadm-config", Some("MachinePool"), Worker),
+    azure_root!("infrastructure.cluster.x-k8s.io/v1beta1", "AzureMachinePool", "azuremachinepools", true, "azure-machine-pool", Some("MachinePool"), Worker),
+    azure_root!("cluster.x-k8s.io/v1beta1", "MachinePool", "machinepools", true, "machine-pool", Some("Cluster"), Worker),
+    azure_entry!("v1", "ConfigMap", "configmaps", true, "addon-values", Root, None, Observed, true, None, None),
+    azure_root!("apps/v1", "Deployment", "deployments", true, "status-probe", None, StatusProbe),
+    azure_root!("batch/v1", "Job", "jobs", true, "addon-job", None, AddonJob),
+    azure_entry!("v1", "Secret", "secrets", true, "tenant-kubeconfig", Typed, Some("KamajiControlPlane"), Kubeconfig, true, Some("-kubeconfig"), None),
+    azure_descendant!("cluster.x-k8s.io/v1beta1", "Machine", "machines", true, "machine", "MachinePool", true),
+    azure_descendant!("infrastructure.cluster.x-k8s.io/v1beta1", "AzureMachinePoolMachine", "azuremachinepoolmachines", true, "azure-machine-pool-machine", "AzureMachinePool", true),
+    azure_descendant!("kamaji.clastix.io/v1alpha1", "TenantControlPlane", "tenantcontrolplanes", true, "provider", "KamajiControlPlane", false),
+    azure_descendant!("cert-manager.io/v1", "Certificate", "certificates", true, "provider-certificate", "KamajiControlPlane", false),
+    azure_descendant!("cert-manager.io/v1", "CertificateRequest", "certificaterequests", true, "provider-certificate-request", "Certificate", false),
+    azure_descendant!("cert-manager.io/v1", "Issuer", "issuers", true, "provider-issuer", "KamajiControlPlane", false),
+    azure_descendant!("v1", "Service", "services", true, "provider-service", "KamajiControlPlane", true),
+    azure_descendant!("v1", "Endpoints", "endpoints", true, "provider-endpoints", "Service", false),
+    azure_descendant!("apps/v1", "StatefulSet", "statefulsets", true, "provider-stateful-set", "KamajiControlPlane", true),
+    azure_descendant!("v1", "PersistentVolumeClaim", "persistentvolumeclaims", true, "provider-pvc", "StatefulSet", false),
+    azure_descendant!("policy/v1", "PodDisruptionBudget", "poddisruptionbudgets", true, "provider-pdb", "KamajiControlPlane", false),
+    azure_descendant!("rbac.authorization.k8s.io/v1", "Role", "roles", true, "provider-role", "KamajiControlPlane", false),
+    azure_descendant!("rbac.authorization.k8s.io/v1", "RoleBinding", "rolebindings", true, "provider-role-binding", "KamajiControlPlane", false),
+    azure_descendant!("resources.azure.com/v1api20200601", "ResourceGroup", "resourcegroups", true, "aso-resource-group", "AzureCluster", false),
+    azure_descendant!("network.azure.com/v1api20201101", "VirtualNetwork", "virtualnetworks", true, "aso-virtual-network", "AzureCluster", false),
+    azure_descendant!("network.azure.com/v1api20201101", "VirtualNetworksSubnet", "virtualnetworkssubnets", true, "aso-subnet", "AzureCluster", false),
+    azure_descendant!("network.azure.com/v1api20220701", "NatGateway", "natgateways", true, "aso-nat-gateway", "AzureCluster", false),
+];
+
 pub fn roots() -> impl Iterator<Item = ManagementResource> {
     MANAGEMENT_RESOURCES
         .iter()
@@ -233,6 +344,20 @@ pub fn by_kind(kind: &str) -> Option<ManagementResource> {
         .iter()
         .copied()
         .find(|resource| resource.kind == kind)
+}
+
+pub fn azure_by_kind(kind: &str) -> Option<ManagementResource> {
+    AZURE_MANAGEMENT_RESOURCES
+        .iter()
+        .copied()
+        .find(|resource| resource.kind == kind)
+}
+
+pub fn azure_watched() -> impl Iterator<Item = ManagementResource> {
+    AZURE_MANAGEMENT_RESOURCES
+        .iter()
+        .copied()
+        .filter(|resource| resource.watched)
 }
 
 #[cfg(test)]
@@ -365,5 +490,52 @@ mod tests {
                 .collect::<Vec<_>>(),
             FINALIZED_DESCENDANTS
         );
+    }
+
+    #[test]
+    fn azure_catalog_is_pinned_complete_and_disjoint_from_local_roots() {
+        let identities: BTreeSet<_> = AZURE_MANAGEMENT_RESOURCES
+            .iter()
+            .map(|resource| (resource.api_version, resource.kind, resource.plural))
+            .collect();
+        assert_eq!(identities.len(), AZURE_MANAGEMENT_RESOURCES.len());
+        for (kind, api_version) in [
+            ("Cluster", "cluster.x-k8s.io/v1beta1"),
+            ("AzureCluster", "infrastructure.cluster.x-k8s.io/v1beta1"),
+            (
+                "KamajiControlPlane",
+                "controlplane.cluster.x-k8s.io/v1alpha1",
+            ),
+            (
+                "AzureMachinePool",
+                "infrastructure.cluster.x-k8s.io/v1beta1",
+            ),
+            ("MachinePool", "cluster.x-k8s.io/v1beta1"),
+            ("ResourceGroup", "resources.azure.com/v1api20200601"),
+            ("NatGateway", "network.azure.com/v1api20220701"),
+        ] {
+            assert_eq!(azure_by_kind(kind).unwrap().api_version, api_version);
+        }
+        assert_eq!(
+            by_kind("Cluster").unwrap().api_version,
+            "cluster.x-k8s.io/v1beta2"
+        );
+        assert_eq!(
+            by_kind("KamajiControlPlane").unwrap().api_version,
+            "controlplane.cluster.x-k8s.io/v1alpha2"
+        );
+        assert!(by_kind("AzureCluster").is_none());
+        assert!(azure_by_kind("DevCluster").is_none());
+        assert!(AZURE_MANAGEMENT_RESOURCES.iter().any(|resource| {
+            resource.kind == "ConfigMap" && resource.role == "addon-values" && resource.watched
+        }));
+        assert!(AZURE_MANAGEMENT_RESOURCES.iter().any(|resource| {
+            resource.kind == "Deployment"
+                && resource.expected_name("tenant-a").as_deref() == Some("tenant-a-status-probe")
+        }));
+        assert!(AZURE_MANAGEMENT_RESOURCES.iter().any(|resource| {
+            resource.kind == "Job"
+                && resource.expected_name("tenant-a").as_deref() == Some("tenant-a-install-addons")
+        }));
     }
 }

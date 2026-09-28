@@ -44,12 +44,14 @@ pub const STORAGE_CLASS: &str = "capi-hostpath";
 pub struct Config {
     pub supported_version: String,
     pub watch_management_resources: bool,
+    pub management_resources: &'static [management::ManagementResource],
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             supported_version: SUPPORTED_KUBERNETES_VERSION.into(),
             watch_management_resources: true,
+            management_resources: management::MANAGEMENT_RESOURCES,
         }
     }
 }
@@ -128,7 +130,9 @@ impl<P: ProviderLifecycle> Reconciler<P> {
             crate::api::TenantProviderSpec::Local { .. } => {
                 (TenantProviderStatus::Local(Default::default()), "Local")
             }
-            crate::api::TenantProviderSpec::Azure { .. } => (TenantProviderStatus::Azure, "Azure"),
+            crate::api::TenantProviderSpec::Azure { .. } => {
+                (TenantProviderStatus::Azure(Default::default()), "Azure")
+            }
         };
         let (reason, detail) = if has_finalizer {
             (
@@ -230,6 +234,14 @@ pub fn map_management_to_tenant(
     if !mapped.is_empty() {
         return mapped;
     }
+    if let Some(name) = object
+        .annotations()
+        .get(crate::azure::TENANT_ANNOTATION)
+        .or_else(|| object.labels().get(crate::azure::TENANT_LABEL))
+        .filter(|name| !name.is_empty())
+    {
+        return vec![ObjectRef::new(name)];
+    }
     if let Some(suffix) = definition.watch_name_suffix {
         object
             .namespace()
@@ -251,7 +263,12 @@ pub fn map_management_to_tenant(
 pub fn controller(client: Client, config: &Config) -> Controller<Tenant> {
     let mut controller = tenant_controller(client.clone());
     if config.watch_management_resources {
-        for definition in management::watched() {
+        for definition in config
+            .management_resources
+            .iter()
+            .copied()
+            .filter(|resource| resource.watched)
+        {
             let resource = definition.api_resource();
             controller = controller.watches_with(
                 Api::<DynamicObject>::all_with(client.clone(), &resource),

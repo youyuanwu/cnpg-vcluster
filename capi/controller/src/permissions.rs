@@ -1,7 +1,9 @@
 use k8s_openapi::api::rbac::v1::{ClusterRole, PolicyRule};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
-use crate::management::{MANAGEMENT_RESOURCES, ResourceClass};
+use crate::management::{
+    AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES, ManagementResource, ResourceClass,
+};
 
 pub const ROLE_NAME: &str = "tenant-controller-role";
 
@@ -40,7 +42,7 @@ fn rule(group: &str, resources: &[&str], verbs: &[&str]) -> PolicyRule {
     }
 }
 
-fn management_rule(resource: &crate::management::ManagementResource) -> PolicyRule {
+fn management_rule(resource: &ManagementResource) -> PolicyRule {
     let group = resource
         .api_version
         .split_once('/')
@@ -61,11 +63,27 @@ fn management_rule(resource: &crate::management::ManagementResource) -> PolicyRu
     rule(group, &[resource.plural], &verbs)
 }
 
+fn azure_management_rule(resource: &ManagementResource) -> PolicyRule {
+    if resource.class != ResourceClass::Descendant {
+        return management_rule(resource);
+    }
+    let group = resource
+        .api_version
+        .split_once('/')
+        .map_or("", |(group, _)| group);
+    let mut verbs = vec!["get", "list"];
+    if resource.watched {
+        verbs.push("watch");
+    }
+    rule(group, &[resource.plural], &verbs)
+}
+
 pub fn controller_role() -> ClusterRole {
     let rules = BASE_PERMISSIONS
         .iter()
         .map(|(group, resources, verbs)| rule(group, resources, verbs))
         .chain(MANAGEMENT_RESOURCES.iter().map(management_rule))
+        .chain(AZURE_MANAGEMENT_RESOURCES.iter().map(azure_management_rule))
         .collect();
     ClusterRole {
         metadata: ObjectMeta {
@@ -88,7 +106,7 @@ mod tests {
         let rules = role.rules.unwrap();
         assert_eq!(
             rules.len(),
-            BASE_PERMISSIONS.len() + MANAGEMENT_RESOURCES.len()
+            BASE_PERMISSIONS.len() + MANAGEMENT_RESOURCES.len() + AZURE_MANAGEMENT_RESOURCES.len()
         );
         assert!(
             rules
@@ -107,6 +125,15 @@ mod tests {
             assert!(rule.verbs.contains(&"get".into()));
             assert!(rule.verbs.contains(&"list".into()));
             assert_eq!(rule.verbs.contains(&"watch".into()), resource.watched);
+        }
+        for resource in AZURE_MANAGEMENT_RESOURCES {
+            assert!(rules.contains(&azure_management_rule(resource)));
+            if resource.class == ResourceClass::Descendant {
+                let verbs = &azure_management_rule(resource).verbs;
+                assert!(!verbs.contains(&"create".into()));
+                assert!(!verbs.contains(&"delete".into()));
+                assert!(!verbs.contains(&"patch".into()));
+            }
         }
         for (kind, expected) in [
             (

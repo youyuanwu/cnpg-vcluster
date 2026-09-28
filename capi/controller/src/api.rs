@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use ipnet::Ipv4Net;
 use kube::{CustomResource, CustomResourceExt};
 use schemars::JsonSchema;
@@ -67,7 +69,10 @@ pub struct TenantStatus {
 #[rustfmt::skip]
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "lowercase")]
-pub enum TenantProviderStatus { Local(LocalProviderStatus), Azure }
+pub enum TenantProviderStatus {
+    Local(LocalProviderStatus),
+    Azure(Box<AzureProviderStatus>),
+}
 #[rustfmt::skip]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -76,12 +81,181 @@ pub struct LocalProviderStatus {
     #[serde(skip_serializing_if = "Option::is_none")] pub foundation_hash: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "clusterUID")] pub cluster_uid: Option<String>,
 }
-#[rustfmt::skip]
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureProviderStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub binding: Option<AzureBindingStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub management: Option<AzureManagementStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kubeconfig: Option<AzureKubeconfigStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vmss: Option<AzureVmssStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub nodes: Vec<AzureNodeIdentity>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub addon_components: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub provider_resources: Vec<AzureProviderResourceIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deletion: Option<AzureDeletionStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureBindingStatus {
+    #[serde(rename = "tenantUID")]
+    pub tenant_uid: String,
+    pub specification_sha256: String,
+    #[serde(rename = "providerConfigUID")]
+    pub provider_config_uid: String,
+    pub provider_config_sha256: String,
+    pub foundation_sha256: String,
+    pub foundation_defaults_sha256: String,
+    pub controller_image: String,
+    pub resource_group_id: String,
+    pub virtual_network_id: String,
+    pub tenant_subnet_id: String,
+    pub identity_id: String,
+    pub operation_id: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureManagementStatus {
+    #[serde(skip_serializing_if = "Option::is_none", rename = "namespaceUID")]
+    pub namespace_uid: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "azureClusterIdentityUID"
+    )]
+    pub azure_cluster_identity_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "clusterUID")]
+    pub cluster_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "azureClusterUID")]
+    pub azure_cluster_uid: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "kamajiControlPlaneUID"
+    )]
+    pub kamaji_control_plane_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "kubeadmConfigUID")]
+    pub kubeadm_config_uid: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "azureMachinePoolUID"
+    )]
+    pub azure_machine_pool_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "machinePoolUID")]
+    pub machine_pool_uid: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "cloudValuesConfigMapUID"
+    )]
+    pub cloud_values_config_map_uid: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "networkValuesConfigMapUID"
+    )]
+    pub network_values_config_map_uid: Option<String>,
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        rename = "statusProbeDeploymentUID"
+    )]
+    pub status_probe_deployment_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "addonJobUID")]
+    pub addon_job_uid: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureKubeconfigStatus {
+    #[serde(rename = "secretUID")]
+    pub secret_uid: String,
+    pub content_sha256: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureVmssStatus {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub instance_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureNodeIdentity {
+    pub name: String,
+    #[serde(rename = "uid")]
+    pub uid: String,
+    #[serde(rename = "providerID")]
+    pub provider_id: String,
+    #[serde(rename = "internalIP")]
+    pub internal_ip: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureProviderResourceIdentity {
+    pub api_version: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    pub name: String,
+    #[serde(rename = "uid")]
+    pub uid: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "ownerUIDs")]
+    pub owner_uids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureDeletionStatus {
+    #[serde(
+        default,
+        skip_serializing_if = "BTreeMap::is_empty",
+        rename = "resourceVersions"
+    )]
+    pub resource_versions: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub verified_azure_resource_ids: Vec<String>,
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        rename = "verifiedProviderUIDs"
+    )]
+    pub verified_provider_uids: Vec<String>,
+}
+
 #[derive(JsonSchema)]
 #[allow(dead_code)]
 struct TenantProviderStatusSchema {
-    #[schemars(rename = "type")] provider_type: ProviderTypeSchema, allocation: Option<AllocationStatus>,
-    #[schemars(rename = "foundationHash")] foundation_hash: Option<String>, #[schemars(rename = "clusterUID")] cluster_uid: Option<String>,
+    #[schemars(rename = "type")]
+    provider_type: ProviderTypeSchema,
+    allocation: Option<AllocationStatus>,
+    #[schemars(rename = "foundationHash")]
+    foundation_hash: Option<String>,
+    #[schemars(rename = "clusterUID")]
+    cluster_uid: Option<String>,
+    binding: Option<AzureBindingStatus>,
+    endpoint: Option<String>,
+    management: Option<AzureManagementStatus>,
+    kubeconfig: Option<AzureKubeconfigStatus>,
+    vmss: Option<AzureVmssStatus>,
+    nodes: Option<Vec<AzureNodeIdentity>>,
+    #[schemars(rename = "addonComponents")]
+    addon_components: Option<BTreeMap<String, String>>,
+    #[schemars(rename = "providerResources")]
+    provider_resources: Option<Vec<AzureProviderResourceIdentity>>,
+    deletion: Option<AzureDeletionStatus>,
 }
 #[rustfmt::skip]
 impl TenantStatus {
@@ -89,7 +263,16 @@ impl TenantStatus {
     pub fn local_mut(&mut self) -> Result<&mut LocalProviderStatus, crate::error::ControllerError> {
         if self.provider.is_none() { self.provider = Some(TenantProviderStatus::Local(LocalProviderStatus::default())); }
         match self.provider.as_mut() { Some(TenantProviderStatus::Local(status)) => Ok(status),
-            Some(TenantProviderStatus::Azure) => Err(crate::error::ControllerError::OwnershipInvalid(SpecError::ProviderStatus.to_string())), None => unreachable!("local provider status was initialized") }
+            Some(TenantProviderStatus::Azure(_)) => Err(crate::error::ControllerError::OwnershipInvalid(SpecError::ProviderStatus.to_string())), None => unreachable!("local provider status was initialized") }
+    }
+    pub fn azure(&self) -> Option<&AzureProviderStatus> { match self.provider.as_ref() { Some(TenantProviderStatus::Azure(status)) => Some(status), _ => None } }
+    pub fn azure_mut(&mut self) -> Result<&mut AzureProviderStatus, crate::error::ControllerError> {
+        if self.provider.is_none() { self.provider = Some(TenantProviderStatus::Azure(Default::default())); }
+        match self.provider.as_mut() {
+            Some(TenantProviderStatus::Azure(status)) => Ok(status),
+            Some(TenantProviderStatus::Local(_)) => Err(crate::error::ControllerError::OwnershipInvalid(SpecError::ProviderStatus.to_string())),
+            None => unreachable!("Azure provider status was initialized"),
+        }
     }
     pub fn allocation(&self) -> Option<&AllocationStatus> { self.local().and_then(|status| status.allocation.as_ref()) }
     pub fn foundation_hash(&self) -> Option<&str> { self.local().and_then(|status| status.foundation_hash.as_deref()) }
@@ -174,7 +357,7 @@ pub fn validate_provider_status(
     spec: &CanonicalSpec, status: Option<&TenantStatus>,
 ) -> Result<(), SpecError> {
     let Some(provider) = status.and_then(|status| status.provider.as_ref()) else { return Ok(()); };
-    matches!((&spec.provider, provider), (TenantProviderSpec::Local { .. }, TenantProviderStatus::Local(_)) | (TenantProviderSpec::Azure { .. }, TenantProviderStatus::Azure))
+    matches!((&spec.provider, provider), (TenantProviderSpec::Local { .. }, TenantProviderStatus::Local(_)) | (TenantProviderSpec::Azure { .. }, TenantProviderStatus::Azure(_)))
         .then_some(()).ok_or(SpecError::ProviderStatus)
 }
 
@@ -215,6 +398,7 @@ pub fn tenant_crd() -> k8s_openapi::apiextensions_apiserver::pkg::apis::apiexten
         rule("self.spec.provider.type != 'azure' || (has(self.spec.provider.podCIDR) && has(self.spec.provider.serviceCIDR) && isCIDR(self.spec.provider.podCIDR) && isCIDR(self.spec.provider.serviceCIDR) && cidr(self.spec.provider.podCIDR).ip().family() == 4 && cidr(self.spec.provider.serviceCIDR).ip().family() == 4 && cidr(self.spec.provider.podCIDR) == cidr(self.spec.provider.podCIDR).masked() && cidr(self.spec.provider.serviceCIDR) == cidr(self.spec.provider.serviceCIDR).masked() && !cidr(self.spec.provider.podCIDR).containsCIDR(cidr(self.spec.provider.serviceCIDR)) && !cidr(self.spec.provider.serviceCIDR).containsCIDR(cidr(self.spec.provider.podCIDR)) && cidr(self.spec.provider.serviceCIDR).prefixLength() <= 28)", "Azure Pod and Service CIDRs must be canonical, disjoint IPv4 networks and the Service CIDR must contain the derived DNS address"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type == self.spec.provider.type", "Tenant provider status must match the requested provider"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type != 'azure' || (!has(self.status.provider.allocation) && !has(self.status.provider.foundationHash) && !has(self.status.provider.clusterUID))", "Azure provider status cannot contain local durable identity"),
+        rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type != 'local' || (!has(self.status.provider.binding) && !has(self.status.provider.endpoint) && !has(self.status.provider.management) && !has(self.status.provider.kubeconfig) && !has(self.status.provider.vmss) && !has(self.status.provider.nodes) && !has(self.status.provider.addonComponents) && !has(self.status.provider.providerResources) && !has(self.status.provider.deletion))", "Local provider status cannot contain Azure durable identity"),
         rule("self.spec.kubernetesVersion.matches('^v?[0-9]+[.][0-9]+[.][0-9]+$')", "kubernetesVersion must be a three-component numeric version"),
     ]);
     crd
@@ -307,7 +491,7 @@ mod tests {
     fn azure_spec_and_placeholder_status_are_representable() {
         let mut tenant = Tenant::new("tenant-a", azure_spec());
         tenant.status = Some(TenantStatus {
-            provider: Some(TenantProviderStatus::Azure),
+            provider: Some(TenantProviderStatus::Azure(Default::default())),
             ..Default::default()
         });
         let value = serde_json::to_value(&tenant).unwrap();
@@ -320,6 +504,79 @@ mod tests {
             })
         );
         assert_eq!(value["status"]["provider"], json!({"type":"azure"}));
+        assert_eq!(serde_json::from_value::<Tenant>(value).unwrap(), tenant);
+    }
+
+    #[test]
+    fn azure_status_is_typed_durable_and_contains_no_secret_material() {
+        let mut tenant = Tenant::new("tenant-a", azure_spec());
+        tenant.status = Some(TenantStatus {
+            provider: Some(TenantProviderStatus::Azure(Box::new(AzureProviderStatus {
+                binding: Some(AzureBindingStatus {
+                    tenant_uid: "tenant-uid".into(),
+                    specification_sha256: "spec-sha".into(),
+                    provider_config_uid: "config-uid".into(),
+                    provider_config_sha256: "config-sha".into(),
+                    foundation_sha256: "foundation-sha".into(),
+                    foundation_defaults_sha256: "defaults-sha".into(),
+                    controller_image: "registry/controller@sha256:digest".into(),
+                    resource_group_id: "/subscriptions/s/resourceGroups/rg".into(),
+                    virtual_network_id: "/subscriptions/s/virtualNetworks/vnet".into(),
+                    tenant_subnet_id: "/subscriptions/s/subnets/tenant".into(),
+                    identity_id: "/subscriptions/s/userAssignedIdentities/id".into(),
+                    operation_id: "operation".into(),
+                }),
+                endpoint: Some("10.220.0.6:6443".into()),
+                management: Some(AzureManagementStatus {
+                    namespace_uid: Some("namespace-uid".into()),
+                    cluster_uid: Some("cluster-uid".into()),
+                    ..Default::default()
+                }),
+                kubeconfig: Some(AzureKubeconfigStatus {
+                    secret_uid: "secret-uid".into(),
+                    content_sha256: "content-sha".into(),
+                }),
+                vmss: Some(AzureVmssStatus {
+                    id: Some("/subscriptions/s/virtualMachineScaleSets/tenant-a-worker".into()),
+                    instance_ids: vec!["instance-0".into()],
+                }),
+                nodes: vec![AzureNodeIdentity {
+                    name: "node-0".into(),
+                    uid: "node-uid".into(),
+                    provider_id: "azure:///instance-0".into(),
+                    internal_ip: "10.30.0.4".into(),
+                }],
+                addon_components: BTreeMap::from([(
+                    "cloudController".into(),
+                    "component-uid".into(),
+                )]),
+                provider_resources: vec![AzureProviderResourceIdentity {
+                    api_version: "network.azure.com/v1api20220701".into(),
+                    kind: "NatGateway".into(),
+                    namespace: Some("tenant-a".into()),
+                    name: "tenant-a-nat".into(),
+                    uid: "nat-uid".into(),
+                    resource_id: Some("/subscriptions/s/natGateways/nat".into()),
+                    owner_uids: vec!["cluster-uid".into()],
+                }],
+                deletion: Some(AzureDeletionStatus {
+                    resource_versions: BTreeMap::from([("Cluster/tenant-a".into(), "42".into())]),
+                    verified_azure_resource_ids: vec!["/subscriptions/s/natGateways/nat".into()],
+                    verified_provider_uids: vec!["nat-uid".into()],
+                }),
+            }))),
+            ..Default::default()
+        });
+        let value = serde_json::to_value(&tenant).unwrap();
+        let provider = &value["status"]["provider"];
+        assert_eq!(provider["type"], "azure");
+        assert_eq!(provider["management"]["clusterUID"], "cluster-uid");
+        assert_eq!(provider["kubeconfig"]["secretUID"], "secret-uid");
+        assert_eq!(provider["nodes"][0]["providerID"], "azure:///instance-0");
+        let text = serde_json::to_string(&value).unwrap();
+        assert!(!text.contains("kubeconfigBytes"));
+        assert!(!text.contains("token"));
+        assert!(!text.contains("clientSecret"));
         assert_eq!(serde_json::from_value::<Tenant>(value).unwrap(), tenant);
     }
 
@@ -464,7 +721,7 @@ mod tests {
             ..Default::default()
         };
         let azure_status = TenantStatus {
-            provider: Some(TenantProviderStatus::Azure),
+            provider: Some(TenantProviderStatus::Azure(Default::default())),
             ..Default::default()
         };
         assert_eq!(validate_provider_status(&local, None), Ok(()));
@@ -559,6 +816,19 @@ mod tests {
             .unwrap();
         assert!(status_provider.contains_key("foundationHash"));
         assert!(!status_provider.contains_key("foundation_hash"));
+        for field in [
+            "binding",
+            "endpoint",
+            "management",
+            "kubeconfig",
+            "vmss",
+            "nodes",
+            "addonComponents",
+            "providerResources",
+            "deletion",
+        ] {
+            assert!(status_provider.contains_key(field), "{field}");
+        }
         let rules: Vec<_> = schema
             .x_kubernetes_validations
             .as_ref()
@@ -597,6 +867,18 @@ mod tests {
                 .is_some_and(|properties| properties.contains_key("podCIDR"))
         );
         assert!(status_provider_fields.contains_key("clusterUID"));
+        assert!(
+            status_provider_fields["management"]
+                .properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains_key("azureMachinePoolUID"))
+        );
+        assert!(
+            status_provider_fields["kubeconfig"]
+                .properties
+                .as_ref()
+                .is_some_and(|properties| properties.contains_key("contentSha256"))
+        );
         assert!(
             properties["status"]
                 .x_kubernetes_preserve_unknown_fields
