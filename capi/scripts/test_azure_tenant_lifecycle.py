@@ -277,6 +277,8 @@ def _incomplete_gate(
                 or payload.get("specificationSha256") != specification_sha256
             ):
                 continue
+            if payload.get("schema") != 2:
+                continue
             if (
                 set(payload)
                 != {
@@ -287,7 +289,6 @@ def _incomplete_gate(
                     "sourceSha256",
                     "records",
                 }
-                or payload.get("schema") != 2
                 or not isinstance(payload.get("operationId"), str)
                 or path.stem != f"lifecycle-{payload.get('operationId')}"
                 or not isinstance(payload.get("records"), list)

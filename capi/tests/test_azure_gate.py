@@ -232,6 +232,31 @@ class AzureGateTests(unittest.TestCase):
                 )
             )
 
+    def test_historical_gate_evidence_is_not_a_resumption_candidate(self) -> None:
+        root = Path(self._testMethodName)
+        path = root / "lifecycle-historical.json"
+        self.addCleanup(
+            lambda: (
+                path.unlink(missing_ok=True),
+                root.rmdir() if root.exists() else None,
+            )
+        )
+        write_private_file(
+            path,
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operationId": "historical",
+                    "tenant": "tenant-c",
+                    "specificationSha256": "spec-sha",
+                    "records": [],
+                }
+            ),
+        )
+        self.assertIsNone(
+            _incomplete_gate(root, "tenant-c", "spec-sha", "source-sha")
+        )
+
     def test_incomplete_destructive_attempt_rejects_changed_source(self) -> None:
         root = Path(self._testMethodName)
         path = root / "lifecycle-operation-1.json"
