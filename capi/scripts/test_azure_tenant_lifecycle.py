@@ -38,13 +38,14 @@ from scripts.lib.azure.gate import (
 )
 from scripts.lib.azure.ownership import discover_azure_owned_resources
 from scripts.lib.azure.readiness import _collect_ready_observations
+from scripts.lib.azure.lifecycle import AzureTenantAdapter
 from scripts.lib.config import parse_duration
 from scripts.lib.files import private_file_exists, read_private_file, write_private_file
 from scripts.lib.process import run
 from scripts.lib.redaction import redact, redact_value
 from scripts.lib.tenant_spec import load_tenant_spec
 from scripts.lib.tenant_runtime import TenantRuntime
-from scripts.tenant import supported_versions
+from scripts.tenant import create_tenant, supported_versions
 
 
 def _group_exists(group: str) -> bool:
@@ -355,6 +356,7 @@ def _incomplete_gate_records(
                 if isinstance(record, dict)
             }
             if "targeted-delete-absent" in passed and not {
+                "worker-identity-verification",
                 "worker-instance-deletion",
                 "worker-recovery",
                 "worker-identity-refresh",
@@ -363,6 +365,7 @@ def _incomplete_gate_records(
                     f"Azure lifecycle gate evidence phase order is invalid: {path.name}"
                 )
             if "recreation" in passed and not {
+                "worker-identity-verification",
                 "targeted-delete-absent",
                 "foundation-verification",
             }.issubset(passed):
@@ -449,6 +452,40 @@ def _complete_prior_gate_attempt(
         path,
         json.dumps(redact_value(payload), sort_keys=True) + "\n",
     )
+
+
+def _load_worker_checkpoint(
+    path: Path,
+    spec,
+    revision: str,
+    attempt_id: str,
+) -> dict[str, object]:
+    if not private_file_exists(path):
+        raise RuntimeError("Azure worker recovery checkpoint is absent")
+    checkpoint = json.loads(read_private_file(path))
+    if (
+        set(checkpoint)
+        != {
+            "schema",
+            "tenant",
+            "specificationSha256",
+            "revision",
+            "gateOperationId",
+            "markerOperationId",
+            "observed",
+        }
+        or checkpoint.get("schema") != 1
+        or checkpoint.get("tenant") != spec.name
+        or checkpoint.get("specificationSha256") != spec.sha256()
+        or checkpoint.get("revision") != revision
+        or checkpoint.get("gateOperationId") != attempt_id
+        or not isinstance(checkpoint.get("markerOperationId"), str)
+        or not isinstance(checkpoint.get("observed"), dict)
+        or checkpoint["observed"].get("markerOperationId")
+        != checkpoint["markerOperationId"]
+    ):
+        raise RuntimeError("Azure worker recovery checkpoint is invalid")
+    return checkpoint
 
 
 def _incompatible_existing_identity(runtime: TenantRuntime, spec):
@@ -661,6 +698,21 @@ def main(arguments: list[str]) -> int:
             if pending.operation == "delete":
                 if prior_gate is not None:
                     _require_authenticated_worker_deletion(prior_gate)
+                    worker_state = _load_worker_checkpoint(
+                        worker_checkpoint,
+                        spec,
+                        revision,
+                        active_gate_operation_id,
+                    )
+                    if (
+                        pending.specification_sha256 != spec.sha256()
+                        or dict(pending.foundation_identity) != foundation_before
+                        or pending.observed.get("markerOperationId")
+                        != worker_state["markerOperationId"]
+                    ):
+                        raise RuntimeError(
+                            "Azure pending delete is unrelated to gate attempt"
+                        )
                     if not private_file_exists(foundation_checkpoint):
                         raise RuntimeError(
                             "Azure foundation checkpoint is absent during delete resume"
@@ -735,39 +787,14 @@ def main(arguments: list[str]) -> int:
                     "Azure worker recovery cannot resume with a pending operation"
                 )
             identity = runtime.load_identity()
-            if not private_file_exists(worker_checkpoint):
-                raise RuntimeError(
-                    "Azure worker recovery checkpoint is absent"
-                )
-            checkpoint = json.loads(read_private_file(worker_checkpoint))
-            if (
-                set(checkpoint)
-                != {
-                    "schema",
-                    "tenant",
-                    "specificationSha256",
-                    "revision",
-                    "gateOperationId",
-                    "markerOperationId",
-                    "observed",
-                }
-                or checkpoint.get("schema") != 1
-                or checkpoint.get("tenant") != spec.name
-                or checkpoint.get("specificationSha256") != spec.sha256()
-                or checkpoint.get("revision") != revision
-                or checkpoint.get("gateOperationId")
-                != _gate_attempt_id(
-                    _incomplete_gate_records(
-                        evidence.parent,
-                        spec.name,
-                        spec.sha256(),
-                        revision,
-                    )
-                    or set()
-                )
-                or checkpoint.get("markerOperationId")
-                != identity.observed.get("markerOperationId")
-                or not isinstance(checkpoint.get("observed"), dict)
+            checkpoint = _load_worker_checkpoint(
+                worker_checkpoint,
+                spec,
+                revision,
+                active_gate_operation_id,
+            )
+            if checkpoint["markerOperationId"] != identity.observed.get(
+                "markerOperationId"
             ):
                 raise RuntimeError("Azure worker recovery checkpoint is invalid")
             baseline_observed = checkpoint["observed"]
@@ -843,12 +870,32 @@ def main(arguments: list[str]) -> int:
             )
             if dict(identity.observed) != observed:
                 runtime.compare_and_replace_identity(identity, observed)
+            elif runtime.load_ready_evidence().get("observed") != observed:
+                raise RuntimeError(
+                    "Azure worker Ready evidence changed during recovery"
+                )
             runtime.write_ready_evidence(ready_payload)
 
         skip_failure_injection = False
         skip_targeted_delete = False
         if prior_gate is not None:
             _require_authenticated_worker_deletion(prior_gate)
+            _load_worker_checkpoint(
+                worker_checkpoint,
+                spec,
+                revision,
+                active_gate_operation_id,
+            )
+            if "targeted-delete-absent" in prior_gate:
+                for completed_phase in (
+                    "worker-identity-verification",
+                    "worker-instance-deletion",
+                    "worker-recovery",
+                    "worker-identity-refresh",
+                    "targeted-delete-absent",
+                ):
+                    if completed_phase in prior_gate:
+                        phase(completed_phase, lambda: None)
             if "targeted-delete-absent" not in prior_gate:
                 _run_profile_mutation(
                     ROOT,
@@ -865,7 +912,12 @@ def main(arguments: list[str]) -> int:
             phase(
                 "create-ready",
                 lambda: (
-                    _tenant_command("create", "azure", str(spec_path)),
+                    create_tenant(
+                        ROOT,
+                        spec_path,
+                        AzureTenantAdapter(),
+                        require_absent=True,
+                    ),
                     _require_status(spec.name, "ready"),
                 ),
             )
@@ -1143,7 +1195,12 @@ def main(arguments: list[str]) -> int:
         phase(
             "recreation",
             lambda: (
-                _tenant_command("create", "azure", str(spec_path)),
+                create_tenant(
+                    ROOT,
+                    spec_path,
+                    AzureTenantAdapter(),
+                    require_absent=True,
+                ),
                 _require_status(spec.name, "ready"),
             ),
         )

@@ -162,6 +162,8 @@ def create_tenant(
     root: Path,
     spec_path: Path,
     adapter: TenantAdapter,
+    *,
+    require_absent: bool = False,
 ) -> int:
     with _tenant_e2e_lock(root):
         with azure_lock(
@@ -200,6 +202,15 @@ def create_tenant(
                     operation="create",
                     operation_id=operation_id,
                 )
+                if require_absent:
+                    gate_runtime = TenantRuntime(root, spec.name)
+                    if (
+                        gate_runtime.identity_exists()
+                        or gate_runtime.operation_exists()
+                    ):
+                        raise RuntimeError(
+                            "Azure gate create precondition changed"
+                        )
                 timings.record_passed(
                     "validation",
                     time.monotonic() - validation_started,

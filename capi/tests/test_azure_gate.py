@@ -362,6 +362,11 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             "revision": "revision",
             "records": [
                 {
+                    "phase": "worker-identity-verification",
+                    "status": "passed",
+                    "seconds": 1.0,
+                },
+                {
                     "phase": "worker-instance-deletion",
                     "status": "passed",
                     "seconds": 1.0,
@@ -380,6 +385,7 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 "revision",
             ),
             {
+                "worker-identity-verification",
                 "worker-instance-deletion",
                 "worker-instance-deletion-started",
                 "gate-operation:operation-1",
@@ -408,6 +414,11 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             "specificationSha256": "spec-sha",
             "revision": "revision",
             "records": [
+                {
+                    "phase": "worker-identity-verification",
+                    "status": "passed",
+                    "seconds": 1.0,
+                },
                 {
                     "phase": "worker-instance-deletion",
                     "status": "passed",
@@ -552,6 +563,7 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                     "seconds": 1.0,
                 }
                 for phase in (
+                    "worker-identity-verification",
                     "worker-instance-deletion",
                     "worker-recovery",
                     "worker-identity-refresh",
