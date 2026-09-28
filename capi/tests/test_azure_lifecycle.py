@@ -206,7 +206,7 @@ class AzurePhaseFourTests(AzureFixtureMixin, unittest.TestCase):
                 return_value=(FOUNDATION, True, ()),
             ),
             patch("scripts.lib.azure.lifecycle._get_management_resource", return_value=None),
-            patch("scripts.lib.azure.lifecycle._json", return_value=[]),
+            patch("scripts.lib.azure.deletion._json", return_value=[]),
         ):
             status = adapter.status(root, "missing")
         after = sorted(path.relative_to(root) for path in root.rglob("*"))
@@ -232,7 +232,7 @@ class AzurePhaseFourTests(AzureFixtureMixin, unittest.TestCase):
                 return_value=(FOUNDATION, True, ()),
             ),
             patch("scripts.lib.azure.lifecycle._get_management_resource", return_value=None),
-            patch("scripts.lib.azure.lifecycle._json", return_value=[]),
+            patch("scripts.lib.azure.deletion._json", return_value=[]),
         ):
             status = adapter.status(root, "missing")
         self.assertEqual(status.classification, "ownership-invalid")
@@ -418,7 +418,7 @@ class AzurePhaseFiveTests(AzureFixtureMixin, unittest.TestCase):
                 return_value=(FOUNDATION, True, ()),
             ),
             patch("scripts.lib.azure.lifecycle._get_management_resource", return_value=None),
-            patch("scripts.lib.azure.lifecycle._json", return_value=[]),
+            patch("scripts.lib.azure.deletion._json", return_value=[]),
         ):
             status = adapter.authoritative_absence(root, spec.name)
         self.assertEqual(status.classification, "absent")
