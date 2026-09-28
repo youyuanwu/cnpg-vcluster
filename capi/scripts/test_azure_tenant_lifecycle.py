@@ -434,6 +434,11 @@ def _complete_prior_gate_attempt(
     attempt_id = _gate_attempt_id(phases)
     path = evidence_dir / f"lifecycle-{attempt_id}.json"
     payload = json.loads(read_private_file(path))
+    if (
+        payload.get("operationId") != attempt_id
+        or path.stem != f"lifecycle-{attempt_id}"
+    ):
+        raise RuntimeError("Azure lifecycle gate attempt identity changed")
     records = payload["records"]
     passed = {
         record.get("phase")
@@ -879,12 +884,17 @@ def main(arguments: list[str]) -> int:
                     "ready": recovered,
                 }
             )
-            if dict(identity.observed) != observed:
+            if dict(identity.observed) == baseline_observed:
                 runtime.compare_and_replace_identity(identity, observed)
-            elif runtime.load_ready_evidence().get("observed") != observed:
-                raise RuntimeError(
-                    "Azure worker Ready evidence changed during recovery"
-                )
+            else:
+                if dict(identity.observed) != observed:
+                    raise RuntimeError(
+                        "Azure worker identity changed after recovery"
+                    )
+                if runtime.load_ready_evidence().get("observed") != observed:
+                    raise RuntimeError(
+                        "Azure worker Ready evidence changed during recovery"
+                    )
             runtime.write_ready_evidence(ready_payload)
 
         skip_failure_injection = False
