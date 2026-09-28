@@ -330,6 +330,13 @@ def _require_authenticated_worker_deletion(phases: set[str]) -> None:
         )
 
 
+def _incompatible_existing_identity(runtime: TenantRuntime, spec):
+    if not runtime.identity_exists():
+        return None
+    identity = runtime.load_identity()
+    return identity if identity.specification_sha256 != spec.sha256() else None
+
+
 def main(arguments: list[str]) -> int:
     os.umask(0o077)
     revision = run(
@@ -463,21 +470,19 @@ def main(arguments: list[str]) -> int:
                         _require_status(spec.name, "absent"),
                     ),
                 )
-        if runtime.identity_exists():
-            existing_identity = runtime.load_identity()
-            if existing_identity.specification_sha256 != spec.sha256():
-                phase(
-                    "delete-incompatible-existing-tenant",
-                    lambda: (
-                        _tenant_command(
-                            "delete",
-                            "azure",
-                            spec.name,
-                            f"azure/{spec.name}",
-                        ),
-                        _require_status(spec.name, "absent"),
+        if _incompatible_existing_identity(runtime, spec) is not None:
+            phase(
+                "delete-incompatible-existing-tenant",
+                lambda: (
+                    _tenant_command(
+                        "delete",
+                        "azure",
+                        spec.name,
+                        f"azure/{spec.name}",
                     ),
-                )
+                    _require_status(spec.name, "absent"),
+                ),
+            )
         prior_gate = _incomplete_gate_records(
             evidence.parent,
             spec.name,

@@ -13,6 +13,7 @@ from scripts.lib.azure.gate import (
 from scripts.lib.files import write_private_file
 from scripts.lib.tenant_runtime import TenantRuntimeError
 from scripts.test_azure_tenant_lifecycle import (
+    _incompatible_existing_identity,
     _incomplete_gate_records,
     _require_authenticated_worker_deletion,
 )
@@ -332,6 +333,38 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 "worker-instance-deletion-started",
                 "worker-instance-deletion",
             }
+        )
+
+    def test_unrelated_historical_evidence_is_ignored(self):
+        root = self.make_root()
+        evidence = root / ".runtime" / "azure-gate" / "evidence"
+        write_private_file(
+            evidence / "lifecycle-old.json",
+            json.dumps({"legacy": True}),
+        )
+        self.assertIsNone(
+            _incomplete_gate_records(
+                evidence,
+                "tenant-c",
+                "spec-sha",
+                "current-revision",
+            )
+        )
+
+    def test_incompatible_existing_tenant_is_selected_for_cleanup(self):
+        root = self.make_root()
+        old_spec = self.spec(workers=1)
+        runtime, journal = self.start_journal(root, old_spec)
+        runtime.complete_create(
+            runtime.load_operation(),
+            old_spec,
+            {"markerOperationId": journal.operation_id},
+        )
+        self.assertIsNotNone(
+            _incompatible_existing_identity(runtime, self.spec(workers=3))
+        )
+        self.assertIsNone(
+            _incompatible_existing_identity(runtime, old_spec)
         )
 
     def test_live_gate_recipe_exists_but_is_not_invoked_by_tests(self):

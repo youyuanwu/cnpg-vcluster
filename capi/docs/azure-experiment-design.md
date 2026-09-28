@@ -144,7 +144,7 @@ The default compute profile minimizes cost:
 |---|---|
 | AKS pricing tier | Free |
 | AKS system node pool | Two `Standard_D4as_v5` nodes |
-| Tenant VMSS | `Standard_B2s`, initially one instance and later three |
+| Tenant VMSS | Three `Standard_B2s` instances |
 
 The AKS Free tier removes the cluster-management charge and provides no
 financially backed uptime SLA. The underlying system-node VMs, disks,
@@ -502,7 +502,7 @@ The proposed interface remains `just`:
 | `just tenant-create azure <spec.json>` | Create the explicitly selected Kamaji control plane and VMSS-backed worker pool, install tenant add-ons, and persist exact tenant identities. |
 | `just tenant-status azure <tenant>` | Report one tenant through the provider-neutral status envelope, separately from foundation health. |
 | `just tenant-delete azure <tenant> azure/<tenant>` | Delete the exact tenant through CAPI/CAPZ after explicit confirmation and verify canonical absence plus foundation preservation. |
-| `just azure-test-tenant-lifecycle` | Destructively prove create, Ready, targeted delete, absence, foundation preservation, and recreation for the example tenant. |
+| `just azure-test-tenant-lifecycle` | Destructively prove three-worker readiness, exact non-primary VMSS instance replacement, targeted tenant deletion, absence, foundation preservation, and recreation. |
 | `just azure-destroy` | Delete the entire recorded Azure foundation resource group. |
 
 The implementation reuses the repository's `just` interface, Python

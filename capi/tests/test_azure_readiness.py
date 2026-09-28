@@ -16,6 +16,7 @@ from scripts.lib.azure.common import (
 )
 from scripts.lib.azure.readiness import (
     _capture_tenant_kubeconfig,
+    _capture_vmss_identities,
     _collect_ready_observations,
     _retain_external_control_plane_lb,
     _tenant_spec_blockers,
@@ -25,10 +26,12 @@ from scripts.lib.azure.readiness import (
     _wait_worker_registered,
 )
 from scripts.lib.azure.rendering import (
+    _azure_tags,
     _render_addon_job,
     _render_tenant_control_plane,
     _render_worker_pool,
 )
+from scripts.lib.azure.contracts import _expected_tenant_markers
 from scripts.lib.files import write_private_file
 from scripts.lib.tenant_runtime import TenantRuntime, foundation_sha256
 from scripts.lib.tenant_timing import TenantTimings
@@ -41,6 +44,45 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzureReadinessTests(AzureFixtureMixin, unittest.TestCase):
+    def test_vmss_capture_validates_canonical_tags_and_instances(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        spec = self.spec(workers=3)
+        runtime, journal = self.start_journal(root, spec)
+        vmss_id = (
+            "/subscriptions/x/resourceGroups/yy-cv-rg/providers/"
+            "Microsoft.Compute/virtualMachineScaleSets/tenant-c-worker"
+        )
+        tags = _azure_tags(_expected_tenant_markers(spec, journal))
+        instances = [
+            {"id": f"{vmss_id}/virtualMachines/{identifier}", "instanceId": str(identifier)}
+            for identifier in range(3)
+        ]
+        with (
+            patch(
+                "scripts.lib.azure.readiness._az",
+                return_value=completed(
+                    json.dumps({"id": vmss_id, "tags": tags})
+                ),
+            ),
+            patch(
+                "scripts.lib.azure.readiness._json",
+                return_value=instances,
+            ),
+        ):
+            updated = _capture_vmss_identities(
+                root,
+                config,
+                spec,
+                runtime,
+                journal,
+            )
+        self.assertEqual(updated.observed["vmssId"], vmss_id)
+        self.assertEqual(
+            len(json.loads(updated.observed["vmssInstanceIds"])),
+            3,
+        )
+
     def test_external_control_plane_retention_uses_canonical_markers(self):
         root = self.make_root()
         spec = self.spec()
