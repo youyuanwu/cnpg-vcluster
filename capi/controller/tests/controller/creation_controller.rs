@@ -7,7 +7,10 @@ use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
 use kube::{ResourceExt, core::DynamicObject, runtime::controller::Action};
 use serde_json::{Value, json};
 use tenant_controller::{
-    api::{Tenant, TenantStatus, canonical_spec, spec_hash},
+    api::{
+        Tenant, TenantPhase, TenantProviderSpec, TenantProviderStatus, TenantStatus,
+        canonical_spec, spec_hash,
+    },
     docker::{DockerContainer, WORKER_CLUSTER_LABEL, WORKER_ROLE_LABEL},
     foundation::{Foundation, FoundationError, canonical_hash, parse_runtime},
     management,
@@ -291,6 +294,41 @@ async fn invalid_spec_has_no_foundation_or_external_calls() {
 }
 
 #[tokio::test]
+async fn valid_azure_spec_stops_before_finalizer_or_local_dependencies() {
+    let fixture = Fixture::new(true);
+    let mut tenant = fixture.current();
+    tenant.spec.provider = TenantProviderSpec::Azure {
+        pod_cidr: "10.244.0.0/16".into(),
+        service_cidr: "10.96.0.0/16".into(),
+    };
+    fixture.management.insert(TENANT, tenant);
+    fixture.step().await;
+    let current = fixture.current();
+    assert!(current.finalizers().is_empty());
+    let status = current.status.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Failed));
+    assert_eq!(status.provider, Some(TenantProviderStatus::Azure));
+    for condition_type in ["Accepted", "Ready"] {
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .find(|condition| condition.type_ == condition_type)
+                .unwrap()
+                .reason,
+            "ProviderUnsupported"
+        );
+    }
+    assert_eq!(
+        fixture.management.calls().len(),
+        2,
+        "Azure status must be the only mutation"
+    );
+    assert!(fixture.workload.calls().is_empty());
+    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn validation_uses_runtime_supported_version_not_a_compiled_literal() {
     let mut fixture = Fixture::new(false);
     fixture.reconciler.config.supported_version = "1.36.5".into();
@@ -343,6 +381,8 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
             .status
             .as_ref()
             .unwrap()
+            .local()
+            .unwrap()
             .foundation_hash
             .as_deref(),
         Some(fixture.hash.as_str())
@@ -362,6 +402,8 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
             .current()
             .status
             .as_ref()
+            .unwrap()
+            .local()
             .unwrap()
             .allocation
             .is_some()
@@ -387,6 +429,8 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
             .status
             .as_ref()
             .unwrap()
+            .local()
+            .unwrap()
             .cluster_uid
             .is_none()
     );
@@ -397,6 +441,8 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
             .current()
             .status
             .as_ref()
+            .unwrap()
+            .local()
             .unwrap()
             .cluster_uid
             .is_some()
@@ -479,7 +525,12 @@ async fn foundation_replacement_never_adds_finalizer_or_claims() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.current();
     tenant.status = Some(TenantStatus {
-        foundation_hash: Some("old-foundation".into()),
+        provider: Some(tenant_controller::api::TenantProviderStatus::Local(
+            tenant_controller::api::LocalProviderStatus {
+                foundation_hash: Some("old-foundation".into()),
+                ..Default::default()
+            },
+        )),
         ..Default::default()
     });
     fixture.management.insert(TENANT, tenant);

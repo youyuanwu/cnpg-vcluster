@@ -60,15 +60,16 @@ def _converging(
     if tenant is None:
         return None
     status = tenant.get("status") or {}
+    provider = status.get("provider") or {}
     if status.get("phase") in {"Failed", "OwnershipInvalid"}:
         raise RuntimeError(
             f"convergence Tenant failed: {json.dumps(status, sort_keys=True)}"
         )
     if not all(
         (
-            status.get("allocation"),
-            status.get("foundationHash"),
-            status.get("clusterUID"),
+            provider.get("allocation"),
+            provider.get("foundationHash"),
+            provider.get("clusterUID"),
         )
     ):
         return None
@@ -180,9 +181,9 @@ def main() -> None:
                     f"{exc}; last Tenant status: "
                     f"{json.dumps(status, sort_keys=True)}"
                 ) from exc
-            allocation = first["status"]["allocation"]
+            allocation = first["status"]["provider"]["allocation"]
             lease = verify_allocation_lease(config, client, first)
-            cluster_uid = first["status"]["clusterUID"]
+            cluster_uid = first["status"]["provider"]["clusterUID"]
             volume = _volume_name(config)
             client.kubectl(
                 "apply",
@@ -200,8 +201,8 @@ def main() -> None:
                 lambda: _converging(client, config),
             )
             if (
-                second["status"]["allocation"] != allocation
-                or second["status"]["clusterUID"] != cluster_uid
+                second["status"]["provider"]["allocation"] != allocation
+                or second["status"]["provider"]["clusterUID"] != cluster_uid
                 or verify_allocation_lease(config, client, second) != lease
             ):
                 raise RuntimeError("idempotent convergence changed stable identity")

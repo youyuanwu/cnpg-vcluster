@@ -42,7 +42,10 @@ def verify_api_boundaries(client, config) -> None:
     for field in ("workers", "databases"):
         for value in (0, 4, -1, True, 1.5, "1", None):
             document = copy.deepcopy(probe)
-            document["spec"][field] = value
+            if field == "workers":
+                document["spec"]["workers"] = value
+            else:
+                document["spec"]["provider"]["databases"] = value
             result = client.kubectl(
                 "create", "--dry-run=server", "--validate=strict", "-f", "-",
                 input_text=json.dumps(document), check=False,
@@ -61,7 +64,8 @@ def verify_api_boundaries(client, config) -> None:
     for version in (config["KUBERNETES_VERSION"].removeprefix("v"),
                     "v" + config["KUBERNETES_VERSION"].removeprefix("v"), "0.0.0"):
         document = copy.deepcopy(probe)
-        document["spec"].update(kubernetesVersion=version, workers=3, databases=3)
+        document["spec"].update(kubernetesVersion=version, workers=3)
+        document["spec"]["provider"]["databases"] = 3
         client.kubectl("create", "--dry-run=server", "--validate=strict", "-f", "-",
                        input_text=json.dumps(document))
     print("live CEL/count/version and Warn/Ignore/Strict API boundaries passed", flush=True)
@@ -153,7 +157,10 @@ def run_allocation_gate(root, config, client) -> None:
             claims[name] = verify_allocation_lease(config, client, document)
             _assert_no_external_state(client, config, name)
         for field in ("slotId", "endpoint", "podCIDR", "serviceCIDR"):
-            if len({document["status"]["allocation"][field] for document in documents}) != len(names):
+            if len({
+                document["status"]["provider"]["allocation"][field]
+                for document in documents
+            }) != len(names):
                 raise RuntimeError(f"concurrent Tenants share {field}")
 
         controller_replicas(client, config, 0)
@@ -164,7 +171,7 @@ def run_allocation_gate(root, config, client) -> None:
                 "patch", f"tenant/{document['metadata']['name']}", "--subresource=status",
                 "--type=json", "-p", json.dumps([
                     {"op": "test", "path": "/metadata/uid", "value": document["metadata"]["uid"]},
-                    {"op": "remove", "path": "/status/allocation"},
+                    {"op": "remove", "path": "/status/provider/allocation"},
                     {"op": "replace", "path": "/status/phase", "value": "Pending"},
                 ]),
             )
@@ -215,7 +222,10 @@ def run_allocation_gate(root, config, client) -> None:
         apply_tenant_document(client, unsupported)
         controller_replicas(client, config, 1)
         rejected = _phase(client, config, "allocation-version", "Failed")
-        if rejected.get("status", {}).get("allocation") or rejected["metadata"].get("finalizers"):
+        if (
+            rejected.get("status", {}).get("provider", {}).get("allocation")
+            or rejected["metadata"].get("finalizers")
+        ):
             raise RuntimeError("unsupported version acquired managed resources")
         _assert_no_external_state(client, config, "allocation-version")
         client.kubectl("delete", "tenant/allocation-version", "--wait=true")

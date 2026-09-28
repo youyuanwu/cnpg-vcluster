@@ -36,17 +36,20 @@ def tenant_document() -> dict[str, object]:
         "spec": {
             "kubernetesVersion": "1.36.4",
             "workers": 2,
-            "databases": 3,
+            "provider": {"type": "local", "databases": 3},
         },
         "status": {
-            "allocation": {
-                "slotId": "slot-0",
-                "endpoint": "172.18.255.10",
-                "podCIDR": "10.73.0.0/16",
-                "serviceCIDR": "10.143.0.0/16",
+            "provider": {
+                "type": "local",
+                "allocation": {
+                    "slotId": "slot-0",
+                    "endpoint": "172.18.255.10",
+                    "podCIDR": "10.73.0.0/16",
+                    "serviceCIDR": "10.143.0.0/16",
+                },
+                "foundationHash": "foundation",
+                "clusterUID": "cluster-uid",
             },
-            "foundationHash": "foundation",
-            "clusterUID": "cluster-uid",
         },
     }
 
@@ -119,12 +122,12 @@ class ControllerScenarioTests(unittest.TestCase):
     def test_spec_hash_matches_rust_canonical_contract(self) -> None:
         document = tenant_document()
         expected = hashlib.sha256(
-            b'{"kubernetesVersion":"1.36.4","workers":2,"databases":3}'
+            b'{"kubernetesVersion":"1.36.4","workers":2,"provider":{"type":"local","databases":3}}'
         ).hexdigest()
         self.assertEqual(expected, tenant_spec_hash(document))
         document["spec"]["kubernetesVersion"] = "v1.36.4"
         self.assertEqual(expected, tenant_spec_hash(document))
-        document["status"]["allocation"]["podCIDR"] = "10.99.0.0/16"
+        document["status"]["provider"]["allocation"]["podCIDR"] = "10.99.0.0/16"
         self.assertEqual(expected, tenant_spec_hash(document))
 
     def test_spec_networks_are_never_allocation_fallbacks(self) -> None:
@@ -132,7 +135,7 @@ class ControllerScenarioTests(unittest.TestCase):
         document["spec"].update(podCIDR="10.1.0.0/16", serviceCIDR="10.2.0.0/16")
         with self.assertRaisesRegex(RuntimeError, "v1alpha2"):
             tenant_spec_hash(document)
-        del document["status"]["allocation"]
+        del document["status"]["provider"]["allocation"]
         with self.assertRaisesRegex(RuntimeError, "allocation"):
             tenant_allocation(document)
 
@@ -145,7 +148,7 @@ class ControllerScenarioTests(unittest.TestCase):
         ):
             with self.subTest(field=field, value=value):
                 document = tenant_document()
-                document["status"]["allocation"][field] = value
+                document["status"]["provider"]["allocation"][field] = value
                 with self.assertRaisesRegex(RuntimeError, "allocation"):
                     tenant_allocation(document)
 

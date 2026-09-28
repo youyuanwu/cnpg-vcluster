@@ -538,7 +538,11 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         delete.assert_called_once()
 
     def test_api_gate_checks_cel_unknown_fields_and_status_using_server_dry_runs(self):
-        spec = {"kubernetesVersion": "1.36.4", "workers": 1, "databases": 1}
+        spec = {
+            "kubernetesVersion": "1.36.4",
+            "workers": 1,
+            "provider": {"type": "local", "databases": 1},
+        }
 
         def handle(*args, **kwargs):
             if "get" in args:
@@ -550,9 +554,12 @@ class CurrentControllerPackagingTests(unittest.TestCase):
                 incoming = value["spec"]
                 if value["metadata"]["name"] == "invalid.name":
                     return response(code=1, error="Invalid: Tenant name")
-                for field, invalid in (("workers", 0), ("databases", 4), ("kubernetesVersion", "bad")):
-                    if incoming[field] == invalid:
-                        return response(code=1, error=f"Invalid {field}")
+                if incoming["workers"] == 0:
+                    return response(code=1, error="Invalid workers")
+                if incoming["provider"]["databases"] == 4:
+                    return response(code=1, error="Invalid databases")
+                if incoming["kubernetesVersion"] == "bad":
+                    return response(code=1, error="Invalid kubernetesVersion")
                 if "unexpected" in incoming and "--validate=strict" in args:
                     return response(code=1, error="unknown field")
                 value.pop("status", None)

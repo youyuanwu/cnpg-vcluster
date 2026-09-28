@@ -33,6 +33,7 @@ use crate::{
 pub use crate::foundation::FoundationInputs as Inputs;
 
 /// Caller supplies the validated Tenant/spec, allocated network, and live mount.
+#[rustfmt::skip]
 #[derive(Clone, Debug)]
 pub struct Context<'a> {
     pub tenant: &'a Tenant,
@@ -41,8 +42,7 @@ pub struct Context<'a> {
     pub foundation_hash: &'a str,
     /// Allocated host:port, with brackets for IPv6.
     pub endpoint: &'a str,
-    pub pod_cidr: &'a str,
-    pub service_cidr: &'a str,
+    pub pod_cidr: &'a str, pub service_cidr: &'a str, pub database_count: i32,
     /// The inspected Docker volume mountpoint, never a constructed host path.
     pub volume_path: &'a str,
     pub worker_bootstrap_commands: &'a [String],

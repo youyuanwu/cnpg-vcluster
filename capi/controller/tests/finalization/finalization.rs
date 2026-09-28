@@ -11,8 +11,8 @@ use serde_json::{Value, json};
 use tenant_controller::{
     allocation::{ClaimContext, new_lease},
     api::{
-        SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase, TenantSpec, TenantStatus,
-        canonical_spec, spec_hash,
+        LocalProviderStatus, SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase,
+        TenantProviderStatus, TenantSpec, TenantStatus, canonical_spec, spec_hash,
     },
     docker::{DockerClient, DockerContainer, DockerError, DockerNetwork, DockerVolume},
     error::ControllerError,
@@ -45,14 +45,7 @@ fn fixture() -> (Arc<RuntimeFoundation>, String, AllocationSlot) {
 }
 
 fn tenant(hash: &str) -> Tenant {
-    let mut tenant = Tenant::new(
-        NAME,
-        TenantSpec {
-            kubernetes_version: "1.36.4".into(),
-            workers: 1,
-            databases: 1,
-        },
-    );
+    let mut tenant = Tenant::new(NAME, TenantSpec::local("1.36.4", 1, 1));
     tenant.metadata.uid = Some(UID.into());
     tenant.metadata.resource_version = Some("1".into());
     tenant.metadata.generation = Some(1);
@@ -61,7 +54,10 @@ fn tenant(hash: &str) -> Tenant {
         Some(serde_json::from_value(json!("2026-09-25T00:00:00Z")).unwrap());
     tenant.status = Some(TenantStatus {
         phase: Some(TenantPhase::Deleting),
-        foundation_hash: Some(hash.into()),
+        provider: Some(TenantProviderStatus::Local(LocalProviderStatus {
+            foundation_hash: Some(hash.into()),
+            ..Default::default()
+        })),
         ..Default::default()
     });
     tenant
@@ -278,8 +274,20 @@ async fn empty_partial_tenant_removes_only_status_and_finalizer() {
 async fn exact_cluster_namespace_and_lease_are_deleted_in_order() {
     let (foundation, hash, slot) = fixture();
     let mut tenant = tenant(&hash);
-    tenant.status.as_mut().unwrap().cluster_uid = Some("cluster-uid".into());
-    tenant.status.as_mut().unwrap().allocation = Some((&slot).into());
+    tenant
+        .status
+        .as_mut()
+        .unwrap()
+        .local_mut()
+        .unwrap()
+        .cluster_uid = Some("cluster-uid".into());
+    tenant
+        .status
+        .as_mut()
+        .unwrap()
+        .local_mut()
+        .unwrap()
+        .allocation = Some((&slot).into());
     let server = server(&tenant);
     let cluster = root(&hash);
     server.insert(&path(&cluster), cluster);
@@ -305,12 +313,9 @@ async fn exact_cluster_namespace_and_lease_are_deleted_in_order() {
             && call.body["propagationPolicy"] == "Background"
     }));
     assert!(server.calls().iter().any(|call| {
-        let status = call.body["status"].as_object();
         call.method == "PATCH"
             && call.path == format!("{TENANT_PATH}/status")
-            && status.is_some_and(|status| {
-                status.contains_key("allocation") && status["allocation"].is_null()
-            })
+            && call.body["status"]["provider"]["allocation"].is_null()
     }));
 }
 
@@ -402,7 +407,13 @@ async fn discovery_failure_and_successor_race_retain_finalizer() {
     let (foundation, hash, slot) = fixture();
     for discovery_failure in [false, true] {
         let mut original = tenant(&hash);
-        original.status.as_mut().unwrap().allocation = Some((&slot).into());
+        original
+            .status
+            .as_mut()
+            .unwrap()
+            .local_mut()
+            .unwrap()
+            .allocation = Some((&slot).into());
         let server = server(&original);
         let old = lease(&hash, &slot);
         let lease_path = format!("{LEASES}/{}", old.name_any());
@@ -443,7 +454,16 @@ async fn discovery_failure_and_successor_race_retain_finalizer() {
         }
         let current: Tenant = serde_json::from_value(server.get(TENANT_PATH)).unwrap();
         assert!(current.finalizers().iter().any(|value| value == FINALIZER));
-        assert!(current.status.as_ref().unwrap().allocation.is_some());
+        assert!(
+            current
+                .status
+                .as_ref()
+                .unwrap()
+                .local()
+                .unwrap()
+                .allocation
+                .is_some()
+        );
         assert!(server.calls().iter().all(|call| call.method != "DELETE"));
     }
 }
@@ -452,7 +472,13 @@ async fn discovery_failure_and_successor_race_retain_finalizer() {
 async fn successor_between_initial_and_release_lists_requires_next_pass() {
     let (foundation, hash, slot) = fixture();
     let mut original = tenant(&hash);
-    original.status.as_mut().unwrap().allocation = Some((&slot).into());
+    original
+        .status
+        .as_mut()
+        .unwrap()
+        .local_mut()
+        .unwrap()
+        .allocation = Some((&slot).into());
     let server = server(&original);
     let old = lease(&hash, &slot);
     let lease_path = format!("{LEASES}/{}", old.name_any());
@@ -479,7 +505,16 @@ async fn successor_between_initial_and_release_lists_requires_next_pass() {
     .await
     .unwrap();
     let current: Tenant = serde_json::from_value(server.get(TENANT_PATH)).unwrap();
-    assert!(current.status.as_ref().unwrap().allocation.is_some());
+    assert!(
+        current
+            .status
+            .as_ref()
+            .unwrap()
+            .local()
+            .unwrap()
+            .allocation
+            .is_some()
+    );
     assert!(current.finalizers().iter().any(|value| value == FINALIZER));
     assert!(server.calls().iter().all(|call| call.method != "DELETE"));
 }

@@ -50,7 +50,7 @@ async fn patch_status(
     let mut status = serde_json::to_value(status)
         .map_err(|error| ControllerError::InvalidInput(error.to_string()))?;
     if clear_allocation {
-        status["allocation"] = Value::Null;
+        status["provider"]["allocation"] = Value::Null;
     }
     let updated = Api::<Tenant>::all(client)
         .patch_status(
@@ -160,7 +160,7 @@ pub async fn replace_status(
 ) -> Result<(), ControllerError> {
     if (current.status.as_ref() == Some(status)
         || (current.status.is_none() && status == &TenantStatus::default()))
-        && (!clear_allocation || status.allocation.is_none())
+        && (!clear_allocation || status.allocation().is_none())
     {
         return Ok(());
     }

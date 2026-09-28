@@ -194,7 +194,12 @@ async fn dynamic_objects_without_uid_or_resource_version_never_receive_apply() {
 async fn management_cluster_never_recreates_a_bound_root_and_refuses_uid_or_owner_changes() {
     let mut tenant = tenant();
     tenant.status = Some(tenant_controller::api::TenantStatus {
-        cluster_uid: Some("tenant-a-uid".into()),
+        provider: Some(tenant_controller::api::TenantProviderStatus::Local(
+            tenant_controller::api::LocalProviderStatus {
+                cluster_uid: Some("tenant-a-uid".into()),
+                ..Default::default()
+            },
+        )),
         ..Default::default()
     });
     let desired = object(

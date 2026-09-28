@@ -23,7 +23,8 @@ use kube::{
 use crate::{
     allocation::{self, ClaimContext},
     api::{
-        CanonicalSpec, SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase, canonical_spec, spec_hash,
+        CanonicalSpec, SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase, TenantProviderSpec,
+        TenantProviderStatus, canonical_spec, spec_hash,
     },
     docker::{BollardDockerClient, DockerClient, validate_volume},
     error::{ControllerError, ErrorClass},
@@ -41,7 +42,6 @@ pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEPENDENCY_INTERVAL: Duration = Duration::from_secs(5);
 pub const READY_INTERVAL: Duration = Duration::from_secs(300);
 pub const STORAGE_CLASS: &str = "capi-hostpath";
-
 #[derive(Clone, Debug)]
 pub struct Config {
     pub supported_version: String,
@@ -135,14 +135,12 @@ impl Reconciler {
 }
 
 impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
+    #[rustfmt::skip]
     pub async fn reconcile_name(&self, name: &str) -> Result<Action, ReconcileError> {
-        let Some(tenant) = Api::<Tenant>::all(self.client.clone())
-            .get_opt(name)
-            .await?
-        else {
-            return Ok(Action::await_change());
-        };
-        let spec = match canonical_spec(name, &tenant.spec, &self.config.supported_version) {
+        let Some(tenant) = Api::<Tenant>::all(self.client.clone()).get_opt(name).await? else { return Ok(Action::await_change()); };
+        let spec = match canonical_spec(name, &tenant.spec, &self.config.supported_version)
+            .and_then(|spec| crate::api::validate_provider_status(&spec, tenant.status.as_ref()).map(|()| spec))
+        {
             Ok(spec) => spec,
             Err(error) => {
                 status::update_status(self.client.clone(), &tenant, |status| {
@@ -169,6 +167,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                 return Ok(Action::await_change());
             }
         };
+        if matches!(spec.provider, TenantProviderSpec::Azure { .. }) { status::update_status(self.client.clone(), &tenant, |status| { status.provider = Some(TenantProviderStatus::Azure); status.phase = Some(TenantPhase::Failed); for condition in ["Accepted", "Ready"] { set_condition(status, &tenant, condition, false, "ProviderUnsupported", "Azure provider reconciliation is not implemented"); } Ok(()) }).await?; return Ok(Action::await_change()); }
         if tenant.metadata.deletion_timestamp.is_some() {
             if !tenant.finalizers().iter().any(|value| value == FINALIZER) {
                 return Ok(Action::await_change());
@@ -195,7 +194,6 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
             Err(error) => self.failure(&tenant, error).await,
         }
     }
-
     async fn failure(
         &self,
         tenant: &Tenant,
@@ -287,15 +285,13 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
         Ok(Action::requeue(interval))
     }
 
-    async fn create(
-        &self,
-        tenant: &Tenant,
-        spec: &CanonicalSpec,
-    ) -> Result<Action, ReconcileError> {
+    #[rustfmt::skip]
+    async fn create(&self, tenant: &Tenant, spec: &CanonicalSpec) -> Result<Action, ReconcileError> {
+        let database_count = spec.local_databases().ok_or_else(|| ReconcileError::InvalidInput("azure provider is not supported by this controller".into()))?;
         let recorded_hash = tenant
             .status
             .as_ref()
-            .and_then(|status| status.foundation_hash.as_deref());
+            .and_then(|status| status.foundation_hash());
         let foundation = self.foundation.creation(recorded_hash)?;
         let foundation_hash = &self.foundation.hash;
         if status::set_finalizer(self.client.clone(), tenant, tenant, FINALIZER, true).await? {
@@ -304,11 +300,12 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
         if tenant
             .status
             .as_ref()
-            .and_then(|status| status.foundation_hash.as_deref())
+            .and_then(|status| status.foundation_hash())
             .is_none_or(str::is_empty)
         {
             status::update_status(self.client.clone(), tenant, |status| {
-                if status
+                let local = status.local_mut()?;
+                if local
                     .foundation_hash
                     .as_deref()
                     .is_some_and(|hash| !hash.is_empty() && hash != foundation_hash)
@@ -317,7 +314,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                         "foundation binding changed".into(),
                     ));
                 }
-                status.foundation_hash = Some(foundation_hash.clone());
+                local.foundation_hash = Some(foundation_hash.clone());
                 readiness::progress_status(status, tenant);
                 Ok(())
             })
@@ -342,18 +339,19 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
             tenant
                 .status
                 .as_ref()
-                .and_then(|status| status.allocation.as_ref()),
+                .and_then(|status| status.allocation()),
         )
         .await?;
         if tenant
             .status
             .as_ref()
-            .and_then(|status| status.allocation.as_ref())
+            .and_then(|status| status.allocation())
             .is_none()
         {
             status::update_status(self.client.clone(), tenant, |status| {
                 let allocation = claim.status();
-                if status
+                let local = status.local_mut()?;
+                if local
                     .allocation
                     .as_ref()
                     .is_some_and(|bound| bound != &allocation)
@@ -362,7 +360,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                         "allocation binding changed".into(),
                     ));
                 }
-                status.allocation = Some(allocation);
+                local.allocation = Some(allocation);
                 readiness::progress_status(status, tenant);
                 Ok(())
             })
@@ -378,6 +376,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
             endpoint: &endpoint,
             pod_cidr: &claim.slot.pod_cidr,
             service_cidr: &claim.slot.service_cidr,
+            database_count,
             volume_path: "",
             worker_bootstrap_commands: &[],
             inputs: &foundation.inputs,
@@ -404,7 +403,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
         if tenant
             .status
             .as_ref()
-            .and_then(|status| status.cluster_uid.as_deref())
+            .and_then(|status| status.cluster_uid())
             .is_none_or(str::is_empty)
         {
             let cluster_uid = cluster
@@ -412,7 +411,8 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                 .uid()
                 .ok_or_else(|| ReconcileError::OwnershipInvalid("Cluster UID is missing".into()))?;
             status::update_status(self.client.clone(), tenant, |status| {
-                if status
+                let local = status.local_mut()?;
+                if local
                     .cluster_uid
                     .as_deref()
                     .is_some_and(|uid| !uid.is_empty() && uid != cluster_uid)
@@ -421,7 +421,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                         "Cluster UID binding changed".into(),
                     ));
                 }
-                status.cluster_uid = Some(cluster_uid.clone());
+                local.cluster_uid = Some(cluster_uid.clone());
                 readiness::progress_status(status, tenant);
                 Ok(())
             })
@@ -471,7 +471,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
             None => self.docker.create_volume(&volume_name, &labels).await?,
         };
         validate_volume(&volume, &volume_name, &labels)?;
-        let commands = resources::worker_bootstrap_commands(foundation.into(), spec.databases)?;
+        let commands = resources::worker_bootstrap_commands(foundation.into(), database_count)?;
         context.volume_path = &volume.mountpoint;
         context.worker_bootstrap_commands = &commands;
         for desired in [
@@ -604,7 +604,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
         if database.created {
             return self.progress(context.tenant, PROGRESS_INTERVAL).await;
         }
-        let database_ready = readiness::database_ready(&database.object, context.spec.databases);
+        let database_ready = readiness::database_ready(&database.object, context.database_count);
         if !database_ready {
             return self.progress(context.tenant, DEPENDENCY_INTERVAL).await;
         }

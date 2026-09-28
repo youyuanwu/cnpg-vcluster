@@ -5,4 +5,6 @@ metadata:
 spec:
   kubernetesVersion: 1.36.4
   workers: 3
-  databases: 3
+  provider:
+    type: local
+    databases: 3
