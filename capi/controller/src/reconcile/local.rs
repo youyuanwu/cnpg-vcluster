@@ -48,8 +48,8 @@ impl TenantAccess for LiveTenantAccess {
     }
 }
 #[rustfmt::skip]
-pub trait ProviderLifecycle {
-    fn supports(&self, provider: &TenantProviderSpec) -> bool; fn reconcile<'a>(&'a self, tenant: &'a Tenant, spec: &'a CanonicalSpec) -> impl Future<Output = Result<Action, ReconcileError>> + Send + 'a;
+pub trait ProviderLifecycle: Send + Sync {
+    fn supports(&self, provider: &TenantProviderSpec) -> bool; fn reconcile<'a>(&'a self, tenant: &'a Tenant, spec: &'a CanonicalSpec) -> impl Future<Output = Result<Action, ReconcileError>> + Send + 'a; fn finalize<'a>(&'a self, tenant: &'a Tenant, supported_version: &'a str) -> impl Future<Output = Result<Action, ReconcileError>> + Send + 'a;
 }
 #[rustfmt::skip]
 pub struct LocalProvider<D = BollardDockerClient, A = LiveTenantAccess> {
@@ -328,6 +328,8 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
         )
         .await
     }
+    #[rustfmt::skip]
+    async fn finalize(&self, tenant: &Tenant, supported_version: &str) -> Result<Action, ReconcileError> { crate::finalize::Finalizer::with_docker(self.client.clone(), self.docker.clone(), supported_version, self.foundation.clone()).reconcile(tenant).await.map_err(Into::into) }
 }
 impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
     #[rustfmt::skip]

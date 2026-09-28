@@ -26,8 +26,7 @@ use crate::{
     api::{
         SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase, TenantProviderStatus, canonical_spec,
     },
-    docker::{BollardDockerClient, DockerClient},
-    error::{ControllerError, ErrorClass},
+    error::ControllerError,
     foundation, management,
     readiness::{self, set_condition},
     runtime::{LeadershipGate, tenant_controller},
@@ -47,16 +46,17 @@ impl Default for Config {
     fn default() -> Self { Self { supported_version: SUPPORTED_KUBERNETES_VERSION.into() } }
 }
 #[rustfmt::skip]
-pub struct Reconciler<D = BollardDockerClient, A = local::LiveTenantAccess> {
-    pub client: Client, pub provider: LocalProvider<D, A>, pub config: Config,
+pub struct Reconciler<P = LocalProvider> {
+    pub client: Client, pub provider: P, pub config: Config,
 }
 #[rustfmt::skip]
-impl Reconciler { pub fn new(client: Client, config: Config, provider: LocalProvider) -> Self { Self { client, provider, config } } }
+impl<P> Reconciler<P> { pub fn new(client: Client, config: Config, provider: P) -> Self { Self { client, provider, config } } }
 
-impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
+impl<P: ProviderLifecycle> Reconciler<P> {
     #[rustfmt::skip]
     pub async fn reconcile_name(&self, name: &str) -> Result<Action, ReconcileError> {
         let Some(tenant) = Api::<Tenant>::all(self.client.clone()).get_opt(name).await? else { return Ok(Action::await_change()); };
+        if !self.provider.supports(&tenant.spec.provider) && tenant.metadata.deletion_timestamp.is_some() && tenant.finalizers().iter().any(|value| value == FINALIZER) { return self.unsupported_provider(&tenant).await; }
         let spec = match canonical_spec(name, &tenant.spec, &self.config.supported_version)
             .and_then(|spec| crate::api::validate_provider_status(&spec, tenant.status.as_ref()).map(|()| spec))
         {
@@ -86,25 +86,17 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
                 return Ok(Action::await_change());
             }
         };
-        if !self.provider.supports(&spec.provider) { status::update_status(self.client.clone(), &tenant, |status| { status.provider = Some(TenantProviderStatus::Azure); status.phase = Some(TenantPhase::Failed); for condition in ["Accepted", "Ready"] { set_condition(status, &tenant, condition, false, "ProviderUnsupported", "Azure provider reconciliation is not implemented"); } Ok(()) }).await?; return Ok(Action::await_change()); }
+        if !self.provider.supports(&spec.provider) { return self.unsupported_provider(&tenant).await; }
         if tenant.metadata.deletion_timestamp.is_some() {
             if !tenant.finalizers().iter().any(|value| value == FINALIZER) {
                 return Ok(Action::await_change());
             }
-            return match crate::finalize::Finalizer::with_docker(
-                self.client.clone(),
-                self.provider.docker.clone(),
-                &self.config.supported_version,
-                self.provider.foundation.clone(),
-            )
-            .reconcile(&tenant)
-            .await
-            {
+            return match self.provider.finalize(&tenant, &self.config.supported_version).await {
                 Ok(action) => Ok(action),
-                Err(error) if error.class() == ErrorClass::Conflict => {
+                Err(error) if error.conflict() => {
                     Ok(Action::requeue(PROGRESS_INTERVAL))
                 }
-                Err(error) => self.failure(&tenant, error.into()).await,
+                Err(error) => self.failure(&tenant, error).await,
             };
         }
         match self
@@ -118,6 +110,12 @@ impl<D: DockerClient + Clone, A: TenantAccess> Reconciler<D, A> {
             }
             Err(error) => self.failure(&tenant, error).await,
         }
+    }
+    #[rustfmt::skip]
+    async fn unsupported_provider(&self, tenant: &Tenant) -> Result<Action, ReconcileError> {
+        let blocked = tenant.metadata.deletion_timestamp.is_some() && tenant.finalizers().iter().any(|value| value == FINALIZER);
+        status::update_status(self.client.clone(), tenant, |status| { if !blocked || status.provider.is_none() { status.provider = Some(TenantProviderStatus::Azure); } status.phase = Some(if blocked { TenantPhase::Deleting } else { TenantPhase::Failed }); set_condition(status, tenant, "Accepted", false, "ProviderUnsupported", "Azure provider reconciliation is not implemented"); set_condition(status, tenant, "Ready", false, if blocked { "ProviderFinalizerUnsupported" } else { "ProviderUnsupported" }, if blocked { "Azure provider carries the controller finalizer; deletion is blocked because Azure lifecycle is not implemented" } else { "Azure provider reconciliation is not implemented" }); Ok(()) }).await?;
+        Ok(Action::await_change())
     }
     async fn failure(
         &self,
@@ -251,13 +249,13 @@ pub fn controller(client: Client, _config: &Config) -> Controller<Tenant> {
     controller
 }
 
-pub struct ControllerContext {
-    pub reconciler: Reconciler,
+pub struct ControllerContext<P> {
+    pub reconciler: Reconciler<P>,
     pub gate: LeadershipGate,
 }
 
-pub async fn run_controller(
-    reconciler: Reconciler,
+pub async fn run_controller<P: ProviderLifecycle + 'static>(
+    reconciler: Reconciler<P>,
     gate: LeadershipGate,
     stop: impl Future<Output = ()> + Send + Sync + 'static,
 ) -> Result<(), ControllerError> {
@@ -265,7 +263,7 @@ pub async fn run_controller(
         controller(reconciler.client.clone(), &reconciler.config).graceful_shutdown_on(stop);
     let context = Arc::new(ControllerContext { reconciler, gate });
     controller.run(
-        |tenant, context: Arc<ControllerContext>| async move {
+        |tenant, context: Arc<ControllerContext<P>>| async move {
             let Some(_permit) = context.gate.try_enter() else { return Ok(Action::await_change()); };
             context.reconciler.reconcile_name(&tenant.name_any()).await
         },

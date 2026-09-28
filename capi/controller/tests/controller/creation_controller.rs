@@ -8,8 +8,8 @@ use kube::{ResourceExt, core::DynamicObject, runtime::controller::Action};
 use serde_json::{Value, json};
 use tenant_controller::{
     api::{
-        Tenant, TenantPhase, TenantProviderSpec, TenantProviderStatus, TenantStatus,
-        canonical_spec, spec_hash,
+        LocalProviderStatus, Tenant, TenantPhase, TenantProviderSpec, TenantProviderStatus,
+        TenantStatus, canonical_spec, spec_hash,
     },
     docker::{DockerContainer, WORKER_CLUSTER_LABEL, WORKER_ROLE_LABEL},
     foundation::{Foundation, FoundationError, canonical_hash, parse_runtime},
@@ -28,7 +28,7 @@ const DEPLOYMENT: &str =
 struct Fixture {
     management: Server,
     workload: Server,
-    reconciler: Reconciler<FakeDocker, FakeAccess>,
+    reconciler: Reconciler<LocalProvider<FakeDocker, FakeAccess>>,
     foundation: Foundation,
     hash: String,
 }
@@ -352,6 +352,77 @@ async fn valid_azure_spec_stops_before_finalizer_or_local_dependencies() {
         fixture.management.calls().len(),
         2,
         "Azure status must be the only mutation"
+    );
+    assert!(fixture.workload.calls().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn azure_spec_with_controller_finalizer_fails_closed_without_local_cleanup() {
+    let fixture = Fixture::new(true);
+    let mut tenant = fixture.current();
+    tenant.spec.provider = TenantProviderSpec::Azure {
+        pod_cidr: "10.244.0.0/16".into(),
+        service_cidr: "10.96.0.0/16".into(),
+    };
+    tenant.metadata.deletion_timestamp =
+        Some(serde_json::from_value(json!("2026-09-28T00:00:00Z")).unwrap());
+    tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
+    tenant.status = Some(TenantStatus {
+        provider: Some(TenantProviderStatus::Local(LocalProviderStatus {
+            foundation_hash: Some(fixture.hash.clone()),
+            ..Default::default()
+        })),
+        ..Default::default()
+    });
+    fixture.management.insert(TENANT, tenant);
+
+    assert_eq!(fixture.step().await, Action::await_change());
+
+    let current = fixture.current();
+    assert!(current.finalizers().iter().any(|value| value == FINALIZER));
+    let status = current.status.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Deleting));
+    assert_eq!(
+        status.provider,
+        Some(TenantProviderStatus::Local(LocalProviderStatus {
+            foundation_hash: Some(fixture.hash.clone()),
+            ..Default::default()
+        }))
+    );
+    let accepted = status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == "Accepted")
+        .unwrap();
+    assert_eq!(accepted.reason, "ProviderUnsupported");
+    assert_eq!(
+        accepted.message,
+        "Azure provider reconciliation is not implemented"
+    );
+    let ready = status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == "Ready")
+        .unwrap();
+    assert_eq!(ready.reason, "ProviderFinalizerUnsupported");
+    assert_eq!(
+        ready.message,
+        "Azure provider carries the controller finalizer; deletion is blocked because Azure lifecycle is not implemented"
+    );
+    assert_eq!(
+        fixture.management.calls().len(),
+        2,
+        "blocked Azure finalization must only publish status"
     );
     assert!(fixture.workload.calls().is_empty());
     assert!(
