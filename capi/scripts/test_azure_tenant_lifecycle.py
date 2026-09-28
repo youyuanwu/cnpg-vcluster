@@ -662,6 +662,7 @@ def main(arguments: list[str]) -> int:
         if initial_prior_gate is not None
         else operation_id
     )
+    delete_operation_id = f"azure-gate-{active_gate_operation_id}"
     primary = None
     try:
         foundation_before = _healthy_schema_v2_foundation(ROOT, config)
@@ -711,6 +712,7 @@ def main(arguments: list[str]) -> int:
                     )
                     if (
                         pending.specification_sha256 != spec.sha256()
+                        or pending.operation_id != delete_operation_id
                         or dict(pending.foundation_identity) != foundation_before
                         or pending.observed.get("markerOperationId")
                         != worker_state["markerOperationId"]
@@ -728,6 +730,8 @@ def main(arguments: list[str]) -> int:
                     if (
                         checkpoint.get("gateOperationId")
                         != active_gate_operation_id
+                        or checkpoint.get("deleteOperationId")
+                        != delete_operation_id
                         or checkpoint.get("foundation") != foundation_before
                     ):
                         raise RuntimeError(
@@ -744,6 +748,7 @@ def main(arguments: list[str]) -> int:
                             expected_marker_operation_id=worker_state[
                                 "markerOperationId"
                             ],
+                            operation_id_override=delete_operation_id,
                         ),
                         _require_status(spec.name, "absent"),
                     ),
@@ -1154,6 +1159,8 @@ def main(arguments: list[str]) -> int:
                 if (
                     checkpoint.get("gateOperationId")
                     != active_gate_operation_id
+                    or checkpoint.get("deleteOperationId")
+                    != delete_operation_id
                     or checkpoint.get("foundation") != foundation_before
                 ):
                     raise RuntimeError(
@@ -1166,6 +1173,7 @@ def main(arguments: list[str]) -> int:
                         {
                             "schema": 1,
                             "gateOperationId": active_gate_operation_id,
+                            "deleteOperationId": delete_operation_id,
                             "foundation": foundation_before,
                         },
                         sort_keys=True,
@@ -1189,6 +1197,7 @@ def main(arguments: list[str]) -> int:
                         expected_marker_operation_id=worker_state[
                             "markerOperationId"
                         ],
+                        operation_id_override=delete_operation_id,
                     ),
                     _require_status(spec.name, "absent"),
                 ),
@@ -1204,10 +1213,17 @@ def main(arguments: list[str]) -> int:
             )
             if (
                 set(checkpoint)
-                != {"schema", "gateOperationId", "foundation"}
+                != {
+                    "schema",
+                    "gateOperationId",
+                    "deleteOperationId",
+                    "foundation",
+                }
                 or checkpoint.get("schema") != 1
                 or checkpoint.get("gateOperationId")
                 != active_gate_operation_id
+                or checkpoint.get("deleteOperationId")
+                != delete_operation_id
                 or not isinstance(checkpoint.get("foundation"), dict)
             ):
                 raise RuntimeError("Azure foundation checkpoint is invalid")

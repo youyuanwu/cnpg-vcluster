@@ -341,6 +341,7 @@ def delete_tenant(
     adapter: TenantAdapter,
     *,
     expected_marker_operation_id: str | None = None,
+    operation_id_override: str | None = None,
 ) -> int:
     validate_tenant_name(tenant)
     expected_confirmation = f"{PROFILE}/{tenant}"
@@ -348,7 +349,9 @@ def delete_tenant(
         raise RuntimeError(
             f"tenant deletion requires confirmation token {expected_confirmation!r}"
         )
-    operation_id = uuid.uuid4().hex
+    operation_id = operation_id_override or uuid.uuid4().hex
+    if not isinstance(operation_id, str) or not operation_id:
+        raise RuntimeError("tenant deletion operation identity is invalid")
     with _tenant_e2e_lock(root):
         with azure_lock(
             root,
