@@ -12,7 +12,7 @@ from .foundation import (
     _inspect_foundation,
     load_inventory,
 )
-from .ownership import tenant_tagged_azure_resources
+from .ownership import normalize_resource_id, tenant_tagged_azure_resources
 
 
 def _required(mapping: Mapping[str, object], key: str) -> str:
@@ -194,9 +194,10 @@ def capture_operator_deletion_proof(
         resource_ids=tuple(
             sorted(
                 {
-                    value
+                    normalize_resource_id(value)
                     for value in resource_ids
-                    if value and value.lower() not in foundation_ids
+                    if value
+                    and normalize_resource_id(value) not in foundation_ids
                 },
                 key=str.lower,
             )

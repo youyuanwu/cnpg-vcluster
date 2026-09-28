@@ -32,8 +32,10 @@ def _required(mapping: Mapping[str, object], key: str) -> str:
     return value
 
 
-def _normalize_resource_id(value: str) -> str:
+def normalize_resource_id(value: str) -> str:
     normalized = value.strip().rstrip("/")
+    if normalized.lower().startswith("azure://"):
+        normalized = normalized[len("azure://") :]
     if not normalized.startswith("/"):
         raise RuntimeError("Azure ownership resource ID is invalid")
     return normalized.lower()
@@ -65,14 +67,14 @@ def classify_azure_owned_resources(
     *,
     verified_ids: Sequence[str] = (),
 ) -> list[dict[str, object]]:
-    verified = {_normalize_resource_id(value) for value in verified_ids}
+    verified = {normalize_resource_id(value) for value in verified_ids}
     selected: dict[str, dict[str, object]] = {}
     unknown = []
     for resource in resources:
         identifier = resource.get("id")
         if not isinstance(identifier, str) or not identifier:
             continue
-        normalized = _normalize_resource_id(identifier)
+        normalized = normalize_resource_id(identifier)
         tags = resource.get("tags")
         tags = tags if isinstance(tags, dict) else {}
         marked = any(key in tags for key in expected_tags)
@@ -220,10 +222,10 @@ def observe_azure_owned_resources(
     for instance in instances:
         if not isinstance(instance, dict):
             raise RuntimeError("Azure VMSS instance discovery returned invalid resources")
-        instance.setdefault(
-            "type",
-            "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
-        )
+        if not isinstance(instance.get("type"), str):
+            instance["type"] = (
+                "Microsoft.Compute/virtualMachineScaleSets/virtualMachines"
+            )
         resources.append(instance)
     nic_response = _az(
         "vmss",
@@ -244,7 +246,8 @@ def observe_azure_owned_resources(
     for nic in nics:
         if not isinstance(nic, dict):
             raise RuntimeError("Azure VMSS NIC discovery returned invalid resources")
-        nic.setdefault("type", "Microsoft.Network/networkInterfaces")
+        if not isinstance(nic.get("type"), str):
+            nic["type"] = "Microsoft.Network/networkInterfaces"
         resources.append(nic)
         identifier = nic.get("id")
         if isinstance(identifier, str):

@@ -8,6 +8,7 @@ from unittest.mock import patch
 from scripts.lib.azure.ownership import (
     classify_azure_owned_resources,
     expected_azure_tags,
+    normalize_resource_id,
     observe_azure_owned_resources,
     tenant_tagged_azure_resources,
 )
@@ -58,6 +59,14 @@ def tenant() -> dict[str, object]:
 
 
 class AzureOwnershipTests(AzureFixtureMixin, unittest.TestCase):
+    def test_provider_id_and_arm_id_share_one_canonical_identity(self) -> None:
+        resource_id = "/subscriptions/sub/resourceGroups/rg/providers/Microsoft.Compute/virtualMachineScaleSets/pool/virtualMachines/1"
+        self.assertEqual(
+            normalize_resource_id("azure://" + resource_id),
+            resource_id.lower(),
+        )
+        self.assertEqual(normalize_resource_id(resource_id + "/"), resource_id.lower())
+
     def test_expected_tags_are_derived_from_operator_binding(self) -> None:
         self.assertEqual(
             expected_azure_tags(tenant()),
@@ -124,14 +133,14 @@ class AzureOwnershipTests(AzureFixtureMixin, unittest.TestCase):
         instances = [
             {
                 "id": f"{VMSS}/virtualMachines/{value}",
-                "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
+                "type": None,
             }
             for value in range(3)
         ]
         nics = [
             {
                 "id": f"{VMSS}/virtualMachines/{value}/networkInterfaces/nic-{value}",
-                "type": "Microsoft.Network/networkInterfaces",
+                "type": None,
                 "virtualMachineId": f"{VMSS}/virtualMachines/{value}",
             }
             for value in range(3)
