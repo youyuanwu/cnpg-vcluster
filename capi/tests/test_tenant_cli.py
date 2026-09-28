@@ -26,7 +26,7 @@ class TenantCLITests(unittest.TestCase):
     def test_default_dispatch_constructs_only_azure_adapter(self) -> None:
         adapter = object()
         with (
-            patch("scripts.azure.AzureTenantAdapter", return_value=adapter),
+            patch("scripts.lib.azure.lifecycle.AzureTenantAdapter", return_value=adapter),
             patch("scripts.tenant.status_tenant", return_value=0) as status,
         ):
             result = execute(Path("."), ["status", "azure", "tenant-a"])

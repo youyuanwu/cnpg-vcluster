@@ -327,6 +327,49 @@ class TenantRuntime:
             json.dumps(dict(payload), sort_keys=True) + "\n",
         )
 
+    def compare_and_replace_identity(
+        self,
+        expected: TenantIdentity,
+        observed: Mapping[str, str],
+    ) -> TenantIdentity:
+        if self.operation_exists():
+            raise TenantRuntimeError(
+                "tenant identity cannot change while an operation is pending"
+            )
+        current = self.load_identity()
+        if current.to_mapping() != expected.to_mapping():
+            raise TenantRuntimeError("tenant identity changed before replacement")
+        if set(observed) != set(current.observed):
+            raise TenantRuntimeError("tenant replacement observed keys changed")
+        changed = {
+            key
+            for key, value in observed.items()
+            if current.observed[key] != value
+        }
+        allowed = {"vmssInstanceIds", "nodeIdentities", "azureResources"}
+        if not changed.issubset(allowed):
+            raise TenantRuntimeError(
+                "tenant replacement changed unrelated observations: "
+                + ", ".join(sorted(changed - allowed))
+            )
+        replacement = TenantIdentity(
+            profile=current.profile,
+            tenant=current.tenant,
+            specification=current.specification,
+            specification_sha256=current.specification_sha256,
+            foundation_identity=dict(current.foundation_identity),
+            observed=_string_mapping(
+                dict(observed),
+                "observed",
+                allow_empty=False,
+            ),
+        )
+        write_private_file(
+            self.paths.identity,
+            json.dumps(replacement.to_mapping(), sort_keys=True) + "\n",
+        )
+        return replacement
+
     def remove_ready_evidence(self) -> None:
         _unlink_private_file(self.paths.ready)
 

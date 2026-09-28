@@ -21,13 +21,17 @@ The experiment succeeds when:
    provider.
 2. A CAPI `Cluster` creates one Kamaji tenant control plane and one
    VMSS-backed worker pool.
-3. One worker joins through the Kamaji private API endpoint and becomes Ready.
-4. Generic status verifies the control plane, MachinePool, Node identity,
-   Azure cloud provider, and Calico.
-5. Explicitly confirmed tenant deletion removes the CAPZ-owned VMSS and all
+3. Three distinct VMSS-backed workers join through the Kamaji private API
+   endpoint and become Ready.
+4. The destructive gate deletes one exactly mapped non-primary VMSS instance,
+   waits for CAPZ to restore exactly three Ready workers, and proves unchanged
+   survivors plus one new Node/instance pair.
+5. Generic status verifies the control plane, MachinePool, Node identities,
+   Azure cloud provider, and Calico after the recovery identity refresh.
+6. Explicitly confirmed tenant deletion removes the CAPZ-owned VMSS and all
    tenant resources without changing the shared foundation.
-6. Recreating the same tenant specification reaches Ready again.
-7. Final whole-experiment cleanup removes the recorded resource group.
+7. Recreating the same tenant specification reaches Ready again.
+8. Final whole-experiment cleanup removes the recorded resource group.
 
 ## Scope
 
@@ -44,11 +48,12 @@ The experiment includes:
 - Calico VXLAN networking;
 - the external Azure cloud provider components required by the tenant nodes;
 - strict tenant-keyed create, status, delete, and recovery state;
-- controller-owned VMSS deletion, foundation preservation, and recreation
-  checks.
+- exact gate-only VMSS instance failure injection and three-worker recovery;
+- controller-owned whole-VMSS deletion, foundation preservation, and
+  recreation checks.
 
-VMSS scaling, Azure Disk, and CloudNativePG remain later experiment
-extensions after the tenant lifecycle is repeatable.
+Azure Disk and CloudNativePG remain later experiment extensions after the
+three-worker tenant lifecycle is repeatable.
 
 ## Non-goals
 
@@ -68,7 +73,6 @@ The experiment does not initially provide:
 - Key Vault integration;
 - database backup or snapshot workflows;
 - Azure Disk CSI and CloudNativePG workload validation;
-- VMSS instance replacement and persistence validation;
 - production monitoring, alerting, or upgrade automation;
 - hostile-tenant isolation guarantees.
 
@@ -140,7 +144,7 @@ The default compute profile minimizes cost:
 |---|---|
 | AKS pricing tier | Free |
 | AKS system node pool | Two `Standard_D4as_v5` nodes |
-| Tenant VMSS | `Standard_B2s`, initially one instance and later three |
+| Tenant VMSS | Three `Standard_B2s` instances |
 
 The AKS Free tier removes the cluster-management charge and provides no
 financially backed uptime SLA. The underlying system-node VMs, disks,
@@ -370,10 +374,11 @@ the network as pre-existing while leaving CAPZ responsible for the tenant
 VMSS. The CAPI `managed-by` annotation is not used because it would disable
 CAPZ reconciliation.
 
-The first run creates one worker. After the worker joins reliably, the
-`MachinePool` is scaled to three. VMSS instance IDs and Azure resource IDs
-replace the Docker container and `DevMachine` identities used by the local
-profile.
+The tracked tenant specification creates three workers. Exact VMSS instance
+IDs and Kubernetes Node name/UID identities replace the Docker container and
+`DevMachine` identities used by the local profile. The destructive gate maps
+those identities one-to-one and fails closed on missing, duplicate, malformed,
+or cross-VMSS provider IDs.
 
 ## Control-plane endpoint
 
@@ -468,8 +473,8 @@ Azure load balancer is the Kamaji API endpoint managed by AKS.
 
 ## Future storage and CloudNativePG extension
 
-The current lifecycle gate stops after worker, cloud-provider, and Calico
-readiness. A later extension can scale to three workers and add:
+The current lifecycle gate proves three-worker VMSS replacement before
+targeted tenant deletion. A later storage extension can add:
 
 - Azure Disk CSI controller and node components;
 - one simple StorageClass using `disk.csi.azure.com`;
@@ -497,7 +502,7 @@ The proposed interface remains `just`:
 | `just tenant-create azure <spec.json>` | Create the explicitly selected Kamaji control plane and VMSS-backed worker pool, install tenant add-ons, and persist exact tenant identities. |
 | `just tenant-status azure <tenant>` | Report one tenant through the provider-neutral status envelope, separately from foundation health. |
 | `just tenant-delete azure <tenant> azure/<tenant>` | Delete the exact tenant through CAPI/CAPZ after explicit confirmation and verify canonical absence plus foundation preservation. |
-| `just azure-test-tenant-lifecycle` | Destructively prove create, Ready, targeted delete, absence, foundation preservation, and recreation for the example tenant. |
+| `just azure-test-tenant-lifecycle` | Destructively prove three-worker readiness, exact non-primary VMSS instance replacement, targeted tenant deletion, absence, foundation preservation, and recreation. |
 | `just azure-destroy` | Delete the entire recorded Azure foundation resource group. |
 
 The implementation reuses the repository's `just` interface, Python
@@ -582,20 +587,25 @@ foundation verification. Evidence is written as owner-only redacted JSON below
 
 1. Apply `Cluster`, `AzureCluster`, and `KamajiControlPlane`.
 2. Wait for the internal Kamaji endpoint.
-3. Apply a one-replica `MachinePool` and `AzureMachinePool`.
-4. Wait for the VMSS instance to register as a Node; `NotReady` is expected.
+3. Apply a three-replica `MachinePool` and `AzureMachinePool`.
+4. Wait for all three VMSS instances to register as distinct Nodes;
+   `NotReady` is expected during bootstrap.
 5. From an AKS-resident Job, install Calico VXLAN, Azure cloud controller
    manager, and cloud-node-manager into the tenant cluster.
-6. Wait for the first Node to become Ready.
+6. Wait for exactly three Nodes to become Ready.
 
-### Future replacement verification
+### Replacement verification
 
-1. Record the VMSS instance IDs, Nodes, PVCs, disks, CNPG primary, and marker.
-2. Delete one non-primary VMSS instance through Azure.
+1. Record the three exact VMSS instance IDs and Node name/UID/provider-ID
+   mappings.
+2. Reserve the lowest numeric instance ID as the gate-local primary anchor and
+   delete the highest numeric non-primary instance.
 3. Wait for CAPZ and VMSS reconciliation to restore desired capacity.
-4. Verify a replacement Node becomes Ready.
-5. Verify CNPG returns to three healthy instances.
-6. Verify the SQL marker remains readable.
+4. Require exactly three Ready MachinePool Nodes, unchanged survivor mappings,
+   absence of the deleted pair, and one pair new in both identity domains.
+5. Refresh only the replacement-sensitive identity and Ready evidence fields,
+   require normal status to return Ready, then continue to whole-tenant
+   deletion, foundation preservation, and recreation.
 
 ### Cleanup
 
@@ -642,13 +652,12 @@ Azure Disk/CNPG behavior, upgrade safety, autoscaling, or large tenant counts.
 
 1. **Compatibility and AKS bootstrap:** pin the provider versions and install
    the controllers on AKS.
-2. **Single worker:** create one tenant API and one VMSS worker that becomes
-   Ready.
-3. **Three workers:** scale the VMSS-backed MachinePool and verify all Nodes.
+2. **Three workers:** create one tenant API and a three-replica VMSS-backed
+   MachinePool, then verify all Nodes.
+3. **Replacement and cleanup:** delete one exact non-primary VMSS instance,
+   verify recovery, then perform complete tenant cleanup and recreation.
 4. **Azure Disk and CNPG:** install CSI and require a healthy three-instance
    database.
-5. **Replacement and cleanup:** delete one VMSS instance, verify recovery and
-   persistence, then perform complete cleanup.
 
 Each step is independently useful and should be kept runnable while later
 steps are developed.

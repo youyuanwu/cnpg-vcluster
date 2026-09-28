@@ -156,7 +156,7 @@ def check_configuration() -> None:
     check(config["KAMAJI_CAPI_CONTRACT"] == "v1beta2", "Kamaji provider contract must be v1beta2")
     from scripts.lib.tenant_spec import load_tenant_spec
 
-    load_tenant_spec(
+    azure_example = load_tenant_spec(
         ROOT / "config" / "tenants" / "examples" / "azure.json",
         expected_profile="azure",
         supported_versions={
@@ -164,6 +164,10 @@ def check_configuration() -> None:
                 ROOT / "config" / "azure" / "defaults.env"
             )["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
         },
+    )
+    check(
+        azure_example.workers == 3,
+        "Azure lifecycle example must request exactly three workers",
     )
     for key in (
         "VIP_POOL_START_OFFSET_FROM_BROADCAST",
@@ -525,7 +529,9 @@ def check_repository_boundaries() -> None:
         *(
             path
             for path in (ROOT / "scripts").rglob("*.py")
-            if path.name not in {"test_static.py", "azure.py"}
+            if path.name != "test_static.py"
+            and path != ROOT / "scripts" / "azure.py"
+            and (ROOT / "scripts" / "lib" / "azure") not in path.parents
         ),
         *(ROOT / "manifests").rglob("*"),
     ]
@@ -541,7 +547,14 @@ def check_repository_boundaries() -> None:
         text = path.read_text(encoding="utf-8")
         for token in forbidden:
             check(token not in text, f"{path.relative_to(ROOT)} contains forbidden token {token!r}")
-    azure_source = (ROOT / "scripts" / "azure.py").read_text(encoding="utf-8")
+    azure_sources = [
+        ROOT / "scripts" / "azure.py",
+        *(ROOT / "scripts" / "lib" / "azure").rglob("*.py"),
+    ]
+    azure_source = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in azure_sources
+    )
     check(
         not re.search(
             r"[\"']vmss[\"']\s*,\s*[\"']delete[\"']",

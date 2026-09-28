@@ -171,7 +171,7 @@ just test-tenant-lifecycle
 | `just tenant-create azure <spec.json>` | Reconcile one explicit Azure tenant on the recorded AKS/CAPZ foundation. |
 | `just tenant-status azure <name>` | Inspect one Azure tenant without mutating state. |
 | `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through CAPI/CAPZ and verify foundation preservation. |
-| `just azure-test-tenant-lifecycle` | Destructively prove Azure create, Ready, targeted absence, foundation preservation, and recreation for the example tenant. |
+| `just azure-test-tenant-lifecycle` | Destructively prove three distinct VMSS-backed workers, exact non-primary instance replacement, targeted absence, foundation preservation, and recreation for the example tenant. |
 | `just diagnose management` | Print management status, workloads, CRDs, and events without mutation. |
 | `just destroy` | Remove recorded tenants, controllers, the management cluster, runtime state, and restore host settings. |
 
@@ -182,6 +182,13 @@ the public local commands do not maintain a second filesystem journal or
 readiness evaluator. Azure credentials, journals, Ready evidence, and identity
 records remain owner-only below ignored `.runtime/`. Commands use explicit
 kubeconfig paths and do not depend on the user's current Kubernetes context.
+
+Azure implementation responsibilities live under `scripts/lib/azure/`:
+`foundation` owns shared infrastructure, `rendering` owns manifests,
+`readiness` owns endpoint/VMSS/Node observations, `ownership` owns fail-closed
+discovery, `deletion` owns exact cleanup mechanics, `lifecycle` owns the tenant
+adapter, and `gate` owns destructive three-worker replacement validation.
+`scripts/azure.py` remains only the foundation command facade.
 
 The retained workflow is a development optimization, not a final gate. It
 retains only the explicitly bound management foundation:

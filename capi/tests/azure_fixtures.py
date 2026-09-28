@@ -1,0 +1,239 @@
+import json
+import tempfile
+from pathlib import Path
+
+from scripts.lib.azure.common import (
+    FOUNDATION_INVENTORY_SCHEMA,
+    _foundation_defaults_checksum,
+    azure_tenant_runtime_path,
+    names,
+)
+from scripts.lib.azure.contracts import _management_resource_specs
+from scripts.lib.files import write_private_file
+from scripts.lib.tenant_runtime import TenantRuntime, foundation_sha256
+from scripts.lib.tenant_spec import TenantSpec
+from scripts.lib.tenants import LIFECYCLE_MARKERS
+
+
+DEFAULTS = """\
+AZURE_AKS_KUBERNETES_VERSION=1.35.7
+AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION=1.32.13
+AZURE_AKS_NODE_SKU=Standard_D4as_v5
+AZURE_TENANT_NODE_SKU=Standard_B2s
+AZURE_AKS_NODE_COUNT=2
+AZURE_VNET_CIDR=10.220.0.0/16
+AZURE_AKS_SUBNET_CIDR=10.220.0.0/20
+AZURE_TENANT_SUBNET_CIDR=10.220.16.0/20
+AZURE_AKS_POD_CIDR=10.221.0.0/16
+AZURE_AKS_SERVICE_CIDR=10.222.0.0/16
+AZURE_AKS_DNS_SERVICE_IP=10.222.0.10
+AZURE_CAPI_VERSION=v1.10.7
+AZURE_CAPZ_VERSION=v1.21.1
+AZURE_KAMAJI_CAPI_VERSION=v0.19.0
+AZURE_KAMAJI_CHART_VERSION=26.8.6-edge
+AZURE_CLOUD_PROVIDER_VERSION=v1.32.3
+AZURE_CALICO_VERSION=v3.32.2
+AZURE_DEPLOY_TIMEOUT=30m
+AZURE_CONTROLLER_TIMEOUT=15m
+AZURE_TENANT_TIMEOUT=20m
+"""
+
+SUBSCRIPTION = "00000000-0000-0000-0000-000000000000"
+
+FOUNDATION = {
+    "foundationDefaultsSha256": "foundation-checksum",
+    "resourceGroupId": "/subscriptions/redacted/resourceGroups/yy-cv-rg",
+    "aksId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ContainerService/managedClusters/yy-cv-mgmt",
+    "aksNodeResourceGroup": "MC_yy-cv-rg_yy-cv-mgmt_westus2",
+    "aksOidcIssuer": "https://example.invalid/issuer",
+    "vnetId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.Network/virtualNetworks/yy-cv-vnet",
+    "aksSubnetId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.Network/virtualNetworks/yy-cv-vnet/subnets/aks",
+    "tenantSubnetId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.Network/virtualNetworks/yy-cv-vnet/subnets/tenant",
+    "identityId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/yy-cv-identity",
+    "roleAssignmentId": "/subscriptions/redacted/providers/Microsoft.Authorization/roleAssignments/role",
+    "aksRoleAssignmentId": "/subscriptions/redacted/providers/Microsoft.Authorization/roleAssignments/aks-role",
+    "capzFederationId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/yy-cv-identity/federatedIdentityCredentials/capz-manager",
+    "asoFederationId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ManagedIdentity/userAssignedIdentities/yy-cv-identity/federatedIdentityCredentials/azureserviceoperator-default",
+    "controller:capi-system/capi-controller-manager": "capi-uid",
+    "controller:capi-kubeadm-bootstrap-system/capi-kubeadm-bootstrap-controller-manager": "cabpk-uid",
+    "controller:capz-system/capz-controller-manager": "capz-uid",
+    "controller:capz-system/azureserviceoperator-controller-manager": "aso-uid",
+    "controller:kamaji-system/kamaji": "kamaji-uid",
+    "controller:kamaji-system/capi-kamaji-controller-manager": "provider-uid",
+}
+
+
+class AzureFixtureMixin:
+    def make_root(self) -> Path:
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        root = Path(temporary.name)
+        (root / "config" / "azure").mkdir(parents=True)
+        (root / "config" / "azure" / "defaults.env").write_text(
+            DEFAULTS,
+            encoding="utf-8",
+        )
+        local = root / "config" / "azure.local.env"
+        local.write_text(
+            f"AZURE_SUBSCRIPTION_ID={SUBSCRIPTION}\n"
+            "AZURE_LOCATION=westus2\n"
+            "AZURE_PREFIX=yy-cv\n",
+            encoding="utf-8",
+        )
+        local.chmod(0o600)
+        return root
+
+    @staticmethod
+    def spec(name: str = "tenant-c", **overrides) -> TenantSpec:
+        payload = {
+            "schema": 1,
+            "profile": "azure",
+            "name": name,
+            "kubernetesVersion": "1.32.13",
+            "workers": 1,
+            "podCIDR": "10.72.0.0/16",
+            "serviceCIDR": "10.142.0.0/16",
+        }
+        payload.update(overrides)
+        return TenantSpec.from_mapping(
+            payload,
+            expected_profile="azure",
+            supported_versions={"azure": "1.32.13"},
+        )
+
+    def start_journal(self, root: Path, spec: TenantSpec):
+        runtime = TenantRuntime(root, spec.name)
+        journal = runtime.start_operation(
+            operation="create",
+            spec=spec,
+            foundation_identity=FOUNDATION,
+            intended_resources=(f"Cluster/{spec.name}",),
+            operation_id="operation-1",
+        )
+        journal = runtime.update_operation(
+            journal,
+            phase="markers-recorded",
+            observed={"markerOperationId": journal.operation_id},
+        )
+        return runtime, journal
+
+    def inventory(self, root: Path, config: dict[str, str]) -> dict[str, object]:
+        outputs = {
+            "resourceGroupName": "yy-cv-rg",
+            "resourceGroupId": FOUNDATION["resourceGroupId"],
+            "aksName": "yy-cv-mgmt",
+            "aksId": FOUNDATION["aksId"],
+            "aksNodeResourceGroup": FOUNDATION["aksNodeResourceGroup"],
+            "aksOidcIssuer": FOUNDATION["aksOidcIssuer"],
+            "vnetName": "yy-cv-vnet",
+            "vnetId": FOUNDATION["vnetId"],
+            "aksSubnetName": "aks",
+            "aksSubnetId": FOUNDATION["aksSubnetId"],
+            "tenantSubnetName": "tenant",
+            "tenantSubnetId": FOUNDATION["tenantSubnetId"],
+            "identityName": "yy-cv-identity",
+            "identityId": FOUNDATION["identityId"],
+            "identityClientId": "client-id",
+            "tenantId": "tenant-id",
+            "roleAssignmentId": FOUNDATION["roleAssignmentId"],
+            "aksRoleAssignmentId": FOUNDATION["aksRoleAssignmentId"],
+            "capzFederationId": FOUNDATION["capzFederationId"],
+            "asoFederationId": FOUNDATION["asoFederationId"],
+        }
+        controllers = {
+            key.removeprefix("controller:"): value
+            for key, value in FOUNDATION.items()
+            if key.startswith("controller:")
+        }
+        return {
+            "schema": FOUNDATION_INVENTORY_SCHEMA,
+            "subscriptionId": SUBSCRIPTION,
+            "location": "westus2",
+            "prefix": "yy-cv",
+            "names": names(config),
+            "foundationDefaultsSha256": _foundation_defaults_checksum(root, config),
+            "deploymentId": "/subscriptions/redacted/providers/Microsoft.Resources/deployments/yy-cv-foundation",
+            "deploymentName": "yy-cv-foundation",
+            "outputs": outputs,
+            "controllers": controllers,
+        }
+
+    def write_inventory(self, root: Path, payload: dict[str, object]) -> Path:
+        path = root / ".runtime" / "azure" / "resources.json"
+        write_private_file(path, json.dumps(payload))
+        return path
+
+    def ready_identity(self, root: Path, spec: TenantSpec):
+        runtime, journal = self.start_journal(root, spec)
+        observed = {
+            "markerOperationId": journal.operation_id,
+            "tenantKubeconfigSecretUid": "tenant-kubeconfig-secret-uid",
+            "tenantKubeconfigSha256": "kubeconfig-sha256",
+            "vmssId": (
+                "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/"
+                "Microsoft.Compute/virtualMachineScaleSets/tenant-c-worker"
+            ),
+            "vmssInstanceIds": "[]",
+            "azureResources": json.dumps(
+                {"azure": [], "aso": [], "unknown": []},
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+        }
+        for key, _, _, _ in _management_resource_specs(spec):
+            observed[key] = f"{key}-value"
+        runtime.complete_create(runtime.load_operation(), spec, observed)
+        write_private_file(
+            azure_tenant_runtime_path(root, spec.name) / "endpoint.json",
+            "{}\n",
+        )
+        return runtime, runtime.load_identity()
+
+    def management_payloads(self, spec: TenantSpec, identity):
+        markers = {
+            "tenant": spec.name,
+            "profile": "azure",
+            "specificationSha256": spec.sha256(),
+            "foundationSha256": foundation_sha256(identity.foundation_identity),
+            "operationId": identity.observed["markerOperationId"],
+        }
+        payloads = []
+        namespace = None
+        for key, namespace_name, kind, name in _management_resource_specs(spec):
+            payload = {
+                "apiVersion": "v1",
+                "kind": kind,
+                "metadata": {
+                    "name": name,
+                    "uid": identity.observed[key],
+                    "resourceVersion": f"{key}-rv",
+                    "annotations": {
+                        LIFECYCLE_MARKERS[marker]: value
+                        for marker, value in markers.items()
+                    },
+                },
+            }
+            if namespace_name is not None:
+                payload["metadata"]["namespace"] = namespace_name
+            if kind == "Namespace":
+                namespace = payload
+            else:
+                payloads.append(payload)
+        payloads.append(
+            {
+                "apiVersion": "v1",
+                "kind": "Secret",
+                "metadata": {
+                    "name": f"{spec.name}-kubeconfig",
+                    "uid": identity.observed["tenantKubeconfigSecretUid"],
+                    "resourceVersion": "secret-rv",
+                    "ownerReferences": [
+                        {
+                            "uid": identity.observed["kamajiControlPlaneUid"],
+                            "controller": True,
+                        }
+                    ],
+                },
+            }
+        )
+        return namespace, payloads

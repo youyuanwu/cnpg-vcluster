@@ -162,6 +162,8 @@ def create_tenant(
     root: Path,
     spec_path: Path,
     adapter: TenantAdapter,
+    *,
+    require_absent: bool = False,
 ) -> int:
     with _tenant_e2e_lock(root):
         with azure_lock(
@@ -200,6 +202,15 @@ def create_tenant(
                     operation="create",
                     operation_id=operation_id,
                 )
+                if require_absent:
+                    gate_runtime = TenantRuntime(root, spec.name)
+                    if (
+                        gate_runtime.identity_exists()
+                        or gate_runtime.operation_exists()
+                    ):
+                        raise RuntimeError(
+                            "Azure gate create precondition changed"
+                        )
                 timings.record_passed(
                     "validation",
                     time.monotonic() - validation_started,
@@ -328,6 +339,9 @@ def delete_tenant(
     tenant: str,
     confirmation: str,
     adapter: TenantAdapter,
+    *,
+    expected_marker_operation_id: str | None = None,
+    operation_id_override: str | None = None,
 ) -> int:
     validate_tenant_name(tenant)
     expected_confirmation = f"{PROFILE}/{tenant}"
@@ -335,7 +349,9 @@ def delete_tenant(
         raise RuntimeError(
             f"tenant deletion requires confirmation token {expected_confirmation!r}"
         )
-    operation_id = uuid.uuid4().hex
+    operation_id = operation_id_override or uuid.uuid4().hex
+    if not isinstance(operation_id, str) or not operation_id:
+        raise RuntimeError("tenant deletion operation identity is invalid")
     with _tenant_e2e_lock(root):
         with azure_lock(
             root,
@@ -367,6 +383,24 @@ def delete_tenant(
                         )
                         if pending is not None:
                             timings.bind_operation_id(pending.operation_id)
+                        if expected_marker_operation_id is not None:
+                            marker_source = identity or pending
+                            if (
+                                marker_source is None
+                                or marker_source.observed.get("markerOperationId")
+                                != expected_marker_operation_id
+                            ):
+                                raise TenantRuntimeError(
+                                    "Azure gate delete precondition changed"
+                                )
+                        if (
+                            operation_id_override is not None
+                            and pending is not None
+                            and pending.operation_id != operation_id_override
+                        ):
+                            raise TenantRuntimeError(
+                                "Azure gate delete operation identity changed"
+                            )
                     if identity is None:
                         with timings.phase("absence"):
                             inspected = _safe_authoritative_absence(
@@ -439,7 +473,7 @@ def execute(
     adapter: TenantAdapter | None = None,
 ) -> int:
     if adapter is None:
-        from scripts.azure import AzureTenantAdapter
+        from scripts.lib.azure.lifecycle import AzureTenantAdapter
 
         adapter = AzureTenantAdapter()
     if not arguments:
