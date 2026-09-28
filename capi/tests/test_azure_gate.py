@@ -94,6 +94,19 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 VMSS,
                 [instance(0), instance(1), instance(2)],
             )
+        invalid_vmss = VMSS.replace("/subscriptions/00000000", "/subscriptions/ ")
+        invalid_readiness = readiness()
+        for node in invalid_readiness["nodes"]:
+            node["providerID"] = node["providerID"].replace(VMSS, invalid_vmss)
+        with self.assertRaisesRegex(RuntimeError, "VMSS resource ID"):
+            build_worker_snapshot(
+                invalid_readiness,
+                invalid_vmss,
+                [
+                    value.replace(VMSS, invalid_vmss)
+                    for value in (instance(0), instance(1), instance(2))
+                ],
+            )
 
     def test_recovery_requires_unchanged_survivors_and_new_pair(self):
         before = build_worker_snapshot(
@@ -482,6 +495,40 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             json.dumps(payload),
         )
         with self.assertRaisesRegex(RuntimeError, "invalid Azure lifecycle"):
+            _incomplete_gate_records(
+                evidence,
+                "tenant-c",
+                "spec-sha",
+                "revision",
+            )
+
+    def test_evidence_classifier_rejects_impossible_phase_order(self):
+        root = self.make_root()
+        evidence = root / ".runtime" / "azure-gate" / "evidence"
+        phases = (
+            "recreation",
+            "targeted-delete-absent",
+            "foundation-verification",
+            "worker-identity-refresh",
+            "worker-recovery",
+            "worker-instance-deletion",
+        )
+        payload = {
+            "schema": 1,
+            "operationId": "operation-1",
+            "tenant": "tenant-c",
+            "specificationSha256": "spec-sha",
+            "revision": "revision",
+            "records": [
+                {"phase": phase, "status": "passed", "seconds": 1.0}
+                for phase in phases
+            ],
+        }
+        write_private_file(
+            evidence / "lifecycle-operation-1.json",
+            json.dumps(payload),
+        )
+        with self.assertRaisesRegex(RuntimeError, "phase order"):
             _incomplete_gate_records(
                 evidence,
                 "tenant-c",

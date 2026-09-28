@@ -7,8 +7,8 @@ from typing import Mapping, Sequence
 
 
 VMSS_ID_RE = re.compile(
-    r"^/subscriptions/[^/]+/resourcegroups/[^/]+/providers/"
-    r"microsoft\.compute/virtualmachinescalesets/[^/]+$"
+    r"^/subscriptions/[^/\s]+/resourcegroups/[^/\s]+/providers/"
+    r"microsoft\.compute/virtualmachinescalesets/[^/\s]+$"
 )
 
 

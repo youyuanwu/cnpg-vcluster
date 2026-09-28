@@ -327,6 +327,28 @@ def _incomplete_gate_records(
                 for record in payload["records"]
                 if isinstance(record, dict) and record.get("status") == "passed"
             }
+            ordered_phases = (
+                "worker-identity-verification",
+                "worker-instance-deletion",
+                "worker-recovery",
+                "worker-identity-refresh",
+                "targeted-delete-absent",
+                "foundation-verification",
+                "recreation",
+            )
+            ordered_indices = [
+                ordered_phases.index(record["phase"])
+                for record in payload["records"]
+                if record.get("status") == "passed"
+                and record.get("phase") in ordered_phases
+            ]
+            if (
+                ordered_indices != sorted(ordered_indices)
+                or len(ordered_indices) != len(set(ordered_indices))
+            ):
+                raise RuntimeError(
+                    f"Azure lifecycle gate evidence phase order is invalid: {path.name}"
+                )
             seen = {
                 record.get("phase")
                 for record in payload["records"]
@@ -529,15 +551,69 @@ def main(arguments: list[str]) -> int:
         persist_evidence()
         return value
 
-    initial_prior_gate = _run_profile_mutation(
-        ROOT,
-        config,
-        lambda _root, _config: _incomplete_gate_records(
+    def classify_startup():
+        prior = _incomplete_gate_records(
             evidence.parent,
             spec.name,
             spec.sha256(),
             revision,
-        ),
+        )
+        runtime = TenantRuntime(ROOT, spec.name)
+        if runtime.operation_exists():
+            if prior is None:
+                raise RuntimeError(
+                    "Azure lifecycle gate found an unrelated pending operation"
+                )
+            return prior, False
+        if runtime.identity_exists():
+            identity = runtime.load_identity()
+            if identity.specification_sha256 != spec.sha256():
+                raise RuntimeError(
+                    "Azure lifecycle gate found an incompatible tenant identity"
+                )
+            if prior is None:
+                ready = runtime.load_ready_evidence()
+                if ready.get("observed") != dict(identity.observed):
+                    raise RuntimeError(
+                        "Azure tenant Ready evidence changed before gate startup"
+                    )
+                _require_three_worker_pool(spec, require_ready=True)
+                observations, blockers = _collect_ready_observations(
+                    ROOT,
+                    config,
+                    spec,
+                )
+                if blockers:
+                    raise RuntimeError(
+                        "Azure tenant is not Ready before gate startup: "
+                        + "; ".join(blockers)
+                    )
+                vmss_id = identity.observed["vmssId"]
+                live = build_worker_snapshot(
+                    observations,
+                    vmss_id,
+                    _vmss_instances(config, vmss_id),
+                )
+                if live != _recorded_worker_snapshot(identity):
+                    raise RuntimeError(
+                        "Azure worker identities changed before gate startup"
+                    )
+                if discover_azure_owned_resources(
+                    ROOT,
+                    config,
+                    spec,
+                    identity,
+                ) != json.loads(identity.observed["azureResources"]):
+                    raise RuntimeError(
+                        "Azure owned resources changed before gate startup"
+                    )
+                return None, True
+        return prior, False
+
+    initial_prior_gate, existing_ready = _run_profile_mutation(
+        ROOT,
+        config,
+        lambda _root, _config: classify_startup(),
     )
     active_gate_operation_id = (
         _gate_attempt_id(initial_prior_gate)
@@ -765,31 +841,27 @@ def main(arguments: list[str]) -> int:
                     "ready": recovered,
                 }
             )
-            runtime.write_ready_evidence(ready_payload)
             if dict(identity.observed) != observed:
                 runtime.compare_and_replace_identity(identity, observed)
-            elif runtime.load_ready_evidence() != ready_payload:
-                raise RuntimeError(
-                    "Azure worker Ready evidence changed during recovery"
-                )
+            runtime.write_ready_evidence(ready_payload)
 
         skip_failure_injection = False
         skip_targeted_delete = False
         if prior_gate is not None:
             _require_authenticated_worker_deletion(prior_gate)
             if "targeted-delete-absent" not in prior_gate:
-                if "worker-identity-refresh" not in prior_gate:
-                    _run_profile_mutation(
-                        ROOT,
-                        config,
-                        lambda _root, _config: resume_worker_refresh(),
-                    )
-                    phase("worker-recovery", lambda: None)
-                    phase("worker-identity-refresh", lambda: None)
+                _run_profile_mutation(
+                    ROOT,
+                    config,
+                    lambda _root, _config: resume_worker_refresh(),
+                )
+                phase("worker-instance-deletion", lambda: None)
+                phase("worker-recovery", lambda: None)
+                phase("worker-identity-refresh", lambda: None)
                 _require_status(spec.name, "ready")
             skip_failure_injection = True
             skip_targeted_delete = "targeted-delete-absent" in prior_gate
-        else:
+        elif not existing_ready:
             phase(
                 "create-ready",
                 lambda: (
@@ -967,24 +1039,23 @@ def main(arguments: list[str]) -> int:
                             instances,
                             discovery,
                         )
-                        runtime.write_ready_evidence(
-                            {
-                                "schema": 1,
-                                "profile": "azure",
-                                "tenant": spec.name,
-                                "specificationSha256": spec.sha256(),
-                                "foundationIdentity": dict(
-                                    identity.foundation_identity
-                                ),
-                                "observed": observed,
-                                "verifiedAt": time.time(),
-                                "ready": recovered,
-                            }
-                        )
+                        ready_payload = {
+                            "schema": 1,
+                            "profile": "azure",
+                            "tenant": spec.name,
+                            "specificationSha256": spec.sha256(),
+                            "foundationIdentity": dict(
+                                identity.foundation_identity
+                            ),
+                            "observed": observed,
+                            "verifiedAt": time.time(),
+                            "ready": recovered,
+                        }
                         runtime.compare_and_replace_identity(
                             identity,
                             observed,
                         )
+                        runtime.write_ready_evidence(ready_payload)
                         phase("worker-recovery", lambda: after)
                         phase("worker-identity-refresh", lambda: None)
                         return
