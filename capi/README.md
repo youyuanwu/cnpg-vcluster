@@ -90,7 +90,10 @@ manifest is the reconcile/retry path, status reads generation-aware Kubernetes
 conditions, and ordinary deletion is completed by the controller finalizer.
 Apply is asynchronous; repeat `just local-tenant-status tenant-example` until
 it exits zero. Tenant specifications are immutable; delete and recreate to
-change capacity or versions; endpoint and networks are assigned in status.
+change capacity or versions. Local manifests select `provider.type: local`;
+endpoint and networks are assigned in provider status. The CRD also reserves
+an Azure provider shape, but Azure tenants retain the JSON specification and
+Python lifecycle until that provider is implemented in the controller.
 The bounded final E2E waits for one
 explicitly selected Tenant's structural Ready contract, runs `SELECT 1`
 through its PostgreSQL read/write service with the existing disposable SQL

@@ -81,7 +81,7 @@ pub struct LocalProviderStatus {
 #[allow(dead_code)]
 struct TenantProviderStatusSchema {
     #[schemars(rename = "type")] provider_type: ProviderTypeSchema, allocation: Option<AllocationStatus>,
-    foundation_hash: Option<String>, #[schemars(rename = "clusterUID")] cluster_uid: Option<String>,
+    #[schemars(rename = "foundationHash")] foundation_hash: Option<String>, #[schemars(rename = "clusterUID")] cluster_uid: Option<String>,
 }
 #[rustfmt::skip]
 impl TenantStatus {
@@ -195,10 +195,10 @@ pub fn tenant_crd() -> k8s_openapi::apiextensions_apiserver::pkg::apis::apiexten
     (workers.minimum, workers.maximum) = (Some(1.0), Some(3.0));
     let provider = fields.get_mut("provider").expect("provider field").properties.as_mut().expect("provider has fields");
     let databases = provider.get_mut("databases").expect("local database field");
-    (databases.minimum, databases.maximum) = (Some(1.0), Some(3.0));
+    (databases.minimum, databases.maximum, databases.nullable) = (Some(1.0), Some(3.0), None);
     for field in ["podCIDR", "serviceCIDR"] {
-        provider.get_mut(field).expect("Azure CIDR field").pattern =
-            Some(r"^([0-9]{1,3}[.]){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$".into());
+        let field = provider.get_mut(field).expect("Azure CIDR field");
+        (field.nullable, field.pattern) = (None, Some(r"^([0-9]{1,3}[.]){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$".into()));
     }
     let conditions = properties.get_mut("status").and_then(|s| s.properties.as_mut())
         .and_then(|s| s.get_mut("conditions")).expect("status has conditions");
@@ -211,7 +211,7 @@ pub fn tenant_crd() -> k8s_openapi::apiextensions_apiserver::pkg::apis::apiexten
         rule("self.spec == oldSelf.spec", "Tenant spec is immutable"),
         rule("self.metadata.name.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')", "Tenant name must be a 1-30 character lowercase DNS label"),
         rule("self.spec.workers >= 1 && self.spec.workers <= 3", "workers must be between 1 and 3"),
-        rule("self.spec.provider.type == 'local' ? has(self.spec.provider.databases) && !has(self.spec.provider.podCIDR) && !has(self.spec.provider.serviceCIDR) : !has(self.spec.provider.databases) && has(self.spec.provider.podCIDR) && has(self.spec.provider.serviceCIDR)", "provider fields must match the selected local or Azure provider"),
+        rule("self.spec.provider.type == 'local' ? has(self.spec.provider.databases) && !has(self.spec.provider.podCIDR) && !has(self.spec.provider.serviceCIDR) : !has(self.spec.provider.databases) && has(self.spec.provider.podCIDR) && has(self.spec.provider.serviceCIDR)", "local databases and Azure CIDR fields must match the selected provider"),
         rule("self.spec.provider.type != 'azure' || (isCIDR(self.spec.provider.podCIDR) && isCIDR(self.spec.provider.serviceCIDR) && cidr(self.spec.provider.podCIDR).ip().family() == 4 && cidr(self.spec.provider.serviceCIDR).ip().family() == 4 && !cidr(self.spec.provider.podCIDR).containsCIDR(cidr(self.spec.provider.serviceCIDR)) && !cidr(self.spec.provider.serviceCIDR).containsCIDR(cidr(self.spec.provider.podCIDR)) && cidr(self.spec.provider.serviceCIDR).prefixLength() <= 28)", "Azure Pod and Service CIDRs must be disjoint IPv4 networks and the Service CIDR must contain the derived DNS address"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type == self.spec.provider.type", "Tenant provider status must match the requested provider"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type != 'azure' || (!has(self.status.provider.allocation) && !has(self.status.provider.foundationHash) && !has(self.status.provider.clusterUID))", "Azure provider status cannot contain local durable identity"),
@@ -545,12 +545,20 @@ mod tests {
         );
         let provider_fields = fields["provider"].properties.as_ref().unwrap();
         assert_eq!(provider_fields["databases"].maximum, Some(3.0));
+        assert_eq!(provider_fields["databases"].nullable, None);
         assert!(
             provider_fields["podCIDR"]
                 .pattern
                 .as_deref()
                 .is_some_and(|pattern| pattern.contains("[0-9]{1,3}"))
         );
+        assert_eq!(provider_fields["podCIDR"].nullable, None);
+        let status_provider = properties["status"].properties.as_ref().unwrap()["provider"]
+            .properties
+            .as_ref()
+            .unwrap();
+        assert!(status_provider.contains_key("foundationHash"));
+        assert!(!status_provider.contains_key("foundation_hash"));
         let rules: Vec<_> = schema
             .x_kubernetes_validations
             .as_ref()
