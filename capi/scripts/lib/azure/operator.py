@@ -114,6 +114,15 @@ def tenant_status(tenant: str, payload: Mapping[str, object] | None) -> TenantSt
         and isinstance(condition.get("message"), str)
     )
     provider = status.get("provider")
+    if (
+        classification == "ready"
+        and (
+            not isinstance(provider, dict)
+            or provider.get("type") != "azure"
+        )
+    ):
+        classification = "ownership-invalid"
+        blockers = ("Azure provider status is absent",)
     return TenantStatus(
         profile="azure",
         tenant=tenant,
@@ -175,6 +184,26 @@ def create_tenant(root: Path, spec: TenantSpec) -> None:
     )
 
 
+def wait_tenant_ready(root: Path, tenant: str) -> TenantStatus:
+    config = load_azure_configuration(root)
+    return _wait(
+        root,
+        tenant,
+        parse_duration(config["AZURE_TENANT_TIMEOUT"]),
+        lambda status: status.classification == "ready",
+    )
+
+
+def wait_tenant_absent(root: Path, tenant: str) -> TenantStatus:
+    config = load_azure_configuration(root)
+    return _wait(
+        root,
+        tenant,
+        parse_duration(config["AZURE_TENANT_TIMEOUT"]),
+        lambda status: status.classification == "absent",
+    )
+
+
 def status_tenant(root: Path, tenant: str) -> TenantStatus:
     return tenant_status(tenant, read_tenant(root, tenant))
 
@@ -192,10 +221,5 @@ def delete_tenant(root: Path, tenant: str) -> None:
         "--ignore-not-found=true",
         "--wait=false",
     )
-    _wait(
-        root,
-        tenant,
-        parse_duration(config["AZURE_TENANT_TIMEOUT"]),
-        lambda status: status.classification == "absent",
-    )
+    wait_tenant_absent(root, tenant)
     prove_operator_deletion(root, config, proof)

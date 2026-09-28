@@ -527,7 +527,6 @@ helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant
                     "image":{"computeGallery":{"gallery":"ClusterAPI-f72ceb4f-5159-4c26-a0fe-2ea738f0d019","name":"capi-ubun2-2404","version":context.spec.kubernetes_version}},
                     "networkInterfaces":[{"subnetName":config.tenant_subnet_name}],
                     "osDisk":{"diskSizeGB":30,"managedDisk":{"storageAccountType":"StandardSSD_LRS"},"osType":"Linux"},
-                    "sshPublicKey":"",
                     "vmSize":config.worker_sku
                 },
                 "userAssignedIdentities":[{"providerID":provider_id}]
@@ -547,7 +546,7 @@ helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant
                         "bootstrap":{"configRef":{"apiVersion":"bootstrap.cluster.x-k8s.io/v1beta1","kind":"KubeadmConfig","name":names.pool}},
                         "clusterName":context.name(),
                         "infrastructureRef":{"apiVersion":"infrastructure.cluster.x-k8s.io/v1beta1","kind":"AzureMachinePool","name":names.pool},
-                        "nodeDrainTimeout":"2m",
+                        "nodeDrainTimeout":"2m0s",
                         "version":format!("v{}",context.spec.kubernetes_version)
                     }
                 }
@@ -1095,7 +1094,7 @@ mod tests {
         );
         assert_eq!(
             by_kind("MachinePool").data["spec"]["template"]["spec"]["nodeDrainTimeout"],
-            "2m"
+            "2m0s"
         );
         let deployment = by_kind("Deployment");
         let container = &deployment.data["spec"]["template"]["spec"]["containers"][0];

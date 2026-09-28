@@ -7,12 +7,12 @@ from pathlib import Path
 from typing import Mapping
 
 from .common import _json, names
-from .deletion import _tenant_tagged_azure_resources
 from .foundation import (
     _azure_provider_configuration,
     _inspect_foundation,
     load_inventory,
 )
+from .ownership import tenant_tagged_azure_resources
 
 
 def _required(mapping: Mapping[str, object], key: str) -> str:
@@ -54,6 +54,50 @@ class AzureDeletionProof:
     foundation: Mapping[str, str]
     vmss_id: str | None
     resource_ids: tuple[str, ...]
+
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "tenant": self.tenant,
+            "binding": dict(self.binding),
+            "foundation": dict(self.foundation),
+            "vmssId": self.vmss_id,
+            "resourceIds": list(self.resource_ids),
+        }
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, object]) -> "AzureDeletionProof":
+        binding = payload.get("binding")
+        foundation = payload.get("foundation")
+        resource_ids = payload.get("resourceIds")
+        tenant = payload.get("tenant")
+        vmss_id = payload.get("vmssId")
+        if (
+            set(payload)
+            != {"tenant", "binding", "foundation", "vmssId", "resourceIds"}
+            or not isinstance(tenant, str)
+            or not tenant
+            or not isinstance(binding, dict)
+            or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in binding.items()
+            )
+            or not isinstance(foundation, dict)
+            or not all(
+                isinstance(key, str) and isinstance(value, str)
+                for key, value in foundation.items()
+            )
+            or (vmss_id is not None and not isinstance(vmss_id, str))
+            or not isinstance(resource_ids, list)
+            or not all(isinstance(value, str) and value for value in resource_ids)
+        ):
+            raise RuntimeError("Azure deletion proof checkpoint is invalid")
+        return cls(
+            tenant=tenant,
+            binding=dict(binding),
+            foundation=dict(foundation),
+            vmss_id=vmss_id,
+            resource_ids=tuple(resource_ids),
+        )
 
 
 def capture_operator_deletion_proof(
@@ -168,7 +212,7 @@ def prove_operator_deletion(
     foundation, _, _ = _inspect_foundation(root, config, require_healthy=True)
     if foundation != dict(proof.foundation):
         raise RuntimeError("Azure shared foundation identity changed during tenant deletion")
-    residues = _tenant_tagged_azure_resources(root, config, proof.tenant)
+    residues = tenant_tagged_azure_resources(config, proof.tenant)
     if residues:
         raise RuntimeError("Azure tenant-tagged resources remain after Tenant finalization")
     resources = _json(

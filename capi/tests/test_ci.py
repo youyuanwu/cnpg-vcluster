@@ -37,7 +37,8 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("if: always()", gate)
         self.assertIn("needs: [fast-checks, e2e, high-capacity]", gate)
         for command in (
-            "just test-unit", "just test-static", "just controller-fetch",
+            "just test-unit", "just test-static",
+            "just test-azure-operator-contracts", "just controller-fetch",
             "just controller-verify", "just controller-lint", "just controller-test",
             "just controller-metrics", "just controller-build",
         ):

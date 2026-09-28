@@ -68,20 +68,16 @@ fn recorded_delete(
     object: &DynamicObject,
     deletion: &AzureDeletionStatus,
 ) -> Result<DeleteParams, ReconcileError> {
-    let recorded = deletion
+    deletion
         .resource_versions
         .get(&key(object)?)
         .ok_or_else(|| blocked("Azure deletion resourceVersion barrier is incomplete"))?;
-    if object.metadata.deletion_timestamp.is_none() && recorded != &rv(object)? {
-        return Err(blocked(
-            "Azure deletion resourceVersion changed after discovery",
-        ));
-    }
+    let live_resource_version = rv(object)?;
     Ok(DeleteParams {
         propagation_policy: Some(PropagationPolicy::Foreground),
         preconditions: Some(Preconditions {
             uid: Some(uid(object)?),
-            resource_version: Some(recorded.clone()),
+            resource_version: Some(live_resource_version),
         }),
         ..Default::default()
     })
@@ -243,6 +239,7 @@ fn exact_recorded_resources(
     live: &[AzureProviderResourceIdentity],
     pool_started: bool,
     cluster_started: bool,
+    pool_root_uids: &BTreeSet<String>,
 ) -> Result<(), ReconcileError> {
     for current in live {
         if !recorded.iter().any(|item| same_resource(item, current)) {
@@ -255,10 +252,13 @@ fn exact_recorded_resources(
         if live.iter().any(|current| same_resource(item, current))
             || cluster_started
             || (pool_started
-                && matches!(
+                && (matches!(
                     item.kind.as_str(),
                     "Machine" | "MachineSet" | "AzureMachinePoolMachine"
-                ))
+                ) || item
+                    .owner_uids
+                    .iter()
+                    .any(|uid| pool_root_uids.contains(uid))))
         {
             continue;
         }
@@ -481,12 +481,23 @@ pub async fn finalize(
     let mut seen = BTreeSet::new();
     for definition in management::AZURE_MANAGEMENT_RESOURCES
         .iter()
-        .filter(|definition| definition.namespaced)
+        .filter(|definition| {
+            definition.namespaced
+                && (definition.class == management::ResourceClass::Descendant
+                    || matches!(definition.kind, "ConfigMap" | "Deployment" | "Secret"))
+        })
     {
         if seen.insert((definition.api_version, definition.plural)) {
             inventory.extend(list(client.clone(), &name, *definition).await?);
         }
     }
+    inventory.retain(|object| {
+        !(object
+            .types
+            .as_ref()
+            .is_some_and(|types| types.kind == "ConfigMap")
+            && object.name_any() == "kube-root-ca.crt")
+    });
     let explicit_uids: BTreeSet<_> = explicit
         .values()
         .flatten()
@@ -545,11 +556,21 @@ pub async fn finalize(
         .and_then(|objects| objects.first())
         .is_none_or(|object| object.metadata.deletion_timestamp.is_some());
     if let Some(recorded) = azure_status.deletion.as_ref() {
+        let pool_root_uids = [
+            management.kubeadm_config_uid.as_ref(),
+            management.azure_machine_pool_uid.as_ref(),
+            management.machine_pool_uid.as_ref(),
+        ]
+        .into_iter()
+        .flatten()
+        .cloned()
+        .collect();
         exact_recorded_resources(
             &azure_status.provider_resources,
             &provider_resources,
             pool_started,
             cluster_started,
+            &pool_root_uids,
         )?;
         if provider_resources
             .iter()
@@ -786,4 +807,42 @@ pub async fn finalize(
         .ok_or_else(|| blocked("Tenant disappeared during Azure finalization"))?;
     status::set_finalizer(client, tenant, &current, FINALIZER, false).await?;
     Ok(Action::await_change())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn resource(kind: &str, uid: &str, owner: &str) -> AzureProviderResourceIdentity {
+        AzureProviderResourceIdentity {
+            api_version: "v1".into(),
+            kind: kind.into(),
+            namespace: Some("tenant".into()),
+            name: uid.into(),
+            uid: uid.into(),
+            resource_id: None,
+            owner_uids: vec![owner.into()],
+        }
+    }
+
+    #[test]
+    fn pool_scoped_absence_requires_a_recorded_pool_owner() {
+        let pool_uids = BTreeSet::from(["pool-uid".into()]);
+        let worker_secret = resource("Secret", "worker-secret", "pool-uid");
+        assert!(
+            exact_recorded_resources(
+                std::slice::from_ref(&worker_secret),
+                &[],
+                true,
+                false,
+                &pool_uids,
+            )
+            .is_ok()
+        );
+        let control_plane_secret = resource("Secret", "control-plane-secret", "cluster-uid");
+        assert!(
+            exact_recorded_resources(&[control_plane_secret], &[], true, false, &pool_uids,)
+                .is_err()
+        );
+    }
 }

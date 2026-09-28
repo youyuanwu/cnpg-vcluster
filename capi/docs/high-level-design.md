@@ -10,8 +10,8 @@ with CAPZ-owned VMSS workers.
 
 Azure tenants are not separate AKS clusters. AKS is shared management
 infrastructure; each tenant remains a Kamaji hosted control plane. The Tenant
-API now represents local and Azure provider intent, but only the local
-`ProviderLifecycle` is installed. Azure retains its JSON/Python lifecycle.
+API represents local and Azure provider intent. One manager binary starts in
+an explicit provider mode and installs exactly one `ProviderLifecycle`.
 
 ## Local as-built topology
 
@@ -71,23 +71,22 @@ Status contains the observed generation, phase, standard conditions, and
 provider-specific state. Local status contains
 `status.provider.allocation.{slotId,endpoint,podCIDR,serviceCIDR}`,
 `status.provider.foundationHash`, and the exact root
-`status.provider.clusterUID`. Azure status is currently only its
-discriminator.
+`status.provider.clusterUID`. Azure status binds the exact foundation,
+specification, operation, management UIDs, kubeconfig identity, endpoint,
+VMSS/Node inventory, add-on components, provider descendants, and deletion
+barriers.
 There is no persisted creation
 stage, tenant-API cleanup checkpoint, child-resource UID ledger,
 worker-container evidence, or Docker volume identity.
 
 The generic reconciler validates and dispatches through `ProviderLifecycle`.
-`LocalProvider` owns the existing allocation, CAPI/CAPD/Kamaji, Docker,
-network, storage, CNPG, readiness, and finalization sequence. Valid Azure
-Tenant resources report `ProviderUnsupported` without a finalizer or local
-side effects. Deletion of an unsupported object without that finalizer is a
-read-only no-op. An impossible Azure resource carrying the controller
-finalizer remains blocked with `ProviderFinalizerUnsupported`; it is `Failed`
-before deletion and `Deleting` during deletion, and local cleanup is never
-attempted. A provider/status discriminator mismatch is instead invalid durable
-identity and reports `OwnershipInvalid` without provider calls or finalizer
-removal.
+`LocalProvider` owns allocation, CAPI/CAPD/Kamaji, Docker, network, storage,
+CNPG, readiness, and finalization. `AzureProvider` owns the Kubernetes
+CAPI/CAPZ/Kamaji/add-on desired state and finalizer but has no Azure
+credentials; CAPZ/ASO perform cloud mutation. A provider not installed in the
+selected manager mode reports unsupported without acquiring a new finalizer.
+A provider/status discriminator mismatch is invalid durable identity and
+reports `OwnershipInvalid`.
 
 The Tokio manager uses kube-rs watches, a dedicated renewable leader-election
 Lease, health probes, and one bounded reconcile worker. Allocation Leases
@@ -329,8 +328,8 @@ just local-tenant-delete tenant-example
 
 The legacy local JSON adapter, imperative create/delete modules, runtime
 journals, profile lock, and callable local mutators have been removed. The
-schema-1 specification, durable journal, identity, Ready/timing evidence, and
-profile lock are Azure-only. Azure commands remain:
+superseded Azure rendering/lifecycle/deletion adapter and filesystem Tenant
+runtime are also removed. Azure commands remain:
 
 ```bash
 just tenant-create azure config/tenants/examples/azure.json
@@ -348,14 +347,16 @@ and host-setting restoration.
 ## Azure boundary
 
 Bicep owns the Azure resource group, VNet, subnets, identity, role/federation,
-and AKS foundation. CAPZ owns tenant MachinePools, AzureMachinePools, VMSS
-instances, and NICs. The Tenant CRD contains an Azure intent variant, but the
-controller does not yet install an Azure lifecycle implementation.
+AKS, shared ACR, and AcrPull foundation. The Azure-mode Tenant operator owns
+exact Kubernetes desired state and status; CAPZ/ASO own tenant Azure mutation,
+including MachinePools, AzureMachinePools, VMSS instances, and NICs.
 
-Azure deletion continues to verify exact Kubernetes UIDs, Azure resource IDs,
-tags, ASO objects, and the recorded foundation. CAPI/CAPZ remove the
-MachinePool and VMSS before Cluster deletion. The normal path does not issue a
-direct VMSS delete or strip Azure provider finalizers.
+Azure deletion records exact Kubernetes and Azure identities, deletes exact
+roots with UID/resourceVersion preconditions, waits for descendants, and
+removes the Tenant finalizer last. External Python proof verifies Azure IDs,
+tags, and unchanged foundation after finalization. The normal path does not
+issue a direct VMSS delete, patch CAPZ compatibility state, or strip provider
+finalizers; only the explicit destructive gate deletes one VMSS instance.
 
 ## Isolation and limitations
 

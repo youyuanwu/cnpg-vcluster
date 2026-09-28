@@ -35,10 +35,6 @@ class TenantCLITests(unittest.TestCase):
         )
         with (
             patch(
-                "scripts.lib.azure.lifecycle.AzureTenantAdapter",
-                side_effect=AssertionError("legacy adapter invoked"),
-            ),
-            patch(
                 "scripts.lib.azure.operator.status_tenant",
                 return_value=observed,
             ) as status,
@@ -74,10 +70,6 @@ class TenantCLITests(unittest.TestCase):
             )
             with (
                 contexts,
-                patch(
-                    "scripts.lib.azure.lifecycle.AzureTenantAdapter",
-                    side_effect=AssertionError("legacy adapter invoked"),
-                ),
                 patch("scripts.lib.azure.operator.create_tenant") as create,
                 patch("scripts.lib.azure.operator.delete_tenant") as delete,
             ):

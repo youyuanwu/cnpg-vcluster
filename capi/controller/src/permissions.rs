@@ -52,7 +52,9 @@ fn management_rule(resource: &ManagementResource) -> PolicyRule {
         "Namespace" => vec!["create", "delete", "get", "list"],
         "Secret" => vec!["delete", "get", "list"],
         "Lease" => vec!["create", "delete", "get", "list", "patch", "update"],
-        "KubeadmConfig" | "TenantControlPlane" => vec!["get", "list"],
+        "KubeadmConfig" | "TenantControlPlane" if resource.class != ResourceClass::Root => {
+            vec!["get", "list"]
+        }
         _ if resource.class == ResourceClass::Root => {
             vec!["create", "delete", "get", "list", "patch"]
         }
@@ -73,6 +75,9 @@ fn azure_management_rule(resource: &ManagementResource) -> PolicyRule {
         .split_once('/')
         .map_or("", |(group, _)| group);
     let mut verbs = vec!["get", "list"];
+    if resource.kind == "Machine" {
+        verbs.push("patch");
+    }
     if resource.watched {
         verbs.push("watch");
     }
@@ -133,9 +138,18 @@ mod tests {
                 let verbs = &azure_management_rule(resource).verbs;
                 assert!(!verbs.contains(&"create".into()));
                 assert!(!verbs.contains(&"delete".into()));
-                assert!(!verbs.contains(&"patch".into()));
+                assert_eq!(verbs.contains(&"patch".into()), resource.kind == "Machine");
             }
         }
+        let azure_kubeadm = AZURE_MANAGEMENT_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == "KubeadmConfig")
+            .unwrap();
+        assert!(
+            azure_management_rule(azure_kubeadm)
+                .verbs
+                .contains(&"create".into())
+        );
         assert!(rules.iter().any(|rule| {
             rule.api_groups.as_deref() == Some(&["cluster.x-k8s.io".into()])
                 && rule.resources.as_deref() == Some(&["clusters/status".into()])

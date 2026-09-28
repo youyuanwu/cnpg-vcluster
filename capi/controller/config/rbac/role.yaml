@@ -255,8 +255,11 @@ rules:
   resources:
   - kubeadmconfigs
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
@@ -329,6 +332,7 @@ rules:
   verbs:
   - get
   - list
+  - patch
   - watch
 - apiGroups:
   - cluster.x-k8s.io
@@ -383,13 +387,6 @@ rules:
   - list
   - watch
 - apiGroups:
-  - ''
-  resources:
-  - endpoints
-  verbs:
-  - get
-  - list
-- apiGroups:
   - apps
   resources:
   - statefulsets
@@ -401,27 +398,6 @@ rules:
   - ''
   resources:
   - persistentvolumeclaims
-  verbs:
-  - get
-  - list
-- apiGroups:
-  - ''
-  resources:
-  - pods
-  verbs:
-  - get
-  - list
-- apiGroups:
-  - apps
-  resources:
-  - replicasets
-  verbs:
-  - get
-  - list
-- apiGroups:
-  - discovery.k8s.io
-  resources:
-  - endpointslices
   verbs:
   - get
   - list
@@ -471,13 +447,6 @@ rules:
   - network.azure.com
   resources:
   - natgateways
-  verbs:
-  - get
-  - list
-- apiGroups:
-  - network.azure.com
-  resources:
-  - publicipaddresses
   verbs:
   - get
   - list

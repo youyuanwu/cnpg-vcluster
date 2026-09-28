@@ -683,7 +683,12 @@ pub(super) fn validate_parent(
             )))
         };
     };
-    if owner.controller != Some(true)
+    let controller_matches = if kind == "MachinePool" {
+        owner.controller.is_none()
+    } else {
+        owner.controller == Some(true)
+    };
+    if !controller_matches
         || owner.api_version != parent.api_version
         || owner.kind != parent.kind
         || owner.name != parent_name
@@ -835,21 +840,28 @@ async fn observe_workers(
     configuration: &AzureConfiguration,
 ) -> Result<Option<WorkerObservation>, ReconcileError> {
     let workers = i64::from(spec.workers);
-    let replicas_ready = |object: &DynamicObject| {
-        object
+    if pool.data.pointer("/spec/replicas").and_then(Value::as_i64) != Some(workers)
+        || pool
             .data
             .pointer("/status/replicas")
             .and_then(Value::as_i64)
-            == Some(workers)
-            && object
-                .data
-                .pointer("/status/readyReplicas")
-                .and_then(Value::as_i64)
-                == Some(workers)
-    };
-    if pool.data.pointer("/spec/replicas").and_then(Value::as_i64) != Some(workers)
-        || !replicas_ready(pool)
-        || !replicas_ready(azure_pool)
+            != Some(workers)
+        || pool
+            .data
+            .pointer("/status/readyReplicas")
+            .and_then(Value::as_i64)
+            != Some(workers)
+        || azure_pool
+            .data
+            .pointer("/status/replicas")
+            .and_then(Value::as_i64)
+            != Some(workers)
+        || (azure_pool
+            .data
+            .pointer("/status/ready")
+            .and_then(Value::as_bool)
+            != Some(true)
+            && !readiness::object_ready(azure_pool))
     {
         return Ok(None);
     }
@@ -1056,17 +1068,49 @@ async fn observe_provider_resources(
     tenant: &str,
 ) -> Result<Vec<AzureProviderResourceIdentity>, ReconcileError> {
     let mut inventory = Vec::new();
+    let mut seen = BTreeSet::new();
     for definition in management::AZURE_MANAGEMENT_RESOURCES
         .iter()
-        .filter(|definition| definition.class == ResourceClass::Descendant)
+        .filter(|definition| {
+            definition.class == ResourceClass::Descendant
+                || matches!(definition.kind, "ConfigMap" | "Deployment" | "Secret")
+        })
     {
+        if !seen.insert((definition.api_version, definition.plural)) {
+            continue;
+        }
         let api = Api::<DynamicObject>::namespaced_with(
             client.clone(),
             tenant,
             &definition.api_resource(),
         );
-        inventory.extend(api.list(&ListParams::default()).await?.items);
+        let mut items = api.list(&ListParams::default()).await?.items;
+        for item in &mut items {
+            item.types.get_or_insert(kube::core::TypeMeta {
+                api_version: definition.api_version.into(),
+                kind: definition.kind.into(),
+            });
+        }
+        inventory.extend(items);
     }
+    let explicit_uids: BTreeSet<_> = management_status
+        .recorded_uids()
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    inventory.retain(|object| {
+        !object.uid().is_some_and(|uid| explicit_uids.contains(&uid))
+            && !(object
+                .types
+                .as_ref()
+                .is_some_and(|types| types.kind == "ConfigMap")
+                && object.name_any() == "kube-root-ca.crt")
+            && !(object
+                .types
+                .as_ref()
+                .is_some_and(|types| types.kind == "Secret")
+                && object.name_any() == format!("{tenant}-kubeconfig"))
+    });
     let mut owned: BTreeSet<String> = management_status
         .recorded_uids()
         .into_iter()
@@ -1096,9 +1140,25 @@ async fn observe_provider_resources(
         }
     }
     if selected.len() != inventory.len() {
-        return Err(ownership(
-            "foreign or ownerless Azure provider resource is present in the Tenant namespace",
-        ));
+        let unknown = inventory
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !selected.contains(index))
+            .map(|(_, object)| {
+                format!(
+                    "{}/{}",
+                    object
+                        .types
+                        .as_ref()
+                        .map_or("unknown", |types| types.kind.as_str()),
+                    object.name_any()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(ownership(format!(
+            "foreign or ownerless Azure provider resource is present: {unknown}"
+        )));
     }
     let mut result = Vec::new();
     for object in inventory {
@@ -1120,7 +1180,11 @@ async fn observe_provider_resources(
         owner_uids.sort();
         owner_uids.dedup();
         if owner_uids.is_empty() || !owner_uids.iter().any(|uid| owned.contains(uid)) {
-            return Err(ownership("Azure provider owner chain is incomplete"));
+            return Err(ownership(format!(
+                "Azure provider owner chain is incomplete for {}/{}",
+                types.kind,
+                object.name_any()
+            )));
         }
         let resource_id = [
             "/status/id",

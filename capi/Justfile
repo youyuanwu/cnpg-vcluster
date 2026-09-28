@@ -183,6 +183,13 @@ test-unit:
 test-static:
     @python3 scripts/test_static.py
 
+# Validate offline Azure manager packaging, command, proof, ownership, and gate contracts.
+test-azure-operator-contracts:
+    @python3 -m unittest discover -s tests -p "test_azure_foundation.py"
+    @python3 -m unittest discover -s tests -p "test_azure_operator.py"
+    @python3 -m unittest discover -s tests -p "test_azure_ownership.py"
+    @python3 -m unittest discover -s tests -p "test_azure_gate.py"
+
 # [implemented] Exercise the management-only lifecycle.
 test-management:
     @python3 scripts/run_locked.py scripts/test_management.py

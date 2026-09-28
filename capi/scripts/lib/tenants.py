@@ -34,12 +34,6 @@ from .tenant_spec import (
     load_tenant_spec,
     require_non_overlapping_networks,
 )
-from .tenant_runtime import (
-    OperationJournal,
-    TenantRuntime,
-    foundation_sha256,
-    recorded_tenant_names,
-)
 
 
 LIFECYCLE_MARKERS = {
@@ -71,23 +65,6 @@ class Tenant:
     database_count: int = 3
     specification_sha256: str = ""
     lifecycle_markers: Mapping[str, str] = field(default_factory=dict)
-
-
-def lifecycle_markers(
-    spec: TenantSpec,
-    journal: OperationJournal,
-) -> dict[str, str]:
-    marker_operation = journal.observed.get(
-        "markerOperationId",
-        journal.operation_id,
-    )
-    return {
-        "tenant": spec.name,
-        "profile": spec.profile,
-        "specificationSha256": spec.sha256(),
-        "foundationSha256": foundation_sha256(journal.foundation_identity),
-        "operationId": marker_operation,
-    }
 
 
 def resource_lifecycle_markers(payload: Mapping[str, object]) -> dict[str, str]:

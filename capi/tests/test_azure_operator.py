@@ -66,6 +66,7 @@ class AzureOperatorTests(AzureFixtureMixin, unittest.TestCase):
         )
         payload["status"]["observedGeneration"] = 2
         payload["status"]["conditions"][0]["observedGeneration"] = 2
+        payload["status"]["provider"] = {"type": "azure"}
         self.assertEqual("ready", tenant_status("tenant-c", payload).classification)
 
     def test_create_applies_only_tenant_and_waits_for_ready(self) -> None:
@@ -77,6 +78,7 @@ class AzureOperatorTests(AzureFixtureMixin, unittest.TestCase):
             "status": {
                 "observedGeneration": 1,
                 "phase": "Ready",
+                "provider": {"type": "azure"},
                 "conditions": [
                     {
                         "type": "Ready",
@@ -250,10 +252,27 @@ class AzureProofTests(AzureFixtureMixin, unittest.TestCase):
                 return_value=(dict(FOUNDATION), True, ()),
             ),
             patch(
-                "scripts.lib.azure.proof._tenant_tagged_azure_resources",
+                "scripts.lib.azure.proof.tenant_tagged_azure_resources",
                 return_value=[],
             ),
             patch("scripts.lib.azure.proof.names", return_value={"resourceGroup": "rg"}),
             patch("scripts.lib.azure.proof._json", return_value=[]),
         ):
             prove_operator_deletion(root, {}, proof)
+
+    def test_deletion_proof_checkpoint_round_trip_is_exact(self) -> None:
+        proof = AzureDeletionProof(
+            "tenant-c",
+            {"operationId": "operation-1"},
+            FOUNDATION,
+            "/tenant/vmss",
+            ("/tenant/public-ip", "/tenant/vmss"),
+        )
+        self.assertEqual(
+            proof,
+            AzureDeletionProof.from_mapping(proof.to_mapping()),
+        )
+        with self.assertRaisesRegex(RuntimeError, "checkpoint is invalid"):
+            AzureDeletionProof.from_mapping(
+                {**proof.to_mapping(), "unexpected": True}
+            )

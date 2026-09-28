@@ -5,14 +5,10 @@ from pathlib import Path
 from scripts.lib.azure.common import (
     FOUNDATION_INVENTORY_SCHEMA,
     _foundation_defaults_checksum,
-    azure_tenant_runtime_path,
     names,
 )
-from scripts.lib.azure.contracts import _management_resource_specs
 from scripts.lib.files import write_private_file
-from scripts.lib.tenant_runtime import TenantRuntime, foundation_sha256
 from scripts.lib.tenant_spec import TenantSpec
-from scripts.lib.tenants import LIFECYCLE_MARKERS
 
 
 DEFAULTS = """\
@@ -113,22 +109,6 @@ class AzureFixtureMixin:
             supported_versions={"azure": "1.32.13"},
         )
 
-    def start_journal(self, root: Path, spec: TenantSpec):
-        runtime = TenantRuntime(root, spec.name)
-        journal = runtime.start_operation(
-            operation="create",
-            spec=spec,
-            foundation_identity=FOUNDATION,
-            intended_resources=(f"Cluster/{spec.name}",),
-            operation_id="operation-1",
-        )
-        journal = runtime.update_operation(
-            journal,
-            phase="markers-recorded",
-            observed={"markerOperationId": journal.operation_id},
-        )
-        return runtime, journal
-
     def inventory(self, root: Path, config: dict[str, str]) -> dict[str, object]:
         outputs = {
             "resourceGroupName": "yy-cv-rg",
@@ -181,78 +161,3 @@ class AzureFixtureMixin:
         path = root / ".runtime" / "azure" / "resources.json"
         write_private_file(path, json.dumps(payload))
         return path
-
-    def ready_identity(self, root: Path, spec: TenantSpec):
-        runtime, journal = self.start_journal(root, spec)
-        observed = {
-            "markerOperationId": journal.operation_id,
-            "tenantKubeconfigSecretUid": "tenant-kubeconfig-secret-uid",
-            "tenantKubeconfigSha256": "kubeconfig-sha256",
-            "vmssId": (
-                "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/"
-                "Microsoft.Compute/virtualMachineScaleSets/tenant-c-worker"
-            ),
-            "vmssInstanceIds": "[]",
-            "azureResources": json.dumps(
-                {"azure": [], "aso": [], "unknown": []},
-                sort_keys=True,
-                separators=(",", ":"),
-            ),
-        }
-        for key, _, _, _ in _management_resource_specs(spec):
-            observed[key] = f"{key}-value"
-        runtime.complete_create(runtime.load_operation(), spec, observed)
-        write_private_file(
-            azure_tenant_runtime_path(root, spec.name) / "endpoint.json",
-            "{}\n",
-        )
-        return runtime, runtime.load_identity()
-
-    def management_payloads(self, spec: TenantSpec, identity):
-        markers = {
-            "tenant": spec.name,
-            "profile": "azure",
-            "specificationSha256": spec.sha256(),
-            "foundationSha256": foundation_sha256(identity.foundation_identity),
-            "operationId": identity.observed["markerOperationId"],
-        }
-        payloads = []
-        namespace = None
-        for key, namespace_name, kind, name in _management_resource_specs(spec):
-            payload = {
-                "apiVersion": "v1",
-                "kind": kind,
-                "metadata": {
-                    "name": name,
-                    "uid": identity.observed[key],
-                    "resourceVersion": f"{key}-rv",
-                    "annotations": {
-                        LIFECYCLE_MARKERS[marker]: value
-                        for marker, value in markers.items()
-                    },
-                },
-            }
-            if namespace_name is not None:
-                payload["metadata"]["namespace"] = namespace_name
-            if kind == "Namespace":
-                namespace = payload
-            else:
-                payloads.append(payload)
-        payloads.append(
-            {
-                "apiVersion": "v1",
-                "kind": "Secret",
-                "metadata": {
-                    "name": f"{spec.name}-kubeconfig",
-                    "uid": identity.observed["tenantKubeconfigSecretUid"],
-                    "resourceVersion": "secret-rv",
-                    "ownerReferences": [
-                        {
-                            "uid": identity.observed["kamajiControlPlaneUid"],
-                            "controller": True,
-                        }
-                    ],
-                },
-            }
-        )
-        return namespace, payloads

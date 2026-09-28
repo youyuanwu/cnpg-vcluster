@@ -11,11 +11,11 @@ The Azure profile provisions an independently managed AKS foundation with a
 shared ACR, Kamaji control planes, CAPZ-managed Azure worker machines, and the
 external Azure cloud provider. `azure-create-management` publishes the static
 Tenant manager to ACR, pins the deployed digest, and starts it in Azure mode.
-Phase 1 installs only provider-mode startup scaffolding: Azure tenant lifecycle
-remains in Python until the later operator phases are complete. Local tenants
-are Kubernetes `Tenant` resources reconciled by the Rust/kube-rs controller.
-Azure tenants retain the JSON specification and Python lifecycle during this
-phase.
+Local and Azure tenants are Kubernetes `Tenant` resources reconciled by the
+Rust/kube-rs controller. Each manager deployment installs exactly one provider:
+local mode retains Docker and the local foundation, while Azure mode runs in
+AKS without Docker or Azure credentials and delegates cloud mutation to
+CAPZ/ASO.
 
 The proposed minimal Azure experiment is documented in
 [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md). It
@@ -25,8 +25,8 @@ Azure Disk/CNPG workload validation, and operational hardening.
 
 Azure foundation operations use the ignored owner-only
 `config/azure.local.env` selectors. Azure Tenant creation uses a schema-1 JSON
-specification and the Python lifecycle; local Tenant operations instead use
-the Kubernetes resource and its status:
+specification as a command input; the client converts it to the Azure Tenant
+CR shape and observes operator status:
 
 ```bash
 just azure-preflight
@@ -39,16 +39,16 @@ just tenant-delete azure tenant-example azure/tenant-example
 just azure-test-tenant-lifecycle
 ```
 
-The Azure lifecycle journals and records the tenant control plane, CAPZ
-worker pool, Azure resource identities, add-ons, and Ready evidence under
-owner-only tenant-keyed runtime paths. Local operations do not create these
-records. Targeted Azure deletion verifies exact
-management UIDs and Azure resource IDs, lets CAPI/CAPZ delete the MachinePool
-and VMSS, proves the shared foundation is unchanged, and then removes tenant
-orchestration state. Pre-ACR Azure foundation inventory is rejected and requires a clean redeploy.
-The Azure-mode manager reports lifecycle dependencies pending and must not be
-treated as Azure tenant lifecycle readiness. Tenant Azure resources remain billable until
-targeted deletion removes the VMSS and related resources. The preserved
+Azure durable identity lives in Tenant status: exact foundation/specification
+binding, management UIDs, kubeconfig hash, VMSS instances, Nodes, add-ons,
+provider descendants, and deletion barriers. Ordinary Tenant deletion lets the
+operator and CAPI/CAPZ finalizers remove exact Kubernetes roots; the Python
+client only captures and verifies external Azure/tag absence and unchanged
+foundation identity. The destructive gate keeps owner-only resumable evidence
+under `.runtime/azure-gate/` and is the only Python path allowed to inject
+`az vmss delete-instances`. Pre-ACR Azure foundation inventory is rejected and
+requires a clean redeploy. Tenant Azure resources remain billable until
+ordinary deletion removes the VMSS and related resources. The preserved
 AKS, VNet, identity, and other shared foundation resources remain billable
 until `just azure-destroy` completes.
 
@@ -95,9 +95,8 @@ conditions, and ordinary deletion is completed by the controller finalizer.
 Apply is asynchronous; repeat `just local-tenant-status tenant-example` until
 it exits zero. Tenant specifications are immutable; delete and recreate to
 change capacity or versions. Local manifests select `provider.type: local`;
-endpoint and networks are assigned in provider status. The CRD also reserves
-an Azure provider shape, but Azure tenants retain the JSON specification and
-Python lifecycle until that provider is implemented in the controller.
+endpoint and networks are assigned in provider status. The same CRD supports Azure provider intent. The JSON Azure example remains a
+CLI input format, not a second lifecycle authority.
 The bounded final E2E waits for one
 explicitly selected Tenant's structural Ready contract, runs `SELECT 1`
 through its PostgreSQL read/write service with the existing disposable SQL
@@ -127,13 +126,10 @@ webhook is installed.
 This provider-discriminated contract is a breaking in-place redesign of the
 experimental `v1alpha2` API. There is no conversion or migration from the
 earlier flat local spec/status: existing Tenant objects must be deleted and
-recreated with the new shape. Azure CRD objects are admitted but the current
-manager reports them unsupported and performs no Azure or local lifecycle
-work. An unsupported object without the controller finalizer is ignored once
-deletion starts. If it carries the controller finalizer, the controller
-retains it and reports `ProviderFinalizerUnsupported` (`Failed` before
-deletion, `Deleting` during deletion). Azure lifecycle commands continue to
-use schema `1` JSON specifications. Safe examples are in
+recreated with the new shape. Azure-mode managers reconcile only Azure Tenants; local-mode managers reconcile
+only local Tenants. Provider mismatches remain unsupported and do not acquire a
+new finalizer. Azure lifecycle commands continue to accept schema `1` JSON
+specifications and translate them to the CRD. Safe examples are in
 [`config/tenants/examples/`](config/tenants/examples/).
 
 The lifecycle does not infer a singleton tenant from environment variables.
@@ -142,10 +138,10 @@ legacy controller state. The manager loads one foundation snapshot at startup.
 Same-identity restarts resume active Tenants; changed configuration requires
 an empty Tenant/provider/host inventory and a candidate-bound activation
 ticket. Failed pre-activation replacement restores the prior controller.
-Removed fixed tenant commands, old Azure foundation inventories, and legacy
-local runtime layouts are not migrated or adopted. Local retries reapply the
-same immutable Tenant manifest; Azure retries use the same JSON specification
-and recorded foundation identity.
+Removed fixed tenant commands, old Azure foundation inventories, legacy local
+runtime layouts, and Python Azure tenant journals are not migrated or adopted.
+Local retries reapply the same immutable Tenant manifest; Azure retries submit
+the same JSON-derived Tenant specification.
 
 `just cache` is the explicit online acquisition and provenance-refresh step.
 After it succeeds, `just tools` and `just preflight` verify and use the local
@@ -200,16 +196,17 @@ All mutating tenant paths validate pinned inputs and tenant networks before
 changing state. Local lifecycle state is held in the Tenant resource, schema-3 foundation
 ConfigMap, per-slot allocation Leases, provider resources, and exact Docker identities;
 the public local commands do not maintain a second filesystem journal or
-readiness evaluator. Azure credentials, journals, Ready evidence, and identity
-records remain owner-only below ignored `.runtime/`. Commands use explicit
+readiness evaluator. Azure lifecycle identity is held in the Tenant resource;
+only foundation inventory, management kubeconfig, and destructive-gate
+evidence remain below ignored owner-only `.runtime/`. Commands use explicit
 kubeconfig paths and do not depend on the user's current Kubernetes context.
 
 Azure implementation responsibilities live under `scripts/lib/azure/`:
-`foundation` owns shared infrastructure, `rendering` owns manifests,
-`readiness` owns endpoint/VMSS/Node observations, `ownership` owns fail-closed
-discovery, `deletion` owns exact cleanup mechanics, `lifecycle` owns the tenant
-adapter, and `gate` owns destructive three-worker replacement validation.
-`scripts/azure.py` remains only the foundation command facade.
+`foundation` owns shared infrastructure and digest-pinned manager packaging,
+`operator` submits and observes Tenant resources, `proof` verifies external
+absence, `ownership` observes Azure/tag identity, and `gate` owns destructive
+three-worker replacement validation. `scripts/azure.py` remains only the
+foundation command facade.
 
 The retained workflow is a development optimization, not a final gate. It
 retains only the explicitly bound management foundation:
@@ -454,8 +451,10 @@ labels, network, address, generation-backed file inventory, and checksums.
 GitHub Actions runs Python unit/static checks and Rust generated-artifact
 verification, format, Clippy, tests, and release/static-link build in
 **CAPI fast checks**, independently of the destructive **CAPI end-to-end**
-job. Parallel jobs allow image acquisition and fast checks to overlap; E2E
-builds the controller image during management bootstrap.
+job. Fast checks explicitly repeat the offline Azure foundation packaging,
+operator command, proof, ownership, and gate contracts; the destructive Azure
+gate remains manual. Parallel jobs allow image acquisition and fast checks to
+overlap; E2E builds the controller image during management bootstrap.
 The final **CAPI tests** check requires fast checks and the online E2E on PRs
 (including fork PRs), fast checks and the targeted/offline high-capacity job
 on manual dispatch and the weekly Monday 04:23 UTC schedule, and fast checks
@@ -480,6 +479,7 @@ controller-gen tool acquisition is needed. For Docker-free local checks:
 just controller-fetch
 just test-unit
 just test-static
+just test-azure-operator-contracts
 just controller-verify
 just controller-lint
 just controller-test
@@ -524,8 +524,8 @@ The enforced-offline gate also prints `CAPI_OFFLINE_EGRESS` records with the
 node and counted reject-rule packets, plus `CAPI_OFFLINE_MIRROR` records for
 each exact digest-qualified image exercised through the local mirror.
 
-Azure create and delete operations additionally print redacted tenant-specific
-`TENANT_TIMING` records and persist owner-only timing evidence.
+The destructive Azure gate writes redacted phase evidence and its resumable
+worker/deletion checkpoint below owner-only `.runtime/azure-gate/`.
 
 Exact versions, URLs, checksums, source commits, and image digests are in
 [`config/versions.env`](config/versions.env). See

@@ -98,6 +98,8 @@ impl Fixture {
                 }
                 Some("MachinePool") => {
                     if let Some(owner) = cluster.as_ref() {
+                        let mut owner = owner.clone();
+                        owner.as_object_mut().unwrap().remove("controller");
                         value["metadata"]["ownerReferences"] = json!([owner]);
                     }
                 }
@@ -128,7 +130,7 @@ impl Fixture {
                         "nodeRefs":[{"name":"node-0"},{"name":"node-1"},{"name":"node-2"}]});
                 }
                 Some("AzureMachinePool") => {
-                    value["status"] = json!({"replicas":3,"readyReplicas":3});
+                    value["status"] = json!({"replicas":3,"ready":true});
                 }
                 Some("Deployment")
                     if value["metadata"]["name"]

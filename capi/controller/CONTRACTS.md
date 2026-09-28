@@ -1,6 +1,6 @@
 # Rust Tenant contracts
 
-`tenancy.cnpg-vcluster.io/v1alpha2` is the only installed local Tenant API.
+`tenancy.cnpg-vcluster.io/v1alpha2` is the only installed Tenant API.
 Rust `src/bin/generate.rs` produces the checked-in
 `config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml` and
 `config/rbac/role.yaml`. `just controller-verify` compares those artifacts
@@ -50,15 +50,11 @@ under `tests/support/`. `controller-metrics` reports production Rust source
 before test-only modules and rejects growth above the 12,000-line workflow ceiling.
 
 Installation uses one `Recreate` replica, a separate leader-election Lease,
-Docker socket access, and HTTP `/healthz` and `/readyz`, without admission
-ports or TLS mounts. A disposable in-cluster Job probes Kubernetes DNS and
-the `default` Namespace with mounted credentials. The Python-produced
-schema-3 foundation resolves an ordered slot catalog; non-expiring per-slot
-allocation Leases and status bind each Tenant's assigned endpoint and CIDRs.
-The manager reads one schema-3 foundation snapshot at startup. Same-identity
-restarts resume active Tenants. Changed identity requires a one-time activation
-ticket, clean authoritative inventory, and an atomic accepted-identity update
-before reconciliation opens.
+and HTTP `/healthz` and `/readyz`, without admission ports or TLS mounts.
+Local mode additionally uses Docker, the schema-3 local foundation, and staged
+assets. Azure mode uses the schema-1 Azure provider ConfigMap and no Docker
+socket or Azure credentials. The same binary accepts `--provider=local|azure`;
+one deployment installs exactly one lifecycle implementation.
 
 The generated management-resource JSON is the cross-language local operator
 contract. Entries declare exact served API identity and scope,
@@ -87,3 +83,9 @@ PR fast checks upload the verified static manager and PR E2E consumes that
 same-revision artifact from `.tools/artifacts`. Scheduled and manually
 dispatched high-capacity validation do not use the artifact and retain a clean
 enforced-offline release build.
+
+Azure lifecycle authority is Rust-only. Python may provision and inspect the
+shared foundation, submit/observe/delete the Tenant CR, externally prove Azure
+absence, and run the explicit VMSS replacement gate. Static checks require the
+old rendering/lifecycle/deletion modules and filesystem Tenant runtime to
+remain absent.

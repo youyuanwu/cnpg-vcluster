@@ -49,6 +49,9 @@ jobs:
           just test-unit
           just test-static
 
+      - name: Validate Azure operator contracts
+        run: just test-azure-operator-contracts
+
       - name: Fetch locked controller dependencies
         run: just controller-fetch
 

@@ -307,12 +307,8 @@ pub const AZURE_MANAGEMENT_RESOURCES: &[ManagementResource] = &[
     azure_descendant!("cert-manager.io/v1", "CertificateRequest", "certificaterequests", true, "provider-certificate-request", "Certificate", false),
     azure_descendant!("cert-manager.io/v1", "Issuer", "issuers", true, "provider-issuer", "KamajiControlPlane", false),
     azure_descendant!("v1", "Service", "services", true, "provider-service", "KamajiControlPlane", true),
-    azure_descendant!("v1", "Endpoints", "endpoints", true, "provider-endpoints", "Service", false),
     azure_descendant!("apps/v1", "StatefulSet", "statefulsets", true, "provider-stateful-set", "KamajiControlPlane", true),
     azure_descendant!("v1", "PersistentVolumeClaim", "persistentvolumeclaims", true, "provider-pvc", "StatefulSet", false),
-    azure_descendant!("v1", "Pod", "pods", true, "provider-pod", "StatefulSet", false),
-    azure_descendant!("apps/v1", "ReplicaSet", "replicasets", true, "provider-replica-set", "Deployment", false),
-    azure_descendant!("discovery.k8s.io/v1", "EndpointSlice", "endpointslices", true, "provider-endpoint-slice", "Service", false),
     azure_descendant!("policy/v1", "PodDisruptionBudget", "poddisruptionbudgets", true, "provider-pdb", "KamajiControlPlane", false),
     azure_descendant!("rbac.authorization.k8s.io/v1", "Role", "roles", true, "provider-role", "KamajiControlPlane", false),
     azure_descendant!("rbac.authorization.k8s.io/v1", "RoleBinding", "rolebindings", true, "provider-role-binding", "KamajiControlPlane", false),
@@ -320,7 +316,6 @@ pub const AZURE_MANAGEMENT_RESOURCES: &[ManagementResource] = &[
     azure_descendant!("network.azure.com/v1api20201101", "VirtualNetwork", "virtualnetworks", true, "aso-virtual-network", "AzureCluster", false),
     azure_descendant!("network.azure.com/v1api20201101", "VirtualNetworksSubnet", "virtualnetworkssubnets", true, "aso-subnet", "AzureCluster", false),
     azure_descendant!("network.azure.com/v1api20220701", "NatGateway", "natgateways", true, "aso-nat-gateway", "AzureCluster", false),
-    azure_descendant!("network.azure.com/v1api20201101", "PublicIPAddress", "publicipaddresses", true, "aso-public-ip-address", "AzureCluster", false),
 ];
 
 pub fn roots() -> impl Iterator<Item = ManagementResource> {

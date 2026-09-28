@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use k8s_openapi::api::core::v1::{ConfigMap, Namespace};
 use kube::Api;
@@ -54,7 +55,7 @@ impl ProviderMode {
                 local_foundation: false,
                 local_assets: false,
                 azure_configuration: true,
-                management_watches: false,
+                management_watches: true,
             },
         }
     }
@@ -84,9 +85,14 @@ impl Default for ManagerConfig {
     fn default() -> Self {
         let namespace = std::env::var("POD_NAMESPACE")
             .unwrap_or_else(|_| DEFAULT_LEADER_ELECTION_NAMESPACE.into());
-        let identity = std::env::var("POD_NAME")
+        let base_identity = std::env::var("POD_NAME")
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| format!("tenant-controller-{}", std::process::id()));
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos();
+        let identity = format!("{base_identity}-{nonce:x}");
         Self {
             provider: ProviderMode::Local,
             probe_in_cluster: false,
@@ -502,7 +508,7 @@ mod tests {
                 local_foundation: false,
                 local_assets: false,
                 azure_configuration: true,
-                management_watches: false,
+                management_watches: true,
             }
         );
     }

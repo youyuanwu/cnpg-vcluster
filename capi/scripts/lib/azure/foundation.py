@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import base64
+
 from .common import *
 from scripts.lib.controller import (
     build_azure_controller_image,
@@ -881,8 +883,8 @@ def _inspect_foundation(
     acr = _az(
         "acr",
         "show",
-        "--ids",
-        str(outputs["acrId"]),
+        "--name",
+        str(outputs["acrName"]),
         "--query",
         (
             "{id:id,name:name,loginServer:loginServer,"

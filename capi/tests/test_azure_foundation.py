@@ -12,10 +12,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from scripts.azure import _run_profile_mutation
-from scripts.lib.azure.deletion import _remove_private_tree
 from scripts.lib.azure.common import (
     _foundation_defaults_checksum,
-    azure_tenant_runtime_path,
     load_azure_configuration,
     tenant_names,
 )
@@ -183,6 +181,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                         "oidcIssuer": outputs["aksOidcIssuer"],
                     }))
                 if arguments[:2] == ("acr", "show"):
+                    self.assertNotIn("--ids", arguments)
+                    self.assertEqual(
+                        arguments[arguments.index("--name") + 1],
+                        outputs["acrName"],
+                    )
                     if not acr_present:
                         return completed(returncode=1)
                     return completed(json.dumps({
@@ -425,27 +428,12 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         ):
             create_foundation(root, config)
         deploy.assert_not_called()
-    def test_tenant_names_and_artifacts_are_tenant_keyed(self):
-        root = self.make_root()
+    def test_tenant_names_are_tenant_keyed(self):
         spec = self.spec("blue")
         selected = tenant_names(spec)
         self.assertEqual(selected["cluster"], "blue")
         self.assertEqual(selected["pool"], "blue-worker")
-        path = azure_tenant_runtime_path(root, "blue")
-        self.assertEqual(path, root / ".runtime" / "azure" / "tenants" / "blue")
         self.assertNotIn("yy-cv-tenant", json.dumps(selected))
-    def test_tenant_runtime_removal_cannot_remove_foundation_files(self):
-        root = self.make_root()
-        foundation = root / ".runtime" / "azure"
-        tenant = azure_tenant_runtime_path(root, "blue")
-        write_private_file(foundation / "resources.json", "{}")
-        write_private_file(foundation / "management.kubeconfig", "foundation")
-        write_private_file(tenant / "endpoint.json", "{}")
-        for child in tenant.iterdir():
-            child.unlink()
-        tenant.rmdir()
-        self.assertTrue((foundation / "resources.json").is_file())
-        self.assertTrue((foundation / "management.kubeconfig").is_file())
     def test_foundation_mutation_waits_for_azure_lock(self):
         root = self.make_root()
         marker = root / "acquired"
