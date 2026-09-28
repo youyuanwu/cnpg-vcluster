@@ -393,6 +393,14 @@ def delete_tenant(
                                 raise TenantRuntimeError(
                                     "Azure gate delete precondition changed"
                                 )
+                        if (
+                            operation_id_override is not None
+                            and pending is not None
+                            and pending.operation_id != operation_id_override
+                        ):
+                            raise TenantRuntimeError(
+                                "Azure gate delete operation identity changed"
+                            )
                     if identity is None:
                         with timings.phase("absence"):
                             inspected = _safe_authoritative_absence(
