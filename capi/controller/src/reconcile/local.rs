@@ -36,14 +36,14 @@ impl Assets {
 }
 #[rustfmt::skip]
 pub trait TenantAccess: Send + Sync {
-    fn connect(&self, management: Client, control_plane: &DynamicObject, tenant_name: &str, endpoint: &str)
+    fn connect(&self, management: Client, control_plane: &DynamicObject, alternate_owner: Option<&DynamicObject>, tenant_name: &str, endpoint: &str)
         -> impl Future<Output = Result<Client, TenantClientError>> + Send;
 }
 pub struct LiveTenantAccess;
 #[rustfmt::skip]
 impl TenantAccess for LiveTenantAccess {
-    async fn connect(&self, management: Client, control_plane: &DynamicObject, tenant_name: &str, endpoint: &str) -> Result<Client, TenantClientError> {
-        tenant_client::load_tenant_client(management, control_plane, tenant_name, tenant_name, endpoint)
+    async fn connect(&self, management: Client, control_plane: &DynamicObject, alternate_owner: Option<&DynamicObject>, tenant_name: &str, endpoint: &str) -> Result<Client, TenantClientError> {
+        tenant_client::load_tenant_client_with_owner(management, control_plane, alternate_owner, tenant_name, tenant_name, endpoint)
             .await.map(|(client, _)| client)
     }
 }
@@ -232,7 +232,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
         }
         let tenant_client = self
             .access
-            .connect(self.client.clone(), &control_plane.object, &name, &endpoint)
+            .connect(self.client.clone(), &control_plane.object, None, &name, &endpoint)
             .await?;
         tenant_client::ensure_bootstrap_rbac(tenant_client.clone()).await?;
         let volume_name = resources::storage_volume_name(&context);

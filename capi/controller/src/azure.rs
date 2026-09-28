@@ -22,14 +22,14 @@ pub const CONFIG_KEY: &str = "provider.json";
 pub const FIELD_MANAGER: &str = "cnpg-vcluster-azure";
 pub const EXTERNAL_CONTROL_PLANE_LABEL: &str = "cnpg-vcluster-external-control-plane";
 
-const LABEL_EXPERIMENT: &str = "cnpg-vcluster-experiment";
+pub(crate) const LABEL_EXPERIMENT: &str = "cnpg-vcluster-experiment";
 pub const TENANT_LABEL: &str = "cnpg-vcluster-tenant";
-const LABEL_PROFILE: &str = "cnpg-vcluster-profile";
+pub(crate) const LABEL_PROFILE: &str = "cnpg-vcluster-profile";
 pub const TENANT_ANNOTATION: &str = "lifecycle.cnpg-vcluster.capi/tenant";
-const ANNOTATION_PROFILE: &str = "lifecycle.cnpg-vcluster.capi/profile";
-const ANNOTATION_SPEC: &str = "lifecycle.cnpg-vcluster.capi/specification-sha256";
-const ANNOTATION_FOUNDATION: &str = "lifecycle.cnpg-vcluster.capi/foundation-sha256";
-const ANNOTATION_OPERATION: &str = "lifecycle.cnpg-vcluster.capi/operation-id";
+pub(crate) const ANNOTATION_PROFILE: &str = "lifecycle.cnpg-vcluster.capi/profile";
+pub(crate) const ANNOTATION_SPEC: &str = "lifecycle.cnpg-vcluster.capi/specification-sha256";
+pub(crate) const ANNOTATION_FOUNDATION: &str = "lifecycle.cnpg-vcluster.capi/foundation-sha256";
+pub(crate) const ANNOTATION_OPERATION: &str = "lifecycle.cnpg-vcluster.capi/operation-id";
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -670,6 +670,16 @@ pub fn validate_live_object(
     live: &DynamicObject,
     recorded_uid: Option<&str>,
 ) -> Result<String, AzureOwnershipError> {
+    let uid = validate_live_identity(desired, live, recorded_uid)?;
+    validate_desired_object(desired, live)?;
+    Ok(uid)
+}
+
+pub fn validate_live_identity(
+    desired: &DynamicObject,
+    live: &DynamicObject,
+    recorded_uid: Option<&str>,
+) -> Result<String, AzureOwnershipError> {
     if desired.types != live.types
         || desired.metadata.name != live.metadata.name
         || desired.metadata.namespace != live.metadata.namespace
@@ -710,8 +720,14 @@ pub fn validate_live_object(
     if recorded_uid.is_some_and(|recorded| recorded != uid) {
         return Err(AzureOwnershipError::Uid);
     }
-    desired_subset(&desired.data, &live.data, "$")?;
     Ok(uid.into())
+}
+
+pub fn validate_desired_object(
+    desired: &DynamicObject,
+    live: &DynamicObject,
+) -> Result<(), AzureOwnershipError> {
+    desired_subset(&desired.data, &live.data, "$")
 }
 
 fn desired_subset(desired: &Value, live: &Value, path: &str) -> Result<(), AzureOwnershipError> {

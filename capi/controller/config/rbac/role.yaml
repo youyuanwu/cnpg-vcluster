@@ -51,6 +51,13 @@ rules:
 - apiGroups:
   - cluster.x-k8s.io
   resources:
+  - clusters/status
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
   - clusters
   verbs:
   - create

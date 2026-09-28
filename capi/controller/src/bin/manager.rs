@@ -209,7 +209,7 @@ async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
                 Api::<ConfigMap>::namespaced(client.clone(), FOUNDATION_NAMESPACE)
                     .get(AZURE_CONFIG_NAME)
                     .await?;
-            let provider = AzureProvider::from_config_map(&provider_config)?;
+            let provider = AzureProvider::from_config_map(client.clone(), &provider_config)?;
             let configured_version = provider
                 .configuration
                 .values

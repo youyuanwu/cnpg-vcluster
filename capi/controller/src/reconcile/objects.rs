@@ -94,7 +94,7 @@ pub struct Ensured {
     pub created: bool,
 }
 
-async fn read_or_create(
+pub(crate) async fn read_or_create(
     client: Client,
     desired: &DynamicObject,
     known: Option<DynamicObject>,
@@ -108,9 +108,17 @@ async fn read_or_create(
     let current = match current {
         Some(current) => current,
         None if refuse_missing => {
+            let kind = desired
+                .types
+                .as_ref()
+                .map_or("resource", |types| types.kind.as_str());
             return Err(ReconcileError::Degraded {
-                reason: "RootClusterMissing",
-                message: "recorded root Cluster is missing".into(),
+                reason: if kind == "Cluster" {
+                    "RootClusterMissing"
+                } else {
+                    "DurableObjectMissing"
+                },
+                message: format!("recorded {}/{} is missing", kind, desired.name_any()),
             });
         }
         None => {

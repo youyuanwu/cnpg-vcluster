@@ -1,6 +1,8 @@
 mod creation_support;
 mod support;
 
+#[path = "controller/azure_reconcile.rs"]
+mod azure_reconcile;
 #[path = "controller/builders.rs"]
 mod builders;
 #[path = "controller/builders_bootstrap.rs"]

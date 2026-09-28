@@ -539,3 +539,29 @@ fn kubeconfig_deletion_requires_one_exact_control_plane_owner_not_secret_content
         );
     }
 }
+
+#[test]
+fn kubeconfig_exact_owner_set_supports_cluster_or_control_plane_compatibility() {
+    let cp = object("KamajiControlPlane", "tenant-a", "cp-uid");
+    let cluster = object("Cluster", "tenant-a", "cluster-uid");
+    let cluster_owned = secret(&cluster);
+    assert_eq!(
+        validate_kubeconfig_secret_owners(&cluster_owned, &[&cp, &cluster]),
+        Ok(())
+    );
+    assert_eq!(
+        validate_kubeconfig_secret_owners(&cluster_owned, &[&cp]),
+        Err(OwnershipError::SecretOwner)
+    );
+    let mut ambiguous = cluster_owned;
+    ambiguous
+        .metadata
+        .owner_references
+        .as_mut()
+        .unwrap()
+        .push(owner(&cp));
+    assert_eq!(
+        validate_kubeconfig_secret_owners(&ambiguous, &[&cp, &cluster]),
+        Err(OwnershipError::SecretOwner)
+    );
+}

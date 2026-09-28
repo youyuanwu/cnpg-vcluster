@@ -31,6 +31,7 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
         &["tenants/status"],
         &["get", "patch", "update"],
     ),
+    ("cluster.x-k8s.io", &["clusters/status"], &["get", "patch"]),
 ];
 
 fn rule(group: &str, resources: &[&str], verbs: &[&str]) -> PolicyRule {
@@ -135,6 +136,11 @@ mod tests {
                 assert!(!verbs.contains(&"patch".into()));
             }
         }
+        assert!(rules.iter().any(|rule| {
+            rule.api_groups.as_deref() == Some(&["cluster.x-k8s.io".into()])
+                && rule.resources.as_deref() == Some(&["clusters/status".into()])
+                && rule.verbs == ["get", "patch"]
+        }));
         for (kind, expected) in [
             (
                 "Cluster",

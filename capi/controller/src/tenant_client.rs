@@ -13,8 +13,8 @@ use kube::config::{KubeConfigOptions, Kubeconfig};
 use kube::core::DynamicObject;
 use kube::{Api, Client, Config};
 
-use crate::management::MANAGEMENT_RESOURCES;
-use crate::ownership::{validate_kubeconfig_secret, validate_kubeconfig_secret_for_deletion};
+use crate::management::{AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES};
+use crate::ownership::validate_kubeconfig_secret_owners;
 use crate::resources::{bootstrap_rbac, bootstrap_subjects_match};
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -145,14 +145,37 @@ pub fn parse_owned_kubeconfig(
     tenant_name: &str,
     endpoint: &str,
 ) -> Result<Kubeconfig, TenantClientError> {
+    parse_owned_kubeconfig_with_owner(
+        secret,
+        control_plane,
+        None,
+        namespace,
+        tenant_name,
+        endpoint,
+    )
+}
+
+fn parse_owned_kubeconfig_with_owner(
+    secret: &Secret,
+    control_plane: &DynamicObject,
+    alternate_owner: Option<&DynamicObject>,
+    namespace: &str,
+    tenant_name: &str,
+    endpoint: &str,
+) -> Result<Kubeconfig, TenantClientError> {
     let secret_definition = MANAGEMENT_RESOURCES
         .iter()
         .find(|resource| resource.kind == "Secret")
         .expect("Secret is catalogued");
-    let control_plane_definition = MANAGEMENT_RESOURCES
+    let control_plane_matches = MANAGEMENT_RESOURCES
         .iter()
-        .find(|resource| resource.kind == "KamajiControlPlane")
-        .expect("KamajiControlPlane is catalogued");
+        .chain(AZURE_MANAGEMENT_RESOURCES)
+        .filter(|resource| resource.kind == "KamajiControlPlane")
+        .any(|resource| {
+            control_plane.types.as_ref().is_some_and(|types| {
+                types.kind == resource.kind && types.api_version == resource.api_version
+            })
+        });
     if namespace.is_empty()
         || tenant_name.is_empty()
         || secret.metadata.name != secret_definition.expected_name(tenant_name)
@@ -163,17 +186,24 @@ pub fn parse_owned_kubeconfig(
     }
     if control_plane.metadata.name.as_deref() != Some(tenant_name)
         || control_plane.metadata.namespace.as_deref() != Some(namespace)
-        || !control_plane.types.as_ref().is_some_and(|types| {
-            types.kind == control_plane_definition.kind
-                && types.api_version == control_plane_definition.api_version
-        })
+        || !control_plane_matches
     {
         return Err(TenantClientError::SecretOwnership);
     }
-    validate_kubeconfig_secret_for_deletion(secret, Some(control_plane))
+    let allowed: Vec<_> = std::iter::once(control_plane)
+        .chain(alternate_owner)
+        .collect();
+    validate_kubeconfig_secret_owners(secret, &allowed)
         .map_err(|_| TenantClientError::SecretOwnership)?;
-    validate_kubeconfig_secret(secret, Some(control_plane))
-        .map_err(|_| TenantClientError::SecretContract)?;
+    if secret.type_.as_deref() != Some("cluster.x-k8s.io/secret")
+        || secret
+            .data
+            .as_ref()
+            .and_then(|data| data.get("value"))
+            .is_none_or(|value| value.0.is_empty())
+    {
+        return Err(TenantClientError::SecretContract);
+    }
     let bytes = &secret
         .data
         .as_ref()
@@ -329,6 +359,25 @@ pub async fn load_tenant_client(
     tenant_name: &str,
     endpoint: &str,
 ) -> Result<(Client, Secret), TenantClientError> {
+    load_tenant_client_with_owner(
+        management,
+        control_plane,
+        None,
+        namespace,
+        tenant_name,
+        endpoint,
+    )
+    .await
+}
+
+pub async fn load_tenant_client_with_owner(
+    management: Client,
+    control_plane: &DynamicObject,
+    alternate_owner: Option<&DynamicObject>,
+    namespace: &str,
+    tenant_name: &str,
+    endpoint: &str,
+) -> Result<(Client, Secret), TenantClientError> {
     let name = MANAGEMENT_RESOURCES
         .iter()
         .find(|resource| resource.kind == "Secret")
@@ -339,8 +388,26 @@ pub async fn load_tenant_client(
         .await
         .map_err(|error| TenantClientError::request("read kubeconfig Secret", error, false))?
         .ok_or(TenantClientError::SecretPending)?;
-    let client =
-        tenant_client_from_secret(&secret, control_plane, namespace, tenant_name, endpoint).await?;
+    let configuration = parse_owned_kubeconfig_with_owner(
+        &secret,
+        control_plane,
+        alternate_owner,
+        namespace,
+        tenant_name,
+        endpoint,
+    )?;
+    let mut config = Config::from_custom_kubeconfig(configuration, &KubeConfigOptions::default())
+        .await
+        .map_err(|_| TenantClientError::ClientConfiguration)?;
+    if config.root_cert.as_ref().is_none_or(Vec::is_empty) {
+        return Err(TenantClientError::ClientConfiguration);
+    }
+    config.proxy_url = None;
+    config.connect_timeout = Some(Duration::from_secs(30));
+    config.read_timeout = Some(Duration::from_secs(30));
+    config.write_timeout = Some(Duration::from_secs(30));
+    config.default_retry = false;
+    let client = Client::try_from(config).map_err(|_| TenantClientError::ClientConfiguration)?;
     Ok((client, secret))
 }
 

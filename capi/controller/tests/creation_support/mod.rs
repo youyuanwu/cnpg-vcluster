@@ -123,6 +123,7 @@ impl TenantAccess for FakeAccess {
         &self,
         _: Client,
         _: &DynamicObject,
+        _: Option<&DynamicObject>,
         _: &str,
         endpoint: &str,
     ) -> Result<Client, TenantClientError> {
