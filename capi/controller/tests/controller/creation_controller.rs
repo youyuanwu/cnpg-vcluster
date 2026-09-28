@@ -15,7 +15,7 @@ use tenant_controller::{
     foundation::{Foundation, FoundationError, canonical_hash, parse_runtime},
     management,
     ownership::Identity,
-    reconcile::{Assets, Config, FINALIZER, PROGRESS_INTERVAL, Reconciler},
+    reconcile::{Assets, Config, FINALIZER, LocalProvider, PROGRESS_INTERVAL, Reconciler},
 };
 
 const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a";
@@ -65,11 +65,14 @@ impl Fixture {
             "spec":{"replicas":1,"template":{"spec":{"initContainers":[{"name":"init","image":"docker.io/cnpg:one"}],"containers":[{"name":"manager","image":"docker.io/cnpg:one"}]}}}}).to_string().into_bytes();
         let reconciler = Reconciler {
             client: management.client(),
-            docker: FakeDocker::default(),
-            access: FakeAccess(workload.client()),
+            provider: LocalProvider {
+                client: management.client(),
+                docker: FakeDocker::default(),
+                access: FakeAccess(workload.client()),
+                assets: Assets { calico, cnpg },
+                foundation: runtime_foundation,
+            },
             config: Config::default(),
-            assets: Assets { calico, cnpg },
-            foundation: runtime_foundation,
         };
         Self {
             management,
@@ -87,7 +90,13 @@ impl Fixture {
     fn clear(&self) {
         self.management.take_calls();
         self.workload.take_calls();
-        self.reconciler.docker.calls.lock().unwrap().clear();
+        self.reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .clear();
     }
 
     async fn step(&self) -> Action {
@@ -213,7 +222,7 @@ impl Fixture {
         coredns.data =
             json!({"spec":{"replicas":1},"status":{"observedGeneration":2,"availableReplicas":1}});
         self.workload.insert(&path(&coredns), coredns);
-        *self.reconciler.docker.containers.lock().unwrap() = vec![DockerContainer {
+        *self.reconciler.provider.docker.containers.lock().unwrap() = vec![DockerContainer {
             id: "container-a".into(),
             name: "worker-a".into(),
             state: "running".into(),
@@ -262,7 +271,16 @@ async fn absent_tenant_only_uses_one_uncached_get() {
     assert_eq!(fixture.step().await, Action::await_change());
     assert_eq!(fixture.management.calls().len(), 1);
     assert!(fixture.workload.calls().is_empty());
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -290,12 +308,23 @@ async fn invalid_spec_has_no_foundation_or_external_calls() {
         "InvalidSpec"
     );
     assert!(fixture.workload.calls().is_empty());
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
 async fn valid_azure_spec_stops_before_finalizer_or_local_dependencies() {
-    let fixture = Fixture::new(true);
+    let mut fixture = Fixture::new(true);
+    Arc::make_mut(&mut fixture.reconciler.provider.foundation).creation =
+        Err(FoundationError::Invalid("must not be observed".into()));
     let mut tenant = fixture.current();
     tenant.spec.provider = TenantProviderSpec::Azure {
         pod_cidr: "10.244.0.0/16".into(),
@@ -325,7 +354,16 @@ async fn valid_azure_spec_stops_before_finalizer_or_local_dependencies() {
         "Azure status must be the only mutation"
     );
     assert!(fixture.workload.calls().is_empty());
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -451,7 +489,16 @@ async fn finalizer_foundation_allocation_namespace_cluster_and_uid_writes_are_se
         |call| call.path.contains("/devclusters") || call.path.contains("/kamajicontrolplanes")
     ));
     assert!(fixture.workload.calls().is_empty());
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -538,7 +585,16 @@ async fn foundation_replacement_never_adds_finalizer_or_claims() {
     assert!(fixture.current().finalizers().is_empty());
     assert_eq!(fixture.management.calls().len(), 2);
     assert!(fixture.workload.calls().is_empty());
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -568,7 +624,16 @@ async fn missing_status_bound_lease_fails_closed_before_namespace_or_docker() {
             .all(|call| call.method != "POST")
     );
     assert!(fixture.workload.calls().is_empty());
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -584,7 +649,16 @@ async fn control_plane_aggregate_gates_credentials_volume_and_workers() {
     fixture.clear();
     fixture.step().await;
     assert!(fixture.workload.calls().is_empty());
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         !fixture
             .management
@@ -881,7 +955,16 @@ async fn root_apply_conflict_requeues_without_external_mutation_or_terminal_fail
     fixture.clear();
     assert_eq!(fixture.step().await, Action::requeue(PROGRESS_INTERVAL));
     assert!(fixture.workload.calls().is_empty());
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         !fixture
             .management
@@ -894,9 +977,9 @@ async fn root_apply_conflict_requeues_without_external_mutation_or_terminal_fail
 #[tokio::test]
 async fn creation_invalid_snapshot_is_classified_without_external_mutation() {
     let mut fixture = Fixture::new(true);
-    Arc::make_mut(&mut fixture.reconciler.foundation).creation = Err(FoundationError::Invalid(
-        "creation inputs are invalid".into(),
-    ));
+    Arc::make_mut(&mut fixture.reconciler.provider.foundation).creation = Err(
+        FoundationError::Invalid("creation inputs are invalid".into()),
+    );
     fixture.step().await;
     let tenant = fixture.current();
     assert!(tenant.finalizers().is_empty());
@@ -912,7 +995,16 @@ async fn creation_invalid_snapshot_is_classified_without_external_mutation() {
         "FoundationInvalid"
     );
     assert!(fixture.workload.calls().is_empty());
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]
@@ -954,7 +1046,16 @@ async fn bootstrap_rbac_drift_is_degraded_and_blocks_volume_and_worker_mutations
             .reason,
         "BootstrapAccessMismatch"
     );
-    assert!(fixture.reconciler.docker.calls.lock().unwrap().is_empty());
+    assert!(
+        fixture
+            .reconciler
+            .provider
+            .docker
+            .calls
+            .lock()
+            .unwrap()
+            .is_empty()
+    );
     assert!(
         !fixture
             .management
@@ -977,6 +1078,7 @@ async fn foreign_volume_blocks_worker_mutations_and_is_not_adopted() {
     fixture.until_ready().await;
     for volume in fixture
         .reconciler
+        .provider
         .docker
         .volumes
         .lock()
@@ -1001,6 +1103,7 @@ async fn foreign_volume_blocks_worker_mutations_and_is_not_adopted() {
     assert!(
         fixture
             .reconciler
+            .provider
             .docker
             .volumes
             .lock()
@@ -1011,6 +1114,7 @@ async fn foreign_volume_blocks_worker_mutations_and_is_not_adopted() {
     assert!(
         fixture
             .reconciler
+            .provider
             .docker
             .calls
             .lock()
