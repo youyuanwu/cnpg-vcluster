@@ -14,12 +14,20 @@ def _normalize_resource_id(value: str) -> str:
     return normalized.rstrip("/").lower()
 
 
+def _provider_resource_id(value: str) -> str:
+    if not value.lower().startswith("azure://"):
+        raise RuntimeError("Azure worker provider ID is invalid")
+    return _normalize_resource_id(value)
+
+
 @dataclass(frozen=True)
 class WorkerMapping:
     node_name: str
     node_uid: str
     instance_id: str
     instance_resource_id: str
+    provider_id: str
+    internal_ip: str
 
 
 @dataclass(frozen=True)
@@ -54,10 +62,14 @@ def build_worker_snapshot(
     ):
         raise RuntimeError("Azure lifecycle gate requires exactly three Ready workers")
     expected_names = {str(value) for value in node_refs}
-    canonical_instances = {
-        _normalize_resource_id(str(value)): str(value)
-        for value in instance_resource_ids
-    }
+    if len(instance_resource_ids) != 3:
+        raise RuntimeError("Azure lifecycle gate requires exactly three VMSS instances")
+    canonical_instances = {}
+    for value in instance_resource_ids:
+        key = _normalize_resource_id(str(value))
+        if key in canonical_instances:
+            raise RuntimeError("Azure VMSS instance inventory contains duplicates")
+        canonical_instances[key] = str(value)
     if len(canonical_instances) != 3:
         raise RuntimeError("Azure lifecycle gate requires three distinct VMSS instances")
     mappings = []
@@ -67,9 +79,13 @@ def build_worker_snapshot(
         name = node.get("name")
         uid = node.get("uid")
         provider_id = node.get("providerID")
-        if not all(isinstance(value, str) and value for value in (name, uid, provider_id)):
+        internal_ip = node.get("internalIP")
+        if not all(
+            isinstance(value, str) and value
+            for value in (name, uid, provider_id, internal_ip)
+        ):
             raise RuntimeError("Azure worker identity is incomplete")
-        canonical_provider = _normalize_resource_id(provider_id)
+        canonical_provider = _provider_resource_id(provider_id)
         prefix = canonical_vmss + "/virtualmachines/"
         if not canonical_provider.startswith(prefix):
             raise RuntimeError("Azure worker is not backed by the expected VMSS")
@@ -84,6 +100,8 @@ def build_worker_snapshot(
                 node_uid=uid,
                 instance_id=instance_id,
                 instance_resource_id=canonical_instances[canonical_provider],
+                provider_id=provider_id,
+                internal_ip=internal_ip,
             )
         )
     if {item.node_name for item in mappings} != expected_names:
@@ -110,17 +128,31 @@ def require_replacement(
     if deleted == before.primary:
         raise RuntimeError("Azure lifecycle gate did not select a non-primary instance")
     before_pairs = {
-        (item.node_name, item.node_uid, _normalize_resource_id(item.instance_resource_id))
+        (
+            item.node_name,
+            item.node_uid,
+            _normalize_resource_id(item.instance_resource_id),
+            item.provider_id,
+            item.internal_ip,
+        )
         for item in before.mappings
     }
     after_pairs = {
-        (item.node_name, item.node_uid, _normalize_resource_id(item.instance_resource_id))
+        (
+            item.node_name,
+            item.node_uid,
+            _normalize_resource_id(item.instance_resource_id),
+            item.provider_id,
+            item.internal_ip,
+        )
         for item in after.mappings
     }
     deleted_pair = (
         deleted.node_name,
         deleted.node_uid,
         _normalize_resource_id(deleted.instance_resource_id),
+        deleted.provider_id,
+        deleted.internal_ip,
     )
     survivors = before_pairs - {deleted_pair}
     if deleted_pair in after_pairs or not survivors.issubset(after_pairs):
@@ -142,6 +174,8 @@ def require_replacement(
             item.node_name,
             item.node_uid,
             _normalize_resource_id(item.instance_resource_id),
+            item.provider_id,
+            item.internal_ip,
         )
         == replacement_pair
     )
@@ -206,6 +240,7 @@ def require_owned_resource_delta(
             result[key] = (
                 str(item.get("type", "")).lower(),
                 json.dumps(item, sort_keys=True, separators=(",", ":")),
+                item,
             )
         return result
 
@@ -258,3 +293,17 @@ def require_owned_resource_delta(
     }
     if len(removed_nics) != len(added_nics) or len(removed_nics) > 1:
         raise RuntimeError("Azure VMSS replacement NIC delta is ambiguous")
+    if any(
+        _normalize_resource_id(
+            str(before[item][2].get("virtualMachineId", ""))
+        )
+        != deleted_id
+        for item in removed_nics
+    ) or any(
+        _normalize_resource_id(
+            str(after[item][2].get("virtualMachineId", ""))
+        )
+        != replacement_id
+        for item in added_nics
+    ):
+        raise RuntimeError("Azure VMSS replacement NIC ownership is unrelated")

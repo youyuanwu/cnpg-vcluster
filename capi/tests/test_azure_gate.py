@@ -76,6 +76,20 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 VMSS,
                 [instance(0), instance(1), instance(2)],
             )
+        with self.assertRaisesRegex(RuntimeError, "exactly three"):
+            build_worker_snapshot(
+                readiness(),
+                VMSS,
+                [instance(0), instance(1), instance(2), instance(2)],
+            )
+        raw = readiness()
+        raw["nodes"][0]["providerID"] = instance(0)
+        with self.assertRaisesRegex(RuntimeError, "provider ID"):
+            build_worker_snapshot(
+                raw,
+                VMSS,
+                [instance(0), instance(1), instance(2)],
+            )
 
     def test_recovery_requires_unchanged_survivors_and_new_pair(self):
         before = build_worker_snapshot(
@@ -112,7 +126,15 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
         runtime.complete_create(
             runtime.load_operation(),
             spec,
-            {"markerOperationId": journal.operation_id, "vmssId": VMSS},
+            {
+                "markerOperationId": journal.operation_id,
+                "vmssId": VMSS,
+                "vmssInstanceIds": "[]",
+                "nodeIdentities": "[]",
+                "azureResources": json.dumps(
+                    {"azure": [], "aso": [], "unknown": []}
+                ),
+            },
         )
         identity = runtime.load_identity()
         observed = refreshed_observed(
@@ -128,6 +150,10 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             "changed before replacement",
         ):
             runtime.compare_and_replace_identity(identity, observed)
+        unrelated = dict(replacement.observed)
+        unrelated["vmssId"] = "changed"
+        with self.assertRaisesRegex(TenantRuntimeError, "unrelated"):
+            runtime.compare_and_replace_identity(replacement, unrelated)
 
     def test_owned_resource_delta_rejects_unrelated_changes(self):
         before = build_worker_snapshot(
@@ -212,6 +238,43 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 deleted,
                 replacement,
             )
+        recorded_with_nic = {
+            **recorded,
+            "azure": [
+                *recorded["azure"],
+                {
+                    "id": f"{VMSS}/networkInterfaces/old",
+                    "type": "Microsoft.Network/networkInterfaces",
+                    "virtualMachineId": instance(0),
+                },
+            ],
+        }
+        discovered_with_nic = {
+            **discovered,
+            "azure": [
+                {
+                    "id": VMSS,
+                    "type": "Microsoft.Compute/virtualMachineScaleSets",
+                    "tags": {"tenant": "tenant-c"},
+                },
+                {
+                    "id": instance(3),
+                    "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
+                },
+                {
+                    "id": f"{VMSS}/networkInterfaces/new",
+                    "type": "Microsoft.Network/networkInterfaces",
+                    "virtualMachineId": instance(1),
+                },
+            ],
+        }
+        with self.assertRaisesRegex(RuntimeError, "NIC ownership"):
+            require_owned_resource_delta(
+                json.dumps(recorded_with_nic),
+                discovered_with_nic,
+                deleted,
+                replacement,
+            )
 
     def test_incomplete_evidence_classifier_is_exact_and_unambiguous(self):
         root = self.make_root()
@@ -289,7 +352,7 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 "revision",
             )
 
-    def test_completed_gate_cannot_reinject_same_revision(self):
+    def test_completed_gate_is_not_an_incomplete_candidate(self):
         root = self.make_root()
         evidence = root / ".runtime" / "azure-gate" / "evidence"
         payload = {
@@ -315,25 +378,27 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             evidence / "lifecycle-operation-1.json",
             json.dumps(payload),
         )
-        with self.assertRaisesRegex(RuntimeError, "already completed"):
+        self.assertIsNone(
             _incomplete_gate_records(
                 evidence,
                 "tenant-c",
                 "spec-sha",
                 "revision",
             )
+        )
 
     def test_started_but_unconfirmed_deletion_fails_closed(self):
-        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
-            _require_authenticated_worker_deletion(
-                {"worker-instance-deletion-started"}
-            )
+        _require_authenticated_worker_deletion(
+            {"worker-instance-deletion-started"}
+        )
         _require_authenticated_worker_deletion(
             {
                 "worker-instance-deletion-started",
                 "worker-instance-deletion",
             }
         )
+        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
+            _require_authenticated_worker_deletion(set())
 
     def test_unrelated_historical_evidence_is_ignored(self):
         root = self.make_root()

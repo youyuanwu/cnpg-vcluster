@@ -582,7 +582,7 @@ def discover_azure_owned_resources(
             "--vmss-name",
             selected["pool"],
             "--query",
-            "[].{id:id,type:type,tags:tags}",
+            "[].{id:id,type:type,tags:tags,virtualMachineId:virtualMachine.id}",
             "--output",
             "json",
             check=False,
@@ -597,6 +597,10 @@ def discover_azure_owned_resources(
                 raise RuntimeError("Azure tenant VMSS NIC discovery returned an invalid NIC")
             if not nic.get("type"):
                 nic["type"] = "Microsoft.Network/networkInterfaces"
+            if not isinstance(nic.get("virtualMachineId"), str):
+                raise RuntimeError(
+                    "Azure tenant VMSS NIC discovery returned an unbound NIC"
+                )
             resources.append(nic)
             verified_ids.append(nic["id"])
     parent_uids = [

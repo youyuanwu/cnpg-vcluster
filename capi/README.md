@@ -183,6 +183,13 @@ readiness evaluator. Azure credentials, journals, Ready evidence, and identity
 records remain owner-only below ignored `.runtime/`. Commands use explicit
 kubeconfig paths and do not depend on the user's current Kubernetes context.
 
+Azure implementation responsibilities live under `scripts/lib/azure/`:
+`foundation` owns shared infrastructure, `rendering` owns manifests,
+`readiness` owns endpoint/VMSS/Node observations, `ownership` owns fail-closed
+discovery, `deletion` owns exact cleanup mechanics, `lifecycle` owns the tenant
+adapter, and `gate` owns destructive three-worker replacement validation.
+`scripts/azure.py` remains only the foundation command facade.
+
 The retained workflow is a development optimization, not a final gate. It
 retains only the explicitly bound management foundation:
 

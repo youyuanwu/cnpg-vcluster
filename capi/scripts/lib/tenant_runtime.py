@@ -339,6 +339,19 @@ class TenantRuntime:
         current = self.load_identity()
         if current.to_mapping() != expected.to_mapping():
             raise TenantRuntimeError("tenant identity changed before replacement")
+        if set(observed) != set(current.observed):
+            raise TenantRuntimeError("tenant replacement observed keys changed")
+        changed = {
+            key
+            for key, value in observed.items()
+            if current.observed[key] != value
+        }
+        allowed = {"vmssInstanceIds", "nodeIdentities", "azureResources"}
+        if not changed.issubset(allowed):
+            raise TenantRuntimeError(
+                "tenant replacement changed unrelated observations: "
+                + ", ".join(sorted(changed - allowed))
+            )
         replacement = TenantIdentity(
             profile=current.profile,
             tenant=current.tenant,
