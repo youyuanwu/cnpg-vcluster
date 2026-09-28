@@ -38,83 +38,118 @@ pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEPENDENCY_INTERVAL: Duration = Duration::from_secs(5);
 pub const READY_INTERVAL: Duration = Duration::from_secs(300);
 pub const STORAGE_CLASS: &str = "capi-hostpath";
-#[rustfmt::skip]
 #[derive(Clone, Debug)]
-pub struct Config { pub supported_version: String }
-#[rustfmt::skip]
+pub struct Config {
+    pub supported_version: String,
+}
 impl Default for Config {
-    fn default() -> Self { Self { supported_version: SUPPORTED_KUBERNETES_VERSION.into() } }
+    fn default() -> Self {
+        Self {
+            supported_version: SUPPORTED_KUBERNETES_VERSION.into(),
+        }
+    }
 }
-#[rustfmt::skip]
 pub struct Reconciler<P = LocalProvider> {
-    pub client: Client, pub provider: P, pub config: Config,
+    pub client: Client,
+    pub provider: P,
+    pub config: Config,
 }
-#[rustfmt::skip]
-impl<P> Reconciler<P> { pub fn new(client: Client, config: Config, provider: P) -> Self { Self { client, provider, config } } }
+impl<P> Reconciler<P> {
+    pub fn new(client: Client, config: Config, provider: P) -> Self {
+        Self {
+            client,
+            provider,
+            config,
+        }
+    }
+}
 
 impl<P: ProviderLifecycle> Reconciler<P> {
-    #[rustfmt::skip]
     pub async fn reconcile_name(&self, name: &str) -> Result<Action, ReconcileError> {
-        let Some(tenant) = Api::<Tenant>::all(self.client.clone()).get_opt(name).await? else { return Ok(Action::await_change()); };
-        if !self.provider.supports(&tenant.spec.provider) && tenant.metadata.deletion_timestamp.is_some() && tenant.finalizers().iter().any(|value| value == FINALIZER) { return self.unsupported_provider(&tenant).await; }
-        let spec = match canonical_spec(name, &tenant.spec, &self.config.supported_version)
-            .and_then(|spec| crate::api::validate_provider_status(&spec, tenant.status.as_ref()).map(|()| spec))
-        {
+        let Some(tenant) = Api::<Tenant>::all(self.client.clone())
+            .get_opt(name)
+            .await?
+        else {
+            return Ok(Action::await_change());
+        };
+        let has_finalizer = tenant.finalizers().iter().any(|value| value == FINALIZER);
+        if tenant.metadata.deletion_timestamp.is_some() && !has_finalizer {
+            return Ok(Action::await_change());
+        }
+        let spec = match canonical_spec(name, &tenant.spec, &self.config.supported_version) {
             Ok(spec) => spec,
             Err(error) => {
                 status::update_status(self.client.clone(), &tenant, |status| {
                     status.phase = Some(TenantPhase::Failed);
-                    set_condition(
-                        status,
-                        &tenant,
-                        "Accepted",
-                        false,
-                        "InvalidSpec",
-                        &error.to_string(),
-                    );
-                    set_condition(
-                        status,
-                        &tenant,
-                        "Ready",
-                        false,
-                        "InvalidSpec",
-                        "Tenant specification is invalid",
-                    );
+                    let error = error.to_string();
+                    for (condition, message) in [
+                        ("Accepted", error.as_str()),
+                        ("Ready", "Tenant specification is invalid"),
+                    ] {
+                        set_condition(status, &tenant, condition, false, "InvalidSpec", message);
+                    }
                     Ok(())
                 })
                 .await?;
                 return Ok(Action::await_change());
             }
         };
-        if !self.provider.supports(&spec.provider) { return self.unsupported_provider(&tenant).await; }
-        if tenant.metadata.deletion_timestamp.is_some() {
-            if !tenant.finalizers().iter().any(|value| value == FINALIZER) {
-                return Ok(Action::await_change());
-            }
-            return match self.provider.finalize(&tenant, &self.config.supported_version).await {
-                Ok(action) => Ok(action),
-                Err(error) if error.conflict() => {
-                    Ok(Action::requeue(PROGRESS_INTERVAL))
-                }
-                Err(error) => self.failure(&tenant, error).await,
-            };
+        if let Err(error) = crate::api::validate_provider_status(&spec, tenant.status.as_ref()) {
+            return self
+                .failure(&tenant, ReconcileError::OwnershipInvalid(error.to_string()))
+                .await;
         }
-        match self
-            .provider
-            .reconcile(&tenant, &spec)
-            .await
-        {
+        if !self.provider.supports(&spec.provider) {
+            return self.unsupported_provider(&tenant).await;
+        }
+        let deleting = tenant.metadata.deletion_timestamp.is_some();
+        let result = if deleting {
+            self.provider
+                .finalize(&tenant, &self.config.supported_version)
+                .await
+        } else {
+            self.provider.reconcile(&tenant, &spec).await
+        };
+        match result {
             Ok(action) => Ok(action),
-            Err(error) if error.pending() => {
+            Err(error) if !deleting && error.pending() => {
                 progress(self.client.clone(), &tenant, DEPENDENCY_INTERVAL).await
             }
             Err(error) => self.failure(&tenant, error).await,
         }
     }
-    #[rustfmt::skip]
     async fn unsupported_provider(&self, tenant: &Tenant) -> Result<Action, ReconcileError> {
-        let blocked = tenant.metadata.deletion_timestamp.is_some() && tenant.finalizers().iter().any(|value| value == FINALIZER);
-        status::update_status(self.client.clone(), tenant, |status| { if !blocked || status.provider.is_none() { status.provider = Some(TenantProviderStatus::Azure); } status.phase = Some(if blocked { TenantPhase::Deleting } else { TenantPhase::Failed }); set_condition(status, tenant, "Accepted", false, "ProviderUnsupported", "Azure provider reconciliation is not implemented"); set_condition(status, tenant, "Ready", false, if blocked { "ProviderFinalizerUnsupported" } else { "ProviderUnsupported" }, if blocked { "Azure provider carries the controller finalizer; deletion is blocked because Azure lifecycle is not implemented" } else { "Azure provider reconciliation is not implemented" }); Ok(()) }).await?;
+        let has_finalizer = tenant.finalizers().iter().any(|value| value == FINALIZER);
+        let (provider_status, provider_name) = match tenant.spec.provider {
+            crate::api::TenantProviderSpec::Local { .. } => {
+                (TenantProviderStatus::Local(Default::default()), "Local")
+            }
+            crate::api::TenantProviderSpec::Azure { .. } => (TenantProviderStatus::Azure, "Azure"),
+        };
+        let (reason, detail) = if has_finalizer {
+            (
+                "ProviderFinalizerUnsupported",
+                "carries the controller finalizer; lifecycle is not implemented",
+            )
+        } else {
+            ("ProviderUnsupported", "reconciliation is not implemented")
+        };
+        let message = format!("{provider_name} provider {detail}");
+        status::update_status(self.client.clone(), tenant, |status| {
+            status
+                .provider
+                .get_or_insert_with(|| provider_status.clone());
+            status.phase = Some(if tenant.metadata.deletion_timestamp.is_some() {
+                TenantPhase::Deleting
+            } else {
+                TenantPhase::Failed
+            });
+            for condition in ["Accepted", "Ready"] {
+                set_condition(status, tenant, condition, false, reason, &message);
+            }
+            Ok(())
+        })
+        .await?;
         Ok(Action::await_change())
     }
     async fn failure(
@@ -123,6 +158,11 @@ impl<P: ProviderLifecycle> Reconciler<P> {
         error: ReconcileError,
     ) -> Result<Action, ReconcileError> {
         let deleting = tenant.metadata.deletion_timestamp.is_some();
+        let failed = if deleting {
+            TenantPhase::Deleting
+        } else {
+            TenantPhase::Failed
+        };
         let (phase, reason) = if error.ownership_invalid() {
             (TenantPhase::OwnershipInvalid, "OwnershipInvalid")
         } else if let Some(reason) = error.degraded_reason() {
@@ -131,30 +171,12 @@ impl<P: ProviderLifecycle> Reconciler<P> {
             &error,
             ReconcileError::Foundation(foundation::FoundationError::Identity)
         ) {
-            (
-                if deleting {
-                    TenantPhase::Deleting
-                } else {
-                    TenantPhase::Failed
-                },
-                "FoundationMismatch",
-            )
+            (failed, "FoundationMismatch")
         } else if matches!(&error, ReconcileError::Foundation(_)) {
-            (
-                if deleting {
-                    TenantPhase::Deleting
-                } else {
-                    TenantPhase::Failed
-                },
-                "FoundationInvalid",
-            )
+            (failed, "FoundationInvalid")
         } else {
             (
-                if deleting {
-                    TenantPhase::Deleting
-                } else {
-                    TenantPhase::Failed
-                },
+                failed,
                 if deleting {
                     "DeletionBlocked"
                 } else {
@@ -165,28 +187,15 @@ impl<P: ProviderLifecycle> Reconciler<P> {
         if error.conflict() {
             return Ok(Action::requeue(PROGRESS_INTERVAL));
         }
+        let message = error.to_string();
         status::update_status(self.client.clone(), tenant, |status| {
             status.phase = Some(phase);
-            set_condition(status, tenant, "Ready", false, reason, &error.to_string());
+            set_condition(status, tenant, "Ready", false, reason, &message);
             if phase == TenantPhase::OwnershipInvalid {
-                set_condition(
-                    status,
-                    tenant,
-                    "OwnershipValid",
-                    false,
-                    reason,
-                    &error.to_string(),
-                );
+                set_condition(status, tenant, "OwnershipValid", false, reason, &message);
             }
             if matches!(reason, "FoundationMismatch" | "FoundationInvalid") {
-                set_condition(
-                    status,
-                    tenant,
-                    "FoundationReady",
-                    false,
-                    reason,
-                    &error.to_string(),
-                );
+                set_condition(status, tenant, "FoundationReady", false, reason, &message);
             }
             Ok(())
         })

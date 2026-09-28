@@ -47,9 +47,18 @@ impl TenantAccess for LiveTenantAccess {
             .await.map(|(client, _)| client)
     }
 }
-#[rustfmt::skip]
 pub trait ProviderLifecycle: Send + Sync {
-    fn supports(&self, provider: &TenantProviderSpec) -> bool; fn reconcile<'a>(&'a self, tenant: &'a Tenant, spec: &'a CanonicalSpec) -> impl Future<Output = Result<Action, ReconcileError>> + Send + 'a; fn finalize<'a>(&'a self, tenant: &'a Tenant, supported_version: &'a str) -> impl Future<Output = Result<Action, ReconcileError>> + Send + 'a;
+    fn supports(&self, provider: &TenantProviderSpec) -> bool;
+    fn reconcile<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        spec: &'a CanonicalSpec,
+    ) -> impl Future<Output = Result<Action, ReconcileError>> + Send + 'a;
+    fn finalize<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        supported_version: &'a str,
+    ) -> impl Future<Output = Result<Action, ReconcileError>> + Send + 'a;
 }
 #[rustfmt::skip]
 pub struct LocalProvider<D = BollardDockerClient, A = LiveTenantAccess> {
@@ -64,26 +73,20 @@ impl LocalProvider {
     }
 }
 impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvider<D, A> {
-    #[rustfmt::skip]
-    fn supports(&self, provider: &TenantProviderSpec) -> bool { matches!(provider, TenantProviderSpec::Local { .. }) }
+    fn supports(&self, provider: &TenantProviderSpec) -> bool {
+        matches!(provider, TenantProviderSpec::Local { .. })
+    }
     #[rustfmt::skip]
     async fn reconcile(&self, tenant: &Tenant, spec: &CanonicalSpec) -> Result<Action, ReconcileError> {
         let database_count = spec.local_databases().ok_or_else(|| ReconcileError::InvalidInput("azure provider is not supported by this controller".into()))?;
-        let recorded_hash = tenant
-            .status
-            .as_ref()
-            .and_then(|status| status.foundation_hash());
+        let current_status = tenant.status.as_ref();
+        let recorded_hash = current_status.and_then(|status| status.foundation_hash());
         let foundation = self.foundation.creation(recorded_hash)?;
         let foundation_hash = &self.foundation.hash;
         if status::set_finalizer(self.client.clone(), tenant, tenant, super::FINALIZER, true).await? {
             return Ok(Action::requeue(PROGRESS_INTERVAL));
         }
-        if tenant
-            .status
-            .as_ref()
-            .and_then(|status| status.foundation_hash())
-            .is_none_or(str::is_empty)
-        {
+        if recorded_hash.is_none_or(str::is_empty) {
             status::update_status(self.client.clone(), tenant, |status| {
                 let local = status.local_mut()?;
                 if local
@@ -117,18 +120,10 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
                 foundation_hash,
                 slots: &foundation.slots,
             },
-            tenant
-                .status
-                .as_ref()
-                .and_then(|status| status.allocation()),
+            current_status.and_then(|status| status.allocation()),
         )
         .await?;
-        if tenant
-            .status
-            .as_ref()
-            .and_then(|status| status.allocation())
-            .is_none()
-        {
+        if current_status.and_then(|status| status.allocation()).is_none() {
             status::update_status(self.client.clone(), tenant, |status| {
                 let allocation = claim.status();
                 let local = status.local_mut()?;
@@ -181,12 +176,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
         if cluster.created {
             return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
-        if tenant
-            .status
-            .as_ref()
-            .and_then(|status| status.cluster_uid())
-            .is_none_or(str::is_empty)
-        {
+        if current_status.and_then(|status| status.cluster_uid()).is_none_or(str::is_empty) {
             let cluster_uid = cluster
                 .object
                 .uid()

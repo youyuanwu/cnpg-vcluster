@@ -552,14 +552,23 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             if "create" in args:
                 value = json.loads(kwargs["input_text"])
                 incoming = value["spec"]
+                provider = incoming["provider"]
                 if value["metadata"]["name"] == "invalid.name":
                     return response(code=1, error="Invalid: Tenant name")
                 if incoming["workers"] == 0:
                     return response(code=1, error="Invalid workers")
-                if incoming["provider"]["databases"] == 4:
+                if provider.get("databases") == 4:
                     return response(code=1, error="Invalid databases")
                 if incoming["kubernetesVersion"] == "bad":
                     return response(code=1, error="Invalid kubernetesVersion")
+                if provider["type"] == "azure":
+                    if provider != {
+                        "type": "azure",
+                        "podCIDR": "10.244.0.0/16",
+                        "serviceCIDR": "10.96.0.0/16",
+                    }:
+                        return response(code=1, error="Invalid CIDR")
+                    return response({**value, "spec": incoming})
                 if "unexpected" in incoming and "--validate=strict" in args:
                     return response(code=1, error="unknown field")
                 value.pop("status", None)
@@ -578,6 +587,27 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         self.assertEqual(len([args for args in creates if "--dry-run=server" not in args]), 1)
         for mode in ("warn", "ignore", "strict"):
             self.assertTrue(any(f"--validate={mode}" in args for args in creates))
+        azure_dry_runs = [
+            json.loads(kwargs["input_text"])["spec"]["provider"]
+            for args, kwargs in client.calls
+            if "create" in args
+            and "--dry-run=server" in args
+            and json.loads(kwargs["input_text"])["spec"]["provider"]["type"] == "azure"
+        ]
+        self.assertEqual(len(azure_dry_runs), 6)
+        self.assertIn(
+            {
+                "type": "azure",
+                "podCIDR": "10.244.0.0/16",
+                "serviceCIDR": "10.96.0.0/16",
+            },
+            azure_dry_runs,
+        )
+        self.assertTrue(any("podCIDR" not in provider for provider in azure_dry_runs))
+        self.assertTrue(any(provider.get("podCIDR") == "10.244.0.1/16" for provider in azure_dry_runs))
+        self.assertTrue(any(provider.get("podCIDR") == "2001:db8::/64" for provider in azure_dry_runs))
+        self.assertTrue(any(provider.get("serviceCIDR") == "10.244.128.0/17" for provider in azure_dry_runs))
+        self.assertTrue(any(provider.get("serviceCIDR") == "10.96.0.0/29" for provider in azure_dry_runs))
         patches = [args for args, _ in client.calls if "patch" in args]
         self.assertEqual(len(patches), 5)
         self.assertTrue(all("--dry-run=server" in args for args in patches))

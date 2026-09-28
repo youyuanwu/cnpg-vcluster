@@ -106,16 +106,30 @@ just test-e2e
 
 ## Tenant specifications and runtime configuration
 
-The local cluster-scoped `tenancy.cnpg-vcluster.io/v1alpha2` API requires a
-name and an immutable three-field spec: `kubernetesVersion`, `workers`, and
-`databases` (each count 1-3). A schema-3 foundation supplies ordered slots
-that bind one endpoint, Pod CIDR, and Service CIDR per Tenant; the assigned
-values appear in `status.allocation`. OpenAPI/CEL reject invalid names,
-counts, version syntax, and spec updates. The controller checks the supported
-Kubernetes version (`1.36.4`). The API server prunes unknown fields under
-`fieldValidation=Warn` or `Ignore`, but rejects them under `Strict`, as used by
-the repository's local clients. No validating webhook is installed. Azure
-continues to use schema `1` JSON specifications. Safe examples are in
+The cluster-scoped `tenancy.cnpg-vcluster.io/v1alpha2` API requires a name and
+an immutable spec with common `kubernetesVersion` and `workers` fields plus
+one tagged `provider`. Local manifests use `type: local` and `databases`
+(counts 1-3). Azure placeholders use `type: azure` with canonical,
+non-overlapping IPv4 `podCIDR` and `serviceCIDR` networks; the Service CIDR
+must be at least `/28`. A schema-3 foundation supplies ordered local slots
+that bind one endpoint, Pod CIDR, and Service CIDR per Tenant; those values
+appear in `status.provider.allocation`. OpenAPI/CEL reject invalid names,
+counts, version syntax, provider fields, CIDRs, and spec updates. The
+controller checks the supported Kubernetes version (`1.36.4`). The API server
+prunes unknown fields under `fieldValidation=Warn` or `Ignore`, but rejects
+them under `Strict`, as used by the repository's local clients. No validating
+webhook is installed.
+
+This provider-discriminated contract is a breaking in-place redesign of the
+experimental `v1alpha2` API. There is no conversion or migration from the
+earlier flat local spec/status: existing Tenant objects must be deleted and
+recreated with the new shape. Azure CRD objects are admitted but the current
+manager reports them unsupported and performs no Azure or local lifecycle
+work. An unsupported object without the controller finalizer is ignored once
+deletion starts. If it carries the controller finalizer, the controller
+retains it and reports `ProviderFinalizerUnsupported` (`Failed` before
+deletion, `Deleting` during deletion). Azure lifecycle commands continue to
+use schema `1` JSON specifications. Safe examples are in
 [`config/tenants/examples/`](config/tenants/examples/).
 
 The lifecycle does not infer a singleton tenant from environment variables.

@@ -1,23 +1,28 @@
 # Tenant API compatibility
 
-`tenancy.cnpg-vcluster.io/v1alpha2` is the only served and stored local
-Tenant version. It is experimental; incompatible changes require an explicit
-version transition with updated CRD, examples, tests and documentation.
-There is no conversion or migration of `v1alpha1` Go-managed objects. The
-current installer requires unsupported legacy state to be removed manually.
-It verifies both `spec.versions` and `status.storedVersions`, then starts the
-manager with one immutable foundation snapshot and accepted configuration
-identity.
+`tenancy.cnpg-vcluster.io/v1alpha2` is the only served and stored Tenant
+version. It is experimental and was redesigned in place from the earlier flat
+local shape to the provider-discriminated contract described below. This is a
+breaking change: there is no conversion or migration for old flat `v1alpha2`
+objects or `v1alpha1` Go-managed objects. Existing objects must be deleted and
+recreated, and the current installer requires unsupported legacy state to be
+removed manually. It verifies both `spec.versions` and
+`status.storedVersions`, then starts the manager with one immutable foundation
+snapshot and accepted configuration identity. Future incompatible changes
+require an explicit version transition rather than another in-place redesign.
 
-A Tenant is cluster-scoped. Its immutable spec has exactly
-`kubernetesVersion`, `workers`, and `databases`. OpenAPI requires all three
-fields, numeric three-part version syntax (optional leading `v`), and integer
-counts from one to three. CEL constrains the name to a 1-30 character lowercase
-DNS label and compares the *whole literal spec* to `oldSelf.spec` on updates.
-The controller checks the supported version (`1.36.4`) separately and
-normalizes an initial `v` for the canonical spec hash. A `v` spelling change
-on an existing object is still prohibited by CEL. Change a spec by ordinary
-DELETE and recreate, not by in-place update.
+A Tenant is cluster-scoped. Its immutable spec has common
+`kubernetesVersion` and `workers` fields plus exactly one tagged `provider`.
+The local variant contains `type: local` and `databases`; the Azure variant
+contains `type: azure`, `podCIDR`, and `serviceCIDR`. OpenAPI requires numeric
+three-part version syntax (optional leading `v`), integer counts from one to
+three, provider-specific fields, canonical IPv4 Azure networks, non-overlap,
+and an Azure Service CIDR no smaller than `/28`. CEL constrains the name to a
+1-30 character lowercase DNS label and compares the *whole literal spec* to
+`oldSelf.spec` on updates. The controller checks the supported version
+(`1.36.4`) separately and normalizes an initial `v` for the canonical spec
+hash. A `v` spelling change on an existing object is still prohibited by CEL.
+Change a spec by ordinary DELETE and recreate, not by in-place update.
 
 The structural CRD prunes unsupported fields under
 `fieldValidation=Warn` (warning returned) or `Ignore` (no warning); only
@@ -25,13 +30,17 @@ The structural CRD prunes unsupported fields under
 request Strict. No validating webhook is installed, so callers must not rely
 on Warn/Ignore to reject extra input. Status is controller-owned through its
 subresource and may add optional observational fields without changing spec
-semantics. It exposes the allocated `slotId`, endpoint, Pod CIDR and Service
-CIDR under `status.allocation`, `foundationHash`, the exact `clusterUID`,
-phase and conditions. Clients must compare `metadata.generation`,
+semantics. Common status contains phase, conditions, and observed generation.
+Local status exposes the allocated `slotId`, endpoint, Pod CIDR and Service
+CIDR under `status.provider.allocation`, plus
+`status.provider.foundationHash` and the exact
+`status.provider.clusterUID`. Azure status currently contains only
+`status.provider.type: azure`. Clients must compare `metadata.generation`,
 `status.observedGeneration`, and the Ready condition's observed generation;
 do not depend on condition order, cached True conditions, or an internal
-reconciliation stage. The supported local status command owns exit
-classification.
+reconciliation stage. A provider/status discriminator mismatch is invalid
+durable identity and is reported as `OwnershipInvalid`; it is never repaired
+across providers. The supported local status command owns exit classification.
 
 Every status and finalizer write is an exact merge patch containing the
 observed UID and current resourceVersion. The controller revalidates UID,
@@ -77,6 +86,15 @@ version migration, downgrade behavior and removal criteria are documented and
 covered by conformance tests. Existing objects must never be silently re-read
 under different semantics.
 
-The Azure JSON TenantSpec and Python/CAPZ lifecycle are separate interfaces.
-They do not imply that the local CRD is served on AKS or that local
-status/allocation/finalizer semantics apply to CAPZ tenants.
+The CRD admits structurally valid Azure provider intent, but the installed
+manager has no Azure lifecycle implementation. It reports
+`ProviderUnsupported`, does not add the controller finalizer, and makes no
+local or Azure lifecycle calls. Once an unsupported object without that
+finalizer is deleting, reconciliation is a read-only no-op. If an unsupported
+object carries the controller finalizer, the controller retains it, makes no
+provider calls, and reports `ProviderFinalizerUnsupported` with phase `Failed`
+before deletion or `Deleting` during deletion.
+
+The Azure JSON TenantSpec and Python/CAPZ lifecycle remain separate interfaces.
+The CRD placeholder does not imply that it is used on AKS or that local
+status, allocation, or finalizer semantics apply to CAPZ tenants.

@@ -26,16 +26,22 @@ just destroy
 ```
 
 Local tenants are declarative `tenancy.cnpg-vcluster.io/v1alpha2` resources
-reconciled by a Rust/kube-rs operator. Their immutable specs contain only
-`kubernetesVersion`, `workers`, and `databases`; the controller assigns the
-endpoint and Pod/Service CIDRs. Change a tenant by deleting and reapplying its
-manifest. Ready reflects current Kubernetes conditions and live component
-health. Ordinary DELETE runs a fail-closed finalizer that does not require
-tenant API access. Apply is asynchronous; repeat `local-tenant-status` until
-it exits zero. Installation supports only the current Rust controller and
-requires a clean environment; existing legacy Tenants are not migrated. The Azure profile independently retains
-the existing JSON-based `tenant-create`, `tenant-status`, and `tenant-delete`
-commands.
+reconciled by a Rust/kube-rs operator. Their immutable specs contain common
+`kubernetesVersion` and `workers` fields plus a tagged provider; local
+manifests use `provider.type: local` and `provider.databases`. The controller
+assigns the endpoint and Pod/Service CIDRs under `status.provider.allocation`.
+Change a tenant by deleting and reapplying its manifest. Ready reflects current
+Kubernetes conditions and live component health. Ordinary DELETE runs a
+fail-closed finalizer that does not require tenant API access. Apply is
+asynchronous; repeat `local-tenant-status` until it exits zero.
+
+The provider-discriminated shape is a breaking in-place redesign of
+experimental `v1alpha2`; flat `databases` fields and flat local status are not
+migrated or converted. Existing objects must be deleted and recreated, and
+installation requires a clean environment. Azure-shaped CRD objects are
+accepted but reported unsupported without local lifecycle operations; the
+Azure profile independently retains the JSON-based `tenant-create`,
+`tenant-status`, and `tenant-delete` commands.
 CAPD and the shared-host storage profile remain local development mechanisms;
 neither profile is a production hostile-tenant isolation boundary.
 

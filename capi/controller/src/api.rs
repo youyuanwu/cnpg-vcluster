@@ -212,7 +212,7 @@ pub fn tenant_crd() -> k8s_openapi::apiextensions_apiserver::pkg::apis::apiexten
         rule("self.metadata.name.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')", "Tenant name must be a 1-30 character lowercase DNS label"),
         rule("self.spec.workers >= 1 && self.spec.workers <= 3", "workers must be between 1 and 3"),
         rule("self.spec.provider.type == 'local' ? has(self.spec.provider.databases) && !has(self.spec.provider.podCIDR) && !has(self.spec.provider.serviceCIDR) : !has(self.spec.provider.databases) && has(self.spec.provider.podCIDR) && has(self.spec.provider.serviceCIDR)", "local databases and Azure CIDR fields must match the selected provider"),
-        rule("self.spec.provider.type != 'azure' || (isCIDR(self.spec.provider.podCIDR) && isCIDR(self.spec.provider.serviceCIDR) && cidr(self.spec.provider.podCIDR).ip().family() == 4 && cidr(self.spec.provider.serviceCIDR).ip().family() == 4 && !cidr(self.spec.provider.podCIDR).containsCIDR(cidr(self.spec.provider.serviceCIDR)) && !cidr(self.spec.provider.serviceCIDR).containsCIDR(cidr(self.spec.provider.podCIDR)) && cidr(self.spec.provider.serviceCIDR).prefixLength() <= 28)", "Azure Pod and Service CIDRs must be disjoint IPv4 networks and the Service CIDR must contain the derived DNS address"),
+        rule("self.spec.provider.type != 'azure' || (has(self.spec.provider.podCIDR) && has(self.spec.provider.serviceCIDR) && isCIDR(self.spec.provider.podCIDR) && isCIDR(self.spec.provider.serviceCIDR) && cidr(self.spec.provider.podCIDR).ip().family() == 4 && cidr(self.spec.provider.serviceCIDR).ip().family() == 4 && cidr(self.spec.provider.podCIDR) == cidr(self.spec.provider.podCIDR).masked() && cidr(self.spec.provider.serviceCIDR) == cidr(self.spec.provider.serviceCIDR).masked() && !cidr(self.spec.provider.podCIDR).containsCIDR(cidr(self.spec.provider.serviceCIDR)) && !cidr(self.spec.provider.serviceCIDR).containsCIDR(cidr(self.spec.provider.podCIDR)) && cidr(self.spec.provider.serviceCIDR).prefixLength() <= 28)", "Azure Pod and Service CIDRs must be canonical, disjoint IPv4 networks and the Service CIDR must contain the derived DNS address"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type == self.spec.provider.type", "Tenant provider status must match the requested provider"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type != 'azure' || (!has(self.status.provider.allocation) && !has(self.status.provider.foundationHash) && !has(self.status.provider.clusterUID))", "Azure provider status cannot contain local durable identity"),
         rule("self.spec.kubernetesVersion.matches('^v?[0-9]+[.][0-9]+[.][0-9]+$')", "kubernetesVersion must be a three-component numeric version"),
@@ -570,6 +570,12 @@ mod tests {
         assert!(rules.iter().any(|r| r.contains("metadata.name")));
         assert!(rules.iter().any(|r| r.contains("spec.workers")));
         assert!(rules.iter().any(|r| r.contains("containsCIDR")));
+        assert!(
+            rules
+                .iter()
+                .any(|r| r.contains("has(self.spec.provider.podCIDR)"))
+        );
+        assert!(rules.iter().any(|r| r.contains(".masked()")));
         assert!(
             rules
                 .iter()

@@ -69,8 +69,10 @@ protocol.
 
 Status contains the observed generation, phase, standard conditions, and
 provider-specific state. Local status contains
-`provider.allocation.{slotId,endpoint,podCIDR,serviceCIDR}`, foundation hash,
-and exact root Cluster UID. Azure status is currently only its discriminator.
+`status.provider.allocation.{slotId,endpoint,podCIDR,serviceCIDR}`,
+`status.provider.foundationHash`, and the exact root
+`status.provider.clusterUID`. Azure status is currently only its
+discriminator.
 There is no persisted creation
 stage, tenant-API cleanup checkpoint, child-resource UID ledger,
 worker-container evidence, or Docker volume identity.
@@ -79,9 +81,13 @@ The generic reconciler validates and dispatches through `ProviderLifecycle`.
 `LocalProvider` owns the existing allocation, CAPI/CAPD/Kamaji, Docker,
 network, storage, CNPG, readiness, and finalization sequence. Valid Azure
 Tenant resources report `ProviderUnsupported` without a finalizer or local
-side effects. An impossible Azure resource carrying the controller finalizer
-remains blocked with `ProviderFinalizerUnsupported`; local cleanup is never
-attempted.
+side effects. Deletion of an unsupported object without that finalizer is a
+read-only no-op. An impossible Azure resource carrying the controller
+finalizer remains blocked with `ProviderFinalizerUnsupported`; it is `Failed`
+before deletion and `Deleting` during deletion, and local cleanup is never
+attempted. A provider/status discriminator mismatch is instead invalid durable
+identity and reports `OwnershipInvalid` without provider calls or finalizer
+removal.
 
 The Tokio manager uses kube-rs watches, a dedicated renewable leader-election
 Lease, health probes, and one bounded reconcile worker. Allocation Leases
@@ -130,7 +136,7 @@ different contracts by role:
   UID/resource-version-bound server-side apply.
 
 Missing non-root children may be recreated. A missing or different-UID root
-Cluster after `status.clusterUID` is recorded becomes Degraded or
+Cluster after `status.provider.clusterUID` is recorded becomes Degraded or
 OwnershipInvalid and is not silently replaced.
 
 Objects applied by the Tenant controller have deterministic names and exact
