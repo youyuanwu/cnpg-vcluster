@@ -8,7 +8,9 @@ use tenant_controller::api::SUPPORTED_KUBERNETES_VERSION;
 use tenant_controller::docker::BollardDockerClient;
 use tenant_controller::error::ControllerError;
 use tenant_controller::foundation;
-use tenant_controller::reconcile::{Assets, Config as ReconcileConfig, Reconciler, run_controller};
+use tenant_controller::reconcile::{
+    Assets, Config as ReconcileConfig, LocalProvider, Reconciler, run_controller,
+};
 use tenant_controller::runtime::{
     DEFAULT_LEADER_ELECTION_ID, DEFAULT_LEADER_ELECTION_NAMESPACE, DEFAULT_LEASE_DURATION_SECONDS,
     DEFAULT_LEASE_GRACE_SECONDS, HealthState, LeaderConfig, LeadershipContext, LeadershipGate,
@@ -131,14 +133,18 @@ async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
         foundation.creation(None).is_ok(),
     )
     .await?;
-    let reconciler = Reconciler::new(
+    let provider = LocalProvider::new(
         client.clone(),
         docker,
+        Assets::load(std::path::Path::new("/assets"))?,
+        foundation,
+    );
+    let reconciler = Reconciler::new(
+        client.clone(),
         ReconcileConfig {
             supported_version: config.supported_kubernetes_version.clone(),
         },
-        Assets::load(std::path::Path::new("/assets"))?,
-        foundation,
+        provider,
     );
 
     let health = HealthState::default();

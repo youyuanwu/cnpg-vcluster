@@ -27,10 +27,17 @@ CONFIG = {
 
 
 class LiveAPIContractsTests(unittest.TestCase):
-    def test_client_has_only_three_fields_and_always_uses_strict_ssa(self):
+    def test_client_uses_provider_discriminated_spec_and_strict_ssa(self):
         client = Mock()
         document = tenant_manifest_document(CONFIG, "tenant-a")
-        self.assertEqual({"kubernetesVersion": "1.36.4", "workers": 1, "databases": 1}, document["spec"])
+        self.assertEqual(
+            {
+                "kubernetesVersion": "1.36.4",
+                "workers": 1,
+                "provider": {"type": "local", "databases": 1},
+            },
+            document["spec"],
+        )
         self.assertEqual("tenancy.cnpg-vcluster.io/v1alpha2", document["apiVersion"])
         apply_tenant_document(client, document)
         self.assertIn("--validate=strict", client.kubectl.call_args.args)
@@ -45,9 +52,11 @@ class LiveAPIContractsTests(unittest.TestCase):
             self.assertIn("--dry-run=server", args)
             spec = json.loads(kwargs["input_text"])["spec"]
             observed.append(spec)
-            for field in ("workers", "databases"):
-                if type(spec[field]) is not int or not 1 <= spec[field] <= 3:
-                    return response(error=f"invalid {field}")
+            if type(spec["workers"]) is not int or not 1 <= spec["workers"] <= 3:
+                return response(error="invalid workers")
+            databases = spec["provider"]["databases"]
+            if type(databases) is not int or not 1 <= databases <= 3:
+                return response(error="invalid databases")
             if spec["kubernetesVersion"] in ("1.36", "1.36.4-extra", "", "vv1.36.4"):
                 return response(error="invalid kubernetesVersion")
             return response({})
@@ -107,7 +116,14 @@ class LiveAPIContractsTests(unittest.TestCase):
             for name in ("tenant-a", "tenant-b", "tenant-c"):
                 _apply(Path("."), CONFIG, name)
         specs = [json.loads(call.kwargs["input_text"])["spec"] for call in client.kubectl.call_args_list]
-        self.assertEqual([{"kubernetesVersion": "1.36.4", "workers": 1, "databases": 1}] * 3, specs)
+        self.assertEqual(
+            [{
+                "kubernetesVersion": "1.36.4",
+                "workers": 1,
+                "provider": {"type": "local", "databases": 1},
+            }] * 3,
+            specs,
+        )
 
 
 class StaticNetworkTests(unittest.TestCase):

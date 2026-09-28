@@ -25,24 +25,46 @@ LEASE_NAMESPACE = LEASE.inventory_namespace or "tenant-system"
 
 def tenant_spec_hash(document: dict[str, object]) -> str:
     spec = document.get("spec")
-    if not isinstance(spec, dict) or set(spec) != {"kubernetesVersion", "workers", "databases"}:
+    if not isinstance(spec, dict) or set(spec) != {"kubernetesVersion", "workers", "provider"}:
         raise RuntimeError("Tenant spec is not the v1alpha2 contract")
+    provider = spec["provider"]
+    if (
+        not isinstance(provider, dict)
+        or set(provider) != {"type", "databases"}
+        or provider.get("type") != "local"
+    ):
+        raise RuntimeError("Tenant spec is not the local v1alpha2 contract")
     version = spec["kubernetesVersion"]
     if not isinstance(version, str) or not re.fullmatch(r"v?[0-9]+\.[0-9]+\.[0-9]+", version):
         raise RuntimeError("Tenant Kubernetes version is invalid")
-    if any(type(spec[field]) is not int or not 1 <= spec[field] <= 3 for field in ("workers", "databases")):
+    if (
+        type(spec["workers"]) is not int
+        or not 1 <= spec["workers"] <= 3
+        or type(provider["databases"]) is not int
+        or not 1 <= provider["databases"] <= 3
+    ):
         raise RuntimeError("Tenant counts are invalid")
     canonical = {
         "kubernetesVersion": version.removeprefix("v"),
         "workers": spec["workers"],
-        "databases": spec["databases"],
+        "provider": {
+            "type": "local",
+            "databases": provider["databases"],
+        },
     }
     return hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode()).hexdigest()
 
 
-def tenant_allocation(document: dict[str, object]) -> dict[str, str]:
+def tenant_local_status(document: dict[str, object]) -> dict[str, object]:
     status = document.get("status")
-    allocation = status.get("allocation") if isinstance(status, dict) else None
+    provider = status.get("provider") if isinstance(status, dict) else None
+    if not isinstance(provider, dict) or provider.get("type") != "local":
+        raise RuntimeError("Tenant local provider status is invalid or absent")
+    return provider
+
+
+def tenant_allocation(document: dict[str, object]) -> dict[str, str]:
+    allocation = tenant_local_status(document).get("allocation")
     try:
         if not isinstance(allocation, dict) or set(allocation) != {"slotId", "endpoint", "podCIDR", "serviceCIDR"}:
             raise ValueError
@@ -75,7 +97,7 @@ def allocation_lease_manifest(
 ) -> dict[str, object]:
     allocation = tenant_allocation(document)
     metadata = document["metadata"]
-    foundation_hash = document["status"].get("foundationHash")
+    foundation_hash = tenant_local_status(document).get("foundationHash")
     if not metadata.get("name") or not metadata.get("uid") or not foundation_hash:
         raise RuntimeError("Tenant allocation identity is incomplete")
     return {
@@ -366,7 +388,7 @@ def tenant_from_document(
         storage_host_path=Path(str(volume[0]["Mountpoint"])),
         cnpg_cluster=config["SPIKE_CNPG_CLUSTER"],
         workers=int(spec["workers"]),
-        database_count=int(spec["databases"]),
+        database_count=int(spec["provider"]["databases"]),
         specification_sha256=specification_sha256,
     )
 
@@ -517,8 +539,8 @@ def tenant_snapshot(
         "uid": metadata.get("uid"),
         "allocation": tenant_allocation(document),
         "allocationLease": verify_allocation_lease(config, client, document),
-        "foundationHash": status.get("foundationHash"),
-        "clusterUID": status.get("clusterUID"),
+        "foundationHash": tenant_local_status(document).get("foundationHash"),
+        "clusterUID": tenant_local_status(document).get("clusterUID"),
         "managementResources": sorted(management_resources),
         "dockerVolume": {
             "name": volume.get("Name"),

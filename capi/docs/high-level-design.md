@@ -9,10 +9,9 @@ storage, and CloudNativePG. The Azure profile separately proves Kamaji on AKS
 with CAPZ-owned VMSS workers.
 
 Azure tenants are not separate AKS clusters. AKS is shared management
-infrastructure; each tenant remains a Kamaji hosted control plane. The local
-and Azure profiles share intent and conformance goals, but they do not share a
-mutation implementation: local uses the repository-owned Tenant controller,
-while Azure retains its JSON/Python lifecycle.
+infrastructure; each tenant remains a Kamaji hosted control plane. The Tenant
+API now represents local and Azure provider intent, but only the local
+`ProviderLifecycle` is installed. Azure retains its JSON/Python lifecycle.
 
 ## Local as-built topology
 
@@ -51,11 +50,12 @@ remains responsible for worker and load-balancer creation and deletion.
 ## Tenant API and controller
 
 The cluster-scoped API is
-`tenancy.cnpg-vcluster.io/v1alpha2`, kind `Tenant`. The immutable spec contains:
+`tenancy.cnpg-vcluster.io/v1alpha2`, kind `Tenant`. The immutable spec contains
+common `kubernetesVersion` and `workers` fields plus one tagged `provider`:
 
-- `kubernetesVersion`;
-- `workers`, from one through three;
-- `databases`, from one through three.
+- `type: local` with `databases`, from one through three; or
+- `type: azure` with canonical, non-overlapping IPv4 `podCIDR` and
+  `serviceCIDR` networks.
 
 OpenAPI and CEL reject invalid names, counts, version syntax, types, and
 any spec update. A leading `v` is accepted on creation, but a spelling change
@@ -67,11 +67,27 @@ repository clients. There is no Tenant validating webhook.
 Ordinary Kubernetes DELETE is accepted without a reservation or custom client
 protocol.
 
-Status contains the observed generation, phase, standard conditions,
-`allocation.{slotId,endpoint,podCIDR,serviceCIDR}`, foundation hash, and exact
-root Cluster UID. There is no persisted creation
+Status contains the observed generation, phase, standard conditions, and
+provider-specific state. Local status contains
+`status.provider.allocation.{slotId,endpoint,podCIDR,serviceCIDR}`,
+`status.provider.foundationHash`, and the exact root
+`status.provider.clusterUID`. Azure status is currently only its
+discriminator.
+There is no persisted creation
 stage, tenant-API cleanup checkpoint, child-resource UID ledger,
 worker-container evidence, or Docker volume identity.
+
+The generic reconciler validates and dispatches through `ProviderLifecycle`.
+`LocalProvider` owns the existing allocation, CAPI/CAPD/Kamaji, Docker,
+network, storage, CNPG, readiness, and finalization sequence. Valid Azure
+Tenant resources report `ProviderUnsupported` without a finalizer or local
+side effects. Deletion of an unsupported object without that finalizer is a
+read-only no-op. An impossible Azure resource carrying the controller
+finalizer remains blocked with `ProviderFinalizerUnsupported`; it is `Failed`
+before deletion and `Deleting` during deletion, and local cleanup is never
+attempted. A provider/status discriminator mismatch is instead invalid durable
+identity and reports `OwnershipInvalid` without provider calls or finalizer
+removal.
 
 The Tokio manager uses kube-rs watches, a dedicated renewable leader-election
 Lease, health probes, and one bounded reconcile worker. Allocation Leases
@@ -120,7 +136,7 @@ different contracts by role:
   UID/resource-version-bound server-side apply.
 
 Missing non-root children may be recreated. A missing or different-UID root
-Cluster after `status.clusterUID` is recorded becomes Degraded or
+Cluster after `status.provider.clusterUID` is recorded becomes Degraded or
 OwnershipInvalid and is not silently replaced.
 
 Objects applied by the Tenant controller have deterministic names and exact
@@ -333,8 +349,8 @@ and host-setting restoration.
 
 Bicep owns the Azure resource group, VNet, subnets, identity, role/federation,
 and AKS foundation. CAPZ owns tenant MachinePools, AzureMachinePools, VMSS
-instances, and NICs. The local Tenant CRD/controller is not installed as the
-Azure lifecycle API in this work.
+instances, and NICs. The Tenant CRD contains an Azure intent variant, but the
+controller does not yet install an Azure lifecycle implementation.
 
 Azure deletion continues to verify exact Kubernetes UIDs, Azure resource IDs,
 tags, ASO objects, and the recorded foundation. CAPI/CAPZ remove the
@@ -350,6 +366,6 @@ do not appear in the management API.
 CAPD workers are privileged Docker containers sharing the host kernel, Docker
 daemon, storage hardware, network, power, and failure domain. This is not a
 hostile-tenant security boundary. The management node and Tenant controller
-also have Docker socket access. The API is experimental `v1alpha2`; incompatible
-changes require an explicit version transition rather than silently changing
-the meaning of stored objects.
+also have Docker socket access. The API is experimental `v1alpha2`; this work
+intentionally replaces the earlier flat local spec. Existing Tenant objects
+must be deleted and recreated with the provider-discriminated shape.

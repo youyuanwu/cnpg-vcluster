@@ -422,11 +422,12 @@ def verify_controller_api(config: dict[str, str], client: ManagementClient) -> N
         "metadata": {"name": name},
         "spec": {
             "kubernetesVersion": config["KUBERNETES_VERSION"].removeprefix("v"),
-            "workers": 1, "databases": 1,
+            "workers": 1,
+            "provider": {"type": "local", "databases": 1},
         },
     }
 
-    def create_dry(document, mode="strict", rejected=None):
+    def create_dry(document, mode="strict", rejected=None, expected_spec=None):
         result = client.kubectl(
             "create", "--dry-run=server", f"--validate={mode}", "-f", "-", "-o", "json",
             input_text=json.dumps(document), check=False,
@@ -443,7 +444,7 @@ def verify_controller_api(config: dict[str, str], client: ManagementClient) -> N
         if result.returncode != 0:
             raise RuntimeError(f"Tenant API dry-run failed: {result.stderr}")
         value = json.loads(result.stdout)
-        if value["spec"] != probe["spec"]:
+        if value["spec"] != (expected_spec or probe["spec"]):
             raise RuntimeError("Tenant API did not prune unknown spec fields")
         if mode == "warn" and "unknown field" not in result.stderr:
             raise RuntimeError("Tenant API Warn did not report the unknown field")
@@ -456,9 +457,57 @@ def verify_controller_api(config: dict[str, str], client: ManagementClient) -> N
     for mode in ("warn", "ignore"):
         create_dry(unknown, mode)
     create_dry(unknown, rejected="unknown field")
-    for field, value in (("workers", 0), ("databases", 4), ("kubernetesVersion", "bad")):
-        create_dry({**probe, "spec": {**probe["spec"], field: value}}, rejected=field)
+    invalid_specs = (
+        ("workers", {**probe["spec"], "workers": 0}),
+        (
+            "databases",
+            {
+                **probe["spec"],
+                "provider": {**probe["spec"]["provider"], "databases": 4},
+            },
+        ),
+        ("kubernetesVersion", {**probe["spec"], "kubernetesVersion": "bad"}),
+    )
+    for field, invalid_spec in invalid_specs:
+        create_dry({**probe, "spec": invalid_spec}, rejected=field)
     create_dry({**probe, "metadata": {"name": "invalid.name"}}, rejected="Tenant name")
+    azure_spec = {
+        "kubernetesVersion": probe["spec"]["kubernetesVersion"],
+        "workers": 3,
+        "provider": {
+            "type": "azure",
+            "podCIDR": "10.244.0.0/16",
+            "serviceCIDR": "10.96.0.0/16",
+        },
+    }
+    create_dry({**probe, "spec": azure_spec}, expected_spec=azure_spec)
+    for invalid_provider in (
+        {"type": "azure", "serviceCIDR": "10.96.0.0/16"},
+        {
+            "type": "azure",
+            "podCIDR": "10.244.0.1/16",
+            "serviceCIDR": "10.96.0.0/16",
+        },
+        {
+            "type": "azure",
+            "podCIDR": "2001:db8::/64",
+            "serviceCIDR": "10.96.0.0/16",
+        },
+        {
+            "type": "azure",
+            "podCIDR": "10.244.0.0/16",
+            "serviceCIDR": "10.244.128.0/17",
+        },
+        {
+            "type": "azure",
+            "podCIDR": "10.244.0.0/16",
+            "serviceCIDR": "10.96.0.0/29",
+        },
+    ):
+        create_dry(
+            {**probe, "spec": {**azure_spec, "provider": invalid_provider}},
+            rejected="CIDR",
+        )
 
     response = client.kubectl(
         "create", "--validate=strict", "-f", "-", "-o", "json",
@@ -468,13 +517,20 @@ def verify_controller_api(config: dict[str, str], client: ManagementClient) -> N
         created = json.loads(response.stdout)
         if created.get("status"):
             raise RuntimeError("Tenant create must ignore user-supplied status")
-        for field, value in (
-            ("workers", 2), ("databases", 2),
-            ("kubernetesVersion", "0.0.0" if probe["spec"]["kubernetesVersion"] != "0.0.0" else "1.0.0"),
+        for patch in (
+            {"workers": 2},
+            {"provider": {"databases": 2}},
+            {
+                "kubernetesVersion": (
+                    "0.0.0"
+                    if probe["spec"]["kubernetesVersion"] != "0.0.0"
+                    else "1.0.0"
+                )
+            },
         ):
             result = client.kubectl(
                 "patch", f"tenant/{name}", "--type=merge", "--dry-run=server",
-                "-p", json.dumps({"spec": {field: value}}), check=False,
+                "-p", json.dumps({"spec": patch}), check=False,
             )
             if result.returncode == 0 or "Tenant spec is immutable" not in result.stderr:
                 raise RuntimeError("Tenant CEL spec immutability gate failed")

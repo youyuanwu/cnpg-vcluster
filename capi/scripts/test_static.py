@@ -521,7 +521,13 @@ def check_repository_boundaries() -> None:
             and "kind: Tenant" in manifest
             and f"name: {expected_name}" in manifest
             and set(re.findall(r"^  ([a-zA-Z]+):", manifest.split("spec:\n")[1], re.MULTILINE))
-            == {"kubernetesVersion", "workers", "databases"},
+            == {"kubernetesVersion", "workers", "provider"}
+            and re.search(
+                r"^  provider:\n    type: local\n    databases: [1-3]$",
+                manifest,
+                re.MULTILINE,
+            )
+            is not None,
             f"invalid local Tenant manifest {relative}",
         )
     production = [

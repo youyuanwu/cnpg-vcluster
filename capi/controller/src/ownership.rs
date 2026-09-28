@@ -129,7 +129,7 @@ pub fn validate_cluster_uid(tenant: &Tenant, object: &ObjectMeta) -> Result<(), 
     if let Some(expected) = tenant
         .status
         .as_ref()
-        .and_then(|s| s.cluster_uid.as_deref())
+        .and_then(|status| status.cluster_uid())
         && !expected.is_empty()
         && object.uid.as_deref() != Some(expected)
     {
@@ -327,7 +327,7 @@ pub fn validate_provider_owner_for_deletion(
     let cluster_uid = tenant
         .status
         .as_ref()
-        .and_then(|status| status.cluster_uid.as_deref());
+        .and_then(|status| status.cluster_uid());
     if definition.parent_kind == Some("Cluster")
         && by_kind("Cluster").is_some_and(|cluster| {
             owner.api_version == cluster.api_version && owner.kind == cluster.kind

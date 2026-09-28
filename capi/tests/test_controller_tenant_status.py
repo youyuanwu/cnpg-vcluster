@@ -11,7 +11,7 @@ def tenant_document() -> dict[str, object]:
         "spec": {
             "kubernetesVersion": "v1.36.4",
             "workers": 1,
-            "databases": 1,
+            "provider": {"type": "local", "databases": 1},
         },
         "status": {
             "observedGeneration": 2,

@@ -19,7 +19,7 @@ def tenant_manifest_document(
         "spec": {
             "kubernetesVersion": config["KUBERNETES_VERSION"].removeprefix("v"),
             "workers": workers,
-            "databases": databases,
+            "provider": {"type": "local", "databases": databases},
         },
     }
 

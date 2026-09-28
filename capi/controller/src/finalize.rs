@@ -132,6 +132,7 @@ impl<D: DockerClient> Finalizer<D> {
         tenant_status::replace_status(self.client.clone(), original, current, status, clear_allocation).await
     }
 
+    #[rustfmt::skip]
     pub async fn reconcile(&self, tenant: &Tenant) -> Result<Action, ReconcileError> {
         let name = tenant
             .metadata
@@ -144,11 +145,13 @@ impl<D: DockerClient> Finalizer<D> {
         }
         let spec = canonical_spec(name, &tenant.spec, &self.supported_version)
             .map_err(|error| ReconcileError::InvalidInput(error.to_string()))?;
+        crate::api::validate_provider_status(&spec, tenant.status.as_ref()).map_err(|error| invalid(error.to_string()))?;
+        if spec.local_databases().is_none() { return Err(invalid("controller finalizer cannot run for an unsupported Azure provider")); }
         let spec_hash = spec_hash(&spec);
         let recorded_hash = tenant
             .status
             .as_ref()
-            .and_then(|status| status.foundation_hash.as_deref());
+            .and_then(|status| status.foundation_hash());
         let foundation = self
             .foundation
             .deletion(recorded_hash)
@@ -179,7 +182,7 @@ impl<D: DockerClient> Finalizer<D> {
         let bound = tenant
             .status
             .as_ref()
-            .and_then(|status| status.allocation.as_ref());
+            .and_then(|status| status.allocation());
         let ns = Api::<Namespace>::all(self.client.clone())
             .get_opt(name)
             .await?;
@@ -228,7 +231,7 @@ impl<D: DockerClient> Finalizer<D> {
         let cluster_uid = tenant
             .status
             .as_ref()
-            .and_then(|status| status.cluster_uid.as_deref())
+            .and_then(|status| status.cluster_uid())
             .filter(|uid| !uid.is_empty());
         let mut inventory: Vec<DynamicObject> = roots.iter().flatten().cloned().collect();
         for (index, root) in roots.iter().enumerate() {
@@ -369,26 +372,23 @@ impl<D: DockerClient> Finalizer<D> {
             self.status(tenant, &current, &status, false).await?;
             return Ok(pending());
         }
-        if status.foundation_hash.as_deref().is_none_or(str::is_empty)
+        if status.foundation_hash().is_none_or(str::is_empty)
             && (residue || matches!(lease_decision, ReleaseDecision::Delete(_)))
         {
-            status.foundation_hash = Some(foundation_hash.clone());
+            status.local_mut()?.foundation_hash = Some(foundation_hash.clone());
             self.status(tenant, &current, &status, false).await?;
             return Ok(pending());
         }
-        if let Some(cluster) = cluster
-            && cluster_uid.is_none()
-        {
-            status.cluster_uid = Some(uid(&cluster.metadata)?.into());
+        if let Some(cluster) = cluster && cluster_uid.is_none() {
+            status.local_mut()?.cluster_uid = Some(uid(&cluster.metadata)?.into());
             self.status(tenant, &current, &status, false).await?;
             return Ok(pending());
         }
-        if status.allocation.is_none()
+        if status.allocation().is_none()
             && !matches!(lease_decision, ReleaseDecision::Complete)
-            && let Some(allocation) = recover_allocation(&claim_context, &lease_inventory)
-                .map_err(|error| invalid(error.to_string()))?
+            && let Some(allocation) = recover_allocation(&claim_context, &lease_inventory).map_err(|error| invalid(error.to_string()))?
         {
-            status.allocation = Some(allocation);
+            status.local_mut()?.allocation = Some(allocation);
             self.status(tenant, &current, &status, false).await?;
             return Ok(pending());
         }
@@ -442,8 +442,8 @@ impl<D: DockerClient> Finalizer<D> {
             ReleaseDecision::Delete(_) | ReleaseDecision::Pending => return Ok(pending()),
             ReleaseDecision::Complete => {}
         }
-        if status.allocation.is_some() {
-            status.allocation = None;
+        if status.allocation().is_some() {
+            status.local_mut()?.allocation = None;
             self.status(tenant, &current, &status, true).await?;
             return Ok(pending());
         }

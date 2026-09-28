@@ -45,6 +45,7 @@ def _ready(client: ManagementClient) -> dict[str, object] | None:
         )
     if status.get("phase") != "Ready":
         return None
+    provider = status.get("provider") or {}
     ready = next(
         (
             condition
@@ -58,7 +59,7 @@ def _ready(client: ManagementClient) -> dict[str, object] | None:
     metadata = tenant.get("metadata") or {}
     if ready.get("observedGeneration") != metadata.get("generation"):
         raise RuntimeError("readiness condition generation is stale")
-    if not status.get("clusterUID") or not status.get("foundationHash"):
+    if not provider.get("clusterUID") or not provider.get("foundationHash"):
         raise RuntimeError("readiness root identity is incomplete")
     return tenant
 

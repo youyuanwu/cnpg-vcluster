@@ -20,13 +20,13 @@ spec:
     - jsonPath: .status.conditions[?(@.type=="Ready")].status
       name: Ready
       type: string
-    - jsonPath: .status.allocation.endpoint
+    - jsonPath: .status.provider.allocation.endpoint
       name: Endpoint
       type: string
     - jsonPath: .spec.workers
       name: Workers
       type: integer
-    - jsonPath: .spec.databases
+    - jsonPath: .spec.provider.databases
       name: Databases
       type: integer
     name: v1alpha2
@@ -36,47 +36,43 @@ spec:
         properties:
           spec:
             properties:
-              databases:
-                format: int32
-                maximum: 3.0
-                minimum: 1.0
-                type: integer
               kubernetesVersion:
                 pattern: ^v?[0-9]+\.[0-9]+\.[0-9]+$
                 type: string
+              provider:
+                properties:
+                  databases:
+                    format: int32
+                    maximum: 3.0
+                    minimum: 1.0
+                    type: integer
+                  podCIDR:
+                    pattern: ^([0-9]{1,3}[.]){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$
+                    type: string
+                  serviceCIDR:
+                    pattern: ^([0-9]{1,3}[.]){3}[0-9]{1,3}/([0-9]|[12][0-9]|3[0-2])$
+                    type: string
+                  type:
+                    enum:
+                    - local
+                    - azure
+                    type: string
+                required:
+                - type
+                type: object
               workers:
                 format: int32
                 maximum: 3.0
                 minimum: 1.0
                 type: integer
             required:
-            - databases
             - kubernetesVersion
+            - provider
             - workers
             type: object
           status:
             nullable: true
             properties:
-              allocation:
-                nullable: true
-                properties:
-                  endpoint:
-                    type: string
-                  podCIDR:
-                    type: string
-                  serviceCIDR:
-                    type: string
-                  slotId:
-                    type: string
-                required:
-                - endpoint
-                - podCIDR
-                - serviceCIDR
-                - slotId
-                type: object
-              clusterUID:
-                nullable: true
-                type: string
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current state of this API Resource.
@@ -112,9 +108,6 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
-              foundationHash:
-                nullable: true
-                type: string
               observedGeneration:
                 format: int64
                 nullable: true
@@ -131,6 +124,40 @@ spec:
                 - null
                 nullable: true
                 type: string
+              provider:
+                nullable: true
+                properties:
+                  allocation:
+                    nullable: true
+                    properties:
+                      endpoint:
+                        type: string
+                      podCIDR:
+                        type: string
+                      serviceCIDR:
+                        type: string
+                      slotId:
+                        type: string
+                    required:
+                    - endpoint
+                    - podCIDR
+                    - serviceCIDR
+                    - slotId
+                    type: object
+                  clusterUID:
+                    nullable: true
+                    type: string
+                  foundationHash:
+                    nullable: true
+                    type: string
+                  type:
+                    enum:
+                    - local
+                    - azure
+                    type: string
+                required:
+                - type
+                type: object
             type: object
         required:
         - spec
@@ -141,8 +168,16 @@ spec:
           rule: self.spec == oldSelf.spec
         - message: Tenant name must be a 1-30 character lowercase DNS label
           rule: self.metadata.name.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')
-        - message: workers and databases must each be between 1 and 3
-          rule: self.spec.workers >= 1 && self.spec.workers <= 3 && self.spec.databases >= 1 && self.spec.databases <= 3
+        - message: workers must be between 1 and 3
+          rule: self.spec.workers >= 1 && self.spec.workers <= 3
+        - message: local databases and Azure CIDR fields must match the selected provider
+          rule: 'self.spec.provider.type == ''local'' ? has(self.spec.provider.databases) && !has(self.spec.provider.podCIDR) && !has(self.spec.provider.serviceCIDR) : !has(self.spec.provider.databases) && has(self.spec.provider.podCIDR) && has(self.spec.provider.serviceCIDR)'
+        - message: Azure Pod and Service CIDRs must be canonical, disjoint IPv4 networks and the Service CIDR must contain the derived DNS address
+          rule: self.spec.provider.type != 'azure' || (has(self.spec.provider.podCIDR) && has(self.spec.provider.serviceCIDR) && isCIDR(self.spec.provider.podCIDR) && isCIDR(self.spec.provider.serviceCIDR) && cidr(self.spec.provider.podCIDR).ip().family() == 4 && cidr(self.spec.provider.serviceCIDR).ip().family() == 4 && cidr(self.spec.provider.podCIDR) == cidr(self.spec.provider.podCIDR).masked() && cidr(self.spec.provider.serviceCIDR) == cidr(self.spec.provider.serviceCIDR).masked() && !cidr(self.spec.provider.podCIDR).containsCIDR(cidr(self.spec.provider.serviceCIDR)) && !cidr(self.spec.provider.serviceCIDR).containsCIDR(cidr(self.spec.provider.podCIDR)) && cidr(self.spec.provider.serviceCIDR).prefixLength() <= 28)
+        - message: Tenant provider status must match the requested provider
+          rule: '!has(self.status) || !has(self.status.provider) || self.status.provider.type == self.spec.provider.type'
+        - message: Azure provider status cannot contain local durable identity
+          rule: '!has(self.status) || !has(self.status.provider) || self.status.provider.type != ''azure'' || (!has(self.status.provider.allocation) && !has(self.status.provider.foundationHash) && !has(self.status.provider.clusterUID))'
         - message: kubernetesVersion must be a three-component numeric version
           rule: self.spec.kubernetesVersion.matches('^v?[0-9]+[.][0-9]+[.][0-9]+$')
     served: true

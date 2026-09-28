@@ -10,7 +10,7 @@ use k8s_openapi::{
 use kube::core::DynamicObject;
 use serde_json::json;
 use tenant_controller::{
-    api::{Tenant, TenantSpec, TenantStatus},
+    api::{LocalProviderStatus, Tenant, TenantProviderStatus, TenantSpec, TenantStatus},
     management::by_kind,
     ownership::*,
 };
@@ -47,17 +47,13 @@ fn owner(object: &DynamicObject) -> OwnerReference {
 }
 
 fn tenant() -> Tenant {
-    let mut tenant = Tenant::new(
-        "tenant-a",
-        TenantSpec {
-            kubernetes_version: "1.36.4".into(),
-            workers: 1,
-            databases: 1,
-        },
-    );
+    let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
     tenant.metadata.uid = Some("tenant-uid".into());
     tenant.status = Some(TenantStatus {
-        cluster_uid: Some("cluster-uid".into()),
+        provider: Some(TenantProviderStatus::Local(LocalProviderStatus {
+            cluster_uid: Some("cluster-uid".into()),
+            ..Default::default()
+        })),
         ..Default::default()
     });
     tenant
@@ -181,7 +177,13 @@ fn recorded_cluster_identity_rejects_replacement_but_allows_initial_binding() {
     ));
     changed.uid = None;
     assert!(validate_cluster_uid(&tenant, &changed).is_err());
-    tenant.status.as_mut().unwrap().cluster_uid = None;
+    tenant
+        .status
+        .as_mut()
+        .unwrap()
+        .local_mut()
+        .unwrap()
+        .cluster_uid = None;
     assert_eq!(validate_cluster_uid(&tenant, &changed), Ok(()));
 }
 
@@ -424,7 +426,13 @@ fn deletion_accepts_only_recorded_dangling_cluster_or_live_template_deployment()
     let mut child = object("DevCluster", "tenant-a", "child");
     child.metadata.owner_references = Some(vec![owner(&cluster)]);
     let mut unbound = tenant;
-    unbound.status.as_mut().unwrap().cluster_uid = None;
+    unbound
+        .status
+        .as_mut()
+        .unwrap()
+        .local_mut()
+        .unwrap()
+        .cluster_uid = None;
     assert!(validate_provider_owner_for_deletion(&child, &unbound, &[]).is_err());
 }
 

@@ -258,13 +258,14 @@ Bicep owns the management foundation, while CAPZ owns the tenant VMSS. This
 keeps retry and deletion semantics in the controllers designed for those
 resources.
 
-The local Rust/kube-rs `tenancy.cnpg-vcluster.io/v1alpha2` CRD and controller
-are not the Azure lifecycle API in this experiment. Azure continues to use explicit JSON
+The Rust/kube-rs `tenancy.cnpg-vcluster.io/v1alpha2` CRD now represents Azure
+intent, but the controller reports that provider as unsupported and does not
+own its lifecycle in this experiment. Azure continues to use explicit JSON
 TenantSpec files, the Python adapter, and Azure-specific identity/evidence
 records. Local conditions, allocation Leases, Docker ownership, image
 bootstrap, and finalizer semantics must not be copied into Azure without a
-separate CAPZ design and migration plan. Conversely, local deletion never
-uses Azure foundation snapshots, ASO discovery, or VMSS operations.
+separate CAPZ lifecycle implementation. Conversely, local deletion never uses
+Azure foundation snapshots, ASO discovery, or VMSS operations.
 The schema-1 parser, durable operation/identity runtime, timing evidence, and
 profile lock are Azure-only; there is no remaining local profile branch in
 that machinery.

@@ -96,7 +96,7 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
         spec = {
             "kubernetesVersion": version,
             "workers": workers,
-            "databases": 1,
+            "provider": {"type": "local", "databases": 1},
         }
         if unknown:
             spec["unknown"] = True
@@ -138,7 +138,7 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
                 **manifest(),
                 "spec": {
                     **manifest()["spec"],
-                    "databases": 4,
+                    "provider": {"type": "local", "databases": 4},
                 },
             },
         ),

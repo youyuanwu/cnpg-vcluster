@@ -60,7 +60,7 @@ pub fn database_namespace(context: &Context<'_>) -> Namespace {
 }
 
 pub fn persistent_volumes(context: &Context<'_>, storage_class: &str) -> Vec<PersistentVolume> {
-    (1..=context.spec.databases)
+    (1..=context.database_count)
         .map(|ordinal| PersistentVolume {
             metadata: context.metadata(&format!("capi-postgres-pv-{ordinal}"), "", "cnpg"),
             spec: Some(PersistentVolumeSpec {
@@ -92,13 +92,13 @@ pub fn cnpg_cluster(
     storage_class: &str,
     postgres_image: &str,
 ) -> DynamicObject {
-    let affinity = if context.spec.databases > context.spec.workers {
+    let affinity = if context.database_count > context.spec.workers {
         "preferred"
     } else {
         "required"
     };
     context.object("postgresql.cnpg.io/v1", "Cluster", "capi-postgres", "database", "cnpg", json!({
-        "instances":context.spec.databases, "imageName":postgres_image,
+        "instances":context.database_count, "imageName":postgres_image,
         "affinity":{"enablePodAntiAffinity":true,"podAntiAffinityType":affinity,"topologyKey":"kubernetes.io/hostname"},
         "bootstrap":{"initdb":{"database":"app","owner":"app"}},
         "storage":{"size":"1Gi","storageClass":storage_class},

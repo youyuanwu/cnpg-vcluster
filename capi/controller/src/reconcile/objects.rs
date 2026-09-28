@@ -232,7 +232,7 @@ pub async fn ensure_management(
     let bound = tenant
         .status
         .as_ref()
-        .and_then(|status| status.cluster_uid.as_deref())
+        .and_then(|status| status.cluster_uid())
         .is_some_and(|uid| !uid.is_empty());
     let mut result = read_or_create(client.clone(), desired, known, is_cluster && bound).await?;
     ownership::validate_root_ownership(&result.object.metadata, identity, role(desired)?)?;
