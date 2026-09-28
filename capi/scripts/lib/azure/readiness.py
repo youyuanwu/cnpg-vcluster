@@ -5,6 +5,7 @@ from .contracts import _expected_tenant_markers
 from .foundation import _get_management_resource
 from .rendering import (
     _azure_tags,
+    _azure_tags_match,
     _external_azure_cluster_metadata,
     _require_markers,
 )
