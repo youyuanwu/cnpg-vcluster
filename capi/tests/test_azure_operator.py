@@ -16,6 +16,7 @@ from scripts.lib.azure.operator import (
 )
 from scripts.lib.azure.proof import (
     AzureDeletionProof,
+    _specification_sha256,
     capture_operator_deletion_proof,
     prove_operator_deletion,
 )
@@ -136,6 +137,22 @@ class AzureOperatorTests(AzureFixtureMixin, unittest.TestCase):
 
 
 class AzureProofTests(AzureFixtureMixin, unittest.TestCase):
+    def test_specification_hash_matches_rust_canonical_vector(self) -> None:
+        self.assertEqual(
+            _specification_sha256(
+                {
+                    "kubernetesVersion": "v1.36.4",
+                    "workers": 3,
+                    "provider": {
+                        "type": "azure",
+                        "podCIDR": "10.244.0.0/16",
+                        "serviceCIDR": "10.96.0.0/16",
+                    },
+                }
+            ),
+            "61bf78756f6c9cc847f31de706048bae68b07b1cf8c0cd856142931854ac1885",
+        )
+
     def test_capture_binds_operator_foundation_and_resource_ids(self) -> None:
         root = self.make_root()
         config = {
@@ -153,13 +170,7 @@ class AzureProofTests(AzureFixtureMixin, unittest.TestCase):
                 "serviceCIDR": "10.142.0.0/16",
             },
         }
-        specification_sha256 = hashlib.sha256(
-            json.dumps(
-                specification,
-                sort_keys=True,
-                separators=(",", ":"),
-            ).encode()
-        ).hexdigest()
+        specification_sha256 = _specification_sha256(specification)
         operation_id = "tenant-" + hashlib.sha256(
             b"azure-tenant-operation-v1\0"
             + b"tenant-uid\0"

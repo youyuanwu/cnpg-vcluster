@@ -22,6 +22,31 @@ def _required(mapping: Mapping[str, object], key: str) -> str:
     return value
 
 
+def _specification_sha256(specification: Mapping[str, object]) -> str:
+    provider = specification.get("provider")
+    if (
+        not isinstance(provider, dict)
+        or provider.get("type") != "azure"
+        or not isinstance(specification.get("kubernetesVersion"), str)
+        or type(specification.get("workers")) is not int
+        or not isinstance(provider.get("podCIDR"), str)
+        or not isinstance(provider.get("serviceCIDR"), str)
+    ):
+        raise RuntimeError("Azure operator Tenant specification is invalid")
+    canonical = {
+        "kubernetesVersion": specification["kubernetesVersion"].removeprefix("v"),
+        "workers": specification["workers"],
+        "provider": {
+            "type": "azure",
+            "podCIDR": provider["podCIDR"],
+            "serviceCIDR": provider["serviceCIDR"],
+        },
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 @dataclass(frozen=True)
 class AzureDeletionProof:
     tenant: str
@@ -49,13 +74,7 @@ def capture_operator_deletion_proof(
     specification = tenant.get("spec")
     if not isinstance(specification, dict):
         raise RuntimeError("Azure operator Tenant specification is absent")
-    specification_sha256 = hashlib.sha256(
-        json.dumps(
-            specification,
-            sort_keys=True,
-            separators=(",", ":"),
-        ).encode()
-    ).hexdigest()
+    specification_sha256 = _specification_sha256(specification)
     if binding.get("specificationSha256") != specification_sha256:
         raise RuntimeError("Azure operator specification binding changed")
     operation_id = "tenant-" + hashlib.sha256(

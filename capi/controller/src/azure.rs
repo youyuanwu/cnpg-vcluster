@@ -100,8 +100,11 @@ impl AzureConfiguration {
             .filter(|value| !value.is_empty())
             .ok_or(AzureConfigurationError::Uid)?;
         values.validate()?;
-        let canonical = serde_json::to_vec(&values)
-            .map_err(|error| AzureConfigurationError::Json(error.to_string()))?;
+        let canonical = serde_json::to_vec(
+            &serde_json::to_value(&values)
+                .map_err(|error| AzureConfigurationError::Json(error.to_string()))?,
+        )
+        .map_err(|error| AzureConfigurationError::Json(error.to_string()))?;
         Ok(Self {
             values,
             config_map_uid,
