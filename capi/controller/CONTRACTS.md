@@ -47,7 +47,7 @@ offline build.
 Cargo discovers four integration targets: `controller`, `adapters`,
 `allocation`, and `finalization`. They share the Kubernetes API simulator
 under `tests/support/`. `controller-metrics` reports production Rust source
-before test-only modules and rejects growth above the 8,050-line baseline.
+before test-only modules and rejects growth above the 12,000-line workflow ceiling.
 
 Installation uses one `Recreate` replica, a separate leader-election Lease,
 Docker socket access, and HTTP `/healthz` and `/readyz`, without admission

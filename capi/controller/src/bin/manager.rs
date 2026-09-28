@@ -9,7 +9,8 @@ use tenant_controller::docker::BollardDockerClient;
 use tenant_controller::error::ControllerError;
 use tenant_controller::foundation;
 use tenant_controller::reconcile::{
-    Assets, Config as ReconcileConfig, LocalProvider, Reconciler, run_controller,
+    AZURE_CONFIG_NAME, Assets, AzureProvider, Config as ReconcileConfig, LocalProvider,
+    ProviderLifecycle, Reconciler, run_controller,
 };
 use tenant_controller::runtime::{
     DEFAULT_LEADER_ELECTION_ID, DEFAULT_LEADER_ELECTION_NAMESPACE, DEFAULT_LEASE_DURATION_SECONDS,
@@ -22,6 +23,43 @@ const DEFAULT_HEALTH_ADDRESS: &str = "0.0.0.0:8081";
 const FOUNDATION_NAMESPACE: &str = "tenant-system";
 const FOUNDATION_NAME: &str = "tenant-foundation";
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ProviderMode {
+    #[default]
+    Local,
+    Azure,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StartupDependencies {
+    docker: bool,
+    local_foundation: bool,
+    local_assets: bool,
+    azure_configuration: bool,
+    management_watches: bool,
+}
+
+impl ProviderMode {
+    const fn dependencies(self) -> StartupDependencies {
+        match self {
+            Self::Local => StartupDependencies {
+                docker: true,
+                local_foundation: true,
+                local_assets: true,
+                azure_configuration: false,
+                management_watches: true,
+            },
+            Self::Azure => StartupDependencies {
+                docker: false,
+                local_foundation: false,
+                local_assets: false,
+                azure_configuration: true,
+                management_watches: false,
+            },
+        }
+    }
+}
+
 struct AbortControllerOnDrop(tokio::task::AbortHandle);
 
 impl Drop for AbortControllerOnDrop {
@@ -32,6 +70,7 @@ impl Drop for AbortControllerOnDrop {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ManagerConfig {
+    provider: ProviderMode,
     probe_in_cluster: bool,
     leader_elect: bool,
     health_address: SocketAddr,
@@ -49,6 +88,7 @@ impl Default for ManagerConfig {
             .or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| format!("tenant-controller-{}", std::process::id()));
         Self {
+            provider: ProviderMode::Local,
             probe_in_cluster: false,
             leader_elect: true,
             health_address: DEFAULT_HEALTH_ADDRESS
@@ -104,45 +144,81 @@ async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
         .get_opt("default")
         .await?
         .ok_or_else(|| ControllerError::DependencyPending("default Namespace".into()))?;
-    let docker = BollardDockerClient::connect("/var/run/docker.sock")
-        .map_err(|error| ControllerError::Configuration(error.to_string()))?;
-    let foundation_config = Api::<ConfigMap>::namespaced(client.clone(), FOUNDATION_NAMESPACE)
-        .get(FOUNDATION_NAME)
-        .await?;
-    let data = foundation_config.data.as_ref().ok_or_else(|| {
-        ControllerError::Configuration("foundation ConfigMap data is missing".into())
-    })?;
-    let foundation = Arc::new(
-        foundation::parse_runtime(
-            data.get("foundation.json")
-                .map(String::as_str)
-                .unwrap_or(""),
-            data.get("foundation.sha256")
-                .map(String::as_str)
-                .unwrap_or(""),
-            &config.supported_kubernetes_version,
-            &config.controller_image,
-        )
-        .map_err(|error| ControllerError::Configuration(error.to_string()))?,
-    );
-    activation::admit(
-        client.clone(),
-        &docker,
-        &foundation.hash,
-        &config.activation_token,
-        foundation.creation(None).is_ok(),
-    )
-    .await?;
-    let provider = LocalProvider::new(
-        client.clone(),
-        docker,
-        Assets::load(std::path::Path::new("/assets"))?,
-        foundation,
-    );
+    let dependencies = config.provider.dependencies();
+    match config.provider {
+        ProviderMode::Local => {
+            debug_assert!(
+                dependencies.docker
+                    && dependencies.local_foundation
+                    && dependencies.local_assets
+                    && !dependencies.azure_configuration
+            );
+            let docker = BollardDockerClient::connect("/var/run/docker.sock")
+                .map_err(|error| ControllerError::Configuration(error.to_string()))?;
+            let foundation_config =
+                Api::<ConfigMap>::namespaced(client.clone(), FOUNDATION_NAMESPACE)
+                    .get(FOUNDATION_NAME)
+                    .await?;
+            let data = foundation_config.data.as_ref().ok_or_else(|| {
+                ControllerError::Configuration("foundation ConfigMap data is missing".into())
+            })?;
+            let foundation = Arc::new(
+                foundation::parse_runtime(
+                    data.get("foundation.json")
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    data.get("foundation.sha256")
+                        .map(String::as_str)
+                        .unwrap_or(""),
+                    &config.supported_kubernetes_version,
+                    &config.controller_image,
+                )
+                .map_err(|error| ControllerError::Configuration(error.to_string()))?,
+            );
+            activation::admit(
+                client.clone(),
+                &docker,
+                &foundation.hash,
+                &config.activation_token,
+                foundation.creation(None).is_ok(),
+            )
+            .await?;
+            let provider = LocalProvider::new(
+                client.clone(),
+                docker,
+                Assets::load(std::path::Path::new("/assets"))?,
+                foundation,
+            );
+            run_runtime(config, client, provider, dependencies.management_watches).await
+        }
+        ProviderMode::Azure => {
+            debug_assert!(
+                !dependencies.docker
+                    && !dependencies.local_foundation
+                    && !dependencies.local_assets
+                    && dependencies.azure_configuration
+            );
+            let provider_config =
+                Api::<ConfigMap>::namespaced(client.clone(), FOUNDATION_NAMESPACE)
+                    .get(AZURE_CONFIG_NAME)
+                    .await?;
+            let provider = AzureProvider::from_config_map(&provider_config)?;
+            run_runtime(config, client, provider, dependencies.management_watches).await
+        }
+    }
+}
+
+async fn run_runtime<P: ProviderLifecycle + 'static>(
+    config: ManagerConfig,
+    client: kube::Client,
+    provider: P,
+    watch_management_resources: bool,
+) -> Result<(), ControllerError> {
     let reconciler = Reconciler::new(
         client.clone(),
         ReconcileConfig {
             supported_version: config.supported_kubernetes_version.clone(),
+            watch_management_resources,
         },
         provider,
     );
@@ -242,6 +318,17 @@ where
             }
         };
         match flag {
+            "--provider" => {
+                config.provider = match value {
+                    "local" => ProviderMode::Local,
+                    "azure" => ProviderMode::Azure,
+                    _ => {
+                        return Err(ControllerError::Configuration(
+                            "--provider must be local or azure".into(),
+                        ));
+                    }
+                };
+            }
             "--leader-elect" => config.leader_elect = parse_bool(flag, value)?,
             "--health-probe-bind-address" => {
                 config.health_address = normalize_address(value).parse().map_err(|error| {
@@ -303,6 +390,7 @@ mod tests {
     fn defaults_are_safe_and_non_reconciling() {
         let config = parse_args(Vec::<String>::new()).unwrap();
         assert!(config.leader_elect);
+        assert_eq!(config.provider, ProviderMode::Local);
         assert!(config.activation_token.is_empty());
         assert_eq!(
             config.health_address,
@@ -319,6 +407,7 @@ mod tests {
     fn parses_inline_and_separate_runtime_flags() {
         let config = parse_args([
             "--probe-in-cluster",
+            "--provider=azure",
             "--leader-elect=false",
             "--health-probe-bind-address",
             ":9090",
@@ -335,6 +424,7 @@ mod tests {
         ])
         .unwrap();
         assert!(config.probe_in_cluster);
+        assert_eq!(config.provider, ProviderMode::Azure);
         assert!(!config.leader_elect);
         assert_eq!(config.health_address, "0.0.0.0:9090".parse().unwrap());
         assert_eq!(config.leader.lease_name, "custom");
@@ -349,6 +439,7 @@ mod tests {
     #[test]
     fn rejects_unknown_missing_and_unsafe_values() {
         assert!(parse_args(["--unknown=true"]).is_err());
+        assert!(parse_args(["--provider=other"]).is_err());
         assert!(parse_args(["--leader-elect"]).is_err());
         assert!(parse_args(["--leader-elect=maybe"]).is_err());
         assert!(
@@ -357,6 +448,30 @@ mod tests {
                 "--leader-renew-grace-seconds=5"
             ])
             .is_err()
+        );
+    }
+
+    #[test]
+    fn provider_modes_select_disjoint_startup_dependencies() {
+        assert_eq!(
+            ProviderMode::Local.dependencies(),
+            StartupDependencies {
+                docker: true,
+                local_foundation: true,
+                local_assets: true,
+                azure_configuration: false,
+                management_watches: true,
+            }
+        );
+        assert_eq!(
+            ProviderMode::Azure.dependencies(),
+            StartupDependencies {
+                docker: false,
+                local_foundation: false,
+                local_assets: false,
+                azure_configuration: true,
+                management_watches: false,
+            }
         );
     }
 }

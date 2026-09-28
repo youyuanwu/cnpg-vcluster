@@ -20,11 +20,10 @@ spec:
       containers:
       - name: manager
         image: ${TENANT_CONTROLLER_IMAGE}
-        imagePullPolicy: Never
+        imagePullPolicy: IfNotPresent
         args:
-        - --provider=local
+        - --provider=azure
         - --leader-elect=true
-        - --activation-token=${CONTROLLER_ACTIVATION_TOKEN}
         - --controller-image=${TENANT_CONTROLLER_IMAGE}
         - --supported-kubernetes-version=${SUPPORTED_KUBERNETES_VERSION}
         - --health-probe-bind-address=0.0.0.0:8081
@@ -52,11 +51,3 @@ spec:
           requests:
             cpu: 50m
             memory: 64Mi
-        volumeMounts:
-        - name: docker-socket
-          mountPath: /var/run/docker.sock
-      volumes:
-      - name: docker-socket
-        hostPath:
-          path: /var/run/docker.sock
-          type: Socket

@@ -283,11 +283,11 @@ Bicep, Python, or `just` recipes. Configuration is split into:
 
 | File or source | Contents | Tracked |
 |---|---|---|
-| `config/azure/defaults.env` | Foundation sizing/network defaults plus supported tenant version, worker SKU, component versions, and timeouts. | Yes |
+| `config/azure/defaults.env` | Foundation sizing/network defaults, controller ACR repository/tag, supported tenant version, worker SKU, component versions, and timeouts. | Yes |
 | `config/azure.local.env` | Subscription ID, location, and operator-selected resource prefix. | No |
 | Explicit Azure TenantSpec JSON | Tenant name, Kubernetes version, worker count, Pod CIDR, and Service CIDR. | Yes when stored as a non-secret example |
 | Active `az` login | Tenant identity and authentication tokens. | No |
-| `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, deployment outputs, controller identities, and foundation checksum. | No |
+| `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, ACR and AcrPull identity, immutable controller digest, deployment/configuration identities, and foundation checksum. | No |
 | `.runtime/azure/tenants/<tenant>/` | Generated tenant manifests, endpoint, and kubeconfig. | No |
 | `.runtime/lifecycle/azure/<tenant>/` | Tenant operation journal, exact identity record, Ready evidence, and timing evidence. | No |
 
@@ -312,6 +312,7 @@ resource group: <prefix>-rg
 AKS:            <prefix>-mgmt
 VNet:           <prefix>-vnet
 identity:       <prefix>-identity
+ACR:            <prefix-without-hyphens>acr
 tenant cluster: <spec.name>
 worker pool:    <spec.name>-worker
 ```
@@ -322,10 +323,9 @@ that the active Azure subscription exactly matches
 unless the existing resource IDs match the owner-only runtime inventory.
 Resources also receive common experiment, prefix, and ownership tags.
 
-The experiment does not currently create a resource that requires a globally
-unique generated name. If one is added later, only that resource should
-receive an explicit uniqueness component rather than adding a suffix to every
-resource.
+The ACR name is the deterministic lowercase alphanumeric prefix plus `acr`.
+Operators must choose an experiment prefix whose derived registry name is
+available in Azure; identity is never replaced with a random suffix.
 
 After Bicep deployment, its outputs and the exact IDs of the resource group,
 AKS cluster, AKS-managed node resource group, VNet, subnets, identity, role
@@ -497,8 +497,8 @@ The proposed interface remains `just`:
 | Command | Purpose |
 |---|---|
 | `just azure-preflight` | Verify Azure CLI login, subscription, required providers, tools, version pins, and configuration. |
-| `just azure-create-foundation` | Create the resource group, VNet, identity, and AKS foundation. |
-| `just azure-create-management` | Install the CAPI, CAPZ, Kamaji, and ASO controller stack. |
+| `just azure-create-foundation` | Create the resource group, VNet, identity, AKS, shared ACR, and exact kubelet AcrPull assignment. |
+| `just azure-create-management` | Install CAPI/CAPZ/Kamaji/ASO, build and push the static Tenant manager, resolve its ACR digest, and install the Azure-mode startup shell. |
 | `just azure-foundation-status` | Report only shared Azure foundation health. |
 | `just tenant-create azure <spec.json>` | Create the explicitly selected Kamaji control plane and VMSS-backed worker pool, install tenant add-ons, and persist exact tenant identities. |
 | `just tenant-status azure <tenant>` | Report one tenant through the provider-neutral status envelope, separately from foundation health. |

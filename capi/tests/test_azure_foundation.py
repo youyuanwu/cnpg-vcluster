@@ -19,12 +19,26 @@ from scripts.lib.azure.common import (
     load_azure_configuration,
     tenant_names,
 )
-from scripts.lib.azure.foundation import create_foundation, load_inventory, preflight
+from scripts.lib.azure.foundation import (
+    ACR_PULL_ROLE_DEFINITION_ID,
+    TENANT_CONTROLLER_CONFIG,
+    TENANT_CONTROLLER_CONFIG_KEY,
+    _azure_provider_configuration,
+    _foundation_identity,
+    _inspect_foundation,
+    _push_controller_image,
+    create_foundation,
+    load_inventory,
+    preflight,
+)
 from scripts.lib.config import ConfigError
 from scripts.lib.files import write_private_file
 from scripts.lib.locking import azure_lock
 from scripts.lib.tenant_spec import TenantSpecError
 from tests.azure_fixtures import AzureFixtureMixin, FOUNDATION, SUBSCRIPTION
+
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def completed(stdout: str = "", returncode: int = 0):
@@ -47,6 +61,270 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             config["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
             "1.32.13",
         )
+        self.assertEqual(config["AZURE_CONTROLLER_REPOSITORY"], "tenant-controller")
+        self.assertEqual(config["AZURE_CONTROLLER_TAG"], "v1alpha2")
+        self.assertEqual(config["AZURE_PREFIX"].replace("-", "") + "acr", "yycvacr")
+    def test_bicep_defines_exact_acr_and_kubelet_pull_outputs(self):
+        foundation = (ROOT / "infra" / "azure" / "foundation.bicep").read_text()
+        acr_pull = (ROOT / "infra" / "azure" / "acr-pull.bicep").read_text()
+        main = (ROOT / "infra" / "azure" / "main.bicep").read_text()
+        for expected in (
+            "Microsoft.ContainerRegistry/registries",
+            "aks.properties.identityProfile.kubeletidentity.objectId",
+            "output acrName string",
+            "output acrId string",
+            "output acrLoginServer string",
+            "output acrPullRoleAssignmentId string",
+        ):
+            self.assertIn(expected, foundation)
+        for expected in (
+            "7f951dda-4ed3-4680-a7ca-43fe172d538d",
+            "guid(acr.id, kubeletPrincipalId, acrPullRoleDefinitionId)",
+            "principalId: kubeletPrincipalId",
+            "output roleAssignmentId string",
+        ):
+            self.assertIn(expected, acr_pull)
+        for output in (
+            "aksKubeletPrincipalId",
+            "acrName",
+            "acrId",
+            "acrLoginServer",
+            "acrPullRoleAssignmentId",
+        ):
+            self.assertIn(f"output {output} string", main)
+    def test_foundation_identity_requires_acr_role_and_controller_digest(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        identity = _foundation_identity(inventory)
+        self.assertEqual(identity["acrId"], inventory["outputs"]["acrId"])
+        self.assertEqual(identity["controllerImage"], inventory["controllerImage"])
+        for missing in ("acrId", "acrPullRoleAssignmentId"):
+            broken = json.loads(json.dumps(inventory))
+            broken["outputs"].pop(missing)
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                RuntimeError, "incomplete"
+            ):
+                _foundation_identity(broken)
+        broken = json.loads(json.dumps(inventory))
+        broken["controllerImage"] = "mutable:tag"
+        with self.assertRaisesRegex(RuntimeError, "controller inventory"):
+            _foundation_identity(broken)
+        broken["controllerImage"] = (
+            "other.azurecr.io/tenant-controller@sha256:" + "1" * 64
+        )
+        with self.assertRaisesRegex(RuntimeError, "controller inventory"):
+            _foundation_identity(broken)
+    def test_foundation_health_fails_closed_on_acr_or_pull_role_drift(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        self.write_inventory(root, inventory)
+        outputs = inventory["outputs"]
+
+        def resource(namespace, name):
+            key = f"{namespace}/{name}"
+            containers = (
+                [{
+                    "name": "manager",
+                    "image": inventory["controllerImage"],
+                    "args": ["--provider=azure"],
+                }]
+                if key == "tenant-system/tenant-controller"
+                else []
+            )
+            return {
+                "metadata": {"uid": inventory["controllers"][key]},
+                "spec": {
+                    "replicas": 1,
+                    "template": {"spec": {"containers": containers}},
+                },
+                "status": {"availableReplicas": 1, "updatedReplicas": 1},
+            }
+
+        def management(_root, namespace, selected):
+            if selected.startswith("deployment/"):
+                return resource(namespace, selected.removeprefix("deployment/"))
+            if selected == f"configmap/{TENANT_CONTROLLER_CONFIG}":
+                return {
+                    "metadata": {"uid": inventory["azureProviderConfigUid"]},
+                    "data": {
+                        TENANT_CONTROLLER_CONFIG_KEY: json.dumps(
+                            _azure_provider_configuration(config, inventory),
+                            sort_keys=True,
+                            separators=(",", ":"),
+                        )
+                    },
+                }
+            if selected.startswith("mutatingwebhookconfiguration/"):
+                return {
+                    "webhooks": [{
+                        "name": "default.azurecluster.infrastructure.cluster.x-k8s.io",
+                        "objectSelector": {
+                            "matchExpressions": [{
+                                "key": "cnpg-vcluster-external-control-plane",
+                                "operator": "NotIn",
+                                "values": ["true"],
+                            }]
+                        },
+                    }]
+                }
+            raise AssertionError(selected)
+
+        def azure(role_present=True, acr_present=True):
+            def invoke(*arguments, **_kwargs):
+                if arguments[:2] == ("aks", "show"):
+                    return completed(json.dumps({
+                        "id": outputs["aksId"],
+                        "provisioningState": "Succeeded",
+                        "powerState": "Running",
+                        "kubernetesVersion": config["AZURE_AKS_KUBERNETES_VERSION"],
+                        "nodeResourceGroup": outputs["aksNodeResourceGroup"],
+                        "oidcIssuer": outputs["aksOidcIssuer"],
+                    }))
+                if arguments[:2] == ("acr", "show"):
+                    if not acr_present:
+                        return completed(returncode=1)
+                    return completed(json.dumps({
+                        "id": outputs["acrId"],
+                        "name": outputs["acrName"],
+                        "loginServer": outputs["acrLoginServer"],
+                        "adminUserEnabled": False,
+                        "provisioningState": "Succeeded",
+                    }))
+                if arguments[:3] == ("role", "assignment", "list"):
+                    assignments = [] if not role_present else [{
+                        "id": outputs["acrPullRoleAssignmentId"],
+                        "principalId": outputs["aksKubeletPrincipalId"],
+                        "scope": outputs["acrId"],
+                        "roleDefinitionId": (
+                            "/subscriptions/redacted"
+                            + ACR_PULL_ROLE_DEFINITION_ID
+                        ),
+                    }]
+                    return completed(json.dumps(assignments))
+                if "--ids" in arguments:
+                    return completed(arguments[arguments.index("--ids") + 1] + "\n")
+                if arguments[:2] == ("group", "show"):
+                    return completed(outputs["resourceGroupId"] + "\n")
+                if arguments[:3] == ("network", "vnet", "show"):
+                    return completed(outputs["vnetId"] + "\n")
+                if arguments[:4] == ("network", "vnet", "subnet", "show"):
+                    selected = (
+                        outputs["aksSubnetId"]
+                        if arguments[arguments.index("--name") + 1] == "aks"
+                        else outputs["tenantSubnetId"]
+                    )
+                    return completed(selected + "\n")
+                if arguments[:2] == ("identity", "show"):
+                    return completed(outputs["identityId"] + "\n")
+                raise AssertionError(arguments)
+            return invoke
+
+        common = (
+            patch("scripts.lib.azure.foundation._validate_foundation_networks"),
+            patch(
+                "scripts.lib.azure.foundation._active_subscription",
+                return_value={"id": SUBSCRIPTION},
+            ),
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                return_value=completed("ok"),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                side_effect=management,
+            ),
+        )
+        with common[0], common[1], common[2], common[3], patch(
+            "scripts.lib.azure.foundation._az",
+            side_effect=azure(),
+        ):
+            _, healthy, blockers = _inspect_foundation(
+                root, config, require_healthy=False
+            )
+        self.assertTrue(healthy, blockers)
+        for missing, expected in (
+            ({"acr_present": False}, "container registry is absent"),
+            ({"role_present": False}, "AcrPull role assignment is absent"),
+        ):
+            with (
+                patch("scripts.lib.azure.foundation._validate_foundation_networks"),
+                patch(
+                    "scripts.lib.azure.foundation._active_subscription",
+                    return_value={"id": SUBSCRIPTION},
+                ),
+                patch(
+                    "scripts.lib.azure.foundation._kubectl",
+                    return_value=completed("ok"),
+                ),
+                patch(
+                    "scripts.lib.azure.foundation._get_management_resource",
+                    side_effect=management,
+                ),
+                patch(
+                    "scripts.lib.azure.foundation._az",
+                    side_effect=azure(**missing),
+                ),
+            ):
+                _, healthy, blockers = _inspect_foundation(
+                    root, config, require_healthy=False
+                )
+            self.assertFalse(healthy)
+            self.assertTrue(
+                any(expected in blocker for blocker in blockers),
+                blockers,
+            )
+    def test_controller_push_uses_acr_login_mutable_tag_and_resolved_digest(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        digest = "sha256:" + "a" * 64
+        with (
+            patch(
+                "scripts.lib.azure.foundation.load_configuration",
+                return_value={"COMMAND_TIMEOUT": "1s"},
+            ),
+            patch(
+                "scripts.lib.azure.foundation.build_azure_controller_image"
+            ) as build,
+            patch(
+                "scripts.lib.azure.foundation.run",
+                return_value=completed(),
+            ) as run_command,
+            patch(
+                "scripts.lib.azure.foundation._az",
+                side_effect=[completed(), completed(digest + "\n")],
+            ) as az,
+        ):
+            image = _push_controller_image(root, config, inventory)
+        tagged = "yycvacr.azurecr.io/tenant-controller:v1alpha2"
+        build.assert_called_once_with(
+            root,
+            {"COMMAND_TIMEOUT": "1s"},
+            tagged,
+        )
+        self.assertEqual(run_command.call_args.args[0], ["docker", "push", tagged])
+        self.assertEqual(az.call_args_list[0].args[:3], ("acr", "login", "--name"))
+        self.assertEqual(
+            az.call_args_list[1].args[:4],
+            ("acr", "manifest", "show-metadata", "--registry"),
+        )
+        self.assertEqual(image, f"yycvacr.azurecr.io/tenant-controller@{digest}")
+    def test_controller_push_rejects_unresolved_manifest_digest(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        with (
+            patch("scripts.lib.azure.foundation.load_configuration", return_value={}),
+            patch("scripts.lib.azure.foundation.build_azure_controller_image"),
+            patch("scripts.lib.azure.foundation.run", return_value=completed()),
+            patch(
+                "scripts.lib.azure.foundation._az",
+                side_effect=[completed(), completed("latest\n")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "manifest digest"),
+        ):
+            _push_controller_image(root, config, self.inventory(root, config))
     def test_preflight_output_does_not_expose_subscription_id(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -81,6 +359,21 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         path.chmod(0o600)
         with self.assertRaisesRegex(ConfigError, "AZURE_PREFIX"):
             load_azure_configuration(root)
+    def test_rejects_invalid_controller_repository_and_tag(self):
+        for key, value in (
+            ("AZURE_CONTROLLER_REPOSITORY", "Upper/Repo"),
+            ("AZURE_CONTROLLER_TAG", "bad tag"),
+        ):
+            root = self.make_root()
+            defaults = root / "config" / "azure" / "defaults.env"
+            defaults.write_text(
+                defaults.read_text().replace(
+                    f"{key}={'tenant-controller' if key.endswith('REPOSITORY') else 'v1alpha2'}",
+                    f"{key}={value!r}",
+                )
+            )
+            with self.subTest(key=key), self.assertRaises(ConfigError):
+                load_azure_configuration(root)
     def test_rejects_pre_cutover_tenant_configuration(self):
         root = self.make_root()
         path = root / "config" / "azure.local.env"

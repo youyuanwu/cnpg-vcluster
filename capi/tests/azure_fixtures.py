@@ -33,6 +33,8 @@ AZURE_KAMAJI_CAPI_VERSION=v0.19.0
 AZURE_KAMAJI_CHART_VERSION=26.8.6-edge
 AZURE_CLOUD_PROVIDER_VERSION=v1.32.3
 AZURE_CALICO_VERSION=v3.32.2
+AZURE_CONTROLLER_REPOSITORY=tenant-controller
+AZURE_CONTROLLER_TAG=v1alpha2
 AZURE_DEPLOY_TIMEOUT=30m
 AZURE_CONTROLLER_TIMEOUT=15m
 AZURE_TENANT_TIMEOUT=20m
@@ -46,6 +48,11 @@ FOUNDATION = {
     "aksId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ContainerService/managedClusters/yy-cv-mgmt",
     "aksNodeResourceGroup": "MC_yy-cv-rg_yy-cv-mgmt_westus2",
     "aksOidcIssuer": "https://example.invalid/issuer",
+    "aksKubeletPrincipalId": "kubelet-principal-id",
+    "acrName": "yycvacr",
+    "acrId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ContainerRegistry/registries/yycvacr",
+    "acrLoginServer": "yycvacr.azurecr.io",
+    "acrPullRoleAssignmentId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.ContainerRegistry/registries/yycvacr/providers/Microsoft.Authorization/roleAssignments/acr-pull",
     "vnetId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.Network/virtualNetworks/yy-cv-vnet",
     "aksSubnetId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.Network/virtualNetworks/yy-cv-vnet/subnets/aks",
     "tenantSubnetId": "/subscriptions/redacted/resourceGroups/yy-cv-rg/providers/Microsoft.Network/virtualNetworks/yy-cv-vnet/subnets/tenant",
@@ -60,7 +67,12 @@ FOUNDATION = {
     "controller:capz-system/azureserviceoperator-controller-manager": "aso-uid",
     "controller:kamaji-system/kamaji": "kamaji-uid",
     "controller:kamaji-system/capi-kamaji-controller-manager": "provider-uid",
+    "controller:tenant-system/tenant-controller": "tenant-controller-uid",
 }
+CONTROLLER_IMAGE = (
+    "yycvacr.azurecr.io/tenant-controller@sha256:"
+    "1111111111111111111111111111111111111111111111111111111111111111"
+)
 
 
 class AzureFixtureMixin:
@@ -125,6 +137,11 @@ class AzureFixtureMixin:
             "aksId": FOUNDATION["aksId"],
             "aksNodeResourceGroup": FOUNDATION["aksNodeResourceGroup"],
             "aksOidcIssuer": FOUNDATION["aksOidcIssuer"],
+            "aksKubeletPrincipalId": FOUNDATION["aksKubeletPrincipalId"],
+            "acrName": FOUNDATION["acrName"],
+            "acrId": FOUNDATION["acrId"],
+            "acrLoginServer": FOUNDATION["acrLoginServer"],
+            "acrPullRoleAssignmentId": FOUNDATION["acrPullRoleAssignmentId"],
             "vnetName": "yy-cv-vnet",
             "vnetId": FOUNDATION["vnetId"],
             "aksSubnetName": "aks",
@@ -156,6 +173,8 @@ class AzureFixtureMixin:
             "deploymentName": "yy-cv-foundation",
             "outputs": outputs,
             "controllers": controllers,
+            "controllerImage": CONTROLLER_IMAGE,
+            "azureProviderConfigUid": "azure-provider-config-uid",
         }
 
     def write_inventory(self, root: Path, payload: dict[str, object]) -> Path:

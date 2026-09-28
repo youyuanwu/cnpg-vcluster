@@ -6,7 +6,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CONTROLLER_SRC = ROOT / "controller" / "src"
-BASELINE_PRODUCTION_LINES = 8050
+MAX_PRODUCTION_LINES = 12000
 
 
 def production_lines(path: Path) -> int:

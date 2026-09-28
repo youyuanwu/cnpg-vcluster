@@ -7,12 +7,15 @@ Kamaji, and the Kamaji control-plane provider. Explicit tenant specifications
 select the hosted control plane, one to three exclusive Docker worker
 containers, and one to three CloudNativePG instances.
 
-The Azure profile provisions an independently managed AKS foundation with
-Kamaji control planes, CAPZ-managed Azure worker machines, and the external
-Azure cloud provider. The local and Azure profiles deliberately have different lifecycle surfaces.
-Local tenants are Kubernetes `Tenant` resources reconciled by the Rust/kube-rs
-controller. Azure tenants retain the JSON specification and Python lifecycle
-while CAPZ integration remains an independent experiment.
+The Azure profile provisions an independently managed AKS foundation with a
+shared ACR, Kamaji control planes, CAPZ-managed Azure worker machines, and the
+external Azure cloud provider. `azure-create-management` publishes the static
+Tenant manager to ACR, pins the deployed digest, and starts it in Azure mode.
+Phase 1 installs only provider-mode startup scaffolding: Azure tenant lifecycle
+remains in Python until the later operator phases are complete. Local tenants
+are Kubernetes `Tenant` resources reconciled by the Rust/kube-rs controller.
+Azure tenants retain the JSON specification and Python lifecycle during this
+phase.
 
 The proposed minimal Azure experiment is documented in
 [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md). It
@@ -42,8 +45,9 @@ owner-only tenant-keyed runtime paths. Local operations do not create these
 records. Targeted Azure deletion verifies exact
 management UIDs and Azure resource IDs, lets CAPI/CAPZ delete the MachinePool
 and VMSS, proves the shared foundation is unchanged, and then removes tenant
-orchestration state. Pre-cutover Azure foundation inventory is rejected and
-requires a clean redeploy. Tenant Azure resources remain billable until
+orchestration state. Pre-ACR Azure foundation inventory is rejected and requires a clean redeploy.
+The Azure-mode manager reports lifecycle dependencies pending and must not be
+treated as Azure tenant lifecycle readiness. Tenant Azure resources remain billable until
 targeted deletion removes the VMSS and related resources. The preserved
 AKS, VNet, identity, and other shared foundation resources remain billable
 until `just azure-destroy` completes.

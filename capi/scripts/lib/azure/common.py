@@ -50,7 +50,11 @@ from scripts.lib.tenants import LIFECYCLE_MARKERS, lifecycle_markers, resource_l
 
 
 PREFIX_RE = re.compile(r"^[a-z][a-z0-9-]{1,19}$")
-FOUNDATION_INVENTORY_SCHEMA = 2
+CONTROLLER_REPOSITORY_RE = re.compile(
+    r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$"
+)
+CONTROLLER_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+FOUNDATION_INVENTORY_SCHEMA = 3
 READY_EVIDENCE_MAX_AGE_SECONDS = 24 * 60 * 60
 FOUNDATION_DEFAULT_KEYS = (
     "AZURE_AKS_KUBERNETES_VERSION",
@@ -66,6 +70,8 @@ FOUNDATION_DEFAULT_KEYS = (
     "AZURE_CAPZ_VERSION",
     "AZURE_KAMAJI_CAPI_VERSION",
     "AZURE_KAMAJI_CHART_VERSION",
+    "AZURE_CONTROLLER_REPOSITORY",
+    "AZURE_CONTROLLER_TAG",
 )
 REQUIRED_PROVIDERS = (
     "Microsoft.Authorization",
@@ -74,13 +80,16 @@ REQUIRED_PROVIDERS = (
     "Microsoft.ManagedIdentity",
     "Microsoft.Network",
 )
-CONTROLLER_DEPLOYMENTS = (
+PLATFORM_CONTROLLER_DEPLOYMENTS = (
     ("capi-system", "capi-controller-manager"),
     ("capi-kubeadm-bootstrap-system", "capi-kubeadm-bootstrap-controller-manager"),
     ("capz-system", "capz-controller-manager"),
     ("capz-system", "azureserviceoperator-controller-manager"),
     ("kamaji-system", "kamaji"),
     ("kamaji-system", "capi-kamaji-controller-manager"),
+)
+CONTROLLER_DEPLOYMENTS = PLATFORM_CONTROLLER_DEPLOYMENTS + (
+    ("tenant-system", "tenant-controller"),
 )
 CAPZ_EXTERNAL_CONTROL_PLANE_LABEL = "cnpg-vcluster-external-control-plane"
 CAPZ_AZURECLUSTER_WEBHOOK = "default.azurecluster.infrastructure.cluster.x-k8s.io"
@@ -226,6 +235,8 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
         "AZURE_KAMAJI_CHART_VERSION",
         "AZURE_CLOUD_PROVIDER_VERSION",
         "AZURE_CALICO_VERSION",
+        "AZURE_CONTROLLER_REPOSITORY",
+        "AZURE_CONTROLLER_TAG",
         "AZURE_DEPLOY_TIMEOUT",
         "AZURE_CONTROLLER_TIMEOUT",
         "AZURE_TENANT_TIMEOUT",
@@ -236,6 +247,13 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
             "AZURE_PREFIX must start with a lowercase letter and contain "
             "2-20 lowercase letters, digits, or hyphens"
         )
+    repository = config["AZURE_CONTROLLER_REPOSITORY"]
+    if len(repository) > 255 or not CONTROLLER_REPOSITORY_RE.fullmatch(repository):
+        raise ConfigError(
+            "AZURE_CONTROLLER_REPOSITORY must be a lowercase OCI repository path"
+        )
+    if not CONTROLLER_TAG_RE.fullmatch(config["AZURE_CONTROLLER_TAG"]):
+        raise ConfigError("AZURE_CONTROLLER_TAG must be a valid OCI tag")
     return config
 
 
@@ -247,6 +265,7 @@ def names(config: Mapping[str, str]) -> dict[str, str]:
         "aks": f"{prefix}-mgmt",
         "vnet": f"{prefix}-vnet",
         "identity": f"{prefix}-identity",
+        "acr": f"{prefix.replace('-', '')}acr",
     }
 
 

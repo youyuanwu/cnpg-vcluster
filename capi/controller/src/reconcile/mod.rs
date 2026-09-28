@@ -1,11 +1,13 @@
 //! Direct-read reconciliation with durable-write barriers and narrowly bound SSA.
 
+mod azure;
 mod error;
 mod local;
 pub mod objects;
 pub mod workers;
 
 pub use crate::api::FINALIZER;
+pub use azure::{AzureProvider, CONFIG_NAME as AZURE_CONFIG_NAME};
 pub use error::ReconcileError;
 pub use local::{Assets, LocalProvider, ProviderLifecycle, TenantAccess};
 
@@ -41,11 +43,13 @@ pub const STORAGE_CLASS: &str = "capi-hostpath";
 #[derive(Clone, Debug)]
 pub struct Config {
     pub supported_version: String,
+    pub watch_management_resources: bool,
 }
 impl Default for Config {
     fn default() -> Self {
         Self {
             supported_version: SUPPORTED_KUBERNETES_VERSION.into(),
+            watch_management_resources: true,
         }
     }
 }
@@ -244,16 +248,18 @@ pub fn map_management_to_tenant(
     }
 }
 
-pub fn controller(client: Client, _config: &Config) -> Controller<Tenant> {
+pub fn controller(client: Client, config: &Config) -> Controller<Tenant> {
     let mut controller = tenant_controller(client.clone());
-    for definition in management::watched() {
-        let resource = definition.api_resource();
-        controller = controller.watches_with(
-            Api::<DynamicObject>::all_with(client.clone(), &resource),
-            resource,
-            watcher::Config::default(),
-            move |object| map_management_to_tenant(definition, &object),
-        );
+    if config.watch_management_resources {
+        for definition in management::watched() {
+            let resource = definition.api_resource();
+            controller = controller.watches_with(
+                Api::<DynamicObject>::all_with(client.clone(), &resource),
+                resource,
+                watcher::Config::default(),
+                move |object| map_management_to_tenant(definition, &object),
+            );
+        }
     }
     controller
 }

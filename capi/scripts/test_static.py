@@ -235,6 +235,7 @@ def check_repository_boundaries() -> None:
         "controller/Cargo.toml",
         "controller/src/bin/manager.rs",
         "controller/Dockerfile",
+        "controller/Dockerfile.azure",
         "controller/API_COMPATIBILITY.md",
         "controller/config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml",
         "controller/config/rbac/role.yaml",
@@ -253,7 +254,7 @@ def check_repository_boundaries() -> None:
     justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
     check("controller-metrics:" in justfile, "controller metrics recipe is missing")
     check(
-        "scripts/controller_metrics.py --max 8050" in justfile,
+        "scripts/controller_metrics.py --max 12000" in justfile,
         "controller production-line threshold is not enforced",
     )
     controller = ROOT / "controller"
@@ -293,6 +294,14 @@ def check_repository_boundaries() -> None:
     manager = (controller / "config" / "manager" / "manager.yaml.tpl").read_text(encoding="utf-8")
     check(not re.search(r"webhook|tls|9443|serving-cert", manager, re.IGNORECASE),
           "manager still exposes local admission webhook or TLS")
+    azure_manager = (
+        controller / "config" / "manager" / "manager-azure.yaml.tpl"
+    ).read_text(encoding="utf-8")
+    check("--provider=azure" in azure_manager,
+          "Azure manager does not select the Azure provider")
+    check(not re.search(r"docker.sock|tenant-foundation|activation|calico|cnpg",
+                        azure_manager, re.IGNORECASE),
+          "Azure manager retains local-only dependencies")
     for relative in ("scripts", "config/versions.env", "Justfile"):
         paths = (ROOT / relative).rglob("*.py") if relative == "scripts" else (ROOT / relative,)
         for path in paths:

@@ -1,6 +1,17 @@
 from __future__ import annotations
 
 from .common import *
+from scripts.lib.controller import (
+    build_azure_controller_image,
+    render_azure_controller_manager,
+)
+
+ACR_PULL_ROLE_DEFINITION_ID = (
+    "/providers/Microsoft.Authorization/roleDefinitions/"
+    "7f951dda-4ed3-4680-a7ca-43fe172d538d"
+)
+TENANT_CONTROLLER_CONFIG = "tenant-azure-provider"
+TENANT_CONTROLLER_CONFIG_KEY = "provider.json"
 
 def preflight(
     root: Path,
@@ -434,6 +445,165 @@ def _controller_identities(root: Path) -> dict[str, str]:
     return identities
 
 
+def _push_controller_image(
+    root: Path,
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> str:
+    outputs = inventory["outputs"]
+    assert isinstance(outputs, dict)
+    login_server = str(outputs["acrLoginServer"])
+    repository = config["AZURE_CONTROLLER_REPOSITORY"]
+    tag = config["AZURE_CONTROLLER_TAG"]
+    tagged_image = f"{login_server}/{repository}:{tag}"
+    controller_config = load_configuration(root)
+    build_azure_controller_image(root, controller_config, tagged_image)
+    _az("acr", "login", "--name", str(outputs["acrName"]), timeout=120)
+    run(
+        ["docker", "push", tagged_image],
+        timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]),
+    )
+    digest = _az(
+        "acr",
+        "manifest",
+        "show-metadata",
+        "--registry",
+        str(outputs["acrName"]),
+        "--name",
+        f"{repository}:{tag}",
+        "--query",
+        "digest",
+        "--output",
+        "tsv",
+        timeout=120,
+    ).stdout.strip().lower()
+    if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise RuntimeError("pushed Azure controller manifest digest is invalid")
+    return f"{login_server}/{repository}@{digest}"
+
+
+def _azure_provider_configuration(
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> dict[str, object]:
+    outputs = inventory["outputs"]
+    assert isinstance(outputs, dict)
+    return {
+        "schema": 1,
+        "subscriptionId": config["AZURE_SUBSCRIPTION_ID"],
+        "tenantId": outputs["tenantId"],
+        "location": config["AZURE_LOCATION"],
+        "resourceGroupName": outputs["resourceGroupName"],
+        "resourceGroupId": outputs["resourceGroupId"],
+        "vnetName": outputs["vnetName"],
+        "vnetId": outputs["vnetId"],
+        "tenantSubnetName": outputs["tenantSubnetName"],
+        "tenantSubnetId": outputs["tenantSubnetId"],
+        "identityName": outputs["identityName"],
+        "identityId": outputs["identityId"],
+        "identityClientId": outputs["identityClientId"],
+        "supportedKubernetesVersion": config[
+            "AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"
+        ],
+        "workerSku": config["AZURE_TENANT_NODE_SKU"],
+        "cloudProviderVersion": config["AZURE_CLOUD_PROVIDER_VERSION"],
+        "calicoVersion": config["AZURE_CALICO_VERSION"],
+    }
+
+
+def _install_tenant_controller(
+    root: Path,
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> tuple[str, str]:
+    image = _push_controller_image(root, config, inventory)
+    for path in (
+        root / "controller" / "config" / "namespace" / "namespace.yaml",
+        root / "controller" / "config" / "crd" / "bases",
+        root / "controller" / "config" / "rbac" / "role.yaml",
+        root / "controller" / "config" / "rbac" / "service-account.yaml",
+        root / "controller" / "config" / "rbac" / "role-binding.yaml",
+    ):
+        _kubectl(
+            root,
+            "apply",
+            "--server-side",
+            "--field-manager=cnpg-vcluster-azure-controller",
+            "--force-conflicts",
+            "-f",
+            str(path),
+        )
+    _kubectl(
+        root,
+        "wait",
+        "--for=condition=Established",
+        "crd/tenants.tenancy.cnpg-vcluster.io",
+        f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
+        timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
+    )
+    provider_config = _azure_provider_configuration(config, inventory)
+    config_map = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": TENANT_CONTROLLER_CONFIG,
+            "namespace": "tenant-system",
+        },
+        "data": {
+            TENANT_CONTROLLER_CONFIG_KEY: json.dumps(
+                provider_config,
+                sort_keys=True,
+                separators=(",", ":"),
+            )
+        },
+    }
+    _kubectl(
+        root,
+        "apply",
+        "--server-side",
+        "--field-manager=cnpg-vcluster-azure-controller",
+        "--force-conflicts",
+        "-f",
+        "-",
+        input_text=json.dumps(config_map),
+    )
+    manager = render_azure_controller_manager(
+        root,
+        config["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
+        image,
+    )
+    _kubectl(
+        root,
+        "apply",
+        "--server-side",
+        "--field-manager=cnpg-vcluster-azure-controller",
+        "--force-conflicts",
+        "-f",
+        str(manager),
+    )
+    _kubectl(
+        root,
+        "-n",
+        "tenant-system",
+        "rollout",
+        "status",
+        "deployment/tenant-controller",
+        f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
+        timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
+    )
+    observed = _get_management_resource(
+        root,
+        "tenant-system",
+        f"configmap/{TENANT_CONTROLLER_CONFIG}",
+    )
+    if observed is None:
+        raise RuntimeError("Azure provider configuration ConfigMap is absent")
+    uid = observed.get("metadata", {}).get("uid")
+    if not isinstance(uid, str) or not uid:
+        raise RuntimeError("Azure provider configuration ConfigMap UID is absent")
+    return image, uid
+
+
 def create_management(root: Path, config: Mapping[str, str]) -> None:
     preflight(root, config, emit=False)
     inventory = load_inventory(root, config)
@@ -441,7 +611,7 @@ def create_management(root: Path, config: Mapping[str, str]) -> None:
     _install_capi_capz(root, config, inventory)
     _install_kamaji(root, config)
     _install_kamaji_provider(root, config)
-    for namespace, deployment in CONTROLLER_DEPLOYMENTS:
+    for namespace, deployment in PLATFORM_CONTROLLER_DEPLOYMENTS:
         _kubectl(
             root,
             "-n",
@@ -452,10 +622,17 @@ def create_management(root: Path, config: Mapping[str, str]) -> None:
             f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
             timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
         )
+    controller_image, provider_config_uid = _install_tenant_controller(
+        root,
+        config,
+        inventory,
+    )
     updated = dict(inventory)
     updated["controllers"] = _controller_identities(root)
+    updated["controllerImage"] = controller_image
+    updated["azureProviderConfigUid"] = provider_config_uid
     _write_inventory(root, updated)
-    print("Azure management controllers are ready")
+    print("Azure management controllers and Tenant manager are ready")
 
 
 def load_inventory(
@@ -511,6 +688,11 @@ def load_inventory(
         for key, value in controllers.items()
     ):
         raise RuntimeError("Azure foundation controller inventory is invalid")
+    for key in ("controllerImage", "azureProviderConfigUid"):
+        if key in payload and (
+            not isinstance(payload[key], str) or not payload[key]
+        ):
+            raise RuntimeError(f"Azure foundation {key} is invalid")
     return payload
 
 
@@ -524,6 +706,11 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
         "aksId",
         "aksNodeResourceGroup",
         "aksOidcIssuer",
+        "aksKubeletPrincipalId",
+        "acrName",
+        "acrId",
+        "acrLoginServer",
+        "acrPullRoleAssignmentId",
         "vnetId",
         "aksSubnetId",
         "tenantSubnetId",
@@ -543,8 +730,23 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
         for namespace, deployment in CONTROLLER_DEPLOYMENTS
     }:
         raise RuntimeError("Azure management controller inventory is incomplete")
+    controller_image = inventory.get("controllerImage")
+    provider_config_uid = inventory.get("azureProviderConfigUid")
+    if (
+        not isinstance(controller_image, str)
+        or not re.fullmatch(
+            r"[^@\s]+@sha256:[0-9a-f]{64}",
+            controller_image,
+        )
+        or not controller_image.startswith(f"{outputs['acrLoginServer']}/")
+        or not isinstance(provider_config_uid, str)
+        or not provider_config_uid
+    ):
+        raise RuntimeError("Azure Tenant controller inventory is incomplete")
     return {
         "foundationDefaultsSha256": str(inventory["foundationDefaultsSha256"]),
+        "controllerImage": controller_image,
+        "azureProviderConfigUid": provider_config_uid,
         **{key: str(outputs[key]) for key in required_outputs},
         **{
             f"controller:{key}": str(value)
@@ -615,6 +817,14 @@ def _inspect_foundation(
     assert isinstance(outputs, dict)
     assert isinstance(controllers, dict)
     blockers = []
+    expected_controller_prefix = (
+        f"{outputs['acrLoginServer']}/"
+        f"{config['AZURE_CONTROLLER_REPOSITORY']}@sha256:"
+    )
+    if not str(inventory.get("controllerImage", "")).startswith(
+        expected_controller_prefix
+    ):
+        blockers.append("Azure Tenant manager repository binding changed")
     aks = _az(
         "aks",
         "show",
@@ -649,6 +859,72 @@ def _inspect_foundation(
             blockers.append("AKS managed node resource group changed")
         if payload.get("oidcIssuer") != outputs["aksOidcIssuer"]:
             blockers.append("AKS OIDC issuer changed")
+    acr = _az(
+        "acr",
+        "show",
+        "--ids",
+        str(outputs["acrId"]),
+        "--query",
+        (
+            "{id:id,name:name,loginServer:loginServer,"
+            "adminUserEnabled:adminUserEnabled,"
+            "provisioningState:provisioningState}"
+        ),
+        "--output",
+        "json",
+        check=False,
+    )
+    if acr.returncode != 0:
+        blockers.append("recorded Azure container registry is absent")
+    else:
+        payload = json.loads(acr.stdout)
+        if not _azure_id_equal(payload.get("id"), outputs["acrId"]):
+            blockers.append("Azure container registry identity changed")
+        if payload.get("name") != outputs["acrName"]:
+            blockers.append("Azure container registry name changed")
+        if payload.get("loginServer") != outputs["acrLoginServer"]:
+            blockers.append("Azure container registry login server changed")
+        if payload.get("adminUserEnabled") is not False:
+            blockers.append("Azure container registry admin user is enabled")
+        if payload.get("provisioningState") != "Succeeded":
+            blockers.append("Azure container registry provisioning is not Succeeded")
+    acr_roles = _az(
+        "role",
+        "assignment",
+        "list",
+        "--scope",
+        str(outputs["acrId"]),
+        "--assignee-object-id",
+        str(outputs["aksKubeletPrincipalId"]),
+        "--output",
+        "json",
+        check=False,
+    )
+    if acr_roles.returncode != 0:
+        blockers.append("AKS kubelet ACR role assignment inspection failed")
+    else:
+        assignments = json.loads(acr_roles.stdout)
+        matching = [
+            assignment
+            for assignment in assignments
+            if isinstance(assignment, dict)
+            and _azure_id_equal(
+                assignment.get("id"),
+                outputs["acrPullRoleAssignmentId"],
+            )
+        ] if isinstance(assignments, list) else []
+        if len(matching) != 1:
+            blockers.append("recorded AKS kubelet AcrPull role assignment is absent")
+        else:
+            assignment = matching[0]
+            if assignment.get("principalId") != outputs["aksKubeletPrincipalId"]:
+                blockers.append("AKS kubelet AcrPull principal changed")
+            if not _azure_id_equal(assignment.get("scope"), outputs["acrId"]):
+                blockers.append("AKS kubelet AcrPull scope changed")
+            if not str(assignment.get("roleDefinitionId", "")).lower().endswith(
+                ACR_PULL_ROLE_DEFINITION_ID.lower()
+            ):
+                blockers.append("AKS kubelet AcrPull role changed")
     azure_identity_checks = (
         (
             "resource group",
@@ -723,6 +999,21 @@ def _inspect_foundation(
             outputs["aksRoleAssignmentId"],
         ),
         (
+            "container registry",
+            ("resource", "show", "--ids", str(outputs["acrId"])),
+            outputs["acrId"],
+        ),
+        (
+            "AKS kubelet AcrPull role assignment",
+            (
+                "resource",
+                "show",
+                "--ids",
+                str(outputs["acrPullRoleAssignmentId"]),
+            ),
+            outputs["acrPullRoleAssignmentId"],
+        ),
+        (
             "CAPZ federated credential",
             ("resource", "show", "--ids", str(outputs["capzFederationId"])),
             outputs["capzFederationId"],
@@ -767,6 +1058,51 @@ def _inspect_foundation(
                 blockers.append(f"management controller identity changed: {deployment}")
             if not _deployment_ready(observed):
                 blockers.append(f"management controller is unavailable: {deployment}")
+            if (namespace, deployment) == ("tenant-system", "tenant-controller"):
+                containers = observed.get("spec", {}).get(
+                    "template", {}
+                ).get("spec", {}).get("containers", [])
+                manager = next(
+                    (
+                        item
+                        for item in containers
+                        if isinstance(item, dict) and item.get("name") == "manager"
+                    ),
+                    None,
+                )
+                if not isinstance(manager, dict):
+                    blockers.append("Azure Tenant manager container is absent")
+                else:
+                    if manager.get("image") != inventory.get("controllerImage"):
+                        blockers.append("Azure Tenant manager image identity changed")
+                    arguments = manager.get("args")
+                    if (
+                        not isinstance(arguments, list)
+                        or "--provider=azure" not in arguments
+                    ):
+                        blockers.append("Azure Tenant manager provider mode changed")
+        provider_config = _get_management_resource(
+            root,
+            "tenant-system",
+            f"configmap/{TENANT_CONTROLLER_CONFIG}",
+        )
+        if provider_config is None:
+            blockers.append("Azure provider configuration ConfigMap is absent")
+        else:
+            if (
+                provider_config.get("metadata", {}).get("uid")
+                != inventory.get("azureProviderConfigUid")
+            ):
+                blockers.append("Azure provider configuration identity changed")
+            raw = provider_config.get("data", {}).get(
+                TENANT_CONTROLLER_CONFIG_KEY
+            )
+            try:
+                observed_config = json.loads(raw)
+            except (TypeError, json.JSONDecodeError):
+                observed_config = None
+            if observed_config != _azure_provider_configuration(config, inventory):
+                blockers.append("Azure provider configuration changed")
         webhook = _get_management_resource(
             root,
             None,
