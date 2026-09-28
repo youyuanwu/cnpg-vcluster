@@ -45,7 +45,7 @@ from scripts.lib.process import run
 from scripts.lib.redaction import redact, redact_value
 from scripts.lib.tenant_spec import load_tenant_spec
 from scripts.lib.tenant_runtime import TenantRuntime
-from scripts.tenant import create_tenant, supported_versions
+from scripts.tenant import create_tenant, delete_tenant, supported_versions
 
 
 def _group_exists(group: str) -> bool:
@@ -731,11 +731,14 @@ def main(arguments: list[str]) -> int:
                 phase(
                     "resume-pending-delete",
                     lambda: (
-                        _tenant_command(
-                            "delete",
-                            "azure",
+                        delete_tenant(
+                            ROOT,
                             spec.name,
                             f"azure/{spec.name}",
+                            AzureTenantAdapter(),
+                            expected_marker_operation_id=worker_state[
+                                "markerOperationId"
+                            ],
                         ),
                         _require_status(spec.name, "absent"),
                     ),
@@ -798,6 +801,14 @@ def main(arguments: list[str]) -> int:
             ):
                 raise RuntimeError("Azure worker recovery checkpoint is invalid")
             baseline_observed = checkpoint["observed"]
+            if (
+                dict(identity.observed) == baseline_observed
+                and runtime.load_ready_evidence().get("observed")
+                != baseline_observed
+            ):
+                raise RuntimeError(
+                    "Azure worker Ready evidence changed before recovery"
+                )
             baseline_identity = type(identity)(
                 profile=identity.profile,
                 tenant=identity.tenant,
@@ -902,6 +913,7 @@ def main(arguments: list[str]) -> int:
                     config,
                     lambda _root, _config: resume_worker_refresh(),
                 )
+                phase("worker-identity-verification", lambda: None)
                 phase("worker-instance-deletion", lambda: None)
                 phase("worker-recovery", lambda: None)
                 phase("worker-identity-refresh", lambda: None)
@@ -1150,14 +1162,23 @@ def main(arguments: list[str]) -> int:
                     )
                     + "\n",
                 )
+            worker_state = _load_worker_checkpoint(
+                worker_checkpoint,
+                spec,
+                revision,
+                active_gate_operation_id,
+            )
             phase(
                 "targeted-delete-absent",
                 lambda: (
-                    _tenant_command(
-                        "delete",
-                        "azure",
+                    delete_tenant(
+                        ROOT,
                         spec.name,
                         f"azure/{spec.name}",
+                        AzureTenantAdapter(),
+                        expected_marker_operation_id=worker_state[
+                            "markerOperationId"
+                        ],
                     ),
                     _require_status(spec.name, "absent"),
                 ),

@@ -339,6 +339,8 @@ def delete_tenant(
     tenant: str,
     confirmation: str,
     adapter: TenantAdapter,
+    *,
+    expected_marker_operation_id: str | None = None,
 ) -> int:
     validate_tenant_name(tenant)
     expected_confirmation = f"{PROFILE}/{tenant}"
@@ -378,6 +380,16 @@ def delete_tenant(
                         )
                         if pending is not None:
                             timings.bind_operation_id(pending.operation_id)
+                        if expected_marker_operation_id is not None:
+                            marker_source = identity or pending
+                            if (
+                                marker_source is None
+                                or marker_source.observed.get("markerOperationId")
+                                != expected_marker_operation_id
+                            ):
+                                raise TenantRuntimeError(
+                                    "Azure gate delete precondition changed"
+                                )
                     if identity is None:
                         with timings.phase("absence"):
                             inspected = _safe_authoritative_absence(
