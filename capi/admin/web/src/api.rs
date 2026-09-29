@@ -2,7 +2,10 @@ use gloo_net::http::Request;
 use serde_json::Value;
 use tenant_admin_shared::{API_SCHEMA_VERSION, ApiEnvelope};
 
-use crate::error::{UiError, map_error_response};
+use crate::{
+    error::{UiError, map_error_response},
+    unsafe_request_header,
+};
 
 pub async fn get_envelope<T>(path: &str) -> Result<T, UiError>
 where
@@ -12,6 +15,37 @@ where
         .send()
         .await
         .map_err(|error| UiError::network(error.to_string()))?;
+    read_envelope_response(response).await
+}
+
+pub async fn post_envelope<TRequest, TResponse>(
+    path: &str,
+    payload: &TRequest,
+) -> Result<TResponse, UiError>
+where
+    TRequest: serde::Serialize,
+    TResponse: serde::de::DeserializeOwned,
+{
+    let (header, value) = unsafe_request_header();
+    let request = Request::post(path)
+        .header(header, value)
+        .json(payload)
+        .map_err(|error| UiError {
+            kind: crate::error::UiErrorKind::InvalidRequest,
+            message: format!("The request could not be encoded: {error}"),
+            retryable: false,
+        })?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| UiError::network(error.to_string()))?;
+    read_envelope_response(response).await
+}
+
+async fn read_envelope_response<T>(response: gloo_net::http::Response) -> Result<T, UiError>
+where
+    T: serde::de::DeserializeOwned,
+{
     let status = response.status();
     let body = response
         .text()

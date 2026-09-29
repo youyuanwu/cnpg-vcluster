@@ -1,6 +1,7 @@
 #![deny(unsafe_code)]
 
 mod app;
+mod database;
 mod error;
 mod projection;
 mod source;

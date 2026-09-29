@@ -34,7 +34,7 @@ ADMIN_LABEL = "app.kubernetes.io/name=tenant-admin"
 ADMIN_SERVICE_PROXY = (
     "/api/v1/namespaces/tenant-system/services/http:tenant-admin:80/proxy"
 )
-ADMIN_API_SCHEMA_VERSION = 2
+ADMIN_API_SCHEMA_VERSION = 3
 ADMIN_IMAGE_PATTERN = re.compile(
     r"[a-z0-9](?:[a-z0-9._/-]*[a-z0-9])?:"
     r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}"
@@ -413,6 +413,22 @@ def _service_proxy(client: ManagementClient, path: str) -> str:
     return response.stdout
 
 
+def _service_proxy_post(
+    client: ManagementClient,
+    path: str,
+    payload: dict[str, object],
+):
+    return client.kubectl(
+        "create",
+        "--raw",
+        f"{ADMIN_SERVICE_PROXY}/{path.lstrip('/')}",
+        "-f",
+        "-",
+        input_text=json.dumps(payload),
+        check=False,
+    )
+
+
 def _envelope(raw: str, description: str) -> object:
     try:
         envelope = json.loads(raw)
@@ -425,6 +441,78 @@ def _envelope(raw: str, description: str) -> object:
     ):
         raise RuntimeError(f"Tenant Admin {description} response envelope is invalid")
     return envelope["data"]
+
+
+def _validate_database_query(
+    client: ManagementClient,
+    tenant_name: str,
+    database: dict[str, object],
+) -> None:
+    cluster = _required_mapping(database.get("cluster"), "database cluster")
+    instances = _required_list(cluster.get("instances"), "database instances")
+    current_primary = cluster.get("currentPrimary")
+    names = [
+        _required_string(
+            _required_mapping(instance, "database instance").get("name"),
+            "database instance name",
+        )
+        for instance in instances
+    ]
+    instance = (
+        current_primary
+        if isinstance(current_primary, str) and current_primary in names
+        else names[0] if names else None
+    )
+    if instance is None:
+        raise RuntimeError("Tenant Admin database query instance is unavailable")
+    response = _service_proxy_post(
+        client,
+        f"api/v1/tenants/{tenant_name}/database/query",
+        {
+            "instance": instance,
+            "database": "postgres",
+            "sql": "SELECT 1 AS value;",
+        },
+    )
+    if response.returncode != 0:
+        raise RuntimeError("Tenant Admin database query API is unavailable")
+    query = _required_mapping(
+        _envelope(response.stdout, "database query"),
+        "database query data",
+    )
+    results = _required_list(query.get("results"), "database query results")
+    if (
+        set(query)
+        != {
+            "tenant",
+            "cluster",
+            "instance",
+            "database",
+            "executedAt",
+            "durationMs",
+            "truncated",
+            "results",
+        }
+        or query.get("tenant") != tenant_name
+        or query.get("cluster") != "capi-postgres"
+        or query.get("instance") != instance
+        or query.get("database") != "postgres"
+        or not isinstance(query.get("executedAt"), str)
+        or not query["executedAt"]
+        or not _is_integer(query.get("durationMs"))
+        or query["durationMs"] < 0
+        or query.get("truncated") is not False
+        or len(results) != 1
+    ):
+        raise RuntimeError("Tenant Admin database query response is invalid")
+    result = _required_mapping(results[0], "database query result")
+    if result != {
+        "columns": ["value"],
+        "rows": [["1"]],
+        "affectedRows": 1,
+        "truncated": False,
+    }:
+        raise RuntimeError("Tenant Admin database query result is invalid")
 
 
 def _validate_summary(value: object) -> str:
@@ -796,6 +884,7 @@ def verify_admin_api(
     *,
     expected_tenant_names: tuple[str, ...] | None = None,
     require_available_databases: bool = False,
+    verify_database_queries: bool = False,
 ) -> dict[str, object]:
     for path in ("healthz", "readyz"):
         if _service_proxy(client, path):
@@ -896,6 +985,14 @@ def verify_admin_api(
             != database_instances
         ):
             raise RuntimeError("Tenant Admin database topology response is invalid")
+        if verify_database_queries and database_state == "available":
+            _validate_database_query(
+                client,
+                name,
+                _required_mapping(
+                    snapshot.get("database"), "database observation"
+                ),
+            )
         if (
             database_state == "unavailable"
             and "database:unavailable" not in topology_node_ids

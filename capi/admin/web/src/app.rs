@@ -3,7 +3,8 @@ use tenant_admin_shared::{
     API_SCHEMA_VERSION,
     query::{
         AzureProviderView, ConditionStatus, DatabaseClusterObservation, DatabaseCondition,
-        DatabaseObservation, DatabaseObservationFreshness, OverviewSnapshot,
+        DatabaseInstanceObservation, DatabaseObservation, DatabaseObservationFreshness,
+        DatabaseQueryRequest, DatabaseQueryResponse, DatabaseQueryResult, OverviewSnapshot,
         ProviderSpecificationView, ProviderStatusView, TenantCondition, TenantSnapshot,
         TenantSummary, TopologyGraph,
     },
@@ -12,7 +13,11 @@ use tenant_admin_shared::{
 use wasm_bindgen_futures::spawn_local;
 
 use crate::{
-    api::get_envelope,
+    api::{get_envelope, post_envelope},
+    database_console::{
+        DEFAULT_DATABASE, DEFAULT_SQL, QueryResultPresentation, format_query_duration,
+        project_query_result, selectable_database_instances,
+    },
     error::{UiError, UiErrorKind},
     format::{
         classification_class, classification_label, condition_status_label,
@@ -22,7 +27,7 @@ use crate::{
         node_kind_label, optional_text, provider_label, provider_mode_label,
         sort_database_instances,
     },
-    route::{AppRoute, parse_route, tenant_href},
+    route::{AppRoute, parse_route, tenant_database_query_path, tenant_href},
     topology::layout_graph,
 };
 
@@ -377,6 +382,7 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
     let database = data.database;
     let topology = data.topology;
     let summary = detail.summary.clone();
+    let tenant_name = summary.name.clone();
     let classification = summary.classification;
     let status_class = classification_class(classification);
     let provider_specification = detail.specification.provider.clone();
@@ -424,7 +430,7 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
             </div>
         </section>
 
-        {database_panel(database)}
+        {database_panel(tenant_name, database)}
 
         <div class="detail-grid">
             <section class="panel" aria-labelledby="specification-heading">
@@ -464,13 +470,13 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
 
 const MAX_DATABASE_CONDITIONS: usize = 8;
 
-fn database_panel(observation: DatabaseObservation) -> AnyView {
+fn database_panel(tenant: String, observation: DatabaseObservation) -> AnyView {
     match observation {
         DatabaseObservation::Available {
             observed_at,
             freshness,
             cluster,
-        } => available_database_panel(observed_at, freshness, *cluster),
+        } => available_database_panel(tenant, observed_at, freshness, *cluster),
         DatabaseObservation::Unavailable {
             observed_at,
             freshness,
@@ -557,11 +563,13 @@ fn database_panel(observation: DatabaseObservation) -> AnyView {
 }
 
 fn available_database_panel(
+    tenant: String,
     observed_at: String,
     freshness: DatabaseObservationFreshness,
     mut cluster: DatabaseClusterObservation,
 ) -> AnyView {
     sort_database_instances(&mut cluster.instances);
+    let console_instances = selectable_database_instances(&cluster.instances);
     cluster.conditions.sort_by(|left, right| {
         left.condition_type
             .cmp(&right.condition_type)
@@ -680,12 +688,332 @@ fn available_database_panel(
 
             {instances}
             {conditions}
+            <DatabaseConsole tenant instances=console_instances/>
             <p class="database-credential-note">
                 "Database credentials, passwords, and connection secrets are never returned to this browser."
             </p>
         </section>
     }
     .into_any()
+}
+
+#[derive(Clone)]
+enum QueryExecutionState {
+    Idle,
+    Running,
+    Success(DatabaseQueryResponse),
+    Error(UiError),
+}
+
+#[component]
+fn DatabaseConsole(tenant: String, instances: Vec<DatabaseInstanceObservation>) -> impl IntoView {
+    let selected_instance = RwSignal::new(
+        instances
+            .first()
+            .map(|instance| instance.name.clone())
+            .unwrap_or_default(),
+    );
+    let database = RwSignal::new(DEFAULT_DATABASE.to_owned());
+    let sql = RwSignal::new(DEFAULT_SQL.to_owned());
+    let state = RwSignal::new(QueryExecutionState::Idle);
+    let query_path = tenant_database_query_path(&tenant);
+    let has_instances = !instances.is_empty();
+
+    let submit_query = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        if matches!(state.get_untracked(), QueryExecutionState::Running) {
+            return;
+        }
+        let Some(path) = query_path.clone() else {
+            state.set(QueryExecutionState::Error(UiError {
+                kind: UiErrorKind::InvalidRequest,
+                message: "The Tenant name is not valid.".to_owned(),
+                retryable: false,
+            }));
+            return;
+        };
+        let request = DatabaseQueryRequest {
+            instance: selected_instance.get_untracked(),
+            database: database.get_untracked(),
+            sql: sql.get_untracked(),
+        };
+        state.set(QueryExecutionState::Running);
+        spawn_local(async move {
+            state.set(
+                match post_envelope::<_, DatabaseQueryResponse>(&path, &request).await {
+                    Ok(response) => QueryExecutionState::Success(response),
+                    Err(error) => QueryExecutionState::Error(error),
+                },
+            );
+        });
+    };
+
+    view! {
+        <section class="database-console" aria-labelledby="database-console-heading">
+            <div class="database-console__warning">
+                <p class="eyebrow">"Dangerous operation"</p>
+                <h3 id="database-console-heading">"Unsafe administrator SQL console"</h3>
+                <p>
+                    "Queries run as the CNPG PostgreSQL superuser and can modify or destroy data. Database credentials stay server-side and are never rendered in this browser."
+                </p>
+            </div>
+            <form class="database-console__form" on:submit=submit_query>
+                <div class="database-console__controls">
+                    <label>
+                        <span>"CNPG instance"</span>
+                        <select
+                            disabled=!has_instances
+                            prop:value=move || selected_instance.get()
+                            on:change=move |event| {
+                                selected_instance.set(event_target_value(&event));
+                            }
+                        >
+                            {instances
+                                .into_iter()
+                                .map(|instance| {
+                                    let role = database_instance_role_label(instance.role);
+                                    let label = format!("{} ({role})", instance.name);
+                                    view! { <option value=instance.name>{label}</option> }
+                                })
+                                .collect_view()}
+                        </select>
+                    </label>
+                    <label>
+                        <span>"Database name"</span>
+                        <input
+                            type="text"
+                            autocomplete="off"
+                            required
+                            prop:value=move || database.get()
+                            on:input=move |event| database.set(event_target_value(&event))
+                        />
+                    </label>
+                </div>
+                <label class="database-console__sql">
+                    <span>"SQL statement"</span>
+                    <textarea
+                        rows="8"
+                        required
+                        spellcheck="false"
+                        prop:value=move || sql.get()
+                        on:input=move |event| sql.set(event_target_value(&event))
+                    ></textarea>
+                </label>
+                {(!has_instances).then(|| view! {
+                    <p class="database-console__notice" role="status">
+                        "No observed CNPG instance is available for query execution."
+                    </p>
+                })}
+                <div class="database-console__actions">
+                    <button
+                        type="submit"
+                        class="database-console__execute"
+                        disabled=move || {
+                            !has_instances
+                                || matches!(state.get(), QueryExecutionState::Running)
+                        }
+                    >
+                        {move || {
+                            if matches!(state.get(), QueryExecutionState::Running) {
+                                "Executing…"
+                            } else {
+                                "Execute SQL"
+                            }
+                        }}
+                    </button>
+                    <p class="secondary">
+                        "Only the selected observed instance is targeted. Connection details remain on the server."
+                    </p>
+                </div>
+            </form>
+            <div class="database-console__output" aria-live="polite" aria-atomic="false">
+                {move || query_execution_view(state.get())}
+            </div>
+        </section>
+    }
+}
+
+fn query_execution_view(state: QueryExecutionState) -> AnyView {
+    match state {
+        QueryExecutionState::Idle => view! {
+            <p class="database-console__placeholder">
+                "No query has been executed in this browser session."
+            </p>
+        }
+        .into_any(),
+        QueryExecutionState::Running => view! {
+            <p class="database-console__running" role="status">
+                <span class="loading-indicator" aria-hidden="true"></span>
+                "Executing SQL on the selected CNPG instance…"
+            </p>
+        }
+        .into_any(),
+        QueryExecutionState::Success(response) => query_response_view(response),
+        QueryExecutionState::Error(error) => view! {
+            <section class="database-console__error" role="alert">
+                <h4>{error.title()}</h4>
+                <p>{error.message}</p>
+                {error.retryable.then(|| view! {
+                    <p class="secondary">"The query can be submitted again when the database is available."</p>
+                })}
+            </section>
+        }
+        .into_any(),
+    }
+}
+
+fn query_response_view(response: DatabaseQueryResponse) -> AnyView {
+    let result_count = response.results.len();
+    let duration = format_query_duration(response.duration_ms);
+    let global_truncated = response.truncated;
+    let results = response.results;
+    let executed_at_datetime = response.executed_at.clone();
+
+    view! {
+        <section class="database-console__success" role="status">
+            <div class="database-console__result-header">
+                <div>
+                    <h4>"Query completed"</h4>
+                    <p>{format!(
+                        "{result_count} result set{} returned in {duration}.",
+                        if result_count == 1 { "" } else { "s" }
+                    )}</p>
+                </div>
+                <span class="status status--ready">"Success"</span>
+            </div>
+            <dl class="definition-list database-console__identity">
+                <dt>"Tenant"</dt><dd>{response.tenant}</dd>
+                <dt>"CNPG cluster"</dt><dd>{response.cluster}</dd>
+                <dt>"Instance"</dt><dd>{response.instance}</dd>
+                <dt>"Database"</dt><dd>{response.database}</dd>
+                <dt>"Executed"</dt><dd><time datetime=executed_at_datetime>{response.executed_at}</time></dd>
+                <dt>"Duration"</dt><dd>{duration}</dd>
+            </dl>
+            {global_truncated.then(|| view! {
+                <p class="database-console__truncation" role="alert">
+                    "The overall response was truncated by the server. Additional rows or result data were omitted."
+                </p>
+            })}
+            {if results.is_empty() {
+                view! {
+                    <p class="database-console__notice">
+                        "The server returned no result sets."
+                    </p>
+                }
+                .into_any()
+            } else {
+                view! {
+                    <div class="database-console__results">
+                        {results
+                            .into_iter()
+                            .enumerate()
+                            .map(|(index, result)| query_result_view(index + 1, result))
+                            .collect_view()}
+                    </div>
+                }
+                .into_any()
+            }}
+        </section>
+    }
+    .into_any()
+}
+
+fn query_result_view(index: usize, result: DatabaseQueryResult) -> AnyView {
+    let presentation = project_query_result(&result);
+    let truncated = result.truncated;
+    let truncation = truncated.then(|| {
+        view! {
+            <p class="database-console__truncation" role="alert">
+                "This result set was truncated. Additional rows were omitted."
+            </p>
+        }
+    });
+
+    match presentation {
+        QueryResultPresentation::Rows {
+            column_count,
+            row_count,
+        } => {
+            let columns = result.columns;
+            let rows = result.rows;
+            view! {
+                <section class="database-console__result" aria-labelledby=format!("query-result-{index}-heading")>
+                    <div class="database-console__result-header">
+                        <h5 id=format!("query-result-{index}-heading")>{format!("Result set {index}")}</h5>
+                        <span class="secondary">{format!(
+                            "{row_count} row{} · {column_count} column{}",
+                            if row_count == 1 { "" } else { "s" },
+                            if column_count == 1 { "" } else { "s" }
+                        )}</span>
+                    </div>
+                    <div class="table-scroll">
+                        <table class="database-console__table">
+                            <caption>{format!("SQL query result set {index}")}</caption>
+                            <thead>
+                                <tr>
+                                    {columns
+                                        .into_iter()
+                                        .map(|column| view! { <th scope="col">{column}</th> })
+                                        .collect_view()}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {rows
+                                    .into_iter()
+                                    .map(|row| {
+                                        view! {
+                                            <tr>
+                                                {row
+                                                    .into_iter()
+                                                    .map(|cell| {
+                                                        view! {
+                                                            <td>
+                                                                {match cell {
+                                                                    Some(value) => view! {
+                                                                        <span class="database-console__value">{value}</span>
+                                                                    }
+                                                                    .into_any(),
+                                                                    None => view! {
+                                                                        <span
+                                                                            class="database-console__null"
+                                                                            aria-label="NULL value"
+                                                                        >
+                                                                            "NULL"
+                                                                        </span>
+                                                                    }
+                                                                    .into_any(),
+                                                                }}
+                                                            </td>
+                                                        }
+                                                    })
+                                                    .collect_view()}
+                                            </tr>
+                                        }
+                                    })
+                                    .collect_view()}
+                            </tbody>
+                        </table>
+                    </div>
+                    {truncation}
+                </section>
+            }
+            .into_any()
+        }
+        QueryResultPresentation::Command { affected_rows } => view! {
+            <section class="database-console__result" aria-labelledby=format!("query-result-{index}-heading")>
+                <div class="database-console__result-header">
+                    <h5 id=format!("query-result-{index}-heading")>{format!("Result set {index}")}</h5>
+                    <span class="secondary">"Command result"</span>
+                </div>
+                <p class="database-console__affected">
+                    <strong>{affected_rows}</strong>
+                    {format!(" row{} affected", if affected_rows == 1 { "" } else { "s" })}
+                </p>
+                {truncation}
+            </section>
+        }
+        .into_any(),
+    }
 }
 
 fn database_instances_view(

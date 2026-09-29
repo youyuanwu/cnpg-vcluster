@@ -259,6 +259,36 @@ pub struct DatabaseCondition {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct DatabaseQueryRequest {
+    pub instance: String,
+    pub database: String,
+    pub sql: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseQueryResponse {
+    pub tenant: String,
+    pub cluster: String,
+    pub instance: String,
+    pub database: String,
+    pub executed_at: String,
+    pub duration_ms: u64,
+    pub truncated: bool,
+    pub results: Vec<DatabaseQueryResult>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseQueryResult {
+    pub columns: Vec<String>,
+    pub rows: Vec<Vec<Option<String>>>,
+    pub affected_rows: u64,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TenantSpecificationView {
     pub kubernetes_version: String,
     pub workers: u32,

@@ -263,7 +263,7 @@ class FakeClient:
         if path.endswith("/api/v1/overview"):
             return json.dumps(
                 {
-                    "schemaVersion": 2,
+                    "schemaVersion": 3,
                     "data": {
                         "overview": {
                             "providerMode": "local",
@@ -286,7 +286,7 @@ class FakeClient:
         if path.endswith("/api/v1/tenants"):
             return json.dumps(
                 {
-                    "schemaVersion": 2,
+                    "schemaVersion": 3,
                     "data": [
                         tenant_summary(name) for name in self.tenant_names
                     ],
@@ -296,14 +296,14 @@ class FakeClient:
             if path.endswith(f"/api/v1/tenants/{name}/topology"):
                 return json.dumps(
                     {
-                        "schemaVersion": 2,
+                        "schemaVersion": 3,
                         "data": topology(name),
                     }
                 )
             if path.endswith(f"/api/v1/tenants/{name}"):
                 return json.dumps(
                     {
-                        "schemaVersion": 2,
+                        "schemaVersion": 3,
                         "data": {
                             "identity": {
                                 "uid": f"{name}-uid",
@@ -342,6 +342,27 @@ class FakeClient:
                         )
                 return response(returncode=1)
             return response(self._proxy_response(path))
+        if arguments[:2] == ("create", "--raw"):
+            request = json.loads(kwargs["input_text"])
+            tenant_name = arguments[2].split("/tenants/", 1)[1].split("/", 1)[0]
+            return response(json.dumps({
+                "schemaVersion": 3,
+                "data": {
+                    "tenant": tenant_name,
+                    "cluster": "capi-postgres",
+                    "instance": request["instance"],
+                    "database": request["database"],
+                    "executedAt": "2026-09-29T22:40:00Z",
+                    "durationMs": 7,
+                    "truncated": False,
+                    "results": [{
+                        "columns": ["value"],
+                        "rows": [["1"]],
+                        "affectedRows": 1,
+                        "truncated": False,
+                    }],
+                },
+            }))
         if arguments[0] == "create" and "-f" in arguments:
             request = json.loads(kwargs["input_text"])
             namespace = request["spec"]["namespace"]
@@ -707,6 +728,25 @@ class AdminLocalTests(unittest.TestCase):
                 if arguments[:2] == ("get", "--raw")
             ],
         )
+        queried = FakeClient(tenant_names=("tenant-a",))
+        result = admin_local.verify_admin_api(
+            queried,
+            expected_tenant_names=("tenant-a",),
+            require_available_databases=True,
+            verify_database_queries=True,
+        )
+        self.assertEqual(["tenant-a"], result["tenantNames"])
+        query_calls = [
+            arguments
+            for arguments in queried.calls
+            if arguments[:2] == ("create", "--raw")
+        ]
+        self.assertEqual(1, len(query_calls))
+        self.assertTrue(
+            query_calls[0][2].endswith(
+                "/api/v1/tenants/tenant-a/database/query"
+            )
+        )
         transitioning = FakeClient(tenant_names=("tenant-a",))
         original_transition = transitioning._proxy_response
 
@@ -714,11 +754,11 @@ class AdminLocalTests(unittest.TestCase):
             if path.endswith("/api/v1/tenants"):
                 summary = tenant_summary("tenant-a")
                 summary["classification"] = "progressing"
-                return json.dumps({"schemaVersion": 2, "data": [summary]})
+                return json.dumps({"schemaVersion": 3, "data": [summary]})
             if path.endswith("/api/v1/tenants/tenant-a/topology"):
                 topology = json.loads(original_transition(path))["data"]
                 topology["nodes"][0]["health"] = "progressing"
-                return json.dumps({"schemaVersion": 2, "data": topology})
+                return json.dumps({"schemaVersion": 3, "data": topology})
             return original_transition(path)
 
         with patch.object(
@@ -792,7 +832,7 @@ class AdminLocalTests(unittest.TestCase):
 
         def malformed_response(path: str) -> str:
             if path.endswith("/api/v1/overview"):
-                return '{"schemaVersion":2,"data":[]}'
+                return '{"schemaVersion":3,"data":[]}'
             return original(path)
 
         with patch.object(

@@ -9,6 +9,7 @@ use std::{
 use axum::http::uri::Authority;
 use chrono::{SecondsFormat, Utc};
 use futures::{StreamExt, stream};
+use k8s_openapi::api::core::v1::{Pod, Secret};
 use kube::{
     Api, Client,
     api::{ListParams, ObjectList},
@@ -18,8 +19,8 @@ use serde::Deserialize;
 use tenant_admin_shared::query::{
     ConditionStatus, DatabaseClusterIdentity, DatabaseClusterObservation, DatabaseCondition,
     DatabaseInstanceObservation, DatabaseInstanceRole, DatabaseNotApplicableReason,
-    DatabaseObservation, DatabaseObservationFreshness, DatabasePvcHealth, DatabaseServices,
-    DatabaseUnavailableReason, ProviderMode,
+    DatabaseObservation, DatabaseObservationFreshness, DatabasePvcHealth, DatabaseQueryRequest,
+    DatabaseQueryResponse, DatabaseServices, DatabaseUnavailableReason, ProviderMode,
 };
 use tenant_controller::{
     api::{Tenant, TenantProviderSpec},
@@ -32,7 +33,14 @@ use tenant_controller::{
     tenant_client::{TenantApiErrorClass, TenantClientError, load_tenant_client},
 };
 
-use crate::{SourceError, projection::is_accepted_local_management_resource};
+use crate::{
+    SourceError,
+    database::{
+        PodBindingError, PostgresQueryExecutor, QueryClusterBinding, QueryConnection,
+        QueryExecutionError, QueryExecutor, validate_pod_binding,
+    },
+    projection::is_accepted_local_management_resource,
+};
 
 const MAX_TENANTS: u32 = 500;
 const MAX_RESOURCES_PER_KIND: u32 = 500;
@@ -45,6 +53,12 @@ const MAX_IDENTITY: usize = 253;
 const MAX_TEXT: usize = 512;
 const MAX_IMAGE: usize = 1_024;
 const MAX_TIMESTAMP: usize = 64;
+const MAX_SQL_BYTES: usize = 64 * 1_024;
+const MAX_DATABASE_BYTES: usize = 63;
+const MAX_INSTANCE_BYTES: usize = 63;
+const MAX_DATABASE_USERNAME_BYTES: usize = 1_024;
+const MAX_DATABASE_PASSWORD_BYTES: usize = 16 * 1_024;
+const DATABASE_SUPERUSER_SECRET_NAME: &str = "capi-postgres-superuser";
 
 pub type SourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SourceError>> + Send + 'a>>;
 type TenantClientFuture<'a> =
@@ -111,6 +125,21 @@ pub trait DataSource: Send + Sync {
             })
         })
     }
+    fn database_query<'a>(
+        &'a self,
+        provider: ProviderMode,
+        tenant: &'a Tenant,
+        management_resources: &'a [DynamicObject],
+        request: &'a DatabaseQueryRequest,
+    ) -> SourceFuture<'a, DatabaseQueryResponse> {
+        let _ = (provider, tenant, management_resources, request);
+        Box::pin(async move {
+            Err(SourceError::DatabaseUnavailable {
+                message: "Live database query source is unavailable".into(),
+                retryable: true,
+            })
+        })
+    }
     fn check_ready(&self) -> SourceFuture<'_, ()>;
 }
 
@@ -118,6 +147,7 @@ pub trait DataSource: Send + Sync {
 pub struct KubeDataSource {
     client: Client,
     tenant_clients: Arc<dyn TenantClientLoader>,
+    query_executor: Arc<dyn QueryExecutor>,
 }
 
 impl KubeDataSource {
@@ -125,6 +155,7 @@ impl KubeDataSource {
         Self {
             client,
             tenant_clients: Arc::new(ValidatedTenantClientLoader),
+            query_executor: Arc::new(PostgresQueryExecutor),
         }
     }
 
@@ -227,167 +258,16 @@ impl KubeDataSource {
                 DatabaseNotApplicableReason::ProviderUnsupported,
             );
         }
-        let tenant_name = tenant.metadata.name.as_deref().unwrap_or_default();
-        if tenant_name.is_empty() {
-            return unavailable(
-                observed_at,
-                DatabaseUnavailableReason::Malformed,
-                "Tenant identity is malformed",
-                false,
-            );
-        }
-        let Some(local_status) = tenant.status.as_ref().and_then(|status| status.local()) else {
-            return unavailable(
-                observed_at,
-                DatabaseUnavailableReason::Pending,
-                "Tenant API endpoint is pending",
-                true,
-            );
-        };
-        let Some(allocation_host) = local_status
-            .allocation
-            .as_ref()
-            .map(|allocation| allocation.endpoint.as_str())
-            .filter(|endpoint| !endpoint.is_empty())
-        else {
-            return unavailable(
-                observed_at,
-                DatabaseUnavailableReason::Pending,
-                "Tenant API endpoint is pending",
-                true,
-            );
-        };
-        let Some(cluster_uid) = local_status
-            .cluster_uid
-            .as_deref()
-            .filter(|uid| !uid.is_empty())
-        else {
-            return unavailable(
-                observed_at,
-                DatabaseUnavailableReason::Pending,
-                "Tenant management Cluster identity is pending",
-                true,
-            );
-        };
-        let Some(cluster) = expected_management_cluster(management_resources, tenant_name) else {
-            return unavailable(
-                observed_at,
-                DatabaseUnavailableReason::ManagementResourceMissing,
-                "Expected management Cluster is unavailable",
-                true,
-            );
-        };
-        if !is_accepted_local_management_resource(tenant, management_resources, cluster) {
-            return unavailable(
-                observed_at,
-                DatabaseUnavailableReason::TenantAccessInvalid,
-                "Tenant management-cluster ownership is invalid",
-                false,
-            );
-        }
-        let endpoint = match trusted_endpoint_authority(cluster, cluster_uid, allocation_host) {
-            Ok(endpoint) => endpoint,
-            Err(()) => {
-                tracing::warn!(
-                    tenant = %tenant_controller::sanitize::text(tenant_name),
-                    "trusted Tenant API endpoint metadata is invalid"
-                );
-                return unavailable(
-                    observed_at,
-                    DatabaseUnavailableReason::Malformed,
-                    "Trusted Tenant API endpoint metadata is invalid",
-                    false,
-                );
-            }
-        };
-        let Some(control_plane) = expected_control_plane(management_resources, tenant_name) else {
-            return unavailable(
-                observed_at,
-                DatabaseUnavailableReason::ManagementResourceMissing,
-                "Expected Tenant control plane is unavailable",
-                true,
-            );
-        };
-        if !is_accepted_local_management_resource(tenant, management_resources, control_plane) {
-            return unavailable(
-                observed_at,
-                DatabaseUnavailableReason::TenantAccessInvalid,
-                "Tenant control-plane ownership is invalid",
-                false,
-            );
-        }
-        if validate_provider_owner(control_plane, tenant_name, true, management_resources).is_err()
-        {
-            return unavailable(
-                observed_at,
-                DatabaseUnavailableReason::TenantAccessInvalid,
-                "Tenant control-plane ownership is invalid",
-                false,
-            );
-        }
-        let tenant_client = match self
-            .tenant_clients
-            .load(
-                self.client.clone(),
-                control_plane,
-                tenant_name,
-                tenant_name,
-                &endpoint,
-            )
+        let access = match self
+            .tenant_database_access(tenant, management_resources)
             .await
         {
-            Ok(client) => client,
+            Ok(access) => access,
             Err(error) => {
-                let (reason, message, retryable) = match error.class() {
-                    TenantApiErrorClass::Pending => (
-                        DatabaseUnavailableReason::Pending,
-                        "Tenant administrative access is pending",
-                        true,
-                    ),
-                    TenantApiErrorClass::Conflict | TenantApiErrorClass::Retryable => (
-                        DatabaseUnavailableReason::TenantApiUnavailable,
-                        "Tenant API is unavailable",
-                        true,
-                    ),
-                    TenantApiErrorClass::Terminal => (
-                        DatabaseUnavailableReason::TenantAccessInvalid,
-                        "Tenant administrative access is invalid",
-                        false,
-                    ),
-                };
-                tracing::warn!(
-                    tenant = %tenant_controller::sanitize::text(tenant_name),
-                    reason = ?reason,
-                    "live database access failed"
-                );
-                return unavailable(observed_at, reason, message, retryable);
+                return unavailable(observed_at, error.reason, error.message, error.retryable);
             }
         };
-        let cluster = match read_database_cluster(tenant_client).await {
-            Ok(Some(cluster)) => cluster,
-            Ok(None) => {
-                return unavailable(
-                    observed_at,
-                    DatabaseUnavailableReason::ClusterMissing,
-                    "Managed database Cluster was not found",
-                    true,
-                );
-            }
-            Err(error) => {
-                tracing::warn!(
-                    tenant = %tenant_controller::sanitize::text(tenant_name),
-                    status = database_error_status(&error),
-                    "live database read failed"
-                );
-                return unavailable(
-                    observed_at,
-                    DatabaseUnavailableReason::TenantApiUnavailable,
-                    "Tenant API database read failed",
-                    true,
-                );
-            }
-        };
-        match project_database_cluster(cluster) {
+        match project_database_cluster(access.cluster) {
             Ok(Some(cluster)) => DatabaseObservation::Available {
                 observed_at,
                 freshness: DatabaseObservationFreshness::Live,
@@ -405,6 +285,235 @@ impl KubeDataSource {
                 "Managed database metadata is malformed",
                 true,
             ),
+        }
+    }
+
+    async fn query_database(
+        &self,
+        provider: ProviderMode,
+        tenant: &Tenant,
+        management_resources: &[DynamicObject],
+        request: &DatabaseQueryRequest,
+    ) -> Result<DatabaseQueryResponse, SourceError> {
+        validate_query_request(request)?;
+        if provider != ProviderMode::Local
+            || !matches!(tenant.spec.provider, TenantProviderSpec::Local { .. })
+        {
+            return Err(database_unavailable(
+                "Database queries are available only for local Tenants",
+                false,
+            ));
+        }
+        let tenant_name = tenant
+            .metadata
+            .name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .ok_or_else(|| database_unavailable("Tenant identity is malformed", false))?;
+        let access = self
+            .tenant_database_access(tenant, management_resources)
+            .await
+            .map_err(|error| database_unavailable(error.message, error.retryable))?;
+        let cluster_identity = validated_query_cluster(&access.cluster, &request.instance)?;
+        let pod = read_database_pod(access.client.clone(), &request.instance).await?;
+        let pod_binding = validate_pod_binding(&pod, &request.instance, &cluster_identity)
+            .map_err(pod_binding_error)?;
+        let secret = read_database_secret(access.client.clone()).await?;
+        let credentials = validate_database_secret(&secret, &cluster_identity.uid)?;
+        let execution = self
+            .query_executor
+            .execute(QueryConnection {
+                client: access.client,
+                pod: &pod_binding,
+                database: &request.database,
+                username: &credentials.username,
+                password: &credentials.password,
+                sql: &request.sql,
+            })
+            .await
+            .map_err(query_execution_error)?;
+        Ok(DatabaseQueryResponse {
+            tenant: tenant_name.to_owned(),
+            cluster: MANAGED_DATABASE_CLUSTER_NAME.into(),
+            instance: request.instance.clone(),
+            database: request.database.clone(),
+            executed_at: observed_at(),
+            duration_ms: execution.duration_ms,
+            truncated: execution.truncated,
+            results: execution.results,
+        })
+    }
+
+    async fn tenant_database_access(
+        &self,
+        tenant: &Tenant,
+        management_resources: &[DynamicObject],
+    ) -> Result<TenantDatabaseAccess, DatabaseAccessError> {
+        let tenant_name = tenant
+            .metadata
+            .name
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .ok_or(DatabaseAccessError::malformed(
+                "Tenant identity is malformed",
+            ))?;
+        let local_status = tenant
+            .status
+            .as_ref()
+            .and_then(|status| status.local())
+            .ok_or(DatabaseAccessError::pending(
+                "Tenant API endpoint is pending",
+            ))?;
+        let allocation_host = local_status
+            .allocation
+            .as_ref()
+            .map(|allocation| allocation.endpoint.as_str())
+            .filter(|endpoint| !endpoint.is_empty())
+            .ok_or(DatabaseAccessError::pending(
+                "Tenant API endpoint is pending",
+            ))?;
+        let cluster_uid = local_status
+            .cluster_uid
+            .as_deref()
+            .filter(|uid| !uid.is_empty())
+            .ok_or(DatabaseAccessError::pending(
+                "Tenant management Cluster identity is pending",
+            ))?;
+        let cluster = expected_management_cluster(management_resources, tenant_name).ok_or(
+            DatabaseAccessError::management_missing("Expected management Cluster is unavailable"),
+        )?;
+        if !is_accepted_local_management_resource(tenant, management_resources, cluster) {
+            return Err(DatabaseAccessError::invalid(
+                "Tenant management-cluster ownership is invalid",
+            ));
+        }
+        let endpoint =
+            trusted_endpoint_authority(cluster, cluster_uid, allocation_host).map_err(|()| {
+                tracing::warn!(
+                    tenant = %tenant_controller::sanitize::text(tenant_name),
+                    "trusted Tenant API endpoint metadata is invalid"
+                );
+                DatabaseAccessError::malformed("Trusted Tenant API endpoint metadata is invalid")
+            })?;
+        let control_plane = expected_control_plane(management_resources, tenant_name).ok_or(
+            DatabaseAccessError::management_missing("Expected Tenant control plane is unavailable"),
+        )?;
+        if !is_accepted_local_management_resource(tenant, management_resources, control_plane)
+            || validate_provider_owner(control_plane, tenant_name, true, management_resources)
+                .is_err()
+        {
+            return Err(DatabaseAccessError::invalid(
+                "Tenant control-plane ownership is invalid",
+            ));
+        }
+        let client = self
+            .tenant_clients
+            .load(
+                self.client.clone(),
+                control_plane,
+                tenant_name,
+                tenant_name,
+                &endpoint,
+            )
+            .await
+            .map_err(|error| {
+                let access_error = match error.class() {
+                    TenantApiErrorClass::Pending => {
+                        DatabaseAccessError::pending("Tenant administrative access is pending")
+                    }
+                    TenantApiErrorClass::Conflict | TenantApiErrorClass::Retryable => {
+                        DatabaseAccessError::tenant_api("Tenant API is unavailable")
+                    }
+                    TenantApiErrorClass::Terminal => {
+                        DatabaseAccessError::invalid("Tenant administrative access is invalid")
+                    }
+                };
+                tracing::warn!(
+                    tenant = %tenant_controller::sanitize::text(tenant_name),
+                    reason = ?access_error.reason,
+                    "live database access failed"
+                );
+                access_error
+            })?;
+        let cluster = match read_database_cluster(client.clone()).await {
+            Ok(Some(cluster)) => cluster,
+            Ok(None) => {
+                return Err(DatabaseAccessError::cluster_missing(
+                    "Managed database Cluster was not found",
+                ));
+            }
+            Err(error) => {
+                tracing::warn!(
+                    tenant = %tenant_controller::sanitize::text(tenant_name),
+                    status = database_error_status(&error),
+                    "live database read failed"
+                );
+                return Err(DatabaseAccessError::tenant_api(
+                    "Tenant API database read failed",
+                ));
+            }
+        };
+        Ok(TenantDatabaseAccess { client, cluster })
+    }
+}
+
+struct TenantDatabaseAccess {
+    client: Client,
+    cluster: DynamicObject,
+}
+
+struct DatabaseAccessError {
+    reason: DatabaseUnavailableReason,
+    message: &'static str,
+    retryable: bool,
+}
+
+impl DatabaseAccessError {
+    const fn pending(message: &'static str) -> Self {
+        Self {
+            reason: DatabaseUnavailableReason::Pending,
+            message,
+            retryable: true,
+        }
+    }
+
+    const fn management_missing(message: &'static str) -> Self {
+        Self {
+            reason: DatabaseUnavailableReason::ManagementResourceMissing,
+            message,
+            retryable: true,
+        }
+    }
+
+    const fn invalid(message: &'static str) -> Self {
+        Self {
+            reason: DatabaseUnavailableReason::TenantAccessInvalid,
+            message,
+            retryable: false,
+        }
+    }
+
+    const fn tenant_api(message: &'static str) -> Self {
+        Self {
+            reason: DatabaseUnavailableReason::TenantApiUnavailable,
+            message,
+            retryable: true,
+        }
+    }
+
+    const fn cluster_missing(message: &'static str) -> Self {
+        Self {
+            reason: DatabaseUnavailableReason::ClusterMissing,
+            message,
+            retryable: true,
+        }
+    }
+
+    const fn malformed(message: &'static str) -> Self {
+        Self {
+            reason: DatabaseUnavailableReason::Malformed,
+            message,
+            retryable: false,
         }
     }
 }
@@ -521,10 +630,245 @@ async fn read_database_cluster(client: Client) -> Result<Option<DynamicObject>, 
         .await
 }
 
+async fn read_database_pod(client: Client, name: &str) -> Result<Pod, SourceError> {
+    match Api::<Pod>::namespaced(client, MANAGED_DATABASE_NAMESPACE)
+        .get_opt(name)
+        .await
+    {
+        Ok(Some(pod)) => Ok(pod),
+        Ok(None) => Err(database_unavailable(
+            "Requested database instance is unavailable",
+            true,
+        )),
+        Err(error) => {
+            tracing::warn!(
+                instance = %tenant_controller::sanitize::text(name),
+                status = database_error_status(&error),
+                "database instance Pod read failed"
+            );
+            Err(database_unavailable(
+                "Tenant API database Pod read failed",
+                true,
+            ))
+        }
+    }
+}
+
+async fn read_database_secret(client: Client) -> Result<Secret, SourceError> {
+    match Api::<Secret>::namespaced(client, MANAGED_DATABASE_NAMESPACE)
+        .get_opt(DATABASE_SUPERUSER_SECRET_NAME)
+        .await
+    {
+        Ok(Some(secret)) => Ok(secret),
+        Ok(None) => Err(database_unavailable(
+            "Database credentials are unavailable",
+            true,
+        )),
+        Err(error) => {
+            tracing::warn!(
+                status = database_error_status(&error),
+                "database credential Secret read failed"
+            );
+            Err(database_unavailable(
+                "Tenant API database credential read failed",
+                true,
+            ))
+        }
+    }
+}
+
 fn database_error_status(error: &kube::Error) -> u16 {
     match error {
         kube::Error::Api(response) => response.code,
         _ => 0,
+    }
+}
+
+fn validated_query_cluster(
+    cluster: &DynamicObject,
+    requested_instance: &str,
+) -> Result<QueryClusterBinding, SourceError> {
+    let types = cluster
+        .types
+        .as_ref()
+        .filter(|types| {
+            types.api_version == CNPG_CLUSTER_API_VERSION && types.kind == CNPG_CLUSTER_KIND
+        })
+        .ok_or_else(|| database_unavailable("Managed database identity is invalid", false))?;
+    let _ = types;
+    if cluster.metadata.namespace.as_deref() != Some(MANAGED_DATABASE_NAMESPACE)
+        || cluster.metadata.name.as_deref() != Some(MANAGED_DATABASE_CLUSTER_NAME)
+    {
+        return Err(database_unavailable(
+            "Managed database identity is invalid",
+            false,
+        ));
+    }
+    let uid = cluster
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| database_unavailable("Managed database identity is pending", true))?
+        .to_owned();
+    let body: CnpgClusterData = serde_json::from_value(cluster.data.clone())
+        .map_err(|_| database_unavailable("Managed database metadata is malformed", false))?;
+    let status = body
+        .status
+        .ok_or_else(|| database_unavailable("Managed database status is pending", true))?;
+    let is_current_instance = requested_instance != "pending"
+        && projected_instances(&status)
+            .iter()
+            .any(|instance| instance.name == requested_instance);
+    if !is_current_instance {
+        return Err(database_unavailable(
+            "Requested database instance is not current",
+            false,
+        ));
+    }
+    Ok(QueryClusterBinding {
+        api_version: CNPG_CLUSTER_API_VERSION.into(),
+        kind: CNPG_CLUSTER_KIND.into(),
+        name: MANAGED_DATABASE_CLUSTER_NAME.into(),
+        uid,
+    })
+}
+
+struct DatabaseCredentials {
+    username: String,
+    password: String,
+}
+
+fn validate_database_secret(
+    secret: &Secret,
+    cluster_uid: &str,
+) -> Result<DatabaseCredentials, SourceError> {
+    if secret.metadata.name.as_deref() != Some(DATABASE_SUPERUSER_SECRET_NAME)
+        || secret.metadata.namespace.as_deref() != Some(MANAGED_DATABASE_NAMESPACE)
+        || secret.metadata.uid.as_deref().is_none_or(str::is_empty)
+        || secret.metadata.deletion_timestamp.is_some()
+        || secret.type_.as_deref() != Some("kubernetes.io/basic-auth")
+        || !has_exact_controlling_cluster_owner(&secret.metadata.owner_references, cluster_uid)
+    {
+        return Err(database_unavailable(
+            "Database credentials are invalid",
+            false,
+        ));
+    }
+    let data = secret
+        .data
+        .as_ref()
+        .ok_or_else(|| database_unavailable("Database credentials are invalid", false))?;
+    let username = credential_text(
+        data.get("username").map(|value| value.0.as_slice()),
+        MAX_DATABASE_USERNAME_BYTES,
+    )?;
+    let password = credential_text(
+        data.get("password").map(|value| value.0.as_slice()),
+        MAX_DATABASE_PASSWORD_BYTES,
+    )?;
+    Ok(DatabaseCredentials { username, password })
+}
+
+fn credential_text(value: Option<&[u8]>, maximum: usize) -> Result<String, SourceError> {
+    let value =
+        value.ok_or_else(|| database_unavailable("Database credentials are invalid", false))?;
+    if value.is_empty() || value.len() > maximum || value.contains(&0) {
+        return Err(database_unavailable(
+            "Database credentials are invalid",
+            false,
+        ));
+    }
+    String::from_utf8(value.to_vec())
+        .map_err(|_| database_unavailable("Database credentials are invalid", false))
+}
+
+fn has_exact_controlling_cluster_owner(
+    owners: &Option<Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference>>,
+    cluster_uid: &str,
+) -> bool {
+    owners.as_ref().is_some_and(|owners| {
+        owners.iter().any(|owner| {
+            owner.api_version == CNPG_CLUSTER_API_VERSION
+                && owner.kind == CNPG_CLUSTER_KIND
+                && owner.name == MANAGED_DATABASE_CLUSTER_NAME
+                && owner.uid == cluster_uid
+                && owner.controller == Some(true)
+        })
+    })
+}
+
+fn validate_query_request(request: &DatabaseQueryRequest) -> Result<(), SourceError> {
+    if request.sql.trim().is_empty() || request.sql.len() > MAX_SQL_BYTES {
+        return Err(SourceError::DatabaseUnavailable {
+            message: "SQL must be nonempty and at most 64 KiB".into(),
+            retryable: false,
+        });
+    }
+    if request.database.is_empty()
+        || request.database.len() > MAX_DATABASE_BYTES
+        || request
+            .database
+            .chars()
+            .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(SourceError::DatabaseUnavailable {
+            message: "Database name must be 1 to 63 bytes without control characters".into(),
+            retryable: false,
+        });
+    }
+    if !is_dns_label(&request.instance, MAX_INSTANCE_BYTES) {
+        return Err(SourceError::DatabaseUnavailable {
+            message: "Database instance must be a valid DNS label of at most 63 bytes".into(),
+            retryable: false,
+        });
+    }
+    Ok(())
+}
+
+fn is_dns_label(value: &str, maximum: usize) -> bool {
+    let bytes = value.as_bytes();
+    (1..=maximum).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || *value == b'-')
+}
+
+fn database_unavailable(message: impl Into<String>, retryable: bool) -> SourceError {
+    SourceError::DatabaseUnavailable {
+        message: message.into(),
+        retryable,
+    }
+}
+
+fn query_execution_error(error: QueryExecutionError) -> SourceError {
+    match error {
+        QueryExecutionError::DatabaseUnavailable => {
+            database_unavailable("Database connection is unavailable", true)
+        }
+        QueryExecutionError::QueryFailed { sqlstate, message } => {
+            SourceError::QueryFailed { sqlstate, message }
+        }
+        QueryExecutionError::ResponseLimitExceeded => SourceError::QueryResponseTooLarge,
+        QueryExecutionError::TimedOut => SourceError::QueryTimedOut,
+        QueryExecutionError::OutcomeUnknown => SourceError::QueryOutcomeUnknown,
+    }
+}
+
+fn pod_binding_error(error: PodBindingError) -> SourceError {
+    match error {
+        PodBindingError::InvalidIdentity => {
+            database_unavailable("Requested database instance Pod identity is invalid", false)
+        }
+        PodBindingError::NotReady => {
+            database_unavailable("Requested database instance Pod is not ready", true)
+        }
     }
 }
 
@@ -916,6 +1260,19 @@ impl DataSource for KubeDataSource {
         })
     }
 
+    fn database_query<'a>(
+        &'a self,
+        provider: ProviderMode,
+        tenant: &'a Tenant,
+        management_resources: &'a [DynamicObject],
+        request: &'a DatabaseQueryRequest,
+    ) -> SourceFuture<'a, DatabaseQueryResponse> {
+        Box::pin(async move {
+            self.query_database(provider, tenant, management_resources, request)
+                .await
+        })
+    }
+
     fn check_ready(&self) -> SourceFuture<'_, ()> {
         Box::pin(async move {
             self.tenant_list(1).await?;
@@ -929,6 +1286,7 @@ mod tests {
     use std::{
         collections::VecDeque,
         convert::Infallible,
+        future::ready,
         sync::{Arc, Mutex},
     };
 
@@ -950,6 +1308,41 @@ mod tests {
     struct StaticTenantClientLoader {
         client: Client,
         endpoints: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[derive(Clone)]
+    struct StaticQueryExecutor {
+        result: Result<crate::database::QueryExecution, QueryExecutionError>,
+        calls: Arc<Mutex<Vec<QueryExecutorCall>>>,
+    }
+
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    struct QueryExecutorCall {
+        pod: String,
+        pod_uid: String,
+        cluster_uid: String,
+        database: String,
+        username: String,
+        password: String,
+        sql: String,
+    }
+
+    impl QueryExecutor for StaticQueryExecutor {
+        fn execute<'a>(&'a self, request: QueryConnection<'a>) -> crate::database::QueryFuture<'a> {
+            self.calls
+                .lock()
+                .expect("query calls lock")
+                .push(QueryExecutorCall {
+                    pod: request.pod.pod_name.clone(),
+                    pod_uid: request.pod.pod_uid.clone(),
+                    cluster_uid: request.pod.cluster.uid.clone(),
+                    database: request.database.into(),
+                    username: request.username.into(),
+                    password: request.password.into(),
+                    sql: request.sql.into(),
+                });
+            Box::pin(ready(self.result.clone()))
+        }
     }
 
     impl TenantClientLoader for StaticTenantClientLoader {
@@ -1034,8 +1427,29 @@ mod tests {
                 client: tenant,
                 endpoints: endpoints.clone(),
             }),
+            query_executor: Arc::new(PostgresQueryExecutor),
         };
         (source, endpoints)
+    }
+
+    fn source_with_query_executor(
+        management: Client,
+        tenant: Client,
+        result: Result<crate::database::QueryExecution, QueryExecutionError>,
+    ) -> (KubeDataSource, Arc<Mutex<Vec<QueryExecutorCall>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let source = KubeDataSource {
+            client: management,
+            tenant_clients: Arc::new(StaticTenantClientLoader {
+                client: tenant,
+                endpoints: Arc::new(Mutex::new(Vec::new())),
+            }),
+            query_executor: Arc::new(StaticQueryExecutor {
+                result,
+                calls: calls.clone(),
+            }),
+        };
+        (source, calls)
     }
 
     fn local_tenant() -> Tenant {
@@ -1208,6 +1622,88 @@ mod tests {
         })
     }
 
+    fn database_pod() -> Value {
+        json!({
+            "apiVersion":"v1",
+            "kind":"Pod",
+            "metadata":{
+                "name":"capi-postgres-1",
+                "namespace":"database",
+                "uid":"pod-uid",
+                "ownerReferences":[{
+                    "apiVersion":"postgresql.cnpg.io/v1",
+                    "kind":"Cluster",
+                    "name":"capi-postgres",
+                    "uid":"database-uid",
+                    "controller":true,
+                    "blockOwnerDeletion":true
+                }]
+            },
+            "spec":{"containers":[{"name":"postgres","image":"postgres:18"}]},
+            "status":{
+                "phase":"Running",
+                "conditions":[{
+                    "type":"Ready",
+                    "status":"True",
+                    "lastTransitionTime":"2026-09-29T20:40:00Z"
+                }]
+            }
+        })
+    }
+
+    fn database_secret() -> Value {
+        json!({
+            "apiVersion":"v1",
+            "kind":"Secret",
+            "metadata":{
+                "name":"capi-postgres-superuser",
+                "namespace":"database",
+                "uid":"secret-uid",
+                "ownerReferences":[{
+                    "apiVersion":"postgresql.cnpg.io/v1",
+                    "kind":"Cluster",
+                    "name":"capi-postgres",
+                    "uid":"database-uid",
+                    "controller":true
+                }]
+            },
+            "type":"kubernetes.io/basic-auth",
+            "data":{
+                "username":"cG9zdGdyZXM=",
+                "password":"cHJpdmF0ZS1wYXNzd29yZA=="
+            }
+        })
+    }
+
+    fn query_request() -> DatabaseQueryRequest {
+        DatabaseQueryRequest {
+            instance: "capi-postgres-1".into(),
+            database: "postgres".into(),
+            sql: "select 1; update values set active = true".into(),
+        }
+    }
+
+    fn query_execution() -> crate::database::QueryExecution {
+        crate::database::QueryExecution {
+            duration_ms: 17,
+            truncated: false,
+            results: vec![
+                tenant_admin_shared::query::DatabaseQueryResult {
+                    columns: vec!["value".into()],
+                    rows: vec![vec![Some("1".into())]],
+                    affected_rows: 1,
+                    truncated: false,
+                },
+                tenant_admin_shared::query::DatabaseQueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    affected_rows: 4,
+                    truncated: false,
+                },
+            ],
+        }
+    }
+
     fn status_response(code: u16) -> Value {
         json!({
             "apiVersion":"v1",
@@ -1354,6 +1850,336 @@ mod tests {
                 "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres".into()
             )]
         );
+    }
+
+    #[tokio::test]
+    async fn database_query_uses_exact_cluster_pod_secret_gets_and_mock_executor() {
+        let (management, _) = fixture_client(Vec::new());
+        let (tenant_client, tenant_calls) = fixture_client(vec![
+            (200, cnpg_cluster()),
+            (200, database_pod()),
+            (200, database_secret()),
+        ]);
+        let (source, executor_calls) =
+            source_with_query_executor(management, tenant_client, Ok(query_execution()));
+
+        let response = source
+            .database_query(
+                ProviderMode::Local,
+                &local_tenant(),
+                &local_resources(),
+                &query_request(),
+            )
+            .await
+            .expect("database query");
+
+        assert_eq!(response.tenant, "tenant-a");
+        assert_eq!(response.cluster, "capi-postgres");
+        assert_eq!(response.results.len(), 2);
+        assert_eq!(response.results[0].rows[0][0].as_deref(), Some("1"));
+        assert_eq!(response.results[1].affected_rows, 4);
+        assert_eq!(
+            *tenant_calls.lock().expect("tenant calls"),
+            vec![
+                (
+                    Method::GET,
+                    "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres".into(),
+                ),
+                (
+                    Method::GET,
+                    "/api/v1/namespaces/database/pods/capi-postgres-1".into(),
+                ),
+                (
+                    Method::GET,
+                    "/api/v1/namespaces/database/secrets/capi-postgres-superuser".into(),
+                ),
+            ]
+        );
+        let calls = executor_calls.lock().expect("executor calls");
+        assert_eq!(
+            calls.as_slice(),
+            [QueryExecutorCall {
+                pod: "capi-postgres-1".into(),
+                pod_uid: "pod-uid".into(),
+                cluster_uid: "database-uid".into(),
+                database: "postgres".into(),
+                username: "postgres".into(),
+                password: "private-password".into(),
+                sql: "select 1; update values set active = true".into(),
+            }]
+        );
+    }
+
+    #[tokio::test]
+    async fn database_query_rejects_provider_and_noncurrent_instance_before_pod_access() {
+        let (management, _) = fixture_client(Vec::new());
+        let (tenant_client, calls) = fixture_client(Vec::new());
+        let (source, executor_calls) =
+            source_with_query_executor(management, tenant_client, Ok(query_execution()));
+        let error = source
+            .database_query(ProviderMode::Azure, &azure_tenant(), &[], &query_request())
+            .await
+            .expect_err("Azure query must fail");
+        assert!(matches!(
+            error,
+            SourceError::DatabaseUnavailable {
+                retryable: false,
+                ..
+            }
+        ));
+        assert!(calls.lock().expect("calls").is_empty());
+        assert!(executor_calls.lock().expect("executor calls").is_empty());
+
+        let mut request = query_request();
+        request.instance = "capi-postgres-9".into();
+        let (management, _) = fixture_client(Vec::new());
+        let (tenant_client, calls) = fixture_client(vec![(200, cnpg_cluster())]);
+        let (source, executor_calls) =
+            source_with_query_executor(management, tenant_client, Ok(query_execution()));
+        let error = source
+            .database_query(
+                ProviderMode::Local,
+                &local_tenant(),
+                &local_resources(),
+                &request,
+            )
+            .await
+            .expect_err("unknown instance must fail");
+        assert!(matches!(
+            error,
+            SourceError::DatabaseUnavailable {
+                retryable: false,
+                ..
+            }
+        ));
+        assert_eq!(calls.lock().expect("calls").len(), 1);
+        assert!(executor_calls.lock().expect("executor calls").is_empty());
+
+        let mut cluster = cnpg_cluster();
+        cluster["status"]["targetPrimary"] = json!("pending");
+        let mut request = query_request();
+        request.instance = "pending".into();
+        let (management, _) = fixture_client(Vec::new());
+        let (tenant_client, calls) = fixture_client(vec![(200, cluster)]);
+        let (source, executor_calls) =
+            source_with_query_executor(management, tenant_client, Ok(query_execution()));
+        assert!(
+            source
+                .database_query(
+                    ProviderMode::Local,
+                    &local_tenant(),
+                    &local_resources(),
+                    &request,
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.lock().expect("calls").len(), 1);
+        assert!(executor_calls.lock().expect("executor calls").is_empty());
+    }
+
+    #[test]
+    fn database_query_request_validation_is_bounded() {
+        for request in [
+            DatabaseQueryRequest {
+                instance: "INVALID".into(),
+                ..query_request()
+            },
+            DatabaseQueryRequest {
+                database: "bad\0database".into(),
+                ..query_request()
+            },
+            DatabaseQueryRequest {
+                sql: " ".into(),
+                ..query_request()
+            },
+            DatabaseQueryRequest {
+                sql: "x".repeat(MAX_SQL_BYTES + 1),
+                ..query_request()
+            },
+        ] {
+            assert!(validate_query_request(&request).is_err());
+        }
+        assert!(validate_query_request(&query_request()).is_ok());
+    }
+
+    #[tokio::test]
+    async fn database_query_requires_live_owned_ready_pod() {
+        for edit in 0..8 {
+            let mut pod = database_pod();
+            match edit {
+                0 => pod["metadata"]["uid"] = json!(""),
+                1 => pod["metadata"]["deletionTimestamp"] = json!("2026-09-29T22:00:00Z"),
+                2 => pod["status"]["phase"] = json!("Pending"),
+                3 => pod["status"]["conditions"][0]["status"] = json!("False"),
+                4 => pod["metadata"]["ownerReferences"][0]["uid"] = json!("foreign-uid"),
+                5 => {
+                    pod["metadata"]["ownerReferences"][0]["apiVersion"] =
+                        json!("postgresql.cnpg.io/v1beta1")
+                }
+                6 => pod["metadata"]["ownerReferences"][0]["controller"] = json!(false),
+                _ => pod["metadata"]["ownerReferences"][0]["blockOwnerDeletion"] = json!(false),
+            }
+            let (management, _) = fixture_client(Vec::new());
+            let (tenant_client, calls) = fixture_client(vec![(200, cnpg_cluster()), (200, pod)]);
+            let (source, executor_calls) =
+                source_with_query_executor(management, tenant_client, Ok(query_execution()));
+            let error = source
+                .database_query(
+                    ProviderMode::Local,
+                    &local_tenant(),
+                    &local_resources(),
+                    &query_request(),
+                )
+                .await
+                .expect_err("untrusted Pod must fail");
+            assert!(matches!(error, SourceError::DatabaseUnavailable { .. }));
+            assert_eq!(calls.lock().expect("calls").len(), 2, "edit {edit}");
+            assert!(executor_calls.lock().expect("executor calls").is_empty());
+        }
+
+        let (management, _) = fixture_client(Vec::new());
+        let (tenant_client, calls) =
+            fixture_client(vec![(200, cnpg_cluster()), (404, status_response(404))]);
+        let (source, executor_calls) =
+            source_with_query_executor(management, tenant_client, Ok(query_execution()));
+        assert!(
+            source
+                .database_query(
+                    ProviderMode::Local,
+                    &local_tenant(),
+                    &local_resources(),
+                    &query_request(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.lock().expect("calls").len(), 2);
+        assert!(executor_calls.lock().expect("executor calls").is_empty());
+    }
+
+    #[tokio::test]
+    async fn database_query_requires_owned_well_formed_basic_auth_secret() {
+        for edit in 0..9 {
+            let mut secret = database_secret();
+            match edit {
+                0 => secret["type"] = json!("Opaque"),
+                1 => secret["metadata"]["ownerReferences"][0]["uid"] = json!("foreign-uid"),
+                2 => secret["metadata"]["ownerReferences"][0]["kind"] = json!("Foreign"),
+                3 => {
+                    secret["metadata"]["ownerReferences"][0]["apiVersion"] =
+                        json!("postgresql.cnpg.io/v1beta1")
+                }
+                4 => secret["metadata"]["ownerReferences"][0]["controller"] = json!(false),
+                5 => {
+                    secret["metadata"]["ownerReferences"][0]
+                        .as_object_mut()
+                        .expect("owner reference")
+                        .remove("controller");
+                }
+                6 => secret["data"]["username"] = json!(""),
+                7 => secret["data"]["username"] = json!("//4="),
+                _ => {
+                    secret["data"]
+                        .as_object_mut()
+                        .expect("data")
+                        .remove("password");
+                }
+            };
+            let (management, _) = fixture_client(Vec::new());
+            let (tenant_client, calls) = fixture_client(vec![
+                (200, cnpg_cluster()),
+                (200, database_pod()),
+                (200, secret),
+            ]);
+            let (source, executor_calls) =
+                source_with_query_executor(management, tenant_client, Ok(query_execution()));
+            let error = source
+                .database_query(
+                    ProviderMode::Local,
+                    &local_tenant(),
+                    &local_resources(),
+                    &query_request(),
+                )
+                .await
+                .expect_err("invalid Secret must fail");
+            assert!(matches!(
+                error,
+                SourceError::DatabaseUnavailable {
+                    retryable: false,
+                    ..
+                }
+            ));
+            assert_eq!(calls.lock().expect("calls").len(), 3, "edit {edit}");
+            assert!(executor_calls.lock().expect("executor calls").is_empty());
+        }
+
+        let (management, _) = fixture_client(Vec::new());
+        let (tenant_client, calls) = fixture_client(vec![
+            (200, cnpg_cluster()),
+            (200, database_pod()),
+            (404, status_response(404)),
+        ]);
+        let (source, executor_calls) =
+            source_with_query_executor(management, tenant_client, Ok(query_execution()));
+        assert!(
+            source
+                .database_query(
+                    ProviderMode::Local,
+                    &local_tenant(),
+                    &local_resources(),
+                    &query_request(),
+                )
+                .await
+                .is_err()
+        );
+        assert_eq!(calls.lock().expect("calls").len(), 3);
+        assert!(executor_calls.lock().expect("executor calls").is_empty());
+    }
+
+    #[tokio::test]
+    async fn database_query_maps_executor_query_error_and_timeout_without_sql() {
+        for (executor_error, expected) in [
+            (
+                QueryExecutionError::QueryFailed {
+                    sqlstate: Some("42601".into()),
+                    message: "syntax error".into(),
+                },
+                SourceError::QueryFailed {
+                    sqlstate: Some("42601".into()),
+                    message: "syntax error".into(),
+                },
+            ),
+            (
+                QueryExecutionError::ResponseLimitExceeded,
+                SourceError::QueryResponseTooLarge,
+            ),
+            (QueryExecutionError::TimedOut, SourceError::QueryTimedOut),
+            (
+                QueryExecutionError::OutcomeUnknown,
+                SourceError::QueryOutcomeUnknown,
+            ),
+        ] {
+            let (management, _) = fixture_client(Vec::new());
+            let (tenant_client, _) = fixture_client(vec![
+                (200, cnpg_cluster()),
+                (200, database_pod()),
+                (200, database_secret()),
+            ]);
+            let (source, _) =
+                source_with_query_executor(management, tenant_client, Err(executor_error));
+            let error = source
+                .database_query(
+                    ProviderMode::Local,
+                    &local_tenant(),
+                    &local_resources(),
+                    &query_request(),
+                )
+                .await
+                .expect_err("executor error");
+            assert_eq!(error, expected);
+            assert!(!format!("{error:?}").contains("select 1"));
+        }
     }
 
     #[tokio::test]

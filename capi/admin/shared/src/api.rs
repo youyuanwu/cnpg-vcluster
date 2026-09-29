@@ -59,5 +59,10 @@ pub enum ApiErrorCode {
     InvalidRequest,
     SchemaMismatch,
     KubernetesUnavailable,
+    DatabaseUnavailable,
+    QueryFailed,
+    QueryResponseTooLarge,
+    QueryTimedOut,
+    QueryOutcomeUnknown,
     Internal,
 }

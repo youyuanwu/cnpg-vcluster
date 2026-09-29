@@ -107,9 +107,9 @@ controller-build:
 controller-image:
     @python3 scripts/build_controller.py
 
-# Report the separate admin Rust baseline, delta, and 6,000-line ceiling.
+# Report the separate admin Rust baseline, delta, and 7,500-line ceiling.
 admin-metrics:
-    @python3 scripts/admin_metrics.py --max 6000
+    @python3 scripts/admin_metrics.py --max 7500
 
 # Fetch locked admin Cargo dependencies.
 admin-fetch:

@@ -1,30 +1,33 @@
 use std::{
     convert::Infallible,
+    net::IpAddr,
     path::{Path as FilePath, PathBuf},
     sync::Arc,
 };
 
 use axum::{
     Json, Router,
-    body::Body,
-    extract::{Path, State},
-    http::{Request, StatusCode, header},
+    body::{Body, Bytes},
+    extract::{DefaultBodyLimit, Path, State, rejection::BytesRejection},
+    http::{HeaderMap, Request, StatusCode, header, uri::Authority},
     middleware::{self, Next},
     response::IntoResponse,
-    routing::get,
+    routing::{get, post},
 };
 use tenant_admin_shared::{
     ApiEnvelope,
     query::{
-        ManagementComponentView, ManagementOverview, OverviewSnapshot, ProviderMode,
-        TenantClassification, TenantCounts, TenantSnapshot, TenantSnapshotIdentity, TenantSummary,
-        TopologyGraph,
+        DatabaseQueryRequest, DatabaseQueryResponse, ManagementComponentView, ManagementOverview,
+        OverviewSnapshot, ProviderMode, TenantClassification, TenantCounts, TenantSnapshot,
+        TenantSnapshotIdentity, TenantSummary, TopologyGraph,
     },
     routes::{
-        API_OVERVIEW_PATH, API_TENANT_PATH, API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH,
-        READINESS_PATH,
+        API_OVERVIEW_PATH, API_TENANT_DATABASE_QUERY_PATH, API_TENANT_PATH,
+        API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH, READINESS_PATH,
+        TENANT_ADMIN_UNSAFE_REQUEST_HEADER, TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
     },
 };
+use tenant_controller::api::TenantProviderSpec;
 use tower::{ServiceExt, service_fn};
 use tower_http::{
     services::{ServeDir, ServeFile},
@@ -32,6 +35,8 @@ use tower_http::{
 };
 
 use crate::{AppError, DataSource, TenantProjection, project_summary};
+
+const MAX_DATABASE_QUERY_BODY_BYTES: usize = 128 * 1_024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -74,6 +79,10 @@ pub fn router(state: AppState, web_directory: PathBuf) -> Router {
         .route(API_TENANTS_PATH, get(tenants))
         .route(API_TENANT_PATH, get(tenant_detail))
         .route(API_TENANT_TOPOLOGY_PATH, get(tenant_topology))
+        .route(
+            API_TENANT_DATABASE_QUERY_PATH,
+            post(database_query).layer(DefaultBodyLimit::max(MAX_DATABASE_QUERY_BODY_BYTES)),
+        )
         .route("/api/{*path}", get(api_not_found))
         .fallback_service(static_files)
         .layer(middleware::from_fn(no_store_html))
@@ -194,6 +203,114 @@ async fn tenant_topology(
     )))
 }
 
+async fn database_query(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<ApiEnvelope<DatabaseQueryResponse>>, AppError> {
+    validate_tenant_name(&name)?;
+    validate_request_origin(&headers)?;
+    let body = body.map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    let request: DatabaseQueryRequest = serde_json::from_slice(&body)
+        .map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    validate_query_request(&request)?;
+    if state.provider != ProviderMode::Local {
+        return Err(AppError::database_unavailable(
+            "Database queries are available only for local Tenants",
+            false,
+        ));
+    }
+    let tenant = state
+        .source
+        .get_tenant(&name)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Tenant {name} was not found")))?;
+    if !matches!(tenant.spec.provider, TenantProviderSpec::Local { .. }) {
+        return Err(AppError::database_unavailable(
+            "Database queries are available only for local Tenants",
+            false,
+        ));
+    }
+    let resources = state
+        .source
+        .list_management_resources(state.provider, &name)
+        .await?;
+    let response = state
+        .source
+        .database_query(state.provider, &tenant, &resources, &request)
+        .await?;
+    Ok(Json(ApiEnvelope::new(response)))
+}
+
+fn validate_request_origin(headers: &HeaderMap) -> Result<(), AppError> {
+    let mut origins = headers.get_all(header::ORIGIN).iter();
+    let Some(origin) = origins.next() else {
+        return Ok(());
+    };
+    if origins.next().is_some() {
+        return Err(AppError::invalid_request("Request Origin is not allowed"));
+    }
+    let mut unsafe_headers = headers.get_all(TENANT_ADMIN_UNSAFE_REQUEST_HEADER).iter();
+    if unsafe_headers
+        .next()
+        .filter(|value| value.as_bytes() == TENANT_ADMIN_UNSAFE_REQUEST_VALUE.as_bytes())
+        .filter(|_| unsafe_headers.next().is_none())
+        .is_none()
+    {
+        return Err(AppError::invalid_request(
+            "Unsafe browser request header is required",
+        ));
+    }
+    let origin = origin
+        .to_str()
+        .map_err(|_| AppError::invalid_request("Request Origin is not allowed"))?;
+    let (_scheme, origin_authority) = origin
+        .split_once("://")
+        .filter(|(scheme, authority)| {
+            matches!(*scheme, "http" | "https")
+                && !authority.is_empty()
+                && !authority
+                    .chars()
+                    .any(|character| character.is_whitespace() || "/@?#".contains(character))
+        })
+        .ok_or_else(|| AppError::invalid_request("Request Origin is not allowed"))?;
+    let origin_authority = origin_authority
+        .parse::<Authority>()
+        .map_err(|_| AppError::invalid_request("Request Origin is not allowed"))?;
+
+    let mut hosts = headers.get_all(header::HOST).iter();
+    let host = hosts
+        .next()
+        .filter(|_| hosts.next().is_none())
+        .and_then(|host| host.to_str().ok())
+        .ok_or_else(|| AppError::invalid_request("Request Origin is not allowed"))?;
+    if host.contains('@') {
+        return Err(AppError::invalid_request("Request Origin is not allowed"));
+    }
+    let host_authority = host
+        .parse::<Authority>()
+        .map_err(|_| AppError::invalid_request("Request Origin is not allowed"))?;
+    if !origin_authority
+        .host()
+        .eq_ignore_ascii_case(host_authority.host())
+        || origin_authority.port_u16() != host_authority.port_u16()
+    {
+        return Err(AppError::invalid_request("Request Origin is not allowed"));
+    }
+    let hostname = host_authority.host();
+    let ip_candidate = hostname
+        .strip_prefix('[')
+        .and_then(|hostname| hostname.strip_suffix(']'))
+        .unwrap_or(hostname);
+    if !hostname.eq_ignore_ascii_case("localhost") && ip_candidate.parse::<IpAddr>().is_err() {
+        return Err(AppError::invalid_request(
+            "Request Host is not allowed for browser SQL requests",
+        ));
+    }
+    Ok(())
+}
+
 async fn api_not_found() -> impl IntoResponse {
     AppError::not_found("API route was not found")
 }
@@ -253,6 +370,45 @@ fn validate_tenant_name(name: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+fn validate_query_request(request: &DatabaseQueryRequest) -> Result<(), AppError> {
+    if request.sql.trim().is_empty() || request.sql.len() > 64 * 1_024 {
+        return Err(AppError::invalid_request(
+            "SQL must be nonempty and at most 64 KiB",
+        ));
+    }
+    if request.database.is_empty()
+        || request.database.len() > 63
+        || request
+            .database
+            .chars()
+            .any(|character| character == '\0' || character.is_control())
+    {
+        return Err(AppError::invalid_request(
+            "Database name must be 1 to 63 bytes without control characters",
+        ));
+    }
+    if !is_dns_label(&request.instance, 63) {
+        return Err(AppError::invalid_request(
+            "Database instance must be a valid DNS label of at most 63 bytes",
+        ));
+    }
+    Ok(())
+}
+
+fn is_dns_label(value: &str, maximum: usize) -> bool {
+    let bytes = value.as_bytes();
+    (1..=maximum).contains(&bytes.len())
+        && bytes
+            .first()
+            .is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
+        && bytes
+            .last()
+            .is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
+        && bytes
+            .iter()
+            .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || *value == b'-')
+}
+
 fn usize_u32(value: usize) -> u32 {
     u32::try_from(value).unwrap_or(u32::MAX)
 }
@@ -281,7 +437,8 @@ mod tests {
         query::{
             ConditionStatus, DatabaseClusterIdentity, DatabaseClusterObservation,
             DatabaseCondition, DatabaseInstanceObservation, DatabaseInstanceRole,
-            DatabaseObservation, DatabaseObservationFreshness, DatabasePvcHealth, DatabaseServices,
+            DatabaseObservation, DatabaseObservationFreshness, DatabasePvcHealth,
+            DatabaseQueryRequest, DatabaseQueryResponse, DatabaseQueryResult, DatabaseServices,
             OverviewSnapshot, TenantSnapshot, TenantSummary, TopologyGraph,
         },
     };
@@ -299,6 +456,7 @@ mod tests {
         tenant: Result<Option<Tenant>, SourceError>,
         resources: Result<Vec<DynamicObject>, SourceError>,
         database: Result<DatabaseObservation, SourceError>,
+        query: Result<DatabaseQueryResponse, SourceError>,
         ready: Result<(), SourceError>,
         calls: Arc<SourceCalls>,
     }
@@ -309,6 +467,7 @@ mod tests {
         tenant_gets: AtomicUsize,
         resource_lists: AtomicUsize,
         database_observations: AtomicUsize,
+        database_queries: AtomicUsize,
     }
 
     impl DataSource for MockSource {
@@ -341,6 +500,17 @@ mod tests {
                 .database_observations
                 .fetch_add(1, Ordering::Relaxed);
             Box::pin(ready(self.database.clone()))
+        }
+
+        fn database_query<'a>(
+            &'a self,
+            _provider: ProviderMode,
+            _tenant: &'a Tenant,
+            _management_resources: &'a [DynamicObject],
+            _request: &'a DatabaseQueryRequest,
+        ) -> SourceFuture<'a, DatabaseQueryResponse> {
+            self.calls.database_queries.fetch_add(1, Ordering::Relaxed);
+            Box::pin(ready(self.query.clone()))
         }
 
         fn check_ready(&self) -> SourceFuture<'_, ()> {
@@ -425,9 +595,39 @@ mod tests {
         }
     }
 
+    fn query_response() -> DatabaseQueryResponse {
+        DatabaseQueryResponse {
+            tenant: "tenant-a".into(),
+            cluster: "capi-postgres".into(),
+            instance: "capi-postgres-1".into(),
+            database: "postgres".into(),
+            executed_at: "2026-09-29T22:00:00Z".into(),
+            duration_ms: 12,
+            truncated: false,
+            results: vec![
+                DatabaseQueryResult {
+                    columns: vec!["value".into(), "nullable".into()],
+                    rows: vec![vec![Some("42".into()), None]],
+                    affected_rows: 1,
+                    truncated: false,
+                },
+                DatabaseQueryResult {
+                    columns: Vec::new(),
+                    rows: Vec::new(),
+                    affected_rows: 3,
+                    truncated: false,
+                },
+            ],
+        }
+    }
+
     fn test_router(source: MockSource) -> Router {
+        test_router_with_provider(source, ProviderMode::Local)
+    }
+
+    fn test_router_with_provider(source: MockSource, provider: ProviderMode) -> Router {
         router(
-            AppState::new(Arc::new(source), ProviderMode::Local),
+            AppState::new(Arc::new(source), provider),
             PathBuf::from("capi/admin/server/tests/fixtures/web"),
         )
     }
@@ -451,6 +651,7 @@ mod tests {
             tenant: Ok(None),
             resources: Ok(Vec::new()),
             database: Ok(database_observation()),
+            query: Ok(query_response()),
             ready: Ok(()),
             calls: Arc::default(),
         };
@@ -503,6 +704,7 @@ mod tests {
             tenant: Ok(None),
             resources: Ok(Vec::new()),
             database: Ok(database_observation()),
+            query: Ok(query_response()),
             ready: Ok(()),
             calls: Arc::default(),
         };
@@ -539,6 +741,7 @@ mod tests {
             tenant: Ok(Some(tenant)),
             resources: Ok(Vec::new()),
             database: Ok(database_observation()),
+            query: Ok(query_response()),
             ready: Ok(()),
             calls: Arc::default(),
         };
@@ -593,6 +796,7 @@ mod tests {
             tenant: Ok(None),
             resources: Ok(Vec::new()),
             database: Ok(database_observation()),
+            query: Ok(query_response()),
             ready: Err(SourceError::KubernetesUnavailable),
             calls: Arc::default(),
         });
@@ -641,6 +845,353 @@ mod tests {
         assert_eq!(readiness.status(), StatusCode::SERVICE_UNAVAILABLE);
     }
 
+    fn query_request(sql: &str) -> Request<Body> {
+        query_request_with_content_type(sql, Some("application/json"))
+    }
+
+    fn query_request_with_content_type(sql: &str, content_type: Option<&str>) -> Request<Body> {
+        let mut request = Request::post("/api/v1/tenants/tenant-a/database/query");
+        if let Some(content_type) = content_type {
+            request = request.header("content-type", content_type);
+        }
+        request
+            .body(Body::from(
+                serde_json::to_vec(&DatabaseQueryRequest {
+                    instance: "capi-postgres-1".into(),
+                    database: "postgres".into(),
+                    sql: sql.into(),
+                })
+                .expect("query body"),
+            ))
+            .expect("request")
+    }
+
+    fn origin_query_request(
+        host: &str,
+        origin: &str,
+        include_unsafe_header: bool,
+    ) -> Request<Body> {
+        let mut request = query_request_with_content_type("select 1", Some("text/plain"));
+        request
+            .headers_mut()
+            .insert(header::HOST, host.parse().expect("host"));
+        request
+            .headers_mut()
+            .insert(header::ORIGIN, origin.parse().expect("origin"));
+        if include_unsafe_header {
+            request.headers_mut().insert(
+                TENANT_ADMIN_UNSAFE_REQUEST_HEADER,
+                TENANT_ADMIN_UNSAFE_REQUEST_VALUE
+                    .parse()
+                    .expect("unsafe request header"),
+            );
+        }
+        request
+    }
+
+    #[tokio::test]
+    async fn database_query_route_requires_post_json_and_valid_fields() {
+        let source = MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(Some(ready_tenant())),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router(source);
+        let method = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/tenants/tenant-a/database/query")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(method.status(), StatusCode::METHOD_NOT_ALLOWED);
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/tenants/tenant-a/database/query")
+                    .header("content-type", "application/json")
+                    .body(Body::from("{"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        let malformed: ApiErrorEnvelope = response_json(malformed).await;
+        assert_eq!(malformed.error.code, ApiErrorCode::InvalidRequest);
+        let malformed_without_content_type = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/tenants/tenant-a/database/query")
+                    .body(Body::from("{"))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(
+            malformed_without_content_type.status(),
+            StatusCode::BAD_REQUEST
+        );
+        let malformed_without_content_type: ApiErrorEnvelope =
+            response_json(malformed_without_content_type).await;
+        assert_eq!(
+            malformed_without_content_type.error.code,
+            ApiErrorCode::InvalidRequest
+        );
+        let oversized = app
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/tenants/tenant-a/database/query")
+                    .body(Body::from(vec![b'x'; MAX_DATABASE_QUERY_BODY_BYTES + 1]))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(oversized.status(), StatusCode::BAD_REQUEST);
+        let oversized: ApiErrorEnvelope = response_json(oversized).await;
+        assert_eq!(oversized.error.code, ApiErrorCode::InvalidRequest);
+
+        for request in [
+            DatabaseQueryRequest {
+                instance: "INVALID".into(),
+                database: "postgres".into(),
+                sql: "select 1".into(),
+            },
+            DatabaseQueryRequest {
+                instance: "capi-postgres-1".into(),
+                database: "bad\ndatabase".into(),
+                sql: "select 1".into(),
+            },
+            DatabaseQueryRequest {
+                instance: "capi-postgres-1".into(),
+                database: "postgres".into(),
+                sql: " \n\t".into(),
+            },
+            DatabaseQueryRequest {
+                instance: "capi-postgres-1".into(),
+                database: "postgres".into(),
+                sql: "x".repeat(64 * 1_024 + 1),
+            },
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/v1/tenants/tenant-a/database/query")
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::to_vec(&request).expect("request body"),
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        assert_eq!(calls.tenant_gets.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.database_queries.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn database_query_accepts_json_without_required_content_type() {
+        let source = MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(Some(ready_tenant())),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router(source);
+
+        for content_type in [None, Some("application/octet-stream"), Some("text/plain")] {
+            let response = app
+                .clone()
+                .oneshot(query_request_with_content_type("select 1", content_type))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let response: ApiEnvelope<DatabaseQueryResponse> = response_json(response).await;
+            assert_eq!(response.data.results[0].rows[0][0].as_deref(), Some("42"));
+        }
+        assert_eq!(calls.database_queries.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn database_query_enforces_same_origin_when_origin_is_present() {
+        let source = MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(Some(ready_tenant())),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router(source);
+
+        let response = app
+            .clone()
+            .oneshot(origin_query_request(
+                "localhost:8080",
+                "https://localhost:8080",
+                false,
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        for (host, origin) in [
+            ("localhost:8080", "https://LOCALHOST:8080"),
+            ("127.0.0.1:8080", "http://127.0.0.1:8080"),
+            ("[::1]:8080", "http://[::1]:8080"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(origin_query_request(host, origin, true))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK, "{origin}");
+        }
+
+        for (host, origin) in [
+            ("attacker.example:8080", "https://attacker.example:8080"),
+            ("localhost:8080", "https://foreign.example:8080"),
+            ("localhost:8080", "null"),
+            ("localhost:8080", "not-an-origin"),
+            ("localhost:8080", "http://[::1"),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(origin_query_request(host, origin, true))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST, "{origin}");
+            let response: ApiErrorEnvelope = response_json(response).await;
+            assert_eq!(response.error.code, ApiErrorCode::InvalidRequest);
+        }
+        assert_eq!(calls.database_queries.load(Ordering::Relaxed), 3);
+    }
+
+    #[tokio::test]
+    async fn database_query_returns_structured_results_and_preserves_detail_reads() {
+        let source = MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(Some(ready_tenant())),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router(source);
+        let response = app
+            .clone()
+            .oneshot(query_request(
+                "select 42, null; update values set active = true",
+            ))
+            .await
+            .expect("response");
+        assert_eq!(response.status(), StatusCode::OK);
+        let response: ApiEnvelope<DatabaseQueryResponse> = response_json(response).await;
+        assert_eq!(response.data.results.len(), 2);
+        assert_eq!(
+            response.data.results[0].rows,
+            vec![vec![Some("42".into()), None]]
+        );
+        assert_eq!(response.data.results[1].affected_rows, 3);
+        assert_eq!(calls.tenant_gets.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.database_queries.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.database_observations.load(Ordering::Relaxed), 0);
+
+        let detail = app
+            .oneshot(
+                Request::get("/api/v1/tenants/tenant-a")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(detail.status(), StatusCode::OK);
+        assert_eq!(calls.database_observations.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.database_queries.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn database_query_maps_provider_query_error_and_timeout() {
+        for (provider, error, status, code) in [
+            (
+                ProviderMode::Azure,
+                SourceError::DatabaseUnavailable {
+                    message: "Database queries are available only for local Tenants".into(),
+                    retryable: false,
+                },
+                StatusCode::SERVICE_UNAVAILABLE,
+                ApiErrorCode::DatabaseUnavailable,
+            ),
+            (
+                ProviderMode::Local,
+                SourceError::QueryFailed {
+                    sqlstate: Some("42601".into()),
+                    message: "syntax error".into(),
+                },
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiErrorCode::QueryFailed,
+            ),
+            (
+                ProviderMode::Local,
+                SourceError::QueryResponseTooLarge,
+                StatusCode::UNPROCESSABLE_ENTITY,
+                ApiErrorCode::QueryResponseTooLarge,
+            ),
+            (
+                ProviderMode::Local,
+                SourceError::QueryTimedOut,
+                StatusCode::GATEWAY_TIMEOUT,
+                ApiErrorCode::QueryTimedOut,
+            ),
+            (
+                ProviderMode::Local,
+                SourceError::QueryOutcomeUnknown,
+                StatusCode::GATEWAY_TIMEOUT,
+                ApiErrorCode::QueryOutcomeUnknown,
+            ),
+        ] {
+            let source = MockSource {
+                tenants: Ok(Vec::new()),
+                tenant: Ok(Some(ready_tenant())),
+                resources: Ok(Vec::new()),
+                database: Ok(database_observation()),
+                query: Err(error),
+                ready: Ok(()),
+                calls: Arc::default(),
+            };
+            let response = test_router_with_provider(source, provider)
+                .oneshot(query_request("private-sql-must-not-appear"))
+                .await
+                .expect("response");
+            assert_eq!(response.status(), status);
+            let response: ApiErrorEnvelope = response_json(response).await;
+            assert_eq!(response.error.code, code);
+            assert!(!response.error.message.contains("private-sql"));
+            if code == ApiErrorCode::QueryFailed {
+                assert!(response.error.message.contains("SQLSTATE 42601"));
+                assert!(response.error.message.contains("syntax error"));
+            }
+        }
+    }
+
     #[tokio::test]
     async fn static_files_use_mime_nested_fallback_and_no_traversal() {
         static COUNTER: AtomicUsize = AtomicUsize::new(0);
@@ -661,6 +1212,7 @@ mod tests {
             tenant: Ok(None),
             resources: Ok(Vec::new()),
             database: Ok(database_observation()),
+            query: Ok(query_response()),
             ready: Ok(()),
             calls: Arc::default(),
         };

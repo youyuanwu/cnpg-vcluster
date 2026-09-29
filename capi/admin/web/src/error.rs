@@ -6,6 +6,11 @@ pub enum UiErrorKind {
     InvalidRequest,
     SchemaMismatch,
     KubernetesUnavailable,
+    DatabaseUnavailable,
+    QueryFailed,
+    QueryResponseTooLarge,
+    QueryTimedOut,
+    QueryOutcomeUnknown,
     Network,
     Internal,
 }
@@ -42,6 +47,11 @@ impl UiError {
             UiErrorKind::InvalidRequest => "Invalid request",
             UiErrorKind::SchemaMismatch => "UI and server versions do not match",
             UiErrorKind::KubernetesUnavailable => "Kubernetes is unavailable",
+            UiErrorKind::DatabaseUnavailable => "The database is unavailable",
+            UiErrorKind::QueryFailed => "The SQL query failed",
+            UiErrorKind::QueryResponseTooLarge => "The SQL response was too large",
+            UiErrorKind::QueryTimedOut => "The SQL query timed out",
+            UiErrorKind::QueryOutcomeUnknown => "The SQL query outcome is unknown",
             UiErrorKind::Network => "The server could not be reached",
             UiErrorKind::Internal => "The request could not be completed",
         }
@@ -55,6 +65,11 @@ impl From<ApiError> for UiError {
             ApiErrorCode::InvalidRequest => UiErrorKind::InvalidRequest,
             ApiErrorCode::SchemaMismatch => UiErrorKind::SchemaMismatch,
             ApiErrorCode::KubernetesUnavailable => UiErrorKind::KubernetesUnavailable,
+            ApiErrorCode::DatabaseUnavailable => UiErrorKind::DatabaseUnavailable,
+            ApiErrorCode::QueryFailed => UiErrorKind::QueryFailed,
+            ApiErrorCode::QueryResponseTooLarge => UiErrorKind::QueryResponseTooLarge,
+            ApiErrorCode::QueryTimedOut => UiErrorKind::QueryTimedOut,
+            ApiErrorCode::QueryOutcomeUnknown => UiErrorKind::QueryOutcomeUnknown,
             ApiErrorCode::Internal => UiErrorKind::Internal,
         };
         Self {
@@ -109,7 +124,7 @@ mod tests {
     use super::{UiErrorKind, map_error_response};
 
     #[test]
-    fn maps_typed_kubernetes_and_not_found_errors() {
+    fn maps_typed_errors_and_preserves_sanitized_messages() {
         let unavailable = serde_json::to_string(&ApiErrorEnvelope::new(ApiError::new(
             ApiErrorCode::KubernetesUnavailable,
             "API unavailable",
@@ -123,6 +138,51 @@ mod tests {
         let error = map_error_response(404, "not json");
         assert_eq!(error.kind, UiErrorKind::NotFound);
         assert!(!error.retryable);
+
+        let query_failed = serde_json::to_string(&ApiErrorEnvelope::new(ApiError::new(
+            ApiErrorCode::QueryFailed,
+            "relation does not exist",
+            false,
+        )))
+        .expect("test envelope serializes");
+        let error = map_error_response(422, &query_failed);
+        assert_eq!(error.kind, UiErrorKind::QueryFailed);
+        assert_eq!(error.title(), "The SQL query failed");
+        assert_eq!(error.message, "relation does not exist");
+
+        for (code, expected_kind, expected_title) in [
+            (
+                ApiErrorCode::DatabaseUnavailable,
+                UiErrorKind::DatabaseUnavailable,
+                "The database is unavailable",
+            ),
+            (
+                ApiErrorCode::QueryResponseTooLarge,
+                UiErrorKind::QueryResponseTooLarge,
+                "The SQL response was too large",
+            ),
+            (
+                ApiErrorCode::QueryTimedOut,
+                UiErrorKind::QueryTimedOut,
+                "The SQL query timed out",
+            ),
+            (
+                ApiErrorCode::QueryOutcomeUnknown,
+                UiErrorKind::QueryOutcomeUnknown,
+                "The SQL query outcome is unknown",
+            ),
+        ] {
+            let body = serde_json::to_string(&ApiErrorEnvelope::new(ApiError::new(
+                code,
+                "sanitized database detail",
+                true,
+            )))
+            .expect("test envelope serializes");
+            let error = map_error_response(503, &body);
+            assert_eq!(error.kind, expected_kind);
+            assert_eq!(error.title(), expected_title);
+            assert_eq!(error.message, "sanitized database detail");
+        }
     }
 
     #[test]

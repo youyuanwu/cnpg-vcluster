@@ -4,22 +4,24 @@ use tenant_admin_shared::{
     query::{
         ConditionStatus, DatabaseClusterIdentity, DatabaseClusterObservation, DatabaseCondition,
         DatabaseInstanceObservation, DatabaseInstanceRole, DatabaseNotApplicableReason,
-        DatabaseObservation, DatabaseObservationFreshness, DatabasePvcHealth, DatabaseServices,
-        DatabaseUnavailableReason, DisplayAttribute, ManagementOverview, OverviewSnapshot,
-        ProviderMode, ProviderStatusView, TenantCounts, TenantDetail, TenantProvider,
-        TenantSnapshot, TenantSnapshotIdentity, TenantSummary, TopologyEdge, TopologyEdgeKind,
-        TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind, UnknownProviderView,
+        DatabaseObservation, DatabaseObservationFreshness, DatabasePvcHealth, DatabaseQueryRequest,
+        DatabaseQueryResponse, DatabaseQueryResult, DatabaseServices, DatabaseUnavailableReason,
+        DisplayAttribute, ManagementOverview, OverviewSnapshot, ProviderMode, ProviderStatusView,
+        TenantCounts, TenantDetail, TenantProvider, TenantSnapshot, TenantSnapshotIdentity,
+        TenantSummary, TopologyEdge, TopologyEdgeKind, TopologyGraph, TopologyHealth, TopologyNode,
+        TopologyNodeKind, UnknownProviderView,
     },
     routes::{
-        API_OVERVIEW_PATH, API_PREFIX, API_TENANT_PATH, API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH,
-        FRONTEND_FALLBACK_PATH, HEALTH_PATH, READINESS_PATH,
+        API_OVERVIEW_PATH, API_PREFIX, API_TENANT_DATABASE_QUERY_PATH, API_TENANT_PATH,
+        API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH, FRONTEND_FALLBACK_PATH, HEALTH_PATH,
+        READINESS_PATH, TENANT_ADMIN_UNSAFE_REQUEST_HEADER, TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
     },
 };
 
 #[test]
 fn deployment_and_route_constants_are_exact() {
     assert_eq!(API_SCHEMA_NAME, "tenant-admin");
-    assert_eq!(API_SCHEMA_VERSION, 2);
+    assert_eq!(API_SCHEMA_VERSION, 3);
     assert_eq!(ADMIN_RESOURCE_NAME, "tenant-admin");
     assert_eq!(ADMIN_NAMESPACE, "tenant-system");
     assert_eq!(ADMIN_CONTAINER_PORT, 8080);
@@ -29,6 +31,15 @@ fn deployment_and_route_constants_are_exact() {
     assert_eq!(API_TENANTS_PATH, "/api/v1/tenants");
     assert_eq!(API_TENANT_PATH, "/api/v1/tenants/{name}");
     assert_eq!(API_TENANT_TOPOLOGY_PATH, "/api/v1/tenants/{name}/topology");
+    assert_eq!(
+        API_TENANT_DATABASE_QUERY_PATH,
+        "/api/v1/tenants/{name}/database/query"
+    );
+    assert_eq!(
+        TENANT_ADMIN_UNSAFE_REQUEST_HEADER,
+        "x-tenant-admin-unsafe-request"
+    );
+    assert_eq!(TENANT_ADMIN_UNSAFE_REQUEST_VALUE, "1");
     assert_eq!(HEALTH_PATH, "/healthz");
     assert_eq!(READINESS_PATH, "/readyz");
     assert_eq!(FRONTEND_FALLBACK_PATH, "/*");
@@ -39,7 +50,7 @@ fn envelopes_have_stable_versioned_json() {
     let success = ApiEnvelope::new(vec!["alpha", "beta"]);
     assert_eq!(
         serde_json::to_string(&success).expect("success envelope serializes"),
-        r#"{"schemaVersion":2,"data":["alpha","beta"]}"#
+        r#"{"schemaVersion":3,"data":["alpha","beta"]}"#
     );
 
     let error = ApiErrorEnvelope::new(ApiError::new(
@@ -49,7 +60,7 @@ fn envelopes_have_stable_versioned_json() {
     ));
     assert_eq!(
         serde_json::to_string(&error).expect("error envelope serializes"),
-        r#"{"schemaVersion":2,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
+        r#"{"schemaVersion":3,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
     );
 
     let decoded: ApiErrorEnvelope =
@@ -267,6 +278,7 @@ fn database_observation_contract_is_bounded_and_secret_free() {
             "{forbidden} leaked into contract"
         );
     }
+
     let decoded: DatabaseObservation =
         serde_json::from_str(&json).expect("database observation round trips");
     assert_eq!(decoded, observation);
@@ -309,4 +321,70 @@ fn database_observation_contract_is_bounded_and_secret_free() {
         assert_eq!(keys, expected_keys);
         assert!(value.get("observed_at").is_none());
     }
+}
+
+#[test]
+fn database_query_contract_supports_unrestricted_multi_result_sql_without_credentials() {
+    let request = DatabaseQueryRequest {
+        instance: "capi-postgres-1".into(),
+        database: "postgres".into(),
+        sql: "CREATE TABLE demo(id integer); SELECT NULL::text AS value;".into(),
+    };
+    assert_eq!(
+        serde_json::to_string(&request).expect("query request serializes"),
+        r#"{"instance":"capi-postgres-1","database":"postgres","sql":"CREATE TABLE demo(id integer); SELECT NULL::text AS value;"}"#
+    );
+
+    let response = DatabaseQueryResponse {
+        tenant: "demo".into(),
+        cluster: "capi-postgres".into(),
+        instance: "capi-postgres-1".into(),
+        database: "postgres".into(),
+        executed_at: "2026-09-29T22:40:00Z".into(),
+        duration_ms: 17,
+        truncated: false,
+        results: vec![
+            DatabaseQueryResult {
+                columns: Vec::new(),
+                rows: Vec::new(),
+                affected_rows: 0,
+                truncated: false,
+            },
+            DatabaseQueryResult {
+                columns: vec!["value".into()],
+                rows: vec![vec![None]],
+                affected_rows: 1,
+                truncated: false,
+            },
+        ],
+    };
+    let json = serde_json::to_string(&ApiEnvelope::new(response.clone()))
+        .expect("query response serializes");
+    assert_eq!(
+        json,
+        r#"{"schemaVersion":3,"data":{"tenant":"demo","cluster":"capi-postgres","instance":"capi-postgres-1","database":"postgres","executedAt":"2026-09-29T22:40:00Z","durationMs":17,"truncated":false,"results":[{"columns":[],"rows":[],"affectedRows":0,"truncated":false},{"columns":["value"],"rows":[[null]],"affectedRows":1,"truncated":false}]}}"#
+    );
+    for forbidden in ["password", "username", "uri", "pgpass", "kubeconfig"] {
+        assert!(
+            !json.contains(forbidden),
+            "{forbidden} leaked into query response"
+        );
+    }
+    let decoded: ApiEnvelope<DatabaseQueryResponse> =
+        serde_json::from_str(&json).expect("query response round trips");
+    assert_eq!(decoded.data, response);
+}
+
+#[test]
+fn query_limit_and_unknown_outcome_error_codes_are_stable() {
+    assert_eq!(
+        serde_json::to_string(&ApiErrorCode::QueryResponseTooLarge)
+            .expect("response limit code serializes"),
+        r#""query-response-too-large""#
+    );
+    assert_eq!(
+        serde_json::to_string(&ApiErrorCode::QueryOutcomeUnknown)
+            .expect("unknown outcome code serializes"),
+        r#""query-outcome-unknown""#
+    );
 }
