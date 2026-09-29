@@ -28,6 +28,7 @@ from scripts.lib.controller_scenarios import (
     wait_tenant_ready,
 )
 from scripts.lib.tenants import Tenant, verify_tenant_management_ownership
+from scripts.lib.files import write_private_file
 
 
 def tenant_document() -> dict[str, object]:
@@ -548,3 +549,120 @@ class ControllerScenarioTests(unittest.TestCase):
                     run_endpoint_gate(root, {}, manifest=manifest)
             delete.assert_called_once_with(root, {}, "tenant-a")
             self.assertFalse((root / ".runtime" / "evidence").exists())
+
+    def test_endpoint_gate_prints_evidence_without_evidence_file(self) -> None:
+        tenant = type(
+            "Tenant",
+            (),
+            {
+                "name": "tenant-a",
+                "namespace": "tenant-a-system",
+                "vip": "172.18.0.10",
+            },
+        )()
+        machine = {
+            "metadata": {"name": "worker-a", "uid": "machine-uid"},
+            "status": {"nodeRef": {"name": "node-a"}},
+        }
+        node = {"metadata": {"name": "node-a", "uid": "node-uid"}}
+        secret_reads = 0
+
+        class Client:
+            def kubectl(self, *arguments, **_kwargs):
+                nonlocal secret_reads
+                joined = " ".join(arguments)
+                if "get machines." in joined:
+                    return CompletedProcess(
+                        [], 0, stdout=json.dumps({"items": [machine]}), stderr=""
+                    )
+                if "devmachines." in joined:
+                    return CompletedProcess(
+                        [], 0, stdout=json.dumps({"metadata": {}}), stderr=""
+                    )
+                if "kamajicontrolplanes." in joined:
+                    return CompletedProcess(
+                        [],
+                        0,
+                        stdout=json.dumps({"metadata": {"annotations": {}}}),
+                        stderr="",
+                    )
+                if "secrets/" in joined:
+                    secret_reads += 1
+                    return CompletedProcess(
+                        [],
+                        0,
+                        stdout=json.dumps(
+                            {
+                                "data": {"value": "Ym9vdHN0cmFw"},
+                                "metadata": {},
+                            }
+                        ),
+                        stderr="",
+                    )
+                raise AssertionError(arguments)
+
+        def tenant_kubectl(*_arguments, **kwargs):
+            arguments = _arguments[3:]
+            if arguments[:2] == ("get", "node/node-a"):
+                return CompletedProcess(
+                    [], 0, stdout=json.dumps(node), stderr=""
+                )
+            return CompletedProcess([], 1, stdout="", stderr="NotFound")
+
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            manifest = root / "tenant.yaml"
+            manifest.write_text(
+                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2\n"
+                "kind: Tenant\nmetadata:\n  name: tenant-a\n",
+                encoding="utf-8",
+            )
+            write_private_file(
+                root / ".runtime/tenants/tenant-a/kubeconfig",
+                "certificate-authority-data: Y2E=\n",
+            )
+            output = io.StringIO()
+            with (
+                patch(
+                    "scripts.endpoint.management_status",
+                    return_value={"apiReady": False},
+                ),
+                patch("scripts.endpoint.create_management"),
+                patch(
+                    "scripts.endpoint.apply_controller_tenant",
+                    return_value=(Client(), tenant, {}),
+                ),
+                patch(
+                    "scripts.endpoint.verify_tenant_management_ownership",
+                    return_value={},
+                ),
+                patch("scripts.endpoint.verify_tenant_control_plane_contract"),
+                patch(
+                    "scripts.machines.worker_snapshot",
+                    return_value=["worker-a"],
+                ),
+                patch("scripts.endpoint.verify_authoritative_endpoint"),
+                patch("scripts.endpoint.verify_worker_runtime"),
+                patch("scripts.endpoint._verify_bootstrap_secret"),
+                patch(
+                    "scripts.endpoint._tenant_kubectl",
+                    side_effect=tenant_kubectl,
+                ),
+                patch("scripts.endpoint.write_storage_marker"),
+                patch(
+                    "scripts.endpoint.read_storage_marker",
+                    return_value="phase3-marker\n",
+                ),
+                redirect_stdout(output),
+            ):
+                run_endpoint_gate(
+                    root,
+                    {"SPIKE_API_PORT": "6443"},
+                    cleanup=False,
+                    manifest=manifest,
+                )
+            payload = json.loads(output.getvalue())
+            self.assertEqual("tenant-a", payload["cluster"])
+            self.assertEqual("worker-a", payload["machine"])
+            self.assertEqual(1, secret_reads)
+            self.assertFalse((root / ".runtime/evidence").exists())

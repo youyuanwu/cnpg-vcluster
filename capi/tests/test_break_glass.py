@@ -281,3 +281,41 @@ class BreakGlassTests(unittest.TestCase):
         serialized = json.dumps(payload)
         self.assertNotIn("condition-token", serialized)
         self.assertNotIn("condition-password", serialized)
+
+    def test_emits_evidence_before_post_mutation_failure(self) -> None:
+        client = Mock()
+        client.kubectl.side_effect = [
+            result(0, stdout=json.dumps(self.resource())),
+            result(0),
+            result(1, stderr="result inspection failed"),
+        ]
+        output = io.StringIO()
+        with (
+            tempfile.TemporaryDirectory() as temporary,
+            patch("scripts.break_glass.require_management_ownership"),
+            patch("scripts.break_glass.validate_management_kubeconfig"),
+            patch("scripts.break_glass.ManagementClient", return_value=client),
+            patch("scripts.break_glass._resolve_tenant", return_value=object()),
+            patch("scripts.break_glass._verify_resource_graph"),
+            patch(
+                "scripts.break_glass._docker_inventory",
+                return_value={"containers": [], "volumes": []},
+            ),
+            redirect_stdout(output),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "result inspection"):
+                break_glass(
+                    Path(temporary),
+                    {
+                        "OWNERSHIP_LABEL": "example.owner",
+                        "LAB_PREFIX": "lab",
+                    },
+                    "configmap",
+                    "tenant-a",
+                    "fixture",
+                    "uid-1",
+                )
+        self.assertEqual(
+            "cnpg-vcluster.capi/break-glass",
+            json.loads(output.getvalue())["selectedFinalizer"],
+        )

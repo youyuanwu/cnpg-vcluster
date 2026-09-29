@@ -418,10 +418,11 @@ just break-glass <kind> <namespace> <name> <uid>
 
 The command supports only an allowlisted set of CAPI, CAPD, Kamaji, and test
 resource kinds. It requires the exact owned resource UID and deletion
-timestamp, writes an owner-only diagnostic snapshot, and uses atomic JSON
-Patch tests for UID, resource version, and the selected finalizer before
-removing only that finalizer. It does not delete Docker objects or bypass host
-ownership checks.
+timestamp, prints a redacted pre-mutation diagnostic record to stdout, and uses
+atomic JSON Patch tests for UID, resource version, and the selected finalizer
+before removing only that finalizer. Redirect stdout to an explicitly selected
+path when a retained record is required. It does not delete Docker objects or
+bypass host ownership checks.
 
 Do not use break-glass to adopt foreign resources, remove arbitrary
 finalizers, or compensate for an unreachable API. Never use broad Docker prune

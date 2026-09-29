@@ -7,6 +7,7 @@ import os
 import re
 import time
 import urllib.parse
+import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping
@@ -47,6 +48,9 @@ LIFECYCLE_MARKERS = {
 MANAGEMENT_CATALOG = load_management_resources(Path(__file__).resolve().parents[2])
 LOCAL_TENANT_NAME = re.compile(
     r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
+KUBECONFIG_CANDIDATE = re.compile(
+    r"^\.kubeconfig-candidate-[0-9]+-[a-f0-9]{32}$"
 )
 
 
@@ -383,15 +387,7 @@ def tenant_kubeconfig_path(root: Path, tenant: Tenant) -> Path:
     return root / ".runtime" / "tenants" / tenant.name / "kubeconfig"
 
 
-def clear_tenant_kubeconfig(root: Path, tenant_name: str) -> bool:
-    if not LOCAL_TENANT_NAME.fullmatch(tenant_name):
-        raise RuntimeError(
-            "tenant name must be a 1-63 character lowercase DNS label"
-        )
-    path = root / ".runtime" / "tenants" / tenant_name / "kubeconfig"
-    if not private_file_exists(path):
-        return False
-    unlink_private_file(path)
+def _remove_empty_tenant_cache_directory(root: Path, tenant_name: str) -> None:
     tenants = root / ".runtime" / "tenants"
     try:
         with existing_private_directory(tenants) as parent_fd:
@@ -402,7 +398,32 @@ def clear_tenant_kubeconfig(root: Path, tenant_name: str) -> bool:
     except IntegrityError as exc:
         if not isinstance(exc.__cause__, FileNotFoundError):
             raise
-    return True
+
+
+def clear_tenant_kubeconfig(root: Path, tenant_name: str) -> bool:
+    if not LOCAL_TENANT_NAME.fullmatch(tenant_name):
+        raise RuntimeError(
+            "tenant name must be a 1-63 character lowercase DNS label"
+        )
+    path = root / ".runtime" / "tenants" / tenant_name / "kubeconfig"
+    removed = False
+    if private_file_exists(path):
+        unlink_private_file(path)
+        removed = True
+    tenant_directory = path.parent
+    try:
+        with existing_private_directory(tenant_directory) as tenant_fd:
+            candidates = os.listdir(tenant_fd)
+    except IntegrityError as exc:
+        if not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+        candidates = []
+    for candidate in candidates:
+        if KUBECONFIG_CANDIDATE.fullmatch(candidate):
+            unlink_private_file(tenant_directory / candidate)
+            removed = True
+    _remove_empty_tenant_cache_directory(root, tenant_name)
+    return removed
 
 
 def clear_all_tenant_kubeconfigs(root: Path) -> list[str]:
@@ -456,8 +477,9 @@ def validate_tenant_kubeconfig_file(
     tenant: Tenant,
     *,
     check_access: bool = False,
+    path: Path | None = None,
 ) -> Path:
-    path = tenant_kubeconfig_path(root, tenant)
+    path = path or tenant_kubeconfig_path(root, tenant)
     details = path.lstat()
     if (
         path.is_symlink()
@@ -548,30 +570,40 @@ def export_tenant_kubeconfig(
             "json",
         ).stdout
     )
-    value = base64.b64decode(secret["data"]["value"])
-    path = tenant_kubeconfig_path(root, tenant)
-    write_private_file(path, value)
     if secret.get("type") != "cluster.x-k8s.io/secret":
         raise RuntimeError("tenant kubeconfig Secret type is unexpected")
-    validate_tenant_kubeconfig_file(
-        root,
-        config,
-        client,
-        tenant,
-        check_access=False,
+    value = base64.b64decode(secret["data"]["value"])
+    path = tenant_kubeconfig_path(root, tenant)
+    candidate = path.with_name(
+        f".kubeconfig-candidate-{os.getpid()}-{uuid.uuid4().hex}"
     )
-    run(
-        [
-            str(root / ".tools" / "bin" / "kubectl"),
-            "--kubeconfig",
-            str(path),
-            "--request-timeout",
-            config["KUBECTL_REQUEST_TIMEOUT"],
-            "get",
-            "--raw=/readyz",
-        ],
-        timeout=parse_duration(config["COMMAND_TIMEOUT"]),
-    )
+    write_private_file(candidate, value)
+    try:
+        validate_tenant_kubeconfig_file(
+            root,
+            config,
+            client,
+            tenant,
+            check_access=True,
+            path=candidate,
+        )
+        run(
+            [
+                str(root / ".tools" / "bin" / "kubectl"),
+                "--kubeconfig",
+                str(candidate),
+                "--request-timeout",
+                config["KUBECTL_REQUEST_TIMEOUT"],
+                "get",
+                "--raw=/readyz",
+            ],
+            timeout=parse_duration(config["COMMAND_TIMEOUT"]),
+        )
+        write_private_file(path, value)
+    finally:
+        unlink_private_file(candidate)
+        if not private_file_exists(path):
+            _remove_empty_tenant_cache_directory(root, tenant.name)
     return path
 
 

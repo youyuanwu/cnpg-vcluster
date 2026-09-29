@@ -79,14 +79,16 @@ def _validate_runtime_inventory(
         "azure/kamaji-provider.yaml",
     }
     tenant_pattern = r"[a-z0-9](?:[a-z0-9-]{0,28}[a-z0-9])?"
-    tenant_pair_pattern = rf"{tenant_pattern}-to-{tenant_pattern}"
+    local_tenant_pattern = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+    tenant_pair_pattern = rf"{local_tenant_pattern}-to-{local_tenant_pattern}"
     obsolete_files = {"management/tenant-endpoints.json", "lifecycle/.locks/local.lock"}
     obsolete_dynamic = (
         re.compile(
-            rf"^lifecycle/local/{tenant_pattern}/(identity|operation|ready)\.json$"
+            rf"^lifecycle/local/{local_tenant_pattern}/"
+            r"(identity|operation|ready)\.json$"
         ),
         re.compile(
-            rf"^lifecycle/local/{tenant_pattern}/evidence/"
+            rf"^lifecycle/local/{local_tenant_pattern}/evidence/"
             r"(create|delete)-[a-z0-9-]+\.json$"
         ),
         re.compile(
@@ -102,39 +104,44 @@ def _validate_runtime_inventory(
         re.compile(r"^azure-gate/evidence/lifecycle-[a-z0-9-]+\.json$"),
         re.compile(rf"^azure-gate/state/{tenant_pattern}\.json$"),
         re.compile(
-            rf"^rendered/tenants/{tenant_pattern}/"
+            rf"^rendered/tenants/{local_tenant_pattern}/"
             r"(control-plane|workers|worker-templates|worker-deployment|"
             r"invalid-control-plane|invalid-worker)\.yaml$"
         ),
         re.compile(
-            rf"^rendered/addons/{tenant_pattern}/"
+            rf"^rendered/addons/{local_tenant_pattern}/"
             r"(calico|kube-proxy)\.yaml$"
         ),
         re.compile(
-            rf"^rendered/addons/{tenant_pattern}/"
+            rf"^rendered/addons/{local_tenant_pattern}/"
             r"(resource-set|inventory|repair-[a-z0-9-]+)\.json$"
         ),
-        re.compile(rf"^rendered/storage/{tenant_pattern}/smoke\.yaml$"),
+        re.compile(rf"^rendered/storage/{local_tenant_pattern}/smoke\.yaml$"),
         re.compile(
-            rf"^rendered/cnpg/{tenant_pattern}/"
-            r"((operator|cluster|static-pvs)\.yaml|cross-db-[a-z0-9-]+\.json)$"
+            rf"^rendered/cnpg/{local_tenant_pattern}/"
+            r"((operator|cluster|static-pvs)\.yaml|"
+            r"cross-db-[a-z0-9-]+\.json|sql\.json)$"
         ),
         re.compile(r"^rendered/negative/foreign-node\.json$"),
-        re.compile(rf"^storage/{tenant_pattern}/volume\.json$"),
-        re.compile(rf"^deletions/{tenant_pattern}\.json$"),
+        re.compile(rf"^storage/{local_tenant_pattern}/volume\.json$"),
+        re.compile(rf"^deletions/{local_tenant_pattern}\.json$"),
         re.compile(r"^evidence/endpoint-(success\.json|failure\.txt)$"),
         re.compile(r"^evidence/cnpg-(success\.json|failure\.txt)$"),
         re.compile(
             r"^evidence/negative-condition-[a-z0-9.-]+-[a-z0-9.-]+\.json$"
         ),
         re.compile(r"^evidence/(create|verify)-(success\.json|failure\.txt)$"),
-        re.compile(rf"^evidence/preload-{tenant_pattern}\.json$"),
+        re.compile(rf"^evidence/preload-{local_tenant_pattern}\.json$"),
         re.compile(
             r"^evidence/break-glass-[a-z0-9.-]+-[a-z0-9.-]+-[a-z0-9.-]+"
             r"\.json$"
         ),
         re.compile(rf"^tenants/cross-{tenant_pair_pattern}\.kubeconfig$"),
-        re.compile(rf"^tenants/cross-{tenant_pattern}-postgres\.env$"),
+        re.compile(rf"^tenants/cross-{local_tenant_pattern}-postgres\.env$"),
+        re.compile(
+            rf"^tenants/{local_tenant_pattern}/"
+            r"\.kubeconfig-candidate-[0-9]+-[a-f0-9]{32}$"
+        ),
     )
     obsolete_directories = (
         re.compile(r"^azure/deletion-proofs$"),
@@ -144,8 +151,8 @@ def _validate_runtime_inventory(
         re.compile(r"^deletions$"),
         re.compile(r"^evidence$"),
         re.compile(r"^lifecycle/local$"),
-        re.compile(rf"^lifecycle/local/{tenant_pattern}$"),
-        re.compile(rf"^lifecycle/local/{tenant_pattern}/evidence$"),
+        re.compile(rf"^lifecycle/local/{local_tenant_pattern}$"),
+        re.compile(rf"^lifecycle/local/{local_tenant_pattern}/evidence$"),
         re.compile(r"^lifecycle/azure$"),
         re.compile(rf"^lifecycle/azure/{tenant_pattern}$"),
         re.compile(rf"^lifecycle/azure/{tenant_pattern}/evidence$"),
@@ -154,15 +161,15 @@ def _validate_runtime_inventory(
         re.compile(r"^lifecycle/rejected/azure$"),
         re.compile(r"^rendered/negative$"),
         re.compile(r"^rendered/tenants$"),
-        re.compile(rf"^rendered/tenants/{tenant_pattern}$"),
+        re.compile(rf"^rendered/tenants/{local_tenant_pattern}$"),
         re.compile(r"^rendered/addons$"),
-        re.compile(rf"^rendered/addons/{tenant_pattern}$"),
+        re.compile(rf"^rendered/addons/{local_tenant_pattern}$"),
         re.compile(r"^rendered/storage$"),
-        re.compile(rf"^rendered/storage/{tenant_pattern}$"),
+        re.compile(rf"^rendered/storage/{local_tenant_pattern}$"),
         re.compile(r"^rendered/cnpg$"),
-        re.compile(rf"^rendered/cnpg/{tenant_pattern}$"),
+        re.compile(rf"^rendered/cnpg/{local_tenant_pattern}$"),
         re.compile(r"^storage$"),
-        re.compile(rf"^storage/{tenant_pattern}$"),
+        re.compile(rf"^storage/{local_tenant_pattern}$"),
     )
     known_top_level = {
         "azure",
@@ -179,11 +186,11 @@ def _validate_runtime_inventory(
     allowed_directories = (
         re.compile(r"^(host|management|rendered|azure|tenants|lifecycle)$"),
         re.compile(r"^rendered/(providers|controller|azure-controller)$"),
-        re.compile(rf"^tenants/{tenant_pattern}$"),
+        re.compile(rf"^tenants/{local_tenant_pattern}$"),
         re.compile(r"^lifecycle/\.locks$"),
     )
     allowed_dynamic = (
-        re.compile(rf"^tenants/{tenant_pattern}/kubeconfig$"),
+        re.compile(rf"^tenants/{local_tenant_pattern}/kubeconfig$"),
         re.compile(r"^rendered/registry-hosts(?:-[a-z0-9.-]+)?\.toml$"),
         re.compile(r"^lifecycle/\.locks/azure\.lock$"),
     )

@@ -241,6 +241,7 @@ def break_glass(
         "selectedFinalizer": finalizer,
         "dockerInventory": docker_before,
     }
+    print(json.dumps(evidence, sort_keys=True), flush=True)
     patch = [
         {"op": "test", "path": "/metadata/uid", "value": uid},
         {
@@ -282,5 +283,4 @@ def break_glass(
         raise RuntimeError(f"break-glass result inspection failed: {after.stderr}")
     if _docker_inventory(config, tenant) != docker_before:
         raise RuntimeError("break-glass changed Docker object inventory")
-    print(json.dumps(evidence, sort_keys=True))
     return evidence

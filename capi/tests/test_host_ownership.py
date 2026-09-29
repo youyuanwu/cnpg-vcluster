@@ -89,8 +89,13 @@ class HostOwnershipTests(unittest.TestCase):
                 / "evidence"
                 / "delete-operation.json",
                 runtime / "rendered" / "storage" / "tenant-a" / "smoke.yaml",
+                runtime / "rendered" / "cnpg" / "tenant-a" / "sql.json",
                 runtime / "evidence" / "endpoint-success.json",
                 runtime / "storage" / "tenant-a" / "volume.json",
+                runtime
+                / "tenants"
+                / "tenant-a"
+                / (".kubeconfig-candidate-123-" + "a" * 32),
             )
             for path in (retained, foundation, *obsolete):
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -130,6 +135,25 @@ class HostOwnershipTests(unittest.TestCase):
                 _validate_runtime_inventory(root)
             self.assertTrue(kubeconfig.exists())
             self.assertTrue(identity.exists())
+
+    def test_runtime_inventory_allows_sixty_three_character_cache_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = "a" * 63
+            kubeconfig = (
+                root / ".runtime" / "tenants" / name / "kubeconfig"
+            )
+            kubeconfig.parent.mkdir(parents=True, mode=0o700)
+            for parent in kubeconfig.parent.parents:
+                if parent == root:
+                    break
+                parent.chmod(0o700)
+            kubeconfig.write_text("config\n", encoding="utf-8")
+            kubeconfig.chmod(0o600)
+
+            _validate_runtime_inventory(root)
+
+            self.assertTrue(kubeconfig.exists())
 
     def test_runtime_inventory_rejects_symlinked_obsolete_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as target:

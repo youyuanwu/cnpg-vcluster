@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from scripts.lib.azure.gate import (
     WorkerSnapshot,
@@ -9,6 +10,7 @@ from scripts.lib.azure.gate import (
     require_owned_resource_delta,
     require_replacement,
 )
+from scripts.test_azure_tenant_lifecycle import _ensure_tenant_ready
 
 
 VMSS = (
@@ -41,6 +43,38 @@ def readiness(identifiers=(0, 1, 2)):
 
 
 class AzureGateTests(unittest.TestCase):
+    def test_ready_gate_reuses_parsed_spec_after_terminating_tenant(self) -> None:
+        spec = type("Spec", (), {"name": "tenant-c"})()
+        events = []
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle.read_tenant",
+                return_value={
+                    "metadata": {
+                        "name": "tenant-c",
+                        "deletionTimestamp": "2026-09-29T00:00:00Z",
+                    }
+                },
+            ),
+            patch(
+                "scripts.test_azure_tenant_lifecycle.wait_tenant_absent",
+                side_effect=lambda *_args: events.append("absent"),
+            ),
+            patch(
+                "scripts.test_azure_tenant_lifecycle._create_tenant",
+                side_effect=lambda _config, observed: events.append(observed),
+            ),
+            patch(
+                "scripts.test_azure_tenant_lifecycle._require_status",
+                return_value={"classification": "ready"},
+            ),
+        ):
+            self.assertEqual(
+                {"classification": "ready"},
+                _ensure_tenant_ready({}, spec),
+            )
+        self.assertEqual(["absent", spec], events)
+
     def test_exact_mapping_checkpoint_and_non_primary_selection(self) -> None:
         snapshot = build_worker_snapshot(
             readiness(),
@@ -168,6 +202,8 @@ class AzureGateTests(unittest.TestCase):
         self.assertIn("ordinary-tenant-deletion", source)
         self.assertIn("external-absence-proof", source)
         self.assertEqual(2, source.count("_source_sha256(spec_path)"))
+        self.assertEqual(2, source.count("_create_tenant(config, spec)"))
+        self.assertNotIn('_tenant_command("create"', source)
         self.assertNotIn(".runtime", source)
         self.assertNotIn("checkpoint", source.lower())
         self.assertNotIn("persist_evidence", source)

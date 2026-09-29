@@ -28,9 +28,11 @@ from scripts.lib.azure.gate import (
     require_replacement,
 )
 from scripts.lib.azure.operator import (
+    create_tenant,
     read_tenant,
     tenant_document,
     tenant_status,
+    wait_tenant_absent,
     wait_tenant_ready,
 )
 from scripts.lib.azure.ownership import observe_azure_owned_resources
@@ -55,6 +57,14 @@ def _tenant_command(*arguments: str) -> str:
     ).stdout
 
 
+def _create_tenant(config: Mapping[str, str], spec) -> None:
+    _run_profile_mutation(
+        ROOT,
+        config,
+        lambda root, _config: create_tenant(root, spec),
+    )
+
+
 def _require_status(tenant: str, classification: str) -> dict[str, object]:
     output = _tenant_command("status", "azure", tenant)
     lines = [line for line in output.splitlines() if line.strip()]
@@ -67,6 +77,23 @@ def _require_status(tenant: str, classification: str) -> dict[str, object]:
             f"expected {classification}: {payload.get('blockers')}"
         )
     return payload
+
+
+def _ensure_tenant_ready(config: Mapping[str, str], spec) -> dict[str, object]:
+    existing = read_tenant(ROOT, spec.name)
+    metadata = existing.get("metadata") if isinstance(existing, dict) else None
+    if isinstance(metadata, dict) and metadata.get("deletionTimestamp"):
+        wait_tenant_absent(ROOT, spec.name)
+        existing = None
+    if existing is None:
+        _create_tenant(config, spec)
+    else:
+        if existing.get("spec") != tenant_document(spec)["spec"]:
+            raise RuntimeError(
+                "Azure lifecycle gate found an incompatible existing Tenant"
+            )
+        wait_tenant_ready(ROOT, spec.name)
+    return _require_status(spec.name, "ready")
 
 
 def _vmss_instances(config: Mapping[str, str], vmss_id: str) -> list[str]:
@@ -247,27 +274,7 @@ def main(arguments: list[str]) -> int:
         "foundation-readiness",
         lambda: _inspect_foundation(ROOT, config, require_healthy=True)[0],
     )
-    existing = read_tenant(ROOT, spec.name)
-    if existing is None:
-        phase(
-            "create-ready",
-            lambda: (
-                _tenant_command("create", "azure", str(spec_path)),
-                _require_status(spec.name, "ready"),
-            ),
-        )
-    else:
-        if existing.get("spec") != tenant_document(spec)["spec"]:
-            raise RuntimeError(
-                "Azure lifecycle gate found an incompatible existing Tenant"
-            )
-        phase(
-            "create-ready",
-            lambda: (
-                wait_tenant_ready(ROOT, spec.name),
-                _require_status(spec.name, "ready"),
-            ),
-        )
+    phase("create-ready", lambda: _ensure_tenant_ready(config, spec))
 
     tenant, before, owned_before = phase(
         "worker-identity-verification",
@@ -360,7 +367,7 @@ def main(arguments: list[str]) -> int:
     phase(
         "recreation",
         lambda: (
-            _tenant_command("create", "azure", str(spec_path)),
+            _create_tenant(config, spec),
             _require_status(spec.name, "ready"),
             _ready_snapshot(config, spec),
         ),
