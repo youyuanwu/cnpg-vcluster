@@ -13,11 +13,13 @@ base64 = "0.22"
 bollard = { version = "=0.21.1", default-features = false, features = ["pipe"] }
 bytes = "1"
 chrono = { version = "0.4", default-features = false, features = ["clock", "serde"] }
+console_error_panic_hook = "0.1"
 futures = "0.3"
 gloo-net = "0.7"
 hex = "0.4"
 http-body-util = "0.1"
 ipnet = { version = "2", features = ["serde"] }
+js-sys = "=0.3.106"
 k8s-openapi = { version = "=0.28.0", features = ["v1_36", "schemars"] }
 kube = { version = "=4.2.0", features = ["derive", "runtime", "rustls-tls"] }
 kube-lease-manager = "=0.12.0"

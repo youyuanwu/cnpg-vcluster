@@ -8,7 +8,8 @@ use axum::{
     Json, Router,
     body::Body,
     extract::{Path, State},
-    http::{Request, StatusCode},
+    http::{Request, StatusCode, header},
+    middleware::{self, Next},
     response::IntoResponse,
     routing::get,
 };
@@ -75,8 +76,25 @@ pub fn router(state: AppState, web_directory: PathBuf) -> Router {
         .route(API_TENANT_TOPOLOGY_PATH, get(tenant_topology))
         .route("/api/{*path}", get(api_not_found))
         .fallback_service(static_files)
+        .layer(middleware::from_fn(no_store_html))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn no_store_html(request: Request<Body>, next: Next) -> impl IntoResponse {
+    let mut response = next.run(request).await;
+    if response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|value| value.starts_with("text/html"))
+    {
+        response.headers_mut().insert(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-store"),
+        );
+    }
+    response
 }
 
 async fn healthz() -> StatusCode {
@@ -579,6 +597,13 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(nested.status(), StatusCode::OK);
+        assert_eq!(
+            nested
+                .headers()
+                .get("cache-control")
+                .and_then(|value| value.to_str().ok()),
+            Some("no-store")
+        );
         let nested_body = nested.into_body().collect().await.expect("body").to_bytes();
         assert!(
             nested_body

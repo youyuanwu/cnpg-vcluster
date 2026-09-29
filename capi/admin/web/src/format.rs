@@ -1,5 +1,3 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use tenant_admin_shared::query::{
     ConditionStatus, ProviderMode, TenantClassification, TenantProvider, TopologyEdgeKind,
     TopologyHealth, TopologyNodeKind,
@@ -101,10 +99,22 @@ pub fn optional_text(value: Option<&str>) -> &str {
 }
 
 pub fn format_age(created_at: Option<&str>) -> String {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |duration| duration.as_secs() as i64);
+    let now = current_epoch_seconds();
     created_at.map_or_else(|| "Unknown".to_owned(), |value| format_age_at(value, now))
+}
+
+#[cfg(target_arch = "wasm32")]
+fn current_epoch_seconds() -> i64 {
+    (js_sys::Date::now() / 1000.0) as i64
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn current_epoch_seconds() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
 }
 
 pub fn format_age_at(created_at: &str, now: i64) -> String {
