@@ -400,6 +400,27 @@ def _remove_empty_tenant_cache_directory(root: Path, tenant_name: str) -> None:
             raise
 
 
+def _clear_tenant_kubeconfig_candidates(root: Path, tenant_name: str) -> bool:
+    tenant_directory = (
+        root / ".runtime" / "tenants" / tenant_name
+    )
+    try:
+        with existing_private_directory(tenant_directory) as tenant_fd:
+            candidates = os.listdir(tenant_fd)
+    except IntegrityError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return False
+        raise
+    removed = False
+    for candidate in candidates:
+        if KUBECONFIG_CANDIDATE.fullmatch(candidate):
+            unlink_private_file(tenant_directory / candidate)
+            removed = True
+    if removed and not private_file_exists(tenant_directory / "kubeconfig"):
+        _remove_empty_tenant_cache_directory(root, tenant_name)
+    return removed
+
+
 def clear_tenant_kubeconfig(root: Path, tenant_name: str) -> bool:
     if not LOCAL_TENANT_NAME.fullmatch(tenant_name):
         raise RuntimeError(
@@ -410,18 +431,10 @@ def clear_tenant_kubeconfig(root: Path, tenant_name: str) -> bool:
     if private_file_exists(path):
         unlink_private_file(path)
         removed = True
-    tenant_directory = path.parent
-    try:
-        with existing_private_directory(tenant_directory) as tenant_fd:
-            candidates = os.listdir(tenant_fd)
-    except IntegrityError as exc:
-        if not isinstance(exc.__cause__, FileNotFoundError):
-            raise
-        candidates = []
-    for candidate in candidates:
-        if KUBECONFIG_CANDIDATE.fullmatch(candidate):
-            unlink_private_file(tenant_directory / candidate)
-            removed = True
+    removed = (
+        _clear_tenant_kubeconfig_candidates(root, tenant_name)
+        or removed
+    )
     _remove_empty_tenant_cache_directory(root, tenant_name)
     return removed
 
@@ -556,6 +569,7 @@ def export_tenant_kubeconfig(
     client: ManagementClient,
     tenant: Tenant,
 ) -> Path:
+    _clear_tenant_kubeconfig_candidates(root, tenant.name)
     secret = _management_resource("Secret")
     secret_name = secret.expected_name(tenant.name)
     if secret_name is None:
@@ -613,6 +627,7 @@ def ensure_tenant_kubeconfig(
     client: ManagementClient,
     tenant: Tenant,
 ) -> Path:
+    _clear_tenant_kubeconfig_candidates(root, tenant.name)
     path = tenant_kubeconfig_path(root, tenant)
     if path.exists() or path.is_symlink():
         try:

@@ -15,6 +15,7 @@ from scripts.lib.files import IntegrityError, write_private_file
 from scripts.lib.tenants import (
     clear_all_tenant_kubeconfigs,
     clear_tenant_kubeconfig,
+    ensure_tenant_kubeconfig,
     export_tenant_kubeconfig,
 )
 from scripts.machines import _foreign_node_rejected
@@ -96,6 +97,71 @@ class TenantStateTests(unittest.TestCase):
                 ["kubeconfig"],
                 sorted(path.name for path in cache.parent.iterdir()),
             )
+
+    def test_valid_cache_recovery_removes_stale_candidate(self) -> None:
+        tenant = type("Tenant", (), {"name": "tenant-a"})()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            cache = (
+                root / ".runtime" / "tenants" / "tenant-a" / "kubeconfig"
+            )
+            candidate = cache.with_name(
+                ".kubeconfig-candidate-123-" + "a" * 32
+            )
+            write_private_file(cache, "valid-config")
+            write_private_file(candidate, "stale-config")
+            with (
+                patch(
+                    "scripts.lib.tenants.validate_tenant_kubeconfig_file",
+                    return_value=cache,
+                ) as validate,
+                patch("scripts.lib.tenants.export_tenant_kubeconfig") as export,
+            ):
+                self.assertEqual(
+                    cache,
+                    ensure_tenant_kubeconfig(root, {}, object(), tenant),
+                )
+            self.assertFalse(candidate.exists())
+            self.assertEqual(b"valid-config", cache.read_bytes())
+            self.assertEqual(2, validate.call_count)
+            export.assert_not_called()
+
+    def test_export_failure_removes_stale_candidate_without_cache(self) -> None:
+        tenant = type(
+            "Tenant",
+            (),
+            {"name": "tenant-a", "namespace": "tenant-a-system"},
+        )()
+        client = type(
+            "Client",
+            (),
+            {
+                "kubectl": staticmethod(
+                    lambda *_args, **_kwargs: CompletedProcess(
+                        [],
+                        0,
+                        stdout=json.dumps(
+                            {
+                                "type": "Opaque",
+                                "data": {"value": "a3ViZWNvbmZpZw=="},
+                            }
+                        ),
+                        stderr="",
+                    )
+                )
+            },
+        )()
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tenant_directory = root / ".runtime/tenants/tenant-a"
+            write_private_file(
+                tenant_directory
+                / (".kubeconfig-candidate-123-" + "a" * 32),
+                "stale-config",
+            )
+            with self.assertRaisesRegex(RuntimeError, "type is unexpected"):
+                export_tenant_kubeconfig(root, {}, client, tenant)
+            self.assertFalse(tenant_directory.exists())
 
     def test_clear_one_removes_only_exact_cache(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
