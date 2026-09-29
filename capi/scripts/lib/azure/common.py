@@ -132,6 +132,8 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
         "AZURE_CALICO_VERSION",
         "AZURE_CONTROLLER_REPOSITORY",
         "AZURE_CONTROLLER_TAG",
+        "AZURE_ADMIN_REPOSITORY",
+        "AZURE_ADMIN_TAG",
         "AZURE_DEPLOY_TIMEOUT",
         "AZURE_CONTROLLER_TIMEOUT",
         "AZURE_TENANT_TIMEOUT",
@@ -142,13 +144,18 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
             "AZURE_PREFIX must start with a lowercase letter and contain "
             "2-20 lowercase letters, digits, or hyphens"
         )
-    repository = config["AZURE_CONTROLLER_REPOSITORY"]
-    if len(repository) > 255 or not CONTROLLER_REPOSITORY_RE.fullmatch(repository):
-        raise ConfigError(
-            "AZURE_CONTROLLER_REPOSITORY must be a lowercase OCI repository path"
-        )
-    if not CONTROLLER_TAG_RE.fullmatch(config["AZURE_CONTROLLER_TAG"]):
-        raise ConfigError("AZURE_CONTROLLER_TAG must be a valid OCI tag")
+    for key in ("AZURE_CONTROLLER_REPOSITORY", "AZURE_ADMIN_REPOSITORY"):
+        repository = config[key]
+        if (
+            len(repository) > 255
+            or not CONTROLLER_REPOSITORY_RE.fullmatch(repository)
+        ):
+            raise ConfigError(
+                f"{key} must be a lowercase OCI repository path"
+            )
+    for key in ("AZURE_CONTROLLER_TAG", "AZURE_ADMIN_TAG"):
+        if not CONTROLLER_TAG_RE.fullmatch(config[key]):
+            raise ConfigError(f"{key} must be a valid OCI tag")
     return config
 
 

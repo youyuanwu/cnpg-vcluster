@@ -96,6 +96,8 @@ class TimingTests(unittest.TestCase):
                 patch("scripts.test_e2e.verify_all_inputs"),
                 patch("scripts.test_e2e.verify_no_lab_residue"),
                 patch("scripts.test_e2e.wait_tenant_ready"),
+                patch("scripts.test_e2e.ManagementClient", return_value=object()),
+                patch("scripts.test_e2e.verify_admin_api"),
                 redirect_stdout(output),
             ):
                 with self.assertRaisesRegex(RuntimeError, "tenant setup failure"):
@@ -132,6 +134,8 @@ class TimingTests(unittest.TestCase):
                 ),
                 patch("scripts.test_e2e.verify_all_inputs"),
                 patch("scripts.test_e2e.wait_tenant_ready"),
+                patch("scripts.test_e2e.ManagementClient", return_value=object()),
+                patch("scripts.test_e2e.verify_admin_api"),
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,
@@ -319,6 +323,13 @@ class TimingTests(unittest.TestCase):
                 patch("scripts.test_e2e.verify_tenant_deletion", side_effect=verify),
                 patch("scripts.test_e2e.run", return_value=CompletedProcess([], 0, stdout="", stderr="")),
                 patch("scripts.test_e2e.delete_controller_tenant", side_effect=delete_tenant),
+                patch(
+                    "scripts.test_e2e.verify_admin_api",
+                    side_effect=lambda *_args, **kwargs: calls.append(
+                        "admin-api:"
+                        + ",".join(kwargs["expected_tenant_names"])
+                    ),
+                ),
                 redirect_stdout(output),
             ):
                 if deletion_failure or residue or sql_result != "1":
@@ -340,8 +351,23 @@ class TimingTests(unittest.TestCase):
             expected = ["sql", "persistence", "identity", "finalization"]
             if not deletion_failure:
                 expected.append("verify-absence")
+                if not residue:
+                    expected.append("admin-api:")
             expected.append("destroy")
             self.assertEqual(expected, calls[-len(expected):])
+            if not deletion_failure and not residue:
+                self.assertEqual(
+                    [
+                        "admin-api:",
+                        "admin-api:tenant-example",
+                        "admin-api:",
+                    ],
+                    [
+                        call
+                        for call in calls
+                        if call.startswith("admin-api:")
+                    ],
+                )
             self.assertEqual(
                 "failed" if deletion_failure or residue else "passed",
                 timings["tenant_deletion_finalization"],

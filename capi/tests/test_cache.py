@@ -8,6 +8,7 @@ import os
 import tarfile
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import MagicMock, call, patch
@@ -22,6 +23,7 @@ from scripts.cache import (
     _verify_archive_metadata,
     restore_host_image,
     acquire_cache,
+    materialize_inputs,
     verify_cache,
 )
 from scripts.lib.files import IntegrityError
@@ -109,6 +111,81 @@ def write_archive(
 
 
 class CacheTests(unittest.TestCase):
+    def test_lab_cache_default_and_admin_scope_dispatch_exactly(self) -> None:
+        from scripts import lab
+
+        original_umask = os.umask(0)
+        os.umask(original_umask)
+        try:
+            with (
+                patch.object(lab, "load_configuration", return_value={}),
+                patch.object(lab, "tools_lock", return_value=nullcontext()),
+                patch.object(lab, "acquire_cache") as full,
+                patch.object(lab, "acquire_admin_build_cache") as admin,
+            ):
+                self.assertEqual(0, lab.main(["cache", ""]))
+                full.assert_called_once_with(lab.ROOT, {})
+                admin.assert_not_called()
+                full.reset_mock()
+                self.assertEqual(0, lab.main(["cache", "admin-build"]))
+                admin.assert_called_once_with(lab.ROOT, {})
+                full.assert_not_called()
+                with self.assertRaisesRegex(RuntimeError, "optional admin-build"):
+                    lab.main(["cache", "unexpected"])
+        finally:
+            os.umask(original_umask)
+
+    def test_admin_build_cache_acquires_only_pinned_wasm_tools(self) -> None:
+        from scripts.cache import acquire_admin_build_cache
+
+        with patch(
+            "scripts.cache.acquire_admin_build_tools"
+        ) as acquire:
+            acquire_admin_build_cache(Path("/repo/capi"), {"key": "value"})
+        acquire.assert_called_once_with(
+            Path("/repo/capi"),
+            {"key": "value"},
+        )
+
+    def test_trunk_is_required_and_materialized_by_the_cache(self) -> None:
+        config = load_configuration(Path(__file__).resolve().parents[1])
+        requirements = _requirements(config)
+        self.assertIn(
+            {
+                "path": "trunk-x86_64-unknown-linux-gnu.tar.gz",
+                "sha256": config["TRUNK_SHA256"],
+            },
+            requirements["inputs"],
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            generation = root / "generation"
+            (generation / "inputs").mkdir(parents=True)
+            verified = VerifiedCache(generation, {}, "state")
+            copied: list[tuple[Path, Path]] = []
+            with (
+                patch(
+                    "scripts.cache._copy_private",
+                    side_effect=lambda source, destination: copied.append(
+                        (source, destination)
+                    ),
+                ),
+                patch("scripts.cache.verify_all_inputs"),
+            ):
+                materialize_inputs(root, config, verified=verified)
+            self.assertIn(
+                (
+                    generation
+                    / "inputs"
+                    / "trunk-x86_64-unknown-linux-gnu.tar.gz",
+                    root
+                    / ".tools"
+                    / "inputs"
+                    / "trunk-x86_64-unknown-linux-gnu.tar.gz",
+                ),
+                copied,
+            )
+
     def test_cargo_lock_and_compiler_are_cache_requirements(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)

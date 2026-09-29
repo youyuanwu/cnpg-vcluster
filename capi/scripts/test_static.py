@@ -43,6 +43,16 @@ EXPECTED_RECIPES = {
     "controller-lint",
     "controller-build",
     "controller-image",
+    "admin-metrics",
+    "admin-fetch",
+    "admin-generate-check",
+    "admin-test",
+    "admin-lint",
+    "admin-build",
+    "admin-package-check",
+    "admin-image",
+    "admin-status",
+    "admin-port-forward",
     "test-controller-convergence",
     "test-controller-readiness",
     "test-controller-deletion",
@@ -189,6 +199,40 @@ def check_repository_boundaries() -> None:
         result = output("git", "check-ignore", candidate, check_result=False)
         check(result.returncode == 0, f"{candidate} is not ignored")
     check(not any(path.is_symlink() for path in ROOT.rglob("*")), "symlinks below capi are forbidden")
+    yaml_imports = []
+    for path in ROOT.rglob("*.py"):
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
+            if re.match(r"\s*(?:from\s+yaml\b|import\s+.*\byaml\b)", line):
+                yaml_imports.append(f"{path.relative_to(ROOT)}:{line_number}")
+    check(
+        not yaml_imports,
+        f"Python below capi must remain stdlib-only; yaml imports: {yaml_imports}",
+    )
+    dependency_manifests = [
+        path.relative_to(ROOT).as_posix()
+        for pattern in ("requirements*.txt", "Pipfile*", "poetry.lock")
+        for path in ROOT.rglob(pattern)
+    ]
+    check(
+        not dependency_manifests,
+        "Python dependency manifests are forbidden below capi: "
+        f"{sorted(dependency_manifests)}",
+    )
+    automation = (
+        (ROOT / "Justfile").read_text(encoding="utf-8")
+        + (ROOT.parent / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
+    check(
+        re.search(
+            r"\b(?:python3?\s+-m\s+)?pip3?\s+install\b",
+            automation,
+        )
+        is None,
+        "CAPI automation must not install Python dependencies",
+    )
     check((ROOT / "scripts" / "post_renderer.py").stat().st_mode & 0o111 != 0, "post-renderer is not executable")
     repository = ROOT.parent
     check(not (repository / "Makefile").exists(), "obsolete root Makefile remains")
@@ -206,8 +250,10 @@ def check_repository_boundaries() -> None:
     check(
         toolchain.get("channel") == "1.98.1"
         and toolchain.get("profile") == "minimal"
-        and set(toolchain.get("components", [])) == {"clippy", "rustfmt"},
-        "root Rust toolchain must select minimal Rust 1.98.1 with clippy and rustfmt",
+        and set(toolchain.get("components", [])) == {"clippy", "rustfmt"}
+        and toolchain.get("targets") == ["wasm32-unknown-unknown"],
+        "root Rust toolchain must select minimal Rust 1.98.1, clippy, rustfmt, "
+        "and the Wasm target",
     )
     workspace_manifest = tomllib.loads(
         (repository / "Cargo.toml").read_text(encoding="utf-8")
@@ -283,6 +329,24 @@ def check_repository_boundaries() -> None:
         "scripts/controller_metrics.py --max 12000" in justfile,
         "controller production-line threshold is not enforced",
     )
+    check("admin-metrics:" in justfile, "admin metrics recipe is missing")
+    check(
+        "scripts/admin_metrics.py --max 6000" in justfile,
+        "admin production-line threshold is not enforced",
+    )
+    admin_metrics_source = (ROOT / "scripts/admin_metrics.py").read_text(
+        encoding="utf-8"
+    )
+    for contract in (
+        "ADMIN_BASELINE_LINES = 3916",
+        "MAX_ADMIN_PRODUCTION_LINES = 6000",
+        'for crate in ("shared", "server", "web")',
+        "Admin Rust: baseline=",
+    ):
+        check(
+            contract in admin_metrics_source,
+            f"admin metric contract missing: {contract}",
+        )
     metrics_source = (ROOT / "scripts/controller_metrics.py").read_text(
         encoding="utf-8"
     )
@@ -370,13 +434,21 @@ def check_repository_boundaries() -> None:
     for token in (
         "actions/upload-artifact@v6",
         "controller-manager-${{ github.sha }}",
-        "path: capi/.runtime/rendered/controller/manager",
+        "path: capi/.runtime/rendered/ci-artifact/",
+        "just admin-fetch",
+        "just admin-generate-check",
+        "just admin-lint",
+        "just admin-test",
+        "just admin-metrics",
+        "just admin-package-check",
     ):
         check(token in fast_checks, f"fast-check artifact wiring is missing {token}")
     for token in (
         "actions/download-artifact@v7",
         "controller-manager-${{ github.sha }}",
         "CAPI_PREBUILT_CONTROLLER_BINARY",
+        "CAPI_PREBUILT_ADMIN_SERVER",
+        "CAPI_PREBUILT_ADMIN_WEB",
         "capi/.tools/artifacts/${{ github.sha }}",
     ):
         check(token in e2e, f"PR E2E artifact wiring is missing {token}")
@@ -386,6 +458,11 @@ def check_repository_boundaries() -> None:
     check(
         "CAPI_PREBUILT_CONTROLLER_BINARY" not in high_capacity,
         "high-capacity validation must retain an independent controller build",
+    )
+    check(
+        "CAPI_PREBUILT_ADMIN_SERVER" not in high_capacity
+        and "CAPI_PREBUILT_ADMIN_WEB" not in high_capacity,
+        "high-capacity validation must retain an independent admin build",
     )
     check("--activation-token=${CONTROLLER_ACTIVATION_TOKEN}" in manager,
           "Tenant controller activation token placeholder is missing")
@@ -723,11 +800,15 @@ def check_documentation() -> None:
     azure_design = (ROOT / "docs" / "azure-experiment-design.md").read_text(
         encoding="utf-8"
     )
+    admin_design = (ROOT / "docs" / "admin-ui-design.md").read_text(
+        encoding="utf-8"
+    )
     notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
     root_readme = (ROOT.parent / "README.md").read_text(encoding="utf-8")
     readme_flat = " ".join(readme.split())
     design_flat = " ".join(design.split())
     azure_design_flat = " ".join(azure_design.split())
+    admin_design_flat = " ".join(admin_design.split())
     notices_flat = " ".join(notices.split())
     required_readme = (
         "CAPD `DevCluster` and `DevMachine` resources are development-only",
@@ -753,6 +834,9 @@ def check_documentation() -> None:
         "does not silently acquire missing content",
         "owner-only registry storage tree",
         "only on the private kind Docker network",
+        "`just admin-port-forward`",
+        "`just admin-package-check`",
+        "Generated HTML, JavaScript, Wasm, and CSS bundles",
     )
     required_design = (
         "Ordinary Kubernetes DELETE is accepted",
@@ -766,6 +850,8 @@ def check_documentation() -> None:
         "Azure tenants are not separate AKS clusters",
         "`just test-e2e-offline`",
         "materialized from the verified active cache",
+        "## Read-only Tenant Admin",
+        "exact `get` and `list` permissions",
     )
     for token in required_readme:
         check(
@@ -788,6 +874,9 @@ def check_documentation() -> None:
         "Recreate from the same specification and reach Ready",
         "shared Azure Container Registry (ACR)",
         "The Tenant operator receives no Azure credentials.",
+        "`adminImage` and `adminDeploymentUid`",
+        "Tenant Admin images",
+        "admin repository, digest, Deployment UID",
     )
     for token in required_azure_design:
         check(
@@ -799,6 +888,27 @@ def check_documentation() -> None:
         not in azure_design_flat,
         "Azure design claims unimplemented CloudNativePG behavior",
     )
+    required_admin_design = (
+        "Leptos client-side WebAssembly application",
+        "Axum server",
+        "Kubernetes is the only durable data source",
+        "grants only exact `get` and `list` verbs",
+        "Refresh is manual",
+        "`GET /api/v1/overview`",
+        "`GET /api/v1/tenants/{name}/topology`",
+        "validated exact owner UID chain",
+        "`adminImage` and `adminDeploymentUid`",
+        "`just admin-port-forward`",
+        "Generated browser bundles",
+        "Future create or delete support",
+        "## Troubleshooting",
+        "## Limitations",
+    )
+    for token in required_admin_design:
+        check(
+            token in admin_design_flat,
+            f"admin design lacks documentation assertion: {token}",
+        )
     for project in (
         "Cluster API",
         "Kamaji CAPI provider",
@@ -806,6 +916,9 @@ def check_documentation() -> None:
         "PostgreSQL",
         "BusyBox",
         "Distribution",
+        "Trunk",
+        "wasm-bindgen CLI",
+        "leptos",
     ):
         check(project in notices, f"third-party notices omit {project}")
     direct_etcd = (
@@ -823,6 +936,11 @@ def check_documentation() -> None:
     check(
         "one Cluster API and CloudNativePG experiment" in root_readme,
         "root README does not identify the CAPI tenant lifecycle lab",
+    )
+    check(
+        "capi/docs/admin-ui-design.md" in root_readme
+        and "read-only Leptos/Axum Tenant Admin UI" in root_readme,
+        "root README omits the Tenant Admin entry point",
     )
     check(
         (ROOT / "licenses" / "README.md").is_file(),

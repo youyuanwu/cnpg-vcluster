@@ -41,9 +41,12 @@ class CIWorkflowTests(unittest.TestCase):
             "just test-azure-operator-contracts", "just controller-fetch",
             "just controller-verify", "just controller-lint", "just controller-test",
             "just controller-metrics", "just controller-build",
+            "just admin-fetch", "just admin-generate-check", "just admin-lint",
+            "just admin-test", "just admin-metrics", "just admin-package-check",
         ):
             self.assertIn(command, fast)
-        self.assertNotIn("just cache", fast)
+        self.assertIn("just cache admin-build", fast)
+        self.assertNotIn("run: just cache\n", fast)
         self.assertLess(e2e.index("just cache"), e2e.index("just test-e2e"))
         self.assertIn("just test-e2e", e2e)
         self.assertNotIn("just test-e2e-offline", e2e)
@@ -51,6 +54,13 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("controller-manager-${{ github.sha }}", fast)
         self.assertIn("actions/download-artifact@v7", e2e)
         self.assertIn("CAPI_PREBUILT_CONTROLLER_BINARY", e2e)
+        self.assertIn("CAPI_PREBUILT_ADMIN_SERVER", e2e)
+        self.assertIn("CAPI_PREBUILT_ADMIN_WEB", e2e)
+        self.assertIn("path: capi/.runtime/rendered/ci-artifact/", fast)
+        self.assertLess(
+            fast.index("just admin-package-check"),
+            fast.index("actions/upload-artifact@v6"),
+        )
         setup = (
             "just cache", "just tools", "just prepare-host",
             "just create-management",

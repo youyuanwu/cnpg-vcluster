@@ -23,6 +23,7 @@ from scripts.lib.redaction import redact
 from scripts.tools import verify_all_inputs
 from scripts.lib.timing import PhaseTimings
 from scripts.lib.registry import registry_name
+from scripts.lib.admin_local import verify_admin_api
 from scripts.lib.controller_scenarios import (
     delete_controller_tenant,
     tenant_from_document,
@@ -285,10 +286,18 @@ def run_e2e() -> int:
         with timings.phase("management_bootstrap"):
             verify_all_inputs(ROOT, config)
             run_just(ROOT, config, "create-management")
+            verify_admin_api(
+                ManagementClient(ROOT, config),
+                expected_tenant_names=(),
+            )
 
         with timings.phase("tenant_convergence"):
             run_just(ROOT, config, "local-tenant-apply", str(manifest))
             document = wait_tenant_ready(ROOT, config, tenant_name)
+            verify_admin_api(
+                ManagementClient(ROOT, config),
+                expected_tenant_names=(tenant_name,),
+            )
         run_just(ROOT, config, "local-tenant-status", tenant_name)
         with timings.phase("tenant_sql_probe"):
             tenant = tenant_from_document(ROOT, config, document)
@@ -304,6 +313,7 @@ def run_e2e() -> int:
             identity = capture_tenant_deletion_identity(config, client, document)
             delete_controller_tenant(ROOT, config, identity["name"])
             verify_tenant_deletion(client, identity)
+            verify_admin_api(client, expected_tenant_names=())
             print("exact Tenant/root/Lease/container/volume absence verified before management teardown")
     except BaseException as exc:
         failure = exc

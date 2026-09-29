@@ -28,7 +28,14 @@ from scripts.lib.files import (
     write_private_file,
 )
 from scripts.lib.process import CommandError, run
-from scripts.tools import AUTHORED_INPUTS, DOWNLOADS, TAG_SOURCES, acquire_tools, verify_all_inputs
+from scripts.tools import (
+    AUTHORED_INPUTS,
+    DOWNLOADS,
+    TAG_SOURCES,
+    acquire_admin_build_tools,
+    acquire_tools,
+    verify_all_inputs,
+)
 
 
 CACHE_SCHEMA = 1
@@ -929,6 +936,11 @@ def materialize_inputs(
         _private_regular_file(path)
         path.unlink()
     verify_all_inputs(root, config)
+
+
+def acquire_admin_build_cache(root: Path, config: dict[str, str]) -> None:
+    acquire_admin_build_tools(root, config)
+    print("prepared verified Trunk and wasm-bindgen admin build tools")
 
 
 def acquire_cache(root: Path, config: dict[str, str]) -> None:

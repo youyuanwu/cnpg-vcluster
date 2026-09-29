@@ -30,6 +30,7 @@ from scripts.lib.registry import (
     validate_registry_state_files,
 )
 from scripts.lib.controller import delete_controller
+from scripts.lib.admin_local import delete_local_admin
 
 
 def _validate_runtime_inventory(
@@ -74,6 +75,8 @@ def _validate_runtime_inventory(
         "rendered/controller/manager",
         "rendered/controller/manager.yaml",
         "rendered/azure-controller/manager.yaml",
+        "rendered/admin/tenant-admin",
+        "rendered/admin/deployment-local.json",
         "azure/resources.json",
         "azure/management.kubeconfig",
         "azure/kamaji-provider.yaml",
@@ -185,13 +188,20 @@ def _validate_runtime_inventory(
     }
     allowed_directories = (
         re.compile(r"^(host|management|rendered|azure|tenants|lifecycle)$"),
-        re.compile(r"^rendered/(providers|controller|azure-controller)$"),
+        re.compile(r"^rendered/(providers|controller|azure-controller|admin)$"),
+        re.compile(r"^rendered/admin/web$"),
         re.compile(rf"^tenants/{local_tenant_pattern}$"),
         re.compile(r"^lifecycle/\.locks$"),
     )
     allowed_dynamic = (
         re.compile(rf"^tenants/{local_tenant_pattern}/kubeconfig$"),
         re.compile(r"^rendered/registry-hosts(?:-[a-z0-9.-]+)?\.toml$"),
+        re.compile(r"^rendered/admin/web/index\.html$"),
+        re.compile(r"^rendered/admin/web/tenant-admin-web-[0-9a-f]{8,64}\.js$"),
+        re.compile(
+            r"^rendered/admin/web/tenant-admin-web-[0-9a-f]{8,64}_bg\.wasm$"
+        ),
+        re.compile(r"^rendered/admin/web/style-[0-9a-f]{8,64}\.css$"),
         re.compile(r"^lifecycle/\.locks/azure\.lock$"),
     )
     obsolete = []
@@ -281,6 +291,7 @@ def _remove_local_runtime(root: Path) -> None:
 
 
 def _delete_kubernetes_stack(root: Path, config: dict[str, str], client: ManagementClient) -> None:
+    delete_local_admin(root, config, client)
     delete_controller(root, config, client)
     delete_providers(root, config, client)
 

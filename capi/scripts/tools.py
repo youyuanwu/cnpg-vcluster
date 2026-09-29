@@ -31,6 +31,12 @@ if TYPE_CHECKING:
 
 
 DOWNLOADS = (
+    ("trunk-x86_64-unknown-linux-gnu.tar.gz", "TRUNK_URL", "TRUNK_SHA256"),
+    (
+        "wasm-bindgen-0.2.129-x86_64-unknown-linux-musl.tar.gz",
+        "WASM_BINDGEN_URL",
+        "WASM_BINDGEN_SHA256",
+    ),
     ("kind-linux-amd64", "KIND_URL", "KIND_SHA256"),
     ("kubectl-linux-amd64", "KUBECTL_URL", "KUBECTL_SHA256"),
     ("helm-linux-amd64.tar.gz", "HELM_URL", "HELM_SHA256"),
@@ -47,6 +53,7 @@ DOWNLOADS = (
     ("calico.yaml", "CALICO_MANIFEST_URL", "CALICO_MANIFEST_SHA256"),
     ("cnpg.yaml", "CNPG_MANIFEST_URL", "CNPG_MANIFEST_SHA256"),
 )
+ADMIN_BUILD_DOWNLOADS = DOWNLOADS[:2]
 
 EXPECTED_MANIFEST_IMAGES = {
     "capi-core-components.yaml": "CAPI_CORE_IMAGE_TAGGED",
@@ -161,6 +168,83 @@ def _install_helm(archive: Path, destination: Path, expected_binary_sha256: str)
         os.replace(temporary, destination)
     finally:
         temporary.unlink(missing_ok=True)
+
+
+def _install_trunk(
+    archive: Path,
+    destination: Path,
+    expected_version: str,
+) -> None:
+    with tarfile.open(archive, "r:gz") as bundle:
+        members = [member for member in bundle.getmembers() if member.name == "trunk"]
+        if len(members) != 1 or not members[0].isfile():
+            raise IntegrityError("Trunk archive does not contain one regular trunk file")
+        extracted = bundle.extractfile(members[0])
+        if extracted is None:
+            raise IntegrityError("unable to extract Trunk binary")
+        ensure_private_dir(destination.parent)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+            shutil.copyfileobj(extracted, output)
+    try:
+        temporary.chmod(0o755)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    try:
+        version = run([str(destination), "--version"], timeout=30).stdout.strip()
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    if version != f"trunk {expected_version}":
+        destination.unlink(missing_ok=True)
+        raise IntegrityError(
+            f"installed Trunk identity mismatch: {version!r}, "
+            f"expected 'trunk {expected_version}'"
+        )
+
+
+def _install_wasm_bindgen(
+    archive: Path,
+    destination: Path,
+    expected_version: str,
+) -> None:
+    expected_member = (
+        f"wasm-bindgen-{expected_version}-x86_64-unknown-linux-musl/"
+        "wasm-bindgen"
+    )
+    with tarfile.open(archive, "r:gz") as bundle:
+        members = [
+            member for member in bundle.getmembers()
+            if member.name == expected_member
+        ]
+        if len(members) != 1 or not members[0].isfile():
+            raise IntegrityError(
+                "wasm-bindgen archive does not contain the expected regular binary"
+            )
+        extracted = bundle.extractfile(members[0])
+        if extracted is None:
+            raise IntegrityError("unable to extract wasm-bindgen binary")
+        ensure_private_dir(destination.parent)
+        with tempfile.NamedTemporaryFile(dir=destination.parent, delete=False) as output:
+            temporary = Path(output.name)
+            shutil.copyfileobj(extracted, output)
+    try:
+        temporary.chmod(0o755)
+        os.replace(temporary, destination)
+    finally:
+        temporary.unlink(missing_ok=True)
+    try:
+        version = run([str(destination), "--version"], timeout=30).stdout.strip()
+    except BaseException:
+        destination.unlink(missing_ok=True)
+        raise
+    if version != f"wasm-bindgen {expected_version}":
+        destination.unlink(missing_ok=True)
+        raise IntegrityError(
+            f"installed wasm-bindgen identity mismatch: {version!r}, "
+            f"expected 'wasm-bindgen {expected_version}'"
+        )
 
 
 def _verify_tag(repository: str, tag: str, expected_commit: str, timeout: int) -> None:
@@ -480,6 +564,19 @@ def _install_binaries(
     ensure_private_dir(inputs_dir)
     ensure_private_dir(bin_dir)
     downloaded = {filename: inputs_dir / filename for filename, _, _ in DOWNLOADS}
+    _install_trunk(
+        downloaded["trunk-x86_64-unknown-linux-gnu.tar.gz"],
+        bin_dir / "trunk",
+        config["TRUNK_VERSION"],
+    )
+    _install_wasm_bindgen(
+        downloaded[
+            f"wasm-bindgen-{config['WASM_BINDGEN_VERSION']}-"
+            "x86_64-unknown-linux-musl.tar.gz"
+        ],
+        bin_dir / "wasm-bindgen",
+        config["WASM_BINDGEN_VERSION"],
+    )
     _install_copy(downloaded["kind-linux-amd64"], bin_dir / "kind")
     _install_copy(downloaded["kubectl-linux-amd64"], bin_dir / "kubectl")
     _install_copy(downloaded["clusterctl-linux-amd64"], bin_dir / "clusterctl")
@@ -487,6 +584,45 @@ def _install_binaries(
         downloaded["helm-linux-amd64.tar.gz"],
         bin_dir / "helm",
         config["HELM_BINARY_SHA256"],
+    )
+
+
+def acquire_admin_build_tools(root: Path, config: dict[str, str]) -> None:
+    require(
+        config,
+        "DOWNLOAD_TIMEOUT",
+        "TRUNK_VERSION",
+        "TRUNK_URL",
+        "TRUNK_SHA256",
+        "WASM_BINDGEN_VERSION",
+        "WASM_BINDGEN_URL",
+        "WASM_BINDGEN_SHA256",
+    )
+    timeout = parse_duration(config["DOWNLOAD_TIMEOUT"])
+    inputs_dir = root / ".tools" / "inputs"
+    bin_dir = root / ".tools" / "bin"
+    downloaded = {
+        filename: _ensure_download(
+            inputs_dir,
+            filename,
+            config[url_key],
+            config[sha_key],
+            timeout,
+        )
+        for filename, url_key, sha_key in ADMIN_BUILD_DOWNLOADS
+    }
+    _install_trunk(
+        downloaded["trunk-x86_64-unknown-linux-gnu.tar.gz"],
+        bin_dir / "trunk",
+        config["TRUNK_VERSION"],
+    )
+    _install_wasm_bindgen(
+        downloaded[
+            f"wasm-bindgen-{config['WASM_BINDGEN_VERSION']}-"
+            "x86_64-unknown-linux-musl.tar.gz"
+        ],
+        bin_dir / "wasm-bindgen",
+        config["WASM_BINDGEN_VERSION"],
     )
 
 

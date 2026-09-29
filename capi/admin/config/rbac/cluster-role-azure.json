@@ -1,0 +1,189 @@
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "ClusterRole",
+  "metadata": {
+    "name": "tenant-admin-azure"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "configmaps",
+        "persistentvolumeclaims",
+        "services"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "namespaces"
+      ],
+      "verbs": [
+        "get"
+      ]
+    },
+    {
+      "apiGroups": [
+        "apps"
+      ],
+      "resources": [
+        "deployments",
+        "statefulsets"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "batch"
+      ],
+      "resources": [
+        "jobs"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "bootstrap.cluster.x-k8s.io"
+      ],
+      "resources": [
+        "kubeadmconfigs"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "cert-manager.io"
+      ],
+      "resources": [
+        "certificaterequests",
+        "certificates",
+        "issuers"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "cluster.x-k8s.io"
+      ],
+      "resources": [
+        "clusters",
+        "machinepools",
+        "machines",
+        "machinesets"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "controlplane.cluster.x-k8s.io"
+      ],
+      "resources": [
+        "kamajicontrolplanes"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "infrastructure.cluster.x-k8s.io"
+      ],
+      "resources": [
+        "azureclusteridentities",
+        "azureclusters",
+        "azuremachinepoolmachines",
+        "azuremachinepools"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "kamaji.clastix.io"
+      ],
+      "resources": [
+        "tenantcontrolplanes"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "network.azure.com"
+      ],
+      "resources": [
+        "natgateways",
+        "virtualnetworks",
+        "virtualnetworkssubnets"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "policy"
+      ],
+      "resources": [
+        "poddisruptionbudgets"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "rbac.authorization.k8s.io"
+      ],
+      "resources": [
+        "rolebindings",
+        "roles"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "resources.azure.com"
+      ],
+      "resources": [
+        "resourcegroups"
+      ],
+      "verbs": [
+        "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "tenancy.cnpg-vcluster.io"
+      ],
+      "resources": [
+        "tenants"
+      ],
+      "verbs": [
+        "get",
+        "list"
+      ]
+    }
+  ]
+}

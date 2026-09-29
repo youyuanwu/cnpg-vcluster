@@ -1,0 +1,19 @@
+[package]
+name = "tenant-admin-web"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.89"
+publish = false
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tenant-admin-shared.workspace = true
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+console_error_panic_hook.workspace = true
+gloo-net.workspace = true
+js-sys.workspace = true
+leptos.workspace = true
+wasm-bindgen-futures.workspace = true
+web-sys.workspace = true

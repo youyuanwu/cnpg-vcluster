@@ -10,7 +10,9 @@ This repository contains one Cluster API and CloudNativePG experiment:
 
 The local profile creates one kind management cluster and accepts explicit
 tenant specifications for Kamaji hosted control planes, CAPD Docker workers,
-isolated Docker-backed storage, and tenant-owned CloudNativePG clusters:
+isolated Docker-backed storage, and tenant-owned CloudNativePG clusters. Each
+management cluster also runs a read-only Leptos/Axum Tenant Admin UI backed
+only by its Kubernetes API:
 
 ```sh
 cd capi
@@ -21,6 +23,7 @@ just preflight
 just create-management
 just local-tenant-apply config/tenants/examples/local.yaml
 just local-tenant-status tenant-example
+just admin-port-forward
 just local-tenant-delete tenant-example
 just destroy
 ```
@@ -51,6 +54,9 @@ CAPD and the shared-host storage profile remain local development mechanisms;
 neither profile is a production hostile-tenant isolation boundary.
 
 See [`capi/README.md`](capi/README.md) and
-[`capi/docs/high-level-design.md`](capi/docs/high-level-design.md). The local
+[`capi/docs/high-level-design.md`](capi/docs/high-level-design.md). The
+admin architecture, read-only RBAC, APIs, packaging, and port-forward workflow
+are documented in
+[`capi/docs/admin-ui-design.md`](capi/docs/admin-ui-design.md). The local
 operator uses the Rust 1.98.1 toolchain declared in
 [`rust-toolchain.toml`](rust-toolchain.toml); no Go tool downloads are needed.

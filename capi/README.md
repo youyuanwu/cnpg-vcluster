@@ -17,6 +17,14 @@ local mode retains Docker and the local foundation, while Azure mode runs in
 AKS without Docker or Azure credentials and delegates cloud mutation to
 CAPZ/ASO.
 
+Both management profiles install the provider-neutral `tenant-admin`
+application: a Leptos WebAssembly frontend served by an Axum/kube-rs backend.
+It reads only the management Kubernetes API through exact provider-specific
+read-only RBAC, validates the ServiceAccount's complete effective rules, and
+has no Tenant kubeconfig, Azure credentials, database, persistent cache, or
+mutation route. See
+[`docs/admin-ui-design.md`](docs/admin-ui-design.md).
+
 The proposed minimal Azure experiment is documented in
 [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md). It
 deliberately prioritizes tenant control-plane, VMSS worker, cloud-provider,
@@ -85,6 +93,8 @@ just preflight
 just create-management
 just local-tenant-apply config/tenants/examples/local.yaml
 just local-tenant-status tenant-example
+just admin-status
+just admin-port-forward
 just local-tenant-delete tenant-example
 just destroy
 ```
@@ -180,6 +190,14 @@ just test-tenant-lifecycle
 | `just prepare-host` | Securely record and raise runtime inotify values. |
 | `just preflight` | Check tools, inputs, Docker capacity, CIDRs, image digests, ownership collisions, and privileged-container support. |
 | `just create-management` | Reconcile the kind management cluster and lifecycle controllers. |
+| `just admin-status` | Validate the local admin Deployment, Service, provider-specific effective RBAC, health, and typed API responses. |
+| `just admin-port-forward` | Forward `tenant-system/tenant-admin` to `127.0.0.1:8080` until interrupted. |
+| `just admin-fetch` | Fetch the locked workspace dependency graph. |
+| `just admin-generate-check` | Verify generated read-only admin resources are current. |
+| `just admin-lint` | Run Rust formatting and Clippy for all admin crates. |
+| `just admin-test` | Run locked/offline tests for shared DTOs, Axum projection, and Leptos view logic. |
+| `just admin-metrics` | Report the separate admin production-Rust baseline and enforce the 6,000-line ceiling. |
+| `just admin-package-check` | Build the static server and browser bundle twice offline and compare the exact output inventory. |
 | `just dev-bootstrap` | Prepare and bind a retained management context to the current user, host, Docker daemon, branch, revision, configuration, and exact management identity. |
 | `just dev-clean` | Run authoritative cleanup for retained tenant, management, runtime, and host state. |
 | `just local-tenant-apply <manifest.yaml>` | Strictly apply one declarative local Tenant. |
@@ -452,6 +470,12 @@ Management images are imported before controller installation. Worker
 networking start. The controller image contains only the static manager binary
 and checksum-verified Calico and CNPG assets.
 
+Trunk `0.21.14` and wasm-bindgen CLI `0.2.129` are checksum-pinned cache
+inputs. Only `just cache` acquires them (`just cache admin-build` is the
+CI-focused subset); admin builds consume the verified binaries with locked
+Cargo dependencies and Trunk offline. Generated HTML, JavaScript, Wasm, and
+CSS bundles under `.runtime/` are ignored build output.
+
 The enforced-offline path additionally verifies and restores the pinned
 Kubernetes API-server, controller-manager, scheduler, Konnectivity server, and
 Distribution images. It creates an owner-only registry storage tree from the
@@ -470,8 +494,11 @@ verification, format, Clippy, tests, and release/static-link build in
 **CAPI fast checks**, independently of the destructive **CAPI end-to-end**
 job. Fast checks explicitly repeat the offline Azure foundation packaging,
 operator command, proof, ownership, and gate contracts; the destructive Azure
-gate remains manual. Parallel jobs allow image acquisition and fast checks to
-overlap; E2E builds the controller image during management bootstrap.
+gate remains manual. They also verify admin generation, lint, tests, metrics,
+offline reproducible server/Wasm packaging, and upload the static server plus
+browser assets with the controller manager. PR E2E validates and consumes
+those exact artifacts; scheduled/manual CI rebuilds independently from the
+complete cache.
 The final **CAPI tests** check requires fast checks and the online E2E on PRs
 (including fork PRs), fast checks and the targeted/offline high-capacity job
 on manual dispatch and the weekly Monday 04:23 UTC schedule, and fast checks
@@ -501,6 +528,13 @@ just controller-verify
 just controller-lint
 just controller-test
 just controller-build
+just cache admin-build
+just admin-fetch
+just admin-generate-check
+just admin-lint
+just admin-test
+just admin-metrics
+just admin-package-check
 ```
 
 PRs require fast checks and one bounded online clean-to-clean E2E. Scheduled

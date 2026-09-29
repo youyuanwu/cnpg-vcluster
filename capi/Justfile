@@ -4,8 +4,8 @@ default:
     @just --list
 
 # [implemented] Acquire and verify every pinned artifact and OCI image online.
-cache:
-    @python3 scripts/lab.py cache
+cache scope="":
+    @python3 scripts/lab.py cache {{quote(scope)}}
 
 # [implemented] Install and verify tools from the complete local cache.
 tools:
@@ -106,6 +106,46 @@ controller-build:
 # Build the scratch Tenant controller image from verified assets.
 controller-image:
     @python3 scripts/build_controller.py
+
+# Report the separate admin Rust baseline, delta, and 6,000-line ceiling.
+admin-metrics:
+    @python3 scripts/admin_metrics.py --max 6000
+
+# Fetch locked admin Cargo dependencies.
+admin-fetch:
+    @python3 scripts/admin.py fetch
+
+# Verify generated read-only admin resources are current.
+admin-generate-check:
+    @python3 scripts/admin.py generate-check
+
+# Run admin Rust unit and integration tests from locked dependencies.
+admin-test:
+    @python3 scripts/admin.py test
+
+# Check admin Rust format and Clippy warnings.
+admin-lint:
+    @python3 scripts/admin.py lint
+
+# Build the release Wasm assets and static native admin server.
+admin-build:
+    @python3 scripts/admin.py build
+
+# Build the admin server and browser assets twice and compare exact output.
+admin-package-check:
+    @python3 scripts/admin.py package-check
+
+# Build the provider-neutral scratch Tenant Admin image.
+admin-image:
+    @python3 scripts/admin.py image
+
+# Report live Tenant Admin health, identity, and API state.
+admin-status:
+    @python3 scripts/admin.py status
+
+# Forward the local Tenant Admin Service until interrupted.
+admin-port-forward:
+    @python3 scripts/admin.py port-forward
 
 # Exercise controller convergence through worker and host-resource creation.
 test-controller-convergence:

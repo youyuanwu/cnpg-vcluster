@@ -91,6 +91,10 @@ class ManagementTests(unittest.TestCase):
                 "scripts.create_management.reconcile_controller",
                 side_effect=lambda *_: calls.append("tenant-controller"),
             ),
+            patch(
+                "scripts.create_management.reconcile_local_admin",
+                side_effect=lambda *_: calls.append("tenant-admin"),
+            ),
         ):
             create_management(Path("."), config)
         self.assertEqual(
@@ -106,8 +110,37 @@ class ManagementTests(unittest.TestCase):
                 "mirror-pulls",
                 "cert-manager",
                 "tenant-controller",
+                "tenant-admin",
             ],
         )
+
+    def test_admin_failure_propagates_after_controller_without_rollback(self) -> None:
+        calls = []
+        with (
+            patch("scripts.create_management.run_preflight", return_value=object()),
+            patch("scripts.create_management.restore_host_images"),
+            patch("scripts.create_management.reconcile_kind", return_value=object()),
+            patch("scripts.create_management.import_container_images"),
+            patch("scripts.create_management.reconcile_network", return_value={}),
+            patch("scripts.create_management.reconcile_offline_registry"),
+            patch("scripts.create_management.enforce_offline_node_egress"),
+            patch("scripts.create_management.verify_offline_registry_pulls"),
+            patch("scripts.create_management.reconcile_cert_manager"),
+            patch("scripts.create_management.reconcile_metallb"),
+            patch("scripts.create_management.reconcile_kamaji"),
+            patch("scripts.create_management.reconcile_providers"),
+            patch(
+                "scripts.create_management.reconcile_controller",
+                side_effect=lambda *_: calls.append("controller"),
+            ),
+            patch(
+                "scripts.create_management.reconcile_local_admin",
+                side_effect=RuntimeError("admin rollout failed"),
+            ),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "admin rollout failed"):
+                create_management(Path("."), {"KIND_CLUSTER_NAME": "management"})
+        self.assertEqual(["controller"], calls)
 
     def test_metallb_webhook_connection_refusal_is_retryable(self) -> None:
         response = CompletedProcess(
