@@ -119,7 +119,14 @@ class FakeClient:
                 "incomplete": False,
             },
         }
+        self.namespaces = ("default", "tenant-a", "tenant-system")
+        self.rules_reviews = {
+            namespace: copy.deepcopy(self.rules_review)
+            for namespace in self.namespaces
+        }
         self.tenant_names = tenant_names
+        self.failed_proxy_paths: set[str] = set()
+        self.delete_on_proxy_failure: set[str] = set()
         self.calls: list[tuple[str, ...]] = []
 
     def json(self, *arguments: str):
@@ -227,12 +234,34 @@ class FakeClient:
                 )
         raise AssertionError(path)
 
-    def kubectl(self, *arguments: str, check: bool = True, **_kwargs):
+    def kubectl(self, *arguments: str, check: bool = True, **kwargs):
         self.calls.append(arguments)
         if arguments[:2] == ("get", "--raw"):
-            return response(self._proxy_response(arguments[2]))
+            path = arguments[2]
+            if path.startswith("/api/v1/namespaces?"):
+                return response(json.dumps({
+                    "apiVersion": "v1",
+                    "kind": "NamespaceList",
+                    "metadata": {"continue": ""},
+                    "items": [
+                        {"metadata": {"name": namespace}}
+                        for namespace in self.namespaces
+                    ],
+                }))
+            if any(path.endswith(suffix) for suffix in self.failed_proxy_paths):
+                for name in self.delete_on_proxy_failure:
+                    if f"/tenants/{name}" in path:
+                        self.tenant_names = tuple(
+                            tenant
+                            for tenant in self.tenant_names
+                            if tenant != name
+                        )
+                return response(returncode=1)
+            return response(self._proxy_response(path))
         if arguments[0] == "create" and "-f" in arguments:
-            return response(json.dumps(self.rules_review))
+            request = json.loads(kwargs["input_text"])
+            namespace = request["spec"]["namespace"]
+            return response(json.dumps(self.rules_reviews[namespace]))
         return response()
 
 
@@ -378,10 +407,21 @@ class AdminLocalTests(unittest.TestCase):
             for arguments in client.calls
             if arguments[0] == "create" and "-f" in arguments
         ]
-        self.assertEqual(1, len(review_calls))
+        self.assertEqual(len(client.namespaces), len(review_calls))
+        self.assertTrue(
+            all(
+                "--as=system:serviceaccount:tenant-system:tenant-admin"
+                in arguments
+                for arguments in review_calls
+            )
+        )
         self.assertIn(
-            "--as=system:serviceaccount:tenant-system:tenant-admin",
-            review_calls[0],
+            (
+                "get",
+                "--raw",
+                "/api/v1/namespaces?limit=1001",
+            ),
+            client.calls,
         )
 
     def test_effective_rbac_rejects_additive_and_missing_permissions(self) -> None:
@@ -411,9 +451,12 @@ class AdminLocalTests(unittest.TestCase):
                 },
             ),
         )
-        for name, rule in additions:
+        for index, (name, rule) in enumerate(additions):
             client = FakeClient()
-            client.rules_review["status"]["resourceRules"].append(rule)
+            namespace = ("default", "tenant-a", "tenant-system")[index]
+            client.rules_reviews[namespace]["status"]["resourceRules"].append(
+                rule
+            )
             with self.subTest(name=name), self.assertRaisesRegex(
                 RuntimeError,
                 "effective RBAC",
@@ -421,16 +464,29 @@ class AdminLocalTests(unittest.TestCase):
                 admin_local.verify_local_admin(ROOT, client, IMAGE)
 
         client = FakeClient()
-        client.rules_review["status"]["resourceRules"].pop(0)
+        client.rules_reviews["tenant-system"]["status"]["resourceRules"].pop(0)
         with self.assertRaisesRegex(RuntimeError, "effective RBAC"):
             admin_local.verify_local_admin(ROOT, client, IMAGE)
+
+        for namespaces in (
+            ("default", "default", "tenant-system"),
+            ("default", "Invalid", "tenant-system"),
+            tuple(f"ns-{index}" for index in range(1_001))
+            + ("tenant-system",),
+        ):
+            client = FakeClient()
+            client.namespaces = namespaces
+            with self.subTest(namespace_count=len(namespaces)), (
+                self.assertRaisesRegex(RuntimeError, "Namespace inventory")
+            ):
+                admin_local.verify_local_admin(ROOT, client, IMAGE)
 
         for field, value in (
             ("incomplete", True),
             ("evaluationError", "authorizer unavailable"),
         ):
             client = FakeClient()
-            client.rules_review["status"][field] = value
+            client.rules_reviews["tenant-system"]["status"][field] = value
             with self.subTest(field=field), self.assertRaisesRegex(
                 RuntimeError,
                 "incomplete",
@@ -438,10 +494,19 @@ class AdminLocalTests(unittest.TestCase):
                 admin_local.verify_local_admin(ROOT, client, IMAGE)
 
         client = FakeClient()
-        client.rules_review["status"]["nonResourceRules"][0][
+        client.rules_reviews["tenant-system"]["status"]["nonResourceRules"][0][
             "nonResourceURLs"
         ].append("/metrics")
         with self.assertRaisesRegex(RuntimeError, "non-resource RBAC"):
+            admin_local.verify_local_admin(ROOT, client, IMAGE)
+
+        client = FakeClient()
+        client.rules_reviews["tenant-a"]["status"]["resourceRules"].append({
+            "apiGroups": [""],
+            "resources": ["secrets"],
+            "verbs": ["get"],
+        })
+        with self.assertRaisesRegex(RuntimeError, "effective RBAC"):
             admin_local.verify_local_admin(ROOT, client, IMAGE)
 
     def test_api_verification_accepts_empty_and_typed_populated_responses(
@@ -524,6 +589,37 @@ class AdminLocalTests(unittest.TestCase):
             side_effect=malformed_response,
         ), self.assertRaisesRegex(RuntimeError, "envelope"):
             admin_local.verify_admin_api(malformed)
+
+    def test_api_verification_handles_tenant_deletion_race(self) -> None:
+        for suffix in (
+            "/api/v1/tenants/tenant-a",
+            "/api/v1/tenants/tenant-a/topology",
+        ):
+            client = FakeClient(tenant_names=("tenant-a",))
+            client.failed_proxy_paths.add(suffix)
+            client.delete_on_proxy_failure.add("tenant-a")
+            with self.subTest(suffix=suffix):
+                result = admin_local.verify_admin_api(client)
+                self.assertEqual(["tenant-a"], result["tenantNames"])
+                overview_calls = [
+                    arguments
+                    for arguments in client.calls
+                    if arguments[:2] == ("get", "--raw")
+                    and arguments[2].endswith("/api/v1/overview")
+                ]
+                self.assertEqual(2, len(overview_calls))
+
+        client = FakeClient(tenant_names=("tenant-a",))
+        client.failed_proxy_paths.add("/api/v1/tenants/tenant-a")
+        with self.assertRaisesRegex(RuntimeError, "API is unavailable"):
+            admin_local.verify_admin_api(client)
+        overview_calls = [
+            arguments
+            for arguments in client.calls
+            if arguments[:2] == ("get", "--raw")
+            and arguments[2].endswith("/api/v1/overview")
+        ]
+        self.assertEqual(2, len(overview_calls))
 
     def test_status_and_port_forward_use_explicit_management_identity(
         self,

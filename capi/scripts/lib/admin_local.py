@@ -10,7 +10,9 @@ import yaml
 
 from scripts.lib.admin import (
     ADMIN_IDENTITY,
+    ADMIN_NAMESPACE_LIMIT,
     admin_rbac_resource_paths,
+    admin_review_namespaces,
     admin_role_name,
     admin_rules_review_request,
     build_admin_image,
@@ -343,32 +345,56 @@ def _verify_deployment_contract(
 
 
 def _verify_effective_rbac(root: Path, client: ManagementClient) -> None:
-    response = client.kubectl(
-        "create",
-        "--validate=false",
-        "-f",
-        "-",
-        "-o",
-        "json",
-        f"--as={ADMIN_IDENTITY}",
-        input_text=admin_rules_review_request(),
+    inventory = client.kubectl(
+        "get",
+        "--raw",
+        f"/api/v1/namespaces?limit={ADMIN_NAMESPACE_LIMIT + 1}",
         check=False,
     )
-    if response.returncode != 0:
-        raise RuntimeError("Tenant Admin effective RBAC review failed")
+    if inventory.returncode != 0:
+        raise RuntimeError("Tenant Admin Namespace inventory failed")
     try:
-        review = json.loads(response.stdout)
+        namespaces = admin_review_namespaces(json.loads(inventory.stdout))
     except json.JSONDecodeError as exc:
-        raise RuntimeError("Tenant Admin effective RBAC review is invalid") from exc
-    validate_admin_effective_rules(root, "local", review)
+        raise RuntimeError("Tenant Admin Namespace inventory is invalid") from exc
+    for namespace in namespaces:
+        response = client.kubectl(
+            "create",
+            "--validate=false",
+            "-f",
+            "-",
+            "-o",
+            "json",
+            f"--as={ADMIN_IDENTITY}",
+            input_text=admin_rules_review_request(namespace),
+            check=False,
+        )
+        if response.returncode != 0:
+            raise RuntimeError(
+                f"Tenant Admin effective RBAC review failed in {namespace}"
+            )
+        try:
+            review = json.loads(response.stdout)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(
+                f"Tenant Admin effective RBAC review is invalid in {namespace}"
+            ) from exc
+        validate_admin_effective_rules(root, "local", review)
 
 
-def _service_proxy(client: ManagementClient, path: str) -> str:
-    response = client.kubectl(
+def _service_proxy_response(client: ManagementClient, path: str):
+    return client.kubectl(
         "get",
         "--raw",
         f"{ADMIN_SERVICE_PROXY}/{path.lstrip('/')}",
+        check=False,
     )
+
+
+def _service_proxy(client: ManagementClient, path: str) -> str:
+    response = _service_proxy_response(client, path)
+    if response.returncode != 0:
+        raise RuntimeError(f"Tenant Admin API is unavailable: /{path}")
     return response.stdout
 
 
@@ -507,14 +533,9 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
             raise RuntimeError("Tenant Admin topology edge response is invalid")
 
 
-def verify_admin_api(
+def _local_overview(
     client: ManagementClient,
-    *,
-    expected_tenant_names: tuple[str, ...] | None = None,
-) -> dict[str, object]:
-    for path in ("healthz", "readyz"):
-        if _service_proxy(client, path):
-            raise RuntimeError(f"Tenant Admin {path} response body must be empty")
+) -> tuple[dict[str, object], tuple[str, ...]]:
     overview_snapshot = _required_mapping(
         _envelope(_service_proxy(client, "api/v1/overview"), "overview"),
         "overview data",
@@ -545,6 +566,18 @@ def verify_admin_api(
     names = tuple(_validate_summary(summary) for summary in summaries)
     if names != tuple(sorted(names)) or counts["total"] != len(names):
         raise RuntimeError("Tenant Admin overview and Tenant list disagree")
+    return counts, names
+
+
+def verify_admin_api(
+    client: ManagementClient,
+    *,
+    expected_tenant_names: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    for path in ("healthz", "readyz"):
+        if _service_proxy(client, path):
+            raise RuntimeError(f"Tenant Admin {path} response body must be empty")
+    counts, names = _local_overview(client)
     if expected_tenant_names is not None and names != tuple(
         sorted(expected_tenant_names)
     ):
@@ -557,9 +590,20 @@ def verify_admin_api(
     if listed_names != tuple(sorted(listed_names)):
         raise RuntimeError("Tenant Admin Tenant list is not sorted")
     for name in names:
+        snapshot_response = _service_proxy_response(
+            client,
+            f"api/v1/tenants/{name}",
+        )
+        if snapshot_response.returncode != 0:
+            _, refreshed_names = _local_overview(client)
+            if name not in refreshed_names:
+                continue
+            raise RuntimeError(
+                f"Tenant Admin API is unavailable: /api/v1/tenants/{name}"
+            )
         snapshot = _required_mapping(
             _envelope(
-                _service_proxy(client, f"api/v1/tenants/{name}"),
+                snapshot_response.stdout,
                 f"Tenant {name} snapshot",
             ),
             "Tenant snapshot data",
@@ -605,9 +649,21 @@ def verify_admin_api(
             _required_mapping(snapshot.get("topology"), "Tenant topology data"),
             name,
         )
+        topology_response = _service_proxy_response(
+            client,
+            f"api/v1/tenants/{name}/topology",
+        )
+        if topology_response.returncode != 0:
+            _, refreshed_names = _local_overview(client)
+            if name not in refreshed_names:
+                continue
+            raise RuntimeError(
+                "Tenant Admin API is unavailable: "
+                f"/api/v1/tenants/{name}/topology"
+            )
         topology = _required_mapping(
             _envelope(
-                _service_proxy(client, f"api/v1/tenants/{name}/topology"),
+                topology_response.stdout,
                 f"Tenant {name} topology",
             ),
             "Tenant topology data",

@@ -73,12 +73,14 @@ Secret, watch, create, update, patch, or delete access.
 
 Installation and health checks compare the owned ServiceAccount, binding, and
 selected ClusterRole with the tracked generated resources. They also submit
-an impersonated `SelfSubjectRulesReview` and compare the complete effective
-resource permissions with the generated contract. Incomplete evaluations,
-extra bindings, mutations, subresources, wildcards, or provider-irrelevant
-rights fail health. Only the exact Kubernetes self-review permissions and
-bounded authenticated discovery URLs supplied by default cluster roles are
-accepted outside the generated contract. The browser receives no
+an impersonated `SelfSubjectRulesReview` in every live Namespace from a
+bounded management-admin inventory and compare the complete effective
+resource permissions with the generated contract. This catches additive
+RoleBindings outside `tenant-system`. Incomplete evaluations, extra bindings,
+mutations, subresources, wildcards, or provider-irrelevant rights fail health.
+Only the exact Kubernetes self-review permissions and bounded authenticated
+discovery URLs supplied by default cluster roles are accepted outside the
+generated contract. The browser receives no
 ServiceAccount token, kubeconfig, certificate, credential, or raw unbounded
 Kubernetes object.
 
@@ -139,7 +141,9 @@ retryable flag. The routes are:
 `/tenants` and `/tenants/{name}/topology` compatibility routes are validated
 independently for schema and shape; health does not compare their values with
 a snapshot returned by a separate request because normal reconciliation may
-advance between calls.
+advance between calls. If a per-Tenant request fails, health re-reads the
+overview once and accepts the failure only when that coherent snapshot proves
+the Tenant was concurrently deleted.
 
 The shared DTOs include:
 

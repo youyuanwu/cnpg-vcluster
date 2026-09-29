@@ -54,8 +54,12 @@ PREBUILT_SERVER_ENV = "CAPI_PREBUILT_ADMIN_SERVER"
 PREBUILT_WEB_ENV = "CAPI_PREBUILT_ADMIN_WEB"
 ADMIN_NAMESPACE = "tenant-system"
 ADMIN_NAME = "tenant-admin"
+ADMIN_NAMESPACE_LIMIT = 1_000
 ADMIN_IDENTITY = (
     f"system:serviceaccount:{ADMIN_NAMESPACE}:{ADMIN_NAME}"
+)
+_NAMESPACE_NAME = re.compile(
+    r"^[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?$"
 )
 _DEFAULT_EFFECTIVE_RESOURCE_PERMISSIONS = frozenset(
     {
@@ -147,16 +151,50 @@ def admin_rbac_resource_paths(root: Path, provider: str) -> tuple[Path, ...]:
     )
 
 
-def admin_rules_review_request() -> str:
+def admin_rules_review_request(namespace: str) -> str:
+    if not _NAMESPACE_NAME.fullmatch(namespace):
+        raise RuntimeError("Tenant Admin RBAC review namespace is invalid")
     return json.dumps(
         {
             "apiVersion": "authorization.k8s.io/v1",
             "kind": "SelfSubjectRulesReview",
-            "spec": {"namespace": ADMIN_NAMESPACE},
+            "spec": {"namespace": namespace},
         },
         sort_keys=True,
         separators=(",", ":"),
     )
+
+
+def admin_review_namespaces(payload: object) -> tuple[str, ...]:
+    if not isinstance(payload, dict):
+        raise RuntimeError("Tenant Admin Namespace inventory is invalid")
+    metadata = payload.get("metadata")
+    items = payload.get("items")
+    if (
+        payload.get("apiVersion") != "v1"
+        or payload.get("kind") != "NamespaceList"
+        or not isinstance(metadata, dict)
+        or not isinstance(items, list)
+        or len(items) > ADMIN_NAMESPACE_LIMIT
+        or metadata.get("continue", "") != ""
+    ):
+        raise RuntimeError(
+            "Tenant Admin Namespace inventory is malformed or oversized"
+        )
+    names = []
+    for value in items:
+        item_metadata = value.get("metadata") if isinstance(value, dict) else None
+        name = (
+            item_metadata.get("name")
+            if isinstance(item_metadata, dict)
+            else None
+        )
+        if not isinstance(name, str) or not _NAMESPACE_NAME.fullmatch(name):
+            raise RuntimeError("Tenant Admin Namespace inventory is invalid")
+        names.append(name)
+    if len(set(names)) != len(names) or ADMIN_NAMESPACE not in names:
+        raise RuntimeError("Tenant Admin Namespace inventory is invalid")
+    return tuple(sorted(names))
 
 
 def _admin_resource_permission_atoms(

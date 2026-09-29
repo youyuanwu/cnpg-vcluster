@@ -728,6 +728,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             *,
             resource_overrides=None,
             review_mutator=None,
+            review_namespace="tenant-system",
+            namespaces=("default", "tenant-a", "tenant-system"),
             api_overrides=None,
         ):
             resources = {
@@ -738,20 +740,39 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 "clusterrolebinding/tenant-admin": binding,
             }
             resources.update(resource_overrides or {})
-            review = copy.deepcopy(rules_review)
+            reviews = {
+                namespace: copy.deepcopy(rules_review)
+                for namespace in namespaces
+            }
             if review_mutator is not None:
-                review_mutator(review)
+                review_mutator(reviews[review_namespace])
             api = dict(api_overrides or {})
 
             def get_resource(_root, _namespace, selected):
                 return copy.deepcopy(resources[selected])
 
-            def kubectl(_root, *arguments, **_kwargs):
+            def kubectl(_root, *arguments, **kwargs):
                 if arguments[0] == "create" and "-f" in arguments:
-                    return completed(json.dumps(review))
+                    request = json.loads(kwargs["input_text"])
+                    namespace = request["spec"]["namespace"]
+                    return completed(json.dumps(reviews[namespace]))
                 path = arguments[-1]
+                if path.startswith("/api/v1/namespaces?"):
+                    return completed(json.dumps({
+                        "apiVersion": "v1",
+                        "kind": "NamespaceList",
+                        "metadata": {"continue": ""},
+                        "items": [
+                            {"metadata": {"name": namespace}}
+                            for namespace in namespaces
+                        ],
+                    }))
                 for suffix, payload in api.items():
                     if path.endswith(suffix):
+                        if callable(payload):
+                            payload = payload()
+                        if isinstance(payload, subprocess.CompletedProcess):
+                            return payload
                         return completed(json.dumps(payload))
                 if path.endswith("/api/v1/overview"):
                     return completed(json.dumps({
@@ -813,10 +834,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             and call.args[1] == "create"
             and "-f" in call.args[1:]
         ]
-        self.assertEqual(1, len(review_calls))
-        self.assertIn(
-            "--as=system:serviceaccount:tenant-system:tenant-admin",
-            review_calls[0],
+        self.assertEqual(3, len(review_calls))
+        self.assertTrue(
+            all(
+                "--as=system:serviceaccount:tenant-system:tenant-admin"
+                in arguments
+                for arguments in review_calls
+            )
         )
         overview_summary = {"name": "tenant-a", "classification": "ready"}
         snapshot_topology = {
@@ -888,6 +912,60 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 for path in transition_paths
             )
         )
+
+        populated_overview = api_overrides["/api/v1/overview"]
+        empty_overview = {
+            "schemaVersion": 1,
+            "data": {
+                "overview": {
+                    "providerMode": "azure",
+                    "tenants": {"total": 0},
+                },
+                "tenants": [],
+            },
+        }
+
+        for failed_endpoint in (
+            "/api/v1/tenants/tenant-a",
+            "/api/v1/tenants/tenant-a/topology",
+        ):
+            overview_payloads = iter((populated_overview, empty_overview))
+            deletion_overrides = dict(api_overrides)
+            deletion_overrides["/api/v1/overview"] = (
+                lambda payloads=overview_payloads: next(payloads)
+            )
+            deletion_overrides[failed_endpoint] = completed(returncode=1)
+            (_, blockers), deletion_calls = inspect(
+                api_overrides=deletion_overrides
+            )
+            with self.subTest(failed_endpoint=failed_endpoint):
+                self.assertEqual((), blockers)
+                overview_paths = [
+                    call.args[-1]
+                    for call in deletion_calls
+                    if "--raw" in call.args
+                    and call.args[-1].endswith("/api/v1/overview")
+                ]
+                self.assertEqual(2, len(overview_paths))
+
+        still_present_overrides = dict(api_overrides)
+        still_present_overrides[
+            "/api/v1/tenants/tenant-a"
+        ] = completed(returncode=1)
+        (_, blockers), still_present_calls = inspect(
+            api_overrides=still_present_overrides
+        )
+        self.assertTrue(
+            any("API is unavailable" in blocker for blocker in blockers),
+            blockers,
+        )
+        overview_paths = [
+            call.args[-1]
+            for call in still_present_calls
+            if "--raw" in call.args
+            and call.args[-1].endswith("/api/v1/overview")
+        ]
+        self.assertEqual(2, len(overview_paths))
 
         drifted = copy.deepcopy(deployment)
         drifted["spec"]["template"]["spec"]["containers"][0]["image"] = "old:image"
@@ -997,9 +1075,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         def remove_expected_rule(review):
             review["status"]["resourceRules"].pop(0)
 
-        for name, mutate in (
+        for name, namespace, mutate in (
             (
                 "extra-binding-create-pods",
+                "default",
                 add_effective_rule({
                     "apiGroups": [""],
                     "resources": ["pods"],
@@ -1008,6 +1087,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ),
             (
                 "extra-binding-patch-deployments",
+                "tenant-a",
                 add_effective_rule({
                     "apiGroups": ["apps"],
                     "resources": ["deployments"],
@@ -1016,6 +1096,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ),
             (
                 "group-contributed-right",
+                "tenant-system",
                 add_effective_rule({
                     "apiGroups": [""],
                     "resources": ["pods"],
@@ -1024,11 +1105,24 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ),
             (
                 "missing-expected-permission",
+                "default",
                 remove_expected_rule,
+            ),
+            (
+                "extra-binding-secret-read",
+                "tenant-a",
+                add_effective_rule({
+                    "apiGroups": [""],
+                    "resources": ["secrets"],
+                    "verbs": ["get"],
+                }),
             ),
         ):
             with self.subTest(name=name):
-                (_, blockers), _ = inspect(review_mutator=mutate)
+                (_, blockers), _ = inspect(
+                    review_mutator=mutate,
+                    review_namespace=namespace,
+                )
                 self.assertTrue(
                     any("effective RBAC" in blocker for blocker in blockers),
                     blockers,

@@ -9,7 +9,9 @@ import yaml
 from .common import *
 from scripts.lib.admin import (
     ADMIN_IDENTITY,
+    ADMIN_NAMESPACE_LIMIT,
     admin_rbac_resource_paths,
+    admin_review_namespaces,
     admin_role_name,
     admin_rules_review_request,
     build_admin_image,
@@ -984,26 +986,103 @@ def _admin_binding_blockers(
 
 
 def _admin_authorization_blockers(root: Path) -> list[str]:
+    inventory = _kubectl(
+        root,
+        "get",
+        "--raw",
+        f"/api/v1/namespaces?limit={ADMIN_NAMESPACE_LIMIT + 1}",
+        check=False,
+    )
+    if inventory.returncode != 0:
+        return ["Azure admin Namespace inventory failed"]
+    try:
+        namespaces = admin_review_namespaces(json.loads(inventory.stdout))
+    except (json.JSONDecodeError, RuntimeError) as exc:
+        return [str(exc).replace("Tenant Admin", "Azure admin", 1)]
+    for namespace in namespaces:
+        response = _kubectl(
+            root,
+            "create",
+            "--validate=false",
+            "-f",
+            "-",
+            "-o",
+            "json",
+            f"--as={ADMIN_IDENTITY}",
+            input_text=admin_rules_review_request(namespace),
+            check=False,
+        )
+        if response.returncode != 0:
+            return [
+                f"Azure admin effective RBAC review failed in {namespace}"
+            ]
+        try:
+            review = json.loads(response.stdout)
+            validate_admin_effective_rules(root, "azure", review)
+        except (json.JSONDecodeError, RuntimeError) as exc:
+            return [str(exc).replace("Tenant Admin", "Azure admin", 1)]
+    return []
+
+
+def _azure_admin_overview_names(raw: str) -> tuple[str, ...]:
+    try:
+        overview = json.loads(raw)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise RuntimeError("Azure admin overview API returned invalid JSON") from exc
+    overview_data = overview.get("data") if isinstance(overview, dict) else None
+    overview_summary = (
+        overview_data.get("overview")
+        if isinstance(overview_data, dict)
+        else None
+    )
+    overview_tenants = (
+        overview_data.get("tenants")
+        if isinstance(overview_data, dict)
+        else None
+    )
+    counts = (
+        overview_summary.get("tenants")
+        if isinstance(overview_summary, dict)
+        else None
+    )
+    names = (
+        [
+            item.get("name")
+            for item in overview_tenants
+            if isinstance(item, dict) and isinstance(item.get("name"), str)
+        ]
+        if isinstance(overview_tenants, list)
+        else []
+    )
+    if (
+        not isinstance(overview, dict)
+        or overview.get("schemaVersion") != 1
+        or not isinstance(overview_data, dict)
+        or set(overview_data) != {"overview", "tenants"}
+        or not isinstance(overview_summary, dict)
+        or overview_summary.get("providerMode") != "azure"
+        or not isinstance(overview_tenants, list)
+        or len(names) != len(overview_tenants)
+        or names != sorted(names)
+        or not isinstance(counts, dict)
+        or not isinstance(counts.get("total"), int)
+        or counts.get("total") != len(overview_tenants)
+    ):
+        raise RuntimeError("Azure admin overview API contract changed")
+    return tuple(names)
+
+
+def _azure_admin_tenant_disappeared(root: Path, name: str) -> bool:
     response = _kubectl(
         root,
-        "create",
-        "--validate=false",
-        "-f",
-        "-",
-        "-o",
-        "json",
-        f"--as={ADMIN_IDENTITY}",
-        input_text=admin_rules_review_request(),
+        "get",
+        "--raw",
+        f"{ADMIN_SERVICE_PROXY}/api/v1/overview",
         check=False,
     )
     if response.returncode != 0:
-        return ["Azure admin effective RBAC review failed"]
-    try:
-        review = json.loads(response.stdout)
-        validate_admin_effective_rules(root, "azure", review)
-    except (json.JSONDecodeError, RuntimeError) as exc:
-        return [str(exc).replace("Tenant Admin", "Azure admin", 1)]
-    return []
+        raise RuntimeError("Azure admin overview API is unavailable")
+    return name not in _azure_admin_overview_names(response.stdout)
 
 
 def _admin_api_blockers(root: Path) -> list[str]:
@@ -1024,51 +1103,16 @@ def _admin_api_blockers(root: Path) -> list[str]:
     if blockers:
         return blockers
     try:
-        overview = json.loads(responses["api/v1/overview"])
+        overview_names = _azure_admin_overview_names(
+            responses["api/v1/overview"]
+        )
+    except RuntimeError as exc:
+        return [str(exc)]
+    try:
         tenants = json.loads(responses["api/v1/tenants"])
     except (TypeError, json.JSONDecodeError):
         return ["Azure admin API returned invalid JSON"]
-    overview_data = overview.get("data") if isinstance(overview, dict) else None
     tenant_data = tenants.get("data") if isinstance(tenants, dict) else None
-    overview_summary = (
-        overview_data.get("overview")
-        if isinstance(overview_data, dict)
-        else None
-    )
-    overview_tenants = (
-        overview_data.get("tenants")
-        if isinstance(overview_data, dict)
-        else None
-    )
-    counts = (
-        overview_summary.get("tenants")
-        if isinstance(overview_summary, dict)
-        else None
-    )
-    overview_names = (
-        [
-            item.get("name")
-            for item in overview_tenants
-            if isinstance(item, dict) and isinstance(item.get("name"), str)
-        ]
-        if isinstance(overview_tenants, list)
-        else []
-    )
-    if (
-        not isinstance(overview, dict)
-        or overview.get("schemaVersion") != 1
-        or not isinstance(overview_data, dict)
-        or set(overview_data) != {"overview", "tenants"}
-        or not isinstance(overview_summary, dict)
-        or overview_summary.get("providerMode") != "azure"
-        or not isinstance(overview_tenants, list)
-        or len(overview_names) != len(overview_tenants)
-        or overview_names != sorted(overview_names)
-        or not isinstance(counts, dict)
-        or not isinstance(counts.get("total"), int)
-        or counts.get("total") != len(overview_tenants)
-    ):
-        blockers.append("Azure admin overview API contract changed")
     if (
         not isinstance(tenants, dict)
         or tenants.get("schemaVersion") != 1
@@ -1087,6 +1131,8 @@ def _admin_api_blockers(root: Path) -> list[str]:
         return blockers
     for name in overview_names:
         endpoint_responses = {}
+        tenant_disappeared = False
+        tenant_request_failed = False
         for endpoint in (
             f"api/v1/tenants/{name}",
             f"api/v1/tenants/{name}/topology",
@@ -1099,8 +1145,20 @@ def _admin_api_blockers(root: Path) -> list[str]:
                 check=False,
             )
             if response.returncode != 0:
-                blockers.append(f"Azure admin API is unavailable: /{endpoint}")
-                continue
+                try:
+                    tenant_disappeared = _azure_admin_tenant_disappeared(
+                        root,
+                        name,
+                    )
+                except RuntimeError as exc:
+                    blockers.append(str(exc))
+                    tenant_request_failed = True
+                if not tenant_disappeared and not tenant_request_failed:
+                    blockers.append(
+                        f"Azure admin API is unavailable: /{endpoint}"
+                    )
+                    tenant_request_failed = True
+                break
             try:
                 envelope = json.loads(response.stdout)
             except (TypeError, json.JSONDecodeError):
@@ -1113,6 +1171,10 @@ def _admin_api_blockers(root: Path) -> list[str]:
                 blockers.append(f"Azure admin API contract changed: /{endpoint}")
                 continue
             endpoint_responses[endpoint] = envelope.get("data")
+        if tenant_disappeared:
+            continue
+        if tenant_request_failed:
+            continue
         snapshot = endpoint_responses.get(f"api/v1/tenants/{name}")
         if not isinstance(snapshot, dict) or set(snapshot) != {
             "identity",
