@@ -197,7 +197,7 @@ impl Fixture {
             .and_then(|value| value.as_str().map(str::to_owned))
             .unwrap_or_else(|| azure_pool_uid.into());
         let azure_owner = json!({"apiVersion":"infrastructure.cluster.x-k8s.io/v1beta1",
-            "kind":"AzureMachinePool","name":"tenant-a-worker","uid":azure_owner,"controller":true});
+            "kind":"AzureMachinePool","name":"tenant-a-worker","uid":azure_owner});
         for index in 0..3 {
             self.management.insert(
                 &format!(

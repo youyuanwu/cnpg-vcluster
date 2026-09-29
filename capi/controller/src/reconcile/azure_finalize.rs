@@ -219,7 +219,16 @@ fn descendants(
                 .iter()
                 .filter(|owner| owner.controller == Some(true))
                 .collect();
-            if controllers.len() == 1 && owned.contains(&controllers[0].uid) {
+            let azure_pool_machine = object
+                .types
+                .as_ref()
+                .is_some_and(|types| types.kind == "AzureMachinePoolMachine");
+            let owner_match = if azure_pool_machine {
+                owners.iter().any(|owner| owned.contains(&owner.uid))
+            } else {
+                controllers.len() == 1 && owned.contains(&controllers[0].uid)
+            };
+            if owner_match {
                 owned.insert(uid(object)?);
                 selected.insert(index);
             }
@@ -229,9 +238,25 @@ fn descendants(
         }
     }
     if selected.len() != inventory.len() {
-        return Err(blocked(
-            "unknown, foreign, or ownerless residue is present in the Azure Tenant namespace",
-        ));
+        let unknown = inventory
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| !selected.contains(index))
+            .map(|(_, object)| {
+                format!(
+                    "{}/{}",
+                    object
+                        .types
+                        .as_ref()
+                        .map_or("unknown", |types| types.kind.as_str()),
+                    object.name_any()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(",");
+        return Err(blocked(format!(
+            "unknown, foreign, or ownerless residue is present: {unknown}"
+        )));
     }
     let mut result = inventory
         .iter()
@@ -264,7 +289,10 @@ fn exact_recorded_resources(
     pool_root_uids: &BTreeSet<String>,
 ) -> Result<(), ReconcileError> {
     for current in live {
-        if !recorded.iter().any(|item| same_resource(item, current)) {
+        if !recorded.iter().any(|item| same_resource(item, current))
+            && !cluster_started
+            && !(pool_started && pool_scoped(current, pool_root_uids))
+        {
             return Err(blocked(
                 "Azure provider residue is not present in the durable deletion inventory",
             ));
@@ -289,6 +317,19 @@ fn exact_recorded_resources(
         ));
     }
     Ok(())
+}
+
+fn pool_scoped(
+    resource: &AzureProviderResourceIdentity,
+    pool_root_uids: &BTreeSet<String>,
+) -> bool {
+    matches!(
+        resource.kind.as_str(),
+        "Machine" | "MachineSet" | "AzureMachinePoolMachine"
+    ) || resource
+        .owner_uids
+        .iter()
+        .any(|uid| pool_root_uids.contains(uid))
 }
 
 fn tenant_resource_ids(
@@ -606,10 +647,11 @@ pub async fn finalize(
             cluster_started,
             &pool_root_uids,
         )?;
-        if provider_resources
-            .iter()
-            .any(|item| !recorded.verified_provider_uids.contains(&item.uid))
-        {
+        if provider_resources.iter().any(|item| {
+            !recorded.verified_provider_uids.contains(&item.uid)
+                && !cluster_started
+                && !(pool_started && pool_scoped(item, &pool_root_uids))
+        }) {
             return Err(blocked("Azure provider deletion UID barrier changed"));
         }
         let expected: BTreeSet<_> = tenant_resource_ids(
@@ -899,5 +941,9 @@ mod tests {
             exact_recorded_resources(&[control_plane_secret], &[], true, false, &pool_uids,)
                 .is_err()
         );
+        let replacement = resource("AzureMachinePoolMachine", "replacement", "pool-uid");
+        assert!(exact_recorded_resources(&[], &[replacement], true, false, &pool_uids).is_ok());
+        let foreign = resource("Secret", "foreign", "foreign-uid");
+        assert!(exact_recorded_resources(&[], &[foreign], true, false, &pool_uids).is_err());
     }
 }

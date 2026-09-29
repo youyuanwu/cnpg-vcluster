@@ -489,7 +489,6 @@ helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant
                 ]},
                 "dataStoreName":"default",
                 "network":{
-                    "certSANs":[],
                     "dnsServiceIPs":[dns],
                     "serviceAnnotations":{"service.beta.kubernetes.io/azure-load-balancer-internal":"true"},
                     "serviceType":"LoadBalancer"
