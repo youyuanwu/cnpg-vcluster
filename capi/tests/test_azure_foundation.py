@@ -12,8 +12,6 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
-import yaml
-
 from scripts.azure import _run_profile_mutation
 from scripts.lib.azure.common import (
     _foundation_defaults_checksum,
@@ -544,7 +542,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         config = load_azure_configuration(root)
         inventory = self.inventory(root, config)
         image = "yycvacr.azurecr.io/tenant-admin@sha256:" + "7" * 64
-        rendered = root / ".runtime/rendered/azure-admin/deployment.yaml"
+        rendered = root / ".runtime/rendered/azure-admin/deployment.json"
         with (
             patch(
                 "scripts.lib.azure.foundation._push_admin_image",
@@ -570,13 +568,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         ]
         self.assertEqual(
             [
-                str(root / "admin/config/rbac/service-account.yaml"),
-                str(root / "admin/config/rbac/cluster-role-azure.yaml"),
+                str(root / "admin/config/rbac/service-account.json"),
+                str(root / "admin/config/rbac/cluster-role-azure.json"),
                 str(
                     root
-                    / "admin/config/rbac/cluster-role-binding-azure.yaml"
+                    / "admin/config/rbac/cluster-role-binding-azure.json"
                 ),
-                str(root / "admin/config/service/service.yaml"),
+                str(root / "admin/config/service/service.json"),
                 str(rendered),
             ],
             applied,
@@ -679,15 +677,15 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 }],
             }
         }
-        service_account = yaml.safe_load(
-            (ROOT / "admin/config/rbac/service-account.yaml").read_text()
+        service_account = json.loads(
+            (ROOT / "admin/config/rbac/service-account.json").read_text()
         )
-        role = yaml.safe_load(
-            (ROOT / "admin/config/rbac/cluster-role-azure.yaml").read_text()
+        role = json.loads(
+            (ROOT / "admin/config/rbac/cluster-role-azure.json").read_text()
         )
-        binding = yaml.safe_load(
+        binding = json.loads(
             (
-                ROOT / "admin/config/rbac/cluster-role-binding-azure.yaml"
+                ROOT / "admin/config/rbac/cluster-role-binding-azure.json"
             ).read_text()
         )
         rules_review = {

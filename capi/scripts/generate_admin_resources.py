@@ -24,6 +24,16 @@ PROVIDER_CATALOGS = {
 }
 
 OUTPUT_PATHS = (
+    Path("admin/config/deployment/deployment-azure.json.tpl"),
+    Path("admin/config/deployment/deployment-local.json.tpl"),
+    Path("admin/config/rbac/cluster-role-azure.json"),
+    Path("admin/config/rbac/cluster-role-binding-azure.json"),
+    Path("admin/config/rbac/cluster-role-binding-local.json"),
+    Path("admin/config/rbac/cluster-role-local.json"),
+    Path("admin/config/rbac/service-account.json"),
+    Path("admin/config/service/service.json"),
+)
+LEGACY_OUTPUT_PATHS = (
     Path("admin/config/deployment/deployment-azure.yaml.tpl"),
     Path("admin/config/deployment/deployment-local.yaml.tpl"),
     Path("admin/config/rbac/cluster-role-azure.yaml"),
@@ -38,13 +48,13 @@ OUTPUT_PATHS = (
 def cluster_role_path(provider: str) -> Path:
     if provider not in PROVIDERS:
         raise ValueError(f"unsupported admin provider: {provider}")
-    return Path(f"admin/config/rbac/cluster-role-{provider}.yaml")
+    return Path(f"admin/config/rbac/cluster-role-{provider}.json")
 
 
 def cluster_role_binding_path(provider: str) -> Path:
     if provider not in PROVIDERS:
         raise ValueError(f"unsupported admin provider: {provider}")
-    return Path(f"admin/config/rbac/cluster-role-binding-{provider}.yaml")
+    return Path(f"admin/config/rbac/cluster-role-binding-{provider}.json")
 
 
 def provider_rules(
@@ -113,157 +123,189 @@ def provider_rules(
     return tuple(sorted(rules))
 
 
-def _cluster_role(root: Path, provider: str) -> str:
-    lines = [
-        "---",
-        "apiVersion: rbac.authorization.k8s.io/v1",
-        "kind: ClusterRole",
-        "metadata:",
-        f"  name: {ADMIN_ROLE_NAMES[provider]}",
-        "rules:",
-    ]
-    for api_group, resources, verbs in provider_rules(root, provider):
-        rendered_group = f"'{api_group}'" if not api_group else api_group
-        lines.extend(
-            (
-                "- apiGroups:",
-                f"  - {rendered_group}",
-                "  resources:",
-                *(f"  - {resource}" for resource in resources),
-                "  verbs:",
-                *(f"  - {verb}" for verb in verbs),
-            )
-        )
-    return "\n".join(lines) + "\n"
+def _render_json(document: dict[str, object]) -> str:
+    return json.dumps(document, indent=2, sort_keys=True) + "\n"
 
 
-def _deployment(provider: str) -> str:
+def _cluster_role(root: Path, provider: str) -> dict[str, object]:
+    return {
+        "apiVersion": "rbac.authorization.k8s.io/v1",
+        "kind": "ClusterRole",
+        "metadata": {"name": ADMIN_ROLE_NAMES[provider]},
+        "rules": [
+            {
+                "apiGroups": [api_group],
+                "resources": list(resources),
+                "verbs": list(verbs),
+            }
+            for api_group, resources, verbs in provider_rules(root, provider)
+        ],
+    }
+
+
+def _deployment(provider: str) -> dict[str, object]:
     if provider not in PROVIDERS:
         raise ValueError(f"unsupported admin provider: {provider}")
     image_pull_policy = "Never" if provider == "local" else "IfNotPresent"
-    return f"""\
-apiVersion: apps/v1
-kind: Deployment
-metadata:
-  name: {ADMIN_NAME}
-  namespace: {ADMIN_NAMESPACE}
-spec:
-  replicas: 1
-  revisionHistoryLimit: 2
-  progressDeadlineSeconds: 300
-  strategy:
-    type: Recreate
-  selector:
-    matchLabels:
-      app.kubernetes.io/name: {ADMIN_NAME}
-  template:
-    metadata:
-      labels:
-        app.kubernetes.io/name: {ADMIN_NAME}
-    spec:
-      serviceAccountName: {ADMIN_NAME}
-      automountServiceAccountToken: true
-      enableServiceLinks: false
-      terminationGracePeriodSeconds: 30
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 65532
-        runAsGroup: 65532
-        seccompProfile:
-          type: RuntimeDefault
-      containers:
-      - name: admin
-        image: {ADMIN_IMAGE}
-        imagePullPolicy: {image_pull_policy}
-        env:
-        - name: TENANT_ADMIN_PROVIDER
-          value: {provider}
-        ports:
-        - name: http
-          containerPort: {ADMIN_CONTAINER_PORT}
-          protocol: TCP
-        livenessProbe:
-          httpGet:
-            path: /healthz
-            port: http
-          initialDelaySeconds: 5
-          periodSeconds: 10
-          timeoutSeconds: 2
-          failureThreshold: 3
-        readinessProbe:
-          httpGet:
-            path: /readyz
-            port: http
-          periodSeconds: 5
-          timeoutSeconds: 2
-          failureThreshold: 3
-        securityContext:
-          runAsNonRoot: true
-          privileged: false
-          allowPrivilegeEscalation: false
-          readOnlyRootFilesystem: true
-          capabilities:
-            drop:
-            - ALL
-        resources:
-          requests:
-            cpu: 25m
-            memory: 32Mi
-          limits:
-            cpu: 250m
-            memory: 128Mi
-"""
+    return {
+        "apiVersion": "apps/v1",
+        "kind": "Deployment",
+        "metadata": {
+            "name": ADMIN_NAME,
+            "namespace": ADMIN_NAMESPACE,
+        },
+        "spec": {
+            "replicas": 1,
+            "revisionHistoryLimit": 2,
+            "progressDeadlineSeconds": 300,
+            "strategy": {"type": "Recreate"},
+            "selector": {
+                "matchLabels": {"app.kubernetes.io/name": ADMIN_NAME}
+            },
+            "template": {
+                "metadata": {
+                    "labels": {"app.kubernetes.io/name": ADMIN_NAME}
+                },
+                "spec": {
+                    "serviceAccountName": ADMIN_NAME,
+                    "automountServiceAccountToken": True,
+                    "enableServiceLinks": False,
+                    "terminationGracePeriodSeconds": 30,
+                    "securityContext": {
+                        "runAsNonRoot": True,
+                        "runAsUser": 65532,
+                        "runAsGroup": 65532,
+                        "seccompProfile": {"type": "RuntimeDefault"},
+                    },
+                    "containers": [
+                        {
+                            "name": "admin",
+                            "image": ADMIN_IMAGE,
+                            "imagePullPolicy": image_pull_policy,
+                            "env": [
+                                {
+                                    "name": "TENANT_ADMIN_PROVIDER",
+                                    "value": provider,
+                                }
+                            ],
+                            "ports": [
+                                {
+                                    "name": "http",
+                                    "containerPort": ADMIN_CONTAINER_PORT,
+                                    "protocol": "TCP",
+                                }
+                            ],
+                            "livenessProbe": {
+                                "httpGet": {
+                                    "path": "/healthz",
+                                    "port": "http",
+                                },
+                                "initialDelaySeconds": 5,
+                                "periodSeconds": 10,
+                                "timeoutSeconds": 2,
+                                "failureThreshold": 3,
+                            },
+                            "readinessProbe": {
+                                "httpGet": {
+                                    "path": "/readyz",
+                                    "port": "http",
+                                },
+                                "periodSeconds": 5,
+                                "timeoutSeconds": 2,
+                                "failureThreshold": 3,
+                            },
+                            "securityContext": {
+                                "runAsNonRoot": True,
+                                "privileged": False,
+                                "allowPrivilegeEscalation": False,
+                                "readOnlyRootFilesystem": True,
+                                "capabilities": {"drop": ["ALL"]},
+                            },
+                            "resources": {
+                                "requests": {
+                                    "cpu": "25m",
+                                    "memory": "32Mi",
+                                },
+                                "limits": {
+                                    "cpu": "250m",
+                                    "memory": "128Mi",
+                                },
+                            },
+                        }
+                    ],
+                },
+            },
+        },
+    }
 
 
 def generated_documents(root: Path = ROOT) -> dict[Path, str]:
     documents = {
-        Path("admin/config/deployment/deployment-azure.yaml.tpl"): _deployment(
-            "azure"
+        Path("admin/config/deployment/deployment-azure.json.tpl"): _render_json(
+            _deployment("azure")
         ),
-        Path("admin/config/deployment/deployment-local.yaml.tpl"): _deployment(
-            "local"
+        Path("admin/config/deployment/deployment-local.json.tpl"): _render_json(
+            _deployment("local")
         ),
-        Path("admin/config/rbac/service-account.yaml"): f"""\
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: {ADMIN_NAME}
-  namespace: {ADMIN_NAMESPACE}
-automountServiceAccountToken: false
-""",
-        Path("admin/config/service/service.yaml"): f"""\
-apiVersion: v1
-kind: Service
-metadata:
-  name: {ADMIN_NAME}
-  namespace: {ADMIN_NAMESPACE}
-spec:
-  type: ClusterIP
-  selector:
-    app.kubernetes.io/name: {ADMIN_NAME}
-  ports:
-  - name: http
-    port: {ADMIN_SERVICE_PORT}
-    targetPort: {ADMIN_CONTAINER_PORT}
-    protocol: TCP
-""",
+        Path("admin/config/rbac/service-account.json"): _render_json(
+            {
+                "apiVersion": "v1",
+                "kind": "ServiceAccount",
+                "metadata": {
+                    "name": ADMIN_NAME,
+                    "namespace": ADMIN_NAMESPACE,
+                },
+                "automountServiceAccountToken": False,
+            }
+        ),
+        Path("admin/config/service/service.json"): _render_json(
+            {
+                "apiVersion": "v1",
+                "kind": "Service",
+                "metadata": {
+                    "name": ADMIN_NAME,
+                    "namespace": ADMIN_NAMESPACE,
+                },
+                "spec": {
+                    "type": "ClusterIP",
+                    "selector": {
+                        "app.kubernetes.io/name": ADMIN_NAME,
+                    },
+                    "ports": [
+                        {
+                            "name": "http",
+                            "port": ADMIN_SERVICE_PORT,
+                            "targetPort": ADMIN_CONTAINER_PORT,
+                            "protocol": "TCP",
+                        }
+                    ],
+                },
+            }
+        ),
     }
     for provider in PROVIDERS:
-        documents[cluster_role_path(provider)] = _cluster_role(root, provider)
-        documents[cluster_role_binding_path(provider)] = f"""\
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {ADMIN_NAME}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {ADMIN_ROLE_NAMES[provider]}
-subjects:
-- kind: ServiceAccount
-  name: {ADMIN_NAME}
-  namespace: {ADMIN_NAMESPACE}
-"""
+        documents[cluster_role_path(provider)] = _render_json(
+            _cluster_role(root, provider)
+        )
+        documents[cluster_role_binding_path(provider)] = _render_json(
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "ClusterRoleBinding",
+                "metadata": {"name": ADMIN_NAME},
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": ADMIN_ROLE_NAMES[provider],
+                },
+                "subjects": [
+                    {
+                        "kind": "ServiceAccount",
+                        "name": ADMIN_NAME,
+                        "namespace": ADMIN_NAMESPACE,
+                    }
+                ],
+            }
+        )
     return documents
 
 
@@ -273,6 +315,17 @@ def generate(root: Path, *, check: bool) -> bool:
         raise RuntimeError("admin resource output set does not match OUTPUT_PATHS")
 
     valid = True
+    for relative_path in LEGACY_OUTPUT_PATHS:
+        path = root / relative_path
+        if check:
+            if path.exists():
+                print(
+                    f"legacy generated admin resource remains: {path}",
+                    file=sys.stderr,
+                )
+                valid = False
+        elif path.exists():
+            path.unlink()
     for relative_path in OUTPUT_PATHS:
         path = root / relative_path
         expected = documents[relative_path]

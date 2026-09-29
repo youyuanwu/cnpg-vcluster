@@ -53,7 +53,9 @@ The server listens on `0.0.0.0:8080`. The generated Deployment,
 ServiceAccount, ClusterRoleBinding, and ClusterIP Service are named
 `tenant-admin` in `tenant-system`. Local installs the
 `tenant-admin-local` ClusterRole and Azure installs `tenant-admin-azure`.
-The Service exposes port `80`.
+The Service exposes port `80`. These checked-in resources and deployment
+templates are canonical indented JSON, generated and validated with only the
+Python standard library so offline installation never needs PyYAML or pip.
 
 ## Data and security model
 

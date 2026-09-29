@@ -76,7 +76,7 @@ def _validate_runtime_inventory(
         "rendered/controller/manager.yaml",
         "rendered/azure-controller/manager.yaml",
         "rendered/admin/tenant-admin",
-        "rendered/admin/deployment-local.yaml",
+        "rendered/admin/deployment-local.json",
         "azure/resources.json",
         "azure/management.kubeconfig",
         "azure/kamaji-provider.yaml",

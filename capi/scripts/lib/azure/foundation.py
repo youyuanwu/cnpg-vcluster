@@ -4,8 +4,6 @@ import base64
 import uuid
 from collections.abc import Callable
 
-import yaml
-
 from .common import *
 from scripts.lib.admin import (
     ADMIN_IDENTITY,
@@ -880,8 +878,8 @@ def _tracked_admin_resource(
 ) -> dict[str, object]:
     path = root / relative_path
     try:
-        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             f"tracked Azure admin resource is invalid: {path}"
         ) from exc
@@ -1250,7 +1248,7 @@ def _inspect_admin(
         blockers.extend(_admin_service_blockers(service))
     expected_service_account = _tracked_admin_resource(
         root,
-        "admin/config/rbac/service-account.yaml",
+        "admin/config/rbac/service-account.json",
     )
     service_account = _get_management_resource(
         root,
@@ -1268,7 +1266,7 @@ def _inspect_admin(
         )
     expected_role = _tracked_admin_resource(
         root,
-        "admin/config/rbac/cluster-role-azure.yaml",
+        "admin/config/rbac/cluster-role-azure.json",
     )
     role = _get_management_resource(
         root,
@@ -1281,7 +1279,7 @@ def _inspect_admin(
         blockers.extend(_admin_role_blockers(role, expected_role))
     expected_binding = _tracked_admin_resource(
         root,
-        "admin/config/rbac/cluster-role-binding-azure.yaml",
+        "admin/config/rbac/cluster-role-binding-azure.json",
     )
     binding = _get_management_resource(
         root,

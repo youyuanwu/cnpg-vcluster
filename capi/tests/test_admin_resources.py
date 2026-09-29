@@ -1,9 +1,8 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
-
-import yaml
 
 from scripts import generate_admin_resources as generator
 
@@ -98,7 +97,7 @@ EXPECTED_RBAC = {
 
 
 def load(relative_path: str) -> dict:
-    return yaml.safe_load((ROOT / relative_path).read_text(encoding="utf-8"))
+    return json.loads((ROOT / relative_path).read_text(encoding="utf-8"))
 
 
 class AdminResourceTests(unittest.TestCase):
@@ -121,8 +120,8 @@ class AdminResourceTests(unittest.TestCase):
         self.assertEqual(2, generator.main(["--check", "extra"]))
 
     def test_service_account_binding_and_service_contract(self) -> None:
-        service_account = load("admin/config/rbac/service-account.yaml")
-        service = load("admin/config/service/service.yaml")
+        service_account = load("admin/config/rbac/service-account.json")
+        service = load("admin/config/service/service.json")
 
         for resource in (service_account, service):
             self.assertEqual("tenant-admin", resource["metadata"]["name"])
@@ -131,7 +130,7 @@ class AdminResourceTests(unittest.TestCase):
 
         for provider in generator.PROVIDERS:
             binding = load(
-                f"admin/config/rbac/cluster-role-binding-{provider}.yaml"
+                f"admin/config/rbac/cluster-role-binding-{provider}.json"
             )
             self.assertEqual("tenant-admin", binding["metadata"]["name"])
             self.assertEqual(
@@ -172,7 +171,7 @@ class AdminResourceTests(unittest.TestCase):
 
     def test_cluster_roles_are_exact_provider_catalog_permissions(self) -> None:
         for provider in generator.PROVIDERS:
-            role = load(f"admin/config/rbac/cluster-role-{provider}.yaml")
+            role = load(f"admin/config/rbac/cluster-role-{provider}.json")
             self.assertEqual(
                 f"tenant-admin-{provider}",
                 role["metadata"]["name"],
@@ -202,7 +201,7 @@ class AdminResourceTests(unittest.TestCase):
         images = set()
         for provider in ("local", "azure"):
             deployment = load(
-                f"admin/config/deployment/deployment-{provider}.yaml.tpl"
+                f"admin/config/deployment/deployment-{provider}.json.tpl"
             )
             self.assertEqual("tenant-admin", deployment["metadata"]["name"])
             self.assertEqual("tenant-system", deployment["metadata"]["namespace"])

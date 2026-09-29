@@ -8,8 +8,6 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-import yaml
-
 from scripts import admin as admin_cli
 from scripts import destroy as destroy_script
 from scripts.lib import admin_local
@@ -40,9 +38,9 @@ def tenant_summary(name: str) -> dict[str, object]:
 class FakeClient:
     def __init__(self, *, tenant_names: tuple[str, ...] = ()) -> None:
         template = (
-            ROOT / "admin/config/deployment/deployment-local.yaml.tpl"
+            ROOT / "admin/config/deployment/deployment-local.json.tpl"
         ).read_text(encoding="utf-8")
-        self.deployment = yaml.safe_load(
+        self.deployment = json.loads(
             template.replace("${TENANT_ADMIN_IMAGE}", IMAGE)
         )
         self.deployment["metadata"].update(
@@ -63,23 +61,23 @@ class FakeClient:
                 "conditions": [{"type": "Ready", "status": "True"}]
             },
         }
-        self.service_account = yaml.safe_load(
-            (ROOT / "admin/config/rbac/service-account.yaml").read_text(
+        self.service_account = json.loads(
+            (ROOT / "admin/config/rbac/service-account.json").read_text(
                 encoding="utf-8"
             )
         )
-        self.role = yaml.safe_load(
-            (ROOT / "admin/config/rbac/cluster-role-local.yaml").read_text(
+        self.role = json.loads(
+            (ROOT / "admin/config/rbac/cluster-role-local.json").read_text(
                 encoding="utf-8"
             )
         )
-        self.binding = yaml.safe_load(
+        self.binding = json.loads(
             (
-                ROOT / "admin/config/rbac/cluster-role-binding-local.yaml"
+                ROOT / "admin/config/rbac/cluster-role-binding-local.json"
             ).read_text(encoding="utf-8")
         )
-        self.service = yaml.safe_load(
-            (ROOT / "admin/config/service/service.yaml").read_text(
+        self.service = json.loads(
+            (ROOT / "admin/config/service/service.json").read_text(
                 encoding="utf-8"
             )
         )
@@ -272,12 +270,12 @@ class AdminLocalTests(unittest.TestCase):
     def test_render_is_exact_private_and_rejects_unsafe_images(self) -> None:
         with tempfile.TemporaryDirectory(dir=ROOT / ".runtime") as temporary:
             root = Path(temporary)
-            template = root / "admin/config/deployment/deployment-local.yaml.tpl"
+            template = root / "admin/config/deployment/deployment-local.json.tpl"
             template.parent.mkdir(parents=True)
             template.write_text(
                 (
                     ROOT
-                    / "admin/config/deployment/deployment-local.yaml.tpl"
+                    / "admin/config/deployment/deployment-local.json.tpl"
                 ).read_text(encoding="utf-8"),
                 encoding="utf-8",
             )
@@ -285,7 +283,7 @@ class AdminLocalTests(unittest.TestCase):
             self.assertEqual(0o600, rendered.stat().st_mode & 0o777)
             self.assertEqual(
                 IMAGE,
-                yaml.safe_load(rendered.read_text(encoding="utf-8"))["spec"][
+                json.loads(rendered.read_text(encoding="utf-8"))["spec"][
                     "template"
                 ]["spec"]["containers"][0]["image"],
             )
@@ -304,7 +302,7 @@ class AdminLocalTests(unittest.TestCase):
         self,
     ) -> None:
         client = FakeClient()
-        rendered = ROOT / ".runtime/rendered/admin/deployment-local.yaml"
+        rendered = ROOT / ".runtime/rendered/admin/deployment-local.json"
         with (
             patch.object(
                 admin_local, "build_admin_image", return_value=IMAGE
@@ -331,10 +329,10 @@ class AdminLocalTests(unittest.TestCase):
         load.assert_called_once_with(ROOT, expected_config, IMAGE)
         self.assertEqual(
             [
-                ROOT / "admin/config/rbac/service-account.yaml",
-                ROOT / "admin/config/rbac/cluster-role-local.yaml",
-                ROOT / "admin/config/rbac/cluster-role-binding-local.yaml",
-                ROOT / "admin/config/service/service.yaml",
+                ROOT / "admin/config/rbac/service-account.json",
+                ROOT / "admin/config/rbac/cluster-role-local.json",
+                ROOT / "admin/config/rbac/cluster-role-binding-local.json",
+                ROOT / "admin/config/service/service.json",
                 rendered,
             ],
             [call.args[1] for call in apply.call_args_list],
@@ -718,7 +716,7 @@ class AdminLocalTests(unittest.TestCase):
             root = Path(temporary)
             rendered = root / ".runtime/rendered/admin"
             rendered.mkdir(parents=True)
-            (rendered / "deployment-local.yaml").write_text(
+            (rendered / "deployment-local.json").write_text(
                 "fixture\n", encoding="utf-8"
             )
             resources = iter((None, None, None, None, None))

@@ -199,6 +199,40 @@ def check_repository_boundaries() -> None:
         result = output("git", "check-ignore", candidate, check_result=False)
         check(result.returncode == 0, f"{candidate} is not ignored")
     check(not any(path.is_symlink() for path in ROOT.rglob("*")), "symlinks below capi are forbidden")
+    yaml_imports = []
+    for path in ROOT.rglob("*.py"):
+        for line_number, line in enumerate(
+            path.read_text(encoding="utf-8").splitlines(),
+            start=1,
+        ):
+            if re.match(r"\s*(?:from\s+yaml\b|import\s+.*\byaml\b)", line):
+                yaml_imports.append(f"{path.relative_to(ROOT)}:{line_number}")
+    check(
+        not yaml_imports,
+        f"Python below capi must remain stdlib-only; yaml imports: {yaml_imports}",
+    )
+    dependency_manifests = [
+        path.relative_to(ROOT).as_posix()
+        for pattern in ("requirements*.txt", "Pipfile*", "poetry.lock")
+        for path in ROOT.rglob(pattern)
+    ]
+    check(
+        not dependency_manifests,
+        "Python dependency manifests are forbidden below capi: "
+        f"{sorted(dependency_manifests)}",
+    )
+    automation = (
+        (ROOT / "Justfile").read_text(encoding="utf-8")
+        + (ROOT.parent / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    )
+    check(
+        re.search(
+            r"\b(?:python3?\s+-m\s+)?pip3?\s+install\b",
+            automation,
+        )
+        is None,
+        "CAPI automation must not install Python dependencies",
+    )
     check((ROOT / "scripts" / "post_renderer.py").stat().st_mode & 0o111 != 0, "post-renderer is not executable")
     repository = ROOT.parent
     check(not (repository / "Makefile").exists(), "obsolete root Makefile remains")

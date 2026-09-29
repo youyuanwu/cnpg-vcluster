@@ -17,7 +17,7 @@ class HostOwnershipTests(unittest.TestCase):
             web.mkdir(parents=True, mode=0o700)
             files = (
                 web.parent / "tenant-admin",
-                web.parent / "deployment-local.yaml",
+                web.parent / "deployment-local.json",
                 web / "index.html",
                 web / ("tenant-admin-web-" + "a" * 16 + ".js"),
                 web / ("tenant-admin-web-" + "a" * 16 + "_bg.wasm"),

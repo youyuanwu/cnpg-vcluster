@@ -8,8 +8,6 @@ import shutil
 import stat
 from pathlib import Path
 
-import yaml
-
 from scripts import generate_admin_resources as admin_resource_generator
 from scripts.lib.config import parse_duration, require
 from scripts.lib.controller import rust_toolchain
@@ -144,10 +142,10 @@ def admin_role_name(provider: str) -> str:
 
 def admin_rbac_resource_paths(root: Path, provider: str) -> tuple[Path, ...]:
     return (
-        root / "admin/config/rbac/service-account.yaml",
+        root / "admin/config/rbac/service-account.json",
         root / admin_resource_generator.cluster_role_path(provider),
         root / admin_resource_generator.cluster_role_binding_path(provider),
-        root / "admin/config/service/service.yaml",
+        root / "admin/config/service/service.json",
     )
 
 
@@ -272,8 +270,8 @@ def validate_admin_effective_rules(
         raise RuntimeError("Tenant Admin effective RBAC review is incomplete")
     role_path = root / admin_resource_generator.cluster_role_path(provider)
     try:
-        role = yaml.safe_load(role_path.read_text(encoding="utf-8"))
-    except (OSError, yaml.YAMLError) as exc:
+        role = json.loads(role_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(
             f"Tenant Admin generated ClusterRole is invalid: {role_path}"
         ) from exc
@@ -773,7 +771,7 @@ def render_azure_admin_deployment(root: Path, image: str) -> Path:
     if not re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", image):
         raise RuntimeError("Azure admin image must be an immutable digest reference")
     template = (
-        root / "admin" / "config" / "deployment" / "deployment-azure.yaml.tpl"
+        root / "admin" / "config" / "deployment" / "deployment-azure.json.tpl"
     ).read_text(encoding="utf-8")
     placeholder = "${TENANT_ADMIN_IMAGE}"
     if template.count(placeholder) != 1:
@@ -781,7 +779,7 @@ def render_azure_admin_deployment(root: Path, image: str) -> Path:
             "Azure admin Deployment template must contain exactly one image placeholder"
         )
     destination = (
-        root / ".runtime" / "rendered" / "azure-admin" / "deployment.yaml"
+        root / ".runtime" / "rendered" / "azure-admin" / "deployment.json"
     )
     write_private_file(destination, template.replace(placeholder, image))
     return destination

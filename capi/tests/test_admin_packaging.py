@@ -379,7 +379,7 @@ class AdminPackagingTests(unittest.TestCase):
             "admin/server/src/main.rs": "server",
             "admin/web/src/main.rs": "web",
             "admin/web/Trunk.toml": "config",
-            "admin/config/rbac/cluster-role-local.yaml": "generated",
+            "admin/config/rbac/cluster-role-local.json": "generated",
             "controller/Cargo.toml": "[package]\nname = \"tenant-controller\"",
             "controller/src/api.rs": "api",
             "controller/src/management.rs": "management",
@@ -473,18 +473,18 @@ class AdminPackagingTests(unittest.TestCase):
         )
 
     def test_azure_deployment_render_requires_one_immutable_image(self) -> None:
-        template = self.root / "admin/config/deployment/deployment-azure.yaml.tpl"
+        template = self.root / "admin/config/deployment/deployment-azure.json.tpl"
         template.parent.mkdir(parents=True)
         template.write_text(
-            "image: ${TENANT_ADMIN_IMAGE}\n"
-            "env:\n- name: TENANT_ADMIN_PROVIDER\n  value: azure\n",
+            '{"image":"${TENANT_ADMIN_IMAGE}",'
+            '"env":[{"name":"TENANT_ADMIN_PROVIDER","value":"azure"}]}\n',
             encoding="utf-8",
         )
         image = "example.azurecr.io/tenant-admin@sha256:" + "a" * 64
         rendered = packaging.render_azure_admin_deployment(self.root, image)
         self.assertEqual(0o600, rendered.stat().st_mode & 0o777)
         content = rendered.read_text(encoding="utf-8")
-        self.assertIn(f"image: {image}", content)
+        self.assertIn(f'"image":"{image}"', content)
         self.assertNotIn("${TENANT_ADMIN_IMAGE}", content)
         for invalid in (
             "example.azurecr.io/tenant-admin:latest",
@@ -494,7 +494,7 @@ class AdminPackagingTests(unittest.TestCase):
                 RuntimeError, "immutable digest"
             ):
                 packaging.render_azure_admin_deployment(self.root, invalid)
-        template.write_text("image: fixed\n", encoding="utf-8")
+        template.write_text('{"image":"fixed"}\n', encoding="utf-8")
         with self.assertRaisesRegex(RuntimeError, "exactly one"):
             packaging.render_azure_admin_deployment(self.root, image)
 

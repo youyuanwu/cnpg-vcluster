@@ -6,8 +6,6 @@ import shutil
 import subprocess
 from pathlib import Path
 
-import yaml
-
 from scripts.lib.admin import (
     ADMIN_IDENTITY,
     ADMIN_NAMESPACE_LIMIT,
@@ -80,7 +78,7 @@ ADMIN_TOPOLOGY_EDGE_KINDS = {
 def render_local_admin_deployment(root: Path, image: str) -> Path:
     if not ADMIN_IMAGE_PATTERN.fullmatch(image):
         raise RuntimeError("Tenant Admin image reference is unsafe")
-    source = root / "admin/config/deployment/deployment-local.yaml.tpl"
+    source = root / "admin/config/deployment/deployment-local.json.tpl"
     template = source.read_text(encoding="utf-8")
     placeholder = "${TENANT_ADMIN_IMAGE}"
     if template.count(placeholder) != 1:
@@ -89,8 +87,8 @@ def render_local_admin_deployment(root: Path, image: str) -> Path:
     if placeholder in rendered:
         raise RuntimeError("local Tenant Admin image substitution was incomplete")
     try:
-        deployment = yaml.safe_load(rendered)
-    except yaml.YAMLError as exc:
+        deployment = json.loads(rendered)
+    except json.JSONDecodeError as exc:
         raise RuntimeError("rendered local Tenant Admin Deployment is invalid") from exc
     try:
         rendered_image = deployment["spec"]["template"]["spec"]["containers"][0][
@@ -101,7 +99,7 @@ def render_local_admin_deployment(root: Path, image: str) -> Path:
     if rendered_image != image:
         raise RuntimeError("rendered local Tenant Admin image does not match")
     destination = (
-        root / ".runtime/rendered/admin/deployment-local.yaml"
+        root / ".runtime/rendered/admin/deployment-local.json"
     )
     write_private_file(destination, rendered)
     return destination
@@ -165,9 +163,9 @@ def _container(document: dict[str, object]) -> dict[str, object]:
 
 
 def _expected_rules(root: Path) -> list[dict[str, object]]:
-    document = yaml.safe_load(
+    document = json.loads(
         (
-            root / "admin/config/rbac/cluster-role-local.yaml"
+            root / "admin/config/rbac/cluster-role-local.json"
         ).read_text(encoding="utf-8")
     )
     return document["rules"]
@@ -231,9 +229,9 @@ def _verify_binding(root: Path, binding: dict[str, object]) -> None:
     metadata = _required_mapping(
         binding.get("metadata"), "ClusterRoleBinding metadata"
     )
-    expected = yaml.safe_load(
+    expected = json.loads(
         (
-            root / "admin/config/rbac/cluster-role-binding-local.yaml"
+            root / "admin/config/rbac/cluster-role-binding-local.json"
         ).read_text(encoding="utf-8")
     )
     if (
