@@ -153,7 +153,11 @@ async fn tenant_detail(
         .source
         .list_management_resources(state.provider, &name)
         .await?;
-    let projection = TenantProjection::new(state.provider, tenant, resources);
+    let database = state
+        .source
+        .database_observation(state.provider, &tenant, &resources)
+        .await?;
+    let projection = TenantProjection::new(state.provider, tenant, resources, database);
     let identity = TenantSnapshotIdentity {
         uid: projection.detail.uid.clone(),
         generation: projection.detail.generation,
@@ -162,6 +166,7 @@ async fn tenant_detail(
     Ok(Json(ApiEnvelope::new(TenantSnapshot {
         identity,
         detail: projection.detail,
+        database: projection.database,
         topology: projection.topology,
     })))
 }
@@ -180,8 +185,12 @@ async fn tenant_topology(
         .source
         .list_management_resources(state.provider, &name)
         .await?;
+    let database = state
+        .source
+        .database_observation(state.provider, &tenant, &resources)
+        .await?;
     Ok(Json(ApiEnvelope::new(
-        TenantProjection::new(state.provider, tenant, resources).topology,
+        TenantProjection::new(state.provider, tenant, resources, database).topology,
     )))
 }
 
@@ -269,7 +278,12 @@ mod tests {
     use kube::core::DynamicObject;
     use tenant_admin_shared::{
         ApiErrorCode, ApiErrorEnvelope,
-        query::{OverviewSnapshot, TenantSnapshot, TenantSummary, TopologyGraph},
+        query::{
+            ConditionStatus, DatabaseClusterIdentity, DatabaseClusterObservation,
+            DatabaseCondition, DatabaseInstanceObservation, DatabaseInstanceRole,
+            DatabaseObservation, DatabaseObservationFreshness, DatabasePvcHealth, DatabaseServices,
+            OverviewSnapshot, TenantSnapshot, TenantSummary, TopologyGraph,
+        },
     };
     use tenant_controller::api::{
         LocalProviderStatus, Tenant, TenantPhase, TenantProviderStatus, TenantSpec, TenantStatus,
@@ -284,6 +298,7 @@ mod tests {
         tenants: Result<Vec<Tenant>, SourceError>,
         tenant: Result<Option<Tenant>, SourceError>,
         resources: Result<Vec<DynamicObject>, SourceError>,
+        database: Result<DatabaseObservation, SourceError>,
         ready: Result<(), SourceError>,
         calls: Arc<SourceCalls>,
     }
@@ -293,6 +308,7 @@ mod tests {
         tenant_lists: AtomicUsize,
         tenant_gets: AtomicUsize,
         resource_lists: AtomicUsize,
+        database_observations: AtomicUsize,
     }
 
     impl DataSource for MockSource {
@@ -313,6 +329,18 @@ mod tests {
         ) -> SourceFuture<'_, Vec<DynamicObject>> {
             self.calls.resource_lists.fetch_add(1, Ordering::Relaxed);
             Box::pin(ready(self.resources.clone()))
+        }
+
+        fn database_observation<'a>(
+            &'a self,
+            _provider: ProviderMode,
+            _tenant: &'a Tenant,
+            _management_resources: &'a [DynamicObject],
+        ) -> SourceFuture<'a, DatabaseObservation> {
+            self.calls
+                .database_observations
+                .fetch_add(1, Ordering::Relaxed);
+            Box::pin(ready(self.database.clone()))
         }
 
         fn check_ready(&self) -> SourceFuture<'_, ()> {
@@ -341,6 +369,62 @@ mod tests {
         tenant
     }
 
+    fn database_observation() -> DatabaseObservation {
+        DatabaseObservation::Available {
+            observed_at: "2026-09-29T20:50:16Z".into(),
+            freshness: DatabaseObservationFreshness::Live,
+            cluster: Box::new(DatabaseClusterObservation {
+                identity: DatabaseClusterIdentity {
+                    api_version: "postgresql.cnpg.io/v1".into(),
+                    kind: "Cluster".into(),
+                    namespace: "database".into(),
+                    name: "capi-postgres".into(),
+                    uid: Some("database-uid".into()),
+                    generation: 1,
+                },
+                phase: Some("Cluster in healthy state".into()),
+                reason: Some("ClusterIsReady".into()),
+                desired_instances: 1,
+                observed_instances: 1,
+                ready_instances: 1,
+                current_primary: Some("capi-postgres-1".into()),
+                target_primary: Some("capi-postgres-1".into()),
+                current_primary_since: None,
+                target_primary_requested_at: None,
+                current_primary_failing_since: None,
+                image: None,
+                timeline: Some(1),
+                services: DatabaseServices {
+                    read: None,
+                    write: None,
+                },
+                topology_available: true,
+                nodes_used: Some(1),
+                instances: vec![DatabaseInstanceObservation {
+                    name: "capi-postgres-1".into(),
+                    role: DatabaseInstanceRole::Primary,
+                    status: Some("healthy".into()),
+                    timeline: Some(1),
+                    node: Some("worker-a".into()),
+                    zone: Some("local-a".into()),
+                }],
+                storage: DatabasePvcHealth {
+                    total: 1,
+                    healthy: 1,
+                    ..DatabasePvcHealth::default()
+                },
+                conditions: vec![DatabaseCondition {
+                    condition_type: "Ready".into(),
+                    status: ConditionStatus::True,
+                    reason: Some("ClusterIsReady".into()),
+                    message: None,
+                    observed_generation: Some(1),
+                    last_transition_time: None,
+                }],
+            }),
+        }
+    }
+
     fn test_router(source: MockSource) -> Router {
         router(
             AppState::new(Arc::new(source), ProviderMode::Local),
@@ -366,6 +450,7 @@ mod tests {
             tenants: Ok(Vec::new()),
             tenant: Ok(None),
             resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
             ready: Ok(()),
             calls: Arc::default(),
         };
@@ -404,6 +489,7 @@ mod tests {
         let envelope: ApiEnvelope<Vec<TenantSummary>> = response_json(response).await;
         assert!(envelope.data.is_empty());
         assert_eq!(calls.tenant_lists.load(Ordering::Relaxed), 2);
+        assert_eq!(calls.database_observations.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -416,6 +502,7 @@ mod tests {
             tenants: Ok(vec![tenant_b, tenant_a]),
             tenant: Ok(None),
             resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
             ready: Ok(()),
             calls: Arc::default(),
         };
@@ -441,6 +528,7 @@ mod tests {
             ["tenant-a", "tenant-b"]
         );
         assert_eq!(calls.tenant_lists.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.database_observations.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]
@@ -450,6 +538,7 @@ mod tests {
             tenants: Ok(vec![tenant.clone()]),
             tenant: Ok(Some(tenant)),
             resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
             ready: Ok(()),
             calls: Arc::default(),
         };
@@ -472,10 +561,15 @@ mod tests {
         assert_eq!(detail.data.identity.uid, "tenant-uid");
         assert_eq!(detail.data.identity.generation, 1);
         assert_eq!(detail.data.identity.observed_generation, Some(1));
+        assert!(matches!(
+            detail.data.database,
+            DatabaseObservation::Available { .. }
+        ));
         assert_eq!(detail.data.topology.tenant_name, "tenant-a");
         assert!(!detail.data.topology.nodes.is_empty());
         assert_eq!(calls.tenant_gets.load(Ordering::Relaxed), 1);
         assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.database_observations.load(Ordering::Relaxed), 1);
         let topology = app
             .oneshot(
                 Request::get("/api/v1/tenants/tenant-a/topology")
@@ -489,6 +583,7 @@ mod tests {
         assert!(!topology.data.nodes.is_empty());
         assert_eq!(calls.tenant_gets.load(Ordering::Relaxed), 2);
         assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 2);
+        assert_eq!(calls.database_observations.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -497,6 +592,7 @@ mod tests {
             tenants: Err(SourceError::KubernetesUnavailable),
             tenant: Ok(None),
             resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
             ready: Err(SourceError::KubernetesUnavailable),
             calls: Arc::default(),
         });
@@ -564,6 +660,7 @@ mod tests {
             tenants: Ok(Vec::new()),
             tenant: Ok(None),
             resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
             ready: Ok(()),
             calls: Arc::default(),
         };

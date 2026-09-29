@@ -34,6 +34,7 @@ ADMIN_LABEL = "app.kubernetes.io/name=tenant-admin"
 ADMIN_SERVICE_PROXY = (
     "/api/v1/namespaces/tenant-system/services/http:tenant-admin:80/proxy"
 )
+ADMIN_API_SCHEMA_VERSION = 2
 ADMIN_IMAGE_PATTERN = re.compile(
     r"[a-z0-9](?:[a-z0-9._/-]*[a-z0-9])?:"
     r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}"
@@ -46,6 +47,15 @@ ADMIN_CLASSIFICATIONS = {
     "deleting",
     "ownership-invalid",
 }
+ADMIN_DATABASE_UNAVAILABLE_REASONS = {
+    "pending",
+    "management-resource-missing",
+    "tenant-access-invalid",
+    "tenant-api-unavailable",
+    "cluster-missing",
+    "malformed",
+}
+ADMIN_DATABASE_INSTANCE_ROLES = {"primary", "standby", "unknown"}
 ADMIN_CONDITION_STATUSES = {"True", "False", "Unknown"}
 ADMIN_TOPOLOGY_NODE_KINDS = {
     "tenant",
@@ -193,7 +203,14 @@ def _normalized_rules(value: object) -> list[tuple[tuple[str, ...], ...]]:
             "*" in groups
             or "*" in resources
             or "*" in verbs
-            or "secrets" in resources
+            or (
+                "secrets" in resources
+                and (
+                    groups != ("",)
+                    or resources != ("secrets",)
+                    or verbs != ("get",)
+                )
+            )
             or any("/" in resource for resource in resources)
             or not verbs
             or any(verb not in {"get", "list"} for verb in verbs)
@@ -404,7 +421,7 @@ def _envelope(raw: str, description: str) -> object:
     if (
         not isinstance(envelope, dict)
         or set(envelope) != {"schemaVersion", "data"}
-        or envelope.get("schemaVersion") != 1
+        or envelope.get("schemaVersion") != ADMIN_API_SCHEMA_VERSION
     ):
         raise RuntimeError(f"Tenant Admin {description} response envelope is invalid")
     return envelope["data"]
@@ -476,6 +493,213 @@ def _validate_summary(value: object) -> str:
 
 def _is_integer(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _is_optional_string(value: object) -> bool:
+    return value is None or isinstance(value, str)
+
+
+def _validate_database_observation(
+    value: object,
+    *,
+    provider: str,
+    require_available: bool,
+) -> tuple[str, int]:
+    observation = _required_mapping(value, "database observation")
+    state = observation.get("state")
+    if state == "available":
+        if (
+            set(observation)
+            != {"state", "observedAt", "freshness", "cluster"}
+            or not isinstance(observation.get("observedAt"), str)
+            or not observation["observedAt"]
+            or observation.get("freshness") != "live"
+            or provider != "local"
+        ):
+            raise RuntimeError("Tenant Admin database observation is invalid")
+        cluster = _required_mapping(
+            observation.get("cluster"), "database cluster observation"
+        )
+        if set(cluster) != {
+            "identity",
+            "phase",
+            "reason",
+            "desiredInstances",
+            "observedInstances",
+            "readyInstances",
+            "currentPrimary",
+            "targetPrimary",
+            "currentPrimarySince",
+            "targetPrimaryRequestedAt",
+            "currentPrimaryFailingSince",
+            "image",
+            "timeline",
+            "services",
+            "topologyAvailable",
+            "nodesUsed",
+            "instances",
+            "storage",
+            "conditions",
+        }:
+            raise RuntimeError("Tenant Admin database cluster response is invalid")
+        identity = _required_mapping(
+            cluster.get("identity"), "database cluster identity"
+        )
+        services = _required_mapping(
+            cluster.get("services"), "database services"
+        )
+        storage = _required_mapping(cluster.get("storage"), "database storage")
+        instances = _required_list(
+            cluster.get("instances"), "database instances"
+        )
+        conditions = _required_list(
+            cluster.get("conditions"), "database conditions"
+        )
+        if (
+            set(identity)
+            != {
+                "apiVersion",
+                "kind",
+                "namespace",
+                "name",
+                "uid",
+                "generation",
+            }
+            or identity.get("apiVersion") != "postgresql.cnpg.io/v1"
+            or identity.get("kind") != "Cluster"
+            or identity.get("namespace") != "database"
+            or identity.get("name") != "capi-postgres"
+            or not _is_optional_string(identity.get("uid"))
+            or not _is_integer(identity.get("generation"))
+            or set(services) != {"read", "write"}
+            or not all(_is_optional_string(services.get(key)) for key in services)
+            or set(storage)
+            != {
+                "total",
+                "healthy",
+                "dangling",
+                "initializing",
+                "resizing",
+                "unusable",
+            }
+            or not all(_is_integer(item) and item >= 0 for item in storage.values())
+            or not all(
+                _is_integer(cluster.get(key)) and cluster[key] >= 0
+                for key in (
+                    "desiredInstances",
+                    "observedInstances",
+                    "readyInstances",
+                )
+            )
+            or not all(
+                _is_optional_string(cluster.get(key))
+                for key in (
+                    "phase",
+                    "reason",
+                    "currentPrimary",
+                    "targetPrimary",
+                    "currentPrimarySince",
+                    "targetPrimaryRequestedAt",
+                    "currentPrimaryFailingSince",
+                    "image",
+                )
+            )
+            or (
+                cluster.get("timeline") is not None
+                and not _is_integer(cluster.get("timeline"))
+            )
+            or not isinstance(cluster.get("topologyAvailable"), bool)
+            or (
+                cluster.get("nodesUsed") is not None
+                and not _is_integer(cluster.get("nodesUsed"))
+            )
+        ):
+            raise RuntimeError("Tenant Admin database cluster response is invalid")
+        primary_count = 0
+        names = set()
+        for value in instances:
+            instance = _required_mapping(value, "database instance")
+            if (
+                set(instance)
+                != {"name", "role", "status", "timeline", "node", "zone"}
+                or not isinstance(instance.get("name"), str)
+                or not instance["name"]
+                or instance["name"] in names
+                or instance.get("role") not in ADMIN_DATABASE_INSTANCE_ROLES
+                or not _is_optional_string(instance.get("status"))
+                or (
+                    instance.get("timeline") is not None
+                    and not _is_integer(instance.get("timeline"))
+                )
+                or not _is_optional_string(instance.get("node"))
+                or not _is_optional_string(instance.get("zone"))
+            ):
+                raise RuntimeError("Tenant Admin database instance response is invalid")
+            names.add(instance["name"])
+            primary_count += instance["role"] == "primary"
+        if primary_count > 1:
+            raise RuntimeError("Tenant Admin database primary response is invalid")
+        for value in conditions:
+            condition = _required_mapping(value, "database condition")
+            if (
+                set(condition)
+                != {
+                    "type",
+                    "status",
+                    "reason",
+                    "message",
+                    "observedGeneration",
+                    "lastTransitionTime",
+                }
+                or not isinstance(condition.get("type"), str)
+                or condition.get("status") not in ADMIN_CONDITION_STATUSES
+                or not _is_optional_string(condition.get("reason"))
+                or not _is_optional_string(condition.get("message"))
+                or (
+                    condition.get("observedGeneration") is not None
+                    and not _is_integer(condition.get("observedGeneration"))
+                )
+                or not _is_optional_string(condition.get("lastTransitionTime"))
+            ):
+                raise RuntimeError("Tenant Admin database condition response is invalid")
+        return state, len(instances)
+    if state == "unavailable":
+        if (
+            set(observation)
+            != {
+                "state",
+                "observedAt",
+                "freshness",
+                "reason",
+                "message",
+                "retryable",
+            }
+            or provider != "local"
+            or require_available
+            or not isinstance(observation.get("observedAt"), str)
+            or not observation["observedAt"]
+            or observation.get("freshness") != "live"
+            or observation.get("reason")
+            not in ADMIN_DATABASE_UNAVAILABLE_REASONS
+            or not isinstance(observation.get("message"), str)
+            or not observation["message"]
+            or not isinstance(observation.get("retryable"), bool)
+        ):
+            raise RuntimeError("Tenant Admin unavailable database response is invalid")
+        return state, 0
+    if state == "not-applicable":
+        if (
+            set(observation)
+            != {"state", "observedAt", "freshness", "reason"}
+            or provider != "azure"
+            or not isinstance(observation.get("observedAt"), str)
+            or not observation["observedAt"]
+            or observation.get("freshness") != "live"
+            or observation.get("reason") != "provider-unsupported"
+        ):
+            raise RuntimeError("Tenant Admin database applicability response is invalid")
+        return state, 0
+    raise RuntimeError("Tenant Admin database observation is invalid")
 
 
 def _validate_topology(topology: dict[str, object], name: str) -> None:
@@ -571,6 +795,7 @@ def verify_admin_api(
     client: ManagementClient,
     *,
     expected_tenant_names: tuple[str, ...] | None = None,
+    require_available_databases: bool = False,
 ) -> dict[str, object]:
     for path in ("healthz", "readyz"):
         if _service_proxy(client, path):
@@ -606,7 +831,7 @@ def verify_admin_api(
             ),
             "Tenant snapshot data",
         )
-        if set(snapshot) != {"identity", "detail", "topology"}:
+        if set(snapshot) != {"identity", "detail", "database", "topology"}:
             raise RuntimeError("Tenant Admin Tenant snapshot is invalid")
         identity = _required_mapping(
             snapshot.get("identity"), "Tenant snapshot identity"
@@ -633,6 +858,12 @@ def verify_admin_api(
             or not isinstance(detail.get("managementResources"), list)
         ):
             raise RuntimeError("Tenant Admin Tenant detail response is invalid")
+        summary = _required_mapping(detail.get("summary"), "Tenant detail summary")
+        database_state, database_instances = _validate_database_observation(
+            snapshot.get("database"),
+            provider=_required_string(summary.get("provider"), "Tenant provider"),
+            require_available=require_available_databases,
+        )
         detail_uid = _required_string(detail.get("uid"), "Tenant detail UID")
         if (
             identity
@@ -643,10 +874,33 @@ def verify_admin_api(
             }
         ):
             raise RuntimeError("Tenant Admin Tenant snapshot identity changed")
-        _validate_topology(
-            _required_mapping(snapshot.get("topology"), "Tenant topology data"),
-            name,
+        snapshot_topology = _required_mapping(
+            snapshot.get("topology"), "Tenant topology data"
         )
+        _validate_topology(snapshot_topology, name)
+        topology_node_ids = {
+            node.get("id")
+            for node in snapshot_topology["nodes"]
+            if isinstance(node, dict)
+        }
+        if database_state == "available" and (
+            "database:cluster" not in topology_node_ids
+            or len(
+                [
+                    node_id
+                    for node_id in topology_node_ids
+                    if isinstance(node_id, str)
+                    and node_id.startswith("database:instance:")
+                ]
+            )
+            != database_instances
+        ):
+            raise RuntimeError("Tenant Admin database topology response is invalid")
+        if (
+            database_state == "unavailable"
+            and "database:unavailable" not in topology_node_ids
+        ):
+            raise RuntimeError("Tenant Admin database topology response is invalid")
         topology_response = _service_proxy_response(
             client,
             f"api/v1/tenants/{name}/topology",
@@ -668,7 +922,7 @@ def verify_admin_api(
         )
         _validate_topology(topology, name)
     return {
-        "schemaVersion": 1,
+        "schemaVersion": ADMIN_API_SCHEMA_VERSION,
         "tenantCount": len(names),
         "tenantNames": list(names),
         "counts": counts,
@@ -750,7 +1004,7 @@ def verify_local_admin(
     )
     service_spec = _required_mapping(service.get("spec"), "Service spec")
     return {
-        "schemaVersion": 1,
+        "schemaVersion": ADMIN_API_SCHEMA_VERSION,
         "healthy": True,
         "deployment": {
             "name": ADMIN_NAME,

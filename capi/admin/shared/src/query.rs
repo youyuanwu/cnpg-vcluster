@@ -120,7 +120,141 @@ pub struct TenantSnapshotIdentity {
 pub struct TenantSnapshot {
     pub identity: TenantSnapshotIdentity,
     pub detail: TenantDetail,
+    pub database: DatabaseObservation,
     pub topology: TopologyGraph,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum DatabaseObservation {
+    Available {
+        observed_at: String,
+        freshness: DatabaseObservationFreshness,
+        cluster: Box<DatabaseClusterObservation>,
+    },
+    Unavailable {
+        observed_at: String,
+        freshness: DatabaseObservationFreshness,
+        reason: DatabaseUnavailableReason,
+        message: String,
+        retryable: bool,
+    },
+    NotApplicable {
+        observed_at: String,
+        freshness: DatabaseObservationFreshness,
+        reason: DatabaseNotApplicableReason,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseObservationFreshness {
+    Live,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseUnavailableReason {
+    Pending,
+    ManagementResourceMissing,
+    TenantAccessInvalid,
+    TenantApiUnavailable,
+    ClusterMissing,
+    Malformed,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum DatabaseNotApplicableReason {
+    ProviderUnsupported,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseClusterObservation {
+    pub identity: DatabaseClusterIdentity,
+    pub phase: Option<String>,
+    pub reason: Option<String>,
+    pub desired_instances: u32,
+    pub observed_instances: u32,
+    pub ready_instances: u32,
+    pub current_primary: Option<String>,
+    pub target_primary: Option<String>,
+    pub current_primary_since: Option<String>,
+    pub target_primary_requested_at: Option<String>,
+    pub current_primary_failing_since: Option<String>,
+    pub image: Option<String>,
+    pub timeline: Option<i64>,
+    pub services: DatabaseServices,
+    pub topology_available: bool,
+    pub nodes_used: Option<u32>,
+    pub instances: Vec<DatabaseInstanceObservation>,
+    pub storage: DatabasePvcHealth,
+    pub conditions: Vec<DatabaseCondition>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseClusterIdentity {
+    pub api_version: String,
+    pub kind: String,
+    pub namespace: String,
+    pub name: String,
+    pub uid: Option<String>,
+    pub generation: i64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseServices {
+    pub read: Option<String>,
+    pub write: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseInstanceObservation {
+    pub name: String,
+    pub role: DatabaseInstanceRole,
+    pub status: Option<String>,
+    pub timeline: Option<i64>,
+    pub node: Option<String>,
+    pub zone: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseInstanceRole {
+    Primary,
+    Standby,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabasePvcHealth {
+    pub total: u32,
+    pub healthy: u32,
+    pub dangling: u32,
+    pub initializing: u32,
+    pub resizing: u32,
+    pub unusable: u32,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseCondition {
+    #[serde(rename = "type")]
+    pub condition_type: String,
+    pub status: ConditionStatus,
+    pub reason: Option<String>,
+    pub message: Option<String>,
+    pub observed_generation: Option<i64>,
+    pub last_transition_time: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

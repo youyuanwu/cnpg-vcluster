@@ -19,10 +19,12 @@ CAPZ/ASO.
 
 Both management profiles install the provider-neutral `tenant-admin`
 application: a Leptos WebAssembly frontend served by an Axum/kube-rs backend.
-It reads only the management Kubernetes API through exact provider-specific
-read-only RBAC, validates the ServiceAccount's complete effective rules, and
-has no Tenant kubeconfig, Azure credentials, database, persistent cache, or
-mutation route. See
+It reads management topology through exact provider-specific read-only RBAC.
+For a selected local Tenant detail page, it also reads the exact
+provider-owned kubeconfig Secret, validates its ownership and endpoint, and
+uses it only in memory for an exact live CNPG Cluster read. The service
+validates its complete effective rules and has no Azure credentials, database,
+persistent cache, browser credential exposure, or mutation route. See
 [`docs/admin-ui-design.md`](docs/admin-ui-design.md).
 
 The proposed minimal Azure experiment is documented in

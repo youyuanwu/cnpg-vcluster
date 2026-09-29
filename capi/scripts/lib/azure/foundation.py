@@ -33,6 +33,7 @@ ADMIN_SERVICE_PROXY = (
     "/api/v1/namespaces/tenant-system/"
     "services/http:tenant-admin:http/proxy"
 )
+ADMIN_API_SCHEMA_VERSION = 2
 CAPI_CAPZ_DEPLOYMENTS = (
     ("capi-system", "capi-controller-manager"),
     (
@@ -1054,7 +1055,7 @@ def _azure_admin_overview_names(raw: str) -> tuple[str, ...]:
     )
     if (
         not isinstance(overview, dict)
-        or overview.get("schemaVersion") != 1
+        or overview.get("schemaVersion") != ADMIN_API_SCHEMA_VERSION
         or not isinstance(overview_data, dict)
         or set(overview_data) != {"overview", "tenants"}
         or not isinstance(overview_summary, dict)
@@ -1113,7 +1114,7 @@ def _admin_api_blockers(root: Path) -> list[str]:
     tenant_data = tenants.get("data") if isinstance(tenants, dict) else None
     if (
         not isinstance(tenants, dict)
-        or tenants.get("schemaVersion") != 1
+        or tenants.get("schemaVersion") != ADMIN_API_SCHEMA_VERSION
         or not isinstance(tenant_data, list)
         or not all(isinstance(item, dict) for item in tenant_data)
     ):
@@ -1164,7 +1165,7 @@ def _admin_api_blockers(root: Path) -> list[str]:
                 continue
             if (
                 not isinstance(envelope, dict)
-                or envelope.get("schemaVersion") != 1
+                or envelope.get("schemaVersion") != ADMIN_API_SCHEMA_VERSION
             ):
                 blockers.append(f"Azure admin API contract changed: /{endpoint}")
                 continue
@@ -1177,19 +1178,29 @@ def _admin_api_blockers(root: Path) -> list[str]:
         if not isinstance(snapshot, dict) or set(snapshot) != {
             "identity",
             "detail",
+            "database",
             "topology",
         }:
             blockers.append("Azure admin Tenant snapshot API contract changed")
         else:
             identity = snapshot.get("identity")
             detail = snapshot.get("detail")
+            database = snapshot.get("database")
             topology = snapshot.get("topology")
             if (
                 not isinstance(identity, dict)
                 or not isinstance(detail, dict)
+                or not isinstance(database, dict)
                 or not isinstance(topology, dict)
                 or not isinstance(detail.get("summary"), dict)
                 or detail["summary"].get("name") != name
+                or set(database)
+                != {"state", "observedAt", "freshness", "reason"}
+                or database.get("state") != "not-applicable"
+                or not isinstance(database.get("observedAt"), str)
+                or not database["observedAt"]
+                or database.get("freshness") != "live"
+                or database.get("reason") != "provider-unsupported"
                 or topology.get("tenantName") != name
                 or not isinstance(topology.get("nodes"), list)
                 or not isinstance(topology.get("edges"), list)

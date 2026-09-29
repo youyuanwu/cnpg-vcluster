@@ -11,6 +11,7 @@ ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_RBAC = {
     "local": {
         ("", ("namespaces",), ("get",)),
+        ("", ("secrets",), ("get",)),
         (
             "bootstrap.cluster.x-k8s.io",
             ("kubeadmconfigs", "kubeadmconfigtemplates"),
@@ -185,11 +186,16 @@ class AdminResourceTests(unittest.TestCase):
                 resources = tuple(rule["resources"])
                 verbs = tuple(rule["verbs"])
                 self.assertNotIn("*", resources)
-                self.assertNotIn("secrets", resources)
                 self.assertTrue(
                     all("/" not in resource for resource in resources)
                 )
                 self.assertTrue(set(verbs).issubset({"get", "list"}))
+                if "secrets" in resources:
+                    self.assertEqual("local", provider)
+                    self.assertEqual(
+                        ("", ("secrets",), ("get",)),
+                        (group, resources, verbs),
+                    )
                 actual.add((group, resources, verbs))
             self.assertEqual(EXPECTED_RBAC[provider], actual)
             self.assertEqual(

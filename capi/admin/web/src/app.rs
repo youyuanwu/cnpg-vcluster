@@ -2,8 +2,10 @@ use leptos::prelude::*;
 use tenant_admin_shared::{
     API_SCHEMA_VERSION,
     query::{
-        AzureProviderView, ConditionStatus, OverviewSnapshot, ProviderSpecificationView,
-        ProviderStatusView, TenantCondition, TenantSnapshot, TenantSummary, TopologyGraph,
+        AzureProviderView, ConditionStatus, DatabaseClusterObservation, DatabaseCondition,
+        DatabaseObservation, DatabaseObservationFreshness, OverviewSnapshot,
+        ProviderSpecificationView, ProviderStatusView, TenantCondition, TenantSnapshot,
+        TenantSummary, TopologyGraph,
     },
     routes::{API_OVERVIEW_PATH, API_PREFIX},
 };
@@ -13,9 +15,12 @@ use crate::{
     api::get_envelope,
     error::{UiError, UiErrorKind},
     format::{
-        classification_class, classification_label, condition_status_label, edge_kind_label,
-        format_age, health_class, health_label, node_kind_label, optional_text, provider_label,
-        provider_mode_label,
+        classification_class, classification_label, condition_status_label,
+        database_freshness_label, database_instance_role_class, database_instance_role_label,
+        database_instance_summary, database_not_applicable_reason_label,
+        database_unavailable_reason_label, edge_kind_label, format_age, health_class, health_label,
+        node_kind_label, optional_text, provider_label, provider_mode_label,
+        sort_database_instances,
     },
     route::{AppRoute, parse_route, tenant_href},
     topology::layout_graph,
@@ -118,7 +123,7 @@ fn TenantPage(name: String) -> impl IntoView {
                     <p class="eyebrow">"Tenant detail"</p>
                     <h1>{name}</h1>
                     <p class="lede">
-                        "Specification, reconciliation status, management resources, and provider-neutral topology."
+                        "Specification, reconciliation status, live Tenant database metadata, management resources, and provider-neutral topology. Credentials are excluded from browser responses."
                     </p>
                 </div>
                 <RefreshButton state refresh/>
@@ -369,6 +374,8 @@ fn tenant_row(tenant: TenantSummary) -> AnyView {
 
 fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
     let detail = data.detail;
+    let database = data.database;
+    let topology = data.topology;
     let summary = detail.summary.clone();
     let classification = summary.classification;
     let status_class = classification_class(classification);
@@ -417,6 +424,8 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
             </div>
         </section>
 
+        {database_panel(database)}
+
         <div class="detail-grid">
             <section class="panel" aria-labelledby="specification-heading">
                 <h2 id="specification-heading">"Immutable specification"</h2>
@@ -448,7 +457,378 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
 
         {provider_panel(provider_status)}
         {management_resources_panel(detail.management_resources)}
-        {topology_panel(data.topology)}
+        {topology_panel(topology)}
+    }
+    .into_any()
+}
+
+const MAX_DATABASE_CONDITIONS: usize = 8;
+
+fn database_panel(observation: DatabaseObservation) -> AnyView {
+    match observation {
+        DatabaseObservation::Available {
+            observed_at,
+            freshness,
+            cluster,
+        } => available_database_panel(observed_at, freshness, *cluster),
+        DatabaseObservation::Unavailable {
+            observed_at,
+            freshness,
+            reason,
+            message,
+            retryable,
+        } => {
+            let freshness_label = database_freshness_label(freshness);
+            let reason_label = database_unavailable_reason_label(reason);
+            let observed_age = format_age(Some(&observed_at));
+            let observed_at_datetime = observed_at.clone();
+            let retry_label = if retryable {
+                "Retryable on refresh"
+            } else {
+                "Not retryable from this page"
+            };
+            view! {
+                <section
+                    class="panel database-panel database-panel--warning"
+                    aria-labelledby="database-heading"
+                    role="alert"
+                >
+                    <div class="panel__header database-panel__header">
+                        <div>
+                            <h2 id="database-heading">"Database"</h2>
+                            <p>"Live CNPG metadata is temporarily unavailable; the rest of this Tenant remains available."</p>
+                        </div>
+                        <span class="status status--degraded">"Unavailable"</span>
+                    </div>
+                    <div class="database-warning">
+                        <h3>"Database observation warning"</h3>
+                        <p>{message}</p>
+                        <dl class="definition-list database-observation">
+                            <dt>"Reason"</dt><dd>{reason_label}</dd>
+                            <dt>"Retryability"</dt><dd>{retry_label}</dd>
+                            <dt>"Freshness"</dt><dd>{freshness_label}</dd>
+                            <dt>"Observed"</dt>
+                            <dd>
+                                <time datetime=observed_at_datetime>{observed_at}</time>
+                                <span class="secondary">{format!(" · {observed_age} ago")}</span>
+                            </dd>
+                        </dl>
+                    </div>
+                </section>
+            }
+            .into_any()
+        }
+        DatabaseObservation::NotApplicable {
+            observed_at,
+            freshness,
+            reason,
+        } => {
+            let freshness_label = database_freshness_label(freshness);
+            let reason_label = database_not_applicable_reason_label(reason);
+            let observed_age = format_age(Some(&observed_at));
+            let observed_at_datetime = observed_at.clone();
+            view! {
+                <section
+                    class="panel database-panel database-panel--neutral"
+                    aria-labelledby="database-heading"
+                    role="status"
+                >
+                    <div class="panel__header database-panel__header">
+                        <div>
+                            <h2 id="database-heading">"Database"</h2>
+                            <p>"Live CNPG metadata is not applicable to this Tenant provider."</p>
+                        </div>
+                        <span class="status status--unknown">"Not applicable"</span>
+                    </div>
+                    <dl class="definition-list database-observation">
+                        <dt>"Reason"</dt><dd>{reason_label}</dd>
+                        <dt>"Freshness"</dt><dd>{freshness_label}</dd>
+                        <dt>"Observed"</dt>
+                        <dd>
+                            <time datetime=observed_at_datetime>{observed_at}</time>
+                            <span class="secondary">{format!(" · {observed_age} ago")}</span>
+                        </dd>
+                    </dl>
+                </section>
+            }
+            .into_any()
+        }
+    }
+}
+
+fn available_database_panel(
+    observed_at: String,
+    freshness: DatabaseObservationFreshness,
+    mut cluster: DatabaseClusterObservation,
+) -> AnyView {
+    sort_database_instances(&mut cluster.instances);
+    cluster.conditions.sort_by(|left, right| {
+        left.condition_type
+            .cmp(&right.condition_type)
+            .then_with(|| left.last_transition_time.cmp(&right.last_transition_time))
+    });
+
+    let instance_summary = database_instance_summary(&cluster.instances);
+    let observed_age = format_age(Some(&observed_at));
+    let observed_at_datetime = observed_at.clone();
+    let freshness_label = database_freshness_label(freshness);
+    let topology_label = if cluster.topology_available {
+        "Available"
+    } else {
+        "Unavailable"
+    };
+    let phase = optional_text(cluster.phase.as_deref()).to_owned();
+    let reason = optional_text(cluster.reason.as_deref()).to_owned();
+    let current_primary = optional_text(cluster.current_primary.as_deref()).to_owned();
+    let target_primary = optional_text(cluster.target_primary.as_deref()).to_owned();
+    let current_primary_since = optional_text(cluster.current_primary_since.as_deref()).to_owned();
+    let target_primary_requested_at =
+        optional_text(cluster.target_primary_requested_at.as_deref()).to_owned();
+    let current_primary_failing_since =
+        optional_text(cluster.current_primary_failing_since.as_deref()).to_owned();
+    let image = optional_text(cluster.image.as_deref()).to_owned();
+    let timeline = cluster
+        .timeline
+        .map_or_else(|| "—".to_owned(), |value| value.to_string());
+    let nodes_used = cluster
+        .nodes_used
+        .map_or_else(|| "—".to_owned(), |value| value.to_string());
+    let read_service = optional_text(cluster.services.read.as_deref()).to_owned();
+    let write_service = optional_text(cluster.services.write.as_deref()).to_owned();
+    let identity_name = format!("{}/{}", cluster.identity.namespace, cluster.identity.name);
+    let identity_kind = format!(
+        "{} · {}",
+        cluster.identity.api_version, cluster.identity.kind
+    );
+    let identity_uid = optional_text(cluster.identity.uid.as_deref()).to_owned();
+    let conditions = database_conditions_view(cluster.conditions);
+    let instances = database_instances_view(cluster.instances, instance_summary);
+
+    view! {
+        <section class="panel database-panel" aria-labelledby="database-heading">
+            <div class="panel__header database-panel__header">
+                <div>
+                    <h2 id="database-heading">"Database"</h2>
+                    <p>
+                        <span>{format!("{freshness_label} CNPG observation · ")}</span>
+                        <time datetime=observed_at_datetime>{observed_at}</time>
+                        <span>{format!(" · {observed_age} ago")}</span>
+                    </p>
+                </div>
+                <span class="status status--ready">{freshness_label}</span>
+            </div>
+
+            <div class="database-metrics" aria-label="Database instance health summary">
+                <Metric label="Desired" value=cluster.desired_instances/>
+                <Metric label="Current" value=cluster.observed_instances/>
+                <Metric label="Ready" value=cluster.ready_instances/>
+            </div>
+
+            <div class="database-detail-grid">
+                <section class="database-card" aria-labelledby="database-identity-heading">
+                    <h3 id="database-identity-heading">"CNPG identity"</h3>
+                    <dl class="definition-list">
+                        <dt>"Resource"</dt><dd>{identity_kind}</dd>
+                        <dt>"Cluster"</dt><dd>{identity_name}</dd>
+                        <dt>"UID"</dt><dd>{identity_uid}</dd>
+                        <dt>"Generation"</dt><dd>{cluster.identity.generation}</dd>
+                    </dl>
+                </section>
+                <section class="database-card" aria-labelledby="database-state-heading">
+                    <h3 id="database-state-heading">"Cluster state"</h3>
+                    <dl class="definition-list">
+                        <dt>"Phase"</dt><dd>{phase}</dd>
+                        <dt>"Reason"</dt><dd>{reason}</dd>
+                        <dt>"Timeline"</dt><dd>{timeline}</dd>
+                        <dt>"Image"</dt><dd>{image}</dd>
+                        <dt>"Topology extraction"</dt><dd>{topology_label}</dd>
+                        <dt>"Nodes used"</dt><dd>{nodes_used}</dd>
+                    </dl>
+                </section>
+                <section class="database-card" aria-labelledby="database-primary-heading">
+                    <h3 id="database-primary-heading">"Primary and promotion"</h3>
+                    <dl class="definition-list">
+                        <dt>"Current primary"</dt><dd>{current_primary}</dd>
+                        <dt>"Current since"</dt><dd>{current_primary_since}</dd>
+                        <dt>"Target primary"</dt><dd>{target_primary}</dd>
+                        <dt>"Promotion requested"</dt><dd>{target_primary_requested_at}</dd>
+                        <dt>"Failing since"</dt><dd>{current_primary_failing_since}</dd>
+                    </dl>
+                </section>
+            </div>
+
+            <div class="database-detail-grid database-detail-grid--secondary">
+                <section class="database-card" aria-labelledby="database-services-heading">
+                    <h3 id="database-services-heading">"Services"</h3>
+                    <dl class="definition-list">
+                        <dt>"Read service"</dt><dd>{read_service}</dd>
+                        <dt>"Write service"</dt><dd>{write_service}</dd>
+                    </dl>
+                </section>
+                <section class="database-card" aria-labelledby="database-storage-heading">
+                    <h3 id="database-storage-heading">"PVC health"</h3>
+                    <dl class="storage-counts">
+                        <div><dt>"Total"</dt><dd>{cluster.storage.total}</dd></div>
+                        <div><dt>"Healthy"</dt><dd>{cluster.storage.healthy}</dd></div>
+                        <div><dt>"Dangling"</dt><dd>{cluster.storage.dangling}</dd></div>
+                        <div><dt>"Initializing"</dt><dd>{cluster.storage.initializing}</dd></div>
+                        <div><dt>"Resizing"</dt><dd>{cluster.storage.resizing}</dd></div>
+                        <div><dt>"Unusable"</dt><dd>{cluster.storage.unusable}</dd></div>
+                    </dl>
+                </section>
+            </div>
+
+            {instances}
+            {conditions}
+            <p class="database-credential-note">
+                "Database credentials, passwords, and connection secrets are never returned to this browser."
+            </p>
+        </section>
+    }
+    .into_any()
+}
+
+fn database_instances_view(
+    instances: Vec<tenant_admin_shared::query::DatabaseInstanceObservation>,
+    summary: String,
+) -> AnyView {
+    view! {
+        <section class="database-subsection" aria-labelledby="database-instances-heading">
+            <div class="database-subsection__header">
+                <div>
+                    <h3 id="database-instances-heading">"Instances"</h3>
+                    <p>{summary}</p>
+                </div>
+            </div>
+            {if instances.is_empty() {
+                view! { <p class="empty">"No database instances were observed."</p> }.into_any()
+            } else {
+                view! {
+                    <div class="table-scroll">
+                        <table class="database-instance-table">
+                            <caption>
+                                "CNPG database instances sorted with primary first, then standby, then unknown role"
+                            </caption>
+                            <thead>
+                                <tr>
+                                    <th scope="col">"Instance"</th>
+                                    <th scope="col">"Role"</th>
+                                    <th scope="col">"Status"</th>
+                                    <th scope="col">"Timeline"</th>
+                                    <th scope="col">"Worker node"</th>
+                                    <th scope="col">"Zone"</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {instances
+                                    .into_iter()
+                                    .map(|instance| {
+                                        let role = database_instance_role_label(instance.role);
+                                        let role_class = database_instance_role_class(instance.role);
+                                        let status = optional_text(instance.status.as_deref()).to_owned();
+                                        let timeline = instance
+                                            .timeline
+                                            .map_or_else(|| "—".to_owned(), |value| value.to_string());
+                                        let node = optional_text(instance.node.as_deref()).to_owned();
+                                        let zone = optional_text(instance.zone.as_deref()).to_owned();
+                                        view! {
+                                            <tr>
+                                                <th scope="row">{instance.name}</th>
+                                                <td>
+                                                    <span class=format!("database-role database-role--{role_class}")>
+                                                        {role}
+                                                    </span>
+                                                </td>
+                                                <td>{status}</td>
+                                                <td>{timeline}</td>
+                                                <td>{node}</td>
+                                                <td>{zone}</td>
+                                            </tr>
+                                        }
+                                    })
+                                    .collect_view()}
+                            </tbody>
+                        </table>
+                    </div>
+                }
+                .into_any()
+            }}
+        </section>
+    }
+    .into_any()
+}
+
+fn database_conditions_view(mut conditions: Vec<DatabaseCondition>) -> AnyView {
+    let omitted = conditions.len().saturating_sub(MAX_DATABASE_CONDITIONS);
+    conditions.truncate(MAX_DATABASE_CONDITIONS);
+
+    view! {
+        <section class="database-subsection" aria-labelledby="database-conditions-heading">
+            <div class="database-subsection__header">
+                <div>
+                    <h3 id="database-conditions-heading">"Database conditions"</h3>
+                    <p>{format!(
+                        "Showing up to {MAX_DATABASE_CONDITIONS} sanitized CNPG conditions."
+                    )}</p>
+                </div>
+            </div>
+            {if conditions.is_empty() {
+                view! { <p class="empty">"No database conditions were reported."</p> }.into_any()
+            } else {
+                view! {
+                    <ul class="condition-list database-condition-list">
+                        {conditions
+                            .into_iter()
+                            .map(|condition| {
+                                let (class, status) = condition_style(condition.status);
+                                let reason = condition.reason;
+                                let message = condition.message;
+                                let metadata = [
+                                    condition
+                                        .observed_generation
+                                        .map(|value| format!("Observed generation {value}")),
+                                    condition
+                                        .last_transition_time
+                                        .map(|value| format!("Transitioned {value}")),
+                                ]
+                                .into_iter()
+                                .flatten()
+                                .collect::<Vec<_>>()
+                                .join(" · ");
+                                view! {
+                                    <li>
+                                        <div class="condition-heading">
+                                            <strong>{condition.condition_type}</strong>
+                                            <span class=format!("status status--{class}")>{status}</span>
+                                        </div>
+                                        {reason.map(|value| view! {
+                                            <p><strong>"Reason: "</strong>{value}</p>
+                                        })}
+                                        {message.map(|value| view! { <p>{value}</p> })}
+                                        {(!metadata.is_empty()).then(|| view! {
+                                            <p class="secondary">{metadata}</p>
+                                        })}
+                                    </li>
+                                }
+                            })
+                            .collect_view()}
+                    </ul>
+                    {if omitted > 0 {
+                        Some(view! {
+                            <p class="secondary">
+                                {format!(
+                                    "{omitted} additional condition{} omitted to keep this live view bounded.",
+                                    if omitted == 1 { "" } else { "s" }
+                                )}
+                            </p>
+                        })
+                    } else {
+                        None
+                    }}
+                }
+                .into_any()
+            }}
+        </section>
     }
     .into_any()
 }

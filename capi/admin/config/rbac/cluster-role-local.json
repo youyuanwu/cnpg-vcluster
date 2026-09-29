@@ -18,6 +18,17 @@
     },
     {
       "apiGroups": [
+        ""
+      ],
+      "resources": [
+        "secrets"
+      ],
+      "verbs": [
+        "get"
+      ]
+    },
+    {
+      "apiGroups": [
         "bootstrap.cluster.x-k8s.io"
       ],
       "resources": [

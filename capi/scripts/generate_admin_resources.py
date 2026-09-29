@@ -22,6 +22,10 @@ PROVIDER_CATALOGS = {
     "azure": Path("controller/config/azure-management-resources.json"),
     "local": Path("controller/config/management-resources.json"),
 }
+PROVIDER_EXPLICIT_RULES = {
+    "azure": (),
+    "local": (("", ("secrets",), ("get",)),),
+}
 
 OUTPUT_PATHS = (
     Path("admin/config/deployment/deployment-azure.json.tpl"),
@@ -111,6 +115,7 @@ def provider_rules(
             listed.setdefault(api_group, set()).add(plural)
     rules = [
         ("tenancy.cnpg-vcluster.io", ("tenants",), ("get", "list")),
+        *PROVIDER_EXPLICIT_RULES[provider],
         *(
             (group, tuple(sorted(resources)), ("get",))
             for group, resources in exact_gets.items()

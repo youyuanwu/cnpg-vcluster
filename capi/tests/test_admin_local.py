@@ -156,9 +156,40 @@ class FakeClient:
                         "health": "ready",
                         "resource": None,
                         "attributes": [],
-                    }
+                    },
+                    {
+                        "id": "database:cluster",
+                        "kind": "database",
+                        "label": "capi-postgres",
+                        "health": "ready",
+                        "resource": None,
+                        "attributes": [],
+                    },
+                    {
+                        "id": "database:instance:capi-postgres-1",
+                        "kind": "database",
+                        "label": "capi-postgres-1",
+                        "health": "ready",
+                        "resource": None,
+                        "attributes": [],
+                    },
                 ],
-                "edges": [],
+                "edges": [
+                    {
+                        "id": "edge:tenant:database:cluster",
+                        "source": f"tenant:{name}",
+                        "target": "database:cluster",
+                        "kind": "contains",
+                        "label": "CNPG Cluster",
+                    },
+                    {
+                        "id": "edge:database:cluster:database:instance",
+                        "source": "database:cluster",
+                        "target": "database:instance:capi-postgres-1",
+                        "kind": "represents",
+                        "label": "Primary",
+                    },
+                ],
             }
 
         def detail(name: str) -> dict[str, object]:
@@ -173,12 +204,66 @@ class FakeClient:
                 "managementResources": [],
             }
 
+        def database() -> dict[str, object]:
+            return {
+                "state": "available",
+                "observedAt": "2026-09-29T20:00:00Z",
+                "freshness": "live",
+                "cluster": {
+                    "identity": {
+                        "apiVersion": "postgresql.cnpg.io/v1",
+                        "kind": "Cluster",
+                        "namespace": "database",
+                        "name": "capi-postgres",
+                        "uid": "database-uid",
+                        "generation": 1,
+                    },
+                    "phase": "Cluster in healthy state",
+                    "reason": None,
+                    "desiredInstances": 1,
+                    "observedInstances": 1,
+                    "readyInstances": 1,
+                    "currentPrimary": "capi-postgres-1",
+                    "targetPrimary": "capi-postgres-1",
+                    "currentPrimarySince": "2026-09-29T19:59:00Z",
+                    "targetPrimaryRequestedAt": None,
+                    "currentPrimaryFailingSince": None,
+                    "image": "example/postgresql:18",
+                    "timeline": 1,
+                    "services": {
+                        "read": "capi-postgres-r",
+                        "write": "capi-postgres-rw",
+                    },
+                    "topologyAvailable": True,
+                    "nodesUsed": 1,
+                    "instances": [
+                        {
+                            "name": "capi-postgres-1",
+                            "role": "primary",
+                            "status": "healthy",
+                            "timeline": 1,
+                            "node": "worker-1",
+                            "zone": None,
+                        }
+                    ],
+                    "storage": {
+                        "total": 1,
+                        "healthy": 1,
+                        "dangling": 0,
+                        "initializing": 0,
+                        "resizing": 0,
+                        "unusable": 0,
+                    },
+                    "conditions": [],
+                },
+            }
+
         if path.endswith(("/healthz", "/readyz")):
             return ""
         if path.endswith("/api/v1/overview"):
             return json.dumps(
                 {
-                    "schemaVersion": 1,
+                    "schemaVersion": 2,
                     "data": {
                         "overview": {
                             "providerMode": "local",
@@ -201,7 +286,7 @@ class FakeClient:
         if path.endswith("/api/v1/tenants"):
             return json.dumps(
                 {
-                    "schemaVersion": 1,
+                    "schemaVersion": 2,
                     "data": [
                         tenant_summary(name) for name in self.tenant_names
                     ],
@@ -211,14 +296,14 @@ class FakeClient:
             if path.endswith(f"/api/v1/tenants/{name}/topology"):
                 return json.dumps(
                     {
-                        "schemaVersion": 1,
+                        "schemaVersion": 2,
                         "data": topology(name),
                     }
                 )
             if path.endswith(f"/api/v1/tenants/{name}"):
                 return json.dumps(
                     {
-                        "schemaVersion": 1,
+                        "schemaVersion": 2,
                         "data": {
                             "identity": {
                                 "uid": f"{name}-uid",
@@ -226,6 +311,7 @@ class FakeClient:
                                 "observedGeneration": 1,
                             },
                             "detail": detail(name),
+                            "database": database(),
                             "topology": topology(name),
                         },
                     }
@@ -400,6 +486,26 @@ class AdminLocalTests(unittest.TestCase):
         role["rules"][0]["resources"].append("secrets")
         with self.assertRaisesRegex(RuntimeError, "read-only RBAC"):
             admin_local._verify_role(ROOT, role)
+        secret_rule_index = next(
+            index
+            for index, rule in enumerate(client.role["rules"])
+            if rule["resources"] == ["secrets"]
+        )
+        for verbs in (
+            ["list"],
+            ["watch"],
+            ["create"],
+            ["update"],
+            ["patch"],
+            ["delete"],
+        ):
+            role = copy.deepcopy(client.role)
+            role["rules"][secret_rule_index]["verbs"] = verbs
+            with self.subTest(secret_verbs=verbs), self.assertRaisesRegex(
+                RuntimeError,
+                "read-only RBAC",
+            ):
+                admin_local._verify_role(ROOT, role)
         review_calls = [
             arguments
             for arguments in client.calls
@@ -448,10 +554,58 @@ class AdminLocalTests(unittest.TestCase):
                     "verbs": ["list"],
                 },
             ),
+            (
+                "secret-watch",
+                {
+                    "apiGroups": [""],
+                    "resources": ["secrets"],
+                    "verbs": ["watch"],
+                },
+            ),
+            (
+                "secret-mutation",
+                {
+                    "apiGroups": [""],
+                    "resources": ["secrets"],
+                    "verbs": ["create", "update", "patch", "delete"],
+                },
+            ),
+            (
+                "wildcard-api-group",
+                {
+                    "apiGroups": ["*"],
+                    "resources": ["secrets"],
+                    "verbs": ["get"],
+                },
+            ),
+            (
+                "wildcard-resource",
+                {
+                    "apiGroups": [""],
+                    "resources": ["*"],
+                    "verbs": ["get"],
+                },
+            ),
+            (
+                "wildcard-verb",
+                {
+                    "apiGroups": [""],
+                    "resources": ["secrets"],
+                    "verbs": ["*"],
+                },
+            ),
+            (
+                "subresource",
+                {
+                    "apiGroups": [""],
+                    "resources": ["secrets/status"],
+                    "verbs": ["get"],
+                },
+            ),
         )
         for index, (name, rule) in enumerate(additions):
             client = FakeClient()
-            namespace = ("default", "tenant-a", "tenant-system")[index]
+            namespace = client.namespaces[index % len(client.namespaces)]
             client.rules_reviews[namespace]["status"]["resourceRules"].append(
                 rule
             )
@@ -498,14 +652,18 @@ class AdminLocalTests(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "non-resource RBAC"):
             admin_local.verify_local_admin(ROOT, client, IMAGE)
 
-        client = FakeClient()
-        client.rules_reviews["tenant-a"]["status"]["resourceRules"].append({
-            "apiGroups": [""],
-            "resources": ["secrets"],
-            "verbs": ["get"],
-        })
-        with self.assertRaisesRegex(RuntimeError, "effective RBAC"):
-            admin_local.verify_local_admin(ROOT, client, IMAGE)
+        for namespace in FakeClient().namespaces:
+            client = FakeClient()
+            client.rules_reviews[namespace]["status"]["resourceRules"].append({
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["list"],
+            })
+            with self.subTest(namespace=namespace), self.assertRaisesRegex(
+                RuntimeError,
+                "effective RBAC",
+            ):
+                admin_local.verify_local_admin(ROOT, client, IMAGE)
 
     def test_api_verification_accepts_empty_and_typed_populated_responses(
         self,
@@ -556,11 +714,11 @@ class AdminLocalTests(unittest.TestCase):
             if path.endswith("/api/v1/tenants"):
                 summary = tenant_summary("tenant-a")
                 summary["classification"] = "progressing"
-                return json.dumps({"schemaVersion": 1, "data": [summary]})
+                return json.dumps({"schemaVersion": 2, "data": [summary]})
             if path.endswith("/api/v1/tenants/tenant-a/topology"):
                 topology = json.loads(original_transition(path))["data"]
                 topology["nodes"][0]["health"] = "progressing"
-                return json.dumps({"schemaVersion": 1, "data": topology})
+                return json.dumps({"schemaVersion": 2, "data": topology})
             return original_transition(path)
 
         with patch.object(
@@ -573,6 +731,62 @@ class AdminLocalTests(unittest.TestCase):
                 expected_tenant_names=("tenant-a",),
             )
         self.assertEqual(["tenant-a"], transitioned["tenantNames"])
+
+        unavailable = FakeClient(tenant_names=("tenant-a",))
+        original_unavailable = unavailable._proxy_response
+
+        def unavailable_response(path: str) -> str:
+            response = original_unavailable(path)
+            if path.endswith("/api/v1/tenants/tenant-a"):
+                envelope = json.loads(response)
+                envelope["data"]["database"] = {
+                    "state": "unavailable",
+                    "observedAt": "2026-09-29T20:00:00Z",
+                    "freshness": "live",
+                    "reason": "tenant-api-unavailable",
+                    "message": "Tenant API database read failed",
+                    "retryable": True,
+                }
+                topology = envelope["data"]["topology"]
+                topology["nodes"] = [
+                    node
+                    for node in topology["nodes"]
+                    if not node["id"].startswith("database:")
+                ]
+                topology["nodes"].append({
+                    "id": "database:unavailable",
+                    "kind": "database",
+                    "label": "Databases unavailable",
+                    "health": "degraded",
+                    "resource": None,
+                    "attributes": [],
+                })
+                topology["edges"] = [
+                    edge
+                    for edge in topology["edges"]
+                    if not edge["source"].startswith("database:")
+                    and not edge["target"].startswith("database:")
+                ]
+                return json.dumps(envelope)
+            return response
+
+        with patch.object(
+            unavailable,
+            "_proxy_response",
+            side_effect=unavailable_response,
+        ):
+            partial = admin_local.verify_admin_api(
+                unavailable,
+                expected_tenant_names=("tenant-a",),
+            )
+            self.assertEqual(["tenant-a"], partial["tenantNames"])
+            with self.assertRaisesRegex(RuntimeError, "unavailable database"):
+                admin_local.verify_admin_api(
+                    unavailable,
+                    expected_tenant_names=("tenant-a",),
+                    require_available_databases=True,
+                )
+
         malformed = FakeClient()
         original = malformed._proxy_response
 
@@ -585,7 +799,7 @@ class AdminLocalTests(unittest.TestCase):
             malformed,
             "_proxy_response",
             side_effect=malformed_response,
-        ), self.assertRaisesRegex(RuntimeError, "envelope"):
+        ), self.assertRaisesRegex(RuntimeError, "overview data"):
             admin_local.verify_admin_api(malformed)
 
     def test_api_verification_handles_tenant_deletion_race(self) -> None:

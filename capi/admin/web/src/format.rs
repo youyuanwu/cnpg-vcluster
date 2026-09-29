@@ -1,6 +1,8 @@
 use tenant_admin_shared::query::{
-    ConditionStatus, ProviderMode, TenantClassification, TenantProvider, TopologyEdgeKind,
-    TopologyHealth, TopologyNodeKind,
+    ConditionStatus, DatabaseInstanceObservation, DatabaseInstanceRole,
+    DatabaseNotApplicableReason, DatabaseObservationFreshness, DatabaseUnavailableReason,
+    ProviderMode, TenantClassification, TenantProvider, TopologyEdgeKind, TopologyHealth,
+    TopologyNodeKind,
 };
 
 pub const fn provider_mode_label(provider: ProviderMode) -> &'static str {
@@ -46,6 +48,83 @@ pub const fn condition_status_label(status: ConditionStatus) -> &'static str {
         ConditionStatus::False => "False",
         ConditionStatus::Unknown => "Unknown",
     }
+}
+
+pub const fn database_freshness_label(freshness: DatabaseObservationFreshness) -> &'static str {
+    match freshness {
+        DatabaseObservationFreshness::Live => "Live",
+    }
+}
+
+pub const fn database_unavailable_reason_label(reason: DatabaseUnavailableReason) -> &'static str {
+    match reason {
+        DatabaseUnavailableReason::Pending => "Pending",
+        DatabaseUnavailableReason::ManagementResourceMissing => "Management resource missing",
+        DatabaseUnavailableReason::TenantAccessInvalid => "Tenant access invalid",
+        DatabaseUnavailableReason::TenantApiUnavailable => "Tenant API unavailable",
+        DatabaseUnavailableReason::ClusterMissing => "Database cluster missing",
+        DatabaseUnavailableReason::Malformed => "Malformed database observation",
+    }
+}
+
+pub const fn database_not_applicable_reason_label(
+    reason: DatabaseNotApplicableReason,
+) -> &'static str {
+    match reason {
+        DatabaseNotApplicableReason::ProviderUnsupported => "Provider does not use CNPG",
+    }
+}
+
+pub const fn database_instance_role_label(role: DatabaseInstanceRole) -> &'static str {
+    match role {
+        DatabaseInstanceRole::Primary => "Primary",
+        DatabaseInstanceRole::Standby => "Standby",
+        DatabaseInstanceRole::Unknown => "Unknown",
+    }
+}
+
+pub const fn database_instance_role_class(role: DatabaseInstanceRole) -> &'static str {
+    match role {
+        DatabaseInstanceRole::Primary => "primary",
+        DatabaseInstanceRole::Standby => "standby",
+        DatabaseInstanceRole::Unknown => "unknown",
+    }
+}
+
+const fn database_instance_role_rank(role: DatabaseInstanceRole) -> u8 {
+    match role {
+        DatabaseInstanceRole::Primary => 0,
+        DatabaseInstanceRole::Standby => 1,
+        DatabaseInstanceRole::Unknown => 2,
+    }
+}
+
+pub fn sort_database_instances(instances: &mut [DatabaseInstanceObservation]) {
+    instances.sort_by(|left, right| {
+        database_instance_role_rank(left.role)
+            .cmp(&database_instance_role_rank(right.role))
+            .then_with(|| left.name.cmp(&right.name))
+    });
+}
+
+pub fn database_instance_summary(instances: &[DatabaseInstanceObservation]) -> String {
+    let primary_count = instances
+        .iter()
+        .filter(|instance| instance.role == DatabaseInstanceRole::Primary)
+        .count();
+    let standby_count = instances
+        .iter()
+        .filter(|instance| instance.role == DatabaseInstanceRole::Standby)
+        .count();
+    let unknown_count = instances
+        .iter()
+        .filter(|instance| instance.role == DatabaseInstanceRole::Unknown)
+        .count();
+
+    format!(
+        "{primary_count} primary · {standby_count} standby{} · {unknown_count} unknown",
+        if standby_count == 1 { "" } else { "s" }
+    )
 }
 
 pub const fn health_label(health: TopologyHealth) -> &'static str {
@@ -181,9 +260,16 @@ fn parse_number(bytes: &[u8]) -> Option<u32> {
 
 #[cfg(test)]
 mod tests {
-    use tenant_admin_shared::query::{TenantClassification, TopologyHealth};
+    use tenant_admin_shared::query::{
+        DatabaseInstanceObservation, DatabaseInstanceRole, DatabaseNotApplicableReason,
+        DatabaseUnavailableReason, TenantClassification, TopologyHealth,
+    };
 
-    use super::{classification_class, classification_label, format_age_at, health_class};
+    use super::{
+        classification_class, classification_label, database_instance_role_label,
+        database_instance_summary, database_not_applicable_reason_label,
+        database_unavailable_reason_label, format_age_at, health_class, sort_database_instances,
+    };
 
     #[test]
     fn formats_all_status_variants_for_display_and_css() {
@@ -204,5 +290,62 @@ mod tests {
         assert_eq!(format_age_at("2024-01-01T11:59:30Z", now), "just now");
         assert_eq!(format_age_at("2024-01-01T10:00:00Z", now), "2h");
         assert_eq!(format_age_at("not-a-date", now), "Unknown");
+    }
+
+    #[test]
+    fn formats_database_states_for_accessible_labels() {
+        assert_eq!(
+            database_unavailable_reason_label(DatabaseUnavailableReason::TenantApiUnavailable),
+            "Tenant API unavailable"
+        );
+        assert_eq!(
+            database_not_applicable_reason_label(DatabaseNotApplicableReason::ProviderUnsupported),
+            "Provider does not use CNPG"
+        );
+        assert_eq!(
+            database_instance_role_label(DatabaseInstanceRole::Primary),
+            "Primary"
+        );
+    }
+
+    #[test]
+    fn sorts_database_instances_by_role_then_name() {
+        let mut instances = vec![
+            instance("standby-b", DatabaseInstanceRole::Standby),
+            instance("unknown-a", DatabaseInstanceRole::Unknown),
+            instance("primary-a", DatabaseInstanceRole::Primary),
+            instance("standby-a", DatabaseInstanceRole::Standby),
+        ];
+
+        sort_database_instances(&mut instances);
+
+        assert_eq!(
+            instances
+                .iter()
+                .map(|instance| instance.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["primary-a", "standby-a", "standby-b", "unknown-a"]
+        );
+    }
+
+    #[test]
+    fn summarizes_a_single_instance_cluster_as_primary_without_standbys() {
+        let instances = vec![instance("primary-a", DatabaseInstanceRole::Primary)];
+
+        assert_eq!(
+            database_instance_summary(&instances),
+            "1 primary · 0 standbys · 0 unknown"
+        );
+    }
+
+    fn instance(name: &str, role: DatabaseInstanceRole) -> DatabaseInstanceObservation {
+        DatabaseInstanceObservation {
+            name: name.to_owned(),
+            role,
+            status: None,
+            timeline: None,
+            node: None,
+            zone: None,
+        }
     }
 }
