@@ -49,9 +49,11 @@ process is an Axum server. The Cargo workspace contains three crates:
 | `admin/server` | Native Axum server, kube-rs reads, status projection, topology identity validation, health endpoints, and static-file fallback. |
 | `admin/web` | Leptos client-side application, manual refresh, tables, detail panels, errors, and deterministic SVG layout. |
 
-The server listens on `0.0.0.0:8080`. The generated Deployment, read-only
-ClusterRole, ServiceAccount, ClusterRoleBinding, and ClusterIP Service are
-named `tenant-admin` in `tenant-system`. The Service exposes port `80`.
+The server listens on `0.0.0.0:8080`. The generated Deployment,
+ServiceAccount, ClusterRoleBinding, and ClusterIP Service are named
+`tenant-admin` in `tenant-system`. Local installs the
+`tenant-admin-local` ClusterRole and Azure installs `tenant-admin-azure`.
+The Service exposes port `80`.
 
 ## Data and security model
 
@@ -61,12 +63,24 @@ management resources for one detail request. Catalog requests have bounded
 concurrency. Kubernetes errors become typed service errors; oversized results
 fail rather than being silently truncated.
 
-Secrets are excluded from both the resource list and RBAC. The generated
-ClusterRole grants only exact `get` and `list` verbs for the displayed Tenant,
-CAPI, CAPD/CAPZ, Kamaji, workload, lease, RBAC, and selected ASO resource
-types. It grants no wildcard, subresource, Secret, watch, create, update,
-patch, or delete access. The browser receives no ServiceAccount token,
-kubeconfig, certificate, credential, or raw unbounded Kubernetes object.
+Secrets are excluded from both the resource list and RBAC. Provider-specific
+ClusterRoles are derived from the matching management-resource catalog:
+Tenants receive `get` and `list`, the deterministic cluster-scoped Namespace
+receives `get`, and every provider resource actually scanned receives `list`.
+Each role grants only exact `get` and `list` verbs and no
+provider-irrelevant resource, wildcard, subresource,
+Secret, watch, create, update, patch, or delete access.
+
+Installation and health checks compare the owned ServiceAccount, binding, and
+selected ClusterRole with the tracked generated resources. They also submit
+an impersonated `SelfSubjectRulesReview` and compare the complete effective
+resource permissions with the generated contract. Incomplete evaluations,
+extra bindings, mutations, subresources, wildcards, or provider-irrelevant
+rights fail health. Only the exact Kubernetes self-review permissions and
+bounded authenticated discovery URLs supplied by default cluster roles are
+accepted outside the generated contract. The browser receives no
+ServiceAccount token, kubeconfig, certificate, credential, or raw unbounded
+Kubernetes object.
 
 Displayed strings and identities are bounded and sanitized. Azure resource
 IDs shown by the UI come from durable Tenant status; the server does not call
@@ -120,6 +134,12 @@ retryable flag. The routes are:
 | `GET /api/v1/tenants/{name}` | One `TenantSnapshot` containing detail and topology from the same Tenant UID/generation/resource read. |
 | `GET /api/v1/tenants/{name}/topology` | `TopologyGraph`. |
 | `GET /*` | Static asset or `index.html` fallback for browser routes. |
+
+`/overview` and `/tenants/{name}` are the coherent snapshot routes. The
+`/tenants` and `/tenants/{name}/topology` compatibility routes are validated
+independently for schema and shape; health does not compare their values with
+a snapshot returned by a separate request because normal reconciliation may
+advance between calls.
 
 The shared DTOs include:
 
@@ -204,9 +224,9 @@ cache.
 
 Management creation builds or accepts the validated CI artifact, creates the
 provider-neutral scratch image, loads its exact tag into Kind, applies the
-read-only resources and local Deployment, waits for rollout, and validates
-Deployment UID, image, provider mode, Pod, Service, effective RBAC, health,
-overview, list, detail, and topology.
+local least-privilege resources and Deployment, waits for rollout, and
+validates Deployment UID, image, provider mode, Pod, Service, complete
+effective RBAC, health, overview, list, detail, and topology.
 
 ### Azure AKS
 
@@ -216,7 +236,8 @@ and deploys the immutable digest with provider mode `azure`. Foundation
 inventory records `adminImage` and `adminDeploymentUid` together after a
 healthy rollout. Foundation health validates repository binding, immutable
 image, Deployment UID and readiness, Pod security, provider mode, resource
-limits, probes, Service, strict read-only RBAC, and API health. Existing
+limits, probes, Service, the Azure-specific complete effective RBAC contract,
+and API health. Existing
 pre-admin foundation inventory remains valid until management installation
 adds both optional fields.
 

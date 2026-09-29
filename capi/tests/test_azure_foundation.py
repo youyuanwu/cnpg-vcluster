@@ -571,8 +571,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         self.assertEqual(
             [
                 str(root / "admin/config/rbac/service-account.yaml"),
-                str(root / "admin/config/rbac/cluster-role.yaml"),
-                str(root / "admin/config/rbac/cluster-role-binding.yaml"),
+                str(root / "admin/config/rbac/cluster-role-azure.yaml"),
+                str(
+                    root
+                    / "admin/config/rbac/cluster-role-binding-azure.yaml"
+                ),
                 str(root / "admin/config/service/service.yaml"),
                 str(rendered),
             ],
@@ -680,64 +683,76 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             (ROOT / "admin/config/rbac/service-account.yaml").read_text()
         )
         role = yaml.safe_load(
-            (ROOT / "admin/config/rbac/cluster-role.yaml").read_text()
+            (ROOT / "admin/config/rbac/cluster-role-azure.yaml").read_text()
         )
         binding = yaml.safe_load(
-            (ROOT / "admin/config/rbac/cluster-role-binding.yaml").read_text()
+            (
+                ROOT / "admin/config/rbac/cluster-role-binding-azure.yaml"
+            ).read_text()
         )
-        tenant_resource = "tenants.tenancy.cnpg-vcluster.io"
-        allowed = {
-            ("get", tenant_resource),
-            ("list", tenant_resource),
+        rules_review = {
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectRulesReview",
+            "status": {
+                "resourceRules": [
+                    *copy.deepcopy(role["rules"]),
+                    {
+                        "apiGroups": ["authorization.k8s.io"],
+                        "resources": [
+                            "selfsubjectaccessreviews",
+                            "selfsubjectrulesreviews",
+                        ],
+                        "verbs": ["create"],
+                    },
+                    {
+                        "apiGroups": ["authentication.k8s.io"],
+                        "resources": ["selfsubjectreviews"],
+                        "verbs": ["create"],
+                    },
+                ],
+                "nonResourceRules": [{
+                    "verbs": ["get"],
+                    "nonResourceURLs": [
+                        "/api",
+                        "/apis",
+                        "/healthz",
+                        "/readyz",
+                        "/version",
+                    ],
+                }],
+                "incomplete": False,
+            },
         }
 
         def inspect(
             *,
             resource_overrides=None,
-            authorization_overrides=None,
+            review_mutator=None,
+            api_overrides=None,
         ):
             resources = {
                 "deployment/tenant-admin": deployment,
                 "service/tenant-admin": service,
                 "serviceaccount/tenant-admin": service_account,
-                "clusterrole/tenant-admin": role,
+                "clusterrole/tenant-admin-azure": role,
                 "clusterrolebinding/tenant-admin": binding,
             }
             resources.update(resource_overrides or {})
-            authorization = {
-                key: key in allowed
-                for key in (
-                    ("get", tenant_resource),
-                    ("list", tenant_resource),
-                    ("watch", tenant_resource),
-                    ("create", tenant_resource),
-                    ("update", tenant_resource),
-                    ("patch", tenant_resource),
-                    ("delete", tenant_resource),
-                    ("deletecollection", tenant_resource),
-                    ("get", "secrets"),
-                    ("list", "secrets"),
-                    ("watch", "secrets"),
-                    ("create", "secrets"),
-                    ("update", "secrets"),
-                    ("patch", "secrets"),
-                    ("delete", "secrets"),
-                    ("deletecollection", "secrets"),
-                )
-            }
-            authorization.update(authorization_overrides or {})
+            review = copy.deepcopy(rules_review)
+            if review_mutator is not None:
+                review_mutator(review)
+            api = dict(api_overrides or {})
 
             def get_resource(_root, _namespace, selected):
                 return copy.deepcopy(resources[selected])
 
             def kubectl(_root, *arguments, **_kwargs):
-                if arguments[:2] == ("auth", "can-i"):
-                    permitted = authorization[(arguments[2], arguments[3])]
-                    return completed(
-                        "yes\n" if permitted else "no\n",
-                        0 if permitted else 1,
-                    )
+                if arguments[0] == "create" and "-f" in arguments:
+                    return completed(json.dumps(review))
                 path = arguments[-1]
+                for suffix, payload in api.items():
+                    if path.endswith(suffix):
+                        return completed(json.dumps(payload))
                 if path.endswith("/api/v1/overview"):
                     return completed(json.dumps({
                         "schemaVersion": 1,
@@ -791,38 +806,87 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 any(path.endswith(endpoint) for path in proxy_paths),
                 endpoint,
             )
-        authorization_calls = [
+        review_calls = [
             call.args[1:]
             for call in calls
-            if call.args[1:3] == ("auth", "can-i")
+            if call.args[1:]
+            and call.args[1] == "create"
+            and "-f" in call.args[1:]
         ]
-        self.assertTrue(authorization_calls)
+        self.assertEqual(1, len(review_calls))
+        self.assertIn(
+            "--as=system:serviceaccount:tenant-system:tenant-admin",
+            review_calls[0],
+        )
+        overview_summary = {"name": "tenant-a", "classification": "ready"}
+        snapshot_topology = {
+            "tenantName": "tenant-a",
+            "provider": "azure",
+            "nodes": [{"id": "tenant:tenant-a", "health": "ready"}],
+            "edges": [],
+        }
+        api_overrides = {
+            "/api/v1/overview": {
+                "schemaVersion": 1,
+                "data": {
+                    "overview": {
+                        "providerMode": "azure",
+                        "tenants": {"total": 1},
+                    },
+                    "tenants": [overview_summary],
+                },
+            },
+            "/api/v1/tenants": {
+                "schemaVersion": 1,
+                "data": [{
+                    "name": "tenant-a",
+                    "classification": "progressing",
+                }],
+            },
+            "/api/v1/tenants/tenant-a": {
+                "schemaVersion": 1,
+                "data": {
+                    "identity": {
+                        "uid": "tenant-uid",
+                        "generation": 2,
+                        "observedGeneration": 1,
+                    },
+                    "detail": {
+                        "summary": overview_summary,
+                        "uid": "tenant-uid",
+                        "generation": 2,
+                        "observedGeneration": 1,
+                    },
+                    "topology": snapshot_topology,
+                },
+            },
+            "/api/v1/tenants/tenant-a/topology": {
+                "schemaVersion": 1,
+                "data": {
+                    "tenantName": "tenant-a",
+                    "provider": "azure",
+                    "nodes": [{
+                        "id": "tenant:tenant-a",
+                        "health": "progressing",
+                    }],
+                    "edges": [],
+                },
+            },
+        }
+        (_, blockers), transition_calls = inspect(
+            api_overrides=api_overrides
+        )
+        self.assertEqual((), blockers)
+        transition_paths = [
+            call.args[-1]
+            for call in transition_calls
+            if "--raw" in call.args
+        ]
         self.assertTrue(
-            all(
-                "--api-group" not in argument
-                for call in authorization_calls
-                for argument in call
+            any(
+                path.endswith("/api/v1/tenants/tenant-a/topology")
+                for path in transition_paths
             )
-        )
-        self.assertIn(
-            (
-                "auth",
-                "can-i",
-                "get",
-                tenant_resource,
-                "--as=system:serviceaccount:tenant-system:tenant-admin",
-            ),
-            authorization_calls,
-        )
-        self.assertIn(
-            (
-                "auth",
-                "can-i",
-                "get",
-                "secrets",
-                "--as=system:serviceaccount:tenant-system:tenant-admin",
-            ),
-            authorization_calls,
         )
 
         drifted = copy.deepcopy(deployment)
@@ -873,7 +937,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ),
             (
                 "missing-role",
-                {"clusterrole/tenant-admin": None},
+                {"clusterrole/tenant-admin-azure": None},
                 "Azure admin ClusterRole is absent",
             ),
             (
@@ -909,17 +973,17 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ),
             (
                 "wrong-role-name",
-                {"clusterrole/tenant-admin": wrong_role_name},
+                {"clusterrole/tenant-admin-azure": wrong_role_name},
                 "Azure admin ClusterRole contract changed",
             ),
             (
                 "removed-rule",
-                {"clusterrole/tenant-admin": removed_rule},
+                {"clusterrole/tenant-admin-azure": removed_rule},
                 "Azure admin ClusterRole contract changed",
             ),
             (
                 "extra-read-rule",
-                {"clusterrole/tenant-admin": extra_read_rule},
+                {"clusterrole/tenant-admin-azure": extra_read_rule},
                 "Azure admin ClusterRole contract changed",
             ),
         ):
@@ -927,33 +991,48 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 (_, blockers), _ = inspect(resource_overrides=overrides)
                 self.assertIn(expected, blockers)
 
-        for name, overrides, expected in (
+        def add_effective_rule(rule):
+            return lambda review: review["status"]["resourceRules"].append(rule)
+
+        def remove_expected_rule(review):
+            review["status"]["resourceRules"].pop(0)
+
+        for name, mutate in (
             (
-                "tenant-get-denied",
-                {("get", tenant_resource): False},
-                f"Azure admin authorization denied get {tenant_resource}",
+                "extra-binding-create-pods",
+                add_effective_rule({
+                    "apiGroups": [""],
+                    "resources": ["pods"],
+                    "verbs": ["create"],
+                }),
             ),
             (
-                "tenant-watch-allowed",
-                {("watch", tenant_resource): True},
-                f"Azure admin authorization allowed watch {tenant_resource}",
+                "extra-binding-patch-deployments",
+                add_effective_rule({
+                    "apiGroups": ["apps"],
+                    "resources": ["deployments"],
+                    "verbs": ["patch"],
+                }),
             ),
             (
-                "tenant-write-allowed",
-                {("create", tenant_resource): True},
-                f"Azure admin authorization allowed create {tenant_resource}",
+                "group-contributed-right",
+                add_effective_rule({
+                    "apiGroups": [""],
+                    "resources": ["pods"],
+                    "verbs": ["list"],
+                }),
             ),
             (
-                "secret-read-allowed",
-                {("get", "secrets"): True},
-                "Azure admin authorization allowed get secrets",
+                "missing-expected-permission",
+                remove_expected_rule,
             ),
         ):
             with self.subTest(name=name):
-                (_, blockers), _ = inspect(
-                    authorization_overrides=overrides
+                (_, blockers), _ = inspect(review_mutator=mutate)
+                self.assertTrue(
+                    any("effective RBAC" in blocker for blocker in blockers),
+                    blockers,
                 )
-                self.assertIn(expected, blockers)
 
     def test_preflight_output_does_not_expose_subscription_id(self):
         root = self.make_root()

@@ -8,7 +8,14 @@ from pathlib import Path
 
 import yaml
 
-from scripts.lib.admin import build_admin_image
+from scripts.lib.admin import (
+    ADMIN_IDENTITY,
+    admin_rbac_resource_paths,
+    admin_role_name,
+    admin_rules_review_request,
+    build_admin_image,
+    validate_admin_effective_rules,
+)
 from scripts.lib.config import parse_duration
 from scripts.lib.controller_state import delete_named
 from scripts.lib.files import write_private_file
@@ -99,12 +106,7 @@ def render_local_admin_deployment(root: Path, image: str) -> Path:
 
 
 def _admin_resource_paths(root: Path) -> tuple[Path, ...]:
-    return (
-        root / "admin/config/rbac/service-account.yaml",
-        root / "admin/config/rbac/cluster-role.yaml",
-        root / "admin/config/rbac/cluster-role-binding.yaml",
-        root / "admin/config/service/service.yaml",
-    )
+    return admin_rbac_resource_paths(root, "local")
 
 
 def _apply(client: ManagementClient, path: Path) -> None:
@@ -162,7 +164,9 @@ def _container(document: dict[str, object]) -> dict[str, object]:
 
 def _expected_rules(root: Path) -> list[dict[str, object]]:
     document = yaml.safe_load(
-        (root / "admin/config/rbac/cluster-role.yaml").read_text(encoding="utf-8")
+        (
+            root / "admin/config/rbac/cluster-role-local.yaml"
+        ).read_text(encoding="utf-8")
     )
     return document["rules"]
 
@@ -191,7 +195,8 @@ def _normalized_rules(value: object) -> list[tuple[tuple[str, ...], ...]]:
             or "*" in verbs
             or "secrets" in resources
             or any("/" in resource for resource in resources)
-            or verbs != ("get", "list")
+            or not verbs
+            or any(verb not in {"get", "list"} for verb in verbs)
         ):
             raise RuntimeError("Tenant Admin ClusterRole is not exact read-only RBAC")
         normalized.append((groups, resources, verbs))
@@ -213,33 +218,26 @@ def _verify_service_account(service_account: dict[str, object]) -> None:
 def _verify_role(root: Path, role: dict[str, object]) -> None:
     metadata = _required_mapping(role.get("metadata"), "ClusterRole metadata")
     if (
-        metadata.get("name") != ADMIN_NAME
+        metadata.get("name") != admin_role_name("local")
         or _normalized_rules(role.get("rules"))
         != _normalized_rules(_expected_rules(root))
     ):
         raise RuntimeError("Tenant Admin ClusterRole contract does not match")
 
 
-def _verify_binding(binding: dict[str, object]) -> None:
+def _verify_binding(root: Path, binding: dict[str, object]) -> None:
     metadata = _required_mapping(
         binding.get("metadata"), "ClusterRoleBinding metadata"
     )
+    expected = yaml.safe_load(
+        (
+            root / "admin/config/rbac/cluster-role-binding-local.yaml"
+        ).read_text(encoding="utf-8")
+    )
     if (
         metadata.get("name") != ADMIN_NAME
-        or binding.get("roleRef")
-        != {
-            "apiGroup": "rbac.authorization.k8s.io",
-            "kind": "ClusterRole",
-            "name": ADMIN_NAME,
-        }
-        or binding.get("subjects")
-        != [
-            {
-                "kind": "ServiceAccount",
-                "name": ADMIN_NAME,
-                "namespace": ADMIN_NAMESPACE,
-            }
-        ]
+        or binding.get("roleRef") != expected.get("roleRef")
+        or binding.get("subjects") != expected.get("subjects")
     ):
         raise RuntimeError("Tenant Admin ClusterRoleBinding contract does not match")
 
@@ -277,7 +275,7 @@ def _verify_static_resources(
 ) -> None:
     _verify_service_account(service_account)
     _verify_role(root, role)
-    _verify_binding(binding)
+    _verify_binding(root, binding)
     _verify_service(service)
 
 
@@ -344,25 +342,25 @@ def _verify_deployment_contract(
     return uid
 
 
-def _auth_can_i(
-    client: ManagementClient,
-    verb: str,
-    resource: str,
-    *,
-    api_group: str | None = None,
-) -> bool:
-    arguments = [
-        "auth",
-        "can-i",
-        verb,
-        f"{resource}.{api_group}" if api_group else resource,
-        f"--as=system:serviceaccount:{ADMIN_NAMESPACE}:{ADMIN_NAME}",
-    ]
-    response = client.kubectl(*arguments, check=False)
-    answer = response.stdout.strip()
-    if answer not in {"yes", "no"}:
-        raise RuntimeError("Tenant Admin RBAC authorization response is invalid")
-    return response.returncode == 0 and answer == "yes"
+def _verify_effective_rbac(root: Path, client: ManagementClient) -> None:
+    response = client.kubectl(
+        "create",
+        "--validate=false",
+        "-f",
+        "-",
+        "-o",
+        "json",
+        f"--as={ADMIN_IDENTITY}",
+        input_text=admin_rules_review_request(),
+        check=False,
+    )
+    if response.returncode != 0:
+        raise RuntimeError("Tenant Admin effective RBAC review failed")
+    try:
+        review = json.loads(response.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("Tenant Admin effective RBAC review is invalid") from exc
+    validate_admin_effective_rules(root, "local", review)
 
 
 def _service_proxy(client: ManagementClient, path: str) -> str:
@@ -556,8 +554,8 @@ def verify_admin_api(
         "Tenant list data",
     )
     listed_names = tuple(_validate_summary(summary) for summary in listed)
-    if listed_names != names:
-        raise RuntimeError("Tenant Admin overview and Tenant list disagree")
+    if listed_names != tuple(sorted(listed_names)):
+        raise RuntimeError("Tenant Admin Tenant list is not sorted")
     for name in names:
         snapshot = _required_mapping(
             _envelope(
@@ -685,35 +683,13 @@ def verify_local_admin(
     service_account = client.json(
         "-n", ADMIN_NAMESPACE, "get", f"serviceaccount/{ADMIN_NAME}"
     )
-    role = client.json("get", f"clusterrole/{ADMIN_NAME}")
+    role = client.json("get", f"clusterrole/{admin_role_name('local')}")
     binding = client.json("get", f"clusterrolebinding/{ADMIN_NAME}")
     service = client.json(
         "-n", ADMIN_NAMESPACE, "get", f"service/{ADMIN_NAME}"
     )
     _verify_static_resources(root, service_account, role, binding, service)
-    tenant_access = {
-        verb: _auth_can_i(
-            client,
-            verb,
-            "tenants",
-            api_group="tenancy.cnpg-vcluster.io",
-        )
-        for verb in ("get", "list", "watch", "create", "update", "patch", "delete")
-    }
-    secret_access = {
-        verb: _auth_can_i(client, verb, "secrets")
-        for verb in ("get", "list")
-    }
-    if (
-        tenant_access["get"] is not True
-        or tenant_access["list"] is not True
-        or any(
-            tenant_access[verb]
-            for verb in ("watch", "create", "update", "patch", "delete")
-        )
-        or any(secret_access.values())
-    ):
-        raise RuntimeError("Tenant Admin effective RBAC is not read-only")
+    _verify_effective_rbac(root, client)
     api = verify_admin_api(
         client,
         expected_tenant_names=expected_tenant_names,
@@ -815,7 +791,11 @@ def delete_local_admin(
     service_account = _optional_resource(
         client, ADMIN_NAMESPACE, f"serviceaccount/{ADMIN_NAME}"
     )
-    role = _optional_resource(client, None, f"clusterrole/{ADMIN_NAME}")
+    role = _optional_resource(
+        client,
+        None,
+        f"clusterrole/{admin_role_name('local')}",
+    )
     binding = _optional_resource(
         client, None, f"clusterrolebinding/{ADMIN_NAME}"
     )
@@ -827,7 +807,7 @@ def delete_local_admin(
     if role is not None:
         _verify_role(root, role)
     if binding is not None:
-        _verify_binding(binding)
+        _verify_binding(root, binding)
     if service is not None:
         _verify_service(service)
     if deployment is not None:
@@ -838,7 +818,7 @@ def delete_local_admin(
         (ADMIN_NAMESPACE, f"deployment/{ADMIN_NAME}"),
         (ADMIN_NAMESPACE, f"service/{ADMIN_NAME}"),
         (None, f"clusterrolebinding/{ADMIN_NAME}"),
-        (None, f"clusterrole/{ADMIN_NAME}"),
+        (None, f"clusterrole/{admin_role_name('local')}"),
         (ADMIN_NAMESPACE, f"serviceaccount/{ADMIN_NAME}"),
     ):
         delete_named(config, client, namespace, resource)

@@ -8,6 +8,8 @@ import shutil
 import stat
 from pathlib import Path
 
+import yaml
+
 from scripts import generate_admin_resources as admin_resource_generator
 from scripts.lib.config import parse_duration, require
 from scripts.lib.controller import rust_toolchain
@@ -50,6 +52,49 @@ WEB_OUTPUT_PATTERNS = {
 }
 PREBUILT_SERVER_ENV = "CAPI_PREBUILT_ADMIN_SERVER"
 PREBUILT_WEB_ENV = "CAPI_PREBUILT_ADMIN_WEB"
+ADMIN_NAMESPACE = "tenant-system"
+ADMIN_NAME = "tenant-admin"
+ADMIN_IDENTITY = (
+    f"system:serviceaccount:{ADMIN_NAMESPACE}:{ADMIN_NAME}"
+)
+_DEFAULT_EFFECTIVE_RESOURCE_PERMISSIONS = frozenset(
+    {
+        (
+            "authorization.k8s.io",
+            "selfsubjectaccessreviews",
+            "create",
+        ),
+        (
+            "authorization.k8s.io",
+            "selfsubjectrulesreviews",
+            "create",
+        ),
+        (
+            "authentication.k8s.io",
+            "selfsubjectreviews",
+            "create",
+        ),
+    }
+)
+_DEFAULT_DISCOVERY_URLS = frozenset(
+    {
+        "/.well-known/openid-configuration",
+        "/.well-known/openid-configuration/",
+        "/api",
+        "/api/*",
+        "/apis",
+        "/apis/*",
+        "/healthz",
+        "/livez",
+        "/openid/v1/jwks",
+        "/openid/v1/jwks/",
+        "/openapi",
+        "/openapi/*",
+        "/readyz",
+        "/version",
+        "/version/",
+    }
+)
 
 
 def _admin_cwd(root: Path) -> Path:
@@ -84,6 +129,155 @@ def _cargo(root: Path, config: dict[str, str], arguments: list[str]) -> None:
 def generate_admin_resources(*, root: Path, check: bool = True) -> None:
     if not admin_resource_generator.generate(root, check=check):
         raise RuntimeError("generated admin resources are stale")
+
+
+def admin_role_name(provider: str) -> str:
+    try:
+        return admin_resource_generator.ADMIN_ROLE_NAMES[provider]
+    except KeyError as exc:
+        raise ValueError(f"unsupported admin provider: {provider}") from exc
+
+
+def admin_rbac_resource_paths(root: Path, provider: str) -> tuple[Path, ...]:
+    return (
+        root / "admin/config/rbac/service-account.yaml",
+        root / admin_resource_generator.cluster_role_path(provider),
+        root / admin_resource_generator.cluster_role_binding_path(provider),
+        root / "admin/config/service/service.yaml",
+    )
+
+
+def admin_rules_review_request() -> str:
+    return json.dumps(
+        {
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectRulesReview",
+            "spec": {"namespace": ADMIN_NAMESPACE},
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _admin_resource_permission_atoms(
+    rules: object,
+    description: str,
+) -> set[tuple[str, str, str]]:
+    if not isinstance(rules, list):
+        raise RuntimeError(f"Tenant Admin {description} rules are invalid")
+    atoms = set()
+    for value in rules:
+        if not isinstance(value, dict) or not set(value).issubset(
+            {"apiGroups", "resources", "verbs", "resourceNames"}
+        ):
+            raise RuntimeError(f"Tenant Admin {description} rules are invalid")
+        api_groups = value.get("apiGroups")
+        resources = value.get("resources")
+        verbs = value.get("verbs")
+        resource_names = value.get("resourceNames", [])
+        if (
+            not isinstance(api_groups, list)
+            or not api_groups
+            or not isinstance(resources, list)
+            or not resources
+            or not isinstance(verbs, list)
+            or not verbs
+            or not isinstance(resource_names, list)
+            or resource_names
+            or not all(
+                isinstance(item, str)
+                for item in api_groups
+            )
+            or not all(
+                isinstance(item, str) and item
+                for item in (*resources, *verbs)
+            )
+            or "*" in api_groups
+            or "*" in resources
+            or "*" in verbs
+            or any("/" in resource for resource in resources)
+        ):
+            raise RuntimeError(
+                f"Tenant Admin {description} rules are not exact resources"
+            )
+        atoms.update(
+            (api_group, resource, verb)
+            for api_group in api_groups
+            for resource in resources
+            for verb in verbs
+        )
+    return atoms
+
+
+def validate_admin_effective_rules(
+    root: Path,
+    provider: str,
+    review: object,
+) -> None:
+    if not isinstance(review, dict):
+        raise RuntimeError("Tenant Admin effective RBAC review is invalid")
+    status = review.get("status")
+    if (
+        review.get("apiVersion") != "authorization.k8s.io/v1"
+        or review.get("kind") != "SelfSubjectRulesReview"
+        or not isinstance(status, dict)
+    ):
+        raise RuntimeError("Tenant Admin effective RBAC review is invalid")
+    incomplete = status.get("incomplete", False)
+    evaluation_error = status.get("evaluationError", "")
+    if (
+        not isinstance(incomplete, bool)
+        or incomplete
+        or not isinstance(evaluation_error, str)
+        or evaluation_error
+    ):
+        raise RuntimeError("Tenant Admin effective RBAC review is incomplete")
+    role_path = root / admin_resource_generator.cluster_role_path(provider)
+    try:
+        role = yaml.safe_load(role_path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(
+            f"Tenant Admin generated ClusterRole is invalid: {role_path}"
+        ) from exc
+    if not isinstance(role, dict):
+        raise RuntimeError(
+            f"Tenant Admin generated ClusterRole is invalid: {role_path}"
+        )
+    expected = _admin_resource_permission_atoms(
+        role.get("rules"),
+        "generated ClusterRole",
+    )
+    if any(verb not in {"get", "list"} for _, _, verb in expected):
+        raise RuntimeError("Tenant Admin generated ClusterRole is not read-only")
+    actual = _admin_resource_permission_atoms(
+        status.get("resourceRules"),
+        "effective RBAC",
+    )
+    missing = expected - actual
+    extra = actual - expected - _DEFAULT_EFFECTIVE_RESOURCE_PERMISSIONS
+    if missing or extra:
+        raise RuntimeError(
+            "Tenant Admin effective RBAC does not match the generated contract"
+        )
+    non_resource_rules = status.get("nonResourceRules", [])
+    if not isinstance(non_resource_rules, list):
+        raise RuntimeError("Tenant Admin non-resource RBAC rules are invalid")
+    for value in non_resource_rules:
+        if (
+            not isinstance(value, dict)
+            or set(value) != {"nonResourceURLs", "verbs"}
+            or not isinstance(value.get("nonResourceURLs"), list)
+            or not isinstance(value.get("verbs"), list)
+            or not value["nonResourceURLs"]
+            or value["verbs"] != ["get"]
+            or not all(
+                isinstance(url, str) and url in _DEFAULT_DISCOVERY_URLS
+                for url in value["nonResourceURLs"]
+            )
+        ):
+            raise RuntimeError(
+                "Tenant Admin effective non-resource RBAC is broader than discovery"
+            )
 
 
 def test_admin(root: Path, config: dict[str, str]) -> None:

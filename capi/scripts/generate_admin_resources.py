@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -8,87 +9,120 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 
 ADMIN_NAME = "tenant-admin"
-ADMIN_ROLE_NAME = "tenant-admin"
 ADMIN_NAMESPACE = "tenant-system"
 ADMIN_IMAGE = "${TENANT_ADMIN_IMAGE}"
 ADMIN_CONTAINER_PORT = 8080
 ADMIN_SERVICE_PORT = 80
-
-READ_ONLY_RESOURCES = (
-    (
-        "",
-        (
-            "configmaps",
-            "namespaces",
-            "persistentvolumeclaims",
-            "services",
-        ),
-    ),
-    ("apps", ("deployments", "statefulsets")),
-    ("batch", ("jobs",)),
-    (
-        "bootstrap.cluster.x-k8s.io",
-        ("kubeadmconfigs", "kubeadmconfigtemplates"),
-    ),
-    (
-        "cert-manager.io",
-        ("certificates", "certificaterequests", "issuers"),
-    ),
-    (
-        "cluster.x-k8s.io",
-        (
-            "clusters",
-            "machinedeployments",
-            "machinepools",
-            "machines",
-            "machinesets",
-        ),
-    ),
-    ("controlplane.cluster.x-k8s.io", ("kamajicontrolplanes",)),
-    ("coordination.k8s.io", ("leases",)),
-    (
-        "infrastructure.cluster.x-k8s.io",
-        (
-            "azureclusteridentities",
-            "azureclusters",
-            "azuremachinepoolmachines",
-            "azuremachinepools",
-            "devclusters",
-            "devmachines",
-            "devmachinetemplates",
-        ),
-    ),
-    ("kamaji.clastix.io", ("tenantcontrolplanes",)),
-    (
-        "network.azure.com",
-        ("natgateways", "virtualnetworkssubnets", "virtualnetworks"),
-    ),
-    ("policy", ("poddisruptionbudgets",)),
-    ("rbac.authorization.k8s.io", ("rolebindings", "roles")),
-    ("resources.azure.com", ("resourcegroups",)),
-    ("tenancy.cnpg-vcluster.io", ("tenants",)),
-)
+PROVIDERS = ("azure", "local")
+ADMIN_ROLE_NAMES = {
+    "azure": "tenant-admin-azure",
+    "local": "tenant-admin-local",
+}
+PROVIDER_CATALOGS = {
+    "azure": Path("controller/config/azure-management-resources.json"),
+    "local": Path("controller/config/management-resources.json"),
+}
 
 OUTPUT_PATHS = (
     Path("admin/config/deployment/deployment-azure.yaml.tpl"),
     Path("admin/config/deployment/deployment-local.yaml.tpl"),
-    Path("admin/config/rbac/cluster-role-binding.yaml"),
-    Path("admin/config/rbac/cluster-role.yaml"),
+    Path("admin/config/rbac/cluster-role-azure.yaml"),
+    Path("admin/config/rbac/cluster-role-binding-azure.yaml"),
+    Path("admin/config/rbac/cluster-role-binding-local.yaml"),
+    Path("admin/config/rbac/cluster-role-local.yaml"),
     Path("admin/config/rbac/service-account.yaml"),
     Path("admin/config/service/service.yaml"),
 )
 
 
-def _cluster_role() -> str:
+def cluster_role_path(provider: str) -> Path:
+    if provider not in PROVIDERS:
+        raise ValueError(f"unsupported admin provider: {provider}")
+    return Path(f"admin/config/rbac/cluster-role-{provider}.yaml")
+
+
+def cluster_role_binding_path(provider: str) -> Path:
+    if provider not in PROVIDERS:
+        raise ValueError(f"unsupported admin provider: {provider}")
+    return Path(f"admin/config/rbac/cluster-role-binding-{provider}.yaml")
+
+
+def provider_rules(
+    root: Path,
+    provider: str,
+) -> tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]:
+    if provider not in PROVIDERS:
+        raise ValueError(f"unsupported admin provider: {provider}")
+    catalog_path = root / PROVIDER_CATALOGS[provider]
+    try:
+        catalog = json.loads(catalog_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(
+            f"admin provider catalog is invalid: {catalog_path}"
+        ) from exc
+    if not isinstance(catalog, list):
+        raise RuntimeError(f"admin provider catalog is invalid: {catalog_path}")
+    listed: dict[str, set[str]] = {}
+    exact_gets: dict[str, set[str]] = {}
+    for value in catalog:
+        if not isinstance(value, dict):
+            raise RuntimeError(
+                f"admin provider catalog is invalid: {catalog_path}"
+            )
+        api_version = value.get("apiVersion")
+        kind = value.get("kind")
+        plural = value.get("plural")
+        namespaced = value.get("namespaced")
+        if (
+            not isinstance(api_version, str)
+            or not isinstance(kind, str)
+            or not isinstance(plural, str)
+            or not isinstance(namespaced, bool)
+        ):
+            raise RuntimeError(
+                f"admin provider catalog is invalid: {catalog_path}"
+            )
+        if kind == "Secret":
+            continue
+        api_group = api_version.split("/", 1)[0] if "/" in api_version else ""
+        if not namespaced:
+            if (
+                kind != "Namespace"
+                or api_version != "v1"
+                or plural != "namespaces"
+                or value.get("namePolicy") != "tenant"
+            ):
+                raise RuntimeError(
+                    "admin RBAC cannot list or infer an unexpected "
+                    f"cluster-scoped resource: {api_version} {kind}"
+                )
+            exact_gets.setdefault(api_group, set()).add(plural)
+        else:
+            listed.setdefault(api_group, set()).add(plural)
+    rules = [
+        ("tenancy.cnpg-vcluster.io", ("tenants",), ("get", "list")),
+        *(
+            (group, tuple(sorted(resources)), ("get",))
+            for group, resources in exact_gets.items()
+        ),
+        *(
+            (group, tuple(sorted(resources)), ("list",))
+            for group, resources in listed.items()
+        ),
+    ]
+    return tuple(sorted(rules))
+
+
+def _cluster_role(root: Path, provider: str) -> str:
     lines = [
         "---",
         "apiVersion: rbac.authorization.k8s.io/v1",
         "kind: ClusterRole",
         "metadata:",
-        f"  name: {ADMIN_ROLE_NAME}",
+        f"  name: {ADMIN_ROLE_NAMES[provider]}",
         "rules:",
     ]
-    for api_group, resources in READ_ONLY_RESOURCES:
+    for api_group, resources, verbs in provider_rules(root, provider):
         rendered_group = f"'{api_group}'" if not api_group else api_group
         lines.extend(
             (
@@ -97,15 +131,14 @@ def _cluster_role() -> str:
                 "  resources:",
                 *(f"  - {resource}" for resource in resources),
                 "  verbs:",
-                "  - get",
-                "  - list",
+                *(f"  - {verb}" for verb in verbs),
             )
         )
     return "\n".join(lines) + "\n"
 
 
 def _deployment(provider: str) -> str:
-    if provider not in {"local", "azure"}:
+    if provider not in PROVIDERS:
         raise ValueError(f"unsupported admin provider: {provider}")
     image_pull_policy = "Never" if provider == "local" else "IfNotPresent"
     return f"""\
@@ -182,29 +215,14 @@ spec:
 """
 
 
-def generated_documents() -> dict[Path, str]:
-    return {
+def generated_documents(root: Path = ROOT) -> dict[Path, str]:
+    documents = {
         Path("admin/config/deployment/deployment-azure.yaml.tpl"): _deployment(
             "azure"
         ),
         Path("admin/config/deployment/deployment-local.yaml.tpl"): _deployment(
             "local"
         ),
-        Path("admin/config/rbac/cluster-role-binding.yaml"): f"""\
-apiVersion: rbac.authorization.k8s.io/v1
-kind: ClusterRoleBinding
-metadata:
-  name: {ADMIN_NAME}
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: ClusterRole
-  name: {ADMIN_ROLE_NAME}
-subjects:
-- kind: ServiceAccount
-  name: {ADMIN_NAME}
-  namespace: {ADMIN_NAMESPACE}
-""",
-        Path("admin/config/rbac/cluster-role.yaml"): _cluster_role(),
         Path("admin/config/rbac/service-account.yaml"): f"""\
 apiVersion: v1
 kind: ServiceAccount
@@ -230,10 +248,27 @@ spec:
     protocol: TCP
 """,
     }
+    for provider in PROVIDERS:
+        documents[cluster_role_path(provider)] = _cluster_role(root, provider)
+        documents[cluster_role_binding_path(provider)] = f"""\
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {ADMIN_NAME}
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: {ADMIN_ROLE_NAMES[provider]}
+subjects:
+- kind: ServiceAccount
+  name: {ADMIN_NAME}
+  namespace: {ADMIN_NAMESPACE}
+"""
+    return documents
 
 
 def generate(root: Path, *, check: bool) -> bool:
-    documents = generated_documents()
+    documents = generated_documents(root)
     if tuple(sorted(documents)) != OUTPUT_PATHS:
         raise RuntimeError("admin resource output set does not match OUTPUT_PATHS")
 

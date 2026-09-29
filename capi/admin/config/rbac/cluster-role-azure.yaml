@@ -2,74 +2,63 @@
 apiVersion: rbac.authorization.k8s.io/v1
 kind: ClusterRole
 metadata:
-  name: tenant-admin
+  name: tenant-admin-azure
 rules:
 - apiGroups:
   - ''
   resources:
   - configmaps
-  - namespaces
   - persistentvolumeclaims
   - services
   verbs:
-  - get
   - list
+- apiGroups:
+  - ''
+  resources:
+  - namespaces
+  verbs:
+  - get
 - apiGroups:
   - apps
   resources:
   - deployments
   - statefulsets
   verbs:
-  - get
   - list
 - apiGroups:
   - batch
   resources:
   - jobs
   verbs:
-  - get
   - list
 - apiGroups:
   - bootstrap.cluster.x-k8s.io
   resources:
   - kubeadmconfigs
-  - kubeadmconfigtemplates
   verbs:
-  - get
   - list
 - apiGroups:
   - cert-manager.io
   resources:
-  - certificates
   - certificaterequests
+  - certificates
   - issuers
   verbs:
-  - get
   - list
 - apiGroups:
   - cluster.x-k8s.io
   resources:
   - clusters
-  - machinedeployments
   - machinepools
   - machines
   - machinesets
   verbs:
-  - get
   - list
 - apiGroups:
   - controlplane.cluster.x-k8s.io
   resources:
   - kamajicontrolplanes
   verbs:
-  - get
-  - list
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - get
   - list
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
@@ -78,34 +67,27 @@ rules:
   - azureclusters
   - azuremachinepoolmachines
   - azuremachinepools
-  - devclusters
-  - devmachines
-  - devmachinetemplates
   verbs:
-  - get
   - list
 - apiGroups:
   - kamaji.clastix.io
   resources:
   - tenantcontrolplanes
   verbs:
-  - get
   - list
 - apiGroups:
   - network.azure.com
   resources:
   - natgateways
-  - virtualnetworkssubnets
   - virtualnetworks
+  - virtualnetworkssubnets
   verbs:
-  - get
   - list
 - apiGroups:
   - policy
   resources:
   - poddisruptionbudgets
   verbs:
-  - get
   - list
 - apiGroups:
   - rbac.authorization.k8s.io
@@ -113,14 +95,12 @@ rules:
   - rolebindings
   - roles
   verbs:
-  - get
   - list
 - apiGroups:
   - resources.azure.com
   resources:
   - resourcegroups
   verbs:
-  - get
   - list
 - apiGroups:
   - tenancy.cnpg-vcluster.io

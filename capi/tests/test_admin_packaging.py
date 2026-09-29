@@ -379,7 +379,7 @@ class AdminPackagingTests(unittest.TestCase):
             "admin/server/src/main.rs": "server",
             "admin/web/src/main.rs": "web",
             "admin/web/Trunk.toml": "config",
-            "admin/config/rbac/cluster-role.yaml": "generated",
+            "admin/config/rbac/cluster-role-local.yaml": "generated",
             "controller/Cargo.toml": "[package]\nname = \"tenant-controller\"",
             "controller/src/api.rs": "api",
             "controller/src/management.rs": "management",

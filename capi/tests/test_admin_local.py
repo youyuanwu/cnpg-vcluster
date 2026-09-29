@@ -69,14 +69,14 @@ class FakeClient:
             )
         )
         self.role = yaml.safe_load(
-            (ROOT / "admin/config/rbac/cluster-role.yaml").read_text(
+            (ROOT / "admin/config/rbac/cluster-role-local.yaml").read_text(
                 encoding="utf-8"
             )
         )
         self.binding = yaml.safe_load(
-            (ROOT / "admin/config/rbac/cluster-role-binding.yaml").read_text(
-                encoding="utf-8"
-            )
+            (
+                ROOT / "admin/config/rbac/cluster-role-binding-local.yaml"
+            ).read_text(encoding="utf-8")
         )
         self.service = yaml.safe_load(
             (ROOT / "admin/config/service/service.yaml").read_text(
@@ -84,6 +84,41 @@ class FakeClient:
             )
         )
         self.service["spec"]["clusterIP"] = "10.96.1.2"
+        self.rules_review = {
+            "apiVersion": "authorization.k8s.io/v1",
+            "kind": "SelfSubjectRulesReview",
+            "status": {
+                "resourceRules": [
+                    *copy.deepcopy(self.role["rules"]),
+                    {
+                        "apiGroups": ["authorization.k8s.io"],
+                        "resources": [
+                            "selfsubjectaccessreviews",
+                            "selfsubjectrulesreviews",
+                        ],
+                        "verbs": ["create"],
+                    },
+                    {
+                        "apiGroups": ["authentication.k8s.io"],
+                        "resources": ["selfsubjectreviews"],
+                        "verbs": ["create"],
+                    },
+                ],
+                "nonResourceRules": [
+                    {
+                        "verbs": ["get"],
+                        "nonResourceURLs": [
+                            "/api",
+                            "/apis",
+                            "/healthz",
+                            "/readyz",
+                            "/version",
+                        ],
+                    }
+                ],
+                "incomplete": False,
+            },
+        }
         self.tenant_names = tenant_names
         self.calls: list[tuple[str, ...]] = []
 
@@ -95,7 +130,7 @@ class FakeClient:
             return {"items": [copy.deepcopy(self.pod)]}
         if resource == "serviceaccount/tenant-admin":
             return copy.deepcopy(self.service_account)
-        if resource == "clusterrole/tenant-admin":
+        if resource == "clusterrole/tenant-admin-local":
             return copy.deepcopy(self.role)
         if resource == "clusterrolebinding/tenant-admin":
             return copy.deepcopy(self.binding)
@@ -196,12 +231,8 @@ class FakeClient:
         self.calls.append(arguments)
         if arguments[:2] == ("get", "--raw"):
             return response(self._proxy_response(arguments[2]))
-        if arguments[:2] == ("auth", "can-i"):
-            allowed = arguments[2:4] in {
-                ("get", "tenants.tenancy.cnpg-vcluster.io"),
-                ("list", "tenants.tenancy.cnpg-vcluster.io"),
-            }
-            return response("yes\n" if allowed else "no\n", 0 if allowed else 1)
+        if arguments[0] == "create" and "-f" in arguments:
+            return response(json.dumps(self.rules_review))
         return response()
 
 
@@ -272,8 +303,8 @@ class AdminLocalTests(unittest.TestCase):
         self.assertEqual(
             [
                 ROOT / "admin/config/rbac/service-account.yaml",
-                ROOT / "admin/config/rbac/cluster-role.yaml",
-                ROOT / "admin/config/rbac/cluster-role-binding.yaml",
+                ROOT / "admin/config/rbac/cluster-role-local.yaml",
+                ROOT / "admin/config/rbac/cluster-role-binding-local.yaml",
                 ROOT / "admin/config/service/service.yaml",
                 rendered,
             ],
@@ -342,6 +373,76 @@ class AdminLocalTests(unittest.TestCase):
         role["rules"][0]["resources"].append("secrets")
         with self.assertRaisesRegex(RuntimeError, "read-only RBAC"):
             admin_local._verify_role(ROOT, role)
+        review_calls = [
+            arguments
+            for arguments in client.calls
+            if arguments[0] == "create" and "-f" in arguments
+        ]
+        self.assertEqual(1, len(review_calls))
+        self.assertIn(
+            "--as=system:serviceaccount:tenant-system:tenant-admin",
+            review_calls[0],
+        )
+
+    def test_effective_rbac_rejects_additive_and_missing_permissions(self) -> None:
+        additions = (
+            (
+                "create-pods",
+                {
+                    "apiGroups": [""],
+                    "resources": ["pods"],
+                    "verbs": ["create"],
+                },
+            ),
+            (
+                "patch-deployments",
+                {
+                    "apiGroups": ["apps"],
+                    "resources": ["deployments"],
+                    "verbs": ["patch"],
+                },
+            ),
+            (
+                "group-contributed-right",
+                {
+                    "apiGroups": [""],
+                    "resources": ["configmaps"],
+                    "verbs": ["list"],
+                },
+            ),
+        )
+        for name, rule in additions:
+            client = FakeClient()
+            client.rules_review["status"]["resourceRules"].append(rule)
+            with self.subTest(name=name), self.assertRaisesRegex(
+                RuntimeError,
+                "effective RBAC",
+            ):
+                admin_local.verify_local_admin(ROOT, client, IMAGE)
+
+        client = FakeClient()
+        client.rules_review["status"]["resourceRules"].pop(0)
+        with self.assertRaisesRegex(RuntimeError, "effective RBAC"):
+            admin_local.verify_local_admin(ROOT, client, IMAGE)
+
+        for field, value in (
+            ("incomplete", True),
+            ("evaluationError", "authorizer unavailable"),
+        ):
+            client = FakeClient()
+            client.rules_review["status"][field] = value
+            with self.subTest(field=field), self.assertRaisesRegex(
+                RuntimeError,
+                "incomplete",
+            ):
+                admin_local.verify_local_admin(ROOT, client, IMAGE)
+
+        client = FakeClient()
+        client.rules_review["status"]["nonResourceRules"][0][
+            "nonResourceURLs"
+        ].append("/metrics")
+        with self.assertRaisesRegex(RuntimeError, "non-resource RBAC"):
+            admin_local.verify_local_admin(ROOT, client, IMAGE)
 
     def test_api_verification_accepts_empty_and_typed_populated_responses(
         self,
@@ -385,6 +486,30 @@ class AdminLocalTests(unittest.TestCase):
                 if arguments[:2] == ("get", "--raw")
             ],
         )
+        transitioning = FakeClient(tenant_names=("tenant-a",))
+        original_transition = transitioning._proxy_response
+
+        def transition_response(path: str) -> str:
+            if path.endswith("/api/v1/tenants"):
+                summary = tenant_summary("tenant-a")
+                summary["classification"] = "progressing"
+                return json.dumps({"schemaVersion": 1, "data": [summary]})
+            if path.endswith("/api/v1/tenants/tenant-a/topology"):
+                topology = json.loads(original_transition(path))["data"]
+                topology["nodes"][0]["health"] = "progressing"
+                return json.dumps({"schemaVersion": 1, "data": topology})
+            return original_transition(path)
+
+        with patch.object(
+            transitioning,
+            "_proxy_response",
+            side_effect=transition_response,
+        ):
+            transitioned = admin_local.verify_admin_api(
+                transitioning,
+                expected_tenant_names=("tenant-a",),
+            )
+        self.assertEqual(["tenant-a"], transitioned["tenantNames"])
         malformed = FakeClient()
         original = malformed._proxy_response
 
@@ -522,7 +647,7 @@ class AdminLocalTests(unittest.TestCase):
                     ("tenant-system", "deployment/tenant-admin"),
                     ("tenant-system", "service/tenant-admin"),
                     (None, "clusterrolebinding/tenant-admin"),
-                    (None, "clusterrole/tenant-admin"),
+                    (None, "clusterrole/tenant-admin-local"),
                     ("tenant-system", "serviceaccount/tenant-admin"),
                 ],
                 deleted,

@@ -10,47 +10,90 @@ from scripts import generate_admin_resources as generator
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_RBAC = {
-    "": {
-        "configmaps",
-        "namespaces",
-        "persistentvolumeclaims",
-        "services",
+    "local": {
+        ("", ("namespaces",), ("get",)),
+        (
+            "bootstrap.cluster.x-k8s.io",
+            ("kubeadmconfigs", "kubeadmconfigtemplates"),
+            ("list",),
+        ),
+        (
+            "cluster.x-k8s.io",
+            ("clusters", "machinedeployments", "machines", "machinesets"),
+            ("list",),
+        ),
+        (
+            "controlplane.cluster.x-k8s.io",
+            ("kamajicontrolplanes",),
+            ("list",),
+        ),
+        ("coordination.k8s.io", ("leases",), ("list",)),
+        (
+            "infrastructure.cluster.x-k8s.io",
+            ("devclusters", "devmachines", "devmachinetemplates"),
+            ("list",),
+        ),
+        ("kamaji.clastix.io", ("tenantcontrolplanes",), ("list",)),
+        (
+            "tenancy.cnpg-vcluster.io",
+            ("tenants",),
+            ("get", "list"),
+        ),
     },
-    "apps": {"deployments", "statefulsets"},
-    "batch": {"jobs"},
-    "bootstrap.cluster.x-k8s.io": {
-        "kubeadmconfigs",
-        "kubeadmconfigtemplates",
+    "azure": {
+        (
+            "",
+            ("configmaps", "persistentvolumeclaims", "services"),
+            ("list",),
+        ),
+        ("", ("namespaces",), ("get",)),
+        ("apps", ("deployments", "statefulsets"), ("list",)),
+        ("batch", ("jobs",), ("list",)),
+        ("bootstrap.cluster.x-k8s.io", ("kubeadmconfigs",), ("list",)),
+        (
+            "cert-manager.io",
+            ("certificaterequests", "certificates", "issuers"),
+            ("list",),
+        ),
+        (
+            "cluster.x-k8s.io",
+            ("clusters", "machinepools", "machines", "machinesets"),
+            ("list",),
+        ),
+        (
+            "controlplane.cluster.x-k8s.io",
+            ("kamajicontrolplanes",),
+            ("list",),
+        ),
+        (
+            "infrastructure.cluster.x-k8s.io",
+            (
+                "azureclusteridentities",
+                "azureclusters",
+                "azuremachinepoolmachines",
+                "azuremachinepools",
+            ),
+            ("list",),
+        ),
+        ("kamaji.clastix.io", ("tenantcontrolplanes",), ("list",)),
+        (
+            "network.azure.com",
+            ("natgateways", "virtualnetworks", "virtualnetworkssubnets"),
+            ("list",),
+        ),
+        ("policy", ("poddisruptionbudgets",), ("list",)),
+        (
+            "rbac.authorization.k8s.io",
+            ("rolebindings", "roles"),
+            ("list",),
+        ),
+        ("resources.azure.com", ("resourcegroups",), ("list",)),
+        (
+            "tenancy.cnpg-vcluster.io",
+            ("tenants",),
+            ("get", "list"),
+        ),
     },
-    "cert-manager.io": {"certificates", "certificaterequests", "issuers"},
-    "cluster.x-k8s.io": {
-        "clusters",
-        "machinedeployments",
-        "machinepools",
-        "machines",
-        "machinesets",
-    },
-    "controlplane.cluster.x-k8s.io": {"kamajicontrolplanes"},
-    "coordination.k8s.io": {"leases"},
-    "infrastructure.cluster.x-k8s.io": {
-        "azureclusteridentities",
-        "azureclusters",
-        "azuremachinepoolmachines",
-        "azuremachinepools",
-        "devclusters",
-        "devmachines",
-        "devmachinetemplates",
-    },
-    "kamaji.clastix.io": {"tenantcontrolplanes"},
-    "network.azure.com": {
-        "natgateways",
-        "virtualnetworkssubnets",
-        "virtualnetworks",
-    },
-    "policy": {"poddisruptionbudgets"},
-    "rbac.authorization.k8s.io": {"rolebindings", "roles"},
-    "resources.azure.com": {"resourcegroups"},
-    "tenancy.cnpg-vcluster.io": {"tenants"},
 }
 
 
@@ -79,7 +122,6 @@ class AdminResourceTests(unittest.TestCase):
 
     def test_service_account_binding_and_service_contract(self) -> None:
         service_account = load("admin/config/rbac/service-account.yaml")
-        binding = load("admin/config/rbac/cluster-role-binding.yaml")
         service = load("admin/config/service/service.yaml")
 
         for resource in (service_account, service):
@@ -87,25 +129,29 @@ class AdminResourceTests(unittest.TestCase):
             self.assertEqual("tenant-system", resource["metadata"]["namespace"])
         self.assertFalse(service_account["automountServiceAccountToken"])
 
-        self.assertEqual("tenant-admin", binding["metadata"]["name"])
-        self.assertEqual(
-            {
-                "apiGroup": "rbac.authorization.k8s.io",
-                "kind": "ClusterRole",
-                "name": "tenant-admin",
-            },
-            binding["roleRef"],
-        )
-        self.assertEqual(
-            [
+        for provider in generator.PROVIDERS:
+            binding = load(
+                f"admin/config/rbac/cluster-role-binding-{provider}.yaml"
+            )
+            self.assertEqual("tenant-admin", binding["metadata"]["name"])
+            self.assertEqual(
                 {
-                    "kind": "ServiceAccount",
-                    "name": "tenant-admin",
-                    "namespace": "tenant-system",
-                }
-            ],
-            binding["subjects"],
-        )
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "ClusterRole",
+                    "name": f"tenant-admin-{provider}",
+                },
+                binding["roleRef"],
+            )
+            self.assertEqual(
+                [
+                    {
+                        "kind": "ServiceAccount",
+                        "name": "tenant-admin",
+                        "namespace": "tenant-system",
+                    }
+                ],
+                binding["subjects"],
+            )
 
         self.assertEqual("ClusterIP", service["spec"]["type"])
         self.assertEqual(
@@ -124,23 +170,33 @@ class AdminResourceTests(unittest.TestCase):
             service["spec"]["ports"],
         )
 
-    def test_cluster_role_is_exact_read_only_topology_union(self) -> None:
-        role = load("admin/config/rbac/cluster-role.yaml")
-        self.assertEqual("tenant-admin", role["metadata"]["name"])
-        actual = {}
-        for rule in role["rules"]:
-            self.assertEqual(["get", "list"], rule["verbs"])
-            self.assertNotIn("nonResourceURLs", rule)
-            self.assertEqual(1, len(rule["apiGroups"]))
-            group = rule["apiGroups"][0]
-            self.assertNotEqual("*", group)
-            resources = set(rule["resources"])
-            self.assertNotIn("*", resources)
-            self.assertNotIn("secrets", resources)
-            self.assertTrue(all("/" not in resource for resource in resources))
-            self.assertNotIn(group, actual)
-            actual[group] = resources
-        self.assertEqual(EXPECTED_RBAC, actual)
+    def test_cluster_roles_are_exact_provider_catalog_permissions(self) -> None:
+        for provider in generator.PROVIDERS:
+            role = load(f"admin/config/rbac/cluster-role-{provider}.yaml")
+            self.assertEqual(
+                f"tenant-admin-{provider}",
+                role["metadata"]["name"],
+            )
+            actual = set()
+            for rule in role["rules"]:
+                self.assertNotIn("nonResourceURLs", rule)
+                self.assertEqual(1, len(rule["apiGroups"]))
+                group = rule["apiGroups"][0]
+                self.assertNotEqual("*", group)
+                resources = tuple(rule["resources"])
+                verbs = tuple(rule["verbs"])
+                self.assertNotIn("*", resources)
+                self.assertNotIn("secrets", resources)
+                self.assertTrue(
+                    all("/" not in resource for resource in resources)
+                )
+                self.assertTrue(set(verbs).issubset({"get", "list"}))
+                actual.add((group, resources, verbs))
+            self.assertEqual(EXPECTED_RBAC[provider], actual)
+            self.assertEqual(
+                tuple(sorted(EXPECTED_RBAC[provider])),
+                generator.provider_rules(ROOT, provider),
+            )
 
     def test_deployments_are_provider_specific_and_hardened(self) -> None:
         images = set()
