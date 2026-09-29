@@ -208,9 +208,20 @@ fn record_uid(
 fn descendants(
     inventory: &[DynamicObject],
     root_uids: &BTreeSet<String>,
+    recorded: &[AzureProviderResourceIdentity],
 ) -> Result<Vec<AzureProviderResourceIdentity>, ReconcileError> {
     let mut owned = root_uids.clone();
     let mut selected = BTreeSet::new();
+    for (index, object) in inventory.iter().enumerate() {
+        let identity = resource_identity(object)?;
+        if recorded
+            .iter()
+            .any(|expected| same_resource(expected, &identity))
+        {
+            owned.insert(identity.uid);
+            selected.insert(index);
+        }
+    }
     loop {
         let before = selected.len();
         for (index, object) in inventory.iter().enumerate() {
@@ -609,7 +620,12 @@ pub async fn finalize(
         }
         provider_objects.push(object);
     }
-    let provider_resources = descendants(&provider_objects, &explicit_uids)?;
+    let recorded_resources = if azure_status.deletion.is_some() {
+        azure_status.provider_resources.as_slice()
+    } else {
+        &[]
+    };
+    let provider_resources = descendants(&provider_objects, &explicit_uids, recorded_resources)?;
     if azure_status.deletion.is_none() {
         for recorded in &azure_status.provider_resources {
             if !provider_resources

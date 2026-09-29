@@ -244,23 +244,13 @@ async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
     }
 }
 
-async fn run_runtime<P: ProviderLifecycle + 'static>(
+async fn run_runtime<P: ProviderLifecycle + Clone + 'static>(
     config: ManagerConfig,
     client: kube::Client,
     provider: P,
     watch_management_resources: bool,
     management_resources: &'static [tenant_controller::management::ManagementResource],
 ) -> Result<(), ControllerError> {
-    let reconciler = Reconciler::new(
-        client.clone(),
-        ReconcileConfig {
-            supported_version: config.supported_kubernetes_version.clone(),
-            watch_management_resources,
-            management_resources,
-        },
-        provider,
-    );
-
     let health = HealthState::default();
     let listener = bind_health(config.health_address).await?;
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
@@ -276,28 +266,54 @@ async fn run_runtime<P: ProviderLifecycle + 'static>(
     ));
 
     let runtime_result = if config.leader_elect {
-        run_leader_elected(
-            client,
-            config.leader,
-            health.clone(),
-            shutdown_rx.clone(),
-            |mut context: LeadershipContext| async move {
-                let gate = context.gate.clone();
-                // The leader runtime drains permits while awaiting shutdown.
-                // Reconciliation must keep being polled during that drain.
-                let mut controller = tokio::spawn(run_controller(reconciler, gate, async move {
-                    let reason = context.stopped().await;
-                    context.gate.stop_accepting();
-                    tracing::info!(?reason, "controller stopping");
-                }));
-                let _abort_on_drop = AbortControllerOnDrop(controller.abort_handle());
-                (&mut controller)
-                    .await
-                    .map_err(|error| ControllerError::Task(error.to_string()))?
-            },
-        )
-        .await
+        loop {
+            let reconciler = Reconciler::new(
+                client.clone(),
+                ReconcileConfig {
+                    supported_version: config.supported_kubernetes_version.clone(),
+                    watch_management_resources,
+                    management_resources,
+                },
+                provider.clone(),
+            );
+            let result = run_leader_elected(
+                client.clone(),
+                config.leader.clone(),
+                health.clone(),
+                shutdown_rx.clone(),
+                |mut context: LeadershipContext| async move {
+                    let gate = context.gate.clone();
+                    // The leader runtime drains permits while awaiting shutdown.
+                    // Reconciliation must keep being polled during that drain.
+                    let mut controller =
+                        tokio::spawn(run_controller(reconciler, gate, async move {
+                            let reason = context.stopped().await;
+                            context.gate.stop_accepting();
+                            tracing::info!(?reason, "controller stopping");
+                        }));
+                    let _abort_on_drop = AbortControllerOnDrop(controller.abort_handle());
+                    (&mut controller)
+                        .await
+                        .map_err(|error| ControllerError::Task(error.to_string()))?
+                },
+            )
+            .await;
+            if matches!(result, Err(ControllerError::LeadershipLost)) && !*shutdown_rx.borrow() {
+                tracing::warn!("leadership lost; reacquiring");
+                continue;
+            }
+            break result;
+        }
     } else {
+        let reconciler = Reconciler::new(
+            client.clone(),
+            ReconcileConfig {
+                supported_version: config.supported_kubernetes_version.clone(),
+                watch_management_resources,
+                management_resources,
+            },
+            provider,
+        );
         let gate = LeadershipGate::default();
         gate.start_accepting();
         let stop_gate = gate.clone();

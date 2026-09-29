@@ -39,6 +39,7 @@ pub trait TenantAccess: Send + Sync {
     fn connect(&self, management: Client, control_plane: &DynamicObject, alternate_owner: Option<&DynamicObject>, tenant_name: &str, endpoint: &str)
         -> impl Future<Output = Result<Client, TenantClientError>> + Send;
 }
+#[derive(Clone, Copy)]
 pub struct LiveTenantAccess;
 #[rustfmt::skip]
 impl TenantAccess for LiveTenantAccess {
@@ -64,6 +65,7 @@ pub trait ProviderLifecycle: Send + Sync {
     ) -> impl Future<Output = Result<Action, ReconcileError>> + Send + 'a;
 }
 #[rustfmt::skip]
+#[derive(Clone)]
 pub struct LocalProvider<D = BollardDockerClient, A = LiveTenantAccess> {
     pub client: Client, pub docker: D, pub access: A, pub assets: Assets,
     pub foundation: Arc<RuntimeFoundation>,
