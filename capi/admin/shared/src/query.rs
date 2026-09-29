@@ -66,6 +66,13 @@ pub struct ManagementOverview {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
+pub struct OverviewSnapshot {
+    pub overview: ManagementOverview,
+    pub tenants: Vec<TenantSummary>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ManagementComponentView {
     pub name: String,
     pub ready: bool,
@@ -98,6 +105,22 @@ pub struct TenantDetail {
     pub provider_status: ProviderStatusView,
     pub blockers: Vec<TenantBlocker>,
     pub management_resources: Vec<ManagementResourceView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantSnapshotIdentity {
+    pub uid: String,
+    pub generation: i64,
+    pub observed_generation: Option<i64>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantSnapshot {
+    pub identity: TenantSnapshotIdentity,
+    pub detail: TenantDetail,
+    pub topology: TopologyGraph,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

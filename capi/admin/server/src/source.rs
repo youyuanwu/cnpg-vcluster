@@ -67,6 +67,30 @@ impl KubeDataSource {
         } else {
             Api::<DynamicObject>::all_with(client, &api_resource)
         };
+        if !definition.namespaced
+            && let Some(expected_name) = definition.expected_name(&tenant_name)
+        {
+            return match api.get_opt(&expected_name).await {
+                Ok(Some(mut object)) => {
+                    object.types.get_or_insert_with(|| kube::core::TypeMeta {
+                        api_version: definition.api_version.into(),
+                        kind: definition.kind.into(),
+                    });
+                    Ok(vec![object])
+                }
+                Ok(None) => Ok(Vec::new()),
+                Err(error) => {
+                    tracing::warn!(
+                        api_version = definition.api_version,
+                        kind = definition.kind,
+                        name = expected_name,
+                        error = %tenant_controller::sanitize::text(&error.to_string()),
+                        "management resource read failed"
+                    );
+                    Err(SourceError::KubernetesUnavailable)
+                }
+            };
+        }
         match api
             .list(&ListParams::default().limit(MAX_RESOURCES_PER_KIND + 1))
             .await
@@ -176,6 +200,7 @@ impl DataSource for KubeDataSource {
                     return Err(SourceError::ResponseTooLarge);
                 }
             }
+
             Ok(resources)
         })
     }
@@ -185,5 +210,97 @@ impl DataSource for KubeDataSource {
             self.tenant_list(1).await?;
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{
+        convert::Infallible,
+        sync::{Arc, Mutex},
+    };
+
+    use axum::http::{Request, Response};
+    use kube::client::Body;
+    use serde_json::json;
+    use tower::service_fn;
+
+    use super::*;
+
+    #[tokio::test]
+    async fn deterministic_cluster_resource_uses_exact_get() {
+        let calls = Arc::new(Mutex::new(Vec::<(String, String)>::new()));
+        let service_calls = calls.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<Body>| {
+                let calls = service_calls.clone();
+                async move {
+                    let path = request.uri().path().to_owned();
+                    let query = request.uri().query().unwrap_or_default().to_owned();
+                    calls
+                        .lock()
+                        .expect("call log lock")
+                        .push((path.clone(), query));
+                    let (status, body) = if path == "/api/v1/namespaces/tenant-a" {
+                        (
+                            200,
+                            json!({
+                                "metadata": {
+                                    "name": "tenant-a",
+                                    "uid": "namespace-uid"
+                                }
+                            }),
+                        )
+                    } else {
+                        (
+                            404,
+                            json!({
+                                "apiVersion": "v1",
+                                "kind": "Status",
+                                "status": "Failure",
+                                "code": 404,
+                                "reason": "NotFound",
+                                "message": "not found"
+                            }),
+                        )
+                    };
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(
+                                serde_json::to_vec(&body).expect("response body"),
+                            ))
+                            .expect("response"),
+                    )
+                }
+            }),
+            "default",
+        );
+        let source = KubeDataSource::new(client);
+
+        let resources = source
+            .list_management_resources(ProviderMode::Local, "tenant-a")
+            .await
+            .expect("resource scan");
+
+        let namespace = resources
+            .iter()
+            .find(|resource| resource.metadata.uid.as_deref() == Some("namespace-uid"))
+            .expect("exact namespace");
+        let types = namespace.types.as_ref().expect("restored type metadata");
+        assert_eq!(types.api_version, "v1");
+        assert_eq!(types.kind, "Namespace");
+
+        let calls = calls.lock().expect("call log lock");
+        assert!(
+            calls
+                .iter()
+                .any(|(path, _)| path == "/api/v1/namespaces/tenant-a")
+        );
+        assert!(
+            calls.iter().all(|(path, _)| path != "/api/v1/namespaces"),
+            "Namespace inventory must not list every cluster Namespace"
+        );
     }
 }

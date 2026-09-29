@@ -90,9 +90,8 @@ pub fn project_summary(mode: ProviderMode, tenant: &Tenant) -> TenantSummary {
             .allocation
             .as_ref()
             .map(|allocation| bounded(&allocation.endpoint, MAX_TEXT)),
-        Some(TenantProviderStatus::Azure(azure)) => azure
-            .endpoint
-            .as_deref()
+        Some(TenantProviderStatus::Azure(_)) => trusted_azure_status(tenant)
+            .and_then(|azure| azure.endpoint.as_deref())
             .map(|value| bounded(value, MAX_TEXT)),
         None => None,
     });
@@ -114,6 +113,23 @@ pub fn project_summary(mode: ProviderMode, tenant: &Tenant) -> TenantSummary {
             .map(|timestamp| timestamp.0.to_string()),
         conditions: projected_conditions(tenant),
     }
+}
+
+fn trusted_azure_status(tenant: &Tenant) -> Option<&tenant_controller::api::AzureProviderStatus> {
+    if !matches!(tenant.spec.provider, TenantProviderSpec::Azure { .. }) {
+        return None;
+    }
+    let tenant_uid = tenant
+        .metadata
+        .uid
+        .as_deref()
+        .filter(|value| !value.is_empty())?;
+    let status = tenant.status.as_ref()?.azure()?;
+    status
+        .binding
+        .as_ref()
+        .is_some_and(|binding| binding.tenant_uid == tenant_uid)
+        .then_some(status)
 }
 
 impl TenantProjection {
@@ -255,23 +271,12 @@ fn accepted_azure<'a>(
     inventory: &'a [DynamicObject],
 ) -> Vec<AcceptedResource<'a>> {
     let name = tenant.name_any();
-    let Some(tenant_uid) = tenant
-        .metadata
-        .uid
-        .as_deref()
-        .filter(|value| !value.is_empty())
-    else {
-        return Vec::new();
-    };
-    let Some(azure) = tenant.status.as_ref().and_then(|status| status.azure()) else {
+    let Some(azure) = trusted_azure_status(tenant) else {
         return Vec::new();
     };
     let Some(binding) = azure.binding.as_ref() else {
         return Vec::new();
     };
-    if binding.tenant_uid != tenant_uid {
-        return Vec::new();
-    }
     let recorded = azure_recorded_roots(&name, azure);
     let mut roots = Vec::new();
     for object in inventory {
@@ -544,13 +549,8 @@ fn provider_status_matches(tenant: &Tenant) -> bool {
             .and_then(|status| status.provider.as_ref()),
     ) {
         (TenantProviderSpec::Local { .. }, Some(TenantProviderStatus::Local(_))) => true,
-        (TenantProviderSpec::Azure { .. }, Some(TenantProviderStatus::Azure(status))) => {
-            tenant.metadata.uid.as_deref().is_some_and(|tenant_uid| {
-                status
-                    .binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.tenant_uid == tenant_uid)
-            })
+        (TenantProviderSpec::Azure { .. }, Some(TenantProviderStatus::Azure(_))) => {
+            trusted_azure_status(tenant).is_some()
         }
         _ => false,
     }
@@ -584,6 +584,9 @@ fn specification(tenant: &Tenant) -> TenantSpecificationView {
 }
 
 fn provider_status(tenant: &Tenant) -> ProviderStatusView {
+    if let Some(status) = trusted_azure_status(tenant) {
+        return ProviderStatusView::Azure(azure_provider_view(tenant, status));
+    }
     match (
         &tenant.spec.provider,
         tenant
@@ -615,16 +618,6 @@ fn provider_status(tenant: &Tenant) -> ProviderStatusView {
                     .map(|value| bounded(value, MAX_IDENTITY)),
             })
         }
-        (TenantProviderSpec::Azure { .. }, Some(TenantProviderStatus::Azure(status)))
-            if tenant.metadata.uid.as_deref().is_some_and(|tenant_uid| {
-                status
-                    .binding
-                    .as_ref()
-                    .is_some_and(|binding| binding.tenant_uid == tenant_uid)
-            }) =>
-        {
-            ProviderStatusView::Azure(azure_provider_view(tenant, status))
-        }
         (specification, observed) => ProviderStatusView::Unknown(UnknownProviderView {
             provider_type: match specification {
                 TenantProviderSpec::Local { .. } => "local",
@@ -632,14 +625,17 @@ fn provider_status(tenant: &Tenant) -> ProviderStatusView {
             }
             .into(),
             summary: Some(
-                match observed {
-                    Some(TenantProviderStatus::Local(_)) => {
+                match (specification, observed) {
+                    (TenantProviderSpec::Azure { .. }, Some(TenantProviderStatus::Azure(_))) => {
+                        "provider status binding does not match current Tenant identity"
+                    }
+                    (_, Some(TenantProviderStatus::Local(_))) => {
                         "provider status is local but the specification is not"
                     }
-                    Some(TenantProviderStatus::Azure(_)) => {
+                    (_, Some(TenantProviderStatus::Azure(_))) => {
                         "provider status is azure but the specification is not"
                     }
-                    None => "provider status is absent",
+                    (_, None) => "provider status is absent",
                 }
                 .into(),
             ),
@@ -1132,7 +1128,16 @@ fn topology(
             );
         }
         TenantProviderSpec::Azure { .. } => {
-            add_azure_status_nodes(tenant, &mut nodes, &mut edges, &tenant_id, &ids_by_uid)
+            if let Some(status) = trusted_azure_status(tenant) {
+                add_azure_status_nodes(
+                    tenant,
+                    status,
+                    &mut nodes,
+                    &mut edges,
+                    &tenant_id,
+                    &ids_by_uid,
+                );
+            }
         }
     }
     nodes.sort_by(|left, right| left.id.cmp(&right.id));
@@ -1182,14 +1187,12 @@ fn add_summary_node(
 
 fn add_azure_status_nodes(
     tenant: &Tenant,
+    status: &tenant_controller::api::AzureProviderStatus,
     nodes: &mut Vec<TopologyNode>,
     edges: &mut Vec<TopologyEdge>,
     tenant_id: &str,
     ids_by_uid: &BTreeMap<&str, String>,
 ) {
-    let Some(status) = tenant.status.as_ref().and_then(|status| status.azure()) else {
-        return;
-    };
     let worker_id = match status
         .management
         .as_ref()
@@ -1764,5 +1767,57 @@ mod tests {
                 .iter()
                 .any(|node| node.kind == TopologyNodeKind::AddOn)
         );
+    }
+
+    #[test]
+    fn azure_projection_excludes_status_when_binding_is_missing_or_stale() {
+        let mut tenant = azure_tenant();
+        tenant.metadata.uid = Some("replacement-tenant-uid".into());
+        let projection = TenantProjection::new(
+            ProviderMode::Azure,
+            tenant,
+            vec![azure_cluster("cluster-uid")],
+        );
+        assert!(projection.summary.endpoint.is_none());
+        assert!(projection.detail.management_resources.is_empty());
+        assert!(matches!(
+            projection.detail.provider_status,
+            ProviderStatusView::Unknown(_)
+        ));
+        assert!(
+            projection.topology.nodes.iter().all(|node| {
+                !matches!(
+                    node.kind,
+                    TopologyNodeKind::WorkerPool
+                        | TopologyNodeKind::Machine
+                        | TopologyNodeKind::Node
+                        | TopologyNodeKind::ProviderResource
+                        | TopologyNodeKind::AddOn
+                )
+            }),
+            "untrusted Azure status must not create topology nodes"
+        );
+
+        let mut tenant = azure_tenant();
+        let Some(TenantProviderStatus::Azure(status)) = tenant
+            .status
+            .as_mut()
+            .and_then(|status| status.provider.as_mut())
+        else {
+            panic!("azure status");
+        };
+        status.binding = None;
+        let projection = TenantProjection::new(
+            ProviderMode::Azure,
+            tenant,
+            vec![azure_cluster("cluster-uid")],
+        );
+        assert!(projection.detail.management_resources.is_empty());
+        assert!(matches!(
+            projection.detail.provider_status,
+            ProviderStatusView::Unknown(_)
+        ));
+        assert_eq!(projection.topology.nodes.len(), 1);
+        assert_eq!(projection.topology.nodes[0].kind, TopologyNodeKind::Tenant);
     }
 }

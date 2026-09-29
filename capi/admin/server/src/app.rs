@@ -10,8 +10,9 @@ use axum::{
 use tenant_admin_shared::{
     ApiEnvelope,
     query::{
-        ManagementComponentView, ManagementOverview, ProviderMode, TenantClassification,
-        TenantCounts, TenantDetail, TenantSummary, TopologyGraph,
+        ManagementComponentView, ManagementOverview, OverviewSnapshot, ProviderMode,
+        TenantClassification, TenantCounts, TenantSnapshot, TenantSnapshotIdentity, TenantSummary,
+        TopologyGraph,
     },
     routes::{
         API_OVERVIEW_PATH, API_TENANT_PATH, API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH,
@@ -66,7 +67,7 @@ async fn readyz(State(state): State<AppState>) -> StatusCode {
 
 async fn overview(
     State(state): State<AppState>,
-) -> Result<Json<ApiEnvelope<ManagementOverview>>, AppError> {
+) -> Result<Json<ApiEnvelope<OverviewSnapshot>>, AppError> {
     let tenants = state.source.list_tenants().await?;
     let summaries = sorted_summaries(state.provider, tenants);
     let overview = ManagementOverview {
@@ -79,7 +80,10 @@ async fn overview(
             message: None,
         }],
     };
-    Ok(Json(ApiEnvelope::new(overview)))
+    Ok(Json(ApiEnvelope::new(OverviewSnapshot {
+        overview,
+        tenants: summaries,
+    })))
 }
 
 async fn tenants(
@@ -95,7 +99,7 @@ async fn tenants(
 async fn tenant_detail(
     State(state): State<AppState>,
     Path(name): Path<String>,
-) -> Result<Json<ApiEnvelope<TenantDetail>>, AppError> {
+) -> Result<Json<ApiEnvelope<TenantSnapshot>>, AppError> {
     validate_tenant_name(&name)?;
     let tenant = state
         .source
@@ -106,9 +110,17 @@ async fn tenant_detail(
         .source
         .list_management_resources(state.provider, &name)
         .await?;
-    Ok(Json(ApiEnvelope::new(
-        TenantProjection::new(state.provider, tenant, resources).detail,
-    )))
+    let projection = TenantProjection::new(state.provider, tenant, resources);
+    let identity = TenantSnapshotIdentity {
+        uid: projection.detail.uid.clone(),
+        generation: projection.detail.generation,
+        observed_generation: projection.detail.observed_generation,
+    };
+    Ok(Json(ApiEnvelope::new(TenantSnapshot {
+        identity,
+        detail: projection.detail,
+        topology: projection.topology,
+    })))
 }
 
 async fn tenant_topology(
@@ -199,7 +211,10 @@ mod tests {
         fs,
         future::ready,
         path::PathBuf,
-        sync::atomic::{AtomicUsize, Ordering},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
     };
 
     use axum::{
@@ -211,7 +226,7 @@ mod tests {
     use kube::core::DynamicObject;
     use tenant_admin_shared::{
         ApiErrorCode, ApiErrorEnvelope,
-        query::{ManagementOverview, TenantDetail, TenantSummary, TopologyGraph},
+        query::{OverviewSnapshot, TenantSnapshot, TenantSummary, TopologyGraph},
     };
     use tenant_controller::api::{
         LocalProviderStatus, Tenant, TenantPhase, TenantProviderStatus, TenantSpec, TenantStatus,
@@ -227,14 +242,24 @@ mod tests {
         tenant: Result<Option<Tenant>, SourceError>,
         resources: Result<Vec<DynamicObject>, SourceError>,
         ready: Result<(), SourceError>,
+        calls: Arc<SourceCalls>,
+    }
+
+    #[derive(Default)]
+    struct SourceCalls {
+        tenant_lists: AtomicUsize,
+        tenant_gets: AtomicUsize,
+        resource_lists: AtomicUsize,
     }
 
     impl DataSource for MockSource {
         fn list_tenants(&self) -> SourceFuture<'_, Vec<Tenant>> {
+            self.calls.tenant_lists.fetch_add(1, Ordering::Relaxed);
             Box::pin(ready(self.tenants.clone()))
         }
 
         fn get_tenant(&self, _name: &str) -> SourceFuture<'_, Option<Tenant>> {
+            self.calls.tenant_gets.fetch_add(1, Ordering::Relaxed);
             Box::pin(ready(self.tenant.clone()))
         }
 
@@ -243,6 +268,7 @@ mod tests {
             _provider: ProviderMode,
             _tenant_name: &str,
         ) -> SourceFuture<'_, Vec<DynamicObject>> {
+            self.calls.resource_lists.fetch_add(1, Ordering::Relaxed);
             Box::pin(ready(self.resources.clone()))
         }
 
@@ -298,7 +324,9 @@ mod tests {
             tenant: Ok(None),
             resources: Ok(Vec::new()),
             ready: Ok(()),
+            calls: Arc::default(),
         };
+        let calls = source.calls.clone();
         let app = test_router(source);
         for path in ["/healthz", "/readyz"] {
             let response = app
@@ -318,8 +346,10 @@ mod tests {
             .await
             .expect("response");
         assert_eq!(response.status(), StatusCode::OK);
-        let envelope: ApiEnvelope<ManagementOverview> = response_json(response).await;
-        assert_eq!(envelope.data.tenants.total, 0);
+        let envelope: ApiEnvelope<OverviewSnapshot> = response_json(response).await;
+        assert_eq!(envelope.data.overview.tenants.total, 0);
+        assert!(envelope.data.tenants.is_empty());
+        assert_eq!(calls.tenant_lists.load(Ordering::Relaxed), 1);
         let response = app
             .oneshot(
                 Request::get(API_TENANTS_PATH)
@@ -330,17 +360,58 @@ mod tests {
             .expect("response");
         let envelope: ApiEnvelope<Vec<TenantSummary>> = response_json(response).await;
         assert!(envelope.data.is_empty());
+        assert_eq!(calls.tenant_lists.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
-    async fn detail_and_topology_return_shared_envelopes() {
+    async fn overview_snapshot_sorts_summaries_from_one_tenant_scan() {
+        let mut tenant_b = ready_tenant();
+        tenant_b.metadata.name = Some("tenant-b".into());
+        let mut tenant_a = ready_tenant();
+        tenant_a.metadata.name = Some("tenant-a".into());
+        let source = MockSource {
+            tenants: Ok(vec![tenant_b, tenant_a]),
+            tenant: Ok(None),
+            resources: Ok(Vec::new()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let response = test_router(source)
+            .oneshot(
+                Request::get(API_OVERVIEW_PATH)
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        let envelope: ApiEnvelope<OverviewSnapshot> = response_json(response).await;
+        assert_eq!(envelope.data.overview.tenants.total, 2);
+        assert_eq!(
+            envelope
+                .data
+                .tenants
+                .iter()
+                .map(|summary| summary.name.as_str())
+                .collect::<Vec<_>>(),
+            ["tenant-a", "tenant-b"]
+        );
+        assert_eq!(calls.tenant_lists.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn detail_snapshot_and_topology_return_shared_envelopes() {
         let tenant = ready_tenant();
-        let app = test_router(MockSource {
+        let source = MockSource {
             tenants: Ok(vec![tenant.clone()]),
             tenant: Ok(Some(tenant)),
             resources: Ok(Vec::new()),
             ready: Ok(()),
-        });
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router(source);
         let detail = app
             .clone()
             .oneshot(
@@ -350,11 +421,18 @@ mod tests {
             )
             .await
             .expect("response");
-        let detail: ApiEnvelope<TenantDetail> = response_json(detail).await;
+        let detail: ApiEnvelope<TenantSnapshot> = response_json(detail).await;
         assert_eq!(
-            detail.data.summary.classification,
+            detail.data.detail.summary.classification,
             TenantClassification::Ready
         );
+        assert_eq!(detail.data.identity.uid, "tenant-uid");
+        assert_eq!(detail.data.identity.generation, 1);
+        assert_eq!(detail.data.identity.observed_generation, Some(1));
+        assert_eq!(detail.data.topology.tenant_name, "tenant-a");
+        assert!(!detail.data.topology.nodes.is_empty());
+        assert_eq!(calls.tenant_gets.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 1);
         let topology = app
             .oneshot(
                 Request::get("/api/v1/tenants/tenant-a/topology")
@@ -366,6 +444,8 @@ mod tests {
         let topology: ApiEnvelope<TopologyGraph> = response_json(topology).await;
         assert_eq!(topology.data.tenant_name, "tenant-a");
         assert!(!topology.data.nodes.is_empty());
+        assert_eq!(calls.tenant_gets.load(Ordering::Relaxed), 2);
+        assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 2);
     }
 
     #[tokio::test]
@@ -375,6 +455,7 @@ mod tests {
             tenant: Ok(None),
             resources: Ok(Vec::new()),
             ready: Err(SourceError::KubernetesUnavailable),
+            calls: Arc::default(),
         });
         let missing = app
             .clone()
@@ -441,6 +522,7 @@ mod tests {
             tenant: Ok(None),
             resources: Ok(Vec::new()),
             ready: Ok(()),
+            calls: Arc::default(),
         };
         let app = router(
             AppState::new(Arc::new(source), ProviderMode::Local),

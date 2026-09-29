@@ -2,8 +2,10 @@ use tenant_admin_shared::{
     ADMIN_CONTAINER_PORT, ADMIN_NAMESPACE, ADMIN_RESOURCE_NAME, ADMIN_SERVICE_PORT,
     API_SCHEMA_NAME, API_SCHEMA_VERSION, ApiEnvelope, ApiError, ApiErrorCode, ApiErrorEnvelope,
     query::{
-        DisplayAttribute, ProviderStatusView, TenantProvider, TopologyEdge, TopologyEdgeKind,
-        TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind, UnknownProviderView,
+        DisplayAttribute, ManagementOverview, OverviewSnapshot, ProviderMode, ProviderStatusView,
+        TenantCounts, TenantDetail, TenantProvider, TenantSnapshot, TenantSnapshotIdentity,
+        TenantSummary, TopologyEdge, TopologyEdgeKind, TopologyGraph, TopologyHealth, TopologyNode,
+        TopologyNodeKind, UnknownProviderView,
     },
     routes::{
         API_OVERVIEW_PATH, API_PREFIX, API_TENANT_PATH, API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH,
@@ -101,4 +103,69 @@ fn provider_views_preserve_sanitized_unknown_data() {
         serde_json::to_string(&status).expect("provider view serializes"),
         r#"{"provider":"unknown","status":{"providerType":"future-provider","summary":"unsupported provider status"}}"#
     );
+}
+
+#[test]
+fn page_snapshots_keep_identity_and_page_data_together() {
+    let summary = TenantSummary {
+        name: "demo".into(),
+        provider: TenantProvider::Local,
+        classification: tenant_admin_shared::query::TenantClassification::Progressing,
+        kubernetes_version: "1.36.0".into(),
+        requested_workers: 1,
+        requested_databases: Some(1),
+        endpoint: None,
+        created_at: None,
+        conditions: Vec::new(),
+    };
+    let overview = OverviewSnapshot {
+        overview: ManagementOverview {
+            provider_mode: ProviderMode::Local,
+            tenants: TenantCounts {
+                total: 1,
+                progressing: 1,
+                ..TenantCounts::default()
+            },
+            components: Vec::new(),
+        },
+        tenants: vec![summary.clone()],
+    };
+    let overview_json = serde_json::to_value(ApiEnvelope::new(overview)).expect("overview");
+    assert_eq!(overview_json["data"]["tenants"][0]["name"], "demo");
+
+    let detail = TenantDetail {
+        summary,
+        uid: "tenant-uid".into(),
+        generation: 7,
+        observed_generation: Some(6),
+        specification: tenant_admin_shared::query::TenantSpecificationView {
+            kubernetes_version: "1.36.0".into(),
+            workers: 1,
+            provider: tenant_admin_shared::query::ProviderSpecificationView::Local { databases: 1 },
+        },
+        provider_status: ProviderStatusView::Unknown(UnknownProviderView {
+            provider_type: "local".into(),
+            summary: None,
+        }),
+        blockers: Vec::new(),
+        management_resources: Vec::new(),
+    };
+    let tenant = TenantSnapshot {
+        identity: TenantSnapshotIdentity {
+            uid: detail.uid.clone(),
+            generation: detail.generation,
+            observed_generation: detail.observed_generation,
+        },
+        topology: TopologyGraph {
+            tenant_name: detail.summary.name.clone(),
+            provider: detail.summary.provider,
+            nodes: Vec::new(),
+            edges: Vec::new(),
+        },
+        detail,
+    };
+    let tenant_json = serde_json::to_value(ApiEnvelope::new(tenant)).expect("tenant");
+    assert_eq!(tenant_json["data"]["identity"]["uid"], "tenant-uid");
+    assert_eq!(tenant_json["data"]["identity"]["generation"], 7);
+    assert_eq!(tenant_json["data"]["identity"]["observedGeneration"], 6);
 }

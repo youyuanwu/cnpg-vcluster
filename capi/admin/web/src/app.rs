@@ -2,10 +2,10 @@ use leptos::prelude::*;
 use tenant_admin_shared::{
     API_SCHEMA_VERSION,
     query::{
-        AzureProviderView, ConditionStatus, ManagementOverview, ProviderSpecificationView,
-        ProviderStatusView, TenantCondition, TenantDetail, TenantSummary, TopologyGraph,
+        AzureProviderView, ConditionStatus, OverviewSnapshot, ProviderSpecificationView,
+        ProviderStatusView, TenantCondition, TenantSnapshot, TenantSummary, TopologyGraph,
     },
-    routes::{API_OVERVIEW_PATH, API_PREFIX, API_TENANTS_PATH},
+    routes::{API_OVERVIEW_PATH, API_PREFIX},
 };
 use wasm_bindgen_futures::spawn_local;
 
@@ -20,18 +20,6 @@ use crate::{
     route::{AppRoute, parse_route, tenant_href},
     topology::layout_graph,
 };
-
-#[derive(Clone)]
-struct DashboardData {
-    overview: ManagementOverview,
-    tenants: Vec<TenantSummary>,
-}
-
-#[derive(Clone)]
-struct TenantPageData {
-    detail: TenantDetail,
-    topology: TopologyGraph,
-}
 
 #[derive(Clone)]
 enum LoadState<T> {
@@ -68,7 +56,7 @@ pub fn App() -> impl IntoView {
 #[component]
 fn OverviewPage() -> impl IntoView {
     let refresh = RwSignal::new(0_u32);
-    let state = RwSignal::new(LoadState::<DashboardData>::Loading);
+    let state = RwSignal::new(LoadState::<OverviewSnapshot>::Loading);
 
     Effect::new(move |_| {
         refresh.get();
@@ -107,7 +95,7 @@ fn OverviewPage() -> impl IntoView {
 #[component]
 fn TenantPage(name: String) -> impl IntoView {
     let refresh = RwSignal::new(0_u32);
-    let state = RwSignal::new(LoadState::<TenantPageData>::Loading);
+    let state = RwSignal::new(LoadState::<TenantSnapshot>::Loading);
     let requested_name = name.clone();
 
     Effect::new(move |_| {
@@ -211,7 +199,7 @@ fn error_state(error: UiError, refresh: RwSignal<u32>) -> AnyView {
     .into_any()
 }
 
-fn dashboard_view(mut data: DashboardData) -> AnyView {
+fn dashboard_view(mut data: OverviewSnapshot) -> AnyView {
     data.tenants
         .sort_by(|left, right| left.name.cmp(&right.name));
     let counts = data.overview.tenants.clone();
@@ -376,7 +364,7 @@ fn tenant_row(tenant: TenantSummary) -> AnyView {
     .into_any()
 }
 
-fn tenant_detail_view(data: TenantPageData) -> AnyView {
+fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
     let detail = data.detail;
     let summary = detail.summary.clone();
     let classification = summary.classification;
@@ -923,13 +911,11 @@ fn RouteNotFound() -> impl IntoView {
     }
 }
 
-async fn fetch_dashboard() -> Result<DashboardData, UiError> {
-    let overview = get_envelope::<ManagementOverview>(API_OVERVIEW_PATH).await?;
-    let tenants = get_envelope::<Vec<TenantSummary>>(API_TENANTS_PATH).await?;
-    Ok(DashboardData { overview, tenants })
+async fn fetch_dashboard() -> Result<OverviewSnapshot, UiError> {
+    get_envelope(API_OVERVIEW_PATH).await
 }
 
-async fn fetch_tenant_page(name: &str) -> Result<TenantPageData, UiError> {
+async fn fetch_tenant_page(name: &str) -> Result<TenantSnapshot, UiError> {
     let Some(href) = tenant_href(name) else {
         return Err(UiError {
             kind: UiErrorKind::InvalidRequest,
@@ -938,10 +924,7 @@ async fn fetch_tenant_page(name: &str) -> Result<TenantPageData, UiError> {
         });
     };
     let detail_path = format!("{API_PREFIX}{href}");
-    let topology_path = format!("{detail_path}/topology");
-    let detail = get_envelope::<TenantDetail>(&detail_path).await?;
-    let topology = get_envelope::<TopologyGraph>(&topology_path).await?;
-    Ok(TenantPageData { detail, topology })
+    get_envelope(&detail_path).await
 }
 
 fn condition_summary(conditions: &[TenantCondition]) -> String {
