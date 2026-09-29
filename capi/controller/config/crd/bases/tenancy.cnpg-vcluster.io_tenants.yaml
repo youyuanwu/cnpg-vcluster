@@ -127,6 +127,11 @@ spec:
               provider:
                 nullable: true
                 properties:
+                  addonComponents:
+                    additionalProperties:
+                      type: string
+                    nullable: true
+                    type: object
                   allocation:
                     nullable: true
                     properties:
@@ -144,17 +149,187 @@ spec:
                     - serviceCIDR
                     - slotId
                     type: object
+                  binding:
+                    nullable: true
+                    properties:
+                      controllerImage:
+                        type: string
+                      foundationDefaultsSha256:
+                        type: string
+                      foundationSha256:
+                        type: string
+                      identityId:
+                        type: string
+                      operationId:
+                        type: string
+                      providerConfigSha256:
+                        type: string
+                      providerConfigUID:
+                        type: string
+                      resourceGroupId:
+                        type: string
+                      specificationSha256:
+                        type: string
+                      tenantSubnetId:
+                        type: string
+                      tenantUID:
+                        type: string
+                      virtualNetworkId:
+                        type: string
+                    required:
+                    - controllerImage
+                    - foundationDefaultsSha256
+                    - foundationSha256
+                    - identityId
+                    - operationId
+                    - providerConfigSha256
+                    - providerConfigUID
+                    - resourceGroupId
+                    - specificationSha256
+                    - tenantSubnetId
+                    - tenantUID
+                    - virtualNetworkId
+                    type: object
                   clusterUID:
+                    nullable: true
+                    type: string
+                  deletion:
+                    nullable: true
+                    properties:
+                      resourceVersions:
+                        additionalProperties:
+                          type: string
+                        type: object
+                      verifiedAzureResourceIds:
+                        items:
+                          type: string
+                        type: array
+                      verifiedProviderUIDs:
+                        items:
+                          type: string
+                        type: array
+                    type: object
+                  endpoint:
                     nullable: true
                     type: string
                   foundationHash:
                     nullable: true
                     type: string
+                  kubeconfig:
+                    nullable: true
+                    properties:
+                      contentSha256:
+                        type: string
+                      secretUID:
+                        type: string
+                    required:
+                    - contentSha256
+                    - secretUID
+                    type: object
+                  management:
+                    nullable: true
+                    properties:
+                      addonJobUID:
+                        nullable: true
+                        type: string
+                      azureClusterIdentityUID:
+                        nullable: true
+                        type: string
+                      azureClusterUID:
+                        nullable: true
+                        type: string
+                      azureMachinePoolUID:
+                        nullable: true
+                        type: string
+                      cloudValuesConfigMapUID:
+                        nullable: true
+                        type: string
+                      clusterUID:
+                        nullable: true
+                        type: string
+                      kamajiControlPlaneUID:
+                        nullable: true
+                        type: string
+                      kubeadmConfigUID:
+                        nullable: true
+                        type: string
+                      machinePoolUID:
+                        nullable: true
+                        type: string
+                      namespaceUID:
+                        nullable: true
+                        type: string
+                      networkValuesConfigMapUID:
+                        nullable: true
+                        type: string
+                      statusProbeDeploymentUID:
+                        nullable: true
+                        type: string
+                    type: object
+                  nodes:
+                    items:
+                      properties:
+                        internalIP:
+                          type: string
+                        name:
+                          type: string
+                        providerID:
+                          type: string
+                        uid:
+                          type: string
+                      required:
+                      - internalIP
+                      - name
+                      - providerID
+                      - uid
+                      type: object
+                    nullable: true
+                    type: array
+                  providerResources:
+                    items:
+                      properties:
+                        apiVersion:
+                          type: string
+                        kind:
+                          type: string
+                        name:
+                          type: string
+                        namespace:
+                          nullable: true
+                          type: string
+                        ownerUIDs:
+                          items:
+                            type: string
+                          type: array
+                        resourceId:
+                          nullable: true
+                          type: string
+                        uid:
+                          type: string
+                      required:
+                      - apiVersion
+                      - kind
+                      - name
+                      - uid
+                      type: object
+                    nullable: true
+                    type: array
                   type:
                     enum:
                     - local
                     - azure
                     type: string
+                  vmss:
+                    nullable: true
+                    properties:
+                      id:
+                        nullable: true
+                        type: string
+                      instanceIds:
+                        items:
+                          type: string
+                        type: array
+                    type: object
                 required:
                 - type
                 type: object
@@ -178,6 +353,8 @@ spec:
           rule: '!has(self.status) || !has(self.status.provider) || self.status.provider.type == self.spec.provider.type'
         - message: Azure provider status cannot contain local durable identity
           rule: '!has(self.status) || !has(self.status.provider) || self.status.provider.type != ''azure'' || (!has(self.status.provider.allocation) && !has(self.status.provider.foundationHash) && !has(self.status.provider.clusterUID))'
+        - message: Local provider status cannot contain Azure durable identity
+          rule: '!has(self.status) || !has(self.status.provider) || self.status.provider.type != ''local'' || (!has(self.status.provider.binding) && !has(self.status.provider.endpoint) && !has(self.status.provider.management) && !has(self.status.provider.kubeconfig) && !has(self.status.provider.vmss) && !has(self.status.provider.nodes) && !has(self.status.provider.addonComponents) && !has(self.status.provider.providerResources) && !has(self.status.provider.deletion))'
         - message: kubernetesVersion must be a three-component numeric version
           rule: self.spec.kubernetesVersion.matches('^v?[0-9]+[.][0-9]+[.][0-9]+$')
     served: true

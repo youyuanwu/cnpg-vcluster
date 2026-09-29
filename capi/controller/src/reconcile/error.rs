@@ -36,6 +36,8 @@ pub enum ReconcileError {
     InvalidInput(String),
     #[error("dependency is pending: {0}")]
     Pending(String),
+    #[error("Azure provider mutation is blocked: {0}")]
+    MutationGuard(String),
     #[error("{reason}: {message}")]
     Degraded {
         reason: &'static str,
@@ -126,6 +128,7 @@ impl ReconcileError {
             Self::Foundation(_) | Self::Build(_) | Self::InvalidInput(_) => {
                 Action::requeue(super::READY_INTERVAL)
             }
+            Self::MutationGuard(_) => Action::requeue(super::DEPENDENCY_INTERVAL),
             _ => Action::requeue(Duration::from_secs(30)),
         }
     }

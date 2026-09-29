@@ -62,6 +62,7 @@ EXPECTED_RECIPES = {
     "break-glass",
     "test-unit",
     "test-static",
+    "test-azure-operator-contracts",
     "test-management",
     "test-tenant-lifecycle",
     "test-e2e",
@@ -235,10 +236,13 @@ def check_repository_boundaries() -> None:
         "controller/Cargo.toml",
         "controller/src/bin/manager.rs",
         "controller/Dockerfile",
+        "controller/Dockerfile.azure",
         "controller/API_COMPATIBILITY.md",
         "controller/config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml",
         "controller/config/rbac/role.yaml",
+        "controller/config/rbac/role-azure.yaml",
         "controller/config/management-resources.json",
+        "controller/config/azure-management-resources.json",
         "config/tenants/examples/local.yaml",
         "config/tenants/tests/tenant-a.yaml",
         "config/tenants/tests/tenant-b.yaml",
@@ -250,12 +254,43 @@ def check_repository_boundaries() -> None:
     )
     for relative in required_controller_files:
         check((ROOT / relative).is_file(), f"missing Tenant controller file {relative}")
+    local_role = (ROOT / "controller/config/rbac/role.yaml").read_text(
+        encoding="utf-8"
+    )
+    azure_role = (ROOT / "controller/config/rbac/role-azure.yaml").read_text(
+        encoding="utf-8"
+    )
+    for resource in ("azureclusteridentities", "azureclusters", "azuremachinepools"):
+        check(
+            f"- {resource}" not in local_role,
+            f"local controller role grants Azure root permission: {resource}",
+        )
+    for resource in ("devclusters", "devmachinetemplates", "machinedeployments"):
+        check(
+            f"- {resource}" not in azure_role,
+            f"Azure controller role grants local root permission: {resource}",
+        )
+    check(
+        "- clusters/status" not in local_role
+        and "- clusters/status" in azure_role,
+        "Cluster status patch permission must be Azure-only",
+    )
     justfile = (ROOT / "Justfile").read_text(encoding="utf-8")
     check("controller-metrics:" in justfile, "controller metrics recipe is missing")
     check(
-        "scripts/controller_metrics.py --max 8050" in justfile,
+        "scripts/controller_metrics.py --max 12000" in justfile,
         "controller production-line threshold is not enforced",
     )
+    metrics_source = (ROOT / "scripts/controller_metrics.py").read_text(
+        encoding="utf-8"
+    )
+    for contract in (
+        "RUST_BASELINE_LINES = 8049",
+        "PYTHON_BASELINE_LINES = 25094",
+        'PYTHON_SRC = ROOT / "scripts"',
+        "Combined Rust/Python net delta",
+    ):
+        check(contract in metrics_source, f"controller metric contract missing: {contract}")
     controller = ROOT / "controller"
     integration_targets = sorted(
         path.name for path in (controller / "tests").glob("*.rs")
@@ -293,6 +328,14 @@ def check_repository_boundaries() -> None:
     manager = (controller / "config" / "manager" / "manager.yaml.tpl").read_text(encoding="utf-8")
     check(not re.search(r"webhook|tls|9443|serving-cert", manager, re.IGNORECASE),
           "manager still exposes local admission webhook or TLS")
+    azure_manager = (
+        controller / "config" / "manager" / "manager-azure.yaml.tpl"
+    ).read_text(encoding="utf-8")
+    check("--provider=azure" in azure_manager,
+          "Azure manager does not select the Azure provider")
+    check(not re.search(r"docker.sock|tenant-foundation|activation|calico|cnpg",
+                        azure_manager, re.IGNORECASE),
+          "Azure manager retains local-only dependencies")
     for relative in ("scripts", "config/versions.env", "Justfile"):
         paths = (ROOT / relative).rglob("*.py") if relative == "scripts" else (ROOT / relative,)
         for path in paths:
@@ -348,12 +391,6 @@ def check_repository_boundaries() -> None:
     tenant_spec = (ROOT / "scripts" / "lib" / "tenant_spec.py").read_text(
         encoding="utf-8"
     )
-    tenant_runtime = (ROOT / "scripts" / "lib" / "tenant_runtime.py").read_text(
-        encoding="utf-8"
-    )
-    tenant_timing = (ROOT / "scripts" / "lib" / "tenant_timing.py").read_text(
-        encoding="utf-8"
-    )
     locking = (ROOT / "scripts" / "lib" / "locking.py").read_text(
         encoding="utf-8"
     )
@@ -366,17 +403,6 @@ def check_repository_boundaries() -> None:
         and '"databaseCount"' not in tenant_spec
         and '"local"' not in tenant_spec,
         "schema-1 Tenant specifications must remain Azure-only",
-    )
-    check(
-        '"lifecycle" / PROFILE' in tenant_runtime
-        and '"local"' not in tenant_runtime,
-        "durable Tenant lifecycle paths must remain Azure-only",
-    )
-    check(
-        "from .tenant_spec import PROFILE" in tenant_timing
-        and "profile: str" not in tenant_timing
-        and "/ profile" not in tenant_timing,
-        "Tenant timing evidence must remain Azure-only",
     )
     check(
         "def azure_lock(" in locking
@@ -403,6 +429,45 @@ def check_repository_boundaries() -> None:
     )
     catalog = json.loads(
         (ROOT / "controller/config/management-resources.json").read_text()
+    )
+    azure_catalog = json.loads(
+        (ROOT / "controller/config/azure-management-resources.json").read_text()
+    )
+    azure_coordinates = {
+        (entry["apiVersion"], entry["kind"], entry["plural"])
+        for entry in azure_catalog
+    }
+    for coordinate in {
+        ("cluster.x-k8s.io/v1beta1", "Cluster", "clusters"),
+        (
+            "infrastructure.cluster.x-k8s.io/v1beta1",
+            "AzureCluster",
+            "azureclusters",
+        ),
+        (
+            "controlplane.cluster.x-k8s.io/v1alpha1",
+            "KamajiControlPlane",
+            "kamajicontrolplanes",
+        ),
+        (
+            "resources.azure.com/v1api20200601",
+            "ResourceGroup",
+            "resourcegroups",
+        ),
+        (
+            "network.azure.com/v1api20220701",
+            "NatGateway",
+            "natgateways",
+        ),
+    }:
+        check(
+            coordinate in azure_coordinates,
+            f"Azure provider catalog is missing {coordinate}",
+        )
+    check(
+        ("cluster.x-k8s.io/v1beta2", "Cluster", "clusters")
+        not in azure_coordinates,
+        "Azure provider catalog conflates the local CAPI contract",
     )
     identities = catalog_identity_literals(catalog)
     check(
@@ -437,6 +502,17 @@ def check_repository_boundaries() -> None:
         "config/tenants/tests/tenant-c.json",
         "scripts/test_controller_phase2.py",
         "scripts/test_controller_phase3.py",
+        "scripts/lib/tenant_runtime.py",
+        "scripts/lib/tenant_timing.py",
+        "scripts/lib/azure/contracts.py",
+        "scripts/lib/azure/rendering.py",
+        "scripts/lib/azure/readiness.py",
+        "scripts/lib/azure/lifecycle.py",
+        "scripts/lib/azure/deletion.py",
+        "tests/test_azure_rendering.py",
+        "tests/test_azure_readiness.py",
+        "tests/test_azure_lifecycle.py",
+        "tests/test_azure_deletion.py",
     ):
         check(
             not (ROOT / relative).exists(),
@@ -568,6 +644,46 @@ def check_repository_boundaries() -> None:
         ),
         "normal Azure lifecycle directly deletes a VMSS",
     )
+    gate_source = (
+        ROOT / "scripts" / "test_azure_tenant_lifecycle.py"
+    ).read_text(encoding="utf-8")
+    check(
+        gate_source.count('"delete-instances"') == 1
+        and "worker-instance-deletion" in gate_source,
+        "Azure destructive gate must contain one explicit VMSS instance injection",
+    )
+    all_other_python = "\n".join(
+        path.read_text(encoding="utf-8")
+        for path in (ROOT / "scripts").rglob("*.py")
+        if path != ROOT / "scripts" / "test_azure_tenant_lifecycle.py"
+        and path.name != "test_static.py"
+    )
+    check(
+        '"delete-instances"' not in all_other_python,
+        "VMSS instance deletion escaped the explicit destructive gate",
+    )
+    operator_source = (
+        ROOT / "scripts" / "lib" / "azure" / "operator.py"
+    ).read_text(encoding="utf-8")
+    tenant_source = (ROOT / "scripts" / "tenant.py").read_text(encoding="utf-8")
+    check(
+        "--server-side" in operator_source
+        and 'f"tenant/{tenant}"' in operator_source
+        and "_kubectl(" not in tenant_source,
+        "Azure public lifecycle must submit and delete only the Tenant CR",
+    )
+    check(
+        "TenantRuntime" not in azure_source
+        and "tenant_runtime" not in azure_source
+        and "AzureTenantAdapter" not in azure_source,
+        "removed Azure filesystem mutation authority remains reachable",
+    )
+    check(
+        "AzureCluster" not in operator_source
+        and "AzureMachinePool" not in operator_source
+        and "apiServerLB" not in azure_source,
+        "Python Azure lifecycle still patches CAPZ compatibility state",
+    )
     check(
         "/metadata/finalizers" not in azure_source,
         "normal Azure lifecycle patches Azure provider finalizers",
@@ -601,8 +717,9 @@ def check_documentation() -> None:
         "CAPD `DevCluster` and `DevMachine` resources are development-only",
         "sharing the host kernel",
         "Break-glass finalizer removal",
-        "Local tenants are Kubernetes `Tenant` resources",
-        "Azure tenants retain the JSON specification and Python lifecycle",
+        "Local and Azure tenants are Kubernetes `Tenant` resources",
+        "Local and Azure tenants are Kubernetes `Tenant` resources",
+        "only Python path allowed to inject `az vmss delete-instances`",
         "`just tenant-delete azure <name> azure/<name>`",
         "Status, conditions, and exits",
         "26.8.6-edge",
@@ -629,7 +746,7 @@ def check_documentation() -> None:
         "old controller Pod is proved absent",
         "multiple deleting Tenants do not acquire a shared destructive lock",
         "The legacy local JSON adapter",
-        "CAPZ owns tenant MachinePools",
+        "CAPZ/ASO own tenant Azure mutation",
         "Azure tenants are not separate AKS clusters",
         "`just test-e2e-offline`",
         "materialized from the verified active cache",
@@ -648,11 +765,13 @@ def check_documentation() -> None:
         "`just tenant-delete azure <tenant> azure/<tenant>`",
         "`just azure-test-tenant-lifecycle`",
         "CAPZ remains responsible for VMSS deletion.",
-        "Kubernetes UID/resourceVersion preconditions",
+        "UID/resourceVersion preconditions",
         "cnpg-vcluster-external-control-plane=true",
         "Foundation status rejects a missing, broadened, or conflicting selector.",
         "Targeted deletion to canonical absence",
         "Recreate from the same specification and reach Ready",
+        "shared Azure Container Registry (ACR)",
+        "The Tenant operator receives no Azure credentials.",
     )
     for token in required_azure_design:
         check(

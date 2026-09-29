@@ -1,17 +1,11 @@
 from __future__ import annotations
 
-import base64
 import hashlib
 import ipaddress
 import json
-import math
 import os
 import re
-import stat
-import subprocess
-import sys
 import time
-import urllib.request
 import urllib.parse
 from pathlib import Path
 from typing import Mapping, Sequence
@@ -33,25 +27,18 @@ from scripts.lib.locking import azure_lock, azure_lock_exists, e2e_lock, tools_l
 from scripts.lib.management import _prepare_kamaji_chart
 from scripts.lib.process import run
 from scripts.lib.redaction import redact, redact_value
-from scripts.lib.tenant_runtime import (
-    OperationJournal,
-    TenantIdentity,
-    TenantRuntime,
-    foundation_sha256,
-    recorded_tenant_names,
-)
 from scripts.lib.tenant_spec import (
     TenantSpec,
-    require_non_overlapping_networks,
     validate_tenant_name,
 )
-from scripts.lib.tenant_status import TenantStatus
-from scripts.lib.tenants import LIFECYCLE_MARKERS, lifecycle_markers, resource_lifecycle_markers
 
 
 PREFIX_RE = re.compile(r"^[a-z][a-z0-9-]{1,19}$")
-FOUNDATION_INVENTORY_SCHEMA = 2
-READY_EVIDENCE_MAX_AGE_SECONDS = 24 * 60 * 60
+CONTROLLER_REPOSITORY_RE = re.compile(
+    r"^[a-z0-9]+(?:[._-][a-z0-9]+)*(?:/[a-z0-9]+(?:[._-][a-z0-9]+)*)*$"
+)
+CONTROLLER_TAG_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}$")
+FOUNDATION_INVENTORY_SCHEMA = 3
 FOUNDATION_DEFAULT_KEYS = (
     "AZURE_AKS_KUBERNETES_VERSION",
     "AZURE_AKS_NODE_SKU",
@@ -66,6 +53,8 @@ FOUNDATION_DEFAULT_KEYS = (
     "AZURE_CAPZ_VERSION",
     "AZURE_KAMAJI_CAPI_VERSION",
     "AZURE_KAMAJI_CHART_VERSION",
+    "AZURE_CONTROLLER_REPOSITORY",
+    "AZURE_CONTROLLER_TAG",
 )
 REQUIRED_PROVIDERS = (
     "Microsoft.Authorization",
@@ -74,7 +63,7 @@ REQUIRED_PROVIDERS = (
     "Microsoft.ManagedIdentity",
     "Microsoft.Network",
 )
-CONTROLLER_DEPLOYMENTS = (
+PLATFORM_CONTROLLER_DEPLOYMENTS = (
     ("capi-system", "capi-controller-manager"),
     ("capi-kubeadm-bootstrap-system", "capi-kubeadm-bootstrap-controller-manager"),
     ("capz-system", "capz-controller-manager"),
@@ -82,82 +71,11 @@ CONTROLLER_DEPLOYMENTS = (
     ("kamaji-system", "kamaji"),
     ("kamaji-system", "capi-kamaji-controller-manager"),
 )
+CONTROLLER_DEPLOYMENTS = PLATFORM_CONTROLLER_DEPLOYMENTS + (
+    ("tenant-system", "tenant-controller"),
+)
 CAPZ_EXTERNAL_CONTROL_PLANE_LABEL = "cnpg-vcluster-external-control-plane"
 CAPZ_AZURECLUSTER_WEBHOOK = "default.azurecluster.infrastructure.cluster.x-k8s.io"
-MANAGEMENT_RESOURCE_PLURALS = {
-    "AzureClusterIdentity": "azureclusteridentities",
-    "Cluster": "clusters",
-    "ConfigMap": "configmaps",
-    "Job": "jobs",
-    "MachinePool": "machinepools",
-    "Namespace": "namespaces",
-}
-KNOWN_AZURE_TENANT_TYPES = frozenset(
-    {
-        "microsoft.compute/virtualmachinescalesets",
-        "microsoft.compute/virtualmachinescalesets/virtualmachines",
-        "microsoft.network/networkinterfaces",
-        "microsoft.network/natgateways",
-        "microsoft.network/publicipaddresses",
-    }
-)
-KNOWN_ASO_TENANT_KINDS = frozenset({"NatGateway", "PublicIPAddress"})
-KNOWN_ASO_FOUNDATION_REFERENCE_OUTPUTS = {
-    "ResourceGroup": "resourceGroupId",
-    "VirtualNetwork": "vnetId",
-    "VirtualNetworksSubnet": "tenantSubnetId",
-}
-KNOWN_CONTROLLER_MANAGEMENT_KINDS = frozenset(
-    {
-        "AzureCluster",
-        "AzureMachinePool",
-        "AzureMachinePoolMachine",
-        "Certificate",
-        "CertificateRequest",
-        "Cluster",
-        "Endpoints",
-        "Issuer",
-        "KamajiControlPlane",
-        "KubeadmConfig",
-        "Machine",
-        "MachinePool",
-        "MachineSet",
-        "NatGateway",
-        "PublicIPAddress",
-        "ResourceGroup",
-        "PodDisruptionBudget",
-        "PersistentVolumeClaim",
-        "Role",
-        "RoleBinding",
-        "Secret",
-        "Service",
-        "StatefulSet",
-        "TenantControlPlane",
-        "VirtualNetwork",
-        "VirtualNetworksSubnet",
-    }
-)
-KNOWN_ORCHESTRATION_MANAGEMENT_KINDS = frozenset(
-    {
-        "AzureClusterIdentity",
-        "ConfigMap",
-        "Deployment",
-        "Job",
-        "Namespace",
-    }
-)
-KNOWN_NAMESPACE_CHILD_KINDS = frozenset(
-    {
-        "Endpoints",
-        "EndpointSlice",
-        "Event",
-        "Lease",
-        "Pod",
-        "PodMetrics",
-        "ReplicaSet",
-        "ServiceAccount",
-    }
-)
 REMOVED_TENANT_CONFIG_KEYS = frozenset(
     {
         "AZURE_TENANT_KUBERNETES_VERSION",
@@ -167,20 +85,6 @@ REMOVED_TENANT_CONFIG_KEYS = frozenset(
         "AZURE_TENANT_DNS_SERVICE_IP",
     }
 )
-
-
-class AzureDeletionError(RuntimeError):
-    def __init__(
-        self,
-        message: str,
-        *,
-        management: Mapping[str, object],
-        azure: Mapping[str, object],
-    ) -> None:
-        super().__init__(message)
-        self.management = dict(management)
-        self.azure = dict(azure)
-
 
 def load_azure_configuration(root: Path) -> dict[str, str]:
     defaults = load_env_file(root / "config" / "azure" / "defaults.env")
@@ -226,6 +130,8 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
         "AZURE_KAMAJI_CHART_VERSION",
         "AZURE_CLOUD_PROVIDER_VERSION",
         "AZURE_CALICO_VERSION",
+        "AZURE_CONTROLLER_REPOSITORY",
+        "AZURE_CONTROLLER_TAG",
         "AZURE_DEPLOY_TIMEOUT",
         "AZURE_CONTROLLER_TIMEOUT",
         "AZURE_TENANT_TIMEOUT",
@@ -236,6 +142,13 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
             "AZURE_PREFIX must start with a lowercase letter and contain "
             "2-20 lowercase letters, digits, or hyphens"
         )
+    repository = config["AZURE_CONTROLLER_REPOSITORY"]
+    if len(repository) > 255 or not CONTROLLER_REPOSITORY_RE.fullmatch(repository):
+        raise ConfigError(
+            "AZURE_CONTROLLER_REPOSITORY must be a lowercase OCI repository path"
+        )
+    if not CONTROLLER_TAG_RE.fullmatch(config["AZURE_CONTROLLER_TAG"]):
+        raise ConfigError("AZURE_CONTROLLER_TAG must be a valid OCI tag")
     return config
 
 
@@ -247,6 +160,7 @@ def names(config: Mapping[str, str]) -> dict[str, str]:
         "aks": f"{prefix}-mgmt",
         "vnet": f"{prefix}-vnet",
         "identity": f"{prefix}-identity",
+        "acr": f"{prefix.replace('-', '')}acr",
     }
 
 
@@ -316,42 +230,6 @@ def _validate_foundation_networks(config: Mapping[str, str]) -> None:
     dns = ipaddress.ip_address(config["AZURE_AKS_DNS_SERVICE_IP"])
     if dns not in networks["AZURE_AKS_SERVICE_CIDR"]:
         raise ConfigError("AZURE_AKS_DNS_SERVICE_IP is outside the AKS service CIDR")
-
-
-def _recorded_azure_specs(root: Path, *, excluding: str) -> tuple[TenantSpec, ...]:
-    specs = []
-    for tenant in recorded_tenant_names(root):
-        if tenant == excluding:
-            continue
-        runtime = TenantRuntime(root, tenant)
-        if runtime.identity_exists():
-            specs.append(runtime.load_identity().specification)
-        elif runtime.operation_exists():
-            specs.append(TenantSpec.from_mapping(runtime.load_operation().specification))
-    return tuple(specs)
-
-
-def _validate_networks(
-    config: Mapping[str, str],
-    spec: TenantSpec | None = None,
-    *,
-    recorded_specs: Sequence[TenantSpec] = (),
-) -> None:
-    _validate_foundation_networks(config)
-    if spec is None:
-        return
-    shared = _foundation_networks(config)
-    conflicts = {
-        "Azure VNet": shared["AZURE_VNET_CIDR"],
-        "AKS subnet": shared["AZURE_AKS_SUBNET_CIDR"],
-        "tenant node subnet": shared["AZURE_TENANT_SUBNET_CIDR"],
-        "AKS Pod CIDR": shared["AZURE_AKS_POD_CIDR"],
-        "AKS Service CIDR": shared["AZURE_AKS_SERVICE_CIDR"],
-    }
-    for existing in recorded_specs:
-        conflicts[f"tenant {existing.name} Pod CIDR"] = existing.pod_network
-        conflicts[f"tenant {existing.name} Service CIDR"] = existing.service_network
-    require_non_overlapping_networks(spec, conflicts)
 
 
 def _active_subscription(config: Mapping[str, str]) -> dict[str, object]:
@@ -442,17 +320,6 @@ def _runtime_dir(root: Path) -> Path:
     return path
 
 
-def azure_tenant_runtime_path(root: Path, tenant: str) -> Path:
-    validate_tenant_name(tenant)
-    return _azure_runtime_path(root) / "tenants" / tenant
-
-
-def _tenant_runtime_dir(root: Path, tenant: str) -> Path:
-    path = azure_tenant_runtime_path(root, tenant)
-    ensure_private_dir(path)
-    return path
-
-
 def _management_kubeconfig(root: Path) -> Path:
     path = _azure_runtime_path(root) / "management.kubeconfig"
     details = path.lstat()
@@ -463,19 +330,6 @@ def _management_kubeconfig(root: Path) -> Path:
         or details.st_mode & 0o077
     ):
         raise RuntimeError("Azure management kubeconfig must be owner-only")
-    return path
-
-
-def _tenant_kubeconfig(root: Path, tenant: str) -> Path:
-    path = azure_tenant_runtime_path(root, tenant) / "kubeconfig"
-    details = path.lstat()
-    if (
-        path.is_symlink()
-        or not path.is_file()
-        or details.st_uid != os.getuid()
-        or details.st_mode & 0o077
-    ):
-        raise RuntimeError("Azure tenant kubeconfig must be owner-only")
     return path
 
 

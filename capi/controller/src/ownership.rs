@@ -381,9 +381,10 @@ pub fn validate_kubeconfig_secret(
     {
         return Err(OwnershipError::SecretContract);
     }
-    let uid = control_plane
-        .and_then(|cp| cp.metadata.uid.as_deref())
-        .unwrap_or("");
+    let Some(control_plane) = control_plane else {
+        return Err(OwnershipError::SecretOwner);
+    };
+    let uid = control_plane.metadata.uid.as_deref().unwrap_or("");
     if !has_owner_uid(
         secret
             .metadata
@@ -404,13 +405,23 @@ pub fn validate_kubeconfig_secret_for_deletion(
     let Some(control_plane) = control_plane else {
         return Err(OwnershipError::SecretOwner);
     };
+    validate_kubeconfig_secret_owners(secret, &[control_plane])
+}
+
+pub fn validate_kubeconfig_secret_owners(
+    secret: &Secret,
+    allowed: &[&DynamicObject],
+) -> Result<(), OwnershipError> {
     let Some([owner]) = secret.metadata.owner_references.as_deref() else {
         return Err(OwnershipError::SecretOwner);
     };
-    if !by_kind("KamajiControlPlane").is_some_and(|control_plane| {
-        owner.api_version == control_plane.api_version && owner.kind == control_plane.kind
-    }) || !reference_matches(owner, control_plane)
-    {
+    if !allowed.iter().any(|object| {
+        object
+            .types
+            .as_ref()
+            .is_some_and(|types| owner.api_version == types.api_version && owner.kind == types.kind)
+            && reference_matches(owner, object)
+    }) {
         return Err(OwnershipError::SecretOwner);
     }
     Ok(())

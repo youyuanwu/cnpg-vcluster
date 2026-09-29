@@ -1,11 +1,13 @@
 use std::path::PathBuf;
 
 use tenant_controller::{
-    api::tenant_crd, management::MANAGEMENT_RESOURCES, permissions::controller_role,
+    api::tenant_crd,
+    management::{AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES},
+    permissions::{azure_controller_role, controller_role},
 };
 
 type GenerateResult<T> = Result<T, Box<dyn std::error::Error>>;
-type GeneratedFiles = [(&'static str, Vec<u8>); 3];
+type GeneratedFiles = [(&'static str, Vec<u8>); 5];
 
 #[rustfmt::skip]
 fn render<T: serde::Serialize>(value: &T) -> GenerateResult<Vec<u8>> { Ok(format!("---\n{}", serde_yaml::to_string(value)?).into_bytes()) }
@@ -13,19 +15,24 @@ fn render<T: serde::Serialize>(value: &T) -> GenerateResult<Vec<u8>> { Ok(format
 fn generated_files() -> GenerateResult<GeneratedFiles> {
     if MANAGEMENT_RESOURCES
         .iter()
+        .chain(AZURE_MANAGEMENT_RESOURCES)
         .any(|resource| !resource.valid_inventory_contract())
     {
         return Err("invalid management resource inventory contract".into());
     }
     let mut resources = serde_json::to_vec_pretty(MANAGEMENT_RESOURCES)?;
     resources.push(b'\n');
+    let mut azure_resources = serde_json::to_vec_pretty(AZURE_MANAGEMENT_RESOURCES)?;
+    azure_resources.push(b'\n');
     Ok([
         (
             "crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml",
             render(&tenant_crd())?,
         ),
         ("rbac/role.yaml", render(&controller_role())?),
+        ("rbac/role-azure.yaml", render(&azure_controller_role())?),
         ("management-resources.json", resources),
+        ("azure-management-resources.json", azure_resources),
     ])
 }
 

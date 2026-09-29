@@ -34,8 +34,10 @@ semantics. Common status contains phase, conditions, and observed generation.
 Local status exposes the allocated `slotId`, endpoint, Pod CIDR and Service
 CIDR under `status.provider.allocation`, plus
 `status.provider.foundationHash` and the exact
-`status.provider.clusterUID`. Azure status currently contains only
-`status.provider.type: azure`. Clients must compare `metadata.generation`,
+`status.provider.clusterUID`. Azure status contains the exact immutable
+foundation/specification binding, endpoint, management UIDs, kubeconfig
+UID/hash, VMSS and Node identities, add-on identities, provider descendants,
+and deletion barriers. Clients must compare `metadata.generation`,
 `status.observedGeneration`, and the Ready condition's observed generation;
 do not depend on condition order, cached True conditions, or an internal
 reconciliation stage. A provider/status discriminator mismatch is invalid
@@ -86,15 +88,13 @@ version migration, downgrade behavior and removal criteria are documented and
 covered by conformance tests. Existing objects must never be silently re-read
 under different semantics.
 
-The CRD admits structurally valid Azure provider intent, but the installed
-manager has no Azure lifecycle implementation. It reports
-`ProviderUnsupported`, does not add the controller finalizer, and makes no
-local or Azure lifecycle calls. Once an unsupported object without that
-finalizer is deleting, reconciliation is a read-only no-op. If an unsupported
-object carries the controller finalizer, the controller retains it, makes no
-provider calls, and reports `ProviderFinalizerUnsupported` with phase `Failed`
-before deletion or `Deleting` during deletion.
+The manager starts with exactly one provider implementation. A local Tenant in
+Azure mode, or an Azure Tenant in local mode, reports `ProviderUnsupported`
+without acquiring a new finalizer. Azure mode reconciles the Tenant through
+Kubernetes APIs only and delegates Azure mutation to CAPZ/ASO. Its finalizer
+uses exact UID/resourceVersion preconditions and durable status identities;
+external Python proof is observational and does not replace finalization.
 
-The Azure JSON TenantSpec and Python/CAPZ lifecycle remain separate interfaces.
-The CRD placeholder does not imply that it is used on AKS or that local
-status, allocation, or finalizer semantics apply to CAPZ tenants.
+The Azure JSON TenantSpec remains a client input compatibility format. It is
+translated to the CRD and is not a separate Python lifecycle. Existing
+filesystem Azure identity/journal state is not migrated or adopted.

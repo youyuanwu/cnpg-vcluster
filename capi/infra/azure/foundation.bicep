@@ -19,6 +19,7 @@ var commonTags = {
 }
 var aksName = '${prefix}-mgmt'
 var identityName = '${prefix}-identity'
+var acrName = toLower(replace('${prefix}acr', '-', ''))
 var contributorRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   'b24988ac-6180-42a0-ab88-20f7382dd24c'
@@ -128,12 +129,33 @@ resource aks 'Microsoft.ContainerService/managedClusters@2024-10-01' = {
   }
 }
 
+resource acr 'Microsoft.ContainerRegistry/registries@2023-07-01' = {
+  name: acrName
+  location: location
+  tags: commonTags
+  sku: {
+    name: 'Basic'
+  }
+  properties: {
+    adminUserEnabled: false
+    publicNetworkAccess: 'Enabled'
+  }
+}
+
 resource aksContributor 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
   name: guid(resourceGroup().id, aks.id, contributorRoleDefinitionId)
   properties: {
     roleDefinitionId: contributorRoleDefinitionId
     principalId: aks.identity.principalId
     principalType: 'ServicePrincipal'
+  }
+}
+
+module acrPull './acr-pull.bicep' = {
+  name: '${prefix}-acr-pull'
+  params: {
+    acrName: acr.name
+    kubeletPrincipalId: aks.properties.identityProfile.kubeletidentity.objectId
   }
 }
 
@@ -168,6 +190,11 @@ output aksName string = aks.name
 output aksId string = aks.id
 output aksNodeResourceGroup string = aks.properties.nodeResourceGroup
 output aksOidcIssuer string = aks.properties.oidcIssuerProfile.issuerURL
+output aksKubeletPrincipalId string = aks.properties.identityProfile.kubeletidentity.objectId
+output acrName string = acr.name
+output acrId string = acr.id
+output acrLoginServer string = acr.properties.loginServer
+output acrPullRoleAssignmentId string = acrPull.outputs.roleAssignmentId
 output vnetName string = vnet.name
 output vnetId string = vnet.id
 output aksSubnetName string = aksSubnet.name

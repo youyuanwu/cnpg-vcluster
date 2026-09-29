@@ -339,7 +339,10 @@ async fn valid_azure_spec_stops_before_finalizer_or_local_dependencies() {
     assert!(current.finalizers().is_empty());
     let status = current.status.unwrap();
     assert_eq!(status.phase, Some(TenantPhase::Failed));
-    assert_eq!(status.provider, Some(TenantProviderStatus::Azure));
+    assert_eq!(
+        status.provider,
+        Some(TenantProviderStatus::Azure(Default::default()))
+    );
     for condition_type in ["Accepted", "Ready"] {
         assert_eq!(
             status
@@ -483,7 +486,7 @@ async fn provider_status_mismatch_blocks_creation_as_invalid_ownership() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.current();
     tenant.status = Some(TenantStatus {
-        provider: Some(TenantProviderStatus::Azure),
+        provider: Some(TenantProviderStatus::Azure(Default::default())),
         ..Default::default()
     });
     fixture.management.insert(TENANT, tenant);
@@ -518,7 +521,7 @@ async fn provider_status_mismatch_blocks_deletion_and_retains_finalizer() {
         Some(serde_json::from_value(json!("2026-09-28T00:00:00Z")).unwrap());
     tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
     tenant.status = Some(TenantStatus {
-        provider: Some(TenantProviderStatus::Azure),
+        provider: Some(TenantProviderStatus::Azure(Default::default())),
         ..Default::default()
     });
     fixture.management.insert(TENANT, tenant);
@@ -588,7 +591,7 @@ async fn azure_spec_with_controller_finalizer_fails_closed_without_local_cleanup
     };
     tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
     tenant.status = Some(TenantStatus {
-        provider: Some(TenantProviderStatus::Azure),
+        provider: Some(TenantProviderStatus::Azure(Default::default())),
         ..Default::default()
     });
     fixture.management.insert(TENANT, tenant);
@@ -599,7 +602,10 @@ async fn azure_spec_with_controller_finalizer_fails_closed_without_local_cleanup
     assert!(current.finalizers().iter().any(|value| value == FINALIZER));
     let status = current.status.unwrap();
     assert_eq!(status.phase, Some(TenantPhase::Failed));
-    assert_eq!(status.provider, Some(TenantProviderStatus::Azure));
+    assert_eq!(
+        status.provider,
+        Some(TenantProviderStatus::Azure(Default::default()))
+    );
     let accepted = status
         .conditions
         .iter()
@@ -650,7 +656,7 @@ async fn deleting_azure_with_controller_finalizer_reports_blocked_deletion() {
         Some(serde_json::from_value(json!("2026-09-28T00:00:00Z")).unwrap());
     tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
     tenant.status = Some(TenantStatus {
-        provider: Some(TenantProviderStatus::Azure),
+        provider: Some(TenantProviderStatus::Azure(Default::default())),
         ..Default::default()
     });
     fixture.management.insert(TENANT, tenant);

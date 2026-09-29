@@ -63,6 +63,34 @@ rules:
 - apiGroups:
   - cluster.x-k8s.io
   resources:
+  - clusters/status
+  verbs:
+  - get
+  - patch
+- apiGroups:
+  - ''
+  resources:
+  - namespaces
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - azureclusteridentities
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
   - clusters
   verbs:
   - create
@@ -74,7 +102,7 @@ rules:
 - apiGroups:
   - infrastructure.cluster.x-k8s.io
   resources:
-  - devclusters
+  - azureclusters
   verbs:
   - create
   - delete
@@ -96,89 +124,68 @@ rules:
 - apiGroups:
   - bootstrap.cluster.x-k8s.io
   resources:
-  - kubeadmconfigtemplates
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - devmachinetemplates
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups:
-  - cluster.x-k8s.io
-  resources:
-  - machinedeployments
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - watch
-- apiGroups:
-  - cluster.x-k8s.io
-  resources:
-  - machinesets
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - watch
-- apiGroups:
-  - cluster.x-k8s.io
-  resources:
-  - machines
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - watch
-- apiGroups:
-  - infrastructure.cluster.x-k8s.io
-  resources:
-  - devmachines
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - watch
-- apiGroups:
-  - bootstrap.cluster.x-k8s.io
-  resources:
   - kubeadmconfigs
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - watch
 - apiGroups:
-  - kamaji.clastix.io
+  - infrastructure.cluster.x-k8s.io
   resources:
-  - tenantcontrolplanes
+  - azuremachinepools
   verbs:
+  - create
+  - delete
   - get
   - list
+  - patch
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinepools
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
 - apiGroups:
   - ''
   resources:
-  - namespaces
+  - configmaps
   verbs:
   - create
   - delete
   - get
   - list
+  - patch
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - deployments
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
+  - watch
+- apiGroups:
+  - batch
+  resources:
+  - jobs
+  verbs:
+  - create
+  - delete
+  - get
+  - list
+  - patch
   - watch
 - apiGroups:
   - ''
@@ -190,14 +197,127 @@ rules:
   - list
   - watch
 - apiGroups:
-  - coordination.k8s.io
+  - cluster.x-k8s.io
   resources:
-  - leases
+  - machines
   verbs:
-  - create
-  - delete
   - get
   - list
   - patch
-  - update
   - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - machinesets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - infrastructure.cluster.x-k8s.io
+  resources:
+  - azuremachinepoolmachines
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - kamaji.clastix.io
+  resources:
+  - tenantcontrolplanes
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - certificates
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - certificaterequests
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - cert-manager.io
+  resources:
+  - issuers
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - ''
+  resources:
+  - services
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - apps
+  resources:
+  - statefulsets
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ''
+  resources:
+  - persistentvolumeclaims
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - policy
+  resources:
+  - poddisruptionbudgets
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - roles
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - rolebindings
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - resources.azure.com
+  resources:
+  - resourcegroups
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - network.azure.com
+  resources:
+  - virtualnetworks
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - network.azure.com
+  resources:
+  - virtualnetworkssubnets
+  verbs:
+  - get
+  - list
+- apiGroups:
+  - network.azure.com
+  resources:
+  - natgateways
+  verbs:
+  - get
+  - list

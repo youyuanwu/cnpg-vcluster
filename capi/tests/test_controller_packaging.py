@@ -209,6 +209,7 @@ class PackagingTests(unittest.TestCase):
             "controller/config/manager/manager.yaml.tpl": "manager",
             "controller/config/crd/bases/tenant.yaml": "crd",
             "controller/config/rbac/role.yaml": "role",
+            "controller/config/rbac/role-azure.yaml": "azure-role",
             ".tools/inputs/calico.yaml": "calico", ".tools/inputs/cnpg.yaml": "cnpg",
         }
         for name, content in files.items():
@@ -237,11 +238,84 @@ class PackagingTests(unittest.TestCase):
         for absent in ("webhook", "tls", "9443", "secretName"):
             self.assertNotIn(absent, text)
         for present in ("replicas: 1", "type: Recreate", "--leader-elect=true",
-                        "/healthz", "/readyz", "/var/run/docker.sock"):
+                        "--provider=local", "/healthz", "/readyz",
+                        "/var/run/docker.sock"):
             self.assertIn(present, text)
         dockerfile = (ROOT / "controller/Dockerfile").read_text()
         self.assertIn("FROM scratch", dockerfile)
         self.assertIn("COPY assets /assets", dockerfile)
+
+    def test_azure_image_and_manager_exclude_local_only_dependencies(self):
+        dockerfile = ROOT / "controller/Dockerfile.azure"
+        self.assertEqual(
+            dockerfile.read_text(),
+            "FROM scratch\nCOPY manager /manager\nENTRYPOINT [\"/manager\"]\n",
+        )
+        image = (
+            "registry.example/tenant-controller@sha256:"
+            + "1" * 64
+        )
+        rendered = packaging.render_azure_controller_manager(
+            ROOT,
+            "v1.32.13",
+            image,
+        )
+        content = rendered.read_text()
+        self.assertIn("--provider=azure", content)
+        self.assertIn(f"image: {image}", content)
+        self.assertIn("--supported-kubernetes-version=1.32.13", content)
+        for absent in (
+            "docker.sock",
+            "tenant-foundation",
+            "activation-token",
+            "calico",
+            "cnpg",
+            "imagePullPolicy: Never",
+        ):
+            self.assertNotIn(absent, content.lower())
+
+    def test_azure_image_build_context_contains_only_static_manager(self):
+        binary = self.root / ".runtime/rendered/controller/manager"
+        binary.parent.mkdir(parents=True)
+        (self.root / ".runtime").chmod(0o700)
+        (self.root / ".runtime/rendered").chmod(0o700)
+        binary.parent.chmod(0o700)
+        binary.write_bytes(b"\x7fELFmanager")
+        azure_dockerfile = self.root / "controller/Dockerfile.azure"
+        azure_dockerfile.write_text(
+            "FROM scratch\nCOPY manager /manager\nENTRYPOINT [\"/manager\"]\n"
+        )
+
+        def build(command, **_kwargs):
+            context = Path(command[-1])
+            self.assertEqual(
+                sorted(path.name for path in context.iterdir()),
+                ["Dockerfile", "manager"],
+            )
+            return response()
+
+        with (
+            patch.object(packaging, "generate_controller"),
+            patch.object(packaging, "build_controller_binary", return_value=binary),
+            patch.object(packaging, "verify_static_manager"),
+            patch.object(packaging, "run", side_effect=build) as run,
+        ):
+            result = packaging.build_azure_controller_image(
+                self.root,
+                {"COMMAND_TIMEOUT": "1s"},
+                "registry.example/tenant-controller:v1alpha2",
+            )
+        self.assertEqual(result, "registry.example/tenant-controller:v1alpha2")
+        self.assertEqual(
+            run.call_args.args[0][:5],
+            [
+                "docker",
+                "build",
+                "--pull=false",
+                "-t",
+                "registry.example/tenant-controller:v1alpha2",
+            ],
+        )
 
 
 class CurrentControllerPackagingTests(unittest.TestCase):

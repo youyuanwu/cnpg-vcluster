@@ -1,7 +1,9 @@
 use k8s_openapi::api::rbac::v1::{ClusterRole, PolicyRule};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 
-use crate::management::{MANAGEMENT_RESOURCES, ResourceClass};
+use crate::management::{
+    AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES, ManagementResource, ResourceClass,
+};
 
 pub const ROLE_NAME: &str = "tenant-controller-role";
 
@@ -14,6 +16,13 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
         ],
     ),
     ("", &["events"], &["create", "patch", "update"]),
+    (
+        "coordination.k8s.io",
+        &["leases"],
+        &[
+            "create", "delete", "get", "list", "patch", "update", "watch",
+        ],
+    ),
     (
         "tenancy.cnpg-vcluster.io",
         &["tenants"],
@@ -30,6 +39,8 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
         &["get", "patch", "update"],
     ),
 ];
+const AZURE_EXTRA_PERMISSIONS: &[(&str, &[&str], &[&str])] =
+    &[("cluster.x-k8s.io", &["clusters/status"], &["get", "patch"])];
 
 fn rule(group: &str, resources: &[&str], verbs: &[&str]) -> PolicyRule {
     PolicyRule {
@@ -40,7 +51,7 @@ fn rule(group: &str, resources: &[&str], verbs: &[&str]) -> PolicyRule {
     }
 }
 
-fn management_rule(resource: &crate::management::ManagementResource) -> PolicyRule {
+fn management_rule(resource: &ManagementResource) -> PolicyRule {
     let group = resource
         .api_version
         .split_once('/')
@@ -49,7 +60,9 @@ fn management_rule(resource: &crate::management::ManagementResource) -> PolicyRu
         "Namespace" => vec!["create", "delete", "get", "list"],
         "Secret" => vec!["delete", "get", "list"],
         "Lease" => vec!["create", "delete", "get", "list", "patch", "update"],
-        "KubeadmConfig" | "TenantControlPlane" => vec!["get", "list"],
+        "KubeadmConfig" | "TenantControlPlane" if resource.class != ResourceClass::Root => {
+            vec!["get", "list"]
+        }
         _ if resource.class == ResourceClass::Root => {
             vec!["create", "delete", "get", "list", "patch"]
         }
@@ -61,12 +74,25 @@ fn management_rule(resource: &crate::management::ManagementResource) -> PolicyRu
     rule(group, &[resource.plural], &verbs)
 }
 
-pub fn controller_role() -> ClusterRole {
-    let rules = BASE_PERMISSIONS
-        .iter()
-        .map(|(group, resources, verbs)| rule(group, resources, verbs))
-        .chain(MANAGEMENT_RESOURCES.iter().map(management_rule))
-        .collect();
+fn azure_management_rule(resource: &ManagementResource) -> PolicyRule {
+    if resource.class != ResourceClass::Descendant {
+        return management_rule(resource);
+    }
+    let group = resource
+        .api_version
+        .split_once('/')
+        .map_or("", |(group, _)| group);
+    let mut verbs = vec!["get", "list"];
+    if resource.kind == "Machine" {
+        verbs.push("patch");
+    }
+    if resource.watched {
+        verbs.push("watch");
+    }
+    rule(group, &[resource.plural], &verbs)
+}
+
+fn role(rules: Vec<PolicyRule>) -> ClusterRole {
     ClusterRole {
         metadata: ObjectMeta {
             name: Some(ROLE_NAME.into()),
@@ -77,37 +103,84 @@ pub fn controller_role() -> ClusterRole {
     }
 }
 
+pub fn controller_role() -> ClusterRole {
+    let rules = BASE_PERMISSIONS
+        .iter()
+        .map(|(group, resources, verbs)| rule(group, resources, verbs))
+        .chain(MANAGEMENT_RESOURCES.iter().map(management_rule))
+        .collect();
+    role(rules)
+}
+
+pub fn azure_controller_role() -> ClusterRole {
+    let rules = BASE_PERMISSIONS
+        .iter()
+        .chain(AZURE_EXTRA_PERMISSIONS)
+        .map(|(group, resources, verbs)| rule(group, resources, verbs))
+        .chain(AZURE_MANAGEMENT_RESOURCES.iter().map(azure_management_rule))
+        .collect();
+    role(rules)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
-    fn role_grants_catalogued_resources_without_wildcards() {
-        let role = controller_role();
-        assert_eq!(role.metadata.name.as_deref(), Some(ROLE_NAME));
-        let rules = role.rules.unwrap();
+    fn provider_roles_grant_only_their_catalogued_resources() {
+        let local = controller_role();
+        let azure = azure_controller_role();
+        assert_eq!(local.metadata.name.as_deref(), Some(ROLE_NAME));
+        assert_eq!(azure.metadata.name.as_deref(), Some(ROLE_NAME));
+        let local_rules = local.rules.unwrap();
+        let azure_rules = azure.rules.unwrap();
         assert_eq!(
-            rules.len(),
+            local_rules.len(),
             BASE_PERMISSIONS.len() + MANAGEMENT_RESOURCES.len()
         );
+        assert_eq!(
+            azure_rules.len(),
+            BASE_PERMISSIONS.len()
+                + AZURE_EXTRA_PERMISSIONS.len()
+                + AZURE_MANAGEMENT_RESOURCES.len()
+        );
         assert!(
-            rules
+            local_rules
                 .iter()
+                .chain(&azure_rules)
                 .all(|rule| !rule.verbs.contains(&"*".to_string()))
         );
+        assert!(azure_rules.iter().any(|rule| {
+            rule.api_groups.as_deref() == Some(&["coordination.k8s.io".into()])
+                && rule.resources.as_deref() == Some(&["leases".into()])
+                && rule.verbs.contains(&"watch".into())
+        }));
         for resource in MANAGEMENT_RESOURCES {
-            let rule = rules
-                .iter()
-                .find(|rule| {
-                    rule.resources
-                        .as_ref()
-                        .is_some_and(|values| values == &vec![resource.plural.to_string()])
-                })
-                .unwrap();
-            assert!(rule.verbs.contains(&"get".into()));
-            assert!(rule.verbs.contains(&"list".into()));
-            assert_eq!(rule.verbs.contains(&"watch".into()), resource.watched);
+            assert!(local_rules.contains(&management_rule(resource)));
         }
+        for resource in AZURE_MANAGEMENT_RESOURCES {
+            assert!(azure_rules.contains(&azure_management_rule(resource)));
+            if resource.class == ResourceClass::Descendant {
+                let verbs = &azure_management_rule(resource).verbs;
+                assert!(!verbs.contains(&"create".into()));
+                assert!(!verbs.contains(&"delete".into()));
+                assert_eq!(verbs.contains(&"patch".into()), resource.kind == "Machine");
+            }
+        }
+        let azure_kubeadm = AZURE_MANAGEMENT_RESOURCES
+            .iter()
+            .find(|resource| resource.kind == "KubeadmConfig")
+            .unwrap();
+        assert!(
+            azure_management_rule(azure_kubeadm)
+                .verbs
+                .contains(&"create".into())
+        );
+        assert!(azure_rules.iter().any(|rule| {
+            rule.api_groups.as_deref() == Some(&["cluster.x-k8s.io".into()])
+                && rule.resources.as_deref() == Some(&["clusters/status".into()])
+                && rule.verbs == ["get", "patch"]
+        }));
         for (kind, expected) in [
             (
                 "Cluster",
@@ -132,7 +205,7 @@ mod tests {
                 .iter()
                 .find(|resource| resource.kind == kind)
                 .unwrap();
-            let rule = rules
+            let rule = local_rules
                 .iter()
                 .find(|rule| {
                     rule.resources
@@ -146,5 +219,17 @@ mod tests {
         assert!(!management_rule(&kubeadm).verbs.contains(&"watch".into()));
         kubeadm.watched = true;
         assert!(management_rule(&kubeadm).verbs.contains(&"watch".into()));
+        assert!(!local_rules.iter().any(|rule| {
+            rule.resources
+                .as_ref()
+                .is_some_and(|resources| resources.iter().any(|value| value == "azureclusters"))
+        }));
+        assert!(!azure_rules.iter().any(|rule| {
+            rule.resources.as_ref().is_some_and(|resources| {
+                resources
+                    .iter()
+                    .any(|value| matches!(value.as_str(), "devclusters" | "devmachines"))
+            })
+        }));
     }
 }

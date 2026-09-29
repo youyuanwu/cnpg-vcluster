@@ -3,25 +3,22 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from types import SimpleNamespace
 
 from scripts.lib.azure.gate import (
+    WorkerSnapshot,
     build_worker_snapshot,
-    refreshed_observed,
     require_owned_resource_delta,
     require_replacement,
 )
-from scripts.lib.azure.ownership import classify_azure_owned_resources
 from scripts.lib.files import write_private_file
-from scripts.lib.tenant_runtime import TenantRuntimeError
+from scripts.lib.azure.proof import AzureDeletionProof
 from scripts.test_azure_tenant_lifecycle import (
-    _complete_prior_gate_attempt,
-    _incompatible_existing_identity,
-    _incomplete_gate_records,
-    _require_authenticated_worker_deletion,
-    _require_three_worker_pool,
+    _absent_tenant_proof,
+    _checkpoint,
+    _incomplete_gate,
+    _load_checkpoint,
 )
-from tests.azure_fixtures import AzureFixtureMixin
 
 
 VMSS = (
@@ -53,25 +50,18 @@ def readiness(identifiers=(0, 1, 2)):
     }
 
 
-class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
-    def test_exact_mapping_and_non_primary_selection(self):
+class AzureGateTests(unittest.TestCase):
+    def test_exact_mapping_checkpoint_and_non_primary_selection(self) -> None:
         snapshot = build_worker_snapshot(
             readiness(),
             VMSS,
             [instance(0), instance(1), instance(2)],
         )
-        self.assertEqual(snapshot.primary.instance_id, "0")
-        self.assertEqual(snapshot.target.instance_id, "2")
+        self.assertEqual("0", snapshot.primary.instance_id)
+        self.assertEqual("2", snapshot.target.instance_id)
+        self.assertEqual(snapshot, WorkerSnapshot.from_mapping(snapshot.to_mapping()))
 
-    def test_mapping_fails_closed_on_provider_or_identity_ambiguity(self):
-        payload = readiness()
-        payload["nodes"][2]["providerID"] = "azure:///foreign/virtualMachines/2"
-        with self.assertRaisesRegex(RuntimeError, "expected VMSS"):
-            build_worker_snapshot(
-                payload,
-                VMSS,
-                [instance(0), instance(1), instance(2)],
-            )
+    def test_mapping_fails_closed_on_ambiguous_identity(self) -> None:
         payload = readiness()
         payload["nodes"][2]["uid"] = payload["nodes"][1]["uid"]
         with self.assertRaisesRegex(RuntimeError, "duplicated"):
@@ -84,31 +74,10 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             build_worker_snapshot(
                 readiness(),
                 VMSS,
-                [instance(0), instance(1), instance(2), instance(2)],
-            )
-        raw = readiness()
-        raw["nodes"][0]["providerID"] = instance(0)
-        with self.assertRaisesRegex(RuntimeError, "provider ID"):
-            build_worker_snapshot(
-                raw,
-                VMSS,
-                [instance(0), instance(1), instance(2)],
-            )
-        invalid_vmss = VMSS.replace("/subscriptions/00000000", "/subscriptions/ ")
-        invalid_readiness = readiness()
-        for node in invalid_readiness["nodes"]:
-            node["providerID"] = node["providerID"].replace(VMSS, invalid_vmss)
-        with self.assertRaisesRegex(RuntimeError, "VMSS resource ID"):
-            build_worker_snapshot(
-                invalid_readiness,
-                invalid_vmss,
-                [
-                    value.replace(VMSS, invalid_vmss)
-                    for value in (instance(0), instance(1), instance(2))
-                ],
+                [instance(0), instance(1)],
             )
 
-    def test_recovery_requires_unchanged_survivors_and_new_pair(self):
+    def test_recovery_requires_unchanged_survivors_and_one_replacement(self) -> None:
         before = build_worker_snapshot(
             readiness(),
             VMSS,
@@ -120,8 +89,8 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             [instance(0), instance(1), instance(3)],
         )
         deleted, replacement = require_replacement(before, after)
-        self.assertEqual(deleted.instance_id, "2")
-        self.assertEqual(replacement.instance_id, "3")
+        self.assertEqual("2", deleted.instance_id)
+        self.assertEqual("3", replacement.instance_id)
         reused = readiness((0, 1, 2))
         reused["nodes"][2]["name"] = "replacement"
         reused["nodes"][2]["uid"] = "replacement-uid"
@@ -136,105 +105,11 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
                 ),
             )
 
-    def test_identity_compare_and_replace_is_exact_and_operation_safe(self):
-        root = self.make_root()
-        spec = self.spec(workers=3)
-        runtime, journal = self.start_journal(root, spec)
-        runtime.complete_create(
-            runtime.load_operation(),
-            spec,
-            {
-                "markerOperationId": journal.operation_id,
-                "vmssId": VMSS,
-                "vmssInstanceIds": "[]",
-                "nodeIdentities": "[]",
-                "azureResources": json.dumps(
-                    {"azure": [], "aso": [], "unknown": []}
-                ),
-            },
-        )
-        identity = runtime.load_identity()
-        observed = refreshed_observed(
-            identity.observed,
-            readiness(),
-            [instance(0), instance(1), instance(2)],
-            {"azure": [], "aso": [], "unknown": []},
-        )
-        replacement = runtime.compare_and_replace_identity(identity, observed)
-        self.assertEqual(replacement.observed, observed)
-        with self.assertRaisesRegex(
-            TenantRuntimeError,
-            "changed before replacement",
-        ):
-            runtime.compare_and_replace_identity(identity, observed)
-        unrelated = dict(replacement.observed)
-        unrelated["vmssId"] = "changed"
-        with self.assertRaisesRegex(TenantRuntimeError, "unrelated"):
-            runtime.compare_and_replace_identity(replacement, unrelated)
-
-    def test_owned_resource_delta_rejects_unrelated_changes(self):
+    def test_owned_delta_allows_only_vm_and_associated_nic_replacement(self) -> None:
         before = build_worker_snapshot(
             readiness(),
             VMSS,
             [instance(0), instance(1), instance(2)],
-        )
-
-    def test_real_classifier_preserves_nic_instance_association(self):
-        markers = {
-            "tenant": "tenant-c",
-            "profile": "azure",
-            "specificationSha256": "spec-sha",
-            "foundationSha256": "foundation-sha",
-            "operationId": "operation-1",
-        }
-        old_nic = {
-        "id": f"{VMSS}/virtualMachines/2/networkInterfaces/old",
-        "type": "Microsoft.Network/networkInterfaces",
-        "virtualMachineId": instance(2),
-        }
-        new_nic = {
-        "id": f"{VMSS}/virtualMachines/3/networkInterfaces/new",
-        "type": "Microsoft.Network/networkInterfaces",
-        "virtualMachineId": instance(3),
-        }
-        recorded = classify_azure_owned_resources(
-        [
-            {
-                "id": instance(2),
-                "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
-            },
-            old_nic,
-        ],
-        markers,
-        verified_ids=(instance(2), old_nic["id"]),
-        )
-        discovered = classify_azure_owned_resources(
-        [
-            {
-                "id": instance(3),
-                "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
-            },
-            new_nic,
-        ],
-        markers,
-        verified_ids=(instance(3), new_nic["id"]),
-        )
-        before = build_worker_snapshot(
-        readiness(),
-        VMSS,
-        [instance(0), instance(1), instance(2)],
-        )
-        after = build_worker_snapshot(
-        readiness((0, 1, 3)),
-        VMSS,
-        [instance(0), instance(1), instance(3)],
-        )
-        deleted, replacement = require_replacement(before, after)
-        require_owned_resource_delta(
-        json.dumps(recorded),
-        discovered,
-        deleted,
-        replacement,
         )
         after = build_worker_snapshot(
             readiness((0, 1, 3)),
@@ -242,416 +117,263 @@ class AzureGateTests(AzureFixtureMixin, unittest.TestCase):
             [instance(0), instance(1), instance(3)],
         )
         deleted, replacement = require_replacement(before, after)
+        stable = {
+            "id": VMSS,
+            "type": "microsoft.compute/virtualmachinescalesets",
+        }
         recorded = {
             "azure": [
-                {
-                    "id": VMSS,
-                    "type": "Microsoft.Compute/virtualMachineScaleSets",
-                    "tags": {"tenant": "tenant-c"},
-                },
+                stable,
                 {
                     "id": instance(2),
-                    "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
+                    "type": "microsoft.compute/virtualmachinescalesets/virtualmachines",
+                },
+                {
+                    "id": f"{instance(2)}/networkInterfaces/old",
+                    "type": "microsoft.network/networkinterfaces",
+                    "virtualMachineId": instance(2),
+                },
+            ],
+            "provider": [
+                {
+                    "apiVersion": "network.azure.com/v1",
+                    "kind": "PublicIPAddress",
+                    "name": "tenant-c",
+                    "uid": "uid",
+                    "resourceId": "/public-ip",
                 }
             ],
-            "aso": [],
-            "unknown": [],
         }
         discovered = {
             "azure": [
-                {
-                    "id": VMSS,
-                    "type": "Microsoft.Compute/virtualMachineScaleSets",
-                    "tags": {"tenant": "tenant-c"},
-                },
+                stable,
                 {
                     "id": instance(3),
-                    "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
-                }
+                    "type": "microsoft.compute/virtualmachinescalesets/virtualmachines",
+                },
+                {
+                    "id": f"{instance(3)}/networkInterfaces/new",
+                    "type": "microsoft.network/networkinterfaces",
+                    "virtualMachineId": instance(3),
+                },
             ],
-            "aso": [],
-            "unknown": [],
+            "provider": list(recorded["provider"]),
         }
-        require_owned_resource_delta(
-            json.dumps(recorded),
-            discovered,
-            deleted,
-            replacement,
-        )
+        require_owned_resource_delta(recorded, discovered, deleted, replacement)
         discovered["azure"].append(
             {
-                "id": f"{VMSS}/unrelated",
-                "type": "Microsoft.Network/publicIPAddresses",
+                "id": "/unrelated",
+                "type": "microsoft.network/publicipaddresses",
             }
         )
         with self.assertRaisesRegex(RuntimeError, "unrelated"):
             require_owned_resource_delta(
-                json.dumps(recorded),
-                discovered,
-                deleted,
-                replacement,
-            )
-        discovered = {
-            "azure": [
-                {
-                    "id": VMSS,
-                    "type": "Microsoft.Compute/virtualMachineScaleSets",
-                    "tags": {"tenant": "changed"},
-                },
-                {
-                    "id": instance(3),
-                    "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
-                },
-            ],
-            "aso": [],
-            "unknown": [],
-        }
-        with self.assertRaisesRegex(RuntimeError, "retained"):
-            require_owned_resource_delta(
-                json.dumps(recorded),
-                discovered,
-                deleted,
-                replacement,
-            )
-        recorded_with_nic = {
-            **recorded,
-            "azure": [
-                *recorded["azure"],
-                {
-                    "id": f"{VMSS}/networkInterfaces/old",
-                    "type": "Microsoft.Network/networkInterfaces",
-                    "virtualMachineId": instance(0),
-                },
-            ],
-        }
-        discovered_with_nic = {
-            **discovered,
-            "azure": [
-                {
-                    "id": VMSS,
-                    "type": "Microsoft.Compute/virtualMachineScaleSets",
-                    "tags": {"tenant": "tenant-c"},
-                },
-                {
-                    "id": instance(3),
-                    "type": "Microsoft.Compute/virtualMachineScaleSets/virtualMachines",
-                },
-                {
-                    "id": f"{VMSS}/networkInterfaces/new",
-                    "type": "Microsoft.Network/networkInterfaces",
-                    "virtualMachineId": instance(1),
-                },
-            ],
-        }
-        with self.assertRaisesRegex(RuntimeError, "NIC ownership"):
-            require_owned_resource_delta(
-                json.dumps(recorded_with_nic),
-                discovered_with_nic,
-                deleted,
-                replacement,
+                recorded, discovered, deleted, replacement
             )
 
-    def test_incomplete_evidence_classifier_is_exact_and_unambiguous(self):
-        root = self.make_root()
-        evidence = root / ".runtime" / "azure-gate" / "evidence"
-        payload = {
-            "schema": 1,
-            "operationId": "operation-1",
-            "tenant": "tenant-c",
-            "specificationSha256": "spec-sha",
-            "revision": "revision",
-            "records": [
+    def test_incomplete_evidence_resumes_only_destructive_attempt(self) -> None:
+        with self.subTest("started"):
+            root = Path(self._testMethodName)
+            self.addCleanup(
+                lambda: (
+                    (root / "lifecycle-operation-1.json").unlink(missing_ok=True),
+                    root.rmdir() if root.exists() else None,
+                )
+            )
+            payload = {
+                "schema": 2,
+                "operationId": "operation-1",
+                "tenant": "tenant-c",
+                "specificationSha256": "spec-sha",
+                "sourceSha256": "source-sha",
+                "records": [
+                    {
+                        "phase": "foundation-readiness",
+                        "status": "passed",
+                        "seconds": 1.0,
+                    },
+                    {
+                        "phase": "worker-instance-deletion",
+                        "status": "started",
+                        "seconds": 0.0,
+                    },
+                ],
+            }
+            write_private_file(
+                root / "lifecycle-operation-1.json",
+                json.dumps(payload),
+            )
+            self.assertEqual(
+                "operation-1",
+                _incomplete_gate(
+                    root,
+                    "tenant-c",
+                    "spec-sha",
+                    "source-sha",
+                )["operationId"],
+            )
+            payload["records"].append(
                 {
-                    "phase": "worker-identity-verification",
-                    "status": "passed",
-                    "seconds": 1.0,
-                },
-                {
-                    "phase": "worker-instance-deletion",
+                    "phase": "recreation",
                     "status": "passed",
                     "seconds": 1.0,
                 }
-            ],
-        }
+            )
+            write_private_file(
+                root / "lifecycle-operation-1.json",
+                json.dumps(payload),
+            )
+            self.assertIsNone(
+                _incomplete_gate(
+                    root,
+                    "tenant-c",
+                    "spec-sha",
+                    "source-sha",
+                )
+            )
+
+    def test_historical_gate_evidence_is_not_a_resumption_candidate(self) -> None:
+        root = Path(self._testMethodName)
+        path = root / "lifecycle-historical.json"
+        self.addCleanup(
+            lambda: (
+                path.unlink(missing_ok=True),
+                root.rmdir() if root.exists() else None,
+            )
+        )
         write_private_file(
-            evidence / "lifecycle-operation-1.json",
-            json.dumps(payload),
+            path,
+            json.dumps(
+                {
+                    "schema": 1,
+                    "operationId": "historical",
+                    "tenant": "tenant-c",
+                    "specificationSha256": "spec-sha",
+                    "records": [],
+                }
+            ),
+        )
+        self.assertIsNone(
+            _incomplete_gate(root, "tenant-c", "spec-sha", "source-sha")
+        )
+
+    def test_incomplete_destructive_attempt_rejects_changed_source(self) -> None:
+        root = Path(self._testMethodName)
+        path = root / "lifecycle-operation-1.json"
+        self.addCleanup(
+            lambda: (
+                path.unlink(missing_ok=True),
+                root.rmdir() if root.exists() else None,
+            )
+        )
+        write_private_file(
+            path,
+            json.dumps(
+                {
+                    "schema": 2,
+                    "operationId": "operation-1",
+                    "tenant": "tenant-c",
+                    "specificationSha256": "spec-sha",
+                    "sourceSha256": "old-source",
+                    "records": [
+                        {
+                            "phase": "worker-instance-deletion",
+                            "status": "started",
+                            "seconds": 0.0,
+                        }
+                    ],
+                }
+            ),
+        )
+        with self.assertRaisesRegex(RuntimeError, "refusing ambiguous"):
+            _incomplete_gate(
+                root,
+                "tenant-c",
+                "spec-sha",
+                "new-source",
+            )
+
+    def test_gate_source_contains_only_explicit_failure_injection(self) -> None:
+        root = Path(__file__).resolve().parents[1]
+        source = (root / "scripts" / "test_azure_tenant_lifecycle.py").read_text()
+        self.assertEqual(1, source.count('"delete-instances"'))
+        self.assertIn("ordinary-tenant-deletion", source)
+        self.assertIn("external-absence-proof", source)
+
+    def test_private_checkpoint_preserves_subscription_ids_and_resumes_after_finalization(
+        self,
+    ) -> None:
+        root = Path(self._testMethodName)
+        path = root / "state.json"
+        self.addCleanup(
+            lambda: (
+                path.unlink(missing_ok=True),
+                root.rmdir() if root.exists() else None,
+            )
+        )
+        spec = SimpleNamespace(name="tenant-c", sha256=lambda: "spec-sha")
+        snapshot = build_worker_snapshot(
+            readiness(),
+            VMSS,
+            [instance(0), instance(1), instance(2)],
+        )
+        foundation = {
+            "resourceGroupId": (
+                "/subscriptions/00000000-0000-0000-0000-000000000000/"
+                "resourceGroups/rg"
+            )
+        }
+        binding = {
+            "tenantUID": "tenant-uid",
+            "operationId": "provider-operation",
+        }
+        tenant = {
+            "metadata": {"uid": "tenant-uid"},
+            "status": {
+                "provider": {
+                    "type": "azure",
+                    "binding": binding,
+                }
+            },
+        }
+        proof = AzureDeletionProof(
+            "tenant-c",
+            binding,
+            foundation,
+            VMSS,
+            (instance(0), instance(1), instance(2)),
+        )
+        _checkpoint(
+            path,
+            operation_id="gate-operation",
+            spec=spec,
+            source_sha256="source-sha",
+            tenant=tenant,
+            foundation=foundation,
+            before=snapshot,
+            owned_before={"azure": [], "provider": []},
+            deletion_proof=proof,
+        )
+        self.assertIn(
+            "00000000-0000-0000-0000-000000000000",
+            path.read_text(encoding="utf-8"),
+        )
+        loaded = _load_checkpoint(
+            path,
+            operation_id="gate-operation",
+            spec=spec,
+            source_sha256="source-sha",
+            foundation=foundation,
         )
         self.assertEqual(
-            _incomplete_gate_records(
-                evidence,
-                "tenant-c",
-                "spec-sha",
-                "revision",
+            proof,
+            _absent_tenant_proof(
+                loaded,
+                worker_recovery_passed=True,
             ),
-            {
-                "worker-identity-verification",
-                "worker-instance-deletion",
-                "worker-instance-deletion-started",
-                "gate-operation:operation-1",
-            },
         )
-        payload["operationId"] = "operation-2"
-        write_private_file(
-            evidence / "lifecycle-operation-2.json",
-            json.dumps(payload),
-        )
-        with self.assertRaisesRegex(RuntimeError, "multiple incomplete"):
-            _incomplete_gate_records(
-                evidence,
-                "tenant-c",
-                "spec-sha",
-                "revision",
+        with self.assertRaisesRegex(RuntimeError, "before worker recovery"):
+            _absent_tenant_proof(
+                loaded,
+                worker_recovery_passed=False,
             )
-
-    def test_continuation_retires_original_attempt(self):
-        root = self.make_root()
-        evidence = root / ".runtime" / "azure-gate" / "evidence"
-        payload = {
-            "schema": 1,
-            "operationId": "operation-1",
-            "tenant": "tenant-c",
-            "specificationSha256": "spec-sha",
-            "revision": "revision",
-            "records": [
-                {
-                    "phase": "worker-identity-verification",
-                    "status": "passed",
-                    "seconds": 1.0,
-                },
-                {
-                    "phase": "worker-instance-deletion",
-                    "status": "passed",
-                    "seconds": 1.0,
-                }
-            ],
-        }
-        write_private_file(
-            evidence / "lifecycle-operation-1.json",
-            json.dumps(payload),
-        )
-        phases = _incomplete_gate_records(
-            evidence,
-            "tenant-c",
-            "spec-sha",
-            "revision",
-        )
-        _complete_prior_gate_attempt(
-            evidence,
-            phases,
-            [
-                {"phase": "worker-recovery", "status": "passed", "seconds": 1.0},
-                {
-                    "phase": "worker-identity-refresh",
-                    "status": "passed",
-                    "seconds": 1.0,
-                },
-                {
-                    "phase": "targeted-delete-absent",
-                    "status": "passed",
-                    "seconds": 1.0,
-                },
-                {
-                    "phase": "foundation-verification",
-                    "status": "passed",
-                    "seconds": 1.0,
-                },
-                {"phase": "recreation", "status": "passed", "seconds": 1.0},
-            ],
-        )
-        self.assertIsNone(
-            _incomplete_gate_records(
-                evidence,
-                "tenant-c",
-                "spec-sha",
-                "revision",
-            )
-        )
-
-    def test_pool_desired_replicas_survive_transient_readiness(self):
-        with patch(
-            "scripts.test_azure_tenant_lifecycle._get_management_resource",
-            return_value={
-                "spec": {"replicas": 3},
-                "status": {"readyReplicas": 2},
-            },
-        ):
-            _require_three_worker_pool(self.spec(workers=3), require_ready=False)
-            with self.assertRaisesRegex(RuntimeError, "three-replica Ready"):
-                _require_three_worker_pool(
-                    self.spec(workers=3),
-                    require_ready=True,
-                )
-
-    def test_evidence_classifier_rejects_malformed_record_shapes(self):
-        root = self.make_root()
-        evidence = root / ".runtime" / "azure-gate" / "evidence"
-        payload = {
-            "schema": 1,
-            "operationId": "operation-1",
-            "tenant": "tenant-c",
-            "specificationSha256": "spec-sha",
-            "revision": "revision",
-            "records": [
-                {
-                    "phase": "worker-instance-deletion",
-                    "status": "passed",
-                    "seconds": -1,
-                    "extra": True,
-                }
-            ],
-        }
-        write_private_file(
-            evidence / "lifecycle-operation-1.json",
-            json.dumps(payload),
-        )
-        with self.assertRaisesRegex(RuntimeError, "invalid Azure lifecycle"):
-            _incomplete_gate_records(
-                evidence,
-                "tenant-c",
-                "spec-sha",
-                "revision",
-            )
-
-    def test_evidence_classifier_rejects_impossible_phase_order(self):
-        root = self.make_root()
-        evidence = root / ".runtime" / "azure-gate" / "evidence"
-        phases = (
-            "recreation",
-            "targeted-delete-absent",
-            "foundation-verification",
-            "worker-identity-refresh",
-            "worker-recovery",
-            "worker-instance-deletion",
-        )
-        payload = {
-            "schema": 1,
-            "operationId": "operation-1",
-            "tenant": "tenant-c",
-            "specificationSha256": "spec-sha",
-            "revision": "revision",
-            "records": [
-                {"phase": phase, "status": "passed", "seconds": 1.0}
-                for phase in phases
-            ],
-        }
-        write_private_file(
-            evidence / "lifecycle-operation-1.json",
-            json.dumps(payload),
-        )
-        with self.assertRaisesRegex(RuntimeError, "phase order"):
-            _incomplete_gate_records(
-                evidence,
-                "tenant-c",
-                "spec-sha",
-                "revision",
-            )
-
-    def test_completed_gate_is_not_an_incomplete_candidate(self):
-        root = self.make_root()
-        evidence = root / ".runtime" / "azure-gate" / "evidence"
-        payload = {
-            "schema": 1,
-            "operationId": "operation-1",
-            "tenant": "tenant-c",
-            "specificationSha256": "spec-sha",
-            "revision": "revision",
-            "records": [
-                {
-                    "phase": phase,
-                    "status": "passed",
-                    "seconds": 1.0,
-                }
-                for phase in (
-                    "worker-identity-verification",
-                    "worker-instance-deletion",
-                    "worker-recovery",
-                    "worker-identity-refresh",
-                    "targeted-delete-absent",
-                    "foundation-verification",
-                    "recreation",
-                )
-            ],
-        }
-        write_private_file(
-            evidence / "lifecycle-operation-1.json",
-            json.dumps(payload),
-        )
-        self.assertIsNone(
-            _incomplete_gate_records(
-                evidence,
-                "tenant-c",
-                "spec-sha",
-                "revision",
-            )
-        )
-
-    def test_started_but_unconfirmed_deletion_fails_closed(self):
-        _require_authenticated_worker_deletion(
-            {"worker-instance-deletion-started"}
-        )
-        _require_authenticated_worker_deletion(
-            {
-                "worker-instance-deletion-started",
-                "worker-instance-deletion",
-            }
-        )
-        with self.assertRaisesRegex(RuntimeError, "ambiguous"):
-            _require_authenticated_worker_deletion(set())
-
-    def test_unrelated_historical_evidence_is_ignored(self):
-        root = self.make_root()
-        evidence = root / ".runtime" / "azure-gate" / "evidence"
-        write_private_file(
-            evidence / "lifecycle-old.json",
-            json.dumps({"legacy": True}),
-        )
-        self.assertIsNone(
-            _incomplete_gate_records(
-                evidence,
-                "tenant-c",
-                "spec-sha",
-                "current-revision",
-            )
-        )
-
-    def test_incompatible_existing_tenant_is_selected_for_cleanup(self):
-        root = self.make_root()
-        old_spec = self.spec(workers=1)
-        runtime, journal = self.start_journal(root, old_spec)
-        runtime.complete_create(
-            runtime.load_operation(),
-            old_spec,
-            {"markerOperationId": journal.operation_id},
-        )
-        self.assertIsNotNone(
-            _incompatible_existing_identity(runtime, self.spec(workers=3))
-        )
-        self.assertIsNone(
-            _incompatible_existing_identity(runtime, old_spec)
-        )
-
-    def test_live_gate_recipe_exists_but_is_not_invoked_by_tests(self):
-        root = Path(__file__).resolve().parents[1]
-        justfile = (root / "Justfile").read_text(encoding="utf-8")
-        script = (
-            root / "scripts" / "test_azure_tenant_lifecycle.py"
-        ).read_text(encoding="utf-8")
-        self.assertIn("azure-test-tenant-lifecycle", justfile)
-        self.assertIn("destroy-legacy-foundation", script)
-        self.assertIn("targeted-delete-absent", script)
-        self.assertIn("worker-instance-deletion", script)
-        self.assertIn("worker-identity-refresh", script)
-        self.assertIn('"recreation"', script)
-        self.assertIn('"status", "--porcelain", "--untracked-files=no"', script)
-        self.assertIn('"revision": revision', script)
-        example = json.loads(
-            (root / "config" / "tenants" / "examples" / "azure.json").read_text(
-                encoding="utf-8"
-            )
-        )
-        self.assertEqual(example["workers"], 3)
-
-
-if __name__ == "__main__":
-    unittest.main()

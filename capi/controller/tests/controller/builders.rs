@@ -7,7 +7,7 @@ use kube::core::DynamicObject;
 use serde_json::{Value, json};
 use tenant_controller::{
     api::{CanonicalSpec, Tenant, TenantSpec},
-    management::by_kind,
+    management::{azure_by_kind, by_kind},
     ownership::*,
     reconcile::map_management_to_tenant,
     resources::*,
@@ -47,6 +47,16 @@ fn catalog_watch_mapping_preserves_typed_and_dynamic_fallbacks() {
     }))
     .unwrap();
     assert!(map_management_to_tenant(by_kind("Namespace").unwrap(), &namespace).is_empty());
+
+    let azure_job: DynamicObject = serde_json::from_value(json!({
+        "apiVersion":"batch/v1","kind":"Job",
+        "metadata":{"name":"tenant-a-install-addons","namespace":"tenant-a",
+            "annotations":{"lifecycle.cnpg-vcluster.capi/tenant":"tenant-a"}}
+    }))
+    .unwrap();
+    let mapped = map_management_to_tenant(azure_by_kind("Job").unwrap(), &azure_job);
+    assert_eq!(mapped.len(), 1);
+    assert_eq!(mapped[0].name, "tenant-a");
 }
 
 impl Fixture {

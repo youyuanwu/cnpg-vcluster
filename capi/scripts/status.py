@@ -21,7 +21,6 @@ from scripts.lib.tenants import (
     verify_tenant_management_ownership,
 )
 from scripts.controller_tenant_status import evaluate_tenant
-from scripts.lib.tenant_runtime import foundation_sha256
 from scripts.lib.tenant_status import TenantStatus
 from scripts.lib.tenants import (
     inspect_storage_volume,

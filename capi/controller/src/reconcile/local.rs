@@ -36,19 +36,23 @@ impl Assets {
 }
 #[rustfmt::skip]
 pub trait TenantAccess: Send + Sync {
-    fn connect(&self, management: Client, control_plane: &DynamicObject, tenant_name: &str, endpoint: &str)
+    fn connect(&self, management: Client, control_plane: &DynamicObject, alternate_owner: Option<&DynamicObject>, tenant_name: &str, endpoint: &str)
         -> impl Future<Output = Result<Client, TenantClientError>> + Send;
 }
+#[derive(Clone, Copy)]
 pub struct LiveTenantAccess;
 #[rustfmt::skip]
 impl TenantAccess for LiveTenantAccess {
-    async fn connect(&self, management: Client, control_plane: &DynamicObject, tenant_name: &str, endpoint: &str) -> Result<Client, TenantClientError> {
-        tenant_client::load_tenant_client(management, control_plane, tenant_name, tenant_name, endpoint)
+    async fn connect(&self, management: Client, control_plane: &DynamicObject, alternate_owner: Option<&DynamicObject>, tenant_name: &str, endpoint: &str) -> Result<Client, TenantClientError> {
+        tenant_client::load_tenant_client_with_owner(management, control_plane, alternate_owner, tenant_name, tenant_name, endpoint)
             .await.map(|(client, _)| client)
     }
 }
 pub trait ProviderLifecycle: Send + Sync {
     fn supports(&self, provider: &TenantProviderSpec) -> bool;
+    fn validate_mutation(&self) -> impl Future<Output = Result<(), ReconcileError>> + Send {
+        async { Ok(()) }
+    }
     fn reconcile<'a>(
         &'a self,
         tenant: &'a Tenant,
@@ -61,6 +65,7 @@ pub trait ProviderLifecycle: Send + Sync {
     ) -> impl Future<Output = Result<Action, ReconcileError>> + Send + 'a;
 }
 #[rustfmt::skip]
+#[derive(Clone)]
 pub struct LocalProvider<D = BollardDockerClient, A = LiveTenantAccess> {
     pub client: Client, pub docker: D, pub access: A, pub assets: Assets,
     pub foundation: Arc<RuntimeFoundation>,
@@ -232,7 +237,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
         }
         let tenant_client = self
             .access
-            .connect(self.client.clone(), &control_plane.object, &name, &endpoint)
+            .connect(self.client.clone(), &control_plane.object, None, &name, &endpoint)
             .await?;
         tenant_client::ensure_bootstrap_rbac(tenant_client.clone()).await?;
         let volume_name = resources::storage_volume_name(&context);

@@ -36,12 +36,13 @@ fail-closed finalizer that does not require tenant API access. Apply is
 asynchronous; repeat `local-tenant-status` until it exits zero.
 
 The provider-discriminated shape is a breaking in-place redesign of
-experimental `v1alpha2`; flat `databases` fields and flat local status are not
-migrated or converted. Existing objects must be deleted and recreated, and
-installation requires a clean environment. Azure-shaped CRD objects are
-accepted but reported unsupported without local lifecycle operations; the
-Azure profile independently retains the JSON-based `tenant-create`,
-`tenant-status`, and `tenant-delete` commands.
+experimental `v1alpha2`; flat `databases` fields, flat local status, and the
+former Python Azure tenant runtime are not migrated or converted. Existing
+objects must be deleted and recreated, and installation requires a clean
+environment. The same Rust manager runs in an explicit `local` or `azure`
+provider mode. Azure commands accept the retained JSON client specification,
+submit an Azure `Tenant`, and use its generation-aware status and ordinary
+finalization. Shared Azure foundation provisioning remains external.
 CAPD and the shared-host storage profile remain local development mechanisms;
 neither profile is a production hostile-tenant isolation boundary.
 

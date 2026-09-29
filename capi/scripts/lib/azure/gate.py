@@ -57,6 +57,77 @@ class WorkerSnapshot:
     def target(self) -> WorkerMapping:
         return max(self.mappings, key=lambda item: int(item.instance_id))
 
+    def to_mapping(self) -> dict[str, object]:
+        return {
+            "vmssId": self.vmss_id,
+            "workers": [
+                {
+                    "nodeName": item.node_name,
+                    "nodeUid": item.node_uid,
+                    "instanceId": item.instance_id,
+                    "instanceResourceId": item.instance_resource_id,
+                    "providerId": item.provider_id,
+                    "internalIp": item.internal_ip,
+                }
+                for item in self.mappings
+            ],
+        }
+
+    @classmethod
+    def from_mapping(cls, payload: Mapping[str, object]) -> "WorkerSnapshot":
+        vmss_id = payload.get("vmssId")
+        workers = payload.get("workers")
+        if (
+            set(payload) != {"vmssId", "workers"}
+            or not isinstance(vmss_id, str)
+            or not isinstance(workers, list)
+        ):
+            raise RuntimeError("Azure worker checkpoint is invalid")
+        mappings = []
+        for worker in workers:
+            if not isinstance(worker, dict) or set(worker) != {
+                "nodeName",
+                "nodeUid",
+                "instanceId",
+                "instanceResourceId",
+                "providerId",
+                "internalIp",
+            }:
+                raise RuntimeError("Azure worker checkpoint is invalid")
+            values = [worker[key] for key in worker]
+            if not all(isinstance(value, str) and value for value in values):
+                raise RuntimeError("Azure worker checkpoint is invalid")
+            mappings.append(
+                WorkerMapping(
+                    node_name=worker["nodeName"],
+                    node_uid=worker["nodeUid"],
+                    instance_id=worker["instanceId"],
+                    instance_resource_id=worker["instanceResourceId"],
+                    provider_id=worker["providerId"],
+                    internal_ip=worker["internalIp"],
+                )
+            )
+        snapshot = cls(vmss_id=vmss_id, mappings=tuple(mappings))
+        build_worker_snapshot(
+            {
+                "requestedWorkers": 3,
+                "readyReplicas": 3,
+                "nodeRefs": [item.node_name for item in snapshot.mappings],
+                "nodes": [
+                    {
+                        "name": item.node_name,
+                        "uid": item.node_uid,
+                        "providerID": item.provider_id,
+                        "internalIP": item.internal_ip,
+                    }
+                    for item in snapshot.mappings
+                ],
+            },
+            snapshot.vmss_id,
+            [item.instance_resource_id for item in snapshot.mappings],
+        )
+        return snapshot
+
 
 def build_worker_snapshot(
     readiness: Mapping[str, object],
@@ -196,43 +267,32 @@ def require_replacement(
     return deleted, replacement
 
 
-def refreshed_observed(
-    observed: Mapping[str, str],
-    readiness: Mapping[str, object],
-    instance_resource_ids: Sequence[str],
-    discovery: Mapping[str, object],
-) -> dict[str, str]:
-    refreshed = dict(observed)
-    refreshed["vmssInstanceIds"] = json.dumps(
-        sorted(str(value) for value in instance_resource_ids),
-        separators=(",", ":"),
-    )
-    refreshed["nodeIdentities"] = json.dumps(
-        readiness["nodes"],
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    refreshed["azureResources"] = json.dumps(
-        dict(discovery),
-        sort_keys=True,
-        separators=(",", ":"),
-    )
-    return refreshed
-
-
 def require_owned_resource_delta(
-    recorded_json: str,
+    recorded: Mapping[str, object],
     discovered: Mapping[str, object],
     deleted: WorkerMapping,
     replacement: WorkerMapping,
 ) -> None:
-    recorded = json.loads(recorded_json)
-    if not isinstance(recorded, dict):
-        raise RuntimeError("recorded Azure resource inventory is invalid")
-    if recorded.get("aso") != discovered.get("aso"):
-        raise RuntimeError("Azure ASO ownership changed during worker recovery")
-    if recorded.get("unknown") != discovered.get("unknown"):
-        raise RuntimeError("unknown Azure ownership changed during worker recovery")
+    before_provider = recorded.get("provider")
+    after_provider = discovered.get("provider")
+    if not isinstance(before_provider, list) or not isinstance(after_provider, list):
+        raise RuntimeError("Azure provider ownership inventory is invalid")
+
+    def stable_provider(items):
+        return sorted(
+            (
+                item
+                for item in items
+                if isinstance(item, dict)
+                and isinstance(item.get("resourceId"), str)
+                and "/virtualmachines/" not in item["resourceId"].lower()
+                and "/networkinterfaces/" not in item["resourceId"].lower()
+            ),
+            key=lambda item: json.dumps(item, sort_keys=True),
+        )
+
+    if stable_provider(before_provider) != stable_provider(after_provider):
+        raise RuntimeError("Azure provider ownership changed during worker recovery")
 
     def resources(payload):
         items = payload.get("azure")

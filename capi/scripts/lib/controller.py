@@ -233,6 +233,32 @@ def build_controller_image(
         shutil.rmtree(build_root, ignore_errors=True)
 
 
+def build_azure_controller_image(
+    root: Path,
+    config: dict[str, str],
+    image: str,
+) -> str:
+    generate_controller(root, config, check=True)
+    binary = build_controller_binary(root, config)
+    verify_static_manager(binary)
+    build_root = root / ".runtime" / "rendered" / "azure-controller-build"
+    shutil.rmtree(build_root, ignore_errors=True)
+    ensure_private_dir(build_root)
+    try:
+        shutil.copy2(
+            root / "controller" / "Dockerfile.azure",
+            build_root / "Dockerfile",
+        )
+        shutil.copy2(binary, build_root / "manager")
+        run(
+            ["docker", "build", "--pull=false", "-t", image, str(build_root)],
+            timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,
+        )
+        return image
+    finally:
+        shutil.rmtree(build_root, ignore_errors=True)
+
+
 def render_controller_manager(
     root: Path,
     config: dict[str, str],
@@ -252,6 +278,28 @@ def render_controller_manager(
         .replace("${CONTROLLER_ACTIVATION_TOKEN}", activation_token)
     )
     destination = root / ".runtime" / "rendered" / "controller" / "manager.yaml"
+    write_private_file(destination, rendered)
+    return destination
+
+
+def render_azure_controller_manager(
+    root: Path,
+    supported_kubernetes_version: str,
+    image: str,
+) -> Path:
+    template = (
+        root / "controller" / "config" / "manager" / "manager-azure.yaml.tpl"
+    ).read_text(encoding="utf-8")
+    rendered = (
+        template.replace("${TENANT_CONTROLLER_IMAGE}", image)
+        .replace(
+            "${SUPPORTED_KUBERNETES_VERSION}",
+            supported_kubernetes_version.removeprefix("v"),
+        )
+    )
+    destination = (
+        root / ".runtime" / "rendered" / "azure-controller" / "manager.yaml"
+    )
     write_private_file(destination, rendered)
     return destination
 
