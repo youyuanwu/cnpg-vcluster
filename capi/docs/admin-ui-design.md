@@ -8,9 +8,12 @@ same `Tenant` resources, conditions, provider status, and management resources
 used by the lifecycle controller.
 
 Kubernetes is the only durable data source. The application has no database,
-filesystem journal, watch cache, Tenant kubeconfig, Azure credentials, or
-direct browser-to-Kubernetes connection. Every API request performs bounded
-reads against the management Kubernetes API and returns sanitized DTOs.
+filesystem journal, watch cache, persisted Tenant kubeconfig, Azure
+credentials, or direct browser-to-Kubernetes connection. Overview requests
+perform bounded reads against the management Kubernetes API. A selected local
+Tenant detail request additionally validates the exact provider-owned
+kubeconfig Secret, constructs an in-memory Tenant client, and performs one
+exact live read of the managed CNPG Cluster before returning sanitized DTOs.
 
 The first release has no mutation routes, forms, or write permissions. Future
 create or delete support must be designed as separate authenticated command
@@ -28,8 +31,10 @@ flowchart LR
   Leptos[Leptos CSR WebAssembly application]
   DTO[tenant-admin-shared DTOs]
   Kube[Management Kubernetes API]
+  TenantAPI[Selected local Tenant API]
+  CNPG[database/capi-postgres]
   Tenant[Tenant resources and status]
-  Resources[CAPI, provider, add-on, and database resources]
+  Resources[CAPI, provider, and add-on resources]
 
   Browser --> Service --> Axum
   Axum --> Leptos
@@ -38,6 +43,9 @@ flowchart LR
   Axum --> Kube
   Kube --> Tenant
   Kube --> Resources
+  Kube -->|validated kubeconfig Secret| Axum
+  Axum -->|exact live GET| TenantAPI
+  TenantAPI --> CNPG
 ```
 
 The browser is a Leptos client-side WebAssembly application, and the native
@@ -59,19 +67,33 @@ Python standard library so offline installation never needs PyYAML or pip.
 
 ## Data and security model
 
-The server initializes one in-cluster kube-rs client. It lists at most 500
+The server initializes one management-cluster kube-rs client. It lists at most 500
 Tenants, at most 500 resources of one catalog kind, and at most 2,000
 management resources for one detail request. Catalog requests have bounded
 concurrency. Kubernetes errors become typed service errors; oversized results
 fail rather than being silently truncated.
 
-Secrets are excluded from both the resource list and RBAC. Provider-specific
+Secrets remain excluded from management-resource inventory and responses.
+Provider-specific
 ClusterRoles are derived from the matching management-resource catalog:
 Tenants receive `get` and `list`, the deterministic cluster-scoped Namespace
 receives `get`, and every provider resource actually scanned receives `list`.
-Each role grants only exact `get` and `list` verbs and no
-provider-irrelevant resource, wildcard, subresource,
-Secret, watch, create, update, patch, or delete access.
+Local mode additionally receives only `get` on core Secrets so it can fetch
+the deterministic `<tenant>-kubeconfig` Secret. Kubernetes RBAC cannot scope a
+ClusterRole to dynamically named Secrets, so this is deliberately broad
+administrative read authority; the server narrows use to the selected Tenant
+namespace and validates the exact Secret name, control-plane ownership,
+markers, endpoint, CA, context, and credential structure before use. It never
+lists or watches Secrets. Azure mode receives no Secret permission.
+
+The validated Tenant kubeconfig exists only in request memory. The resulting
+client has fixed connect/read/write timeouts, no proxy URL, and retries
+disabled. It performs an exact GET of
+`postgresql.cnpg.io/v1`, `Cluster`, `database/capi-postgres`; it does not list
+Tenant workloads, read database Secrets, execute SQL, scrape metrics, or
+persist credentials. Each role otherwise grants only exact `get` and `list`
+verbs and no provider-irrelevant resource, wildcard, subresource, watch,
+create, update, patch, or delete access.
 
 Installation and health checks compare the owned ServiceAccount, binding, and
 selected ClusterRole with the tracked generated resources. They also submit
@@ -109,24 +131,30 @@ counts.
 
 The detail view shows the immutable specification, current conditions and
 blockers, provider-specific status, accepted management resources, and a
-provider-neutral topology. The topology includes Tenant, control-plane,
-worker-pool, Machine, Node, provider-resource, add-on, and database nodes when
-the management API and durable Tenant status provide trusted identities.
+provider-neutral topology. For local Tenants it also shows a live CNPG panel:
+cluster phase, desired/observed/ready counts, primary and failover target,
+promotion timestamps, image and timeline, read/write Services, topology
+placement, PVC health, conditions, and sorted primary/standby instances. The
+topology includes the exact CNPG Cluster and observed instances when available,
+or an explicit unavailable node when Tenant access is pending or fails.
+Azure reports database observation as not applicable.
 
 Refresh is manual. Loading a page or selecting **Refresh** issues new API
 requests; there is no polling, SSE stream, browser persistence, or server-side
-cache. A Tenant deleted between list and detail returns a typed not-found
-response and a non-fatal link back to the overview.
+cache. Overview and list requests never fan out to Tenant APIs. Tenant or CNPG
+unavailability is represented as a bounded partial observation so the rest of
+the detail page remains usable. A Tenant deleted between list and detail
+returns a typed not-found response and a non-fatal link back to the overview.
 
 ## HTTP API and DTO contract
 
 Every successful JSON response is:
 
 ```json
-{"schemaVersion":1,"data":{}}
+{"schemaVersion":2,"data":{}}
 ```
 
-Errors use schema version 1 plus a typed error code, sanitized message, and
+Errors use schema version 2 plus a typed error code, sanitized message, and
 retryable flag. The routes are:
 
 | Route | Response |
@@ -135,7 +163,7 @@ retryable flag. The routes are:
 | `GET /readyz` | Management Kubernetes API readiness. |
 | `GET /api/v1/overview` | One `OverviewSnapshot` containing the overview and sorted Tenant summaries from the same list operation. |
 | `GET /api/v1/tenants` | Sorted `TenantSummary[]`. |
-| `GET /api/v1/tenants/{name}` | One `TenantSnapshot` containing detail and topology from the same Tenant UID/generation/resource read. |
+| `GET /api/v1/tenants/{name}` | One `TenantSnapshot` containing detail, live database observation, and topology from the same Tenant UID/generation/resource read. |
 | `GET /api/v1/tenants/{name}/topology` | `TopologyGraph`. |
 | `GET /*` | Static asset or `index.html` fallback for browser routes. |
 
@@ -153,6 +181,9 @@ The shared DTOs include:
 - `TenantDetail`, `TenantSpecificationView`, provider status, blockers, and
   accepted management-resource identities;
 - local allocation/foundation/Cluster identity;
+- explicit available, unavailable, or not-applicable database observation;
+- bounded CNPG identity, phase, primary/standby instances, placement, storage,
+  Services, conditions, and observation timestamp;
 - Azure binding, management roots, worker pool, Nodes, add-ons, and recorded
   provider resources;
 - topology nodes, edges, health, display attributes, and exact resource
@@ -179,7 +210,11 @@ to an accepted root through the live owner chain. Secrets and ambiguous,
 foreign, marker-only, missing-UID, or owner-inconsistent objects are excluded.
 
 Node and add-on information is rendered only when already represented by
-sanitized durable status. The admin server does not connect to Tenant APIs.
+sanitized durable status. For local CNPG only, the admin server connects to
+the selected Tenant API after validating the provider-owned kubeconfig and
+reads the deterministic Cluster. CNPG instance topology is derived only from
+that Cluster's bounded status fields; raw objects, arbitrary labels, internal
+IPs, system IDs, managed roles, Secrets, and credentials are excluded.
 Partially reconciled Tenants retain available trusted nodes and show missing
 components as blockers rather than inventing topology.
 
@@ -284,6 +319,11 @@ kubeconfig and local port-forward process.
 - **Overview works but detail omits resources**: inspect Tenant status UIDs,
   controller markers, and owner references. Foreign or ambiguous objects are
   intentionally excluded.
+- **Database panel is unavailable**: inspect the deterministic Tenant
+  kubeconfig Secret ownership, Tenant endpoint reachability, CNPG CRD, and
+  `database/capi-postgres`. The response reason distinguishes pending access,
+  invalid credentials, Tenant API failure, missing Cluster, and malformed
+  status without exposing credential details.
 - **Nested browser route returns an error**: verify the static web inventory
   and server/web schema are from the same build; the Axum fallback should
   return `index.html`.
@@ -297,8 +337,12 @@ kubeconfig and local port-forward process.
 This is an experimental administrative view, not a production control plane.
 It has no Ingress, application authentication, authorization by Tenant,
 pagination UI, watch/poll stream, historical data, metrics backend, audit
-store, Tenant workload topology, or mutation support. Local Nodes and database
-health are summarized from management-observable state; the server never uses
-a Tenant kubeconfig. Azure Disk and CloudNativePG remain outside the Azure
+store, general Tenant workload topology, or mutation support. Local CNPG
+metadata is a point-in-time exact read, not monitoring: there are no LSN,
+replication-lag, SQL, or historical metrics. The local admin ServiceAccount can
+read any known Secret name because Kubernetes ClusterRole rules cannot filter
+dynamic Tenant Secret names; deployment compromise therefore has
+administrative Tenant impact despite application-level exact-name and
+ownership checks. Azure Disk and CloudNativePG remain outside the Azure
 experiment. The fixed list limits intentionally fail closed for larger
 management clusters and will require a separately designed pagination model.

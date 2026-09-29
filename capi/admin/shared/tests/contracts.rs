@@ -2,10 +2,13 @@ use tenant_admin_shared::{
     ADMIN_CONTAINER_PORT, ADMIN_NAMESPACE, ADMIN_RESOURCE_NAME, ADMIN_SERVICE_PORT,
     API_SCHEMA_NAME, API_SCHEMA_VERSION, ApiEnvelope, ApiError, ApiErrorCode, ApiErrorEnvelope,
     query::{
-        DisplayAttribute, ManagementOverview, OverviewSnapshot, ProviderMode, ProviderStatusView,
-        TenantCounts, TenantDetail, TenantProvider, TenantSnapshot, TenantSnapshotIdentity,
-        TenantSummary, TopologyEdge, TopologyEdgeKind, TopologyGraph, TopologyHealth, TopologyNode,
-        TopologyNodeKind, UnknownProviderView,
+        ConditionStatus, DatabaseClusterIdentity, DatabaseClusterObservation, DatabaseCondition,
+        DatabaseInstanceObservation, DatabaseInstanceRole, DatabaseNotApplicableReason,
+        DatabaseObservation, DatabaseObservationFreshness, DatabasePvcHealth, DatabaseServices,
+        DatabaseUnavailableReason, DisplayAttribute, ManagementOverview, OverviewSnapshot,
+        ProviderMode, ProviderStatusView, TenantCounts, TenantDetail, TenantProvider,
+        TenantSnapshot, TenantSnapshotIdentity, TenantSummary, TopologyEdge, TopologyEdgeKind,
+        TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind, UnknownProviderView,
     },
     routes::{
         API_OVERVIEW_PATH, API_PREFIX, API_TENANT_PATH, API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH,
@@ -16,7 +19,7 @@ use tenant_admin_shared::{
 #[test]
 fn deployment_and_route_constants_are_exact() {
     assert_eq!(API_SCHEMA_NAME, "tenant-admin");
-    assert_eq!(API_SCHEMA_VERSION, 1);
+    assert_eq!(API_SCHEMA_VERSION, 2);
     assert_eq!(ADMIN_RESOURCE_NAME, "tenant-admin");
     assert_eq!(ADMIN_NAMESPACE, "tenant-system");
     assert_eq!(ADMIN_CONTAINER_PORT, 8080);
@@ -36,7 +39,7 @@ fn envelopes_have_stable_versioned_json() {
     let success = ApiEnvelope::new(vec!["alpha", "beta"]);
     assert_eq!(
         serde_json::to_string(&success).expect("success envelope serializes"),
-        r#"{"schemaVersion":1,"data":["alpha","beta"]}"#
+        r#"{"schemaVersion":2,"data":["alpha","beta"]}"#
     );
 
     let error = ApiErrorEnvelope::new(ApiError::new(
@@ -46,7 +49,7 @@ fn envelopes_have_stable_versioned_json() {
     ));
     assert_eq!(
         serde_json::to_string(&error).expect("error envelope serializes"),
-        r#"{"schemaVersion":1,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
+        r#"{"schemaVersion":2,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
     );
 
     let decoded: ApiErrorEnvelope =
@@ -156,6 +159,13 @@ fn page_snapshots_keep_identity_and_page_data_together() {
             generation: detail.generation,
             observed_generation: detail.observed_generation,
         },
+        database: DatabaseObservation::Unavailable {
+            observed_at: "2026-09-29T20:50:16Z".into(),
+            freshness: DatabaseObservationFreshness::Live,
+            reason: tenant_admin_shared::query::DatabaseUnavailableReason::Pending,
+            message: "Managed database status is pending".into(),
+            retryable: true,
+        },
         topology: TopologyGraph {
             tenant_name: detail.summary.name.clone(),
             provider: detail.summary.provider,
@@ -168,4 +178,135 @@ fn page_snapshots_keep_identity_and_page_data_together() {
     assert_eq!(tenant_json["data"]["identity"]["uid"], "tenant-uid");
     assert_eq!(tenant_json["data"]["identity"]["generation"], 7);
     assert_eq!(tenant_json["data"]["identity"]["observedGeneration"], 6);
+    assert_eq!(tenant_json["data"]["database"]["state"], "unavailable");
+}
+
+#[test]
+fn database_observation_contract_is_bounded_and_secret_free() {
+    let observation = DatabaseObservation::Available {
+        observed_at: "2026-09-29T20:50:16Z".into(),
+        freshness: DatabaseObservationFreshness::Live,
+        cluster: Box::new(DatabaseClusterObservation {
+            identity: DatabaseClusterIdentity {
+                api_version: "postgresql.cnpg.io/v1".into(),
+                kind: "Cluster".into(),
+                namespace: "database".into(),
+                name: "capi-postgres".into(),
+                uid: Some("cluster-uid".into()),
+                generation: 8,
+            },
+            phase: Some("Cluster in healthy state".into()),
+            reason: None,
+            desired_instances: 3,
+            observed_instances: 3,
+            ready_instances: 3,
+            current_primary: Some("capi-postgres-1".into()),
+            target_primary: Some("capi-postgres-1".into()),
+            current_primary_since: Some("2026-09-29T20:40:00Z".into()),
+            target_primary_requested_at: Some("2026-09-29T20:39:59Z".into()),
+            current_primary_failing_since: None,
+            image: Some("ghcr.io/cloudnative-pg/postgresql:18".into()),
+            timeline: Some(4),
+            services: DatabaseServices {
+                read: Some("capi-postgres-r".into()),
+                write: Some("capi-postgres-rw".into()),
+            },
+            topology_available: true,
+            nodes_used: Some(3),
+            instances: vec![DatabaseInstanceObservation {
+                name: "capi-postgres-1".into(),
+                role: DatabaseInstanceRole::Primary,
+                status: Some("healthy".into()),
+                timeline: Some(4),
+                node: Some("worker-a".into()),
+                zone: Some("local".into()),
+            }],
+            storage: DatabasePvcHealth {
+                total: 3,
+                healthy: 3,
+                ..DatabasePvcHealth::default()
+            },
+            conditions: vec![DatabaseCondition {
+                condition_type: "Ready".into(),
+                status: ConditionStatus::True,
+                reason: Some("ClusterIsReady".into()),
+                message: Some("Cluster is ready".into()),
+                observed_generation: Some(8),
+                last_transition_time: Some("2026-09-29T20:40:00Z".into()),
+            }],
+        }),
+    };
+
+    let json = serde_json::to_string(&observation).expect("database observation serializes");
+    let value = serde_json::to_value(&observation).expect("database observation value");
+    let mut keys: Vec<_> = value
+        .as_object()
+        .expect("database observation object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(keys, ["cluster", "freshness", "observedAt", "state"]);
+    assert_eq!(value["observedAt"], "2026-09-29T20:50:16Z");
+    assert!(value.get("observed_at").is_none());
+    assert!(json.contains(r#""state":"available""#));
+    assert!(json.contains(r#""role":"primary""#));
+    assert!(!json.contains("observed_at"));
+    for forbidden in [
+        "kubeconfig",
+        "client-key-data",
+        "resourceVersion",
+        "systemID",
+        "internalIP",
+        "managedRoles",
+        "labels",
+        "metrics",
+    ] {
+        assert!(
+            !json.contains(forbidden),
+            "{forbidden} leaked into contract"
+        );
+    }
+    let decoded: DatabaseObservation =
+        serde_json::from_str(&json).expect("database observation round trips");
+    assert_eq!(decoded, observation);
+
+    for (observation, expected_keys) in [
+        (
+            DatabaseObservation::Unavailable {
+                observed_at: "2026-09-29T20:50:16Z".into(),
+                freshness: DatabaseObservationFreshness::Live,
+                reason: DatabaseUnavailableReason::Pending,
+                message: "pending".into(),
+                retryable: true,
+            },
+            vec![
+                "freshness",
+                "message",
+                "observedAt",
+                "reason",
+                "retryable",
+                "state",
+            ],
+        ),
+        (
+            DatabaseObservation::NotApplicable {
+                observed_at: "2026-09-29T20:50:16Z".into(),
+                freshness: DatabaseObservationFreshness::Live,
+                reason: DatabaseNotApplicableReason::ProviderUnsupported,
+            },
+            vec!["freshness", "observedAt", "reason", "state"],
+        ),
+    ] {
+        let value = serde_json::to_value(observation).expect("variant serializes");
+        let mut keys: Vec<_> = value
+            .as_object()
+            .expect("variant object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(keys, expected_keys);
+        assert!(value.get("observed_at").is_none());
+    }
 }

@@ -3,11 +3,13 @@ use std::collections::{BTreeMap, BTreeSet};
 use kube::{ResourceExt, core::DynamicObject};
 use tenant_admin_shared::query::{
     AzureBindingView, AzureManagementView, AzureNodeView, AzureProviderView, AzureResourceView,
-    AzureWorkerPoolView, ConditionStatus, DisplayAttribute, LocalAllocationView, LocalProviderView,
-    ManagementResourceView, ProviderMode, ProviderSpecificationView, ProviderStatusView,
-    ResourceIdentityView, TenantBlocker, TenantClassification, TenantCondition, TenantDetail,
-    TenantProvider, TenantSpecificationView, TenantSummary, TopologyEdge, TopologyEdgeKind,
-    TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind, UnknownProviderView,
+    AzureWorkerPoolView, ConditionStatus, DatabaseClusterObservation, DatabaseInstanceObservation,
+    DatabaseInstanceRole, DatabaseObservation, DatabaseUnavailableReason, DisplayAttribute,
+    LocalAllocationView, LocalProviderView, ManagementResourceView, ProviderMode,
+    ProviderSpecificationView, ProviderStatusView, ResourceIdentityView, TenantBlocker,
+    TenantClassification, TenantCondition, TenantDetail, TenantProvider, TenantSpecificationView,
+    TenantSummary, TopologyEdge, TopologyEdgeKind, TopologyGraph, TopologyHealth, TopologyNode,
+    TopologyNodeKind, UnknownProviderView,
 };
 use tenant_controller::{
     api::{
@@ -39,6 +41,7 @@ const AZURE_OPERATION_ANNOTATION: &str = "lifecycle.cnpg-vcluster.capi/operation
 pub struct TenantProjection {
     pub summary: TenantSummary,
     pub detail: TenantDetail,
+    pub database: DatabaseObservation,
     pub topology: TopologyGraph,
 }
 
@@ -133,7 +136,12 @@ fn trusted_azure_status(tenant: &Tenant) -> Option<&tenant_controller::api::Azur
 }
 
 impl TenantProjection {
-    pub fn new(mode: ProviderMode, tenant: Tenant, resources: Vec<DynamicObject>) -> Self {
+    pub fn new(
+        mode: ProviderMode,
+        tenant: Tenant,
+        resources: Vec<DynamicObject>,
+        database: DatabaseObservation,
+    ) -> Self {
         let summary = project_summary(mode, &tenant);
         let accepted = accepted_resources(mode, &tenant, &resources);
         let management_resources = accepted
@@ -158,10 +166,11 @@ impl TenantProjection {
             blockers: blockers(mode, &tenant),
             management_resources,
         };
-        let topology = topology(&tenant, &summary, &accepted);
+        let topology = topology(&tenant, &summary, &accepted, &database);
         Self {
             summary,
             detail,
+            database,
             topology,
         }
     }
@@ -264,6 +273,16 @@ fn accepted_local<'a>(
         }
     }
     accepted
+}
+
+pub(crate) fn is_accepted_local_management_resource(
+    tenant: &Tenant,
+    inventory: &[DynamicObject],
+    candidate: &DynamicObject,
+) -> bool {
+    accepted_local(tenant, inventory)
+        .iter()
+        .any(|resource| std::ptr::eq(resource.object, candidate))
 }
 
 fn accepted_azure<'a>(
@@ -1020,6 +1039,7 @@ fn topology(
     tenant: &Tenant,
     summary: &TenantSummary,
     accepted: &[AcceptedResource<'_>],
+    database: &DatabaseObservation,
 ) -> TopologyGraph {
     let tenant_id = "tenant".to_owned();
     let mut nodes = vec![TopologyNode {
@@ -1114,17 +1134,12 @@ fn topology(
                     health: condition_health(tenant, "WorkersReady"),
                 },
             );
-            add_summary_node(
+            add_database_nodes(
                 &mut nodes,
                 &mut edges,
                 &tenant_id,
-                SummaryNode {
-                    id: "databases",
-                    kind: TopologyNodeKind::Database,
-                    label: "Databases",
-                    count: nonnegative(*databases),
-                    health: condition_health(tenant, "DatabaseReady"),
-                },
+                nonnegative(*databases),
+                database,
             );
         }
         TenantProviderSpec::Azure { .. } => {
@@ -1183,6 +1198,344 @@ fn add_summary_node(
         kind: TopologyEdgeKind::Contains,
         label: None,
     });
+}
+
+fn add_database_nodes(
+    nodes: &mut Vec<TopologyNode>,
+    edges: &mut Vec<TopologyEdge>,
+    tenant_id: &str,
+    requested: u32,
+    observation: &DatabaseObservation,
+) {
+    match observation {
+        DatabaseObservation::Available { cluster, .. } => {
+            add_available_database(nodes, edges, tenant_id, cluster);
+        }
+        DatabaseObservation::Unavailable {
+            reason,
+            message,
+            retryable,
+            ..
+        } => {
+            let node_id = "database:unavailable".to_owned();
+            nodes.push(TopologyNode {
+                id: node_id.clone(),
+                kind: TopologyNodeKind::Database,
+                label: "Databases unavailable".into(),
+                health: unavailable_database_health(*reason),
+                resource: None,
+                attributes: vec![
+                    DisplayAttribute {
+                        label: "Requested".into(),
+                        value: requested.to_string(),
+                    },
+                    DisplayAttribute {
+                        label: "Reason".into(),
+                        value: database_unavailable_reason(*reason).into(),
+                    },
+                    DisplayAttribute {
+                        label: "Message".into(),
+                        value: bounded(message, MAX_TEXT),
+                    },
+                    DisplayAttribute {
+                        label: "Retryable".into(),
+                        value: retryable.to_string(),
+                    },
+                ],
+            });
+            edges.push(TopologyEdge {
+                id: format!("edge:{tenant_id}:{node_id}"),
+                source: tenant_id.into(),
+                target: node_id,
+                kind: TopologyEdgeKind::Contains,
+                label: Some("Database unavailable".into()),
+            });
+        }
+        DatabaseObservation::NotApplicable { .. } => {}
+    }
+}
+
+fn add_available_database(
+    nodes: &mut Vec<TopologyNode>,
+    edges: &mut Vec<TopologyEdge>,
+    tenant_id: &str,
+    cluster: &DatabaseClusterObservation,
+) {
+    let cluster_id = "database:cluster".to_owned();
+    let mut attributes = vec![
+        DisplayAttribute {
+            label: "Phase".into(),
+            value: cluster
+                .phase
+                .as_deref()
+                .map_or_else(|| "Unknown".into(), |value| bounded(value, MAX_TEXT)),
+        },
+        DisplayAttribute {
+            label: "Readiness".into(),
+            value: format!("{}/{}", cluster.ready_instances, cluster.desired_instances),
+        },
+        DisplayAttribute {
+            label: "Observed instances".into(),
+            value: cluster.observed_instances.to_string(),
+        },
+    ];
+    push_attribute(
+        &mut attributes,
+        "Reason",
+        cluster.reason.as_deref(),
+        MAX_TEXT,
+    );
+    push_attribute(
+        &mut attributes,
+        "Primary",
+        cluster.current_primary.as_deref(),
+        MAX_IDENTITY,
+    );
+    if let Some(timeline) = cluster.timeline {
+        attributes.push(DisplayAttribute {
+            label: "Timeline".into(),
+            value: timeline.to_string(),
+        });
+    }
+    nodes.push(TopologyNode {
+        id: cluster_id.clone(),
+        kind: TopologyNodeKind::Database,
+        label: bounded(&cluster.identity.name, MAX_IDENTITY),
+        health: database_cluster_health(cluster),
+        resource: Some(ResourceIdentityView {
+            api_version: bounded(&cluster.identity.api_version, MAX_IDENTITY),
+            kind: bounded(&cluster.identity.kind, MAX_IDENTITY),
+            namespace: Some(bounded(&cluster.identity.namespace, MAX_IDENTITY)),
+            name: bounded(&cluster.identity.name, MAX_IDENTITY),
+            uid: cluster
+                .identity
+                .uid
+                .as_deref()
+                .map(|value| bounded(value, MAX_IDENTITY)),
+        }),
+        attributes,
+    });
+    edges.push(TopologyEdge {
+        id: format!("edge:{tenant_id}:{cluster_id}"),
+        source: tenant_id.into(),
+        target: cluster_id.clone(),
+        kind: TopologyEdgeKind::Contains,
+        label: Some("CNPG Cluster".into()),
+    });
+
+    let mut instances: Vec<_> = cluster.instances.iter().collect();
+    instances.sort_by(|left, right| left.name.cmp(&right.name));
+    for instance in instances {
+        let instance_id = format!(
+            "database:instance:{}",
+            bounded(&instance.name, MAX_IDENTITY)
+        );
+        let role = database_role(instance.role);
+        let mut attributes = vec![DisplayAttribute {
+            label: "Role".into(),
+            value: role.into(),
+        }];
+        push_attribute(
+            &mut attributes,
+            "Status",
+            instance.status.as_deref(),
+            MAX_TEXT,
+        );
+        if let Some(timeline) = instance.timeline {
+            attributes.push(DisplayAttribute {
+                label: "Timeline".into(),
+                value: timeline.to_string(),
+            });
+        }
+        push_attribute(
+            &mut attributes,
+            "Worker node",
+            instance.node.as_deref(),
+            MAX_IDENTITY,
+        );
+        push_attribute(
+            &mut attributes,
+            "Zone",
+            instance.zone.as_deref(),
+            MAX_IDENTITY,
+        );
+        nodes.push(TopologyNode {
+            id: instance_id.clone(),
+            kind: TopologyNodeKind::Database,
+            label: bounded(&instance.name, MAX_IDENTITY),
+            health: database_instance_health(instance),
+            resource: None,
+            attributes,
+        });
+        edges.push(TopologyEdge {
+            id: format!("edge:{cluster_id}:{instance_id}"),
+            source: cluster_id.clone(),
+            target: instance_id,
+            kind: TopologyEdgeKind::Represents,
+            label: Some(role.into()),
+        });
+    }
+}
+
+fn push_attribute(
+    attributes: &mut Vec<DisplayAttribute>,
+    label: &str,
+    value: Option<&str>,
+    limit: usize,
+) {
+    if let Some(value) = value.filter(|value| !value.is_empty()) {
+        attributes.push(DisplayAttribute {
+            label: label.into(),
+            value: bounded(value, limit),
+        });
+    }
+}
+
+fn database_cluster_health(cluster: &DatabaseClusterObservation) -> TopologyHealth {
+    let primary_count = cluster
+        .instances
+        .iter()
+        .filter(|instance| instance.role == DatabaseInstanceRole::Primary)
+        .count();
+    let malformed = cluster.desired_instances == 0
+        || cluster.ready_instances > cluster.observed_instances
+        || usize_u32(cluster.instances.len()) != cluster.observed_instances
+        || primary_count != 1
+        || cluster.current_primary.as_deref().is_some_and(|primary| {
+            !cluster.instances.iter().any(|instance| {
+                instance.name == primary && instance.role == DatabaseInstanceRole::Primary
+            })
+        });
+    if malformed {
+        return TopologyHealth::Unknown;
+    }
+
+    let phase = cluster.phase.as_deref().map(str::to_ascii_lowercase);
+    if phase.as_deref().is_some_and(|phase| {
+        phase.contains("failed") || phase.contains("fatal") || phase.contains("error")
+    }) {
+        return TopologyHealth::Failed;
+    }
+    if phase.as_deref().is_some_and(|phase| {
+        phase.contains("unhealthy") || phase.contains("degraded") || phase.contains("not ready")
+    }) || cluster
+        .conditions
+        .iter()
+        .any(|condition| condition.status == ConditionStatus::False)
+        || cluster.storage.dangling > 0
+        || cluster.storage.unusable > 0
+    {
+        return TopologyHealth::Degraded;
+    }
+    if cluster
+        .conditions
+        .iter()
+        .any(|condition| condition.status == ConditionStatus::Unknown)
+    {
+        return TopologyHealth::Unknown;
+    }
+
+    let ready_condition = cluster
+        .conditions
+        .iter()
+        .find(|condition| condition.condition_type == "Ready");
+    let ready_condition_current = ready_condition.is_some_and(|condition| {
+        condition.status == ConditionStatus::True
+            && condition.observed_generation == Some(cluster.identity.generation)
+    });
+    let phase_healthy = phase
+        .as_deref()
+        .is_some_and(|phase| phase.contains("healthy") || phase == "ready");
+    let all_instances_ready = cluster
+        .instances
+        .iter()
+        .all(|instance| database_instance_health(instance) == TopologyHealth::Ready);
+    if ready_condition_current
+        && phase_healthy
+        && cluster.observed_instances == cluster.desired_instances
+        && cluster.ready_instances == cluster.desired_instances
+        && all_instances_ready
+        && cluster.storage.initializing == 0
+        && cluster.storage.resizing == 0
+        && (cluster.storage.total == 0 || cluster.storage.healthy == cluster.storage.total)
+    {
+        return TopologyHealth::Ready;
+    }
+    if ready_condition.is_some_and(|condition| {
+        condition.status == ConditionStatus::True
+            && condition.observed_generation != Some(cluster.identity.generation)
+    }) || cluster.observed_instances < cluster.desired_instances
+        || cluster.ready_instances < cluster.desired_instances
+        || cluster.storage.initializing > 0
+        || cluster.storage.resizing > 0
+        || phase.as_deref().is_some_and(|phase| {
+            phase.contains("creating")
+                || phase.contains("initializing")
+                || phase.contains("setting up")
+                || phase.contains("waiting")
+                || phase.contains("recovery")
+        })
+    {
+        return TopologyHealth::Progressing;
+    }
+    TopologyHealth::Unknown
+}
+
+fn database_instance_health(instance: &DatabaseInstanceObservation) -> TopologyHealth {
+    if instance.role == DatabaseInstanceRole::Unknown {
+        return TopologyHealth::Unknown;
+    }
+    let Some(status) = instance.status.as_deref().map(str::to_ascii_lowercase) else {
+        return TopologyHealth::Unknown;
+    };
+    if status.contains("failed") || status.contains("fatal") || status.contains("error") {
+        TopologyHealth::Failed
+    } else if status.contains("unhealthy")
+        || status.contains("failing")
+        || status.contains("degraded")
+    {
+        TopologyHealth::Degraded
+    } else if status.contains("creating")
+        || status.contains("initializing")
+        || status.contains("pending")
+        || status.contains("waiting")
+    {
+        TopologyHealth::Progressing
+    } else if status == "healthy" || status == "ready" || status == "running" {
+        TopologyHealth::Ready
+    } else {
+        TopologyHealth::Unknown
+    }
+}
+
+const fn unavailable_database_health(reason: DatabaseUnavailableReason) -> TopologyHealth {
+    match reason {
+        DatabaseUnavailableReason::Pending => TopologyHealth::Progressing,
+        DatabaseUnavailableReason::TenantApiUnavailable => TopologyHealth::Unknown,
+        DatabaseUnavailableReason::ManagementResourceMissing
+        | DatabaseUnavailableReason::TenantAccessInvalid
+        | DatabaseUnavailableReason::ClusterMissing
+        | DatabaseUnavailableReason::Malformed => TopologyHealth::Degraded,
+    }
+}
+
+const fn database_unavailable_reason(reason: DatabaseUnavailableReason) -> &'static str {
+    match reason {
+        DatabaseUnavailableReason::Pending => "pending",
+        DatabaseUnavailableReason::ManagementResourceMissing => "management-resource-missing",
+        DatabaseUnavailableReason::TenantAccessInvalid => "tenant-access-invalid",
+        DatabaseUnavailableReason::TenantApiUnavailable => "tenant-api-unavailable",
+        DatabaseUnavailableReason::ClusterMissing => "cluster-missing",
+        DatabaseUnavailableReason::Malformed => "malformed",
+    }
+}
+
+const fn database_role(role: DatabaseInstanceRole) -> &'static str {
+    match role {
+        DatabaseInstanceRole::Primary => "Primary",
+        DatabaseInstanceRole::Standby => "Standby",
+        DatabaseInstanceRole::Unknown => "Unknown",
+    }
 }
 
 fn add_azure_status_nodes(
@@ -1471,6 +1824,10 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
     use kube::core::TypeMeta;
     use serde_json::json;
+    use tenant_admin_shared::query::{
+        DatabaseClusterIdentity, DatabaseCondition, DatabaseNotApplicableReason,
+        DatabaseObservationFreshness, DatabasePvcHealth, DatabaseServices,
+    };
     use tenant_controller::api::{
         AllocationStatus, AzureBindingStatus, AzureManagementStatus, AzureNodeIdentity,
         AzureProviderResourceIdentity, AzureProviderStatus, AzureVmssStatus, LocalProviderStatus,
@@ -1543,6 +1900,89 @@ mod tests {
                 ..Default::default()
             },
             data: json!({"status":{"phase":"Ready"}}),
+        }
+    }
+
+    fn database_instance(name: &str, role: DatabaseInstanceRole) -> DatabaseInstanceObservation {
+        DatabaseInstanceObservation {
+            name: name.into(),
+            role,
+            status: Some("healthy".into()),
+            timeline: Some(4),
+            node: Some(format!("worker-{name}")),
+            zone: Some("local-a".into()),
+        }
+    }
+
+    fn available_database(instances: Vec<DatabaseInstanceObservation>) -> DatabaseObservation {
+        let count = usize_u32(instances.len());
+        let current_primary = instances
+            .iter()
+            .find(|instance| instance.role == DatabaseInstanceRole::Primary)
+            .map(|instance| instance.name.clone());
+        DatabaseObservation::Available {
+            observed_at: "2026-09-29T20:50:16Z".into(),
+            freshness: DatabaseObservationFreshness::Live,
+            cluster: Box::new(DatabaseClusterObservation {
+                identity: DatabaseClusterIdentity {
+                    api_version: "postgresql.cnpg.io/v1".into(),
+                    kind: "Cluster".into(),
+                    namespace: "database".into(),
+                    name: "capi-postgres".into(),
+                    uid: Some("database-uid".into()),
+                    generation: 8,
+                },
+                phase: Some("Cluster in healthy state".into()),
+                reason: Some("ClusterIsReady".into()),
+                desired_instances: count,
+                observed_instances: count,
+                ready_instances: count,
+                current_primary: current_primary.clone(),
+                target_primary: current_primary,
+                current_primary_since: Some("2026-09-29T20:40:00Z".into()),
+                target_primary_requested_at: None,
+                current_primary_failing_since: None,
+                image: None,
+                timeline: Some(4),
+                services: DatabaseServices {
+                    read: Some("capi-postgres-r".into()),
+                    write: Some("capi-postgres-rw".into()),
+                },
+                topology_available: true,
+                nodes_used: Some(count),
+                instances,
+                storage: DatabasePvcHealth {
+                    total: count,
+                    healthy: count,
+                    ..DatabasePvcHealth::default()
+                },
+                conditions: vec![DatabaseCondition {
+                    condition_type: "Ready".into(),
+                    status: ConditionStatus::True,
+                    reason: Some("ClusterIsReady".into()),
+                    message: None,
+                    observed_generation: Some(8),
+                    last_transition_time: None,
+                }],
+            }),
+        }
+    }
+
+    fn unavailable_database(reason: DatabaseUnavailableReason) -> DatabaseObservation {
+        DatabaseObservation::Unavailable {
+            observed_at: "2026-09-29T20:50:16Z".into(),
+            freshness: DatabaseObservationFreshness::Live,
+            reason,
+            message: "Tenant API database read failed".into(),
+            retryable: true,
+        }
+    }
+
+    fn not_applicable_database() -> DatabaseObservation {
+        DatabaseObservation::NotApplicable {
+            observed_at: "2026-09-29T20:50:16Z".into(),
+            freshness: DatabaseObservationFreshness::Live,
+            reason: DatabaseNotApplicableReason::ProviderUnsupported,
         }
     }
 
@@ -1701,7 +2141,15 @@ mod tests {
         let tenant = local_tenant(TenantPhase::Ready, 2, true);
         let owned = local_root(&tenant, "cluster-uid", false);
         let foreign = local_root(&tenant, "foreign-uid", true);
-        let projection = TenantProjection::new(ProviderMode::Local, tenant, vec![owned, foreign]);
+        let projection = TenantProjection::new(
+            ProviderMode::Local,
+            tenant,
+            vec![owned, foreign],
+            available_database(vec![database_instance(
+                "capi-postgres-1",
+                DatabaseInstanceRole::Primary,
+            )]),
+        );
         assert_eq!(projection.detail.management_resources.len(), 1);
         assert_eq!(
             projection.detail.management_resources[0]
@@ -1718,7 +2166,7 @@ mod tests {
                 .topology
                 .nodes
                 .iter()
-                .any(|node| node.id == "summary:databases")
+                .any(|node| node.id == "database:cluster")
         );
         assert!(
             !projection
@@ -1730,11 +2178,145 @@ mod tests {
     }
 
     #[test]
+    fn available_database_topology_has_cluster_and_sorted_primary_standbys() {
+        let projection = TenantProjection::new(
+            ProviderMode::Local,
+            local_tenant(TenantPhase::Ready, 2, true),
+            Vec::new(),
+            available_database(vec![
+                database_instance("capi-postgres-3", DatabaseInstanceRole::Standby),
+                database_instance("capi-postgres-1", DatabaseInstanceRole::Primary),
+                database_instance("capi-postgres-2", DatabaseInstanceRole::Standby),
+            ]),
+        );
+
+        let cluster = projection
+            .topology
+            .nodes
+            .iter()
+            .find(|node| node.id == "database:cluster")
+            .expect("CNPG cluster node");
+        assert_eq!(cluster.health, TopologyHealth::Ready);
+        assert_eq!(
+            cluster
+                .resource
+                .as_ref()
+                .and_then(|resource| resource.uid.as_deref()),
+            Some("database-uid")
+        );
+        let instances: Vec<_> = projection
+            .topology
+            .nodes
+            .iter()
+            .filter(|node| node.id.starts_with("database:instance:"))
+            .collect();
+        assert_eq!(
+            instances
+                .iter()
+                .map(|node| node.label.as_str())
+                .collect::<Vec<_>>(),
+            ["capi-postgres-1", "capi-postgres-2", "capi-postgres-3"]
+        );
+        assert!(instances.iter().all(|node| node.resource.is_none()));
+        assert_eq!(
+            projection
+                .topology
+                .edges
+                .iter()
+                .filter(|edge| edge.source == "database:cluster")
+                .filter_map(|edge| edge.label.as_deref())
+                .collect::<Vec<_>>(),
+            ["Primary", "Standby", "Standby"]
+        );
+    }
+
+    #[test]
+    fn one_instance_database_primary_is_ready_and_explicit() {
+        let projection = TenantProjection::new(
+            ProviderMode::Local,
+            local_tenant(TenantPhase::Ready, 2, true),
+            Vec::new(),
+            available_database(vec![database_instance(
+                "capi-postgres-1",
+                DatabaseInstanceRole::Primary,
+            )]),
+        );
+
+        let instance = projection
+            .topology
+            .nodes
+            .iter()
+            .find(|node| node.id == "database:instance:capi-postgres-1")
+            .expect("primary instance");
+        assert_eq!(instance.health, TopologyHealth::Ready);
+        assert!(
+            instance
+                .attributes
+                .iter()
+                .any(|attribute| { attribute.label == "Role" && attribute.value == "Primary" })
+        );
+        assert!(projection.topology.edges.iter().any(|edge| {
+            edge.target == instance.id && edge.label.as_deref() == Some("Primary")
+        }));
+    }
+
+    #[test]
+    fn unavailable_database_remains_visible_with_reason_and_health() {
+        let projection = TenantProjection::new(
+            ProviderMode::Local,
+            local_tenant(TenantPhase::Ready, 2, true),
+            Vec::new(),
+            unavailable_database(DatabaseUnavailableReason::TenantApiUnavailable),
+        );
+
+        let database = projection
+            .topology
+            .nodes
+            .iter()
+            .find(|node| node.id == "database:unavailable")
+            .expect("unavailable database node");
+        assert_eq!(database.health, TopologyHealth::Unknown);
+        assert!(database.attributes.iter().any(|attribute| {
+            attribute.label == "Reason" && attribute.value == "tenant-api-unavailable"
+        }));
+        assert!(database.attributes.iter().any(|attribute| {
+            attribute.label == "Message" && attribute.value == "Tenant API database read failed"
+        }));
+    }
+
+    #[test]
+    fn malformed_available_database_is_never_ready() {
+        let mut observation = available_database(vec![database_instance(
+            "capi-postgres-1",
+            DatabaseInstanceRole::Unknown,
+        )]);
+        let DatabaseObservation::Available { cluster, .. } = &mut observation else {
+            panic!("available observation");
+        };
+        cluster.current_primary = None;
+
+        let projection = TenantProjection::new(
+            ProviderMode::Local,
+            local_tenant(TenantPhase::Ready, 2, true),
+            Vec::new(),
+            observation,
+        );
+        let cluster = projection
+            .topology
+            .nodes
+            .iter()
+            .find(|node| node.id == "database:cluster")
+            .expect("CNPG cluster node");
+        assert_eq!(cluster.health, TopologyHealth::Unknown);
+    }
+
+    #[test]
     fn azure_projection_uses_recorded_management_and_tenant_status_identities() {
         let projection = TenantProjection::new(
             ProviderMode::Azure,
             azure_tenant(),
             vec![azure_cluster("cluster-uid"), azure_cluster("foreign-uid")],
+            not_applicable_database(),
         );
         assert_eq!(projection.detail.management_resources.len(), 1);
         let ProviderStatusView::Azure(status) = projection.detail.provider_status else {
@@ -1767,6 +2349,13 @@ mod tests {
                 .iter()
                 .any(|node| node.kind == TopologyNodeKind::AddOn)
         );
+        assert!(
+            projection
+                .topology
+                .nodes
+                .iter()
+                .all(|node| node.kind != TopologyNodeKind::Database)
+        );
     }
 
     #[test]
@@ -1777,6 +2366,7 @@ mod tests {
             ProviderMode::Azure,
             tenant,
             vec![azure_cluster("cluster-uid")],
+            not_applicable_database(),
         );
         assert!(projection.summary.endpoint.is_none());
         assert!(projection.detail.management_resources.is_empty());
@@ -1811,6 +2401,7 @@ mod tests {
             ProviderMode::Azure,
             tenant,
             vec![azure_cluster("cluster-uid")],
+            not_applicable_database(),
         );
         assert!(projection.detail.management_resources.is_empty());
         assert!(matches!(

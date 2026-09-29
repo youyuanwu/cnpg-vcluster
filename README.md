@@ -11,8 +11,9 @@ This repository contains one Cluster API and CloudNativePG experiment:
 The local profile creates one kind management cluster and accepts explicit
 tenant specifications for Kamaji hosted control planes, CAPD Docker workers,
 isolated Docker-backed storage, and tenant-owned CloudNativePG clusters. Each
-management cluster also runs a read-only Leptos/Axum Tenant Admin UI backed
-only by its Kubernetes API:
+management cluster also runs a read-only Leptos/Axum Tenant Admin UI. Overview
+data comes from the management API; a selected local Tenant detail view uses
+its validated administrative kubeconfig in memory to read live CNPG metadata:
 
 ```sh
 cd capi
