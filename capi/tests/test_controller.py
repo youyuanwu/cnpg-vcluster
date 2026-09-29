@@ -446,7 +446,7 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             patch("scripts.controller_tenant.load_configuration", return_value={}),
             patch("scripts.controller_tenant.e2e_lock", side_effect=lambda *_args, **_kwargs: lock("e2e")),
             patch("scripts.controller_tenant.tools_lock", side_effect=lambda *_args, **_kwargs: lock("tools")),
-            patch("scripts.controller_tenant.delete_tenant") as delete,
+            patch("scripts.controller_tenant.delete_controller_tenant") as delete,
         ):
             self.assertEqual(0, controller_tenant_main(["delete", "tenant-a"]))
         delete.assert_called_once_with(Path(__file__).resolve().parents[1], {}, "tenant-a")
@@ -459,6 +459,53 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             ],
             calls,
         )
+
+    def test_public_cache_clear_does_not_require_configuration(self) -> None:
+        with (
+            patch("scripts.controller_tenant.load_configuration") as load,
+            patch(
+                "scripts.controller_tenant.e2e_lock",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "scripts.controller_tenant.tools_lock",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "scripts.controller_tenant.clear_tenant_kubeconfig",
+                return_value=True,
+            ) as clear,
+        ):
+            self.assertEqual(
+                0,
+                controller_tenant_main(["clear-cache", "tenant-a"]),
+            )
+        load.assert_not_called()
+        clear.assert_called_once_with(
+            Path(__file__).resolve().parents[1],
+            "tenant-a",
+        )
+
+    def test_public_cache_clear_all_uses_exact_operation(self) -> None:
+        with (
+            patch(
+                "scripts.controller_tenant.e2e_lock",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "scripts.controller_tenant.tools_lock",
+                return_value=nullcontext(),
+            ),
+            patch(
+                "scripts.controller_tenant.clear_all_tenant_kubeconfigs",
+                return_value=["tenant-a", "tenant-b"],
+            ) as clear,
+        ):
+            self.assertEqual(
+                0,
+                controller_tenant_main(["clear-cache", "--all"]),
+            )
+        clear.assert_called_once_with(Path(__file__).resolve().parents[1])
 
     def test_e2e_child_reuses_parent_lock(self) -> None:
         with (

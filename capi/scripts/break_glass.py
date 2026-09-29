@@ -5,7 +5,6 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 
-from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient
 from scripts.lib.management import (
     require_management_ownership,
@@ -174,7 +173,7 @@ def break_glass(
     namespace: str,
     name: str,
     uid: str,
-) -> Path:
+) -> dict[str, object]:
     kind = kind.lower()
     if kind not in FINALIZERS:
         raise RuntimeError(f"unsupported break-glass kind: {kind}")
@@ -218,40 +217,30 @@ def break_glass(
     index = finalizers.index(finalizer)
     docker_before = _docker_inventory(config, tenant)
     timestamp = datetime.now(timezone.utc).isoformat()
-    evidence = root / ".runtime" / "evidence" / (
-        f"break-glass-{kind}-{namespace}-{name}.json"
-    )
-    write_private_file(
-        evidence,
-        json.dumps(
-            {
-                "timestamp": timestamp,
-                "resource": {
-                    "apiVersion": resource.get("apiVersion"),
-                    "kind": resource.get("kind"),
-                    "namespace": namespace,
-                    "name": name,
-                    "uid": uid,
-                    "resourceVersion": metadata.get("resourceVersion"),
-                    "deletionTimestamp": metadata.get("deletionTimestamp"),
-                    "finalizers": finalizers,
-                    "conditions": [
-                        {
-                            key: condition.get(key)
-                            for key in ("type", "status")
-                        }
-                        for condition in resource.get("status", {}).get(
-                            "conditions", []
-                        )
-                    ],
-                },
-                "selectedFinalizer": finalizer,
-                "dockerInventory": docker_before,
-            },
-            sort_keys=True,
-        )
-        + "\n",
-    )
+    evidence = {
+        "timestamp": timestamp,
+        "resource": {
+            "apiVersion": resource.get("apiVersion"),
+            "kind": resource.get("kind"),
+            "namespace": namespace,
+            "name": name,
+            "uid": uid,
+            "resourceVersion": metadata.get("resourceVersion"),
+            "deletionTimestamp": metadata.get("deletionTimestamp"),
+            "finalizers": finalizers,
+            "conditions": [
+                {
+                    key: condition.get(key)
+                    for key in ("type", "status")
+                }
+                for condition in resource.get("status", {}).get(
+                    "conditions", []
+                )
+            ],
+        },
+        "selectedFinalizer": finalizer,
+        "dockerInventory": docker_before,
+    }
     patch = [
         {"op": "test", "path": "/metadata/uid", "value": uid},
         {
@@ -293,5 +282,5 @@ def break_glass(
         raise RuntimeError(f"break-glass result inspection failed: {after.stderr}")
     if _docker_inventory(config, tenant) != docker_before:
         raise RuntimeError("break-glass changed Docker object inventory")
-    print(f"removed exact finalizer from {kind}/{namespace}/{name}")
+    print(json.dumps(evidence, sort_keys=True))
     return evidence

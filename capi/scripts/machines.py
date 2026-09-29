@@ -15,7 +15,6 @@ from scripts.lib.controller_scenarios import (
     tenant_manifest,
     wait_tenant_ready,
 )
-from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.process import run
 from scripts.lib.tenants import (
@@ -277,20 +276,23 @@ def _foreign_node_rejected(
     client: ManagementClient,
     tenant,
 ) -> None:
-    manifest = root / ".runtime" / "rendered" / "negative" / "foreign-node.json"
-    write_private_file(
-        manifest,
-        json.dumps(
-            {
-                "apiVersion": "v1",
-                "kind": "Node",
-                "metadata": {"name": "foreign-capi-node"},
-                "spec": {"providerID": "docker:////foreign-capi-node"},
-            }
-        )
-        + "\n",
+    manifest = json.dumps(
+        {
+            "apiVersion": "v1",
+            "kind": "Node",
+            "metadata": {"name": "foreign-capi-node"},
+            "spec": {"providerID": "docker:////foreign-capi-node"},
+        }
     )
-    _tenant_kubectl(root, config, tenant, "apply", "-f", str(manifest))
+    _tenant_kubectl(
+        root,
+        config,
+        tenant,
+        "apply",
+        "-f",
+        "-",
+        input_text=manifest,
+    )
     try:
         try:
             worker_snapshot(root, config, client, tenant)
@@ -307,7 +309,6 @@ def _foreign_node_rejected(
             "node/foreign-capi-node",
             "--ignore-not-found",
         )
-        manifest.unlink(missing_ok=True)
 
 
 def _interrupted_machine_deletion(

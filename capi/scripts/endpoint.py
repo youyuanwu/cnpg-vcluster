@@ -12,11 +12,9 @@ from scripts.lib.controller_catalog import (
     load_management_resources,
     resource_by_kind,
 )
-from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient
 from scripts.lib.management import management_status
 from scripts.lib.process import run
-from scripts.lib.redaction import redact
 from scripts.lib.controller_scenarios import (
     apply_controller_tenant,
     delete_controller_tenant,
@@ -201,10 +199,6 @@ def run_endpoint_gate(
                     + deployment_response.stderr
                 )
             create_management(root, config)
-    evidence = root / ".runtime" / "evidence" / "endpoint-failure.txt"
-    success_evidence = root / ".runtime" / "evidence" / "endpoint-success.json"
-    evidence.unlink(missing_ok=True)
-    success_evidence.unlink(missing_ok=True)
     bootstrap_secret_names: list[str] = []
     client = None
     tenant = None
@@ -327,8 +321,7 @@ def run_endpoint_gate(
                 "json",
             ).stdout
         )
-        write_private_file(
-            success_evidence,
+        print(
             json.dumps(
                 {
                     "bootstrapSHA256": hashlib.sha256(
@@ -339,20 +332,10 @@ def run_endpoint_gate(
                     ).hexdigest(),
                     "cluster": tenant.name,
                     "endpoint": f"{tenant.vip}:{config['SPIKE_API_PORT']}",
-                    "machineUID": registered["machine"]["metadata"]["uid"],
-                    "nodeUID": registered["node"]["metadata"]["uid"],
-                },
-                sort_keys=True,
-            )
-            + "\n",
-        )
-        print(
-            json.dumps(
-                {
-                    "cluster": tenant.name,
-                    "endpoint": f"{tenant.vip}:{config['SPIKE_API_PORT']}",
                     "machine": registered["machine"]["metadata"]["name"],
+                    "machineUID": registered["machine"]["metadata"]["uid"],
                     "node": registered["node"]["metadata"]["name"],
+                    "nodeUID": registered["node"]["metadata"]["uid"],
                     "workers": sorted(workers),
                 },
                 sort_keys=True,
@@ -360,9 +343,6 @@ def run_endpoint_gate(
         )
         succeeded = True
         return client, tenant, registered
-    except Exception as exc:
-        write_private_file(evidence, redact(str(exc)) + "\n")
-        raise
     finally:
         if cleanup or not succeeded:
             cleanup_target = tenant if tenant is not None else (

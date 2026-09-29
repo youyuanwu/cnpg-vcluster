@@ -78,6 +78,12 @@ barriers.
 There is no persisted creation
 stage, tenant-API cleanup checkpoint, child-resource UID ledger,
 worker-container evidence, or Docker volume identity.
+Normal Tenant commands also persist no Tenant specification, resource
+identity, rendered manifest, deletion proof, or gate checkpoint on the local
+filesystem. Local validation may create one owner-only kubeconfig cache from
+the management-cluster Secret when it needs direct Tenant API access. That
+cache is non-authoritative, validated against the live Secret, removed after
+Tenant deletion, and explicitly clearable.
 
 The generic reconciler validates and dispatches through `ProviderLifecycle`.
 `LocalProvider` owns allocation, CAPI/CAPD/Kamaji, Docker, network, storage,

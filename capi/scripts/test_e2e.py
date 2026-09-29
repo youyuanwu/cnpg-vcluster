@@ -109,23 +109,20 @@ def verify_no_local_runtime_residue(root: Path) -> None:
     if not runtime.exists():
         return
     allowed = {
+        "azure",
+        "azure/kamaji-provider.yaml",
+        "azure/management.kubeconfig",
+        "azure/resources.json",
         "lifecycle",
         "lifecycle/.locks",
         "lifecycle/.locks/azure.lock",
-        "lifecycle/rejected",
+        "rendered",
+        "rendered/azure-controller",
+        "rendered/azure-controller/manager.yaml",
     }
-    allowed_prefixes = (
-        "azure",
-        "azure-gate",
-        "lifecycle/azure",
-        "lifecycle/rejected/azure",
-    )
     for path in runtime.rglob("*"):
         relative = path.relative_to(runtime).as_posix()
-        if relative in allowed or any(
-            relative == prefix or relative.startswith(prefix + "/")
-            for prefix in allowed_prefixes
-        ):
+        if relative in allowed:
             continue
         raise RuntimeError(
             f"local runtime remained after E2E teardown: {relative}"

@@ -33,6 +33,8 @@ EXPECTED_RECIPES = {
     "local-tenant-apply",
     "local-tenant-status",
     "local-tenant-delete",
+    "local-tenant-kubeconfig-clear",
+    "local-tenant-kubeconfig-clear-all",
     "controller-generate",
     "controller-fetch",
     "controller-verify",
@@ -671,6 +673,20 @@ def check_repository_boundaries() -> None:
         and 'f"tenant/{tenant}"' in operator_source
         and "_kubectl(" not in tenant_source,
         "Azure public lifecycle must submit and delete only the Tenant CR",
+    )
+    check(
+        "deletion-proofs" not in operator_source
+        and "capture_operator_deletion_proof" not in operator_source
+        and "prove_operator_deletion" not in operator_source
+        and "write_private_file" not in operator_source,
+        "Azure public deletion must not persist or perform external proof",
+    )
+    check(
+        ".runtime" not in gate_source
+        and "write_private_file" not in gate_source
+        and "_incomplete_gate" not in gate_source
+        and "_load_checkpoint" not in gate_source,
+        "Azure destructive gate must not persist or resume Tenant state",
     )
     check(
         "TenantRuntime" not in azure_source

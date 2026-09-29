@@ -67,6 +67,14 @@ local-tenant-status tenant="tenant-example":
 local-tenant-delete tenant="tenant-example":
     @python3 scripts/controller_tenant.py delete {{quote(tenant)}}
 
+# Remove one exact owner-only Tenant kubeconfig cache.
+local-tenant-kubeconfig-clear tenant:
+    @python3 scripts/controller_tenant.py clear-cache {{quote(tenant)}}
+
+# Remove every exact owner-only Tenant kubeconfig cache.
+local-tenant-kubeconfig-clear-all:
+    @python3 scripts/controller_tenant.py clear-cache --all
+
 # Generate Tenant CRD and RBAC artifacts from the locked Rust crate.
 controller-generate:
     @python3 scripts/generate_controller.py

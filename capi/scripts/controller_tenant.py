@@ -10,19 +10,28 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 from scripts.lib.config import load_configuration
-from scripts.lib.controller_client import apply_tenant, delete_tenant
+from scripts.lib.controller_client import apply_tenant
+from scripts.lib.controller_scenarios import delete_controller_tenant
 from scripts.lib.locking import e2e_lock, tools_lock
 from scripts.lib.redaction import redact
+from scripts.lib.tenants import (
+    clear_all_tenant_kubeconfigs,
+    clear_tenant_kubeconfig,
+)
 
 
 def main(arguments: list[str]) -> int:
-    if len(arguments) != 2 or arguments[0] not in {"apply", "delete"}:
+    if len(arguments) != 2 or arguments[0] not in {
+        "apply",
+        "delete",
+        "clear-cache",
+    }:
         print(
-            "usage: controller_tenant.py <apply MANIFEST|delete TENANT>",
+            "usage: controller_tenant.py "
+            "<apply MANIFEST|delete TENANT|clear-cache TENANT|--all>",
             file=sys.stderr,
         )
         return 1
-    config = load_configuration(ROOT)
     with (
         (
             nullcontext()
@@ -31,10 +40,24 @@ def main(arguments: list[str]) -> int:
         ),
         tools_lock(ROOT, exclusive=True),
     ):
+        if arguments[0] == "clear-cache":
+            removed = (
+                clear_all_tenant_kubeconfigs(ROOT)
+                if arguments[1] == "--all"
+                else [arguments[1]]
+                if clear_tenant_kubeconfig(ROOT, arguments[1])
+                else []
+            )
+            print(
+                "cleared Tenant kubeconfig cache"
+                + (f": {', '.join(removed)}" if removed else ": none")
+            )
+            return 0
+        config = load_configuration(ROOT)
         if arguments[0] == "apply":
             apply_tenant(ROOT, config, Path(arguments[1]).resolve())
         else:
-            delete_tenant(ROOT, config, arguments[1])
+            delete_controller_tenant(ROOT, config, arguments[1])
     return 0
 
 

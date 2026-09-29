@@ -547,3 +547,4 @@ class ControllerScenarioTests(unittest.TestCase):
                 with self.assertRaisesRegex(RuntimeError, "readiness failed"):
                     run_endpoint_gate(root, {}, manifest=manifest)
             delete.assert_called_once_with(root, {}, "tenant-a")
+            self.assertFalse((root / ".runtime" / "evidence").exists())

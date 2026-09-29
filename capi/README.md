@@ -43,14 +43,14 @@ Azure durable identity lives in Tenant status: exact foundation/specification
 binding, management UIDs, kubeconfig hash, VMSS instances, Nodes, add-ons,
 provider descendants, and deletion barriers. Ordinary Tenant deletion lets the
 operator and CAPI/CAPZ finalizers remove exact Kubernetes roots; the Python
-client only captures and verifies external Azure/tag absence and unchanged
-foundation identity. The destructive gate keeps owner-only resumable evidence
-under `.runtime/azure-gate/` and is the only Python path allowed to inject
+client waits for Tenant absence and does not retain a second deletion
+checkpoint. The destructive gate captures exact external proof identity only
+in memory for its active run and is the only Python path allowed to inject
 `az vmss delete-instances`. Pre-ACR Azure foundation inventory is rejected and
 requires a clean redeploy. Tenant Azure resources remain billable until
-ordinary deletion removes the VMSS and related resources. The preserved
-AKS, VNet, identity, and other shared foundation resources remain billable
-until `just azure-destroy` completes.
+ordinary deletion removes the VMSS and related resources. The preserved AKS,
+VNet, identity, and other shared foundation resources remain billable until
+`just azure-destroy` completes.
 
 Kamaji uses the public `26.8.6-edge` source release. The edge channel is
 experimental, but it requires no account, activation key, or paid artifact.
@@ -185,9 +185,11 @@ just test-tenant-lifecycle
 | `just local-tenant-apply <manifest.yaml>` | Strictly apply one declarative local Tenant. |
 | `just local-tenant-status <name>` | Print generation-aware local Tenant conditions. |
 | `just local-tenant-delete <name>` | Delete one local Tenant and wait for finalization. |
+| `just local-tenant-kubeconfig-clear <name>` | Remove one exact owner-only Tenant kubeconfig cache. |
+| `just local-tenant-kubeconfig-clear-all` | Remove all validated Tenant kubeconfig caches. |
 | `just tenant-create azure <spec.json>` | Reconcile one explicit Azure tenant on the recorded AKS/CAPZ foundation. |
 | `just tenant-status azure <name>` | Inspect one Azure tenant without mutating state. |
-| `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through CAPI/CAPZ and durably retry Azure absence/foundation proof. |
+| `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through Kubernetes/CAPI/CAPZ and wait for Tenant absence. |
 | `just azure-test-tenant-lifecycle` | Destructively prove three distinct VMSS-backed workers, exact non-primary instance replacement, targeted absence, foundation preservation, and recreation for the example tenant. |
 | `just diagnose management` | Print management status, workloads, CRDs, and events without mutation. |
 | `just destroy` | Remove recorded tenants, controllers, the management cluster, runtime state, and restore host settings. |
@@ -197,12 +199,17 @@ changing state. Local lifecycle state is held in the Tenant resource, schema-3 f
 ConfigMap, per-slot allocation Leases, provider resources, and exact Docker identities;
 the public local commands do not maintain a second filesystem journal or
 readiness evaluator. Azure lifecycle identity is held in the Tenant resource.
-The public delete command persists an exact owner-only proof checkpoint before
-DELETE and resumes it when the Tenant is already absent; destructive-gate
-checkpoints are exact/private while published evidence is redacted. Foundation
-inventory, management kubeconfig, delete proof, and gate evidence remain below
-ignored owner-only `.runtime/`. Commands use explicit
-kubeconfig paths and do not depend on the user's current Kubernetes context.
+Normal Tenant commands, retries, and gates do not persist Tenant specifications,
+resource identities, proof checkpoints, rendered manifests, or evidence below
+`.runtime/`. Local validation caches a Tenant kubeconfig on demand only when it
+must invoke `kubectl` against that Tenant API. The cache is validated against
+the live Secret, removed after Tenant deletion, and removable with the explicit
+cache-clear commands. Foundation inventory and the management kubeconfig remain
+below ignored owner-only `.runtime/` because they belong to the shared
+management foundation. Commands use explicit kubeconfig paths and do not depend
+on the user's current Kubernetes context. Validation evidence is printed to
+stdout and is persisted only when the caller explicitly redirects it to a
+selected path.
 
 Azure implementation responsibilities live under `scripts/lib/azure/`:
 `foundation` owns shared infrastructure and digest-pinned manager packaging,
@@ -533,8 +540,10 @@ The enforced-offline gate also prints `CAPI_OFFLINE_EGRESS` records with the
 node and counted reject-rule packets, plus `CAPI_OFFLINE_MIRROR` records for
 each exact digest-qualified image exercised through the local mirror.
 
-The destructive Azure gate writes redacted phase evidence and its resumable
-worker/deletion checkpoint below owner-only `.runtime/azure-gate/`.
+The destructive Azure gate prints phase progress, keeps worker and deletion
+proof identity in memory for the active run, and leaves no Tenant-specific
+runtime files. A later invocation starts from the live Ready state rather than
+resuming a local checkpoint.
 
 Exact versions, URLs, checksums, source commits, and image digests are in
 [`config/versions.env`](config/versions.env). See

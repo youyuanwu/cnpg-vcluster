@@ -13,7 +13,11 @@ from .controller_client import apply_tenant, delete_tenant
 from .kube import ManagementClient, wait_for
 from .process import run
 from .redaction import redact, redact_value
-from .tenants import Tenant, export_tenant_kubeconfig, tenant_kubeconfig_path
+from .tenants import (
+    Tenant,
+    clear_tenant_kubeconfig,
+    export_tenant_kubeconfig,
+)
 from scripts.controller_tenant_status import evaluate_tenant
 
 
@@ -419,16 +423,7 @@ def delete_controller_tenant(
     if wait:
         wait_tenant_absent(root, config, name)
     if wait:
-        path = (
-            tenant_kubeconfig_path(root, tenant)
-            if isinstance(tenant, Tenant)
-            else root / ".runtime" / "tenants" / name / "kubeconfig"
-        )
-        path.unlink(missing_ok=True)
-        try:
-            path.parent.rmdir()
-        except OSError:
-            pass
+        clear_tenant_kubeconfig(root, name)
 
 
 def tenant_snapshot(

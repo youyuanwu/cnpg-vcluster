@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import io
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -239,18 +241,21 @@ class BreakGlassTests(unittest.TestCase):
                 return_value=inventory,
             ),
         ):
-            evidence = break_glass(
-                Path(temporary),
-                {
-                    "OWNERSHIP_LABEL": "example.owner",
-                    "LAB_PREFIX": "lab",
-                },
-                "configmap",
-                "tenant-a",
-                "fixture",
-                "uid-1",
-            )
-            payload = json.loads(evidence.read_text(encoding="utf-8"))
+            output = io.StringIO()
+            with redirect_stdout(output):
+                payload = break_glass(
+                    Path(temporary),
+                    {
+                        "OWNERSHIP_LABEL": "example.owner",
+                        "LAB_PREFIX": "lab",
+                    },
+                    "configmap",
+                    "tenant-a",
+                    "fixture",
+                    "uid-1",
+                )
+            self.assertEqual(payload, json.loads(output.getvalue()))
+            self.assertFalse(Path(temporary).joinpath(".runtime").exists())
         patch_payload = json.loads(client.kubectl.call_args_list[1].args[-1])
         self.assertEqual(
             patch_payload,

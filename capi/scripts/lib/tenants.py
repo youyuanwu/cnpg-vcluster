@@ -5,7 +5,6 @@ import ipaddress
 import json
 import os
 import re
-import shutil
 import time
 import urllib.parse
 from dataclasses import dataclass, field
@@ -22,8 +21,10 @@ from .controller_catalog import (
 from .files import (
     IntegrityError,
     ensure_private_dir,
+    existing_private_directory,
     private_file_exists,
     read_private_file,
+    unlink_private_file,
     write_private_file,
 )
 from .kube import ManagementClient, wait_for
@@ -44,6 +45,9 @@ LIFECYCLE_MARKERS = {
     "operationId": "lifecycle.cnpg-vcluster.capi/operation-id",
 }
 MANAGEMENT_CATALOG = load_management_resources(Path(__file__).resolve().parents[2])
+LOCAL_TENANT_NAME = re.compile(
+    r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$"
+)
 
 
 def _management_resource(kind: str):
@@ -379,6 +383,46 @@ def tenant_kubeconfig_path(root: Path, tenant: Tenant) -> Path:
     return root / ".runtime" / "tenants" / tenant.name / "kubeconfig"
 
 
+def clear_tenant_kubeconfig(root: Path, tenant_name: str) -> bool:
+    if not LOCAL_TENANT_NAME.fullmatch(tenant_name):
+        raise RuntimeError(
+            "tenant name must be a 1-63 character lowercase DNS label"
+        )
+    path = root / ".runtime" / "tenants" / tenant_name / "kubeconfig"
+    if not private_file_exists(path):
+        return False
+    unlink_private_file(path)
+    tenants = root / ".runtime" / "tenants"
+    try:
+        with existing_private_directory(tenants) as parent_fd:
+            try:
+                os.rmdir(tenant_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+    except IntegrityError as exc:
+        if not isinstance(exc.__cause__, FileNotFoundError):
+            raise
+    return True
+
+
+def clear_all_tenant_kubeconfigs(root: Path) -> list[str]:
+    tenants = root / ".runtime" / "tenants"
+    try:
+        with existing_private_directory(tenants) as parent_fd:
+            names = os.listdir(parent_fd)
+    except IntegrityError as exc:
+        if isinstance(exc.__cause__, FileNotFoundError):
+            return []
+        raise
+    removed = []
+    for name in sorted(names):
+        if LOCAL_TENANT_NAME.fullmatch(name) and clear_tenant_kubeconfig(
+            root, name
+        ):
+            removed.append(name)
+    return removed
+
+
 def validate_tenant_kubeconfig_view(
     config: dict[str, str],
     tenant: Tenant,
@@ -595,10 +639,6 @@ def _tenant_kubectl(
 
 def storage_volume_name(config: dict[str, str], tenant: Tenant) -> str:
     return f"{config['LAB_PREFIX']}-{tenant.name}-storage"
-
-
-def storage_record_path(root: Path, tenant: Tenant) -> Path:
-    return root / ".runtime" / "storage" / tenant.name / "volume.json"
 
 
 def inspect_storage_volume(name: str) -> dict[str, object] | None:
