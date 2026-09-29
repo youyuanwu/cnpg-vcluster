@@ -9,7 +9,7 @@ from scripts.lib.controller_scenarios import (
     tenant_manifest,
     wait_tenant_ready,
 )
-from scripts.lib.files import IntegrityError, write_private_file
+from scripts.lib.files import IntegrityError
 from scripts.lib.process import run
 from scripts.lib.tenants import (
     NOT_FOUND,
@@ -36,7 +36,7 @@ def _volume_identity(config: dict[str, str], tenant) -> dict[str, object]:
     return payload
 
 
-def _render_storage(root: Path, config: dict[str, str], tenant) -> Path:
+def _render_storage(root: Path, config: dict[str, str], tenant) -> str:
     source = root / "manifests" / "storage" / "hostpath-smoke.yaml.tpl"
     content = source.read_text(encoding="utf-8")
     replacements = {
@@ -51,9 +51,7 @@ def _render_storage(root: Path, config: dict[str, str], tenant) -> Path:
         content = content.replace(placeholder, value)
     if "${" in content:
         raise IntegrityError("storage template contains unresolved placeholders")
-    path = root / ".runtime" / "rendered" / "storage" / tenant.name / "smoke.yaml"
-    write_private_file(path, content)
-    return path
+    return content
 
 
 def _wait_smoke(root: Path, config: dict[str, str], tenant) -> dict[str, str]:
@@ -144,7 +142,15 @@ def ensure_storage_ready(
     tenant,
 ) -> dict[str, object]:
     manifest = _render_storage(root, config, tenant)
-    _tenant_kubectl(root, config, tenant, "apply", "-f", str(manifest))
+    _tenant_kubectl(
+        root,
+        config,
+        tenant,
+        "apply",
+        "-f",
+        "-",
+        input_text=manifest,
+    )
     smoke = _wait_smoke(root, config, tenant)
     _verify_marker(root, config, tenant, smoke["name"])
     status = _storage_status(root, config, tenant)
@@ -250,7 +256,15 @@ def run_storage_gate(
         before_workers = worker_snapshot(root, config, client, tenant)
         before_volume = _volume_identity(config, tenant)
         manifest = _render_storage(root, config, tenant)
-        _tenant_kubectl(root, config, tenant, "apply", "-f", str(manifest))
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "apply",
+            "-f",
+            "-",
+            input_text=manifest,
+        )
         smoke = _wait_smoke(root, config, tenant)
         _verify_marker(root, config, tenant, smoke["name"])
         initial_storage = _storage_status(root, config, tenant)

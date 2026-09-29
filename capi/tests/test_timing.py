@@ -15,25 +15,25 @@ from scripts.test_e2e import run_e2e, verify_no_local_runtime_residue, verify_te
 
 
 class TimingTests(unittest.TestCase):
-    def test_e2e_runtime_check_preserves_only_azure_state(self) -> None:
+    def test_e2e_runtime_check_preserves_only_azure_foundation_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             azure = root / ".runtime/azure/resources.json"
-            lifecycle = (
+            manager = (
                 root
-                / ".runtime/lifecycle/azure/tenant-example/ready.json"
+                / ".runtime/rendered/azure-controller/manager.yaml"
             )
-            gate = (
+            for path in (azure, manager):
+                path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+                path.write_text("{}\n", encoding="utf-8")
+            verify_no_local_runtime_residue(root)
+            tenant_state = (
                 root
                 / ".runtime/azure-gate/evidence/lifecycle-operation.json"
             )
-            for path in (azure, lifecycle, gate):
-                path.parent.mkdir(parents=True, exist_ok=True)
-                path.write_text("{}\n", encoding="utf-8")
-            verify_no_local_runtime_residue(root)
-            local = root / ".runtime/tenant-endpoints.json"
-            local.write_text("{}\n", encoding="utf-8")
-            with self.assertRaisesRegex(RuntimeError, "tenant-endpoints"):
+            tenant_state.parent.mkdir(parents=True, exist_ok=True)
+            tenant_state.write_text("{}\n", encoding="utf-8")
+            with self.assertRaisesRegex(RuntimeError, "azure-gate"):
                 verify_no_local_runtime_residue(root)
 
     def test_records_passed_failed_and_skipped_without_error_text(self) -> None:

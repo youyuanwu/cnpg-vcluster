@@ -12,6 +12,7 @@ from scripts.storage import (
     _cleanup_storage_and_tenant,
     _delete_storage,
     _render_storage,
+    ensure_storage_ready,
 )
 
 
@@ -35,11 +36,39 @@ class StorageTests(unittest.TestCase):
                 "SPIKE_STORAGE_CONTAINER_PATH": "/shared",
                 "VERIFY_IMAGE": "busybox@sha256:" + "a" * 64,
             }
-            rendered = _render_storage(root, config, tenant).read_text(
-                encoding="utf-8"
-            )
+            rendered = _render_storage(root, config, tenant)
+            self.assertFalse((root / ".runtime").exists())
         self.assertNotIn("nodeAffinity", rendered)
         self.assertIn("path: /shared/volumes/smoke", rendered)
+
+    def test_storage_manifest_is_applied_from_stdin(self) -> None:
+        tenant = type("Tenant", (), {"name": "spike"})()
+        with (
+            patch(
+                "scripts.storage._render_storage",
+                return_value="kind: List\n",
+            ),
+            patch("scripts.storage._tenant_kubectl") as kubectl,
+            patch(
+                "scripts.storage._wait_smoke",
+                return_value={"name": "smoke"},
+            ),
+            patch("scripts.storage._verify_marker"),
+            patch(
+                "scripts.storage._storage_status",
+                return_value={"ready": True},
+            ),
+        ):
+            ensure_storage_ready(Path("."), {}, tenant)
+        kubectl.assert_called_once_with(
+            Path("."),
+            {},
+            tenant,
+            "apply",
+            "-f",
+            "-",
+            input_text="kind: List\n",
+        )
 
     def test_volume_inspection_failure_is_not_absence(self) -> None:
         with patch(

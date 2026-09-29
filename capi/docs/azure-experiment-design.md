@@ -291,8 +291,11 @@ Bicep, Python, or `just` recipes. Configuration is split into:
 | Explicit Azure TenantSpec JSON | Tenant name, Kubernetes version, worker count, Pod CIDR, and Service CIDR. | Yes when stored as a non-secret example |
 | Active `az` login | Tenant identity and authentication tokens. | No |
 | `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, ACR and AcrPull identity, immutable controller digest, deployment/configuration identities, and foundation checksum. | No |
-| `.runtime/azure/deletion-proofs/` | Exact owner-only public-delete proof checkpoints, removed only after Azure absence and foundation proof succeeds. | No |
-| `.runtime/azure-gate/` | Redacted destructive-gate evidence plus an exact owner-only commit/spec/tenant-bound resumable checkpoint. | No |
+
+Tenant specifications, resource identities, deletion checkpoints, and gate
+evidence are not persisted locally. The Tenant resource and provider objects
+remain authoritative in Kubernetes. The destructive gate holds exact external
+proof identity only in memory for its active run.
 
 The local file contains only non-secret selectors:
 
@@ -503,15 +506,15 @@ The proposed interface remains `just`:
 | `just azure-foundation-status` | Report only shared Azure foundation health. |
 | `just tenant-create azure <spec.json>` | Strictly submit the JSON-derived Azure Tenant and wait for operator Ready. |
 | `just tenant-status azure <tenant>` | Report generation-aware operator status through the provider-neutral envelope. |
-| `just tenant-delete azure <tenant> azure/<tenant>` | Persist exact external proof identity, issue ordinary Tenant deletion, wait for finalization, and durably retry Azure/tag absence plus foundation preservation. |
+| `just tenant-delete azure <tenant> azure/<tenant>` | Issue ordinary Tenant deletion and wait for Kubernetes/CAPI/CAPZ finalization and Tenant absence. |
 | `just azure-test-tenant-lifecycle` | Destructively prove three-worker readiness, exact non-primary VMSS instance replacement, targeted tenant deletion, absence, foundation preservation, and recreation. |
 | `just azure-destroy` | Delete the entire recorded Azure foundation resource group. |
 
 The implementation reuses the repository's `just` interface, Python
 validation helpers, fail-closed command execution, immutable version
-configuration, and sanitized evidence patterns. It should not copy local
-Docker ownership logic into the Azure profile or use Python as an Azure
-resource provider.
+configuration, and stdout diagnostics. It should not copy local Docker
+ownership logic into the Azure profile, persist Tenant-specific runtime state,
+or use Python as an Azure resource provider.
 
 ## Measured clean redeployment
 
@@ -567,8 +570,9 @@ foundation and exercised the former Python lifecycle:
 | **Complete gate** | **23m 49s** |
 
 These measurements are retained as historical context and are not the current
-operator gate result. Current evidence is written as owner-only redacted JSON
-below `.runtime/azure-gate/evidence/`.
+operator gate result. The current gate prints phase results and keeps its exact
+worker/deletion proof identity in memory; callers may explicitly redirect
+output when they want a retained record.
 
 ## Lifecycle
 

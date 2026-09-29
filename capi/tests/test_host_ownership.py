@@ -71,6 +71,90 @@ class HostOwnershipTests(unittest.TestCase):
             self.assertFalse((runtime / "lifecycle" / "local").exists())
             self.assertFalse(endpoint.exists())
 
+    def test_runtime_inventory_removes_legacy_tenant_files_only(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            runtime = root / ".runtime"
+            retained = (
+                runtime / "tenants" / "tenant-a" / "kubeconfig"
+            )
+            foundation = runtime / "azure" / "resources.json"
+            obsolete = (
+                runtime / "azure" / "deletion-proofs" / "tenant-a.json",
+                runtime / "azure-gate" / "state" / "tenant-a.json",
+                runtime
+                / "lifecycle"
+                / "azure"
+                / "tenant-a"
+                / "evidence"
+                / "delete-operation.json",
+                runtime / "rendered" / "storage" / "tenant-a" / "smoke.yaml",
+                runtime / "rendered" / "cnpg" / "tenant-a" / "sql.json",
+                runtime / "evidence" / "endpoint-success.json",
+                runtime / "storage" / "tenant-a" / "volume.json",
+                runtime
+                / "tenants"
+                / "tenant-a"
+                / (".kubeconfig-candidate-123-" + "a" * 32),
+            )
+            for path in (retained, foundation, *obsolete):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text("{}\n", encoding="utf-8")
+                path.chmod(0o600)
+            for path in runtime.rglob("*"):
+                if path.is_dir():
+                    path.chmod(0o700)
+            legacy_azure_tenants = runtime / "azure" / "tenants"
+            legacy_azure_tenants.mkdir(mode=0o700)
+            runtime.chmod(0o700)
+
+            _validate_runtime_inventory(root)
+
+            self.assertTrue(retained.exists())
+            self.assertTrue(foundation.exists())
+            self.assertTrue(all(not path.exists() for path in obsolete))
+            self.assertFalse(legacy_azure_tenants.exists())
+
+    def test_runtime_inventory_allows_only_kubeconfig_in_tenant_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            tenant = root / ".runtime" / "tenants" / "tenant-a"
+            tenant.mkdir(parents=True, mode=0o700)
+            for parent in tenant.parents:
+                if parent == root:
+                    break
+                parent.chmod(0o700)
+            kubeconfig = tenant / "kubeconfig"
+            kubeconfig.write_text("config\n", encoding="utf-8")
+            kubeconfig.chmod(0o600)
+            identity = tenant / "identity.json"
+            identity.write_text("{}\n", encoding="utf-8")
+            identity.chmod(0o600)
+
+            with self.assertRaisesRegex(RuntimeError, "identity.json"):
+                _validate_runtime_inventory(root)
+            self.assertTrue(kubeconfig.exists())
+            self.assertTrue(identity.exists())
+
+    def test_runtime_inventory_allows_sixty_three_character_cache_name(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            name = "a" * 63
+            kubeconfig = (
+                root / ".runtime" / "tenants" / name / "kubeconfig"
+            )
+            kubeconfig.parent.mkdir(parents=True, mode=0o700)
+            for parent in kubeconfig.parent.parents:
+                if parent == root:
+                    break
+                parent.chmod(0o700)
+            kubeconfig.write_text("config\n", encoding="utf-8")
+            kubeconfig.chmod(0o600)
+
+            _validate_runtime_inventory(root)
+
+            self.assertTrue(kubeconfig.exists())
+
     def test_runtime_inventory_rejects_symlinked_obsolete_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary, tempfile.TemporaryDirectory() as target:
             root = Path(temporary)

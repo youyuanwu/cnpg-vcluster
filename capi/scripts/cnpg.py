@@ -6,10 +6,9 @@ import re
 import time
 from pathlib import Path
 
-from scripts.lib.files import IntegrityError, verify_sha256, write_private_file
+from scripts.lib.files import IntegrityError, verify_sha256
 from scripts.lib.kube import wait_for
 from scripts.lib.process import run
-from scripts.lib.redaction import redact
 from scripts.lib.tenants import NOT_FOUND, _tenant_kubectl
 from scripts.lib.tenants import storage_volume_name
 from scripts.lib.controller_scenarios import (
@@ -185,43 +184,46 @@ def _cnpg_ready(root: Path, config: dict[str, str], tenant) -> bool:
 
 def _sql(root: Path, config: dict[str, str], tenant, sql: str) -> str:
     name = f"cnpg-sql-{time.time_ns()}"
-    manifest = root / ".runtime" / "rendered" / "cnpg" / tenant.name / "sql.json"
-    write_private_file(
-        manifest,
-        json.dumps(
-            {
-                "apiVersion": "v1",
-                "kind": "Pod",
-                "metadata": {"name": name, "namespace": config["DATABASE_NAMESPACE"]},
-                "spec": {
-                    "restartPolicy": "Never",
-                    "automountServiceAccountToken": False,
-                    "containers": [
-                        {
-                            "name": "psql",
-                            "image": config["POSTGRES_IMAGE"],
-                            "command": ["sleep", "300"],
-                            "env": [
-                                {
-                                    "name": "PGPASSWORD",
-                                    "valueFrom": {
-                                        "secretKeyRef": {
-                                            "name": f"{tenant.cnpg_cluster}-app",
-                                            "key": "password",
-                                        }
-                                    },
-                                }
-                            ],
-                        }
-                    ],
-                },
+    manifest = json.dumps(
+        {
+            "apiVersion": "v1",
+            "kind": "Pod",
+            "metadata": {"name": name, "namespace": config["DATABASE_NAMESPACE"]},
+            "spec": {
+                "restartPolicy": "Never",
+                "automountServiceAccountToken": False,
+                "containers": [
+                    {
+                        "name": "psql",
+                        "image": config["POSTGRES_IMAGE"],
+                        "command": ["sleep", "300"],
+                        "env": [
+                            {
+                                "name": "PGPASSWORD",
+                                "valueFrom": {
+                                    "secretKeyRef": {
+                                        "name": f"{tenant.cnpg_cluster}-app",
+                                        "key": "password",
+                                    }
+                                },
+                            }
+                        ],
+                    }
+                ],
             },
-            sort_keys=True,
-        )
-        + "\n",
+        },
+        sort_keys=True,
     )
     try:
-        _tenant_kubectl(root, config, tenant, "apply", "-f", str(manifest))
+        _tenant_kubectl(
+            root,
+            config,
+            tenant,
+            "apply",
+            "-f",
+            "-",
+            input_text=manifest,
+        )
         _tenant_kubectl(
             root,
             config,
@@ -271,7 +273,6 @@ def _sql(root: Path, config: dict[str, str], tenant, sql: str) -> str:
             "--wait=true",
             check=False,
         )
-        manifest.unlink(missing_ok=True)
         remaining = _tenant_kubectl(
             root,
             config,
@@ -693,10 +694,6 @@ def _evidence_payload(root: Path, config: dict[str, str], client, tenant) -> dic
 
 
 def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
-    failure = root / ".runtime" / "evidence" / "cnpg-failure.txt"
-    success = root / ".runtime" / "evidence" / "cnpg-success.json"
-    failure.unlink(missing_ok=True)
-    success.unlink(missing_ok=True)
     client = None
     tenant = None
     evidence = None
@@ -718,18 +715,9 @@ def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
         _verify_marker(root, config, tenant)
         _verify_filesystem(config, tenant)
         evidence = _evidence_payload(root, config, client, tenant)
-    except Exception as exc:
-        write_private_file(failure, redact(str(exc)) + "\n")
-        raise
     finally:
         if client is not None and tenant is not None:
-            try:
-                _cleanup_storage_and_tenant(root, config, tenant)
-            except Exception as exc:
-                success.unlink(missing_ok=True)
-                write_private_file(failure, redact(str(exc)) + "\n")
-                raise
+            _cleanup_storage_and_tenant(root, config, tenant)
     if evidence is None:
         raise RuntimeError("CNPG evidence was not produced")
-    write_private_file(success, json.dumps(evidence, sort_keys=True) + "\n")
-    print("CNPG persistence checks passed")
+    print(json.dumps(evidence, sort_keys=True))

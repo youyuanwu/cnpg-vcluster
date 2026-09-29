@@ -43,6 +43,10 @@ environment. The same Rust manager runs in an explicit `local` or `azure`
 provider mode. Azure commands accept the retained JSON client specification,
 submit an Azure `Tenant`, and use its generation-aware status and ordinary
 finalization. Shared Azure foundation provisioning remains external.
+Tenant lifecycle identity, checkpoints, rendered inputs, and evidence are not
+persisted locally. Local validation may cache an owner-only Tenant kubeconfig
+on demand; deletion removes it, and explicit cache-clear commands remove one
+or all cached kubeconfigs.
 CAPD and the shared-host storage profile remain local development mechanisms;
 neither profile is a production hostile-tenant isolation boundary.
 

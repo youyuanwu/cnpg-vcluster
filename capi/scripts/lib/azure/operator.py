@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import re
 import time
 from pathlib import Path
 from typing import Mapping
@@ -11,23 +10,9 @@ from scripts.lib.tenant_spec import TenantSpec
 from scripts.lib.tenant_status import TenantStatus
 
 from .common import _kubectl, load_azure_configuration
-from scripts.lib.files import (
-    private_file_exists,
-    read_private_file,
-    unlink_private_file,
-    write_private_file,
-)
-
-from .proof import (
-    AzureDeletionProof,
-    capture_operator_deletion_proof,
-    prove_operator_deletion,
-    validate_operator_deletion_proof,
-)
 
 
 FIELD_MANAGER = "cnpg-vcluster-azure-tenant-client"
-DELETION_CHECKPOINT_SCHEMA = 1
 
 
 def tenant_document(spec: TenantSpec) -> dict[str, object]:
@@ -222,92 +207,9 @@ def status_tenant(root: Path, tenant: str) -> TenantStatus:
     return tenant_status(tenant, read_tenant(root, tenant))
 
 
-def _deletion_checkpoint_path(root: Path, tenant: str) -> Path:
-    if not re.fullmatch(r"[a-z0-9](?:[-a-z0-9]*[a-z0-9])?", tenant):
-        raise RuntimeError("Azure Tenant name is invalid")
-    return root / ".runtime" / "azure" / "deletion-proofs" / f"{tenant}.json"
-
-
-def _write_deletion_checkpoint(
-    root: Path,
-    tenant: str,
-    proof: AzureDeletionProof,
-) -> None:
-    write_private_file(
-        _deletion_checkpoint_path(root, tenant),
-        json.dumps(
-            {
-                "schema": DELETION_CHECKPOINT_SCHEMA,
-                "proof": proof.to_mapping(),
-            },
-            sort_keys=True,
-        )
-        + "\n",
-    )
-
-
-def _load_deletion_checkpoint(
-    root: Path,
-    config: Mapping[str, str],
-    tenant: str,
-) -> AzureDeletionProof | None:
-    path = _deletion_checkpoint_path(root, tenant)
-    if not private_file_exists(path):
-        return None
-    payload = json.loads(read_private_file(path).decode("utf-8"))
-    if (
-        not isinstance(payload, dict)
-        or set(payload) != {"schema", "proof"}
-        or payload.get("schema") != DELETION_CHECKPOINT_SCHEMA
-        or not isinstance(payload.get("proof"), dict)
-    ):
-        raise RuntimeError("Azure deletion proof checkpoint is invalid")
-    proof = AzureDeletionProof.from_mapping(payload["proof"])
-    validate_operator_deletion_proof(root, config, tenant, proof)
-    return proof
-
-
-def _validate_live_tenant_checkpoint(
-    tenant: Mapping[str, object],
-    proof: AzureDeletionProof,
-) -> None:
-    metadata = tenant.get("metadata")
-    status = tenant.get("status")
-    provider = status.get("provider") if isinstance(status, dict) else None
-    binding = provider.get("binding") if isinstance(provider, dict) else None
-    if (
-        not isinstance(metadata, dict)
-        or metadata.get("name") != proof.tenant
-        or metadata.get("uid") != proof.binding.get("tenantUID")
-        or not isinstance(binding, dict)
-        or {
-            str(key): str(value)
-            for key, value in binding.items()
-            if isinstance(key, str) and isinstance(value, str)
-        }
-        != dict(proof.binding)
-    ):
-        raise RuntimeError(
-            "Azure deletion proof checkpoint does not match the live Tenant"
-        )
-
-
 def delete_tenant(root: Path, tenant: str) -> None:
-    config = load_azure_configuration(root)
-    payload = read_tenant(root, tenant)
-    if payload is None:
-        proof = _load_deletion_checkpoint(root, config, tenant)
-        if proof is None:
-            return
-        prove_operator_deletion(root, config, proof)
-        unlink_private_file(_deletion_checkpoint_path(root, tenant))
+    if read_tenant(root, tenant) is None:
         return
-    proof = _load_deletion_checkpoint(root, config, tenant)
-    if proof is None:
-        proof = capture_operator_deletion_proof(root, config, payload)
-        _write_deletion_checkpoint(root, tenant, proof)
-    else:
-        _validate_live_tenant_checkpoint(payload, proof)
     _kubectl(
         root,
         "delete",
@@ -316,5 +218,3 @@ def delete_tenant(root: Path, tenant: str) -> None:
         "--wait=false",
     )
     wait_tenant_absent(root, tenant)
-    prove_operator_deletion(root, config, proof)
-    unlink_private_file(_deletion_checkpoint_path(root, tenant))
