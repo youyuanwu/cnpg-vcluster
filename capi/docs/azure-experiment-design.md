@@ -91,6 +91,7 @@ flowchart TB
   ACR[Shared ACR]
   Controllers[CAPI, CABPK, CAPZ, Kamaji CAPI provider]
   TenantOperator[Rust Tenant operator in Azure mode]
+  Admin[Tenant Admin read-only UI]
   TenantCR[Azure Tenant CR]
   Kamaji[Kamaji and datastore]
   TenantAPI[Kamaji tenant API internal LoadBalancer]
@@ -109,7 +110,9 @@ flowchart TB
   AKSSubnet --> AKS
   AKS --> Controllers
   AKS --> TenantOperator
+  AKS --> Admin
   ACR --> TenantOperator
+  ACR --> Admin
   TenantCR --> TenantOperator
   TenantOperator --> Cluster
   AKS --> Kamaji
@@ -138,7 +141,7 @@ The foundation uses one resource group and one VNet with two subnets:
 | AKS subnet | Hosts the AKS management node pool and Kamaji load balancers. |
 | Tenant subnet | Hosts the tenant VMSS network interfaces. |
 | AKS | Runs all management and tenant control-plane workloads. |
-| Shared ACR | Stores the static Tenant manager image deployed by immutable digest. |
+| Shared ACR | Stores the static Tenant manager and provider-neutral Tenant Admin images deployed by immutable digest. |
 | User-assigned managed identity | Authenticates CAPZ and, for the experiment, tenant Azure integrations. |
 
 AKS enables its OIDC issuer and Azure Workload Identity. The user-assigned
@@ -148,7 +151,8 @@ CAPZ release installs Azure Service Operator (ASO), the same identity receives
 a second federated credential for ASO's ServiceAccount because each federated
 credential has one subject.
 The AKS kubelet identity receives `AcrPull` on the shared ACR. The Tenant
-operator receives no Azure credentials.
+operator receives no Azure credentials. Tenant Admin also receives no Azure
+credentials.
 
 The default compute profile minimizes cost:
 
@@ -290,7 +294,7 @@ Bicep, Python, or `just` recipes. Configuration is split into:
 | `config/azure.local.env` | Subscription ID, location, and operator-selected resource prefix. | No |
 | Explicit Azure TenantSpec JSON | Tenant name, Kubernetes version, worker count, Pod CIDR, and Service CIDR. | Yes when stored as a non-secret example |
 | Active `az` login | Tenant identity and authentication tokens. | No |
-| `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, ACR and AcrPull identity, immutable controller digest, deployment/configuration identities, and foundation checksum. | No |
+| `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, ACR and AcrPull identity, immutable controller/admin digests, Deployment/configuration identities, and foundation checksum. | No |
 
 Tenant specifications, resource identities, deletion checkpoints, and gate
 evidence are not persisted locally. The Tenant resource and provider objects
@@ -337,7 +341,11 @@ After Bicep deployment, its outputs and the exact IDs of the resource group,
 AKS cluster, AKS-managed node resource group, VNet, subnets, identity, role
 assignments, and federated credentials are atomically recorded in
 `.runtime/azure/resources.json`. Controller UIDs are added after management
-installation.
+installation. The optional `adminImage` and `adminDeploymentUid` fields are
+added together only after the read-only admin Deployment, Service, RBAC,
+health endpoints, overview, and Tenant list pass validation. A healthy
+pre-admin foundation remains loadable until management installation records
+both fields.
 Status and cleanup use these exact IDs rather than rediscovering resources by
 a broad name or tag query. The inventory schema and checksum cover only
 foundation-owned inputs. A pre-cutover schema or changed subscription, prefix,
@@ -502,8 +510,8 @@ The proposed interface remains `just`:
 |---|---|
 | `just azure-preflight` | Verify Azure CLI login, subscription, required providers, tools, version pins, and configuration. |
 | `just azure-create-foundation` | Create the resource group, VNet, identity, AKS, shared ACR, and exact kubelet AcrPull assignment. |
-| `just azure-create-management` | Install CAPI/CAPZ/Kamaji/ASO, build and push the static Tenant manager, resolve its ACR digest, and install the Azure-mode startup shell. |
-| `just azure-foundation-status` | Report only shared Azure foundation health. |
+| `just azure-create-management` | Install CAPI/CAPZ/Kamaji/ASO, build and push the static Tenant manager and Tenant Admin images, verify their ACR digests, and deploy immutable references. |
+| `just azure-foundation-status` | Report shared Azure foundation health, including the recorded admin repository, digest, Deployment UID, rollout, provider mode, Service, read-only RBAC, and API health when installed. |
 | `just tenant-create azure <spec.json>` | Strictly submit the JSON-derived Azure Tenant and wait for operator Ready. |
 | `just tenant-status azure <tenant>` | Report generation-aware operator status through the provider-neutral envelope. |
 | `just tenant-delete azure <tenant> azure/<tenant>` | Issue ordinary Tenant deletion and wait for Kubernetes/CAPI/CAPZ finalization and Tenant absence. |
@@ -585,7 +593,10 @@ output when they want a retained record.
 5. Create the user-assigned identity and role assignment.
 6. Create AKS with OIDC and Workload Identity.
 7. Install the compatible controller stack.
-8. Verify controller deployments and CAPZ authentication.
+8. Publish and deploy the static Tenant manager and read-only Tenant Admin by
+   verified ACR digest.
+9. Verify controller deployments, CAPZ authentication, admin inventory,
+   `/healthz`, `/readyz`, overview, and Tenant list contracts.
 
 ### Tenant creation
 
@@ -646,6 +657,9 @@ The Azure experiment proves:
 It does not prove production security isolation, regional resilience,
 availability-zone behavior, disaster recovery, backup correctness, production
 Azure Disk/CNPG behavior, upgrade safety, autoscaling, or large tenant counts.
+The admin Service remains ClusterIP-only and is accessed through an
+authenticated management-cluster port-forward; Ingress and application
+authentication are outside this experiment.
 
 ## Exclusions and future work
 

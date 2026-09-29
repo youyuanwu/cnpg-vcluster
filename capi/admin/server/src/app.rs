@@ -39,7 +39,7 @@ impl AppState {
 
 pub fn router(state: AppState, web_directory: PathBuf) -> Router {
     let index = web_directory.join("index.html");
-    let static_files = ServeDir::new(web_directory).not_found_service(ServeFile::new(index));
+    let static_files = ServeDir::new(web_directory).fallback(ServeFile::new(index));
     Router::new()
         .route("/healthz", get(healthz))
         .route(READINESS_PATH, get(readyz))
@@ -471,6 +471,7 @@ mod tests {
             )
             .await
             .expect("response");
+        assert_eq!(nested.status(), StatusCode::OK);
         let nested_body = nested.into_body().collect().await.expect("body").to_bytes();
         assert!(
             nested_body

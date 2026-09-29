@@ -10,6 +10,35 @@ from scripts.lib.ownership import IdentityRecord, OwnershipError
 
 
 class HostOwnershipTests(unittest.TestCase):
+    def test_runtime_inventory_accepts_only_exact_admin_build_outputs(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            web = root / ".runtime/rendered/admin/web"
+            web.mkdir(parents=True, mode=0o700)
+            files = (
+                web.parent / "tenant-admin",
+                web.parent / "deployment-local.yaml",
+                web / "index.html",
+                web / ("tenant-admin-web-" + "a" * 16 + ".js"),
+                web / ("tenant-admin-web-" + "a" * 16 + "_bg.wasm"),
+                web / ("style-" + "b" * 16 + ".css"),
+            )
+            for path in files:
+                path.write_bytes(b"fixture")
+                path.chmod(0o600)
+            for path in (root / ".runtime").rglob("*"):
+                if path.is_dir():
+                    path.chmod(0o700)
+            (root / ".runtime").chmod(0o700)
+            _validate_runtime_inventory(root)
+
+            source_map = web / ("tenant-admin-web-" + "a" * 16 + ".js.map")
+            source_map.write_text("{}\n", encoding="utf-8")
+            source_map.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "unexpected runtime file"):
+                _validate_runtime_inventory(root)
+            self.assertTrue(source_map.exists())
+
     def test_kind_identity_requires_exact_labels_and_identifier(self) -> None:
         expected = IdentityRecord(
             "container",

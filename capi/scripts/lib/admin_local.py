@@ -1,0 +1,857 @@
+from __future__ import annotations
+
+import json
+import re
+import shutil
+import subprocess
+from pathlib import Path
+
+import yaml
+
+from scripts.lib.admin import build_admin_image
+from scripts.lib.config import parse_duration
+from scripts.lib.controller_state import delete_named
+from scripts.lib.files import write_private_file
+from scripts.lib.kube import ManagementClient
+from scripts.lib.management import (
+    require_management_ownership,
+    validate_management_kubeconfig,
+)
+from scripts.lib.process import run
+
+
+ADMIN_NAME = "tenant-admin"
+ADMIN_NAMESPACE = "tenant-system"
+ADMIN_FIELD_MANAGER = "cnpg-vcluster-admin"
+ADMIN_LABEL = "app.kubernetes.io/name=tenant-admin"
+ADMIN_SERVICE_PROXY = (
+    "/api/v1/namespaces/tenant-system/services/http:tenant-admin:80/proxy"
+)
+ADMIN_IMAGE_PATTERN = re.compile(
+    r"[a-z0-9](?:[a-z0-9._/-]*[a-z0-9])?:"
+    r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}"
+)
+ADMIN_CLASSIFICATIONS = {
+    "ready",
+    "progressing",
+    "degraded",
+    "failed",
+    "deleting",
+    "ownership-invalid",
+}
+ADMIN_CONDITION_STATUSES = {"True", "False", "Unknown"}
+ADMIN_TOPOLOGY_NODE_KINDS = {
+    "tenant",
+    "control-plane",
+    "worker-pool",
+    "machine",
+    "node",
+    "provider-resource",
+    "add-on",
+    "database",
+}
+ADMIN_TOPOLOGY_HEALTH = {
+    "ready",
+    "progressing",
+    "degraded",
+    "failed",
+    "deleting",
+    "unknown",
+}
+ADMIN_TOPOLOGY_EDGE_KINDS = {
+    "owns",
+    "contains",
+    "manages",
+    "provides",
+    "represents",
+    "depends-on",
+}
+
+
+def render_local_admin_deployment(root: Path, image: str) -> Path:
+    if not ADMIN_IMAGE_PATTERN.fullmatch(image):
+        raise RuntimeError("Tenant Admin image reference is unsafe")
+    source = root / "admin/config/deployment/deployment-local.yaml.tpl"
+    template = source.read_text(encoding="utf-8")
+    placeholder = "${TENANT_ADMIN_IMAGE}"
+    if template.count(placeholder) != 1:
+        raise RuntimeError("local Tenant Admin template image placeholder is invalid")
+    rendered = template.replace(placeholder, image)
+    if placeholder in rendered:
+        raise RuntimeError("local Tenant Admin image substitution was incomplete")
+    try:
+        deployment = yaml.safe_load(rendered)
+    except yaml.YAMLError as exc:
+        raise RuntimeError("rendered local Tenant Admin Deployment is invalid") from exc
+    try:
+        rendered_image = deployment["spec"]["template"]["spec"]["containers"][0][
+            "image"
+        ]
+    except (KeyError, IndexError, TypeError) as exc:
+        raise RuntimeError("rendered local Tenant Admin Deployment is incomplete") from exc
+    if rendered_image != image:
+        raise RuntimeError("rendered local Tenant Admin image does not match")
+    destination = (
+        root / ".runtime/rendered/admin/deployment-local.yaml"
+    )
+    write_private_file(destination, rendered)
+    return destination
+
+
+def _admin_resource_paths(root: Path) -> tuple[Path, ...]:
+    return (
+        root / "admin/config/rbac/service-account.yaml",
+        root / "admin/config/rbac/cluster-role.yaml",
+        root / "admin/config/rbac/cluster-role-binding.yaml",
+        root / "admin/config/service/service.yaml",
+    )
+
+
+def _apply(client: ManagementClient, path: Path) -> None:
+    client.kubectl(
+        "apply",
+        "--server-side",
+        f"--field-manager={ADMIN_FIELD_MANAGER}",
+        "--force-conflicts",
+        "-f",
+        str(path),
+    )
+
+
+def _load_admin_image(root: Path, config: dict[str, str], image: str) -> None:
+    run(
+        [
+            str(root / ".tools/bin/kind"),
+            "load",
+            "docker-image",
+            image,
+            "--name",
+            config["KIND_CLUSTER_NAME"],
+        ],
+        timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
+    )
+
+
+def _required_mapping(value: object, description: str) -> dict[str, object]:
+    if not isinstance(value, dict):
+        raise RuntimeError(f"Tenant Admin {description} is not an object")
+    return value
+
+
+def _required_list(value: object, description: str) -> list[object]:
+    if not isinstance(value, list):
+        raise RuntimeError(f"Tenant Admin {description} is not a list")
+    return value
+
+
+def _required_string(value: object, description: str) -> str:
+    if not isinstance(value, str) or not value:
+        raise RuntimeError(f"Tenant Admin {description} is missing")
+    return value
+
+
+def _container(document: dict[str, object]) -> dict[str, object]:
+    try:
+        containers = document["spec"]["template"]["spec"]["containers"]
+    except (KeyError, TypeError) as exc:
+        raise RuntimeError("Tenant Admin Deployment container is missing") from exc
+    if not isinstance(containers, list) or len(containers) != 1:
+        raise RuntimeError("Tenant Admin Deployment must have exactly one container")
+    return _required_mapping(containers[0], "Deployment container")
+
+
+def _expected_rules(root: Path) -> list[dict[str, object]]:
+    document = yaml.safe_load(
+        (root / "admin/config/rbac/cluster-role.yaml").read_text(encoding="utf-8")
+    )
+    return document["rules"]
+
+
+def _normalized_rules(value: object) -> list[tuple[tuple[str, ...], ...]]:
+    rules = _required_list(value, "ClusterRole rules")
+    normalized = []
+    for rule_value in rules:
+        rule = _required_mapping(rule_value, "ClusterRole rule")
+        if set(rule) != {"apiGroups", "resources", "verbs"}:
+            raise RuntimeError("Tenant Admin ClusterRole rule has unexpected fields")
+        raw_groups = _required_list(rule["apiGroups"], "RBAC API groups")
+        raw_resources = _required_list(rule["resources"], "RBAC resources")
+        raw_verbs = _required_list(rule["verbs"], "RBAC verbs")
+        if not all(
+            isinstance(value, str)
+            for value in (*raw_groups, *raw_resources, *raw_verbs)
+        ):
+            raise RuntimeError("Tenant Admin ClusterRole values are invalid")
+        groups = tuple(sorted(raw_groups))
+        resources = tuple(sorted(raw_resources))
+        verbs = tuple(sorted(raw_verbs))
+        if (
+            "*" in groups
+            or "*" in resources
+            or "*" in verbs
+            or "secrets" in resources
+            or any("/" in resource for resource in resources)
+            or verbs != ("get", "list")
+        ):
+            raise RuntimeError("Tenant Admin ClusterRole is not exact read-only RBAC")
+        normalized.append((groups, resources, verbs))
+    return sorted(normalized)
+
+
+def _verify_service_account(service_account: dict[str, object]) -> None:
+    metadata = _required_mapping(
+        service_account.get("metadata"), "ServiceAccount metadata"
+    )
+    if (
+        metadata.get("name") != ADMIN_NAME
+        or metadata.get("namespace") != ADMIN_NAMESPACE
+        or service_account.get("automountServiceAccountToken") is not False
+    ):
+        raise RuntimeError("Tenant Admin ServiceAccount contract does not match")
+
+
+def _verify_role(root: Path, role: dict[str, object]) -> None:
+    metadata = _required_mapping(role.get("metadata"), "ClusterRole metadata")
+    if (
+        metadata.get("name") != ADMIN_NAME
+        or _normalized_rules(role.get("rules"))
+        != _normalized_rules(_expected_rules(root))
+    ):
+        raise RuntimeError("Tenant Admin ClusterRole contract does not match")
+
+
+def _verify_binding(binding: dict[str, object]) -> None:
+    metadata = _required_mapping(
+        binding.get("metadata"), "ClusterRoleBinding metadata"
+    )
+    if (
+        metadata.get("name") != ADMIN_NAME
+        or binding.get("roleRef")
+        != {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "ClusterRole",
+            "name": ADMIN_NAME,
+        }
+        or binding.get("subjects")
+        != [
+            {
+                "kind": "ServiceAccount",
+                "name": ADMIN_NAME,
+                "namespace": ADMIN_NAMESPACE,
+            }
+        ]
+    ):
+        raise RuntimeError("Tenant Admin ClusterRoleBinding contract does not match")
+
+
+def _verify_service(service: dict[str, object]) -> None:
+    metadata = _required_mapping(service.get("metadata"), "Service metadata")
+    service_spec = _required_mapping(service.get("spec"), "Service spec")
+    if (
+        metadata.get("name") != ADMIN_NAME
+        or metadata.get("namespace") != ADMIN_NAMESPACE
+        or service_spec.get("type") != "ClusterIP"
+        or service_spec.get("selector")
+        != {"app.kubernetes.io/name": ADMIN_NAME}
+        or service_spec.get("ports")
+        != [
+            {
+                "name": "http",
+                "port": 80,
+                "protocol": "TCP",
+                "targetPort": 8080,
+            }
+        ]
+        or not isinstance(service_spec.get("clusterIP"), str)
+        or not service_spec["clusterIP"]
+    ):
+        raise RuntimeError("Tenant Admin Service contract does not match")
+
+
+def _verify_static_resources(
+    root: Path,
+    service_account: dict[str, object],
+    role: dict[str, object],
+    binding: dict[str, object],
+    service: dict[str, object],
+) -> None:
+    _verify_service_account(service_account)
+    _verify_role(root, role)
+    _verify_binding(binding)
+    _verify_service(service)
+
+
+def _verify_deployment_contract(
+    deployment: dict[str, object],
+    image: str,
+    *,
+    require_ready: bool,
+) -> str:
+    metadata = _required_mapping(deployment.get("metadata"), "Deployment metadata")
+    uid = _required_string(metadata.get("uid"), "Deployment UID")
+    spec = _required_mapping(deployment.get("spec"), "Deployment spec")
+    template = _required_mapping(spec.get("template"), "Pod template")
+    pod = _required_mapping(template.get("spec"), "Pod template spec")
+    container = _container(deployment)
+    if (
+        metadata.get("name") != ADMIN_NAME
+        or metadata.get("namespace") != ADMIN_NAMESPACE
+        or spec.get("replicas") != 1
+        or spec.get("strategy")
+        != {
+            "type": "RollingUpdate",
+            "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},
+        }
+        or pod.get("serviceAccountName") != ADMIN_NAME
+        or pod.get("automountServiceAccountToken") is not True
+        or pod.get("enableServiceLinks") is not False
+        or pod.get("terminationGracePeriodSeconds") != 30
+        or pod.get("volumes") not in (None, [])
+        or pod.get("securityContext")
+        != {
+            "runAsNonRoot": True,
+            "runAsUser": 65532,
+            "runAsGroup": 65532,
+            "seccompProfile": {"type": "RuntimeDefault"},
+        }
+        or container.get("name") != "admin"
+        or container.get("image") != image
+        or container.get("imagePullPolicy") != "Never"
+        or container.get("env")
+        != [{"name": "TENANT_ADMIN_PROVIDER", "value": "local"}]
+        or container.get("ports")
+        != [{"name": "http", "containerPort": 8080, "protocol": "TCP"}]
+        or container.get("securityContext")
+        != {
+            "runAsNonRoot": True,
+            "privileged": False,
+            "allowPrivilegeEscalation": False,
+            "readOnlyRootFilesystem": True,
+            "capabilities": {"drop": ["ALL"]},
+        }
+    ):
+        raise RuntimeError("Tenant Admin Deployment contract does not match")
+    for name, path in (("livenessProbe", "/healthz"), ("readinessProbe", "/readyz")):
+        probe = _required_mapping(container.get(name), f"{name}")
+        http_get = _required_mapping(probe.get("httpGet"), f"{name} HTTP request")
+        if http_get.get("path") != path or http_get.get("port") != "http":
+            raise RuntimeError(f"Tenant Admin {name} contract does not match")
+    if require_ready:
+        status = _required_mapping(deployment.get("status"), "Deployment status")
+        if (
+            status.get("readyReplicas") != 1
+            or status.get("updatedReplicas") != 1
+            or status.get("availableReplicas") != 1
+            or status.get("observedGeneration") != metadata.get("generation")
+        ):
+            raise RuntimeError("Tenant Admin Deployment is not exactly ready")
+    return uid
+
+
+def _auth_can_i(
+    client: ManagementClient,
+    verb: str,
+    resource: str,
+    *,
+    api_group: str | None = None,
+) -> bool:
+    arguments = [
+        "auth",
+        "can-i",
+        verb,
+        f"{resource}.{api_group}" if api_group else resource,
+        f"--as=system:serviceaccount:{ADMIN_NAMESPACE}:{ADMIN_NAME}",
+    ]
+    response = client.kubectl(*arguments, check=False)
+    answer = response.stdout.strip()
+    if answer not in {"yes", "no"}:
+        raise RuntimeError("Tenant Admin RBAC authorization response is invalid")
+    return response.returncode == 0 and answer == "yes"
+
+
+def _service_proxy(client: ManagementClient, path: str) -> str:
+    response = client.kubectl(
+        "get",
+        "--raw",
+        f"{ADMIN_SERVICE_PROXY}/{path.lstrip('/')}",
+    )
+    return response.stdout
+
+
+def _envelope(raw: str, description: str) -> object:
+    try:
+        envelope = json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Tenant Admin {description} response is not JSON") from exc
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != {"schemaVersion", "data"}
+        or envelope.get("schemaVersion") != 1
+    ):
+        raise RuntimeError(f"Tenant Admin {description} response envelope is invalid")
+    return envelope["data"]
+
+
+def _validate_summary(value: object) -> str:
+    summary = _required_mapping(value, "Tenant summary")
+    expected = {
+        "name",
+        "provider",
+        "classification",
+        "kubernetesVersion",
+        "requestedWorkers",
+        "requestedDatabases",
+        "endpoint",
+        "createdAt",
+        "conditions",
+    }
+    conditions = summary.get("conditions")
+    if (
+        set(summary) != expected
+        or summary.get("provider") not in {"local", "azure", "unknown"}
+        or summary.get("classification") not in ADMIN_CLASSIFICATIONS
+        or not isinstance(summary.get("kubernetesVersion"), str)
+        or not summary["kubernetesVersion"]
+        or not _is_integer(summary.get("requestedWorkers"))
+        or (
+            summary.get("requestedDatabases") is not None
+            and not _is_integer(summary.get("requestedDatabases"))
+        )
+        or (
+            summary.get("endpoint") is not None
+            and not isinstance(summary.get("endpoint"), str)
+        )
+        or (
+            summary.get("createdAt") is not None
+            and not isinstance(summary.get("createdAt"), str)
+        )
+        or not isinstance(conditions, list)
+    ):
+        raise RuntimeError("Tenant Admin Tenant summary response is invalid")
+    for condition_value in conditions:
+        condition = _required_mapping(condition_value, "Tenant condition")
+        if (
+            set(condition)
+            != {
+                "type",
+                "status",
+                "reason",
+                "message",
+                "observedGeneration",
+                "lastTransitionTime",
+            }
+            or not isinstance(condition.get("type"), str)
+            or condition.get("status") not in ADMIN_CONDITION_STATUSES
+            or any(
+                condition.get(key) is not None
+                and not isinstance(condition.get(key), str)
+                for key in ("reason", "message", "lastTransitionTime")
+            )
+            or (
+                condition.get("observedGeneration") is not None
+                and not _is_integer(condition.get("observedGeneration"))
+            )
+        ):
+            raise RuntimeError("Tenant Admin Tenant condition response is invalid")
+    return _required_string(summary.get("name"), "Tenant summary name")
+
+
+def _is_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _validate_topology(topology: dict[str, object], name: str) -> None:
+    nodes = topology.get("nodes")
+    edges = topology.get("edges")
+    if (
+        set(topology) != {"tenantName", "provider", "nodes", "edges"}
+        or topology.get("tenantName") != name
+        or topology.get("provider") not in {"local", "azure", "unknown"}
+        or not isinstance(nodes, list)
+        or not isinstance(edges, list)
+        or not nodes
+    ):
+        raise RuntimeError("Tenant Admin Tenant topology response is invalid")
+    for value in nodes:
+        node = _required_mapping(value, "topology node")
+        if (
+            set(node)
+            != {
+                "id",
+                "kind",
+                "label",
+                "health",
+                "resource",
+                "attributes",
+            }
+            or not isinstance(node.get("id"), str)
+            or not node["id"]
+            or node.get("kind") not in ADMIN_TOPOLOGY_NODE_KINDS
+            or not isinstance(node.get("label"), str)
+            or node.get("health") not in ADMIN_TOPOLOGY_HEALTH
+            or (
+                node.get("resource") is not None
+                and not isinstance(node.get("resource"), dict)
+            )
+            or not isinstance(node.get("attributes"), list)
+        ):
+            raise RuntimeError("Tenant Admin topology node response is invalid")
+    for value in edges:
+        edge = _required_mapping(value, "topology edge")
+        if (
+            set(edge) != {"id", "source", "target", "kind", "label"}
+            or any(
+                not isinstance(edge.get(key), str) or not edge[key]
+                for key in ("id", "source", "target")
+            )
+            or edge.get("kind") not in ADMIN_TOPOLOGY_EDGE_KINDS
+            or (
+                edge.get("label") is not None
+                and not isinstance(edge.get("label"), str)
+            )
+        ):
+            raise RuntimeError("Tenant Admin topology edge response is invalid")
+
+
+def verify_admin_api(
+    client: ManagementClient,
+    *,
+    expected_tenant_names: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    for path in ("healthz", "readyz"):
+        if _service_proxy(client, path):
+            raise RuntimeError(f"Tenant Admin {path} response body must be empty")
+    overview = _required_mapping(
+        _envelope(_service_proxy(client, "api/v1/overview"), "overview"),
+        "overview data",
+    )
+    if (
+        set(overview) != {"providerMode", "tenants", "components"}
+        or overview.get("providerMode") != "local"
+    ):
+        raise RuntimeError("Tenant Admin overview response is invalid")
+    counts = _required_mapping(overview.get("tenants"), "overview counts")
+    if set(counts) != {
+        "total",
+        "ready",
+        "progressing",
+        "degraded",
+        "failed",
+        "deleting",
+    } or not all(_is_integer(value) for value in counts.values()):
+        raise RuntimeError("Tenant Admin overview counts are invalid")
+    summaries = _required_list(
+        _envelope(_service_proxy(client, "api/v1/tenants"), "Tenant list"),
+        "Tenant list data",
+    )
+    names = tuple(_validate_summary(summary) for summary in summaries)
+    if names != tuple(sorted(names)) or counts["total"] != len(names):
+        raise RuntimeError("Tenant Admin overview and Tenant list disagree")
+    if expected_tenant_names is not None and names != tuple(
+        sorted(expected_tenant_names)
+    ):
+        raise RuntimeError("Tenant Admin Tenant list does not match expected identity")
+    for name in names:
+        detail = _required_mapping(
+            _envelope(
+                _service_proxy(client, f"api/v1/tenants/{name}"),
+                f"Tenant {name} detail",
+            ),
+            "Tenant detail data",
+        )
+        if set(detail) != {
+            "summary",
+            "uid",
+            "generation",
+            "observedGeneration",
+            "specification",
+            "providerStatus",
+            "blockers",
+            "managementResources",
+        } or _validate_summary(detail.get("summary")) != name or (
+            not _is_integer(detail.get("generation"))
+            or (
+                detail.get("observedGeneration") is not None
+                and not _is_integer(detail.get("observedGeneration"))
+            )
+            or not isinstance(detail.get("specification"), dict)
+            or not isinstance(detail.get("providerStatus"), dict)
+            or not isinstance(detail.get("blockers"), list)
+            or not isinstance(detail.get("managementResources"), list)
+        ):
+            raise RuntimeError("Tenant Admin Tenant detail response is invalid")
+        _required_string(detail.get("uid"), "Tenant detail UID")
+        topology = _required_mapping(
+            _envelope(
+                _service_proxy(client, f"api/v1/tenants/{name}/topology"),
+                f"Tenant {name} topology",
+            ),
+            "Tenant topology data",
+        )
+        _validate_topology(topology, name)
+    return {
+        "schemaVersion": 1,
+        "tenantCount": len(names),
+        "tenantNames": list(names),
+        "counts": counts,
+    }
+
+
+def verify_local_admin(
+    root: Path,
+    client: ManagementClient,
+    image: str,
+    *,
+    expected_deployment_uid: str | None = None,
+    expected_tenant_names: tuple[str, ...] | None = None,
+) -> dict[str, object]:
+    deployment = client.json(
+        "-n", ADMIN_NAMESPACE, "get", f"deployment/{ADMIN_NAME}"
+    )
+    uid = _verify_deployment_contract(deployment, image, require_ready=True)
+    if expected_deployment_uid is not None and uid != expected_deployment_uid:
+        raise RuntimeError("Tenant Admin Deployment UID changed during installation")
+    pods = client.json(
+        "-n",
+        ADMIN_NAMESPACE,
+        "get",
+        "pods",
+        "-l",
+        ADMIN_LABEL,
+    )
+    items = _required_list(pods.get("items"), "Pod inventory")
+    active = [
+        item
+        for item in items
+        if isinstance(item, dict)
+        and isinstance(item.get("metadata"), dict)
+        and not item["metadata"].get("deletionTimestamp")
+    ]
+    if len(active) != 1:
+        raise RuntimeError("Tenant Admin must have exactly one active Pod")
+    pod = _required_mapping(active[0], "Pod")
+    pod_metadata = _required_mapping(pod.get("metadata"), "Pod metadata")
+    pod_uid = _required_string(pod_metadata.get("uid"), "Pod UID")
+    if pod_metadata.get("deletionTimestamp"):
+        raise RuntimeError("Tenant Admin Pod is terminating")
+    pod_container = _required_mapping(
+        _required_list(
+            _required_mapping(pod.get("spec"), "Pod spec").get("containers"),
+            "Pod containers",
+        )[0],
+        "Pod container",
+    )
+    if (
+        pod_container.get("image") != image
+        or pod_container.get("env")
+        != [{"name": "TENANT_ADMIN_PROVIDER", "value": "local"}]
+        or not any(
+            condition.get("type") == "Ready"
+            and condition.get("status") == "True"
+            for condition in _required_list(
+                _required_mapping(pod.get("status"), "Pod status").get("conditions"),
+                "Pod conditions",
+            )
+            if isinstance(condition, dict)
+        )
+    ):
+        raise RuntimeError("Tenant Admin Pod identity or readiness does not match")
+    service_account = client.json(
+        "-n", ADMIN_NAMESPACE, "get", f"serviceaccount/{ADMIN_NAME}"
+    )
+    role = client.json("get", f"clusterrole/{ADMIN_NAME}")
+    binding = client.json("get", f"clusterrolebinding/{ADMIN_NAME}")
+    service = client.json(
+        "-n", ADMIN_NAMESPACE, "get", f"service/{ADMIN_NAME}"
+    )
+    _verify_static_resources(root, service_account, role, binding, service)
+    tenant_access = {
+        verb: _auth_can_i(
+            client,
+            verb,
+            "tenants",
+            api_group="tenancy.cnpg-vcluster.io",
+        )
+        for verb in ("get", "list", "watch", "create", "update", "patch", "delete")
+    }
+    secret_access = {
+        verb: _auth_can_i(client, verb, "secrets")
+        for verb in ("get", "list")
+    }
+    if (
+        tenant_access["get"] is not True
+        or tenant_access["list"] is not True
+        or any(
+            tenant_access[verb]
+            for verb in ("watch", "create", "update", "patch", "delete")
+        )
+        or any(secret_access.values())
+    ):
+        raise RuntimeError("Tenant Admin effective RBAC is not read-only")
+    api = verify_admin_api(
+        client,
+        expected_tenant_names=expected_tenant_names,
+    )
+    service_spec = _required_mapping(service.get("spec"), "Service spec")
+    return {
+        "schemaVersion": 1,
+        "healthy": True,
+        "deployment": {
+            "name": ADMIN_NAME,
+            "namespace": ADMIN_NAMESPACE,
+            "uid": uid,
+            "image": image,
+            "provider": "local",
+        },
+        "pod": {
+            "name": _required_string(pod_metadata.get("name"), "Pod name"),
+            "uid": pod_uid,
+        },
+        "service": {
+            "name": ADMIN_NAME,
+            "clusterIP": service_spec["clusterIP"],
+            "ports": service_spec["ports"],
+        },
+        "api": api,
+    }
+
+
+def reconcile_local_admin(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+) -> dict[str, object]:
+    image = build_admin_image(root, config)
+    _load_admin_image(root, config, image)
+    for path in _admin_resource_paths(root):
+        _apply(client, path)
+    deployment = render_local_admin_deployment(root, image)
+    _apply(client, deployment)
+    client.kubectl(
+        "rollout",
+        "status",
+        f"deployment/{ADMIN_NAME}",
+        "-n",
+        ADMIN_NAMESPACE,
+        f"--timeout={config['CONDITION_TIMEOUT']}",
+    )
+    installed = client.json(
+        "-n", ADMIN_NAMESPACE, "get", f"deployment/{ADMIN_NAME}"
+    )
+    uid = _required_string(
+        _required_mapping(installed.get("metadata"), "Deployment metadata").get(
+            "uid"
+        ),
+        "Deployment UID",
+    )
+    return verify_local_admin(
+        root,
+        client,
+        image,
+        expected_deployment_uid=uid,
+    )
+
+
+def _optional_resource(
+    client: ManagementClient,
+    namespace: str | None,
+    resource: str,
+) -> dict[str, object] | None:
+    scope = ("-n", namespace) if namespace else ()
+    response = client.kubectl(
+        *scope,
+        "get",
+        resource,
+        "--ignore-not-found=true",
+        "-o",
+        "json",
+        check=False,
+    )
+    if response.returncode != 0:
+        raise RuntimeError(f"failed to inspect Tenant Admin resource {resource}")
+    if not response.stdout.strip():
+        return None
+    try:
+        document = json.loads(response.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError(f"Tenant Admin resource {resource} is invalid") from exc
+    return _required_mapping(document, resource)
+
+
+def delete_local_admin(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    deployment = _optional_resource(
+        client, ADMIN_NAMESPACE, f"deployment/{ADMIN_NAME}"
+    )
+    service_account = _optional_resource(
+        client, ADMIN_NAMESPACE, f"serviceaccount/{ADMIN_NAME}"
+    )
+    role = _optional_resource(client, None, f"clusterrole/{ADMIN_NAME}")
+    binding = _optional_resource(
+        client, None, f"clusterrolebinding/{ADMIN_NAME}"
+    )
+    service = _optional_resource(
+        client, ADMIN_NAMESPACE, f"service/{ADMIN_NAME}"
+    )
+    if service_account is not None:
+        _verify_service_account(service_account)
+    if role is not None:
+        _verify_role(root, role)
+    if binding is not None:
+        _verify_binding(binding)
+    if service is not None:
+        _verify_service(service)
+    if deployment is not None:
+        container = _container(deployment)
+        image = _required_string(container.get("image"), "Deployment image")
+        _verify_deployment_contract(deployment, image, require_ready=False)
+    for namespace, resource in (
+        (ADMIN_NAMESPACE, f"deployment/{ADMIN_NAME}"),
+        (ADMIN_NAMESPACE, f"service/{ADMIN_NAME}"),
+        (None, f"clusterrolebinding/{ADMIN_NAME}"),
+        (None, f"clusterrole/{ADMIN_NAME}"),
+        (ADMIN_NAMESPACE, f"serviceaccount/{ADMIN_NAME}"),
+    ):
+        delete_named(config, client, namespace, resource)
+    shutil.rmtree(root / ".runtime/rendered/admin", ignore_errors=True)
+
+
+def collect_local_admin_status(
+    root: Path,
+    config: dict[str, str],
+) -> dict[str, object]:
+    require_management_ownership(root, config)
+    validate_management_kubeconfig(root, config)
+    client = ManagementClient(root, config)
+    deployment = client.json(
+        "-n", ADMIN_NAMESPACE, "get", f"deployment/{ADMIN_NAME}"
+    )
+    image = _required_string(_container(deployment).get("image"), "Deployment image")
+    return verify_local_admin(root, client, image)
+
+
+def admin_port_forward(root: Path, config: dict[str, str]) -> int:
+    require_management_ownership(root, config)
+    validate_management_kubeconfig(root, config)
+    client = ManagementClient(root, config)
+    command = [
+        str(client.kubectl_path),
+        "--kubeconfig",
+        str(client.kubeconfig),
+        "--context",
+        client.context,
+        "--request-timeout",
+        config["KUBECTL_REQUEST_TIMEOUT"],
+        "-n",
+        ADMIN_NAMESPACE,
+        "port-forward",
+        f"service/{ADMIN_NAME}",
+        "8080:80",
+    ]
+    try:
+        return subprocess.run(command, check=False).returncode
+    except OSError as exc:
+        raise RuntimeError("failed to start Tenant Admin port-forward") from exc

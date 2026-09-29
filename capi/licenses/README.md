@@ -5,8 +5,11 @@ manifests, images, or vendored Rust crates. Non-Rust inputs are downloaded
 into ignored local state from the pinned upstream locations in
 `../config/versions.env`; Cargo resolves the Rust crates in
 [`Cargo.lock`](../../Cargo.lock) through the system
-shared Cargo home. The manager image includes a statically linked binary
-built from that locked crate graph.
+shared Cargo home. The controller and Tenant Admin images include statically
+linked binaries built from that locked crate graph. The admin image also
+includes generated JavaScript, WebAssembly, and CSS produced by the pinned
+Trunk and wasm-bindgen CLI inputs; those browser bundles are ignored build
+output and are not committed.
 
 The authoritative license texts are maintained by the upstream projects:
 
@@ -16,6 +19,11 @@ The authoritative license texts are maintained by the upstream projects:
 - GNU General Public License version 2:
   <https://www.gnu.org/licenses/old-licenses/gpl-2.0.html>
 - CC0 1.0: <https://creativecommons.org/publicdomain/zero/1.0/legalcode>
+
+Trunk, wasm-bindgen CLI, Leptos, and the new browser/server Rust dependencies
+are mapped to their pinned versions and upstream license expressions in
+`THIRD_PARTY_NOTICES.md`. Trunk and wasm-bindgen archives are downloaded only
+by the explicit cache flow and retain their upstream licensing requirements.
 
 See [`../THIRD_PARTY_NOTICES.md`](../THIRD_PARTY_NOTICES.md) for the mapping
 between each pinned project and its license. Before redistributing a downloaded

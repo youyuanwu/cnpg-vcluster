@@ -47,6 +47,27 @@ The management node mounts `/var/run/docker.sock`. The controller uses it only
 for exact local volume ownership and provider-container observation; CAPD
 remains responsible for worker and load-balancer creation and deletion.
 
+## Read-only Tenant Admin
+
+Each management cluster also runs one `tenant-admin` Deployment and ClusterIP
+Service in `tenant-system`. A Leptos client-side WebAssembly application calls
+an Axum/kube-rs server for overview, sorted Tenant list, detail, and
+deterministic topology data. Kubernetes is the only durable data source; the
+server performs live bounded reads and has no database, Tenant kubeconfig,
+filesystem state, watch cache, or Azure credentials.
+
+The generated admin ClusterRole grants exact `get` and `list` permissions,
+excludes Secrets and subresources, and contains no write verb. Local topology
+accepts exact controller markers and owner UID chains. Azure topology also
+requires durable status UIDs, binding markers, and recorded owner UIDs.
+Ambiguous or foreign resources are omitted. Refresh is manual.
+
+The provider-neutral scratch image contains the static native server and the
+generated browser bundle. Local management loads it into Kind; Azure
+management pushes it to shared ACR, verifies the digest, deploys the immutable
+reference, and records the image plus Deployment UID in foundation inventory.
+See [`admin-ui-design.md`](admin-ui-design.md).
+
 ## Tenant API and controller
 
 The cluster-scoped API is

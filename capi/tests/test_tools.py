@@ -1,18 +1,146 @@
 from __future__ import annotations
 
+import io
 import tempfile
+import tarfile
 import unittest
 import os
 from contextlib import contextmanager
 from pathlib import Path
 
 from scripts.lib.files import IntegrityError
-from scripts.tools import DOWNLOADS, _verify_crd, _verify_private_input, _verify_tag, prepare_tools
+from scripts.lib.config import load_configuration
+from scripts.tools import (
+    DOWNLOADS,
+    _install_trunk,
+    _install_wasm_bindgen,
+    _verify_crd,
+    _verify_private_input,
+    _verify_tag,
+    prepare_tools,
+)
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
 
 class ToolSchemaTests(unittest.TestCase):
+    def test_admin_build_tool_acquisition_is_exact_and_checksum_pinned(
+        self,
+    ) -> None:
+        config = {
+            "DOWNLOAD_TIMEOUT": "1s",
+            "TRUNK_VERSION": "0.21.14",
+            "TRUNK_URL": "https://example.invalid/trunk.tar.gz",
+            "TRUNK_SHA256": "a" * 64,
+            "WASM_BINDGEN_VERSION": "0.2.129",
+            "WASM_BINDGEN_URL": "https://example.invalid/wasm.tar.gz",
+            "WASM_BINDGEN_SHA256": "b" * 64,
+        }
+        root = Path("/repo/capi")
+        trunk = Path("/cache/trunk.tar.gz")
+        wasm = Path("/cache/wasm.tar.gz")
+        with (
+            patch(
+                "scripts.tools._ensure_download",
+                side_effect=[trunk, wasm],
+            ) as download,
+            patch("scripts.tools._install_trunk") as install_trunk,
+            patch(
+                "scripts.tools._install_wasm_bindgen"
+            ) as install_wasm,
+        ):
+            from scripts.tools import acquire_admin_build_tools
+
+            acquire_admin_build_tools(root, config)
+        self.assertEqual(2, download.call_count)
+        self.assertEqual(
+            {
+                "trunk-x86_64-unknown-linux-gnu.tar.gz",
+                "wasm-bindgen-0.2.129-x86_64-unknown-linux-musl.tar.gz",
+            },
+            {call.args[1] for call in download.call_args_list},
+        )
+        install_trunk.assert_called_once_with(
+            trunk,
+            root / ".tools/bin/trunk",
+            "0.21.14",
+        )
+        install_wasm.assert_called_once_with(
+            wasm,
+            root / ".tools/bin/wasm-bindgen",
+            "0.2.129",
+        )
+
+    def test_trunk_download_is_exact_official_release_asset(self) -> None:
+        config = load_configuration(Path(__file__).resolve().parents[1])
+        self.assertEqual("0.21.14", config["TRUNK_VERSION"])
+        self.assertEqual(
+            "https://github.com/trunk-rs/trunk/releases/download/v0.21.14/"
+            "trunk-x86_64-unknown-linux-gnu.tar.gz",
+            config["TRUNK_URL"],
+        )
+        self.assertEqual(
+            "f2b4680cd239693a646a2795e4633c625328d7b2a044fbe749fa3a2fe9e7036b",
+            config["TRUNK_SHA256"],
+        )
+        self.assertIn(
+            (
+                "trunk-x86_64-unknown-linux-gnu.tar.gz",
+                "TRUNK_URL",
+                "TRUNK_SHA256",
+            ),
+            DOWNLOADS,
+        )
+
+    def test_trunk_install_extracts_one_binary_and_checks_identity(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "trunk.tar.gz"
+            with tarfile.open(archive, "w:gz") as bundle:
+                member = tarfile.TarInfo("trunk")
+                content = b"trunk executable"
+                member.size = len(content)
+                bundle.addfile(member, io.BytesIO(content))
+            destination = root / "bin" / "trunk"
+            with patch(
+                "scripts.tools.run",
+                return_value=CompletedProcess([], 0, "trunk 0.21.14\n", ""),
+            ):
+                _install_trunk(archive, destination, "0.21.14")
+            self.assertEqual(content, destination.read_bytes())
+            self.assertEqual(0o755, destination.stat().st_mode & 0o777)
+
+            with patch(
+                "scripts.tools.run",
+                return_value=CompletedProcess([], 0, "trunk 0.21.13\n", ""),
+            ), self.assertRaises(IntegrityError):
+                _install_trunk(archive, destination, "0.21.14")
+            self.assertFalse(destination.exists())
+
+    def test_wasm_bindgen_install_extracts_exact_versioned_binary(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            archive = root / "wasm-bindgen.tar.gz"
+            member_name = (
+                "wasm-bindgen-0.2.129-x86_64-unknown-linux-musl/"
+                "wasm-bindgen"
+            )
+            with tarfile.open(archive, "w:gz") as bundle:
+                member = tarfile.TarInfo(member_name)
+                content = b"wasm-bindgen executable"
+                member.size = len(content)
+                bundle.addfile(member, io.BytesIO(content))
+            destination = root / "bin" / "wasm-bindgen"
+            with patch(
+                "scripts.tools.run",
+                return_value=CompletedProcess(
+                    [], 0, "wasm-bindgen 0.2.129\n", ""
+                ),
+            ):
+                _install_wasm_bindgen(archive, destination, "0.2.129")
+            self.assertEqual(content, destination.read_bytes())
+            self.assertEqual(0o755, destination.stat().st_mode & 0o777)
+
     def test_prepare_tools_uses_local_cache_without_network_commands(self) -> None:
         verified = object()
         with (

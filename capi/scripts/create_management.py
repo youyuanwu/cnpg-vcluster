@@ -23,6 +23,7 @@ from scripts.lib.registry import (
     verify_offline_registry_pulls,
 )
 from scripts.lib.controller import reconcile_controller
+from scripts.lib.admin_local import reconcile_local_admin
 
 
 def create_management(root: Path, config: dict[str, str]) -> None:
@@ -68,4 +69,5 @@ def create_management(root: Path, config: dict[str, str]) -> None:
         verified_cache,
         registry,
     )
-    print("management cluster and lifecycle controllers are ready")
+    reconcile_local_admin(root, config, client)
+    print("management cluster, lifecycle controllers, and Tenant Admin are ready")

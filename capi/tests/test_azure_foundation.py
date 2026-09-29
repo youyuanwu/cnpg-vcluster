@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import io
 import json
 import os
@@ -24,9 +25,13 @@ from scripts.lib.azure.foundation import (
     TENANT_CONTROLLER_CONFIG_KEY,
     _azure_provider_configuration,
     _foundation_identity,
+    _inspect_admin,
     _install_capi_capz,
+    _install_admin,
     _inspect_foundation,
+    _push_admin_image,
     _push_controller_image,
+    create_management,
     create_foundation,
     load_inventory,
     preflight,
@@ -97,6 +102,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         )
         self.assertEqual(config["AZURE_CONTROLLER_REPOSITORY"], "tenant-controller")
         self.assertEqual(config["AZURE_CONTROLLER_TAG"], "v1alpha2")
+        self.assertEqual(config["AZURE_ADMIN_REPOSITORY"], "tenant-admin")
+        self.assertEqual(config["AZURE_ADMIN_TAG"], "v1alpha1")
         self.assertEqual(config["AZURE_PREFIX"].replace("-", "") + "acr", "yycvacr")
     def test_bicep_defines_exact_acr_and_kubelet_pull_outputs(self):
         foundation = (ROOT / "infra" / "azure" / "foundation.bicep").read_text()
@@ -434,6 +441,361 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             image,
             f"yycvacr.azurecr.io/tenant-controller@{digest}",
         )
+    def test_admin_push_builds_tags_pushes_and_verifies_digest(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        digest = "sha256:" + "d" * 64
+        admin_config = {"COMMAND_TIMEOUT": "1s"}
+        with (
+            patch(
+                "scripts.lib.azure.foundation.load_configuration",
+                return_value=admin_config,
+            ),
+            patch(
+                "scripts.lib.azure.foundation.build_admin_image"
+            ) as build,
+            patch(
+                "scripts.lib.azure.foundation.run",
+                return_value=completed(f"digest: {digest} size: 123\n"),
+            ) as run_command,
+            patch(
+                "scripts.lib.azure.foundation._az",
+                side_effect=[completed(), completed(digest + "\n")],
+            ),
+        ):
+            image = _push_admin_image(root, config, inventory)
+        tagged = "yycvacr.azurecr.io/tenant-admin:v1alpha1"
+        build.assert_called_once_with(root, admin_config, tagged)
+        self.assertEqual(
+            run_command.call_args.args[0],
+            ["docker", "push", tagged],
+        )
+        self.assertEqual(
+            image,
+            f"yycvacr.azurecr.io/tenant-admin@{digest}",
+        )
+
+    def test_admin_push_rejects_digest_mismatch_and_uses_unique_fallback(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        pushed = "sha256:" + "e" * 64
+        raced = "sha256:" + "f" * 64
+        with (
+            patch("scripts.lib.azure.foundation.load_configuration", return_value={}),
+            patch("scripts.lib.azure.foundation.build_admin_image"),
+            patch(
+                "scripts.lib.azure.foundation.run",
+                return_value=completed(f"digest: {pushed} size: 123\n"),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._az",
+                side_effect=[completed(), completed(raced + "\n")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "changed before deployment"),
+        ):
+            _push_admin_image(root, config, inventory)
+
+        digest = "sha256:" + "9" * 64
+        with (
+            patch("scripts.lib.azure.foundation.load_configuration", return_value={}),
+            patch("scripts.lib.azure.foundation.build_admin_image"),
+            patch(
+                "scripts.lib.azure.foundation.uuid.uuid4",
+                return_value=type("Uuid", (), {"hex": "admin123"})(),
+            ),
+            patch(
+                "scripts.lib.azure.foundation.run",
+                side_effect=[
+                    completed("ambiguous"),
+                    completed(),
+                    completed(f"digest: {digest} size: 123\n"),
+                ],
+            ) as run_command,
+            patch(
+                "scripts.lib.azure.foundation._az",
+                side_effect=[completed(), completed(digest + "\n")],
+            ),
+        ):
+            image = _push_admin_image(root, config, inventory)
+        unique = "yycvacr.azurecr.io/tenant-admin:publish-admin123"
+        self.assertEqual(
+            run_command.call_args_list[1].args[0],
+            [
+                "docker",
+                "tag",
+                "yycvacr.azurecr.io/tenant-admin:v1alpha1",
+                unique,
+            ],
+        )
+        self.assertEqual(
+            run_command.call_args_list[2].args[0],
+            ["docker", "push", unique],
+        )
+        self.assertEqual(
+            image,
+            f"yycvacr.azurecr.io/tenant-admin@{digest}",
+        )
+    def test_admin_install_applies_generated_resources_then_exact_deployment(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        image = "yycvacr.azurecr.io/tenant-admin@sha256:" + "7" * 64
+        rendered = root / ".runtime/rendered/azure-admin/deployment.yaml"
+        with (
+            patch(
+                "scripts.lib.azure.foundation._push_admin_image",
+                return_value=image,
+            ),
+            patch(
+                "scripts.lib.azure.foundation.render_azure_admin_deployment",
+                return_value=rendered,
+            ) as render,
+            patch(
+                "scripts.lib.azure.foundation._inspect_admin",
+                return_value=("admin-uid", ()),
+            ) as inspect,
+            patch("scripts.lib.azure.foundation._kubectl") as kubectl,
+        ):
+            installed = _install_admin(root, config, inventory)
+        self.assertEqual((image, "admin-uid"), installed)
+        render.assert_called_once_with(root, image)
+        applied = [
+            call.args[call.args.index("-f") + 1]
+            for call in kubectl.call_args_list
+            if "apply" in call.args
+        ]
+        self.assertEqual(
+            [
+                str(root / "admin/config/rbac/service-account.yaml"),
+                str(root / "admin/config/rbac/cluster-role.yaml"),
+                str(root / "admin/config/rbac/cluster-role-binding.yaml"),
+                str(root / "admin/config/service/service.yaml"),
+                str(rendered),
+            ],
+            applied,
+        )
+        self.assertIn("rollout", kubectl.call_args_list[-1].args)
+        inspect.assert_called_once_with(
+            root,
+            image,
+            None,
+            verify_api=True,
+        )
+        recorded = dict(inventory)
+        recorded["adminImage"] = (
+            "yycvacr.azurecr.io/tenant-admin@sha256:" + "6" * 64
+        )
+        recorded["adminDeploymentUid"] = "admin-uid"
+        with (
+            patch(
+                "scripts.lib.azure.foundation._push_admin_image",
+                return_value=image,
+            ),
+            patch(
+                "scripts.lib.azure.foundation.render_azure_admin_deployment"
+            ) as render,
+            patch("scripts.lib.azure.foundation._kubectl") as kubectl,
+            self.assertRaisesRegex(RuntimeError, "image identity changed"),
+        ):
+            _install_admin(root, config, recorded)
+        render.assert_not_called()
+        kubectl.assert_not_called()
+
+    def test_admin_live_health_requires_identity_image_service_and_api(self):
+        root = self.make_root()
+        image = "yycvacr.azurecr.io/tenant-admin@sha256:" + "8" * 64
+        deployment = {
+            "metadata": {"uid": "admin-uid", "generation": 4},
+            "spec": {
+                "replicas": 1,
+                "template": {
+                    "spec": {
+                        "serviceAccountName": "tenant-admin",
+                        "automountServiceAccountToken": True,
+                        "enableServiceLinks": False,
+                        "securityContext": {
+                            "runAsNonRoot": True,
+                            "runAsUser": 65532,
+                            "runAsGroup": 65532,
+                            "seccompProfile": {"type": "RuntimeDefault"},
+                        },
+                        "containers": [{
+                            "name": "admin",
+                            "image": image,
+                            "imagePullPolicy": "IfNotPresent",
+                            "env": [{
+                                "name": "TENANT_ADMIN_PROVIDER",
+                                "value": "azure",
+                            }],
+                            "ports": [{
+                                "name": "http",
+                                "containerPort": 8080,
+                                "protocol": "TCP",
+                            }],
+                            "livenessProbe": {
+                                "httpGet": {"path": "/healthz", "port": "http"}
+                            },
+                            "readinessProbe": {
+                                "httpGet": {"path": "/readyz", "port": "http"}
+                            },
+                            "securityContext": {
+                                "runAsNonRoot": True,
+                                "privileged": False,
+                                "allowPrivilegeEscalation": False,
+                                "readOnlyRootFilesystem": True,
+                                "capabilities": {"drop": ["ALL"]},
+                            },
+                            "resources": {
+                                "requests": {"cpu": "25m", "memory": "32Mi"},
+                                "limits": {"cpu": "250m", "memory": "128Mi"},
+                            },
+                        }],
+                    }
+                },
+            },
+            "status": {
+                "availableReplicas": 1,
+                "updatedReplicas": 1,
+                "observedGeneration": 4,
+            },
+        }
+        service = {
+            "spec": {
+                "type": "ClusterIP",
+                "selector": {"app.kubernetes.io/name": "tenant-admin"},
+                "ports": [{
+                    "name": "http",
+                    "port": 80,
+                    "targetPort": 8080,
+                    "protocol": "TCP",
+                }],
+            }
+        }
+        role = {
+            "rules": [{
+                "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                "resources": ["tenants"],
+                "verbs": ["get", "list"],
+            }]
+        }
+
+        def resources(_root, _namespace, selected):
+            if selected.startswith("deployment/"):
+                return deployment
+            if selected.startswith("service/"):
+                return service
+            if selected.startswith("clusterrole/"):
+                return role
+            raise AssertionError(selected)
+
+        def proxy(*arguments, **_kwargs):
+            path = arguments[-1]
+            if path.endswith("/api/v1/overview"):
+                return completed(json.dumps({
+                    "schemaVersion": 1,
+                    "data": {
+                        "providerMode": "azure",
+                        "tenants": {"total": 0},
+                    },
+                }))
+            if path.endswith("/api/v1/tenants"):
+                return completed(json.dumps({"schemaVersion": 1, "data": []}))
+            return completed()
+
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                side_effect=resources,
+            ),
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                side_effect=proxy,
+            ) as kubectl,
+        ):
+            uid, blockers = _inspect_admin(
+                root,
+                image,
+                "admin-uid",
+                verify_api=True,
+            )
+        self.assertEqual("admin-uid", uid)
+        self.assertEqual((), blockers)
+        proxy_paths = [
+            call.args[-1]
+            for call in kubectl.call_args_list
+            if "--raw" in call.args
+        ]
+        for endpoint in (
+            "/healthz",
+            "/readyz",
+            "/api/v1/overview",
+            "/api/v1/tenants",
+        ):
+            self.assertTrue(
+                any(path.endswith(endpoint) for path in proxy_paths),
+                endpoint,
+            )
+
+        drifted = copy.deepcopy(deployment)
+        drifted["spec"]["template"]["spec"]["containers"][0]["image"] = "old:image"
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                side_effect=[drifted, service, role],
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=proxy),
+        ):
+            _, blockers = _inspect_admin(
+                root,
+                image,
+                "admin-uid",
+                verify_api=True,
+            )
+        self.assertIn("Azure admin image identity changed", blockers)
+
+        broken_service = copy.deepcopy(service)
+        broken_service["spec"]["ports"][0]["port"] = 443
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                side_effect=[deployment, broken_service, role],
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=proxy),
+        ):
+            _, blockers = _inspect_admin(
+                root,
+                image,
+                "admin-uid",
+                verify_api=True,
+            )
+        self.assertIn("Azure admin Service port changed", blockers)
+
+        writable_role = {
+            "rules": [{
+                "apiGroups": [""],
+                "resources": ["secrets"],
+                "verbs": ["get", "list", "create"],
+            }]
+        }
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                side_effect=[deployment, service, writable_role],
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=proxy),
+        ):
+            _, blockers = _inspect_admin(
+                root,
+                image,
+                "admin-uid",
+                verify_api=True,
+            )
+        self.assertIn(
+            "Azure admin ClusterRole is not strictly read-only",
+            blockers,
+        )
     def test_preflight_output_does_not_expose_subscription_id(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -468,16 +830,24 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         path.chmod(0o600)
         with self.assertRaisesRegex(ConfigError, "AZURE_PREFIX"):
             load_azure_configuration(root)
-    def test_rejects_invalid_controller_repository_and_tag(self):
+    def test_rejects_invalid_controller_or_admin_repository_and_tag(self):
         for key, value in (
             ("AZURE_CONTROLLER_REPOSITORY", "Upper/Repo"),
             ("AZURE_CONTROLLER_TAG", "bad tag"),
+            ("AZURE_ADMIN_REPOSITORY", "Upper/Admin"),
+            ("AZURE_ADMIN_TAG", "bad tag"),
         ):
             root = self.make_root()
             defaults = root / "config" / "azure" / "defaults.env"
+            original = {
+                "AZURE_CONTROLLER_REPOSITORY": "tenant-controller",
+                "AZURE_CONTROLLER_TAG": "v1alpha2",
+                "AZURE_ADMIN_REPOSITORY": "tenant-admin",
+                "AZURE_ADMIN_TAG": "v1alpha1",
+            }[key]
             defaults.write_text(
                 defaults.read_text().replace(
-                    f"{key}={'tenant-controller' if key.endswith('REPOSITORY') else 'v1alpha2'}",
+                    f"{key}={original}",
                     f"{key}={value!r}",
                 )
             )
@@ -501,9 +871,186 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         changed["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"] = "9.9.9"
         changed["AZURE_TENANT_NODE_SKU"] = "different"
         changed["AZURE_TENANT_TIMEOUT"] = "1m"
+        changed["AZURE_ADMIN_REPOSITORY"] = "different-admin"
+        changed["AZURE_ADMIN_TAG"] = "different-tag"
         self.assertEqual(baseline, _foundation_defaults_checksum(root, changed))
         changed["AZURE_AKS_NODE_COUNT"] = "3"
         self.assertNotEqual(baseline, _foundation_defaults_checksum(root, changed))
+    def test_schema_three_inventory_accepts_optional_admin_identity_as_a_pair(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        pre_ui = self.inventory(root, config)
+        self.write_inventory(root, pre_ui)
+        self.assertNotIn("adminImage", load_inventory(root, config))
+
+        image = (
+            "yycvacr.azurecr.io/tenant-admin@sha256:" + "a" * 64
+        )
+        installed = dict(pre_ui)
+        installed["adminImage"] = image
+        installed["adminDeploymentUid"] = "admin-uid"
+        self.assertEqual(
+            _azure_provider_configuration(config, pre_ui),
+            _azure_provider_configuration(config, installed),
+        )
+        self.write_inventory(root, installed)
+        loaded = load_inventory(root, config)
+        self.assertEqual(image, loaded["adminImage"])
+        identity = _foundation_identity(loaded)
+        self.assertEqual(image, identity["adminImage"])
+        self.assertEqual("admin-uid", identity["adminDeploymentUid"])
+
+        for missing in ("adminImage", "adminDeploymentUid"):
+            broken = dict(installed)
+            broken.pop(missing)
+            self.write_inventory(root, broken)
+            with self.subTest(missing=missing), self.assertRaisesRegex(
+                RuntimeError, "recorded together"
+            ):
+                load_inventory(root, config)
+        broken = dict(installed)
+        broken["adminImage"] = "mutable:tag"
+        self.write_inventory(root, broken)
+        with self.assertRaisesRegex(RuntimeError, "admin image is invalid"):
+            load_inventory(root, config)
+        with self.assertRaisesRegex(RuntimeError, "admin inventory"):
+            _foundation_identity(broken)
+    def test_management_records_admin_only_after_controller_and_admin_install(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        admin_image = (
+            "yycvacr.azurecr.io/tenant-admin@sha256:" + "b" * 64
+        )
+        calls = []
+        written = []
+        with (
+            patch("scripts.lib.azure.foundation.preflight"),
+            patch(
+                "scripts.lib.azure.foundation.load_inventory",
+                return_value=inventory,
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", return_value=completed()),
+            patch(
+                "scripts.lib.azure.foundation._verify_recorded_admin",
+                side_effect=lambda *_: calls.append("verify-recorded"),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._install_capi_capz",
+                side_effect=lambda *_: calls.append("capi"),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._install_kamaji",
+                side_effect=lambda *_: calls.append("kamaji"),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._install_kamaji_provider",
+                side_effect=lambda *_: calls.append("provider"),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._install_tenant_controller",
+                side_effect=lambda *_: (
+                    calls.append("controller")
+                    or (inventory["controllerImage"], "provider-config-uid")
+                ),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._install_admin",
+                side_effect=lambda *_: (
+                    calls.append("admin")
+                    or (admin_image, "admin-deployment-uid")
+                ),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._controller_identities",
+                return_value=inventory["controllers"],
+            ),
+            patch(
+                "scripts.lib.azure.foundation._write_inventory",
+                side_effect=lambda _root, payload: written.append(dict(payload)),
+            ),
+            redirect_stdout(io.StringIO()),
+        ):
+            create_management(root, config)
+        self.assertLess(calls.index("controller"), calls.index("admin"))
+        self.assertEqual(1, len(written))
+        self.assertEqual(admin_image, written[0]["adminImage"])
+        self.assertEqual(
+            "admin-deployment-uid",
+            written[0]["adminDeploymentUid"],
+        )
+        self.assertEqual(
+            inventory["foundationDefaultsSha256"],
+            written[0]["foundationDefaultsSha256"],
+        )
+
+    def test_repeated_management_install_accepts_exact_admin_and_rejects_drift(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        inventory["adminImage"] = (
+            "yycvacr.azurecr.io/tenant-admin@sha256:" + "c" * 64
+        )
+        inventory["adminDeploymentUid"] = "admin-uid"
+        with (
+            patch("scripts.lib.azure.foundation.preflight"),
+            patch(
+                "scripts.lib.azure.foundation.load_inventory",
+                return_value=inventory,
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", return_value=completed()),
+            patch("scripts.lib.azure.foundation._verify_recorded_admin") as verify,
+            patch("scripts.lib.azure.foundation._install_capi_capz"),
+            patch("scripts.lib.azure.foundation._install_kamaji"),
+            patch("scripts.lib.azure.foundation._install_kamaji_provider"),
+            patch(
+                "scripts.lib.azure.foundation._install_tenant_controller",
+                return_value=(
+                    inventory["controllerImage"],
+                    inventory["azureProviderConfigUid"],
+                ),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._install_admin",
+                return_value=(
+                    inventory["adminImage"],
+                    inventory["adminDeploymentUid"],
+                ),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._controller_identities",
+                return_value=inventory["controllers"],
+            ),
+            patch("scripts.lib.azure.foundation._write_inventory") as write,
+            redirect_stdout(io.StringIO()),
+        ):
+            create_management(root, config)
+        verify.assert_called_once_with(root, inventory)
+        self.assertEqual(
+            inventory["adminImage"],
+            write.call_args.args[1]["adminImage"],
+        )
+        self.assertEqual(
+            inventory["adminDeploymentUid"],
+            write.call_args.args[1]["adminDeploymentUid"],
+        )
+
+        with (
+            patch("scripts.lib.azure.foundation.preflight"),
+            patch(
+                "scripts.lib.azure.foundation.load_inventory",
+                return_value=inventory,
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", return_value=completed()),
+            patch(
+                "scripts.lib.azure.foundation._verify_recorded_admin",
+                side_effect=RuntimeError("recorded Azure admin identity is unhealthy"),
+            ),
+            patch("scripts.lib.azure.foundation._install_capi_capz") as capi,
+            self.assertRaisesRegex(RuntimeError, "admin identity is unhealthy"),
+        ):
+            create_management(root, config)
+        capi.assert_not_called()
     def test_old_foundation_inventory_requires_clean_redeploy(self):
         root = self.make_root()
         config = load_azure_configuration(root)

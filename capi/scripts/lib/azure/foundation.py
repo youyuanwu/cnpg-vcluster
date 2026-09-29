@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import base64
 import uuid
+from collections.abc import Callable
 
 from .common import *
+from scripts.lib.admin import build_admin_image, render_azure_admin_deployment
 from scripts.lib.controller import (
     build_azure_controller_image,
     render_azure_controller_manager,
@@ -15,6 +17,12 @@ ACR_PULL_ROLE_DEFINITION_ID = (
 )
 TENANT_CONTROLLER_CONFIG = "tenant-azure-provider"
 TENANT_CONTROLLER_CONFIG_KEY = "provider.json"
+ADMIN_NAME = "tenant-admin"
+ADMIN_NAMESPACE = "tenant-system"
+ADMIN_SERVICE_PROXY = (
+    "/api/v1/namespaces/tenant-system/"
+    "services/http:tenant-admin:http/proxy"
+)
 CAPI_CAPZ_DEPLOYMENTS = (
     ("capi-system", "capi-controller-manager"),
     (
@@ -470,19 +478,21 @@ def _controller_identities(root: Path) -> dict[str, str]:
     return identities
 
 
-def _push_controller_image(
+def _push_acr_image(
     root: Path,
     config: Mapping[str, str],
     inventory: Mapping[str, object],
+    *,
+    repository: str,
+    tag: str,
+    description: str,
+    build: Callable[[str], None],
 ) -> str:
     outputs = inventory["outputs"]
     assert isinstance(outputs, dict)
     login_server = str(outputs["acrLoginServer"])
-    repository = config["AZURE_CONTROLLER_REPOSITORY"]
-    tag = config["AZURE_CONTROLLER_TAG"]
     tagged_image = f"{login_server}/{repository}:{tag}"
-    controller_config = load_configuration(root)
-    build_azure_controller_image(root, controller_config, tagged_image)
+    build(tagged_image)
     _az("acr", "login", "--name", str(outputs["acrName"]), timeout=120)
     pushed = run(
         ["docker", "push", tagged_image],
@@ -535,12 +545,52 @@ def _push_controller_image(
         timeout=120,
     ).stdout.strip().lower()
     if not re.fullmatch(r"sha256:[0-9a-f]{64}", registry_digest):
-        raise RuntimeError("pushed Azure controller manifest digest is invalid")
+        raise RuntimeError(
+            f"pushed Azure {description} manifest digest is invalid"
+        )
     if local_digest is not None and registry_digest != local_digest:
         raise RuntimeError(
-            "pushed Azure controller manifest digest changed before deployment"
+            f"pushed Azure {description} manifest digest changed before deployment"
         )
     return f"{login_server}/{repository}@{registry_digest}"
+
+
+def _push_controller_image(
+    root: Path,
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> str:
+    controller_config = load_configuration(root)
+    return _push_acr_image(
+        root,
+        config,
+        inventory,
+        repository=config["AZURE_CONTROLLER_REPOSITORY"],
+        tag=config["AZURE_CONTROLLER_TAG"],
+        description="controller",
+        build=lambda image: build_azure_controller_image(
+            root,
+            controller_config,
+            image,
+        ),
+    )
+
+
+def _push_admin_image(
+    root: Path,
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> str:
+    admin_config = load_configuration(root)
+    return _push_acr_image(
+        root,
+        config,
+        inventory,
+        repository=config["AZURE_ADMIN_REPOSITORY"],
+        tag=config["AZURE_ADMIN_TAG"],
+        description="admin",
+        build=lambda image: build_admin_image(root, admin_config, image),
+    )
 
 
 def _azure_provider_configuration(
@@ -684,10 +734,341 @@ def _install_tenant_controller(
     return image, uid
 
 
+def _admin_deployment_blockers(
+    payload: Mapping[str, object],
+    image: str,
+    expected_uid: str | None,
+) -> list[str]:
+    blockers = []
+    metadata = payload.get("metadata")
+    spec = payload.get("spec")
+    status = payload.get("status")
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(spec, dict)
+        or not isinstance(status, dict)
+    ):
+        return ["Azure admin Deployment is malformed"]
+    uid = metadata.get("uid")
+    if not isinstance(uid, str) or not uid:
+        blockers.append("Azure admin Deployment UID is absent")
+    elif expected_uid is not None and uid != expected_uid:
+        blockers.append("Azure admin Deployment identity changed")
+    generation = metadata.get("generation")
+    if (
+        spec.get("replicas") != 1
+        or status.get("availableReplicas") != 1
+        or status.get("updatedReplicas") != 1
+        or not isinstance(generation, int)
+        or status.get("observedGeneration") != generation
+    ):
+        blockers.append("Azure admin Deployment is unavailable")
+    pod = spec.get("template", {}).get("spec", {})
+    if not isinstance(pod, dict):
+        return blockers + ["Azure admin Pod template is malformed"]
+    expected_pod_security = {
+        "runAsNonRoot": True,
+        "runAsUser": 65532,
+        "runAsGroup": 65532,
+        "seccompProfile": {"type": "RuntimeDefault"},
+    }
+    if (
+        pod.get("serviceAccountName") != ADMIN_NAME
+        or pod.get("automountServiceAccountToken") is not True
+        or pod.get("enableServiceLinks") is not False
+        or pod.get("securityContext") != expected_pod_security
+    ):
+        blockers.append("Azure admin Pod security contract changed")
+    containers = pod.get("containers")
+    admin = (
+        next(
+            (
+                item
+                for item in containers
+                if isinstance(item, dict) and item.get("name") == "admin"
+            ),
+            None,
+        )
+        if isinstance(containers, list)
+        else None
+    )
+    if not isinstance(admin, dict):
+        return blockers + ["Azure admin container is absent"]
+    if admin.get("image") != image:
+        blockers.append("Azure admin image identity changed")
+    if admin.get("imagePullPolicy") != "IfNotPresent":
+        blockers.append("Azure admin image pull policy changed")
+    if admin.get("env") != [
+        {"name": "TENANT_ADMIN_PROVIDER", "value": "azure"}
+    ]:
+        blockers.append("Azure admin provider mode changed")
+    if admin.get("ports") != [
+        {"name": "http", "containerPort": 8080, "protocol": "TCP"}
+    ]:
+        blockers.append("Azure admin container port changed")
+    expected_container_security = {
+        "runAsNonRoot": True,
+        "privileged": False,
+        "allowPrivilegeEscalation": False,
+        "readOnlyRootFilesystem": True,
+        "capabilities": {"drop": ["ALL"]},
+    }
+    if admin.get("securityContext") != expected_container_security:
+        blockers.append("Azure admin container security contract changed")
+    expected_resources = {
+        "requests": {"cpu": "25m", "memory": "32Mi"},
+        "limits": {"cpu": "250m", "memory": "128Mi"},
+    }
+    if admin.get("resources") != expected_resources:
+        blockers.append("Azure admin resource limits changed")
+    for probe_name, path in (
+        ("livenessProbe", "/healthz"),
+        ("readinessProbe", "/readyz"),
+    ):
+        probe = admin.get(probe_name)
+        if (
+            not isinstance(probe, dict)
+            or probe.get("httpGet", {}).get("path") != path
+            or probe.get("httpGet", {}).get("port") != "http"
+        ):
+            blockers.append(f"Azure admin {probe_name} changed")
+    return blockers
+
+
+def _admin_service_blockers(payload: Mapping[str, object]) -> list[str]:
+    spec = payload.get("spec")
+    if not isinstance(spec, dict):
+        return ["Azure admin Service is malformed"]
+    if (
+        spec.get("type") != "ClusterIP"
+        or spec.get("selector") != {"app.kubernetes.io/name": ADMIN_NAME}
+    ):
+        return ["Azure admin Service identity changed"]
+    ports = spec.get("ports")
+    if not isinstance(ports, list) or len(ports) != 1:
+        return ["Azure admin Service port changed"]
+    port = ports[0]
+    if not isinstance(port, dict) or any(
+        port.get(key) != value
+        for key, value in {
+            "name": "http",
+            "port": 80,
+            "targetPort": 8080,
+            "protocol": "TCP",
+        }.items()
+    ):
+        return ["Azure admin Service port changed"]
+    return []
+
+
+def _admin_rbac_blockers(payload: Mapping[str, object]) -> list[str]:
+    rules = payload.get("rules")
+    if not isinstance(rules, list) or not rules:
+        return ["Azure admin ClusterRole is malformed"]
+    for rule in rules:
+        if not isinstance(rule, dict) or "nonResourceURLs" in rule:
+            return ["Azure admin ClusterRole contains unsupported permissions"]
+        api_groups = rule.get("apiGroups")
+        resources = rule.get("resources")
+        verbs = rule.get("verbs")
+        if (
+            not isinstance(api_groups, list)
+            or not api_groups
+            or not all(isinstance(group, str) for group in api_groups)
+            or "*" in api_groups
+            or not isinstance(resources, list)
+            or not resources
+            or not all(isinstance(resource, str) for resource in resources)
+            or any(
+                resource in {"*", "secrets"} or "/" in resource
+                for resource in resources
+            )
+            or not isinstance(verbs, list)
+            or set(verbs) != {"get", "list"}
+        ):
+            return ["Azure admin ClusterRole is not strictly read-only"]
+    return []
+
+
+def _admin_api_blockers(root: Path) -> list[str]:
+    blockers = []
+    responses = {}
+    for endpoint in ("healthz", "readyz", "api/v1/overview", "api/v1/tenants"):
+        response = _kubectl(
+            root,
+            "get",
+            "--raw",
+            f"{ADMIN_SERVICE_PROXY}/{endpoint}",
+            check=False,
+        )
+        if response.returncode != 0:
+            blockers.append(f"Azure admin API is unavailable: /{endpoint}")
+        else:
+            responses[endpoint] = response.stdout
+    if blockers:
+        return blockers
+    try:
+        overview = json.loads(responses["api/v1/overview"])
+        tenants = json.loads(responses["api/v1/tenants"])
+    except (TypeError, json.JSONDecodeError):
+        return ["Azure admin API returned invalid JSON"]
+    overview_data = overview.get("data") if isinstance(overview, dict) else None
+    tenant_data = tenants.get("data") if isinstance(tenants, dict) else None
+    counts = (
+        overview_data.get("tenants")
+        if isinstance(overview_data, dict)
+        else None
+    )
+    if (
+        not isinstance(overview, dict)
+        or overview.get("schemaVersion") != 1
+        or not isinstance(overview_data, dict)
+        or overview_data.get("providerMode") != "azure"
+        or not isinstance(counts, dict)
+        or not isinstance(counts.get("total"), int)
+    ):
+        blockers.append("Azure admin overview API contract changed")
+    if (
+        not isinstance(tenants, dict)
+        or tenants.get("schemaVersion") != 1
+        or not isinstance(tenant_data, list)
+        or not all(isinstance(item, dict) for item in tenant_data)
+    ):
+        blockers.append("Azure admin Tenant list API contract changed")
+    elif isinstance(counts, dict) and counts.get("total") != len(tenant_data):
+        blockers.append("Azure admin empty/list API counts disagree")
+    return blockers
+
+
+def _inspect_admin(
+    root: Path,
+    image: str,
+    expected_uid: str | None,
+    *,
+    verify_api: bool,
+) -> tuple[str | None, tuple[str, ...]]:
+    blockers = []
+    deployment = _get_management_resource(
+        root,
+        ADMIN_NAMESPACE,
+        f"deployment/{ADMIN_NAME}",
+    )
+    observed_uid = None
+    if deployment is None:
+        blockers.append("Azure admin Deployment is absent")
+    else:
+        blockers.extend(
+            _admin_deployment_blockers(deployment, image, expected_uid)
+        )
+        uid = deployment.get("metadata", {}).get("uid")
+        if isinstance(uid, str) and uid:
+            observed_uid = uid
+    service = _get_management_resource(
+        root,
+        ADMIN_NAMESPACE,
+        f"service/{ADMIN_NAME}",
+    )
+    if service is None:
+        blockers.append("Azure admin Service is absent")
+    else:
+        blockers.extend(_admin_service_blockers(service))
+    role = _get_management_resource(
+        root,
+        None,
+        f"clusterrole/{ADMIN_NAME}",
+    )
+    if role is None:
+        blockers.append("Azure admin ClusterRole is absent")
+    else:
+        blockers.extend(_admin_rbac_blockers(role))
+    if verify_api and deployment is not None and service is not None:
+        blockers.extend(_admin_api_blockers(root))
+    return observed_uid, tuple(blockers)
+
+
+def _verify_recorded_admin(
+    root: Path,
+    inventory: Mapping[str, object],
+) -> None:
+    image = inventory.get("adminImage")
+    uid = inventory.get("adminDeploymentUid")
+    if image is None and uid is None:
+        return
+    assert isinstance(image, str)
+    assert isinstance(uid, str)
+    _, blockers = _inspect_admin(root, image, uid, verify_api=True)
+    if blockers:
+        raise RuntimeError(
+            "recorded Azure admin identity is unhealthy: "
+            + "; ".join(blockers)
+        )
+
+
+def _install_admin(
+    root: Path,
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> tuple[str, str]:
+    image = _push_admin_image(root, config, inventory)
+    recorded_image = inventory.get("adminImage")
+    recorded_uid = inventory.get("adminDeploymentUid")
+    if recorded_image is not None and image != recorded_image:
+        raise RuntimeError("recorded Azure admin image identity changed")
+    for path in (
+        root / "admin" / "config" / "rbac" / "service-account.yaml",
+        root / "admin" / "config" / "rbac" / "cluster-role.yaml",
+        root / "admin" / "config" / "rbac" / "cluster-role-binding.yaml",
+        root / "admin" / "config" / "service" / "service.yaml",
+    ):
+        _kubectl(
+            root,
+            "apply",
+            "--server-side",
+            "--field-manager=cnpg-vcluster-azure-admin",
+            "--force-conflicts",
+            "-f",
+            str(path),
+        )
+    deployment = render_azure_admin_deployment(root, image)
+    _kubectl(
+        root,
+        "apply",
+        "--server-side",
+        "--field-manager=cnpg-vcluster-azure-admin",
+        "--force-conflicts",
+        "-f",
+        str(deployment),
+    )
+    _kubectl(
+        root,
+        "-n",
+        ADMIN_NAMESPACE,
+        "rollout",
+        "status",
+        f"deployment/{ADMIN_NAME}",
+        f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
+        timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
+    )
+    uid, blockers = _inspect_admin(
+        root,
+        image,
+        recorded_uid if isinstance(recorded_uid, str) else None,
+        verify_api=True,
+    )
+    if blockers:
+        raise RuntimeError(
+            "Azure admin installation is unhealthy: " + "; ".join(blockers)
+        )
+    if uid is None:
+        raise RuntimeError("Azure admin Deployment UID is absent")
+    return image, uid
+
+
 def create_management(root: Path, config: Mapping[str, str]) -> None:
     preflight(root, config, emit=False)
     inventory = load_inventory(root, config)
     _kubectl(root, "get", "--raw=/readyz")
+    _verify_recorded_admin(root, inventory)
     _install_capi_capz(root, config, inventory)
     _install_kamaji(root, config)
     _install_kamaji_provider(root, config)
@@ -707,12 +1088,19 @@ def create_management(root: Path, config: Mapping[str, str]) -> None:
         config,
         inventory,
     )
+    admin_image, admin_deployment_uid = _install_admin(
+        root,
+        config,
+        inventory,
+    )
     updated = dict(inventory)
     updated["controllers"] = _controller_identities(root)
     updated["controllerImage"] = controller_image
     updated["azureProviderConfigUid"] = provider_config_uid
+    updated["adminImage"] = admin_image
+    updated["adminDeploymentUid"] = admin_deployment_uid
     _write_inventory(root, updated)
-    print("Azure management controllers and Tenant manager are ready")
+    print("Azure management controllers, Tenant manager, and admin UI are ready")
 
 
 def load_inventory(
@@ -768,11 +1156,30 @@ def load_inventory(
         for key, value in controllers.items()
     ):
         raise RuntimeError("Azure foundation controller inventory is invalid")
-    for key in ("controllerImage", "azureProviderConfigUid"):
+    for key in (
+        "controllerImage",
+        "azureProviderConfigUid",
+        "adminImage",
+        "adminDeploymentUid",
+    ):
         if key in payload and (
             not isinstance(payload[key], str) or not payload[key]
         ):
             raise RuntimeError(f"Azure foundation {key} is invalid")
+    if ("adminImage" in payload) != ("adminDeploymentUid" in payload):
+        raise RuntimeError(
+            "Azure foundation admin image and Deployment UID must be recorded together"
+        )
+    if "adminImage" in payload and (
+        not re.fullmatch(
+            r"[^@\s]+@sha256:[0-9a-f]{64}",
+            str(payload["adminImage"]),
+        )
+        or not str(payload["adminImage"]).startswith(
+            f"{outputs.get('acrLoginServer', '')}/"
+        )
+    ):
+        raise RuntimeError("Azure foundation admin image is invalid")
     return payload
 
 
@@ -823,7 +1230,7 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
         or not provider_config_uid
     ):
         raise RuntimeError("Azure Tenant controller inventory is incomplete")
-    return {
+    identity = {
         "foundationDefaultsSha256": str(inventory["foundationDefaultsSha256"]),
         "controllerImage": controller_image,
         "azureProviderConfigUid": provider_config_uid,
@@ -833,6 +1240,23 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
             for key, value in sorted(controllers.items())
         },
     }
+    admin_image = inventory.get("adminImage")
+    admin_uid = inventory.get("adminDeploymentUid")
+    if admin_image is not None or admin_uid is not None:
+        if (
+            not isinstance(admin_image, str)
+            or not re.fullmatch(
+                r"[^@\s]+@sha256:[0-9a-f]{64}",
+                admin_image,
+            )
+            or not admin_image.startswith(f"{outputs['acrLoginServer']}/")
+            or not isinstance(admin_uid, str)
+            or not admin_uid
+        ):
+            raise RuntimeError("Azure admin inventory is incomplete")
+        identity["adminImage"] = admin_image
+        identity["adminDeploymentUid"] = admin_uid
+    return identity
 
 
 def _get_management_resource(
@@ -905,6 +1329,13 @@ def _inspect_foundation(
         expected_controller_prefix
     ):
         blockers.append("Azure Tenant manager repository binding changed")
+    if "adminImage" in inventory:
+        expected_admin_prefix = (
+            f"{outputs['acrLoginServer']}/"
+            f"{config['AZURE_ADMIN_REPOSITORY']}@sha256:"
+        )
+        if not str(inventory["adminImage"]).startswith(expected_admin_prefix):
+            blockers.append("Azure admin repository binding changed")
     aks = _az(
         "aks",
         "show",
@@ -1195,6 +1626,14 @@ def _inspect_foundation(
             blockers.append(
                 "CAPZ external control-plane webhook selector is unavailable"
             )
+        if "adminImage" in inventory:
+            _, admin_blockers = _inspect_admin(
+                root,
+                str(inventory["adminImage"]),
+                str(inventory["adminDeploymentUid"]),
+                verify_api=True,
+            )
+            blockers.extend(admin_blockers)
     healthy = not blockers
     if require_healthy and not healthy:
         raise RuntimeError("Azure management foundation is unhealthy: " + "; ".join(blockers))

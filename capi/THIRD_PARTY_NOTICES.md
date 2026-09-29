@@ -32,8 +32,10 @@ Upstream copyright, license, and NOTICE files remain authoritative.
 | BusyBox | verification image `1.37.0` | GPL-2.0 |
 | HAProxy | CAPD load-balancer image | GPL-2.0-or-later with upstream exceptions |
 | just | host prerequisite `1.58.0`; not downloaded by the lab | CC0-1.0 |
+| Trunk | checksum-pinned WebAssembly application bundler `0.21.14` | MIT OR Apache-2.0 |
+| wasm-bindgen CLI | checksum-pinned WebAssembly binding tool `0.2.129` | MIT OR Apache-2.0 |
 
-The Rust manager's **direct runtime dependencies** in the locked Cargo graph
+The Rust controller and Tenant Admin **direct runtime dependencies** in the locked Cargo graph
 (versions shown are resolved versions, not necessarily manifest ranges):
 
 | Crate | Version | Cargo license expression |
@@ -43,11 +45,13 @@ The Rust manager's **direct runtime dependencies** in the locked Cargo graph
 | bollard | `0.21.1` | Apache-2.0 |
 | chrono | `0.4.45` | MIT OR Apache-2.0 |
 | futures | `0.3.34` | MIT OR Apache-2.0 |
+| gloo-net | `0.7.0` | MIT OR Apache-2.0 |
 | hex | `0.4.3` | MIT OR Apache-2.0 |
 | ipnet | `2.12.2` | MIT OR Apache-2.0 |
 | k8s-openapi | `0.28.0` | Apache-2.0 |
 | kube | `4.2.0` | Apache-2.0 |
 | kube-lease-manager | `0.12.0` | MIT |
+| leptos | `0.8.12` | MIT |
 | schemars | `1.2.2` | MIT |
 | serde | `1.0.229` | MIT OR Apache-2.0 |
 | serde_json | `1.0.151` | MIT OR Apache-2.0 |
@@ -55,13 +59,19 @@ The Rust manager's **direct runtime dependencies** in the locked Cargo graph
 | sha2 | `0.10.9` | MIT OR Apache-2.0 |
 | thiserror | `2.0.21` | MIT OR Apache-2.0 |
 | tokio | `1.53.1` | MIT |
+| tower-http | `0.7.1` | MIT |
 | tracing | `0.1.44` | MIT |
 | tracing-subscriber | `0.3.23` | MIT |
 | url | `2.5.8` | MIT OR Apache-2.0 |
+| wasm-bindgen | `0.2.129` | MIT OR Apache-2.0 |
+| wasm-bindgen-futures | `0.4.79` | MIT OR Apache-2.0 |
+| web-sys | `0.3.106` | MIT OR Apache-2.0 |
 
 Direct **test-only** dependencies are `bytes 1.12.1` (MIT),
 `http-body-util 0.1.5` (MIT), `tempfile 3.27.0` (MIT OR Apache-2.0), and
-`tower 0.5.3` (MIT). Cargo.lock also includes transitive and platform-specific
+`tower 0.5.3` (MIT). Some versions of shared crates also appear transitively
+for other targets; the table records the direct workspace selections.
+Cargo.lock also includes transitive and platform-specific
 crates; consult the resolved Cargo metadata and each upstream crate's license
 and NOTICE files before redistributing a binary or its source. No crate source
 is vendored into this repository.
@@ -85,12 +95,17 @@ Source and license references:
 - <https://busybox.net/license.html>
 - <https://github.com/haproxy/haproxy>
 - <https://github.com/casey/just>
+- <https://github.com/trunk-rs/trunk>
+- <https://github.com/rustwasm/wasm-bindgen>
+- <https://github.com/leptos-rs/leptos>
+- <https://github.com/rustwasm/gloo>
 - <https://github.com/tokio-rs/axum>
 - <https://github.com/fussybeaver/bollard>
 - <https://github.com/Arnavion/k8s-openapi>
 - <https://github.com/kube-rs/kube>
 - <https://github.com/alex-karpenko/kube-lease-manager>
 - <https://github.com/tokio-rs/tokio>
+- <https://github.com/tower-rs/tower-http>
 - <https://github.com/serde-rs/serde>
 - <https://crates.io/>
 

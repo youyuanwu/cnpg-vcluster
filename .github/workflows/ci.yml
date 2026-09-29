@@ -44,6 +44,9 @@ jobs:
       - name: Prepare repository-local working directory
         run: install -d -m 700 .tools .runtime
 
+      - name: Acquire pinned admin build tools
+        run: just cache admin-build
+
       - name: Run unit and static tests
         run: |
           just test-unit
@@ -69,11 +72,41 @@ jobs:
       - name: Build static Tenant controller
         run: just controller-build
 
-      - name: Upload static Tenant controller
+      - name: Fetch locked admin dependencies
+        run: just admin-fetch
+
+      - name: Verify generated admin resources
+        run: just admin-generate-check
+
+      - name: Lint Tenant Admin
+        env:
+          CAPI_OFFLINE_ENFORCED: "1"
+        run: just admin-lint
+
+      - name: Test and measure Tenant Admin
+        env:
+          CAPI_OFFLINE_ENFORCED: "1"
+        run: |
+          just admin-test
+          just admin-metrics
+
+      - name: Build reproducible static Tenant Admin package
+        env:
+          CAPI_OFFLINE_ENFORCED: "1"
+        run: just admin-package-check
+
+      - name: Stage prebuilt controller and admin artifacts
+        run: |
+          install -d -m 700 .runtime/rendered/ci-artifact/admin/web
+          install -m 700 .runtime/rendered/controller/manager .runtime/rendered/ci-artifact/manager
+          install -m 700 .runtime/rendered/admin/tenant-admin .runtime/rendered/ci-artifact/admin/tenant-admin
+          install -m 600 .runtime/rendered/admin/web/* .runtime/rendered/ci-artifact/admin/web/
+
+      - name: Upload static controller and Tenant Admin
         uses: actions/upload-artifact@v6
         with:
           name: controller-manager-${{ github.sha }}
-          path: capi/.runtime/rendered/controller/manager
+          path: capi/.runtime/rendered/ci-artifact/
           if-no-files-found: error
           retention-days: 1
 
@@ -89,6 +122,8 @@ jobs:
       MIN_DOCKER_STORAGE_GIB: "10"
       PYTHONUNBUFFERED: "1"
       CAPI_PREBUILT_CONTROLLER_BINARY: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/manager
+      CAPI_PREBUILT_ADMIN_SERVER: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/admin/tenant-admin
+      CAPI_PREBUILT_ADMIN_WEB: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/admin/web
     defaults:
       run:
         working-directory: capi
@@ -113,7 +148,7 @@ jobs:
       - name: Prepare repository-local working directory
         run: install -d -m 700 .tools .runtime
 
-      - name: Download static Tenant controller
+      - name: Download static controller and Tenant Admin
         uses: actions/download-artifact@v7
         with:
           name: controller-manager-${{ github.sha }}
