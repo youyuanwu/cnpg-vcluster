@@ -1,9 +1,14 @@
-use std::{path::PathBuf, sync::Arc};
+use std::{
+    convert::Infallible,
+    path::{Path as FilePath, PathBuf},
+    sync::Arc,
+};
 
 use axum::{
     Json, Router,
+    body::Body,
     extract::{Path, State},
-    http::StatusCode,
+    http::{Request, StatusCode},
     response::IntoResponse,
     routing::get,
 };
@@ -19,6 +24,7 @@ use tenant_admin_shared::{
         READINESS_PATH,
     },
 };
+use tower::{ServiceExt, service_fn};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
@@ -40,7 +46,26 @@ impl AppState {
 
 pub fn router(state: AppState, web_directory: PathBuf) -> Router {
     let index = web_directory.join("index.html");
-    let static_files = ServeDir::new(web_directory).fallback(ServeFile::new(index));
+    let index_file = ServeFile::new(index);
+    let static_files =
+        ServeDir::new(web_directory).fallback(service_fn(move |request: Request<Body>| {
+            let index_file = index_file.clone();
+            async move {
+                let path = request.uri().path();
+                let has_extension = path
+                    .rsplit('/')
+                    .next()
+                    .is_some_and(|segment| FilePath::new(segment).extension().is_some());
+                if has_extension {
+                    return Ok::<_, Infallible>(StatusCode::NOT_FOUND.into_response());
+                }
+                let response = match index_file.oneshot(request).await {
+                    Ok(response) => response.map(Body::new),
+                    Err(infallible) => match infallible {},
+                };
+                Ok(response)
+            }
+        }));
     Router::new()
         .route("/healthz", get(healthz))
         .route(READINESS_PATH, get(readyz))
@@ -557,6 +582,27 @@ mod tests {
         let nested_body = nested.into_body().collect().await.expect("body").to_bytes();
         assert!(
             nested_body
+                .windows(18)
+                .any(|value| value == b"tenant-admin-shell")
+        );
+        let missing_asset = app
+            .clone()
+            .oneshot(
+                Request::get("/assets/missing.js")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+        assert_eq!(missing_asset.status(), StatusCode::NOT_FOUND);
+        let missing_asset_body = missing_asset
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        assert!(
+            !missing_asset_body
                 .windows(18)
                 .any(|value| value == b"tenant-admin-shell")
         );

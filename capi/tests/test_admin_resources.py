@@ -153,10 +153,7 @@ class AdminResourceTests(unittest.TestCase):
             spec = deployment["spec"]
             self.assertEqual(1, spec["replicas"])
             self.assertEqual(
-                {
-                    "type": "RollingUpdate",
-                    "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},
-                },
+                {"type": "Recreate"},
                 spec["strategy"],
             )
 

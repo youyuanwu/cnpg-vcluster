@@ -380,6 +380,11 @@ class AdminPackagingTests(unittest.TestCase):
             "admin/web/src/main.rs": "web",
             "admin/web/Trunk.toml": "config",
             "admin/config/rbac/cluster-role.yaml": "generated",
+            "controller/Cargo.toml": "[package]\nname = \"tenant-controller\"",
+            "controller/src/api.rs": "api",
+            "controller/src/management.rs": "management",
+            "controller/src/ownership.rs": "ownership",
+            "controller/src/sanitize.rs": "sanitization",
             "scripts/generate_admin_resources.py": "generator",
         }
         for name, content in files.items():

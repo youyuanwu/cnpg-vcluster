@@ -115,9 +115,9 @@ retryable flag. The routes are:
 |---|---|
 | `GET /healthz` | Process liveness. |
 | `GET /readyz` | Management Kubernetes API readiness. |
-| `GET /api/v1/overview` | `ManagementOverview`. |
+| `GET /api/v1/overview` | One `OverviewSnapshot` containing the overview and sorted Tenant summaries from the same list operation. |
 | `GET /api/v1/tenants` | Sorted `TenantSummary[]`. |
-| `GET /api/v1/tenants/{name}` | `TenantDetail`. |
+| `GET /api/v1/tenants/{name}` | One `TenantSnapshot` containing detail and topology from the same Tenant UID/generation/resource read. |
 | `GET /api/v1/tenants/{name}/topology` | `TopologyGraph`. |
 | `GET /*` | Static asset or `index.html` fallback for browser routes. |
 
@@ -182,6 +182,11 @@ server plus the exact HTML, JavaScript, Wasm, and CSS inventory by SHA-256.
 The server is rejected if ELF `INTERP` or `NEEDED` entries are present. The
 scratch image contains only `/tenant-admin` and `/web` and runs as UID/GID
 65532.
+
+The Deployment uses `Recreate` rather than a rolling update. Each image owns
+one content-hashed frontend generation, so old and new server/assets are never
+simultaneously selected by the Service. Missing `.js`, `.wasm`, and `.css`
+paths return 404; only extensionless browser routes receive the SPA shell.
 
 Generated browser bundles under `.runtime/rendered/admin/web` are ignored
 build output, not source or checked-in generated fixtures. The authoritative

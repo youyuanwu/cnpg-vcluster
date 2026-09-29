@@ -12,6 +12,8 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
+import yaml
+
 from scripts.azure import _run_profile_mutation
 from scripts.lib.azure.common import (
     _foundation_defaults_checksum,
@@ -604,12 +606,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         kubectl.assert_not_called()
 
     def test_admin_live_health_requires_identity_image_service_and_api(self):
-        root = self.make_root()
+        root = ROOT
         image = "yycvacr.azurecr.io/tenant-admin@sha256:" + "8" * 64
         deployment = {
             "metadata": {"uid": "admin-uid", "generation": 4},
             "spec": {
                 "replicas": 1,
+                "strategy": {"type": "Recreate"},
                 "template": {
                     "spec": {
                         "serviceAccountName": "tenant-admin",
@@ -673,58 +676,109 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 }],
             }
         }
-        role = {
-            "rules": [{
-                "apiGroups": ["tenancy.cnpg-vcluster.io"],
-                "resources": ["tenants"],
-                "verbs": ["get", "list"],
-            }]
+        service_account = yaml.safe_load(
+            (ROOT / "admin/config/rbac/service-account.yaml").read_text()
+        )
+        role = yaml.safe_load(
+            (ROOT / "admin/config/rbac/cluster-role.yaml").read_text()
+        )
+        binding = yaml.safe_load(
+            (ROOT / "admin/config/rbac/cluster-role-binding.yaml").read_text()
+        )
+        tenant_resource = "tenants.tenancy.cnpg-vcluster.io"
+        allowed = {
+            ("get", tenant_resource),
+            ("list", tenant_resource),
         }
 
-        def resources(_root, _namespace, selected):
-            if selected.startswith("deployment/"):
-                return deployment
-            if selected.startswith("service/"):
-                return service
-            if selected.startswith("clusterrole/"):
-                return role
-            raise AssertionError(selected)
-
-        def proxy(*arguments, **_kwargs):
-            path = arguments[-1]
-            if path.endswith("/api/v1/overview"):
-                return completed(json.dumps({
-                    "schemaVersion": 1,
-                    "data": {
-                        "providerMode": "azure",
-                        "tenants": {"total": 0},
-                    },
-                }))
-            if path.endswith("/api/v1/tenants"):
-                return completed(json.dumps({"schemaVersion": 1, "data": []}))
-            return completed()
-
-        with (
-            patch(
-                "scripts.lib.azure.foundation._get_management_resource",
-                side_effect=resources,
-            ),
-            patch(
-                "scripts.lib.azure.foundation._kubectl",
-                side_effect=proxy,
-            ) as kubectl,
+        def inspect(
+            *,
+            resource_overrides=None,
+            authorization_overrides=None,
         ):
-            uid, blockers = _inspect_admin(
-                root,
-                image,
-                "admin-uid",
-                verify_api=True,
-            )
+            resources = {
+                "deployment/tenant-admin": deployment,
+                "service/tenant-admin": service,
+                "serviceaccount/tenant-admin": service_account,
+                "clusterrole/tenant-admin": role,
+                "clusterrolebinding/tenant-admin": binding,
+            }
+            resources.update(resource_overrides or {})
+            authorization = {
+                key: key in allowed
+                for key in (
+                    ("get", tenant_resource),
+                    ("list", tenant_resource),
+                    ("watch", tenant_resource),
+                    ("create", tenant_resource),
+                    ("update", tenant_resource),
+                    ("patch", tenant_resource),
+                    ("delete", tenant_resource),
+                    ("deletecollection", tenant_resource),
+                    ("get", "secrets"),
+                    ("list", "secrets"),
+                    ("watch", "secrets"),
+                    ("create", "secrets"),
+                    ("update", "secrets"),
+                    ("patch", "secrets"),
+                    ("delete", "secrets"),
+                    ("deletecollection", "secrets"),
+                )
+            }
+            authorization.update(authorization_overrides or {})
+
+            def get_resource(_root, _namespace, selected):
+                return copy.deepcopy(resources[selected])
+
+            def kubectl(_root, *arguments, **_kwargs):
+                if arguments[:2] == ("auth", "can-i"):
+                    permitted = authorization[(arguments[2], arguments[3])]
+                    return completed(
+                        "yes\n" if permitted else "no\n",
+                        0 if permitted else 1,
+                    )
+                path = arguments[-1]
+                if path.endswith("/api/v1/overview"):
+                    return completed(json.dumps({
+                        "schemaVersion": 1,
+                        "data": {
+                            "overview": {
+                                "providerMode": "azure",
+                                "tenants": {"total": 0},
+                            },
+                            "tenants": [],
+                        },
+                    }))
+                if path.endswith("/api/v1/tenants"):
+                    return completed(
+                        json.dumps({"schemaVersion": 1, "data": []})
+                    )
+                return completed()
+
+            with (
+                patch(
+                    "scripts.lib.azure.foundation._get_management_resource",
+                    side_effect=get_resource,
+                ),
+                patch(
+                    "scripts.lib.azure.foundation._kubectl",
+                    side_effect=kubectl,
+                ) as kubectl_mock,
+            ):
+                result = _inspect_admin(
+                    root,
+                    image,
+                    "admin-uid",
+                    verify_api=True,
+                )
+            return result, kubectl_mock.call_args_list
+
+        (uid, blockers), calls = inspect()
         self.assertEqual("admin-uid", uid)
         self.assertEqual((), blockers)
         proxy_paths = [
             call.args[-1]
-            for call in kubectl.call_args_list
+            for call in calls
             if "--raw" in call.args
         ]
         for endpoint in (
@@ -737,65 +791,170 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 any(path.endswith(endpoint) for path in proxy_paths),
                 endpoint,
             )
+        authorization_calls = [
+            call.args[1:]
+            for call in calls
+            if call.args[1:3] == ("auth", "can-i")
+        ]
+        self.assertTrue(authorization_calls)
+        self.assertTrue(
+            all(
+                "--api-group" not in argument
+                for call in authorization_calls
+                for argument in call
+            )
+        )
+        self.assertIn(
+            (
+                "auth",
+                "can-i",
+                "get",
+                tenant_resource,
+                "--as=system:serviceaccount:tenant-system:tenant-admin",
+            ),
+            authorization_calls,
+        )
+        self.assertIn(
+            (
+                "auth",
+                "can-i",
+                "get",
+                "secrets",
+                "--as=system:serviceaccount:tenant-system:tenant-admin",
+            ),
+            authorization_calls,
+        )
 
         drifted = copy.deepcopy(deployment)
         drifted["spec"]["template"]["spec"]["containers"][0]["image"] = "old:image"
-        with (
-            patch(
-                "scripts.lib.azure.foundation._get_management_resource",
-                side_effect=[drifted, service, role],
-            ),
-            patch("scripts.lib.azure.foundation._kubectl", side_effect=proxy),
-        ):
-            _, blockers = _inspect_admin(
-                root,
-                image,
-                "admin-uid",
-                verify_api=True,
-            )
+        (_, blockers), _ = inspect(
+            resource_overrides={"deployment/tenant-admin": drifted}
+        )
         self.assertIn("Azure admin image identity changed", blockers)
 
         broken_service = copy.deepcopy(service)
         broken_service["spec"]["ports"][0]["port"] = 443
-        with (
-            patch(
-                "scripts.lib.azure.foundation._get_management_resource",
-                side_effect=[deployment, broken_service, role],
-            ),
-            patch("scripts.lib.azure.foundation._kubectl", side_effect=proxy),
-        ):
-            _, blockers = _inspect_admin(
-                root,
-                image,
-                "admin-uid",
-                verify_api=True,
-            )
+        (_, blockers), _ = inspect(
+            resource_overrides={"service/tenant-admin": broken_service}
+        )
         self.assertIn("Azure admin Service port changed", blockers)
 
-        writable_role = {
-            "rules": [{
-                "apiGroups": [""],
-                "resources": ["secrets"],
-                "verbs": ["get", "list", "create"],
-            }]
-        }
-        with (
-            patch(
-                "scripts.lib.azure.foundation._get_management_resource",
-                side_effect=[deployment, service, writable_role],
-            ),
-            patch("scripts.lib.azure.foundation._kubectl", side_effect=proxy),
-        ):
-            _, blockers = _inspect_admin(
-                root,
-                image,
-                "admin-uid",
-                verify_api=True,
-            )
-        self.assertIn(
-            "Azure admin ClusterRole is not strictly read-only",
-            blockers,
+        misbound = copy.deepcopy(binding)
+        misbound["roleRef"]["name"] = "foreign-role"
+        extra_subject = copy.deepcopy(binding)
+        extra_subject["subjects"].append(
+            {
+                "kind": "ServiceAccount",
+                "name": "foreign",
+                "namespace": "tenant-system",
+            }
         )
+        wrong_service_account_namespace = copy.deepcopy(service_account)
+        wrong_service_account_namespace["metadata"]["namespace"] = "default"
+        token_enabled_service_account = copy.deepcopy(service_account)
+        token_enabled_service_account["automountServiceAccountToken"] = True
+        wrong_role_name = copy.deepcopy(role)
+        wrong_role_name["metadata"]["name"] = "foreign-role"
+        removed_rule = copy.deepcopy(role)
+        removed_rule["rules"].pop()
+        extra_read_rule = copy.deepcopy(role)
+        extra_read_rule["rules"].append(
+            {
+                "apiGroups": [""],
+                "resources": ["pods"],
+                "verbs": ["get", "list"],
+            }
+        )
+        for name, overrides, expected in (
+            (
+                "missing-service-account",
+                {"serviceaccount/tenant-admin": None},
+                "Azure admin ServiceAccount is absent",
+            ),
+            (
+                "missing-role",
+                {"clusterrole/tenant-admin": None},
+                "Azure admin ClusterRole is absent",
+            ),
+            (
+                "missing-binding",
+                {"clusterrolebinding/tenant-admin": None},
+                "Azure admin ClusterRoleBinding is absent",
+            ),
+            (
+                "misbound",
+                {"clusterrolebinding/tenant-admin": misbound},
+                "Azure admin ClusterRoleBinding contract changed",
+            ),
+            (
+                "extra-subject",
+                {"clusterrolebinding/tenant-admin": extra_subject},
+                "Azure admin ClusterRoleBinding contract changed",
+            ),
+            (
+                "wrong-service-account-namespace",
+                {
+                    "serviceaccount/tenant-admin": (
+                        wrong_service_account_namespace
+                    )
+                },
+                "Azure admin ServiceAccount contract changed",
+            ),
+            (
+                "service-account-token-enabled",
+                {
+                    "serviceaccount/tenant-admin": token_enabled_service_account
+                },
+                "Azure admin ServiceAccount contract changed",
+            ),
+            (
+                "wrong-role-name",
+                {"clusterrole/tenant-admin": wrong_role_name},
+                "Azure admin ClusterRole contract changed",
+            ),
+            (
+                "removed-rule",
+                {"clusterrole/tenant-admin": removed_rule},
+                "Azure admin ClusterRole contract changed",
+            ),
+            (
+                "extra-read-rule",
+                {"clusterrole/tenant-admin": extra_read_rule},
+                "Azure admin ClusterRole contract changed",
+            ),
+        ):
+            with self.subTest(name=name):
+                (_, blockers), _ = inspect(resource_overrides=overrides)
+                self.assertIn(expected, blockers)
+
+        for name, overrides, expected in (
+            (
+                "tenant-get-denied",
+                {("get", tenant_resource): False},
+                f"Azure admin authorization denied get {tenant_resource}",
+            ),
+            (
+                "tenant-watch-allowed",
+                {("watch", tenant_resource): True},
+                f"Azure admin authorization allowed watch {tenant_resource}",
+            ),
+            (
+                "tenant-write-allowed",
+                {("create", tenant_resource): True},
+                f"Azure admin authorization allowed create {tenant_resource}",
+            ),
+            (
+                "secret-read-allowed",
+                {("get", "secrets"): True},
+                "Azure admin authorization allowed get secrets",
+            ),
+        ):
+            with self.subTest(name=name):
+                (_, blockers), _ = inspect(
+                    authorization_overrides=overrides
+                )
+                self.assertIn(expected, blockers)
+
     def test_preflight_output_does_not_expose_subscription_id(self):
         root = self.make_root()
         config = load_azure_configuration(root)

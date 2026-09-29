@@ -169,14 +169,12 @@ fn loading_state(label: &'static str) -> AnyView {
 
 fn error_state(error: UiError, refresh: RwSignal<u32>) -> AnyView {
     let show_retry = error.retryable;
-    let not_found = error.kind == UiErrorKind::NotFound;
+    let schema_mismatch = error.kind == UiErrorKind::SchemaMismatch;
     view! {
         <section class="state-panel state-panel--error" role="alert">
             <h2>{error.title()}</h2>
             <p>{error.message}</p>
-            {if not_found {
-                view! { <p><a href="/">"Return to all Tenants"</a></p> }.into_any()
-            } else if show_retry {
+            {if show_retry {
                 view! {
                     <button
                         type="button"
@@ -188,9 +186,14 @@ fn error_state(error: UiError, refresh: RwSignal<u32>) -> AnyView {
                 .into_any()
             } else {
                 view! {
-                    <p class="secondary">
-                        "Refresh after the deployed UI and server versions have been aligned."
-                    </p>
+                    <div>
+                        {schema_mismatch.then(|| view! {
+                            <p class="secondary">
+                                "Refresh after the deployed UI and server versions have been aligned."
+                            </p>
+                        })}
+                        <p><a href="/">"Return to all Tenants"</a></p>
+                    </div>
                 }
                 .into_any()
             }}
@@ -842,19 +845,14 @@ fn topology_panel(graph: TopologyGraph) -> AnyView {
                                     let label = edge
                                         .label
                                         .unwrap_or_else(|| edge_kind_label(edge.kind).to_owned());
-                                    let midpoint_x = (edge.x1 + edge.x2) / 2.0;
-                                    let midpoint_y = (edge.y1 + edge.y2) / 2.0 - 7.0;
                                     view! {
                                         <g>
-                                            <line
+                                            <path
                                                 class="edge"
-                                                x1=edge.x1
-                                                y1=edge.y1
-                                                x2=edge.x2
-                                                y2=edge.y2
+                                                d=edge.path
                                                 marker-end="url(#topology-arrow)"
                                             />
-                                            <text class="edge-label" x=midpoint_x y=midpoint_y>{label}</text>
+                                            <text class="edge-label" x=edge.label_x y=edge.label_y>{label}</text>
                                         </g>
                                     }
                                 })

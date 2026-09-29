@@ -38,10 +38,9 @@ pub struct LayoutEdge {
     pub id: String,
     pub kind: TopologyEdgeKind,
     pub label: Option<String>,
-    pub x1: f32,
-    pub y1: f32,
-    pub x2: f32,
-    pub y2: f32,
+    pub path: String,
+    pub label_x: f32,
+    pub label_y: f32,
 }
 
 pub fn layout_graph(graph: &TopologyGraph) -> TopologyLayout {
@@ -79,19 +78,36 @@ pub fn layout_graph(graph: &TopologyGraph) -> TopologyLayout {
         .filter_map(|edge| {
             let source = positions.get(edge.source.as_str())?;
             let target = positions.get(edge.target.as_str())?;
-            let (x1, x2) = if source.x <= target.x {
-                (source.x + source.width, target.x)
+            let y1 = source.y + source.height / 2.0;
+            let y2 = target.y + target.height / 2.0;
+            let (path, label_x, label_y) = if source.x == target.x {
+                let x1 = source.x + source.width;
+                let x2 = target.x + target.width;
+                let route_x = x1.max(x2) + 32.0;
+                (
+                    format!("M {x1} {y1} H {route_x} V {y2} H {x2}"),
+                    route_x + 6.0,
+                    (y1 + y2) / 2.0 - 7.0,
+                )
             } else {
-                (source.x, target.x + target.width)
+                let (x1, x2) = if source.x < target.x {
+                    (source.x + source.width, target.x)
+                } else {
+                    (source.x, target.x + target.width)
+                };
+                (
+                    format!("M {x1} {y1} L {x2} {y2}"),
+                    (x1 + x2) / 2.0,
+                    (y1 + y2) / 2.0 - 7.0,
+                )
             };
             Some(LayoutEdge {
                 id: edge.id.clone(),
                 kind: edge.kind,
                 label: edge.label.as_deref().map(safe_label),
-                x1,
-                y1: source.y + source.height / 2.0,
-                x2,
-                y2: target.y + target.height / 2.0,
+                path,
+                label_x,
+                label_y,
             })
         })
         .collect::<Vec<_>>();
@@ -210,5 +226,28 @@ mod tests {
         assert!(safe_label(&long).ends_with('…'));
         assert!((176.0..=272.0).contains(&node_width("short")));
         assert_eq!(node_width(&long), 272.0);
+    }
+
+    #[test]
+    fn same_column_edges_route_around_nodes() {
+        let graph = TopologyGraph {
+            tenant_name: "demo".to_owned(),
+            provider: TenantProvider::Azure,
+            nodes: vec![
+                node("source", TopologyNodeKind::ProviderResource, "source"),
+                node("target", TopologyNodeKind::ProviderResource, "target"),
+            ],
+            edges: vec![TopologyEdge {
+                id: "owns".to_owned(),
+                source: "source".to_owned(),
+                target: "target".to_owned(),
+                kind: TopologyEdgeKind::Owns,
+                label: None,
+            }],
+        };
+        let layout = layout_graph(&graph);
+        assert_eq!(layout.edges.len(), 1);
+        assert!(layout.edges[0].path.contains(" H "));
+        assert!(layout.edges[0].path.contains(" V "));
     }
 }

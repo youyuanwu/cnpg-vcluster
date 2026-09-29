@@ -104,6 +104,35 @@ class FakeClient:
         raise AssertionError(arguments)
 
     def _proxy_response(self, path: str) -> str:
+        def topology(name: str) -> dict[str, object]:
+            return {
+                "tenantName": name,
+                "provider": "local",
+                "nodes": [
+                    {
+                        "id": f"tenant:{name}",
+                        "kind": "tenant",
+                        "label": name,
+                        "health": "ready",
+                        "resource": None,
+                        "attributes": [],
+                    }
+                ],
+                "edges": [],
+            }
+
+        def detail(name: str) -> dict[str, object]:
+            return {
+                "summary": tenant_summary(name),
+                "uid": f"{name}-uid",
+                "generation": 1,
+                "observedGeneration": 1,
+                "specification": {},
+                "providerStatus": {},
+                "blockers": [],
+                "managementResources": [],
+            }
+
         if path.endswith(("/healthz", "/readyz")):
             return ""
         if path.endswith("/api/v1/overview"):
@@ -111,16 +140,21 @@ class FakeClient:
                 {
                     "schemaVersion": 1,
                     "data": {
-                        "providerMode": "local",
-                        "tenants": {
-                            "total": len(self.tenant_names),
-                            "ready": len(self.tenant_names),
-                            "progressing": 0,
-                            "degraded": 0,
-                            "failed": 0,
-                            "deleting": 0,
+                        "overview": {
+                            "providerMode": "local",
+                            "tenants": {
+                                "total": len(self.tenant_names),
+                                "ready": len(self.tenant_names),
+                                "progressing": 0,
+                                "degraded": 0,
+                                "failed": 0,
+                                "deleting": 0,
+                            },
+                            "components": [],
                         },
-                        "components": [],
+                        "tenants": [
+                            tenant_summary(name) for name in self.tenant_names
+                        ],
                     },
                 }
             )
@@ -138,21 +172,7 @@ class FakeClient:
                 return json.dumps(
                     {
                         "schemaVersion": 1,
-                        "data": {
-                            "tenantName": name,
-                            "provider": "local",
-                            "nodes": [
-                                {
-                                    "id": f"tenant:{name}",
-                                    "kind": "tenant",
-                                    "label": name,
-                                    "health": "ready",
-                                    "resource": None,
-                                    "attributes": [],
-                                }
-                            ],
-                            "edges": [],
-                        },
+                        "data": topology(name),
                     }
                 )
             if path.endswith(f"/api/v1/tenants/{name}"):
@@ -160,14 +180,13 @@ class FakeClient:
                     {
                         "schemaVersion": 1,
                         "data": {
-                            "summary": tenant_summary(name),
-                            "uid": f"{name}-uid",
-                            "generation": 1,
-                            "observedGeneration": 1,
-                            "specification": {},
-                            "providerStatus": {},
-                            "blockers": [],
-                            "managementResources": [],
+                            "identity": {
+                                "uid": f"{name}-uid",
+                                "generation": 1,
+                                "observedGeneration": 1,
+                            },
+                            "detail": detail(name),
+                            "topology": topology(name),
                         },
                     }
                 )

@@ -8,10 +8,7 @@ spec:
   revisionHistoryLimit: 2
   progressDeadlineSeconds: 300
   strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxUnavailable: 0
-      maxSurge: 1
+    type: Recreate
   selector:
     matchLabels:
       app.kubernetes.io/name: tenant-admin

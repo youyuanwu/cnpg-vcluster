@@ -4,6 +4,8 @@ import base64
 import uuid
 from collections.abc import Callable
 
+import yaml
+
 from .common import *
 from scripts.lib.admin import build_admin_image, render_azure_admin_deployment
 from scripts.lib.controller import (
@@ -757,6 +759,7 @@ def _admin_deployment_blockers(
     generation = metadata.get("generation")
     if (
         spec.get("replicas") != 1
+        or spec.get("strategy") != {"type": "Recreate"}
         or status.get("availableReplicas") != 1
         or status.get("updatedReplicas") != 1
         or not isinstance(generation, int)
@@ -861,33 +864,163 @@ def _admin_service_blockers(payload: Mapping[str, object]) -> list[str]:
     return []
 
 
-def _admin_rbac_blockers(payload: Mapping[str, object]) -> list[str]:
-    rules = payload.get("rules")
-    if not isinstance(rules, list) or not rules:
-        return ["Azure admin ClusterRole is malformed"]
-    for rule in rules:
-        if not isinstance(rule, dict) or "nonResourceURLs" in rule:
-            return ["Azure admin ClusterRole contains unsupported permissions"]
-        api_groups = rule.get("apiGroups")
-        resources = rule.get("resources")
-        verbs = rule.get("verbs")
+def _tracked_admin_resource(
+    root: Path,
+    relative_path: str,
+) -> dict[str, object]:
+    path = root / relative_path
+    try:
+        payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    except (OSError, yaml.YAMLError) as exc:
+        raise RuntimeError(
+            f"tracked Azure admin resource is invalid: {path}"
+        ) from exc
+    if not isinstance(payload, dict):
+        raise RuntimeError(f"tracked Azure admin resource is invalid: {path}")
+    return payload
+
+
+def _normalized_admin_rules(
+    value: object,
+) -> list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] | None:
+    if not isinstance(value, list):
+        return None
+    normalized = []
+    for rule in value:
+        if not isinstance(rule, dict) or set(rule) != {
+            "apiGroups",
+            "resources",
+            "verbs",
+        }:
+            return None
+        groups = rule["apiGroups"]
+        resources = rule["resources"]
+        verbs = rule["verbs"]
         if (
-            not isinstance(api_groups, list)
-            or not api_groups
-            or not all(isinstance(group, str) for group in api_groups)
-            or "*" in api_groups
+            not isinstance(groups, list)
             or not isinstance(resources, list)
-            or not resources
-            or not all(isinstance(resource, str) for resource in resources)
-            or any(
-                resource in {"*", "secrets"} or "/" in resource
-                for resource in resources
-            )
             or not isinstance(verbs, list)
-            or set(verbs) != {"get", "list"}
+            or not all(
+                isinstance(item, str)
+                for item in (*groups, *resources, *verbs)
+            )
         ):
-            return ["Azure admin ClusterRole is not strictly read-only"]
+            return None
+        normalized.append(
+            (
+                tuple(sorted(groups)),
+                tuple(sorted(resources)),
+                tuple(sorted(verbs)),
+            )
+        )
+    return sorted(normalized)
+
+
+def _admin_service_account_blockers(
+    payload: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> list[str]:
+    metadata = payload.get("metadata")
+    expected_metadata = expected.get("metadata")
+    if (
+        payload.get("apiVersion") != expected.get("apiVersion")
+        or payload.get("kind") != expected.get("kind")
+        or not isinstance(metadata, dict)
+        or not isinstance(expected_metadata, dict)
+        or metadata.get("name") != expected_metadata.get("name")
+        or metadata.get("namespace") != expected_metadata.get("namespace")
+        or payload.get("automountServiceAccountToken")
+        is not expected.get("automountServiceAccountToken")
+    ):
+        return ["Azure admin ServiceAccount contract changed"]
     return []
+
+
+def _admin_role_blockers(
+    payload: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> list[str]:
+    metadata = payload.get("metadata")
+    expected_metadata = expected.get("metadata")
+    if (
+        payload.get("apiVersion") != expected.get("apiVersion")
+        or payload.get("kind") != expected.get("kind")
+        or not isinstance(metadata, dict)
+        or not isinstance(expected_metadata, dict)
+        or metadata.get("name") != expected_metadata.get("name")
+        or payload.get("aggregationRule") != expected.get("aggregationRule")
+        or _normalized_admin_rules(payload.get("rules"))
+        != _normalized_admin_rules(expected.get("rules"))
+    ):
+        return ["Azure admin ClusterRole contract changed"]
+    return []
+
+
+def _admin_binding_blockers(
+    payload: Mapping[str, object],
+    expected: Mapping[str, object],
+) -> list[str]:
+    metadata = payload.get("metadata")
+    expected_metadata = expected.get("metadata")
+    if (
+        payload.get("apiVersion") != expected.get("apiVersion")
+        or payload.get("kind") != expected.get("kind")
+        or not isinstance(metadata, dict)
+        or not isinstance(expected_metadata, dict)
+        or metadata.get("name") != expected_metadata.get("name")
+        or payload.get("roleRef") != expected.get("roleRef")
+        or payload.get("subjects") != expected.get("subjects")
+    ):
+        return ["Azure admin ClusterRoleBinding contract changed"]
+    return []
+
+
+def _admin_authorization_blockers(root: Path) -> list[str]:
+    identity = f"system:serviceaccount:{ADMIN_NAMESPACE}:{ADMIN_NAME}"
+    checks = (
+        (True, "get", "tenants.tenancy.cnpg-vcluster.io"),
+        (True, "list", "tenants.tenancy.cnpg-vcluster.io"),
+        (False, "watch", "tenants.tenancy.cnpg-vcluster.io"),
+        (False, "create", "tenants.tenancy.cnpg-vcluster.io"),
+        (False, "update", "tenants.tenancy.cnpg-vcluster.io"),
+        (False, "patch", "tenants.tenancy.cnpg-vcluster.io"),
+        (False, "delete", "tenants.tenancy.cnpg-vcluster.io"),
+        (False, "deletecollection", "tenants.tenancy.cnpg-vcluster.io"),
+        (False, "get", "secrets"),
+        (False, "list", "secrets"),
+        (False, "watch", "secrets"),
+        (False, "create", "secrets"),
+        (False, "update", "secrets"),
+        (False, "patch", "secrets"),
+        (False, "delete", "secrets"),
+        (False, "deletecollection", "secrets"),
+    )
+    blockers = []
+    for expected, verb, resource in checks:
+        response = _kubectl(
+            root,
+            "auth",
+            "can-i",
+            verb,
+            resource,
+            f"--as={identity}",
+            check=False,
+        )
+        answer = response.stdout.strip()
+        if answer not in {"yes", "no"} or (
+            (answer == "yes") != (response.returncode == 0)
+        ):
+            blockers.append(
+                f"Azure admin authorization check failed for {verb} {resource}"
+            )
+            continue
+        allowed = answer == "yes"
+        if allowed != expected:
+            disposition = "denied" if expected else "allowed"
+            blockers.append(
+                f"Azure admin authorization {disposition} {verb} {resource}"
+            )
+    return blockers
 
 
 def _admin_api_blockers(root: Path) -> list[str]:
@@ -914,16 +1047,29 @@ def _admin_api_blockers(root: Path) -> list[str]:
         return ["Azure admin API returned invalid JSON"]
     overview_data = overview.get("data") if isinstance(overview, dict) else None
     tenant_data = tenants.get("data") if isinstance(tenants, dict) else None
-    counts = (
+    overview_summary = (
+        overview_data.get("overview")
+        if isinstance(overview_data, dict)
+        else None
+    )
+    overview_tenants = (
         overview_data.get("tenants")
         if isinstance(overview_data, dict)
+        else None
+    )
+    counts = (
+        overview_summary.get("tenants")
+        if isinstance(overview_summary, dict)
         else None
     )
     if (
         not isinstance(overview, dict)
         or overview.get("schemaVersion") != 1
         or not isinstance(overview_data, dict)
-        or overview_data.get("providerMode") != "azure"
+        or set(overview_data) != {"overview", "tenants"}
+        or not isinstance(overview_summary, dict)
+        or overview_summary.get("providerMode") != "azure"
+        or not isinstance(overview_tenants, list)
         or not isinstance(counts, dict)
         or not isinstance(counts.get("total"), int)
     ):
@@ -935,7 +1081,13 @@ def _admin_api_blockers(root: Path) -> list[str]:
         or not all(isinstance(item, dict) for item in tenant_data)
     ):
         blockers.append("Azure admin Tenant list API contract changed")
-    elif isinstance(counts, dict) and counts.get("total") != len(tenant_data):
+    elif (
+        isinstance(counts, dict)
+        and (
+            counts.get("total") != len(tenant_data)
+            or overview_tenants != tenant_data
+        )
+    ):
         blockers.append("Azure admin empty/list API counts disagree")
     return blockers
 
@@ -972,6 +1124,28 @@ def _inspect_admin(
         blockers.append("Azure admin Service is absent")
     else:
         blockers.extend(_admin_service_blockers(service))
+    expected_service_account = _tracked_admin_resource(
+        root,
+        "admin/config/rbac/service-account.yaml",
+    )
+    service_account = _get_management_resource(
+        root,
+        ADMIN_NAMESPACE,
+        f"serviceaccount/{ADMIN_NAME}",
+    )
+    if service_account is None:
+        blockers.append("Azure admin ServiceAccount is absent")
+    else:
+        blockers.extend(
+            _admin_service_account_blockers(
+                service_account,
+                expected_service_account,
+            )
+        )
+    expected_role = _tracked_admin_resource(
+        root,
+        "admin/config/rbac/cluster-role.yaml",
+    )
     role = _get_management_resource(
         root,
         None,
@@ -980,7 +1154,21 @@ def _inspect_admin(
     if role is None:
         blockers.append("Azure admin ClusterRole is absent")
     else:
-        blockers.extend(_admin_rbac_blockers(role))
+        blockers.extend(_admin_role_blockers(role, expected_role))
+    expected_binding = _tracked_admin_resource(
+        root,
+        "admin/config/rbac/cluster-role-binding.yaml",
+    )
+    binding = _get_management_resource(
+        root,
+        None,
+        f"clusterrolebinding/{ADMIN_NAME}",
+    )
+    if binding is None:
+        blockers.append("Azure admin ClusterRoleBinding is absent")
+    else:
+        blockers.extend(_admin_binding_blockers(binding, expected_binding))
+    blockers.extend(_admin_authorization_blockers(root))
     if verify_api and deployment is not None and service is not None:
         blockers.extend(_admin_api_blockers(root))
     return observed_uid, tuple(blockers)

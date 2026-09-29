@@ -297,11 +297,7 @@ def _verify_deployment_contract(
         metadata.get("name") != ADMIN_NAME
         or metadata.get("namespace") != ADMIN_NAMESPACE
         or spec.get("replicas") != 1
-        or spec.get("strategy")
-        != {
-            "type": "RollingUpdate",
-            "rollingUpdate": {"maxUnavailable": 0, "maxSurge": 1},
-        }
+        or spec.get("strategy") != {"type": "Recreate"}
         or pod.get("serviceAccountName") != ADMIN_NAME
         or pod.get("automountServiceAccountToken") is not True
         or pod.get("enableServiceLinks") is not False
@@ -521,9 +517,14 @@ def verify_admin_api(
     for path in ("healthz", "readyz"):
         if _service_proxy(client, path):
             raise RuntimeError(f"Tenant Admin {path} response body must be empty")
-    overview = _required_mapping(
+    overview_snapshot = _required_mapping(
         _envelope(_service_proxy(client, "api/v1/overview"), "overview"),
         "overview data",
+    )
+    if set(overview_snapshot) != {"overview", "tenants"}:
+        raise RuntimeError("Tenant Admin overview snapshot is invalid")
+    overview = _required_mapping(
+        overview_snapshot.get("overview"), "overview summary"
     )
     if (
         set(overview) != {"providerMode", "tenants", "components"}
@@ -541,8 +542,7 @@ def verify_admin_api(
     } or not all(_is_integer(value) for value in counts.values()):
         raise RuntimeError("Tenant Admin overview counts are invalid")
     summaries = _required_list(
-        _envelope(_service_proxy(client, "api/v1/tenants"), "Tenant list"),
-        "Tenant list data",
+        overview_snapshot.get("tenants"), "overview Tenant list"
     )
     names = tuple(_validate_summary(summary) for summary in summaries)
     if names != tuple(sorted(names)) or counts["total"] != len(names):
@@ -551,14 +551,27 @@ def verify_admin_api(
         sorted(expected_tenant_names)
     ):
         raise RuntimeError("Tenant Admin Tenant list does not match expected identity")
+    listed = _required_list(
+        _envelope(_service_proxy(client, "api/v1/tenants"), "Tenant list"),
+        "Tenant list data",
+    )
+    listed_names = tuple(_validate_summary(summary) for summary in listed)
+    if listed_names != names:
+        raise RuntimeError("Tenant Admin overview and Tenant list disagree")
     for name in names:
-        detail = _required_mapping(
+        snapshot = _required_mapping(
             _envelope(
                 _service_proxy(client, f"api/v1/tenants/{name}"),
-                f"Tenant {name} detail",
+                f"Tenant {name} snapshot",
             ),
-            "Tenant detail data",
+            "Tenant snapshot data",
         )
+        if set(snapshot) != {"identity", "detail", "topology"}:
+            raise RuntimeError("Tenant Admin Tenant snapshot is invalid")
+        identity = _required_mapping(
+            snapshot.get("identity"), "Tenant snapshot identity"
+        )
+        detail = _required_mapping(snapshot.get("detail"), "Tenant detail data")
         if set(detail) != {
             "summary",
             "uid",
@@ -580,7 +593,20 @@ def verify_admin_api(
             or not isinstance(detail.get("managementResources"), list)
         ):
             raise RuntimeError("Tenant Admin Tenant detail response is invalid")
-        _required_string(detail.get("uid"), "Tenant detail UID")
+        detail_uid = _required_string(detail.get("uid"), "Tenant detail UID")
+        if (
+            identity
+            != {
+                "uid": detail_uid,
+                "generation": detail["generation"],
+                "observedGeneration": detail["observedGeneration"],
+            }
+        ):
+            raise RuntimeError("Tenant Admin Tenant snapshot identity changed")
+        _validate_topology(
+            _required_mapping(snapshot.get("topology"), "Tenant topology data"),
+            name,
+        )
         topology = _required_mapping(
             _envelope(
                 _service_proxy(client, f"api/v1/tenants/{name}/topology"),

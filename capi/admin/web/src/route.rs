@@ -26,10 +26,10 @@ pub fn tenant_href(name: &str) -> Option<String> {
 }
 
 fn valid_tenant_name(name: &str) -> bool {
-    name.len() <= 253
-        && name.bytes().all(|byte| {
-            byte.is_ascii_lowercase() || byte.is_ascii_digit() || matches!(byte, b'-' | b'.')
-        })
+    (1..=30).contains(&name.len())
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
         && name
             .as_bytes()
             .first()
@@ -67,6 +67,8 @@ mod tests {
             "/tenants/team/a",
             "/tenants/Team-A",
             "/tenants/-team",
+            "/tenants/team.example",
+            "/tenants/this-name-is-longer-than-thirty-characters",
             "/tenants/team%2Fa",
         ] {
             assert_eq!(parse_route(path), AppRoute::NotFound, "{path}");

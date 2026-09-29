@@ -448,24 +448,54 @@ def verify_reproducible_admin_build(
     return second_server, second_web
 
 
+def _source_tree_inputs(directory: Path, description: str) -> list[Path]:
+    try:
+        details = directory.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"{description} source directory is missing") from exc
+    if stat.S_ISLNK(details.st_mode) or not stat.S_ISDIR(details.st_mode):
+        raise RuntimeError(f"{description} source directory is invalid: {directory}")
+    inputs = []
+    for path in directory.rglob("*"):
+        details = path.lstat()
+        if stat.S_ISLNK(details.st_mode):
+            raise RuntimeError(f"{description} source input is a symlink: {path}")
+        if stat.S_ISREG(details.st_mode):
+            inputs.append(path)
+        elif not stat.S_ISDIR(details.st_mode):
+            raise RuntimeError(
+                f"{description} source input is a special file: {path}"
+            )
+    return inputs
+
+
 def admin_source_digest(root: Path, config: dict[str, str]) -> str:
     admin = root / "admin"
+    controller = root / "controller"
     repository = root.parent
-    admin_inputs = []
-    for path in admin.rglob("*"):
-        if path.is_symlink():
-            raise RuntimeError(f"admin source input is a symlink: {path}")
-        if path.is_file():
-            admin_inputs.append(path)
-        elif not path.is_dir():
-            raise RuntimeError(f"admin source input is a special file: {path}")
+    admin_inputs = _source_tree_inputs(admin, "admin")
+    try:
+        controller_details = controller.lstat()
+    except FileNotFoundError as exc:
+        raise RuntimeError("controller source directory is missing") from exc
+    if (
+        stat.S_ISLNK(controller_details.st_mode)
+        or not stat.S_ISDIR(controller_details.st_mode)
+    ):
+        raise RuntimeError(f"controller source directory is invalid: {controller}")
+    controller_inputs = _source_tree_inputs(controller / "src", "controller")
     inputs = [
         *admin_inputs,
+        *controller_inputs,
+        controller / "Cargo.toml",
         root / "scripts" / "generate_admin_resources.py",
         repository / "Cargo.toml",
         repository / "Cargo.lock",
         repository / "rust-toolchain.toml",
     ]
+    controller_build = controller / "build.rs"
+    if os.path.lexists(controller_build):
+        inputs.append(controller_build)
     digest = hashlib.sha256()
     for path in sorted(set(inputs)):
         if path.is_symlink():

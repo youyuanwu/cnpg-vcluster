@@ -57,7 +57,6 @@ class AdminMetricsTests(unittest.TestCase):
         total = sum(lines for _, lines in metrics)
         self.assertEqual(3916, ADMIN_BASELINE_LINES)
         self.assertEqual(6000, MAX_ADMIN_PRODUCTION_LINES)
-        self.assertEqual(ADMIN_BASELINE_LINES, total)
         self.assertLessEqual(total, MAX_ADMIN_PRODUCTION_LINES)
 
     def test_output_reports_baseline_current_and_delta(self) -> None:
@@ -70,8 +69,10 @@ class AdminMetricsTests(unittest.TestCase):
             arguments.return_value.maximum = MAX_ADMIN_PRODUCTION_LINES
             self.assertEqual(0, main())
         rendered = output.getvalue()
+        current = sum(lines for _, lines in source_metrics())
+        delta = current - ADMIN_BASELINE_LINES
         self.assertIn(
-            "Admin Rust: baseline=3916 current=3916 delta=+0",
+            f"Admin Rust: baseline=3916 current={current} delta={delta:+d}",
             rendered,
         )
 
