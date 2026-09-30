@@ -1,4 +1,6 @@
-use tenant_admin_shared::routes::API_TENANT_DATABASE_QUERY_PATH;
+use tenant_admin_shared::routes::{
+    API_TENANT_CREATE_PATH, API_TENANT_DATABASE_QUERY_PATH, API_TENANT_DELETE_PATH,
+};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum AppRoute {
@@ -31,6 +33,14 @@ pub fn tenant_database_query_path(name: &str) -> Option<String> {
     valid_tenant_name(name).then(|| API_TENANT_DATABASE_QUERY_PATH.replace("{name}", name))
 }
 
+pub fn tenant_create_path() -> &'static str {
+    API_TENANT_CREATE_PATH
+}
+
+pub fn tenant_delete_path(name: &str) -> Option<String> {
+    valid_tenant_name(name).then(|| API_TENANT_DELETE_PATH.replace("{name}", name))
+}
+
 fn valid_tenant_name(name: &str) -> bool {
     (1..=30).contains(&name.len())
         && name
@@ -48,7 +58,10 @@ fn valid_tenant_name(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{AppRoute, parse_route, tenant_database_query_path, tenant_href};
+    use super::{
+        AppRoute, parse_route, tenant_create_path, tenant_database_query_path, tenant_delete_path,
+        tenant_href,
+    };
 
     #[test]
     fn parses_supported_routes() {
@@ -85,6 +98,11 @@ mod tests {
         assert_eq!(
             tenant_database_query_path("team-a"),
             Some("/api/v1/tenants/team-a/database/query".to_owned())
+        );
+        assert_eq!(tenant_create_path(), "/api/v1/tenants");
+        assert_eq!(
+            tenant_delete_path("team-a"),
+            Some("/api/v1/tenants/team-a".into())
         );
     }
 }
