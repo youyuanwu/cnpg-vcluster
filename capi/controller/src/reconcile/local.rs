@@ -157,7 +157,6 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
             endpoint: &endpoint,
             pod_cidr: &claim.slot.pod_cidr,
             service_cidr: &claim.slot.service_cidr,
-            database_count: 0,
             volume_path: "",
             worker_bootstrap_commands: &[],
             inputs: &foundation.inputs,
@@ -247,7 +246,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
             None => self.docker.create_volume(&volume_name, &labels).await?,
         };
         validate_volume(&volume, &volume_name, &labels)?;
-        let commands = resources::worker_bootstrap_commands(foundation.into(), 0)?;
+        let commands = resources::worker_bootstrap_commands(foundation.into())?;
         context.volume_path = &volume.mountpoint;
         context.worker_bootstrap_commands = &commands;
         for desired in [

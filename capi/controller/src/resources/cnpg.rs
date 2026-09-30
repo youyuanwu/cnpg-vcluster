@@ -1,28 +1,11 @@
 use std::collections::BTreeMap;
 
-use k8s_openapi::{
-    api::{
-        core::v1::{
-            HostPathVolumeSource, Namespace, ObjectReference, PersistentVolume,
-            PersistentVolumeSpec,
-        },
-        storage::v1::StorageClass,
-    },
-    apimachinery::pkg::api::resource::Quantity,
-};
+use k8s_openapi::api::storage::v1::StorageClass;
 use kube::core::DynamicObject;
-use serde_json::json;
 
 use super::{
     BuildError, Context, decode_manifest, manifest::replace_object_strings, mark_tenant_object,
-    to_dynamic,
 };
-
-pub const CNPG_CLUSTER_API_VERSION: &str = "postgresql.cnpg.io/v1";
-pub const CNPG_CLUSTER_KIND: &str = "Cluster";
-pub const CNPG_CLUSTER_PLURAL: &str = "clusters";
-pub const MANAGED_DATABASE_NAMESPACE: &str = "database";
-pub const MANAGED_DATABASE_CLUSTER_NAME: &str = "capi-postgres";
 
 pub fn storage_class(context: &Context<'_>, name: &str) -> StorageClass {
     StorageClass {
@@ -55,84 +38,5 @@ pub fn cnpg_operator(
             "unexpected CNPG operator image count".into(),
         ));
     }
-    Ok(objects)
-}
-
-pub fn database_namespace(context: &Context<'_>) -> Namespace {
-    Namespace {
-        metadata: context.metadata(MANAGED_DATABASE_NAMESPACE, "", "cnpg"),
-        ..Default::default()
-    }
-}
-
-pub fn persistent_volumes(context: &Context<'_>, storage_class: &str) -> Vec<PersistentVolume> {
-    (1..=context.database_count)
-        .map(|ordinal| PersistentVolume {
-            metadata: context.metadata(
-                &format!("{MANAGED_DATABASE_CLUSTER_NAME}-pv-{ordinal}"),
-                "",
-                "cnpg",
-            ),
-            spec: Some(PersistentVolumeSpec {
-                capacity: Some(BTreeMap::from([("storage".into(), Quantity("1Gi".into()))])),
-                access_modes: Some(vec!["ReadWriteOnce".into()]),
-                persistent_volume_reclaim_policy: Some("Retain".into()),
-                storage_class_name: Some(storage_class.into()),
-                claim_ref: Some(ObjectReference {
-                    namespace: Some(MANAGED_DATABASE_NAMESPACE.into()),
-                    name: Some(format!("{MANAGED_DATABASE_CLUSTER_NAME}-{ordinal}")),
-                    ..Default::default()
-                }),
-                host_path: Some(HostPathVolumeSource {
-                    path: format!(
-                        "{}/volumes/cnpg/{ordinal}",
-                        context.inputs.storage_container_path
-                    ),
-                    type_: Some("DirectoryOrCreate".into()),
-                }),
-                ..Default::default()
-            }),
-            ..Default::default()
-        })
-        .collect()
-}
-
-pub fn cnpg_cluster(
-    context: &Context<'_>,
-    storage_class: &str,
-    postgres_image: &str,
-) -> DynamicObject {
-    let affinity = if context.database_count > context.spec.workers {
-        "preferred"
-    } else {
-        "required"
-    };
-    context.object(
-        CNPG_CLUSTER_API_VERSION,
-        CNPG_CLUSTER_KIND,
-        MANAGED_DATABASE_CLUSTER_NAME,
-        MANAGED_DATABASE_NAMESPACE,
-        "cnpg",
-        json!({
-            "instances":context.database_count, "imageName":postgres_image,
-            "enableSuperuserAccess":true,
-            "affinity":{"enablePodAntiAffinity":true,"podAntiAffinityType":affinity,"topologyKey":"kubernetes.io/hostname"},
-            "bootstrap":{"initdb":{"database":"app","owner":"app"}},
-            "storage":{"size":"1Gi","storageClass":storage_class},
-            "resources":{"requests":{"cpu":"100m","memory":"256Mi"},"limits":{"cpu":"1","memory":"1Gi"}}
-        }),
-    )
-}
-
-pub fn cnpg_objects(
-    context: &Context<'_>,
-    storage_class: &str,
-    postgres_image: &str,
-) -> Result<Vec<DynamicObject>, BuildError> {
-    let mut objects = vec![to_dynamic(&database_namespace(context))?];
-    for volume in persistent_volumes(context, storage_class) {
-        objects.push(to_dynamic(&volume)?);
-    }
-    objects.push(cnpg_cluster(context, storage_class, postgres_image));
     Ok(objects)
 }

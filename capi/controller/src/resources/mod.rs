@@ -42,7 +42,7 @@ pub struct Context<'a> {
     pub foundation_hash: &'a str,
     /// Allocated host:port, with brackets for IPv6.
     pub endpoint: &'a str,
-    pub pod_cidr: &'a str, pub service_cidr: &'a str, pub database_count: i32,
+    pub pod_cidr: &'a str, pub service_cidr: &'a str,
     /// The inspected Docker volume mountpoint, never a constructed host path.
     pub volume_path: &'a str,
     pub worker_bootstrap_commands: &'a [String],

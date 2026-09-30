@@ -74,15 +74,7 @@ pub fn image_registry(reference: &str) -> &str {
     }
 }
 
-pub fn worker_bootstrap_commands(
-    inputs: BootstrapInputs<'_>,
-    database_count: i32,
-) -> Result<Vec<String>, BuildError> {
-    if !(0..=3).contains(&database_count) {
-        return Err(BuildError::Bootstrap(
-            "database count must be between zero and three".into(),
-        ));
-    }
+pub fn worker_bootstrap_commands(inputs: BootstrapInputs<'_>) -> Result<Vec<String>, BuildError> {
     if inputs.generation.is_empty()
         || inputs.generation.contains('/')
         || inputs.generation == "."
@@ -148,15 +140,6 @@ pub fn worker_bootstrap_commands(
                 shell_quote(&runtime_digest_reference(archive)?)
             ),
         ]);
-    }
-    for ordinal in 1..=database_count {
-        let directory = shell_quote(&format!(
-            "{}/volumes/cnpg/{ordinal}",
-            inputs.storage_container_path
-        ));
-        commands.push(format!(
-            "mkdir -p {directory} && chown 26:26 {directory} && chmod 0700 {directory}"
-        ));
     }
     if !inputs.offline_enforced {
         return Ok(commands);

@@ -1,5 +1,4 @@
-//! Go parity: phase2_test.go bootstrap cases and
-//! reconcile_workers_test.go ordinal preparation and order independence.
+//! Worker bootstrap imports pinned images without preparing database data paths.
 
 use tenant_controller::resources::*;
 
@@ -36,8 +35,8 @@ fn inputs(archives: &[WorkerArchive]) -> BootstrapInputs<'_> {
 #[test]
 fn sorted_archive_import_and_three_reference_forms_are_exact() {
     let archives = archives();
-    let commands = worker_bootstrap_commands(inputs(&archives), 1).unwrap();
-    assert_eq!(commands.len(), 36);
+    let commands = worker_bootstrap_commands(inputs(&archives)).unwrap();
+    assert_eq!(commands.len(), 35);
     let first_path =
         "'/var/lib/capi-image-cache/generations/generation/images/calico_cni_image.tar'";
     assert_eq!(
@@ -78,45 +77,23 @@ fn sorted_archive_import_and_three_reference_forms_are_exact() {
 }
 
 #[test]
-fn ordinal_directories_are_prepared_before_offline_setup_and_independent_of_archive_order() {
+fn image_imports_are_independent_of_archive_order() {
     let mut archives = archives();
     let registry = OfflineRegistry {
         address: "172.18.0.10".into(),
         port: 5000,
     };
     for offline in [false, true] {
-        for count in [1, 2, 3] {
-            let mut input = inputs(&archives);
-            input.offline_enforced = offline;
-            let input = BootstrapInputs {
-                registry: Some(&registry),
-                ..input
-            };
-            let baseline = worker_bootstrap_commands(input, 0).unwrap();
-            let commands = worker_bootstrap_commands(input, count).unwrap();
-            assert_eq!(commands.len(), baseline.len() + count as usize);
-            for ordinal in 1..=count {
-                let directory = format!("'/var/lib/storage/volumes/cnpg/{ordinal}'");
-                assert_eq!(
-                    commands[35 + ordinal as usize - 1],
-                    format!(
-                        "mkdir -p {directory} && chown 26:26 {directory} && chmod 0700 {directory}"
-                    )
-                );
-            }
-            let mut unchanged = commands[..35].to_vec();
-            unchanged.extend_from_slice(&commands[35 + count as usize..]);
-            assert_eq!(unchanged, baseline);
-            assert_eq!(worker_bootstrap_commands(input, count).unwrap(), commands);
-            archives.reverse();
-            let mut reversed = inputs(&archives);
-            reversed.offline_enforced = offline;
-            reversed.registry = Some(&registry);
-            assert_eq!(
-                worker_bootstrap_commands(reversed, count).unwrap(),
-                commands
-            );
-        }
+        let mut input = inputs(&archives);
+        input.offline_enforced = offline;
+        input.registry = Some(&registry);
+        let commands = worker_bootstrap_commands(input).unwrap();
+        assert!(!commands.join("\n").contains("/volumes/cnpg/"));
+        archives.reverse();
+        let mut reversed = inputs(&archives);
+        reversed.offline_enforced = offline;
+        reversed.registry = Some(&registry);
+        assert_eq!(worker_bootstrap_commands(reversed).unwrap(), commands);
     }
 }
 
@@ -145,9 +122,9 @@ fn offline_mirrors_include_every_worker_registry_and_egress_rule_order_is_exact(
     input.offline_enforced = true;
     input.registry = Some(&registry);
     input.allowed_subnets = &subnets;
-    let commands = worker_bootstrap_commands(input, 1).unwrap();
-    assert_eq!(commands.len(), 35 + 1 + 4 + 8);
-    for (command, (registry, server)) in commands[36..40].iter().zip([
+    let commands = worker_bootstrap_commands(input).unwrap();
+    assert_eq!(commands.len(), 35 + 4 + 8);
+    for (command, (registry, server)) in commands[35..39].iter().zip([
         ("docker.io", "https://registry-1.docker.io"),
         ("localhost:5001", "https://localhost:5001"),
         ("quay.io", "https://quay.io"),
@@ -161,7 +138,7 @@ fn offline_mirrors_include_every_worker_registry_and_egress_rule_order_is_exact(
         );
     }
     assert_eq!(
-        &commands[40..],
+        &commands[39..],
         &[
             "iptables -N CAPI_OFFLINE 2>/dev/null || true",
             "iptables -F CAPI_OFFLINE",
@@ -189,7 +166,7 @@ fn bootstrap_refuses_each_missing_duplicate_or_unprepared_required_image() {
         let mut missing = archives();
         missing.retain(|archive| archive.key != key);
         assert!(
-            matches!(worker_bootstrap_commands(inputs(&missing),1),Err(BuildError::WorkerImage(value)) if value == key)
+            matches!(worker_bootstrap_commands(inputs(&missing)),Err(BuildError::WorkerImage(value)) if value == key)
         );
         let mut duplicate = archives();
         duplicate.push(
@@ -199,14 +176,14 @@ fn bootstrap_refuses_each_missing_duplicate_or_unprepared_required_image() {
                 .unwrap()
                 .clone(),
         );
-        assert!(worker_bootstrap_commands(inputs(&duplicate), 1).is_err());
+        assert!(worker_bootstrap_commands(inputs(&duplicate)).is_err());
         let mut unprepared = archives();
         unprepared
             .iter_mut()
             .find(|archive| archive.key == key)
             .unwrap()
             .worker = false;
-        assert!(worker_bootstrap_commands(inputs(&unprepared), 1).is_err());
+        assert!(worker_bootstrap_commands(inputs(&unprepared)).is_err());
     }
 }
 
@@ -222,22 +199,19 @@ fn malformed_bootstrap_inputs_fail_instead_of_emitting_partial_commands() {
         "images//archive.tar",
     ] {
         archives[0].path = path.into();
-        assert!(worker_bootstrap_commands(inputs(&archives), 1).is_err());
+        assert!(worker_bootstrap_commands(inputs(&archives)).is_err());
     }
     archives[0] = valid.clone();
     archives[0].sha256 = "not-a-sha256".into();
-    assert!(worker_bootstrap_commands(inputs(&archives), 1).is_err());
+    assert!(worker_bootstrap_commands(inputs(&archives)).is_err());
     archives[0] = valid.clone();
     archives[0].reference = "image:no-digest".into();
-    assert!(worker_bootstrap_commands(inputs(&archives), 1).is_err());
+    assert!(worker_bootstrap_commands(inputs(&archives)).is_err());
     archives[0] = valid;
-    for count in [-1, 4] {
-        assert!(worker_bootstrap_commands(inputs(&archives), count).is_err());
-    }
     let mut input = inputs(&archives);
     input.offline_enforced = true;
     assert!(matches!(
-        worker_bootstrap_commands(input, 1),
+        worker_bootstrap_commands(input),
         Err(BuildError::Registry)
     ));
     for (address, port) in [("", 5000), ("127.0.0.1", 0)] {
@@ -250,14 +224,14 @@ fn malformed_bootstrap_inputs_fail_instead_of_emitting_partial_commands() {
             ..input
         };
         assert!(matches!(
-            worker_bootstrap_commands(input, 1),
+            worker_bootstrap_commands(input),
             Err(BuildError::Registry)
         ));
     }
     for generation in ["", "..", "../outside", "a/b"] {
         let mut input = inputs(&archives);
         input.generation = generation;
-        assert!(worker_bootstrap_commands(input, 1).is_err());
+        assert!(worker_bootstrap_commands(input).is_err());
     }
 }
 
@@ -301,7 +275,11 @@ fn bootstrap_quotes_every_host_controlled_path_and_argument() {
     let mut input = inputs(&archives);
     input.cache_container_path = "/cache's";
     input.storage_container_path = "/storage's";
-    let commands = worker_bootstrap_commands(input, 1).unwrap();
+    let commands = worker_bootstrap_commands(input).unwrap();
     assert!(commands[0].contains("'/cache'\"'\"'s/generations/generation/images/a'\"'\"'b.tar'"));
-    assert!(commands[35].contains("'/storage'\"'\"'s/volumes/cnpg/1'"));
+    assert!(
+        !commands
+            .join("\n")
+            .contains("'/storage'\"'\"'s/volumes/cnpg/1'")
+    );
 }
