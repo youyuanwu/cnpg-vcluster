@@ -22,7 +22,7 @@ pub fn status(code: u16, reason: &str) -> serde_json::Value {
 }
 
 pub fn tenant() -> Tenant {
-    let mut value = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+    let mut value = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1));
     value.metadata.uid = Some("tenant-uid".into());
     value.metadata.resource_version = Some("1".into());
     value.metadata.generation = Some(2);

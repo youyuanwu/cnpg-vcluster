@@ -81,35 +81,6 @@ fn workload_and_generic_ready_reject_stale_malformed_and_deleting_observations()
 }
 
 #[test]
-fn database_health_requires_only_exact_phase_and_instance_count() {
-    for count in 1..=3 {
-        for phase in ["", "Creating a new replica", "Cluster in healthy state"] {
-            for ready in [
-                json!(0),
-                json!(count - 1),
-                json!(count),
-                json!(count + 1),
-                json!(count.to_string()),
-                serde_json::Value::Null,
-            ] {
-                let mut cluster = object(
-                    "postgresql.cnpg.io/v1",
-                    "Cluster",
-                    "database",
-                    "capi-postgres",
-                    "cnpg",
-                );
-                cluster.data = json!({"status":{"phase":phase,"readyInstances":ready}});
-                assert_eq!(
-                    database_ready(&cluster, count),
-                    phase == "Cluster in healthy state" && ready.as_i64() == Some(i64::from(count))
-                );
-            }
-        }
-    }
-}
-
-#[test]
 fn provider_ready_rejects_stale_explicit_generation_but_allows_missing_evidence() {
     for (api, kind) in [
         ("cluster.x-k8s.io/v1beta2", "Machine"),
@@ -200,7 +171,6 @@ fn aggregate_conditions_are_current_and_established_recovery_remains_degraded() 
         workers: true,
         network: true,
         storage: true,
-        database: true,
     };
     healthy.publish(&mut status, &tenant);
     assert_eq!(status.phase, Some(TenantPhase::Ready));
@@ -234,14 +204,13 @@ fn aggregate_conditions_are_current_and_established_recovery_remains_degraded() 
             .reason,
         "Recovering"
     );
-    for index in 0..5 {
+    for index in 0..4 {
         let mut components = healthy;
         match index {
             0 => components.control_plane = false,
             1 => components.workers = false,
             2 => components.network = false,
-            3 => components.storage = false,
-            _ => components.database = false,
+            _ => components.storage = false,
         }
         components.publish(&mut status, &tenant);
         assert_eq!(status.phase, Some(TenantPhase::Degraded));
@@ -250,7 +219,7 @@ fn aggregate_conditions_are_current_and_established_recovery_remains_degraded() 
     assert_eq!(READY_INTERVAL.as_secs(), 300);
 }
 
-const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a";
+const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a";
 
 #[tokio::test]
 async fn status_conflict_preserves_concurrent_fields_without_unneeded_initial_get() {
@@ -356,7 +325,7 @@ async fn status_patch_rejects_a_replacement_response() {
     let server = Server::default();
     let tenant = tenant();
     server.insert(TENANT, serde_json::to_value(&tenant).unwrap());
-    let successor = json!({"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
+    let successor = json!({"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha4",
         "kind":"Tenant","metadata":{"name":"tenant-a","uid":"successor",
         "resourceVersion":"2","generation":2},"spec":tenant.spec,"status":{}});
     server.respond("PATCH", &format!("{TENANT}/status"), 200, successor);
@@ -402,7 +371,7 @@ async fn finalizer_patch_is_exact_noop_aware_and_rejects_replacement_response() 
     );
     assert!(server.take_calls().is_empty());
 
-    let successor = json!({"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
+    let successor = json!({"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha4",
         "kind":"Tenant","metadata":{"name":"tenant-a","uid":"successor",
         "resourceVersion":"3","generation":2},"spec":tenant.spec});
     server.respond("PATCH", TENANT, 200, successor);

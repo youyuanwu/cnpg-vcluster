@@ -120,17 +120,6 @@ pub fn workload_available(object: &DynamicObject) -> bool {
     desired.is_some_and(|desired| desired > 0 && Some(desired) == available)
 }
 
-pub fn database_ready(object: &DynamicObject, instances: i32) -> bool {
-    object.metadata.deletion_timestamp.is_none()
-        && object.data.pointer("/status/phase").and_then(Value::as_str)
-            == Some("Cluster in healthy state")
-        && object
-            .data
-            .pointer("/status/readyInstances")
-            .and_then(Value::as_i64)
-            == Some(i64::from(instances))
-}
-
 pub fn set_condition(
     status: &mut TenantStatus,
     tenant: &Tenant,
@@ -181,7 +170,8 @@ pub fn progress_status(status: &mut TenantStatus, tenant: &Tenant) {
     initialize_status(status, tenant);
     let established = tenant.status.as_ref().is_some_and(|status| {
         status.conditions.iter().any(|condition| {
-            condition.type_ == "DatabaseReady"
+            condition.type_ == "Ready"
+                && condition.status == "True"
                 && condition.observed_generation == tenant.metadata.generation
         })
     });
@@ -211,12 +201,11 @@ pub struct Components {
     pub workers: bool,
     pub network: bool,
     pub storage: bool,
-    pub database: bool,
 }
 
 impl Components {
     pub fn ready(self) -> bool {
-        self.control_plane && self.workers && self.network && self.storage && self.database
+        self.control_plane && self.workers && self.network && self.storage
     }
 
     pub fn publish(self, status: &mut TenantStatus, tenant: &Tenant) {
@@ -226,7 +215,6 @@ impl Components {
             ("WorkersReady", self.workers),
             ("NetworkReady", self.network),
             ("StorageReady", self.storage),
-            ("DatabaseReady", self.database),
         ] {
             set_condition(
                 status,

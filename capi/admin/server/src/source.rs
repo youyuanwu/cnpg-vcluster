@@ -464,7 +464,7 @@ impl KubeDataSource {
     ) -> Result<DatabaseQueryResponse, SourceError> {
         validate_query_request(request)?;
         if provider != ProviderMode::Local
-            || !matches!(tenant.spec.provider, TenantProviderSpec::Local { .. })
+            || !matches!(tenant.spec.provider, TenantProviderSpec::Local)
         {
             return Err(database_unavailable(
                 "Database queries are available only for local Tenants",
@@ -1713,7 +1713,7 @@ mod tests {
 
     fn local_tenant() -> Tenant {
         serde_json::from_value(json!({
-            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
+            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha4",
             "kind":"Tenant",
             "metadata":{"name":"tenant-a","uid":"tenant-uid","generation":4},
             "spec":{
@@ -1742,7 +1742,7 @@ mod tests {
 
     fn azure_tenant() -> Tenant {
         serde_json::from_value(json!({
-            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
+            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha4",
             "kind":"Tenant",
             "metadata":{"name":"tenant-a","uid":"tenant-uid","generation":4},
             "spec":{
@@ -2866,7 +2866,7 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_create_and_delete_classify_conflict_and_exact_identity() {
-        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1));
         tenant.metadata.uid = Some("tenant-uid".into());
         tenant.metadata.resource_version = Some("7".into());
         tenant.metadata.generation = Some(2);
@@ -2918,11 +2918,11 @@ mod tests {
             [
                 (
                     Method::GET,
-                    "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a".into()
+                    "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a".into()
                 ),
                 (
                     Method::DELETE,
-                    "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a".into()
+                    "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a".into()
                 )
             ]
         );
@@ -2977,7 +2977,7 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_delete_sends_uid_and_resource_version_preconditions() {
-        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1));
         tenant.metadata.uid = Some("tenant-uid".into());
         tenant.metadata.resource_version = Some("17".into());
         tenant.metadata.generation = Some(2);

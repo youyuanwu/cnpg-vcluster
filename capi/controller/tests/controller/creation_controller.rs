@@ -21,7 +21,7 @@ use tenant_controller::{
     },
 };
 
-const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a";
+const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a";
 const FOUNDATION: &str = "/api/v1/namespaces/tenant-system/configmaps/tenant-foundation";
 const LEASES: &str = "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases";
 const CLUSTER: &str = "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/clusters/tenant-a";
@@ -1024,25 +1024,15 @@ async fn full_pipeline_converges_then_observes_once_and_preserves_static_content
             .count(),
         1
     );
-    assert_eq!(
+    assert!(
         calls
             .iter()
-            .filter(|call| call.method == "GET"
-                && call.path
-                    == "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres")
-            .count(),
-        1
+            .all(|call| !call.path.contains("/postgresql.cnpg.io/"))
     );
     assert!(calls.iter().all(
         |call| !call.path.ends_with("/pods") && !call.path.ends_with("/persistentvolumeclaims")
     ));
-    let patches: Vec<_> = calls.iter().filter(|call| call.method == "PATCH").collect();
-    assert_eq!(
-        patches.len(),
-        1,
-        "only the CNPG Cluster is dynamic in the tenant API"
-    );
-    assert!(patches[0].path.ends_with("/clusters/capi-postgres"));
+    assert!(calls.iter().all(|call| call.method != "PATCH"));
     assert_eq!(
         fixture.workload.get(config_path)["data"]["config.conf"],
         "owned drift is intentionally not repaired"
@@ -1186,98 +1176,56 @@ async fn worker_root_owners_are_optional_but_must_be_exact_when_present() {
 }
 
 #[tokio::test]
-async fn database_health_trusts_aggregate_phase_and_ready_instances() {
-    for evidence in [
-        "missing-condition",
-        "false-condition",
-        "stale-condition",
-        "stale-status",
-        "missing-generation",
-    ] {
-        let fixture = Fixture::new(true);
-        fixture.until_ready().await;
-        let path = "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres";
-        let mut database = fixture.workload.get(path);
-        match evidence {
-            "missing-condition" => {
-                database["status"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("conditions");
-            }
-            "false-condition" => database["status"]["conditions"][0]["status"] = json!("False"),
-            "stale-condition" => {
-                database["status"]["conditions"][0]["observedGeneration"] = json!(0)
-            }
-            "stale-status" => database["status"]["observedGeneration"] = json!(0),
-            "missing-generation" => {
-                database["status"]["conditions"][0]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("observedGeneration");
-            }
-            _ => unreachable!(),
-        }
-        fixture.workload.insert(path, database);
-        assert_eq!(
-            fixture.step().await,
-            Action::requeue(std::time::Duration::from_secs(300))
-        );
-        let status = fixture.current().status.unwrap();
-        assert_eq!(
-            status.phase,
-            Some(tenant_controller::api::TenantPhase::Ready),
-            "{evidence}"
-        );
-    }
+async fn tenant_readiness_does_not_depend_on_database_workloads() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    fixture.clear();
+    assert_eq!(
+        fixture.step().await,
+        Action::requeue(std::time::Duration::from_secs(300))
+    );
+    assert_eq!(
+        fixture.current().status.unwrap().phase,
+        Some(TenantPhase::Ready)
+    );
+    assert!(fixture.workload.calls().iter().all(|call| {
+        !call.path.contains("/postgresql.cnpg.io/") && !call.path.contains("/namespaces/database")
+    }));
 }
 
 #[tokio::test]
-async fn established_worker_and_database_recovery_remain_degraded_and_use_short_retry() {
-    for component in ["worker", "database"] {
-        let fixture = Fixture::new(true);
-        fixture.until_ready().await;
-        let path = if component == "worker" {
-            "/api/v1/nodes/worker-a"
-        } else {
-            "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres"
-        };
-        let mut value = fixture.workload.get(path);
-        if component == "worker" {
-            value["status"]["conditions"][0]["status"] = json!("False");
-        } else {
-            value["status"]["readyInstances"] = json!(0);
-        }
-        fixture.workload.insert(path, value);
-        fixture.clear();
-        assert_eq!(
-            fixture.step().await,
-            Action::requeue(std::time::Duration::from_secs(5))
-        );
-        let status = fixture.current().status.unwrap();
-        assert_eq!(
-            status.phase,
-            Some(tenant_controller::api::TenantPhase::Degraded)
-        );
-        assert_eq!(
-            status
-                .conditions
-                .iter()
-                .find(|condition| condition.type_ == "Ready")
-                .unwrap()
-                .reason,
-            "Recovering"
-        );
-        assert_eq!(
-            fixture
-                .workload
-                .calls()
-                .iter()
-                .filter(|call| call.path == "/api/v1/nodes")
-                .count(),
-            1
-        );
-    }
+async fn established_worker_recovery_remains_degraded_and_uses_short_retry() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    let path = "/api/v1/nodes/worker-a";
+    let mut value = fixture.workload.get(path);
+    value["status"]["conditions"][0]["status"] = json!("False");
+    fixture.workload.insert(path, value);
+    fixture.clear();
+    assert_eq!(
+        fixture.step().await,
+        Action::requeue(std::time::Duration::from_secs(5))
+    );
+    let status = fixture.current().status.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Degraded));
+    assert_eq!(
+        status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap()
+            .reason,
+        "Recovering"
+    );
+    assert_eq!(
+        fixture
+            .workload
+            .calls()
+            .iter()
+            .filter(|call| call.path == "/api/v1/nodes")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1488,14 +1436,11 @@ async fn final_availability_is_distinct_from_control_plane_access_and_observed_w
             .status,
         "False"
     );
-    assert_eq!(
+    assert!(
         status
             .conditions
             .iter()
-            .find(|condition| condition.type_ == "DatabaseReady")
-            .unwrap()
-            .status,
-        "True"
+            .all(|condition| condition.type_ != "DatabaseReady")
     );
     assert_eq!(
         fixture
@@ -1509,32 +1454,30 @@ async fn final_availability_is_distinct_from_control_plane_access_and_observed_w
 }
 
 #[tokio::test]
-async fn worker_and_database_spec_drift_is_repaired_only_on_the_live_bound_identities() {
+async fn worker_spec_drift_is_repaired_only_on_the_live_bound_identity() {
     let fixture = Fixture::new(true);
     fixture.until_ready().await;
-    let database_path = "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres";
     let mut deployment = fixture.management.get(DEPLOYMENT);
     deployment["spec"]["replicas"] = json!(3);
     fixture.management.insert(DEPLOYMENT, &deployment);
-    let mut database = fixture.workload.get(database_path);
-    database["spec"]["instances"] = json!(3);
-    fixture.workload.insert(database_path, &database);
     fixture.clear();
     fixture.step().await;
     assert_eq!(fixture.management.get(DEPLOYMENT)["spec"]["replicas"], 1);
-    assert_eq!(fixture.workload.get(database_path)["spec"]["instances"], 1);
-    for (calls, original, path) in [
-        (fixture.management.calls(), deployment, DEPLOYMENT),
-        (fixture.workload.calls(), database, database_path),
-    ] {
-        let apply = calls
+    let calls = fixture.management.calls();
+    let apply = calls
+        .iter()
+        .find(|call| call.method == "PATCH" && call.path == DEPLOYMENT)
+        .unwrap();
+    assert_eq!(apply.body["metadata"]["uid"], deployment["metadata"]["uid"]);
+    assert_eq!(
+        apply.body["metadata"]["resourceVersion"],
+        deployment["metadata"]["resourceVersion"]
+    );
+    assert!(
+        fixture
+            .workload
+            .calls()
             .iter()
-            .find(|call| call.method == "PATCH" && call.path == path)
-            .unwrap();
-        assert_eq!(apply.body["metadata"]["uid"], original["metadata"]["uid"]);
-        assert_eq!(
-            apply.body["metadata"]["resourceVersion"],
-            original["metadata"]["resourceVersion"]
-        );
-    }
+            .all(|call| !call.path.contains("/postgresql.cnpg.io/"))
+    );
 }

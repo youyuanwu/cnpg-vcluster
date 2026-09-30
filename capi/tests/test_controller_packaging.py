@@ -33,7 +33,7 @@ def desired_crd():
         "metadata": {"name": packaging.TENANT_CRD},
         "spec": {
             "versions": [{
-                "name": "v1alpha3",
+                "name": "v1alpha4",
                 "served": True,
                 "storage": True,
                 "schema": {"openAPIV3Schema": {"type": "object"}},
@@ -45,6 +45,7 @@ def desired_crd():
 class Client:
     def __init__(self, handler=None):
         self.calls = []
+        self.applied = set()
         self.handler = handler or (lambda *_args, **_kwargs: response())
 
     def kubectl(self, *args, **kwargs):
@@ -52,6 +53,14 @@ class Client:
         result = self.handler(*args, **kwargs)
         if kwargs.get("check", True) and result.returncode:
             raise RuntimeError(result.stderr)
+        if args and args[0] == "apply" and result.returncode == 0:
+            document = json.loads(kwargs.get("input_text", "{}"))
+            if document.get("metadata", {}).get("name") == packaging.DATABASE_ACTIVATION_POLICY:
+                self.applied.add(
+                    document["kind"].lower() + "/" + packaging.DATABASE_ACTIVATION_POLICY
+                )
+        if args and args[0] == "get" and args[1] in self.applied and not result.stdout:
+            return response(args[1])
         return result
 
     def json(self, *args):
@@ -59,11 +68,40 @@ class Client:
 
 
 class PackagingTests(unittest.TestCase):
+    def test_database_activation_lock_is_separate_and_effective(self):
+        policy, binding = packaging.database_activation_lock_documents()
+        self.assertEqual(policy["metadata"]["name"], packaging.DATABASE_ACTIVATION_POLICY)
+        self.assertEqual(policy["spec"]["failurePolicy"], "Fail")
+        self.assertEqual(policy["spec"]["matchConstraints"]["resourceRules"][0], {
+            "apiGroups": ["tenancy.cnpg-vcluster.io"],
+            "apiVersions": ["v1alpha1"],
+            "operations": ["CREATE"],
+            "resources": ["tenantdatabases"],
+            "scope": "Namespaced",
+        })
+        self.assertEqual(binding["spec"]["validationActions"], ["Deny"])
+        calls = []
+
+        def reject(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ("create", "--dry-run=server"):
+                return response(code=1, error="TenantDatabase creation is locked until both providers are ready")
+            return response()
+
+        client = Client(reject)
+        packaging.ensure_database_activation_lock(client)
+        packaging.verify_database_activation_lock(client, namespace="tenant-system")
+        self.assertEqual(len([args for args, _ in calls if args[0] == "create"]), 5)
+        with self.assertRaisesRegex(RuntimeError, "not effective"):
+            packaging.verify_database_activation_lock(
+                Client(lambda *_a, **_k: response()), namespace="tenant-system",
+            )
+
     def test_cutover_lock_denies_create_for_old_and_new_api_generations(self):
         policy, binding = packaging.tenant_cutover_lock_documents()
         self.assertEqual(policy["metadata"]["name"], packaging.TENANT_CUTOVER_POLICY)
         rule = policy["spec"]["matchConstraints"]["resourceRules"][0]
-        self.assertEqual(rule["apiVersions"], ["v1alpha2", "v1alpha3"])
+        self.assertEqual(rule["apiVersions"], ["v1alpha3", "v1alpha4"])
         self.assertEqual(rule["operations"], ["CREATE"])
         self.assertEqual(policy["spec"]["failurePolicy"], "Fail")
         self.assertEqual(binding["spec"]["policyName"], packaging.TENANT_CUTOVER_POLICY)
@@ -95,7 +133,7 @@ class PackagingTests(unittest.TestCase):
             )
 
     def test_cutover_generation_detection_and_phase_two_activation_ready(self):
-        for version in ("v1alpha2", "v1alpha3"):
+        for version in ("v1alpha3", "v1alpha4"):
             crd = {
                 "spec": {
                     "versions": [
@@ -109,15 +147,15 @@ class PackagingTests(unittest.TestCase):
         transition = packaging.tenant_crd_transition_document(
             {
                 "spec": {"versions": [{
-                    "name": "v1alpha2",
+                    "name": "v1alpha3",
                     "served": True,
                     "storage": True,
                 }]},
-                "status": {"storedVersions": ["v1alpha2"]},
+                "status": {"storedVersions": ["v1alpha3"]},
             },
             desired_crd(),
         )
-        transition["status"] = {"storedVersions": ["v1alpha2"]}
+        transition["status"] = {"storedVersions": ["v1alpha3"]}
         self.assertEqual(
             "transitioning",
             packaging.tenant_api_cutover_state(transition),
@@ -130,10 +168,10 @@ class PackagingTests(unittest.TestCase):
         old = {
             "spec": {
                 "versions": [
-                    {"name": "v1alpha2", "served": True, "storage": True}
+                    {"name": "v1alpha3", "served": True, "storage": True}
                 ]
             },
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
 
         def handle(*args, **_kwargs):
@@ -164,14 +202,14 @@ class PackagingTests(unittest.TestCase):
             for args, _ in client.calls
         ))
 
-    def test_cutover_second_check_failure_removes_lock_before_crd_delete(self):
+    def test_cutover_second_check_failure_retains_lock_and_old_crd(self):
         old = {
             "spec": {
                 "versions": [
-                    {"name": "v1alpha2", "served": True, "storage": True}
+                    {"name": "v1alpha3", "served": True, "storage": True}
                 ]
             },
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         client = Client(
             lambda *args, **_kwargs: response(old)
@@ -197,9 +235,7 @@ class PackagingTests(unittest.TestCase):
             )
         )
         for resource in packaging.tenant_cutover_lock_cleanup_refs():
-            self.assertTrue(
-                any(args[:2] == ("delete", resource) for args, _ in client.calls)
-            )
+            self.assertFalse(any(args[:2] == ("delete", resource) for args, _ in client.calls))
         self.assertTrue(any(
             args[:4]
             == ("-n", packaging.CONTROLLER_NAMESPACE, "scale",
@@ -208,12 +244,12 @@ class PackagingTests(unittest.TestCase):
             for args, _ in client.calls
         ))
 
-    def test_cutover_crd_render_failure_does_not_install_lock(self):
+    def test_cutover_crd_render_failure_retains_database_activation_lock(self):
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         client = Client(
             lambda *args, **_kwargs: response(old)
@@ -229,16 +265,23 @@ class PackagingTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "render failed"),
         ):
             packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)
+        self.assertTrue(any(
+            args and args[0] == "apply" and
+            packaging.DATABASE_ACTIVATION_POLICY in kwargs.get("input_text", "")
+            for args, kwargs in client.calls
+        ))
         self.assertFalse(any(
-            args and args[0] == "apply" for args, _ in client.calls
+            args and args[0] == "apply" and
+            packaging.TENANT_CUTOVER_POLICY in kwargs.get("input_text", "")
+            for args, kwargs in client.calls
         ))
 
     def test_cutover_restore_failure_retains_lock(self):
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         client = Client(
             lambda *args, **_kwargs: response(old)
@@ -264,9 +307,9 @@ class PackagingTests(unittest.TestCase):
     def test_cutover_preserves_existing_lock_without_reapply(self):
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         refs = set(packaging.tenant_cutover_lock_cleanup_refs())
 
@@ -297,7 +340,7 @@ class PackagingTests(unittest.TestCase):
         apply_lock.assert_not_called()
         remove_lock.assert_not_called()
 
-    def test_partial_cutover_lock_application_is_cleaned_up(self):
+    def test_partial_cutover_lock_application_retains_policy_for_retry(self):
         apply_count = 0
 
         def handle(*args, **_kwargs):
@@ -312,9 +355,8 @@ class PackagingTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             packaging.apply_tenant_cutover_lock(CONFIG, client)
         for resource in packaging.tenant_cutover_lock_cleanup_refs():
-            self.assertTrue(
-                any(args[:2] == ("delete", resource) for args, _ in client.calls)
-            )
+            self.assertFalse(any(args[:2] == ("delete", resource) for args, _ in client.calls))
+        self.assertEqual(apply_count, 2)
 
     def test_cutover_rerun_adopts_existing_lock_after_crd_deletion(self):
         refs = set(packaging.tenant_cutover_lock_cleanup_refs())
@@ -339,7 +381,7 @@ class PackagingTests(unittest.TestCase):
                 error="Tenant creation is locked during API cutover",
             )
         )
-        packaging.verify_tenant_cutover_lock(client, "v1alpha2")
+        packaging.verify_tenant_cutover_lock(client, "v1alpha3")
         self.assertEqual(5, len(client.calls))
 
     def setUp(self):
@@ -627,6 +669,18 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         cutover = patch.object(packaging, "TENANT_API_CUTOVER_READY", True)
         cutover.start()
         self.addCleanup(cutover.stop)
+        for target, value in (
+            ("database_admission_image", "admission:image"),
+            ("install_database_admission", None),
+        ):
+            mocked = patch.object(packaging, target, return_value=value)
+            mocked.start()
+            self.addCleanup(mocked.stop)
+        from scripts.lib import database_controller
+        build = patch.object(database_controller, "build_admission_image",
+                             return_value="admission:image")
+        build.start()
+        self.addCleanup(build.stop)
 
     @staticmethod
     def foundation(image="rust:image"):
@@ -644,13 +698,13 @@ class CurrentControllerPackagingTests(unittest.TestCase):
     def test_crd_requires_exact_served_and_stored_version_and_status(self):
         valid = {
             "spec": {"versions": [{
-                "name": "v1alpha3", "served": True, "storage": True, "subresources": {"status": {}},
+                "name": "v1alpha4", "served": True, "storage": True, "subresources": {"status": {}},
             }]},
-            "status": {"storedVersions": ["v1alpha3"]},
+            "status": {"storedVersions": ["v1alpha4"]},
         }
         packaging.verify_controller_crd(Client(lambda *_a, **_k: response(valid)))
         for change in (
-            lambda crd: crd["status"].update(storedVersions=["v1alpha2", "v1alpha3"]),
+            lambda crd: crd["status"].update(storedVersions=["v1alpha3", "v1alpha4"]),
             lambda crd: crd["status"].update(storedVersions=[]),
             lambda crd: crd["spec"]["versions"].append({"name": "v1alpha1"}),
             lambda crd: crd["spec"]["versions"][0].update(served=False),
@@ -659,7 +713,7 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         ):
             invalid = copy.deepcopy(valid)
             change(invalid)
-            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "only v1alpha3"):
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "only v1alpha4"):
                 packaging.verify_controller_crd(Client(lambda *_a, **_k: response(invalid)))
 
     def test_pre_acceptance_failure_restores_previous_controller(self):
@@ -924,7 +978,7 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         spec = {
             "kubernetesVersion": "1.36.4",
             "workers": 1,
-            "provider": {"type": "local", "databases": 1},
+            "provider": {"type": "local"},
         }
 
         def handle(*args, **kwargs):
@@ -940,13 +994,11 @@ class CurrentControllerPackagingTests(unittest.TestCase):
                     return response(code=1, error="Invalid: Tenant name")
                 if incoming["workers"] == 0:
                     return response(code=1, error="Invalid workers")
-                if provider.get("databases") == 4:
-                    return response(code=1, error="Invalid databases")
+                if "databases" in provider and "--validate=strict" in args:
+                    return response(code=1, error="unknown field")
                 if incoming["kubernetesVersion"] == "bad":
                     return response(code=1, error="Invalid kubernetesVersion")
                 if provider["type"] == "azure":
-                    if "databases" in provider:
-                        return response(code=1, error="Invalid databases")
                     if provider != {"type": "azure"}:
                         return response(code=1, error="unknown field")
                     return response({**value, "spec": incoming})

@@ -1,15 +1,13 @@
 use tenant_admin_shared::{
     lifecycle::{TenantCreateRequest, TenantField, TenantFieldError},
-    query::{ProviderMode, TenantClassification},
+    query::TenantClassification,
 };
 
 use crate::error::UiErrorKind;
 
 pub fn create_request(
-    provider: ProviderMode,
     name: &str,
     workers: &str,
-    databases: &str,
 ) -> Result<TenantCreateRequest, Vec<TenantFieldError>> {
     let mut errors = Vec::new();
     if !valid_tenant_name(name) {
@@ -27,23 +25,11 @@ pub fn create_request(
         ));
         0
     });
-    let databases = match provider {
-        ProviderMode::Local => parse_count(databases).or_else(|| {
-            errors.push(field_error(
-                TenantField::Databases,
-                "invalid-count",
-                "Databases must be from 1 through 3.",
-            ));
-            None
-        }),
-        ProviderMode::Azure => None,
-    };
     errors.sort_by_key(|error| error.field);
     if errors.is_empty() {
         Ok(TenantCreateRequest {
             name: name.into(),
             workers,
-            databases,
         })
     } else {
         Err(errors)
@@ -123,10 +109,7 @@ fn field_error(field: TenantField, code: &str, message: &str) -> TenantFieldErro
 
 #[cfg(test)]
 mod tests {
-    use tenant_admin_shared::{
-        lifecycle::TenantField,
-        query::{ProviderMode, TenantClassification},
-    };
+    use tenant_admin_shared::{lifecycle::TenantField, query::TenantClassification};
 
     use crate::error::UiErrorKind;
 
@@ -136,22 +119,16 @@ mod tests {
     };
 
     #[test]
-    fn provider_specific_create_requests_validate_all_fields() {
-        let local = create_request(ProviderMode::Local, "tenant-a", "2", "3").unwrap();
-        assert_eq!(local.databases, Some(3));
-        let azure = create_request(ProviderMode::Azure, "tenant-a", "2", "ignored").unwrap();
-        assert_eq!(azure.databases, None);
-        let errors = create_request(ProviderMode::Local, "Invalid", "0", "9").unwrap_err();
+    fn tenant_create_requests_have_no_implicit_databases() {
+        let local = create_request("tenant-a", "2").unwrap();
+        assert_eq!(local.workers, 2);
+        let errors = create_request("Invalid", "0").unwrap_err();
         assert_eq!(
             errors
                 .into_iter()
                 .map(|error| error.field)
                 .collect::<Vec<_>>(),
-            vec![
-                TenantField::Name,
-                TenantField::Workers,
-                TenantField::Databases
-            ]
+            vec![TenantField::Name, TenantField::Workers]
         );
     }
 

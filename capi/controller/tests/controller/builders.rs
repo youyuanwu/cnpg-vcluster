@@ -61,11 +61,11 @@ fn catalog_watch_mapping_preserves_typed_and_dynamic_fallbacks() {
 
 impl Fixture {
     fn new() -> Self {
-        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 2, 1));
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 2));
         tenant.metadata.uid = Some("uid-a".into());
         Self {
             tenant,
-            spec: CanonicalSpec::local("1.36.4", 2, 1),
+            spec: CanonicalSpec::local("1.36.4", 2),
             inputs: Inputs {
                 ownership_label: "example.io/owned".into(),
                 lab_prefix: "example".into(),
@@ -96,7 +96,7 @@ impl Fixture {
             endpoint: "172.18.255.1:6443",
             pod_cidr: "10.20.0.0/16",
             service_cidr: "10.21.0.0/16",
-            database_count: self.spec.local_databases().unwrap(),
+            database_count: 0,
             volume_path: "/var/lib/docker/volumes/tenant/_data",
             worker_bootstrap_commands: &[],
             inputs: &self.inputs,
@@ -593,8 +593,8 @@ fn storage_and_cnpg_all_count_pairs_affinity_and_exact_prebinding() {
     for workers in 1..=3 {
         for databases in 1..=3 {
             fixture.spec.workers = workers;
-            fixture.spec.provider = tenant_controller::api::TenantProviderSpec::Local { databases };
-            let context = fixture.context();
+            let mut context = fixture.context();
+            context.database_count = databases;
             let storage = to_dynamic(&storage_class(&context, "capi-hostpath")).unwrap();
             assert_markers(&storage, "storage");
             assert_eq!(

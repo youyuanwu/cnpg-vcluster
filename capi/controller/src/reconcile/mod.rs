@@ -146,7 +146,7 @@ impl<P: ProviderLifecycle> Reconciler<P> {
     async fn unsupported_provider(&self, tenant: &Tenant) -> Result<Action, ReconcileError> {
         let has_finalizer = tenant.finalizers().iter().any(|value| value == FINALIZER);
         let (provider_status, provider_name) = match tenant.spec.provider {
-            crate::api::TenantProviderSpec::Local { .. } => {
+            crate::api::TenantProviderSpec::Local => {
                 (TenantProviderStatus::Local(Default::default()), "Local")
             }
             crate::api::TenantProviderSpec::Azure => {

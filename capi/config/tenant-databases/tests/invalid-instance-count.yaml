@@ -1,0 +1,9 @@
+apiVersion: tenancy.cnpg-vcluster.io/v1alpha1
+kind: TenantDatabase
+metadata:
+  name: orders
+  namespace: tenant-db-tenant-example
+spec:
+  tenantName: tenant-example
+  tenantUID: replace-with-live-tenant-uid
+  instances: 4

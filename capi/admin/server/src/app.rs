@@ -164,7 +164,7 @@ async fn tenant_create(
     let body = body.map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
     let request: TenantCreateRequest = serde_json::from_slice(&body)
         .map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
-    let field_errors = validate_create_request(state.provider, &request);
+    let field_errors = validate_create_request(&request);
     if !field_errors.is_empty() {
         return Err(AppError::invalid_fields(
             "Tenant creation fields are invalid",
@@ -179,10 +179,7 @@ async fn tenant_create(
         .supported_kubernetes_version
         .ok_or(SourceError::CreationUnavailable)?;
     let provider = match state.provider {
-        ProviderMode::Local => TenantProviderSpec::Local {
-            databases: i32::try_from(request.databases.expect("validated"))
-                .map_err(|_| AppError::invalid_request("databases is invalid"))?,
-        },
+        ProviderMode::Local => TenantProviderSpec::Local,
         ProviderMode::Azure => TenantProviderSpec::Azure,
     };
     let spec = TenantSpec {
@@ -326,7 +323,7 @@ async fn database_query(
         .get_tenant(&name)
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant {name} was not found")))?;
-    if !matches!(tenant.spec.provider, TenantProviderSpec::Local { .. }) {
+    if !matches!(tenant.spec.provider, TenantProviderSpec::Local) {
         return Err(AppError::database_unavailable(
             "Database queries are available only for local Tenants",
             false,
@@ -450,10 +447,7 @@ fn counts(summaries: &[TenantSummary]) -> TenantCounts {
     counts
 }
 
-fn validate_create_request(
-    provider: ProviderMode,
-    request: &TenantCreateRequest,
-) -> Vec<TenantFieldError> {
+fn validate_create_request(request: &TenantCreateRequest) -> Vec<TenantFieldError> {
     let mut errors = Vec::new();
     if !valid_tenant_name(&request.name) {
         errors.push(TenantFieldError {
@@ -468,20 +462,6 @@ fn validate_create_request(
             code: "invalid-count".into(),
             message: "Workers must be from 1 through 3.".into(),
         });
-    }
-    match (provider, request.databases) {
-        (ProviderMode::Local, Some(databases)) if (1..=3).contains(&databases) => {}
-        (ProviderMode::Local, _) => errors.push(TenantFieldError {
-            field: TenantField::Databases,
-            code: "invalid-count".into(),
-            message: "Databases must be from 1 through 3.".into(),
-        }),
-        (ProviderMode::Azure, Some(_)) => errors.push(TenantFieldError {
-            field: TenantField::Databases,
-            code: "provider-inapplicable".into(),
-            message: "Databases are not accepted for Azure Tenants.".into(),
-        }),
-        (ProviderMode::Azure, None) => {}
     }
     errors.sort_by_key(|error| error.field);
     errors
@@ -717,12 +697,13 @@ mod tests {
     }
 
     fn ready_tenant() -> Tenant {
-        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1));
         tenant.metadata.uid = Some("tenant-uid".into());
         tenant.metadata.generation = Some(1);
         tenant.status = Some(TenantStatus {
             observed_generation: Some(1),
             phase: Some(TenantPhase::Ready),
+            database_capability: None,
             conditions: vec![Condition {
                 type_: "Ready".into(),
                 status: "True".into(),
@@ -905,9 +886,7 @@ mod tests {
         let calls = source.calls.clone();
         let app = test_router(source);
         let create = Request::post(API_TENANTS_PATH)
-            .body(Body::from(
-                r#"{"name":"tenant-b","workers":2,"databases":1}"#,
-            ))
+            .body(Body::from(r#"{"name":"tenant-b","workers":2}"#))
             .unwrap();
         let response = app.clone().oneshot(create).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
@@ -920,14 +899,12 @@ mod tests {
             .header("origin", "http://127.0.0.1:8080")
             .header("host", "127.0.0.1:8080")
             .header(TENANT_ADMIN_UNSAFE_REQUEST_HEADER, "1")
-            .body(Body::from(
-                r#"{"name":"Invalid","workers":0,"databases":9}"#,
-            ))
+            .body(Body::from(r#"{"name":"Invalid","workers":0}"#))
             .unwrap();
         let response = app.clone().oneshot(invalid).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let envelope: ApiErrorEnvelope = response_json(response).await;
-        assert_eq!(envelope.error.field_errors.len(), 3);
+        assert_eq!(envelope.error.field_errors.len(), 2);
         assert_eq!(calls.tenant_creates.load(Ordering::Relaxed), 1);
 
         let mismatched = Request::delete("/api/v1/tenants/tenant-a")
@@ -973,7 +950,7 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let envelope: ApiErrorEnvelope = response_json(response).await;
-        assert_eq!(envelope.error.field_errors[0].field, TenantField::Databases);
+        assert_eq!(envelope.error.code, ApiErrorCode::InvalidRequest);
         assert_eq!(calls.tenant_creates.load(Ordering::Relaxed), 0);
     }
 
@@ -991,9 +968,7 @@ mod tests {
         let calls = source.calls.clone();
         let app = test_router_with_provider(source, ProviderMode::Azure);
         let request = Request::post(API_TENANTS_PATH)
-            .body(Body::from(
-                r#"{"name":"tenant-b","workers":2,"databases":null}"#,
-            ))
+            .body(Body::from(r#"{"name":"tenant-b","workers":2}"#))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);

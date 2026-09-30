@@ -26,7 +26,7 @@ class AzureOperatorTests(AzureFixtureMixin, unittest.TestCase):
         spec = self.spec(workers=3)
         self.assertEqual(
             {
-                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
+                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
                 "kind": "Tenant",
                 "metadata": {"name": "tenant-c"},
                 "spec": {

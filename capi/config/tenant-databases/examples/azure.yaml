@@ -1,0 +1,9 @@
+apiVersion: tenancy.cnpg-vcluster.io/v1alpha1
+kind: TenantDatabase
+metadata:
+  name: analytics
+  namespace: tenant-db-azure-example
+spec:
+  tenantName: azure-example
+  tenantUID: replace-with-live-tenant-uid
+  instances: 3

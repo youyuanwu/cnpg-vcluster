@@ -58,11 +58,10 @@ fn lifecycle_contracts_are_versioned_provider_neutral_and_uid_bound() {
     let create = TenantCreateRequest {
         name: "demo".into(),
         workers: 2,
-        databases: Some(1),
     };
     assert_eq!(
         serde_json::to_string(&create).unwrap(),
-        r#"{"name":"demo","workers":2,"databases":1}"#
+        r#"{"name":"demo","workers":2}"#
     );
     let identity = TenantMutationIdentity {
         name: "demo".into(),
@@ -185,7 +184,6 @@ fn page_snapshots_keep_identity_and_page_data_together() {
         classification: tenant_admin_shared::query::TenantClassification::Progressing,
         kubernetes_version: "1.36.0".into(),
         requested_workers: 1,
-        requested_databases: Some(1),
         endpoint: None,
         created_at: None,
         conditions: Vec::new(),
@@ -214,7 +212,7 @@ fn page_snapshots_keep_identity_and_page_data_together() {
         specification: tenant_admin_shared::query::TenantSpecificationView {
             kubernetes_version: "1.36.0".into(),
             workers: 1,
-            provider: tenant_admin_shared::query::ProviderSpecificationView::Local { databases: 1 },
+            provider: tenant_admin_shared::query::ProviderSpecificationView::Local,
         },
         provider_status: ProviderStatusView::Unknown(UnknownProviderView {
             provider_type: "local".into(),

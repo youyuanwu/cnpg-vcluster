@@ -15,7 +15,6 @@ pub struct CreationCapability {
 pub struct TenantCreateRequest {
     pub name: String,
     pub workers: u32,
-    pub databases: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -60,7 +59,6 @@ pub struct TenantDeleteResponse {
 pub enum TenantField {
     Name,
     Workers,
-    Databases,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

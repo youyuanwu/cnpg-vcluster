@@ -1,0 +1,38 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: database-controller
+rules:
+- apiGroups:
+  - tenancy.cnpg-vcluster.io
+  resources:
+  - tenantdatabases
+  verbs:
+  - get
+  - list
+  - watch
+  - patch
+  - update
+- apiGroups:
+  - tenancy.cnpg-vcluster.io
+  resources:
+  - tenantdatabases/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - tenancy.cnpg-vcluster.io
+  resources:
+  - tenantdatabases/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - tenancy.cnpg-vcluster.io
+  resources:
+  - tenants
+  verbs:
+  - get
+  - list
+  - watch

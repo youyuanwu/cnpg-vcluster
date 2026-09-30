@@ -143,10 +143,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         old = {
             "spec": {
                 "versions": [
-                    {"name": "v1alpha2", "served": True, "storage": True}
+                    {"name": "v1alpha3", "served": True, "storage": True}
                 ]
             },
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         calls = []
         entries = json.loads(
@@ -169,7 +169,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             "metadata": {"name": "tenants.tenancy.cnpg-vcluster.io"},
             "spec": {
                 "versions": [{
-                    "name": "v1alpha3",
+                    "name": "v1alpha4",
                     "served": True,
                     "storage": True,
                     "schema": {"openAPIV3Schema": {"type": "object"}},
@@ -183,7 +183,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return completed(json.dumps(desired))
             if arguments[:2] == ("get", "tenants"):
                 return completed(json.dumps({
-                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
                     "kind": "TenantList",
                     "metadata": {"continue": ""},
                     "items": [],
@@ -237,7 +237,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             calls,
         )
 
-    def test_partial_azure_cutover_lock_application_is_cleaned_up(self):
+    def test_partial_azure_cutover_lock_application_retains_policy_for_retry(self):
         root = self.make_root()
         calls = []
         apply_count = 0
@@ -256,29 +256,20 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "binding rejected"),
         ):
             _azure_cutover_lock(root, present=True)
-        self.assertTrue(
-            any(
-                arguments[:2]
-                == (
-                    "delete",
-                    "validatingadmissionpolicybinding/tenant-api-cutover-create-lock",
-                )
-                for arguments in calls
-            )
-        )
+        self.assertFalse(any(arguments[0] == "delete" for arguments in calls))
 
     def test_azure_cutover_second_inventory_failure_restores_controller(self):
         root = self.make_root()
         config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         desired = {
             "spec": {"versions": [{
-                "name": "v1alpha3", "served": True, "storage": True,
+                "name": "v1alpha4", "served": True, "storage": True,
             }]}
         }
         with (
@@ -312,7 +303,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             [call.args for call in scale.call_args_list],
         )
         self.assertEqual(
-            [((root,), {"present": True}), ((root,), {"present": False})],
+            [((root,), {"present": True})],
             [(call.args, call.kwargs) for call in lock.call_args_list],
         )
 
@@ -320,9 +311,9 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         root = self.make_root()
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         with (
             patch(
@@ -347,13 +338,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         desired = {
             "spec": {"versions": [{
-                "name": "v1alpha3", "served": True, "storage": True,
+                "name": "v1alpha4", "served": True, "storage": True,
             }]}
         }
         with (
@@ -397,13 +388,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         desired = {
             "spec": {"versions": [{
-                "name": "v1alpha3", "served": True, "storage": True,
+                "name": "v1alpha4", "served": True, "storage": True,
             }]}
         }
         with (
@@ -469,11 +460,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         def kubectl(_root, *arguments, **_kwargs):
             if arguments[:2] == ("get", "tenants"):
                 return completed(json.dumps({
-                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
                     "kind": "TenantList",
                     "metadata": {"continue": ""},
                     "items": [],
                 }))
+            if arguments[:2] == ("get", "crd/tenantdatabases.tenancy.cnpg-vcluster.io"):
+                return completed()
             items = []
             resource = arguments[1]
             entries = json.loads(

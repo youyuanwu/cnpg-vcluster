@@ -16,7 +16,7 @@ use tenant_controller::{
 
 use crate::creation_support::{FakeAccess, Server};
 
-const TENANT_PATH: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a";
+const TENANT_PATH: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a";
 const PROVIDER_CONFIG_PATH: &str =
     "/api/v1/namespaces/tenant-system/configmaps/tenant-azure-provider";
 const ALLOCATION_CONFIG_PATH: &str =
@@ -64,8 +64,8 @@ impl Fixture {
             "Lease",
         );
         management.allow_typed_list(
-            "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants",
-            "tenancy.cnpg-vcluster.io/v1alpha3",
+            "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants",
+            "tenancy.cnpg-vcluster.io/v1alpha4",
             "Tenant",
         );
         workload.allow_typed_list("/api/v1/nodes", "v1", "Node");

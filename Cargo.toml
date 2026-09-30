@@ -4,6 +4,7 @@ members = [
     "capi/admin/shared",
     "capi/admin/web",
     "capi/controller",
+    "capi/database-controller",
 ]
 resolver = "2"
 
@@ -17,6 +18,8 @@ console_error_panic_hook = "0.1"
 futures = "0.3"
 gloo-net = "0.7"
 hex = "0.4"
+hyper = "1"
+hyper-util = { version = "0.1", features = ["server-auto", "tokio", "service", "http1", "http2"] }
 http-body-util = "0.1"
 ipnet = { version = "2", features = ["serde"] }
 js-sys = "=0.3.106"
@@ -25,6 +28,7 @@ kube = { version = "=4.2.0", features = ["derive", "runtime", "rustls-tls", "ws"
 kube-lease-manager = "=0.12.0"
 leptos = { version = "=0.8.12", default-features = false, features = ["csr"] }
 schemars = "1"
+rustls-pemfile = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_yaml = "0.9"
@@ -32,12 +36,14 @@ sha2 = "0.10"
 tempfile = "3"
 thiserror = "2"
 tokio = { version = "1", features = ["io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 tokio-postgres = "0.7"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 tenant-admin-shared = { path = "capi/admin/shared" }
 tenant-controller = { path = "capi/controller" }
+tenant-database-controller = { path = "capi/database-controller" }
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 url = "2"
 wasm-bindgen = "=0.2.129"

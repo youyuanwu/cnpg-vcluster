@@ -91,7 +91,6 @@ pub struct TenantSummary {
     pub classification: TenantClassification,
     pub kubernetes_version: String,
     pub requested_workers: u32,
-    pub requested_databases: Option<u32>,
     pub endpoint: Option<String>,
     pub created_at: Option<String>,
     pub conditions: Vec<TenantCondition>,
@@ -301,7 +300,7 @@ pub struct TenantSpecificationView {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum ProviderSpecificationView {
-    Local { databases: u32 },
+    Local,
     Azure,
     Unknown { provider_type: String },
 }

@@ -26,10 +26,7 @@ spec:
     - jsonPath: .spec.workers
       name: Workers
       type: integer
-    - jsonPath: .spec.provider.databases
-      name: Databases
-      type: integer
-    name: v1alpha3
+    name: v1alpha4
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for TenantSpec via `CustomResource`
@@ -41,11 +38,6 @@ spec:
                 type: string
               provider:
                 properties:
-                  databases:
-                    format: int32
-                    maximum: 3.0
-                    minimum: 1.0
-                    type: integer
                   type:
                     enum:
                     - local
@@ -102,6 +94,26 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              databaseCapability:
+                nullable: true
+                properties:
+                  available:
+                    type: boolean
+                  gateUID:
+                    type: string
+                  namespaceUID:
+                    type: string
+                  quotaUID:
+                    type: string
+                  reason:
+                    type: string
+                required:
+                - available
+                - gateUID
+                - namespaceUID
+                - quotaUID
+                - reason
+                type: object
               observedGeneration:
                 format: int64
                 nullable: true
@@ -365,8 +377,6 @@ spec:
           rule: self.metadata.name.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')
         - message: workers must be between 1 and 3
           rule: self.spec.workers >= 1 && self.spec.workers <= 3
-        - message: databases must be present only for the local provider
-          rule: 'self.spec.provider.type == ''local'' ? has(self.spec.provider.databases) : !has(self.spec.provider.databases)'
         - message: Tenant provider status must match the requested provider
           rule: '!has(self.status) || !has(self.status.provider) || self.status.provider.type == self.spec.provider.type'
         - message: Azure provider status cannot contain local durable identity

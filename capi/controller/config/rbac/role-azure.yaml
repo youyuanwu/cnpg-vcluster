@@ -25,16 +25,12 @@ rules:
   - patch
   - update
 - apiGroups:
-  - coordination.k8s.io
+  - tenancy.cnpg-vcluster.io
   resources:
-  - leases
+  - tenantdatabases
   verbs:
-  - create
   - delete
-  - get
   - list
-  - patch
-  - update
   - watch
 - apiGroups:
   - tenancy.cnpg-vcluster.io

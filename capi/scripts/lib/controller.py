@@ -31,7 +31,9 @@ if TYPE_CHECKING:
 CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
+DATABASE_CRD = "tenantdatabases.tenancy.cnpg-vcluster.io"
 TENANT_CUTOVER_POLICY = "tenant-api-cutover-create-lock"
+DATABASE_ACTIVATION_POLICY = "tenant-database-activation-create-lock"
 TENANT_API_CUTOVER_READY = True
 STATIC_MANAGER_FLAGS = ("-C", "target-feature=+crt-static")
 
@@ -47,7 +49,7 @@ def tenant_cutover_lock_documents() -> list[dict[str, object]]:
                 "resourceRules": [
                     {
                         "apiGroups": ["tenancy.cnpg-vcluster.io"],
-                        "apiVersions": ["v1alpha2", "v1alpha3"],
+                        "apiVersions": ["v1alpha3", "v1alpha4"],
                         "operations": ["CREATE"],
                         "resources": ["tenants"],
                         "scope": "Cluster",
@@ -72,6 +74,79 @@ def tenant_cutover_lock_documents() -> list[dict[str, object]]:
         },
     }
     return [policy, binding]
+
+def database_activation_lock_documents() -> list[dict[str, object]]:
+    return [
+        {
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicy",
+            "metadata": {"name": DATABASE_ACTIVATION_POLICY},
+            "spec": {
+                "failurePolicy": "Fail",
+                "matchConstraints": {"resourceRules": [{
+                    "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                    "apiVersions": ["v1alpha1"],
+                    "operations": ["CREATE"],
+                    "resources": ["tenantdatabases"],
+                    "scope": "Namespaced",
+                }]},
+                "validations": [{
+                    "expression": "false",
+                    "message": "TenantDatabase creation is locked until both providers are ready",
+                }],
+            },
+        },
+        {
+            "apiVersion": "admissionregistration.k8s.io/v1",
+            "kind": "ValidatingAdmissionPolicyBinding",
+            "metadata": {"name": DATABASE_ACTIVATION_POLICY},
+            "spec": {
+                "policyName": DATABASE_ACTIVATION_POLICY,
+                "validationActions": ["Deny"],
+            },
+        },
+    ]
+
+
+def ensure_database_activation_lock(client: ManagementClient) -> None:
+    for document in database_activation_lock_documents():
+        client.kubectl(
+            "apply", "--server-side",
+            "--field-manager=cnpg-vcluster-database-activation",
+            "--force-conflicts", "-f", "-",
+            input_text=json.dumps(document),
+        )
+    for resource in (
+        f"validatingadmissionpolicy/{DATABASE_ACTIVATION_POLICY}",
+        f"validatingadmissionpolicybinding/{DATABASE_ACTIVATION_POLICY}",
+    ):
+        if not client.kubectl("get", resource, "-o", "name").stdout.strip():
+            raise RuntimeError("TenantDatabase activation lock is incomplete")
+
+
+def verify_database_activation_lock(
+    client: ManagementClient, *, namespace: str,
+) -> None:
+    document = {
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+        "kind": "TenantDatabase",
+        "metadata": {
+            "name": f"database-lock-probe-{uuid.uuid4().hex[:8]}",
+            "namespace": namespace,
+        },
+        "spec": {"tenantName": "database-lock-probe", "tenantUID": "probe", "instances": 1},
+    }
+    for _ in range(5):
+        result = client.kubectl(
+            "create", "--dry-run=server", "-f", "-",
+            input_text=json.dumps(document), check=False,
+        )
+        if (
+            result.returncode == 0
+            or "TenantDatabase creation is locked until both providers are ready"
+            not in result.stderr
+        ):
+            raise RuntimeError("TenantDatabase activation create lock is not effective")
 
 
 def tenant_cutover_lock_cleanup_refs() -> tuple[str, str]:
@@ -107,7 +182,7 @@ def tenant_api_generation(crd: object) -> str:
     version = versions[0]
     name = version.get("name") if isinstance(version, dict) else None
     if (
-        name not in {"v1alpha2", "v1alpha3"}
+        name not in {"v1alpha3", "v1alpha4"}
         or version.get("served") is not True
         or version.get("storage") is not True
         or stored != [name]
@@ -137,10 +212,10 @@ def tenant_api_cutover_state(crd: object) -> str:
         for version in versions
         if isinstance(version, dict)
     }
-    if names == {"v1alpha2", "v1alpha3"} and stored in (
-        ["v1alpha2"],
-        ["v1alpha2", "v1alpha3"],
+    if names == {"v1alpha3", "v1alpha4"} and stored in (
         ["v1alpha3"],
+        ["v1alpha3", "v1alpha4"],
+        ["v1alpha4"],
     ):
         return "transitioning"
     return tenant_api_generation(crd)
@@ -150,12 +225,12 @@ def tenant_crd_transition_document(
     observed: dict[str, object],
     desired: dict[str, object],
 ) -> dict[str, object]:
-    if tenant_api_generation(observed) != "v1alpha2":
+    if tenant_api_generation(observed) != "v1alpha3":
         raise RuntimeError("Tenant CRD transition source is invalid")
     if tenant_api_generation({
         **desired,
-        "status": {"storedVersions": ["v1alpha3"]},
-    }) != "v1alpha3":
+        "status": {"storedVersions": ["v1alpha4"]},
+    }) != "v1alpha4":
         raise RuntimeError("Tenant CRD transition target is invalid")
     old = json.loads(json.dumps(observed["spec"]["versions"][0]))
     old["served"] = False
@@ -196,7 +271,7 @@ def desired_tenant_crd(
 def require_tenant_api_cutover_ready() -> None:
     if not TENANT_API_CUTOVER_READY:
         raise RuntimeError(
-            "Tenant API v1alpha3 activation is blocked until the Azure allocation lifecycle is complete"
+            "Tenant API v1alpha4 activation is blocked until provider lifecycle contracts are complete"
         )
 
 
@@ -204,23 +279,16 @@ def apply_tenant_cutover_lock(
     config: dict[str, str],
     client: ManagementClient,
 ) -> None:
-    try:
-        for document in tenant_cutover_lock_documents():
-            client.kubectl(
-                "apply",
-                "--server-side",
-                "--field-manager=cnpg-vcluster-tenant-api-cutover",
-                "--force-conflicts",
-                "-f",
-                "-",
-                input_text=json.dumps(document),
-            )
-    except Exception as failure:
-        try:
-            remove_tenant_cutover_lock(config, client)
-        except Exception as cleanup:
-            failure.add_note(f"partial Tenant cutover lock cleanup failed: {cleanup}")
-        raise
+    for document in tenant_cutover_lock_documents():
+        client.kubectl(
+            "apply",
+            "--server-side",
+            "--field-manager=cnpg-vcluster-tenant-api-cutover",
+            "--force-conflicts",
+            "-f",
+            "-",
+            input_text=json.dumps(document),
+        )
 
 
 def tenant_cutover_lock_present(client: ManagementClient) -> bool:
@@ -242,7 +310,10 @@ def verify_tenant_cutover_lock(client: ManagementClient, generation: str) -> Non
         "spec": {
             "kubernetesVersion": "1.36.4",
             "workers": 1,
-            "provider": {"type": "local", "databases": 1},
+            "provider": (
+                {"type": "local", "databases": 1}
+                if generation == "v1alpha3" else {"type": "local"}
+            ),
         },
     }
     for _ in range(5):
@@ -304,6 +375,7 @@ def prepare_tenant_api_cutover(
     config: dict[str, str],
     client: ManagementClient,
 ) -> bool:
+    ensure_database_activation_lock(client)
     observed = client.kubectl(
         "get",
         f"crd/{TENANT_CRD}",
@@ -315,7 +387,7 @@ def prepare_tenant_api_cutover(
         return tenant_cutover_lock_present(client)
     current = json.loads(observed)
     generation = tenant_api_cutover_state(current)
-    if generation == "v1alpha3":
+    if generation == "v1alpha4":
         return tenant_cutover_lock_present(client)
     desired = desired_tenant_crd(root, client)
     transition = generation == "transitioning"
@@ -324,18 +396,16 @@ def prepare_tenant_api_cutover(
         if transition
         else tenant_crd_transition_document(current, desired)
     )
-    acquired_lock = False
     if transition:
         if not tenant_cutover_lock_present(client):
             raise RuntimeError("Tenant CRD transition is missing its create lock")
     else:
         if not tenant_cutover_lock_present(client):
             apply_tenant_cutover_lock(config, client)
-            acquired_lock = True
     try:
         verify_tenant_cutover_lock(
             client,
-            "v1alpha3" if transition else generation,
+            "v1alpha4" if transition else generation,
         )
         if not transition:
             require_clean_controller_state(root, client)
@@ -352,7 +422,7 @@ def prepare_tenant_api_cutover(
                 "-",
                 input_text=json.dumps(transition_document),
             )
-        verify_tenant_cutover_lock(client, "v1alpha3")
+        verify_tenant_cutover_lock(client, "v1alpha4")
         require_clean_controller_state(root, client)
         client.kubectl(
             "patch",
@@ -360,7 +430,7 @@ def prepare_tenant_api_cutover(
             "--subresource=status",
             "--type=merge",
             "-p",
-            json.dumps({"status": {"storedVersions": ["v1alpha3"]}}),
+            json.dumps({"status": {"storedVersions": ["v1alpha4"]}}),
         )
         client.kubectl(
             "apply",
@@ -376,8 +446,6 @@ def prepare_tenant_api_cutover(
     except Exception:
         if not transition:
             restore_controller(config, client)
-            if acquired_lock:
-                remove_tenant_cutover_lock(config, client)
         raise
 
 
@@ -802,13 +870,108 @@ def verify_controller_crd(client: ManagementClient) -> None:
     crd = client.json("get", f"crd/{TENANT_CRD}")
     versions = crd["spec"].get("versions", [])
     if (
-        len(versions) != 1 or versions[0].get("name") != "v1alpha3"
+        len(versions) != 1 or versions[0].get("name") != "v1alpha4"
         or versions[0].get("served") is not True or versions[0].get("storage") is not True
-        or crd.get("status", {}).get("storedVersions") != ["v1alpha3"]
+        or crd.get("status", {}).get("storedVersions") != ["v1alpha4"]
         or "status" not in versions[0].get("subresources", {})
         or crd["spec"].get("conversion", {}).get("strategy", "None") != "None"
     ):
-        raise RuntimeError("Tenant CRD must serve and store only v1alpha3 with a status subresource")
+        raise RuntimeError("Tenant CRD must serve and store only v1alpha4 with a status subresource")
+
+
+def database_admission_image(root: Path, config: dict[str, str]) -> str:
+    from scripts.lib.database_controller import source_digest
+
+    return (
+        f"{config['TENANT_CONTROLLER_IMAGE_REPOSITORY']}-database-admission:"
+        f"{source_digest(root)[:16]}"
+    )
+
+
+def install_database_admission(
+    root: Path, config: dict[str, str], client: ManagementClient, image: str,
+    *, azure: bool = False,
+) -> None:
+    from scripts.lib.database_controller import (
+        admission_manifests,
+        admission_webhooks,
+        render_admission_deployment,
+    )
+
+    for path in admission_manifests(root, azure=azure):
+        client.kubectl(
+            "apply", "--server-side",
+            "--field-manager=cnpg-vcluster-database-admission",
+            "--force-conflicts", "-f", str(path),
+        )
+    timeout = config["CONDITION_TIMEOUT"]
+    client.kubectl(
+        "wait", "--for=condition=Established", f"crd/{DATABASE_CRD}",
+        f"--timeout={timeout}",
+    )
+    crd = client.json("get", f"crd/{DATABASE_CRD}")
+    versions = crd.get("spec", {}).get("versions", [])
+    if (
+        len(versions) != 1
+        or versions[0].get("name") != "v1alpha1"
+        or versions[0].get("served") is not True
+        or versions[0].get("storage") is not True
+        or crd.get("status", {}).get("storedVersions") != ["v1alpha1"]
+        or "status" not in versions[0].get("subresources", {})
+    ):
+        raise RuntimeError("TenantDatabase CRD must serve only v1alpha1 with status")
+    verify_database_activation_lock(client, namespace=CONTROLLER_NAMESPACE)
+    for certificate in ("database-admission-ca", "database-admission-serving"):
+        client.kubectl(
+            "-n", CONTROLLER_NAMESPACE, "wait", "--for=condition=Ready",
+            f"certificate/{certificate}", f"--timeout={timeout}",
+        )
+    client.kubectl(
+        "apply", "--server-side",
+        "--field-manager=cnpg-vcluster-database-admission",
+        "--force-conflicts", "-f", "-",
+        input_text=render_admission_deployment(root, image),
+    )
+    client.kubectl(
+        "-n", CONTROLLER_NAMESPACE, "rollout", "status",
+        "deployment/database-admission", f"--timeout={timeout}",
+    )
+    deployment = client.json(
+        "-n", CONTROLLER_NAMESPACE, "get", "deployment/database-admission",
+    )
+    if (
+        deployment.get("spec", {}).get("replicas") != 2
+        or deployment.get("status", {}).get("readyReplicas") != 2
+        or deployment["spec"]["template"]["spec"]["containers"][0]["image"] != image
+    ):
+        raise RuntimeError("database admission deployment identity is not Ready")
+    for path in admission_webhooks(root):
+        client.kubectl(
+            "apply", "--server-side",
+            "--field-manager=cnpg-vcluster-database-admission",
+            "--force-conflicts", "-f", str(path),
+        )
+    def trusted_webhooks() -> bool | None:
+        for resource in (
+            "mutatingwebhookconfiguration/database-admission",
+            "validatingwebhookconfiguration/database-admission",
+        ):
+            configuration = client.json("get", resource)
+            webhooks = configuration.get("webhooks", [])
+            if len(webhooks) != 1:
+                raise RuntimeError("database admission webhook configuration is malformed")
+            webhook = webhooks[0]
+            if webhook.get("failurePolicy") != "Fail":
+                raise RuntimeError("database admission webhook must fail closed")
+            if not webhook.get("clientConfig", {}).get("caBundle"):
+                return None
+        return True
+    wait_for(
+        "database admission CA injection",
+        parse_duration(timeout),
+        1,
+        trusted_webhooks,
+    )
 
 
 def verify_controller_api(
@@ -819,13 +982,13 @@ def verify_controller_api(
 ) -> None:
     name = f"contract-probe-{uuid.uuid4().hex[:12]}"
     probe = {
-        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
         "kind": "Tenant",
         "metadata": {"name": name},
         "spec": {
             "kubernetesVersion": config["KUBERNETES_VERSION"].removeprefix("v"),
             "workers": 1,
-            "provider": {"type": "local", "databases": 1},
+            "provider": {"type": "local"},
         },
     }
 
@@ -861,17 +1024,16 @@ def verify_controller_api(
     create_dry(unknown, rejected="unknown field")
     invalid_specs = (
         ("workers", {**probe["spec"], "workers": 0}),
-        (
-            "databases",
-            {
-                **probe["spec"],
-                "provider": {**probe["spec"]["provider"], "databases": 4},
-            },
-        ),
         ("kubernetesVersion", {**probe["spec"], "kubernetesVersion": "bad"}),
     )
     for field, invalid_spec in invalid_specs:
         create_dry({**probe, "spec": invalid_spec}, rejected=field)
+    create_dry(
+        {**probe, "spec": {
+            **probe["spec"], "provider": {"type": "local", "databases": 1},
+        }},
+        rejected="unknown field",
+    )
     create_dry({**probe, "metadata": {"name": "invalid.name"}}, rejected="Tenant name")
     azure_spec = {
         "kubernetesVersion": probe["spec"]["kubernetesVersion"],
@@ -880,7 +1042,7 @@ def verify_controller_api(
     }
     create_dry({**probe, "spec": azure_spec}, expected_spec=azure_spec)
     for invalid_provider, rejected in (
-        ({"type": "azure", "databases": 1}, "databases"),
+        ({"type": "azure", "databases": 1}, "unknown field"),
         ({"type": "azure", "podCIDR": "10.244.0.0/16"}, "unknown field"),
         ({"type": "azure", "serviceCIDR": "10.96.0.0/16"}, "unknown field"),
     ):
@@ -915,7 +1077,7 @@ def verify_controller_api(
             )
         for patch in (
             {"workers": 2},
-            {"provider": {"databases": 2}},
+            {"provider": {"type": "azure"}},
             {
                 "kubernetesVersion": (
                     "0.0.0"
@@ -988,6 +1150,9 @@ def reconcile_controller(
 ) -> None:
     require_tenant_api_cutover_ready()
     image = build_controller_image(root, config)
+    admission_image = database_admission_image(root, config)
+    from scripts.lib.database_controller import build_admission_image
+    build_admission_image(root, config, admission_image)
     foundation = _foundation_payload(
         root, config, network, image, verified_cache, registry,
     )
@@ -1007,6 +1172,11 @@ def reconcile_controller(
         ],
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
     )
+    run(
+        [str(root / ".tools" / "bin" / "kind"), "load", "docker-image",
+         admission_image, "--name", config["KIND_CLUSTER_NAME"]],
+        timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
+    )
     cutover_locked = prepare_tenant_api_cutover(root, config, client)
     paths = (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
@@ -1014,6 +1184,8 @@ def reconcile_controller(
         root / "controller" / "config" / "rbac" / "role.yaml",
         root / "controller" / "config" / "rbac" / "service-account.yaml",
         root / "controller" / "config" / "rbac" / "role-binding.yaml",
+        root / "controller" / "config" / "rbac" / "allocation-role.yaml",
+        root / "controller" / "config" / "rbac" / "allocation-binding.yaml",
     )
     for path in paths:
         client.kubectl(
@@ -1032,6 +1204,7 @@ def reconcile_controller(
         f"--timeout={timeout}",
     )
     verify_controller_crd(client)
+    install_database_admission(root, config, client, admission_image)
     previous = {
         name: client.kubectl(
             "-n",

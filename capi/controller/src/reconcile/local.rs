@@ -79,11 +79,11 @@ impl LocalProvider {
 }
 impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvider<D, A> {
     fn supports(&self, provider: &TenantProviderSpec) -> bool {
-        matches!(provider, TenantProviderSpec::Local { .. })
+        matches!(provider, TenantProviderSpec::Local)
     }
     #[rustfmt::skip]
     async fn reconcile(&self, tenant: &Tenant, spec: &CanonicalSpec) -> Result<Action, ReconcileError> {
-        let database_count = spec.local_databases().ok_or_else(|| ReconcileError::InvalidInput("azure provider is not supported by this controller".into()))?;
+        if !matches!(spec.provider, TenantProviderSpec::Local) { return Err(ReconcileError::InvalidInput("azure provider is not supported by this controller".into())); }
         let current_status = tenant.status.as_ref();
         let recorded_hash = current_status.and_then(|status| status.foundation_hash());
         let foundation = self.foundation.creation(recorded_hash)?;
@@ -157,7 +157,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
             endpoint: &endpoint,
             pod_cidr: &claim.slot.pod_cidr,
             service_cidr: &claim.slot.service_cidr,
-            database_count,
+            database_count: 0,
             volume_path: "",
             worker_bootstrap_commands: &[],
             inputs: &foundation.inputs,
@@ -247,7 +247,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
             None => self.docker.create_volume(&volume_name, &labels).await?,
         };
         validate_volume(&volume, &volume_name, &labels)?;
-        let commands = resources::worker_bootstrap_commands(foundation.into(), database_count)?;
+        let commands = resources::worker_bootstrap_commands(foundation.into(), 0)?;
         context.volume_path = &volume.mountpoint;
         context.worker_bootstrap_commands = &commands;
         for desired in [
@@ -368,27 +368,6 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
         if deployment.is_none_or(|deployment| !readiness::workload_available(deployment)) {
             return self.progress(context.tenant, DEPENDENCY_INTERVAL).await;
         }
-        let mut database = resources::cnpg_objects(
-            context,
-            STORAGE_CLASS,
-            &image(foundation, "POSTGRES_IMAGE")?.reference,
-        )?;
-        let desired = database
-            .pop()
-            .ok_or_else(|| ReconcileError::InvalidInput("CNPG Cluster is missing".into()))?;
-        let static_objects =
-            objects::ensure_batch(client.clone(), &database, context.identity()).await?;
-        if static_objects.created || static_objects.pending {
-            return self.progress(context.tenant, PROGRESS_INTERVAL).await;
-        }
-        let database = objects::ensure_dynamic(client, &desired, context.identity()).await?;
-        if database.created {
-            return self.progress(context.tenant, PROGRESS_INTERVAL).await;
-        }
-        let database_ready = readiness::database_ready(&database.object, context.database_count);
-        if !database_ready {
-            return self.progress(context.tenant, DEPENDENCY_INTERVAL).await;
-        }
         let components = Components {
             control_plane: readiness::management_conditions_ready(cluster, &["Available"])?,
             workers: workers.inventory_complete && workers.all_ready,
@@ -399,7 +378,6 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
                 .get("provisioner")
                 .and_then(serde_json::Value::as_str)
                 == Some("kubernetes.io/no-provisioner"),
-            database: database_ready,
         };
         status::update_status(self.client.clone(), context.tenant, |status| {
             components.publish(status, context.tenant);

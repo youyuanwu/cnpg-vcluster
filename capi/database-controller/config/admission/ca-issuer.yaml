@@ -1,0 +1,9 @@
+---
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: database-admission-ca
+  namespace: tenant-system
+spec:
+  ca:
+    secretName: database-admission-ca

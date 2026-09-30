@@ -107,6 +107,23 @@ controller-build:
 controller-image:
     @python3 scripts/build_controller.py
 
+# Verify checked-in TenantDatabase API and admission/RBAC resources.
+database-controller-verify:
+    @cargo run --locked --offline -p tenant-database-controller --bin generate -- --check
+
+# Run database-controller API, admission, and generated-contract tests.
+database-controller-test:
+    @cargo test --locked --offline -p tenant-database-controller --all-targets
+
+# Lint the isolated database-controller crate.
+database-controller-lint:
+    @cargo fmt --all --check
+    @cargo clippy --locked --offline -p tenant-database-controller --all-targets -- -D warnings
+
+# Enforce the independent 12,000-line database-controller production Rust ceiling.
+database-controller-metrics:
+    @python3 scripts/database_controller_metrics.py
+
 # Report the separate informational admin Rust baseline and delta.
 admin-metrics:
     @python3 scripts/admin_metrics.py

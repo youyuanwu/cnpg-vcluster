@@ -18,6 +18,8 @@ from scripts.lib.admin import (
 )
 from scripts.lib.controller import (
     build_azure_controller_image,
+    database_activation_lock_documents,
+    install_database_admission,
     require_empty_tenant_cutover,
     require_tenant_api_cutover_ready,
     render_azure_controller_manager,
@@ -599,6 +601,23 @@ def _push_controller_image(
     )
 
 
+def _push_database_admission_image(
+    root: Path,
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> str:
+    from scripts.lib.database_controller import build_admission_image
+
+    controller_config = load_configuration(root)
+    return _push_acr_image(
+        root, config, inventory,
+        repository=config["AZURE_CONTROLLER_REPOSITORY"] + "-database-admission",
+        tag=config["AZURE_CONTROLLER_TAG"],
+        description="database admission",
+        build=lambda image: build_admission_image(root, controller_config, image),
+    )
+
+
 def _push_admin_image(
     root: Path,
     config: Mapping[str, str],
@@ -741,26 +760,17 @@ def _azure_allocation_configuration(
 
 def _azure_cutover_lock(root: Path, *, present: bool) -> None:
     if present:
-        try:
-            for document in tenant_cutover_lock_documents():
-                _kubectl(
-                    root,
-                    "apply",
-                    "--server-side",
-                    "--field-manager=cnpg-vcluster-tenant-api-cutover",
-                    "--force-conflicts",
-                    "-f",
-                    "-",
-                    input_text=json.dumps(document),
-                )
-        except Exception as failure:
-            try:
-                _azure_cutover_lock(root, present=False)
-            except Exception as cleanup:
-                failure.add_note(
-                    f"partial Azure Tenant cutover lock cleanup failed: {cleanup}"
-                )
-            raise
+        for document in tenant_cutover_lock_documents():
+            _kubectl(
+                root,
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(document),
+            )
         return
     for resource in tenant_cutover_lock_cleanup_refs():
         _kubectl(
@@ -792,7 +802,10 @@ def _verify_azure_cutover_lock(root: Path, generation: str) -> None:
         "spec": {
             "kubernetesVersion": "1.36.4",
             "workers": 1,
-            "provider": {"type": "local", "databases": 1},
+            "provider": (
+                {"type": "local", "databases": 1}
+                if generation == "v1alpha3" else {"type": "local"}
+            ),
         },
     }
     for _ in range(5):
@@ -850,6 +863,19 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
     ):
         raise RuntimeError("Azure cutover Tenant inventory is malformed")
     _validated_azure_list(tenants, tenant_api_version, "Tenant")
+    database_crd = _kubectl(
+        root, "get", "crd/tenantdatabases.tenancy.cnpg-vcluster.io",
+        "--ignore-not-found=true", "-o", "name",
+    ).stdout.strip()
+    databases = []
+    if database_crd:
+        databases = _validated_azure_list(
+            json.loads(_kubectl(
+                root, "get", "tenantdatabases.tenancy.cnpg-vcluster.io",
+                "--all-namespaces", "-o", "json",
+            ).stdout),
+            "tenancy.cnpg-vcluster.io/v1alpha1", "TenantDatabase",
+        )
     catalog = json.loads(
         (root / "controller" / "config" / "azure-management-resources.json").read_text(
             encoding="utf-8"
@@ -927,6 +953,10 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
         for item, _, _, _ in items
         if item.get("metadata", {}).get("uid") in owned_uids
     ]
+    residue.extend(
+        f"TenantDatabase/{item['metadata']['namespace']}/{item['metadata']['name']}"
+        for item in databases
+    )
     return tenants, residue
 
 
@@ -971,13 +1001,19 @@ def _prepare_azure_tenant_api_cutover(
     root: Path,
     config: Mapping[str, str],
 ) -> bool:
+    for document in database_activation_lock_documents():
+        _kubectl(
+            root, "apply", "--server-side",
+            "--field-manager=cnpg-vcluster-database-activation",
+            "--force-conflicts", "-f", "-", input_text=json.dumps(document),
+        )
     observed = _get_management_resource(
         root, None, "crd/tenants.tenancy.cnpg-vcluster.io"
     )
     if observed is None:
         return _azure_cutover_lock_present(root)
     generation = tenant_api_cutover_state(observed)
-    if generation == "v1alpha3":
+    if generation == "v1alpha4":
         return _azure_cutover_lock_present(root)
     rendered = _kubectl(
         root,
@@ -1004,18 +1040,16 @@ def _prepare_azure_tenant_api_cutover(
         if transition
         else tenant_crd_transition_document(observed, desired)
     )
-    acquired_lock = False
     if transition:
         if not _azure_cutover_lock_present(root):
             raise RuntimeError("Azure Tenant CRD transition is missing its create lock")
     else:
         if not _azure_cutover_lock_present(root):
             _azure_cutover_lock(root, present=True)
-            acquired_lock = True
     try:
         _verify_azure_cutover_lock(
             root,
-            "v1alpha3" if transition else generation,
+            "v1alpha4" if transition else generation,
         )
         if not transition:
             tenants, residue = _azure_cutover_inventory(root)
@@ -1035,7 +1069,7 @@ def _prepare_azure_tenant_api_cutover(
                 "-",
                 input_text=json.dumps(transition_document),
             )
-        _verify_azure_cutover_lock(root, "v1alpha3")
+        _verify_azure_cutover_lock(root, "v1alpha4")
         tenants, residue = _azure_cutover_inventory(root)
         require_empty_tenant_cutover(tenants, residue)
         _kubectl(
@@ -1045,7 +1079,7 @@ def _prepare_azure_tenant_api_cutover(
             "--subresource=status",
             "--type=merge",
             "-p",
-            json.dumps({"status": {"storedVersions": ["v1alpha3"]}}),
+            json.dumps({"status": {"storedVersions": ["v1alpha4"]}}),
         )
         _kubectl(
             root,
@@ -1063,8 +1097,6 @@ def _prepare_azure_tenant_api_cutover(
     except Exception:
         if not transition:
             _scale_azure_controller(root, config, 1)
-            if acquired_lock:
-                _azure_cutover_lock(root, present=False)
         raise
 
 
@@ -1074,7 +1106,7 @@ def _verify_azure_cutover_probe(
 ) -> None:
     name = f"cutover-probe-{uuid.uuid4().hex[:12]}"
     document = {
-        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
         "kind": "Tenant",
         "metadata": {"name": name},
         "spec": {
@@ -1201,6 +1233,7 @@ def _install_tenant_controller(
 ) -> tuple[str, str, str]:
     require_tenant_api_cutover_ready()
     image = _push_controller_image(root, config, inventory)
+    admission_image = _push_database_admission_image(root, config, inventory)
     provider_config = _azure_provider_configuration(config, inventory, image)
     _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(root, config)
     cutover_locked = _prepare_azure_tenant_api_cutover(root, config)
@@ -1210,6 +1243,8 @@ def _install_tenant_controller(
         root / "controller" / "config" / "rbac" / "role-azure.yaml",
         root / "controller" / "config" / "rbac" / "service-account.yaml",
         root / "controller" / "config" / "rbac" / "role-binding.yaml",
+        root / "controller" / "config" / "rbac" / "allocation-role.yaml",
+        root / "controller" / "config" / "rbac" / "allocation-binding.yaml",
     ):
         _kubectl(
             root,
@@ -1320,6 +1355,19 @@ def _install_tenant_controller(
     )
     if not isinstance(allocation_uid, str) or not allocation_uid:
         raise RuntimeError("Azure Tenant allocation ConfigMap UID is absent")
+    class AzureAdmissionClient:
+        def kubectl(self, *args, **kwargs):
+            return _kubectl(root, *args, **kwargs)
+
+        def json(self, *args):
+            return json.loads(self.kubectl(*args, "-o", "json").stdout)
+
+    admission_config = load_configuration(root)
+    admission_config["CONDITION_TIMEOUT"] = config["AZURE_CONTROLLER_TIMEOUT"]
+    install_database_admission(
+        root, admission_config, AzureAdmissionClient(), admission_image,
+        azure=True,
+    )
     if cutover_locked:
         _verify_azure_controller_allocation_readiness(
             root,

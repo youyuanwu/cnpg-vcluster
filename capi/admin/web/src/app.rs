@@ -259,7 +259,7 @@ fn dashboard_view(mut data: OverviewSnapshot) -> AnyView {
             </div>
         </section>
 
-        <TenantCreatePanel provider=provider_mode capability=creation/>
+        <TenantCreatePanel capability=creation/>
 
         <section class="panel" aria-labelledby="tenants-heading">
             <div class="panel__header">
@@ -327,10 +327,9 @@ fn dashboard_view(mut data: OverviewSnapshot) -> AnyView {
 }
 
 #[component]
-fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> impl IntoView {
+fn TenantCreatePanel(capability: CreationCapability) -> impl IntoView {
     let name = RwSignal::new(String::new());
     let workers = RwSignal::new("1".to_owned());
-    let databases = RwSignal::new("1".to_owned());
     let field_errors = RwSignal::new(Vec::<TenantFieldError>::new());
     let state = RwSignal::new(MutationState::Idle);
     let capability_available = capability.available;
@@ -345,12 +344,7 @@ fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> 
         if !capability_available || matches!(state.get(), MutationState::Running) {
             return;
         }
-        let request = match create_request(
-            provider,
-            &name.get_untracked(),
-            &workers.get_untracked(),
-            &databases.get_untracked(),
-        ) {
+        let request = match create_request(&name.get_untracked(), &workers.get_untracked()) {
             Ok(request) => request,
             Err(errors) => {
                 field_errors.set(errors);
@@ -436,22 +430,6 @@ fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> 
                     />
                     <FieldError id="tenant-create-workers-error" errors=field_errors field=TenantField::Workers/>
                 </div>
-                {matches!(provider, ProviderMode::Local).then(|| view! {
-                    <div class="form-field">
-                        <label for="tenant-create-databases">"Databases"</label>
-                        <input
-                            id="tenant-create-databases"
-                            type="number"
-                            min="1"
-                            max="3"
-                            value="1"
-                            disabled=move || !capability_available || matches!(state.get(), MutationState::Running)
-                            aria-describedby="tenant-create-databases-error"
-                            on:input=move |event| databases.set(event_target_value(&event))
-                        />
-                        <FieldError id="tenant-create-databases-error" errors=field_errors field=TenantField::Databases/>
-                    </div>
-                })}
                 <div class="form-field">
                     <span class="form-label">"Kubernetes version"</span>
                     <strong>{version}</strong>
@@ -545,20 +523,11 @@ fn tenant_row(tenant: TenantSummary) -> AnyView {
     let classification = tenant.classification;
     let status_class = classification_class(classification);
     let status_label = classification_label(classification);
-    let capacity = match tenant.requested_databases {
-        Some(databases) => format!(
-            "{} worker{}, {} database{}",
-            tenant.requested_workers,
-            plural(tenant.requested_workers),
-            databases,
-            plural(databases)
-        ),
-        None => format!(
-            "{} worker{}",
-            tenant.requested_workers,
-            plural(tenant.requested_workers)
-        ),
-    };
+    let capacity = format!(
+        "{} worker{}",
+        tenant.requested_workers,
+        plural(tenant.requested_workers)
+    );
     let conditions = condition_summary(&tenant.conditions);
     let endpoint = optional_text(tenant.endpoint.as_deref()).to_owned();
     let age = format_age(tenant.created_at.as_deref());
@@ -615,12 +584,6 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
             <div class="metric">
                 <span class="metric__label">"Workers"</span>
                 <strong class="metric__value">{summary.requested_workers}</strong>
-            </div>
-            <div class="metric">
-                <span class="metric__label">"Databases"</span>
-                <strong class="metric__value">
-                    {summary.requested_databases.map_or_else(|| "—".to_owned(), |value| value.to_string())}
-                </strong>
             </div>
             <div class="metric">
                 <span class="metric__label">"Kubernetes"</span>
@@ -1503,9 +1466,9 @@ fn database_conditions_view(mut conditions: Vec<DatabaseCondition>) -> AnyView {
 
 fn provider_specification_rows(specification: ProviderSpecificationView) -> AnyView {
     match specification {
-        ProviderSpecificationView::Local { databases } => view! {
+        ProviderSpecificationView::Local => view! {
             <dt>"Provider configuration"</dt>
-            <dd>{format!("{databases} local database{}", plural(databases))}</dd>
+            <dd>"Local workers and storage"</dd>
         }
         .into_any(),
         ProviderSpecificationView::Azure => view! {
