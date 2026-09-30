@@ -3,6 +3,8 @@ use tenant_admin_shared::{
     query::{ProviderMode, TenantClassification},
 };
 
+use crate::error::UiErrorKind;
+
 pub fn create_request(
     provider: ProviderMode,
     name: &str,
@@ -60,6 +62,27 @@ pub enum DeleteRecovery {
     InspectCurrent,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CreateRecovery {
+    InspectExisting,
+    PreserveError,
+}
+
+pub fn create_recovery(observed_exists: bool) -> CreateRecovery {
+    if observed_exists {
+        CreateRecovery::InspectExisting
+    } else {
+        CreateRecovery::PreserveError
+    }
+}
+
+pub fn requires_authoritative_read(kind: UiErrorKind) -> bool {
+    matches!(
+        kind,
+        UiErrorKind::Network | UiErrorKind::KubernetesUnavailable
+    )
+}
+
 pub fn delete_recovery(
     requested_uid: &str,
     observed: Option<(&str, TenantClassification)>,
@@ -105,7 +128,12 @@ mod tests {
         query::{ProviderMode, TenantClassification},
     };
 
-    use super::{DeleteRecovery, create_request, delete_enabled, delete_recovery};
+    use crate::error::UiErrorKind;
+
+    use super::{
+        CreateRecovery, DeleteRecovery, create_recovery, create_request, delete_enabled,
+        delete_recovery, requires_authoritative_read,
+    };
 
     #[test]
     fn provider_specific_create_requests_validate_all_fields() {
@@ -149,5 +177,16 @@ mod tests {
             delete_recovery("uid", Some(("uid", TenantClassification::Ready))),
             DeleteRecovery::InspectCurrent
         );
+    }
+
+    #[test]
+    fn ambiguous_create_and_error_kinds_require_explicit_recovery() {
+        assert_eq!(create_recovery(true), CreateRecovery::InspectExisting);
+        assert_eq!(create_recovery(false), CreateRecovery::PreserveError);
+        assert!(requires_authoritative_read(UiErrorKind::Network));
+        assert!(requires_authoritative_read(
+            UiErrorKind::KubernetesUnavailable
+        ));
+        assert!(!requires_authoritative_read(UiErrorKind::InvalidRequest));
     }
 }

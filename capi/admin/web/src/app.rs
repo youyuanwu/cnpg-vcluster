@@ -31,7 +31,10 @@ use crate::{
         node_kind_label, optional_text, provider_label, provider_mode_label,
         sort_database_instances,
     },
-    lifecycle::{DeleteRecovery, create_request, delete_enabled, delete_recovery},
+    lifecycle::{
+        CreateRecovery, DeleteRecovery, create_recovery, create_request, delete_enabled,
+        delete_recovery, requires_authoritative_read,
+    },
     route::{
         AppRoute, parse_route, tenant_create_path, tenant_database_query_path, tenant_delete_path,
         tenant_href,
@@ -51,6 +54,7 @@ enum MutationState {
     Idle,
     Running,
     Error(UiError),
+    Uncertain { message: String, href: String },
 }
 
 #[component]
@@ -358,9 +362,17 @@ fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> 
         spawn_local(async move {
             match post_envelope::<_, TenantCreateResponse>(tenant_create_path(), &request).await {
                 Ok(response) => navigate_to_tenant(&response.identity.name),
-                Err(error) if error.kind == UiErrorKind::Network => {
+                Err(error) if requires_authoritative_read(error.kind) => {
                     match fetch_tenant_page(&request.name).await {
-                        Ok(_) => navigate_to_tenant(&request.name),
+                        Ok(_) => match create_recovery(true) {
+                            CreateRecovery::InspectExisting => {
+                                state.set(MutationState::Uncertain {
+                                    message: "A Tenant with this name exists after an uncertain create response. Inspect its current identity and specification before retrying.".into(),
+                                    href: tenant_href(&request.name).unwrap_or_else(|| "/".into()),
+                                });
+                            }
+                            CreateRecovery::PreserveError => unreachable!(),
+                        },
                         Err(observed) if observed.kind == UiErrorKind::NotFound => {
                             state.set(MutationState::Error(error));
                         }
@@ -397,7 +409,7 @@ fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> 
                     <p>{reason}</p>
                 </div>
             })}
-            <form class="lifecycle-form" on:submit=submit>
+            <form class="lifecycle-form" novalidate=true on:submit=submit>
                 <div class="form-field">
                     <label for="tenant-create-name">"Tenant name"</label>
                     <input
@@ -463,6 +475,13 @@ fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> 
                         }.into_any()),
                         MutationState::Running => Some(view! {
                             <p class="secondary" role="status">"Submitting Tenant creation…"</p>
+                        }.into_any()),
+                        MutationState::Uncertain { message, href } => Some(view! {
+                            <p class="form-error" role="alert">
+                                {message}
+                                " "
+                                <a href=href>"Inspect Tenant"</a>
+                            </p>
                         }.into_any()),
                         MutationState::Idle => None,
                     }}
@@ -690,7 +709,7 @@ fn TenantDeletePanel(name: String, uid: String) -> impl IntoView {
                     TenantDeleteState::Completed => navigate_to_overview(),
                     TenantDeleteState::Accepted => reload_page(),
                 },
-                Err(error) if error.kind == UiErrorKind::Network => {
+                Err(error) if requires_authoritative_read(error.kind) => {
                     match fetch_tenant_page(&name).await {
                         Ok(snapshot) => match delete_recovery(
                             &uid,
@@ -699,25 +718,25 @@ fn TenantDeletePanel(name: String, uid: String) -> impl IntoView {
                                 snapshot.detail.summary.classification,
                             )),
                         ) {
-                            DeleteRecovery::StaleIdentity => state.set(MutationState::Error(UiError {
+                            DeleteRecovery::StaleIdentity => state
+                                .set(MutationState::Error(UiError {
                                 kind: UiErrorKind::StaleIdentity,
-                                message: "A replacement Tenant now uses this name; it was not deleted.".into(),
+                                message:
+                                    "A replacement Tenant now uses this name; it was not deleted."
+                                        .into(),
                                 retryable: false,
                                 field_errors: Vec::new(),
                             })),
                             DeleteRecovery::Reload => reload_page(),
                             DeleteRecovery::Overview => navigate_to_overview(),
-                            DeleteRecovery::InspectCurrent => state.set(MutationState::Error(UiError {
-                                kind: UiErrorKind::Conflict,
-                                message: "The delete outcome is uncertain. Current state was refreshed; inspect it before retrying.".into(),
-                                retryable: false,
-                                field_errors: Vec::new(),
-                            })),
+                            DeleteRecovery::InspectCurrent => reload_page(),
                         },
-                        Err(observed) if observed.kind == UiErrorKind::NotFound => match delete_recovery(&uid, None) {
-                            DeleteRecovery::Overview => navigate_to_overview(),
-                            _ => unreachable!(),
-                        },
+                        Err(observed) if observed.kind == UiErrorKind::NotFound => {
+                            match delete_recovery(&uid, None) {
+                                DeleteRecovery::Overview => navigate_to_overview(),
+                                _ => unreachable!(),
+                            }
+                        }
                         Err(_) => state.set(MutationState::Error(error)),
                     }
                 }
@@ -776,6 +795,9 @@ fn TenantDeletePanel(name: String, uid: String) -> impl IntoView {
                         }.into_any()),
                         MutationState::Running => Some(view! {
                             <p class="secondary" role="status">"Submitting Tenant deletion…"</p>
+                        }.into_any()),
+                        MutationState::Uncertain { message, href } => Some(view! {
+                            <p class="form-error" role="alert">{message}" "<a href=href>"Inspect Tenant"</a></p>
                         }.into_any()),
                         MutationState::Idle => None,
                     }}
