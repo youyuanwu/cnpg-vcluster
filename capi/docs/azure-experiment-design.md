@@ -596,7 +596,7 @@ output when they want a retained record.
 5. Create the user-assigned identity and role assignment.
 6. Create AKS with OIDC and Workload Identity.
 7. Install the compatible controller stack.
-8. Publish and deploy the static Tenant manager and read-only Tenant Admin by
+8. Publish and deploy the static Tenant manager and lifecycle Tenant Admin by
    verified ACR digest.
 9. Verify controller deployments, CAPZ authentication, admin inventory,
    `/healthz`, `/readyz`, overview, and Tenant list contracts.

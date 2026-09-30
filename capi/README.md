@@ -136,8 +136,9 @@ canonical, non-overlapping Pod and Service CIDRs from the approved finite
 Azure allocation catalog. A schema-3 foundation supplies ordered local slots
 that bind one endpoint, Pod CIDR, and Service CIDR per Tenant; those values
 appear in `status.provider.allocation`. OpenAPI/CEL reject invalid names,
-counts, version syntax, provider fields, allocation catalogs, and spec updates.
-Each controller checks its configured supported Kubernetes version. The API server
+counts, version syntax, provider fields, and spec updates. The Azure controller
+separately validates the approved allocation catalog and active claims. Each
+controller checks its configured supported Kubernetes version. The API server
 prunes unknown fields under `fieldValidation=Warn` or `Ignore`, but rejects
 them under `Strict`, as used by the repository's local clients. No validating
 webhook is installed.
