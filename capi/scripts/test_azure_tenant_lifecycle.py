@@ -278,6 +278,28 @@ def _wait_ready_snapshot(
     raise RuntimeError("Azure worker recovery timed out: " + last)
 
 
+def _require_recreated_identity(
+    recreated: Mapping[str, object],
+    old_tenant_uid: object,
+    old_lease_uid: str,
+) -> None:
+    metadata = recreated.get("metadata")
+    allocation = _provider(recreated).get("networkAllocation")
+    new_lease_uid = (
+        allocation.get("leaseUID") if isinstance(allocation, dict) else None
+    )
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(metadata.get("uid"), str)
+        or not metadata["uid"]
+        or metadata.get("uid") == old_tenant_uid
+        or not isinstance(new_lease_uid, str)
+        or not new_lease_uid
+        or new_lease_uid == old_lease_uid
+    ):
+        raise RuntimeError("Azure Tenant recreation retained old identity")
+
+
 def _source_sha256(spec_path: Path) -> str:
     tracked = run(
         ["git", "status", "--porcelain", "--untracked-files=no"],
@@ -444,15 +466,11 @@ def main(arguments: list[str]) -> int:
         _admin_create_tenant(spec)
         wait_tenant_ready(ROOT, spec.name)
         recreated, _, _ = _ready_snapshot(config, spec)
-        metadata = recreated.get("metadata")
-        allocation = _provider(recreated).get("networkAllocation")
-        if (
-            not isinstance(metadata, dict)
-            or metadata.get("uid") == tenant_uid
-            or not isinstance(allocation, dict)
-            or allocation.get("leaseUID") == allocation_lease_uid
-        ):
-            raise RuntimeError("Azure Tenant recreation retained old identity")
+        _require_recreated_identity(
+            recreated,
+            tenant_uid,
+            allocation_lease_uid,
+        )
 
     phase("recreation", verify_recreation)
     return 0

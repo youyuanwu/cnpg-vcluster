@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -14,6 +15,7 @@ from scripts.test_azure_tenant_lifecycle import (
     _admin_create_tenant,
     _admin_delete_tenant,
     _ensure_tenant_ready,
+    _require_recreated_identity,
 )
 
 
@@ -89,6 +91,32 @@ class AzureGateTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "delete response"),
         ):
             _admin_delete_tenant("tenant-c", "uid")
+
+    def test_recreated_identity_requires_new_nonempty_tenant_and_lease_uids(self):
+        valid = {
+            "metadata": {"uid": "tenant-new"},
+            "status": {
+                "provider": {
+                    "type": "azure",
+                    "networkAllocation": {"leaseUID": "lease-new"},
+                }
+            },
+        }
+        _require_recreated_identity(valid, "tenant-old", "lease-old")
+        for value in (None, "", "lease-old"):
+            invalid = json.loads(json.dumps(valid))
+            if value is None:
+                invalid["status"]["provider"]["networkAllocation"].pop("leaseUID")
+            else:
+                invalid["status"]["provider"]["networkAllocation"]["leaseUID"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(
+                RuntimeError, "retained old identity"
+            ):
+                _require_recreated_identity(
+                    invalid,
+                    "tenant-old",
+                    "lease-old",
+                )
 
     def test_ready_gate_reuses_parsed_spec_after_terminating_tenant(self) -> None:
         spec = type("Spec", (), {"name": "tenant-c"})()
