@@ -22,10 +22,11 @@ use crate::{
 };
 
 const PREFIX: &str = "tenant-slot-";
-const SLOT_LABEL: &str = "tenancy.cnpg-vcluster.io/slot-id";
-const ENDPOINT_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/endpoint";
-const POD_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/pod-cidr";
-const SERVICE_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/service-cidr";
+const AZURE_PREFIX: &str = "tenant-azure-slot-";
+pub(crate) const SLOT_LABEL: &str = "tenancy.cnpg-vcluster.io/slot-id";
+pub(crate) const ENDPOINT_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/endpoint";
+pub(crate) const POD_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/pod-cidr";
+pub(crate) const SERVICE_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/service-cidr";
 
 #[derive(Clone, Copy)]
 pub struct ClaimContext<'a> {
@@ -101,7 +102,12 @@ pub enum ReleaseDecision {
 #[must_use]
 pub fn lease_name(slot_id: &str) -> String {
     let digest = hex::encode(Sha256::digest(slot_id.as_bytes()));
-    format!("{PREFIX}{}", &digest[..63 - PREFIX.len()])
+    let prefix = if slot_id.starts_with("azure-") {
+        AZURE_PREFIX
+    } else {
+        PREFIX
+    };
+    format!("{prefix}{}", &digest[..63 - prefix.len()])
 }
 
 fn status_matches(slot: &AllocationSlot, status: &AllocationStatus) -> bool {

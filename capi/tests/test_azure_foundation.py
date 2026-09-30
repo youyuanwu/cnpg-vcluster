@@ -28,6 +28,8 @@ from scripts.lib.azure.foundation import (
     TENANT_CONTROLLER_CONFIG_KEY,
     _azure_provider_configuration,
     _azure_allocation_configuration,
+    _prepare_azure_tenant_api_cutover,
+    _verify_azure_cutover_probe,
     _foundation_identity,
     _inspect_admin,
     _install_capi_capz,
@@ -55,6 +57,77 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
+    def test_azure_cutover_probe_requires_allocation_and_always_deletes(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        calls = []
+
+        def kubectl(_root, *arguments, **_kwargs):
+            calls.append(arguments)
+            if arguments[:2] == ("get", next(
+                (value for value in arguments if value.startswith("tenant/")),
+                "",
+            )):
+                return completed(json.dumps({
+                    "status": {
+                        "provider": {
+                            "networkAllocation": {"slotId": "azure-01"}
+                        }
+                    }
+                }))
+            return completed()
+
+        with (
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            patch(
+                "scripts.lib.azure.foundation.uuid.uuid4",
+                return_value=type("Uuid", (), {"hex": "1234567890abcdef"})(),
+            ),
+        ):
+            _verify_azure_cutover_probe(root, config)
+        self.assertTrue(any(arguments[0] == "create" for arguments in calls))
+        self.assertTrue(any(arguments[0] == "delete" for arguments in calls))
+
+    def test_azure_cutover_locks_checks_residue_and_replaces_only_empty_crd(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        old = {
+            "spec": {
+                "versions": [
+                    {"name": "v1alpha2", "served": True, "storage": True}
+                ]
+            },
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        calls = []
+
+        def kubectl(_root, *arguments, **_kwargs):
+            calls.append(arguments)
+            if arguments[:2] == ("get", "tenants") or (
+                arguments and arguments[0] == "get" and "--all-namespaces" in arguments
+            ):
+                return completed(json.dumps({"items": []}))
+            return completed()
+
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=old,
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+        ):
+            self.assertTrue(_prepare_azure_tenant_api_cutover(root, config))
+        self.assertIn(
+            ("delete", "crd/tenants.tenancy.cnpg-vcluster.io", "--wait=true",
+             f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}"),
+            calls,
+        )
+        self.assertIn(
+            ("-n", "tenant-system", "delete", "deployment/tenant-controller",
+             "--ignore-not-found=true", "--wait=true"),
+            calls,
+        )
+
     def test_existing_complete_capi_stack_skips_clusterctl_init(self) -> None:
         root = self.make_root()
         config = load_azure_configuration(root)

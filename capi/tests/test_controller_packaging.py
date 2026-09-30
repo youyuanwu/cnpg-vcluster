@@ -78,7 +78,7 @@ class PackagingTests(unittest.TestCase):
                 {"items": []}, {"items": [{}]}, []
             )
 
-    def test_cutover_generation_detection_and_phase_one_activation_block(self):
+    def test_cutover_generation_detection_and_phase_two_activation_ready(self):
         for version in ("v1alpha2", "v1alpha3"):
             crd = {
                 "spec": {
@@ -89,8 +89,74 @@ class PackagingTests(unittest.TestCase):
                 "status": {"storedVersions": [version]},
             }
             self.assertEqual(packaging.tenant_api_generation(crd), version)
-        with self.assertRaisesRegex(RuntimeError, "activation is blocked"):
-            packaging.require_tenant_api_cutover_ready()
+        packaging.require_tenant_api_cutover_ready()
+
+    def test_cutover_locks_double_checks_stops_and_deletes_old_crd(self):
+        old = {
+            "spec": {
+                "versions": [
+                    {"name": "v1alpha2", "served": True, "storage": True}
+                ]
+            },
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+
+        def handle(*args, **_kwargs):
+            if args[:2] == ("get", f"crd/{packaging.TENANT_CRD}"):
+                return response(old)
+            return response()
+
+        client = Client(handle)
+        with (
+            patch.object(packaging, "require_clean_controller_state") as clean,
+            patch.object(packaging, "stop_controller") as stop,
+        ):
+            self.assertTrue(
+                packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)
+            )
+        self.assertEqual(clean.call_count, 2)
+        stop.assert_called_once()
+        self.assertTrue(
+            any(
+                args[:2] == ("delete", f"crd/{packaging.TENANT_CRD}")
+                for args, _ in client.calls
+            )
+        )
+
+    def test_cutover_second_check_failure_removes_lock_before_crd_delete(self):
+        old = {
+            "spec": {
+                "versions": [
+                    {"name": "v1alpha2", "served": True, "storage": True}
+                ]
+            },
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        client = Client(
+            lambda *args, **_kwargs: response(old)
+            if args[:2] == ("get", f"crd/{packaging.TENANT_CRD}")
+            else response()
+        )
+        with (
+            patch.object(
+                packaging,
+                "require_clean_controller_state",
+                side_effect=[None, RuntimeError("race")],
+            ),
+            patch.object(packaging, "stop_controller"),
+            self.assertRaisesRegex(RuntimeError, "race"),
+        ):
+            packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)
+        self.assertFalse(
+            any(
+                args[:2] == ("delete", f"crd/{packaging.TENANT_CRD}")
+                for args, _ in client.calls
+            )
+        )
+        for resource in packaging.tenant_cutover_lock_cleanup_refs():
+            self.assertTrue(
+                any(args[:2] == ("delete", resource) for args, _ in client.calls)
+            )
 
     def setUp(self):
         (ROOT / ".runtime").mkdir(exist_ok=True)

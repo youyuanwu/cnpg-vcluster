@@ -11,8 +11,9 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    allocation::ReleaseDecision,
     api::{
-        AzureDeletionStatus, AzureKubeconfigStatus, AzureManagementStatus,
+        AzureAllocationStatus, AzureDeletionStatus, AzureKubeconfigStatus, AzureManagementStatus,
         AzureProviderResourceIdentity, CanonicalSpec, Tenant, TenantPhase, TenantProviderSpec,
         canonical_spec, spec_hash,
     },
@@ -20,6 +21,7 @@ use crate::{
         AzureConfiguration, AzureContext, EXTERNAL_CONTROL_PLANE_LABEL, desired_objects,
         validate_binding, validate_desired_object, validate_live_identity,
     },
+    azure_allocation::{self, AzureClaimIdentity},
     error::ControllerError,
     management,
     readiness::set_condition,
@@ -36,6 +38,12 @@ const DRAIN: &str = "machine.cluster.x-k8s.io/exclude-node-draining";
 
 fn blocked(message: impl Into<String>) -> ReconcileError {
     ReconcileError::OwnershipInvalid(message.into())
+}
+#[rustfmt::skip]
+fn placeholder_allocation() -> AzureAllocationStatus {
+    AzureAllocationStatus { slot_id: "azure-unallocated".into(), pod_cidr: "192.0.2.0/24".into(),
+        service_cidr: "198.51.100.0/24".into(), catalog_uid: "unallocated".into(),
+        catalog_sha256: "unallocated".into(), lease_name: "unallocated".into(), lease_uid: "unallocated".into() }
 }
 
 fn uid(object: &DynamicObject) -> Result<String, ReconcileError> {
@@ -504,10 +512,23 @@ pub async fn finalize(
         .as_ref()
         .and_then(|status| status.azure())
         .ok_or_else(|| blocked("Azure typed provider status is absent"))?;
-    let allocation = azure_status
+    let claim_identity = AzureClaimIdentity {
+        tenant_name: &name,
+        tenant_uid: &tenant_uid,
+        spec_hash: &specification_sha256,
+    };
+    let recovered = if azure_status.network_allocation.is_none() {
+        azure_allocation::recover(client.clone(), claim_identity)
+            .await
+            .map_err(|error| blocked(error.to_string()))?
+    } else {
+        None
+    };
+    let actual_allocation = azure_status
         .network_allocation
         .as_ref()
-        .ok_or_else(|| blocked("Azure network allocation status is absent"))?;
+        .or(recovered.as_ref());
+    let placeholder = placeholder_allocation();
     validate_binding(
         azure_status
             .binding
@@ -523,7 +544,7 @@ pub async fn finalize(
         foundation_sha256: &configuration.values.foundation_sha256,
         operation_id: &operation,
         configuration: &configuration.values,
-        allocation,
+        allocation: actual_allocation.unwrap_or(&placeholder),
     };
     let desired = desired_objects(&context)
         .map_err(|error| ReconcileError::InvalidInput(error.to_string()))?;
@@ -763,6 +784,9 @@ pub async fn finalize(
             )
             .map_err(|error| ControllerError::OwnershipInvalid(error.to_string()))?;
             azure.management = Some(management.clone());
+            if azure.network_allocation.is_none() {
+                azure.network_allocation = recovered.clone();
+            }
             azure.kubeconfig = kubeconfig.clone();
             azure.provider_resources = provider_resources.clone();
             azure.deletion = Some(deletion.clone());
@@ -917,6 +941,21 @@ pub async fn finalize(
                 .await?;
         }
         return Ok(Action::requeue(DEPENDENCY_INTERVAL));
+    }
+    match azure_allocation::release(client.clone(), claim_identity, actual_allocation, true)
+        .await
+        .map_err(|error| blocked(error.to_string()))?
+    {
+        ReleaseDecision::Pending | ReleaseDecision::Delete(_) => {
+            return Ok(Action::requeue(DEPENDENCY_INTERVAL));
+        }
+        ReleaseDecision::Complete if azure_status.network_allocation.is_some() => {
+            let mut cleared = tenant.status.clone().unwrap_or_default();
+            cleared.azure_mut()?.network_allocation = None;
+            status::replace_status(client.clone(), tenant, tenant, &cleared, true).await?;
+            return Ok(Action::requeue(PROGRESS_INTERVAL));
+        }
+        ReleaseDecision::Complete => {}
     }
     let current = Api::<Tenant>::all(client.clone())
         .get_opt(&name)

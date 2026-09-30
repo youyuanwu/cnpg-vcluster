@@ -32,7 +32,7 @@ CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
 TENANT_CUTOVER_POLICY = "tenant-api-cutover-create-lock"
-TENANT_API_CUTOVER_READY = False
+TENANT_API_CUTOVER_READY = True
 STATIC_MANAGER_FLAGS = ("-C", "target-feature=+crt-static")
 
 
@@ -130,6 +130,67 @@ def require_tenant_api_cutover_ready() -> None:
         raise RuntimeError(
             "Tenant API v1alpha3 activation is blocked until the Azure allocation lifecycle is complete"
         )
+
+
+def apply_tenant_cutover_lock(client: ManagementClient) -> None:
+    for document in tenant_cutover_lock_documents():
+        client.kubectl(
+            "apply",
+            "--server-side",
+            "--field-manager=cnpg-vcluster-tenant-api-cutover",
+            "--force-conflicts",
+            "-f",
+            "-",
+            input_text=json.dumps(document),
+        )
+
+
+def remove_tenant_cutover_lock(config: dict[str, str], client: ManagementClient) -> None:
+    for resource in tenant_cutover_lock_cleanup_refs():
+        client.kubectl(
+            "delete",
+            resource,
+            "--ignore-not-found=true",
+            "--wait=true",
+            f"--timeout={config['DELETE_TIMEOUT']}",
+        )
+
+
+def prepare_tenant_api_cutover(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+) -> bool:
+    observed = client.kubectl(
+        "get",
+        f"crd/{TENANT_CRD}",
+        "--ignore-not-found=true",
+        "-o",
+        "json",
+    ).stdout.strip()
+    if not observed:
+        return False
+    generation = tenant_api_generation(json.loads(observed))
+    if generation == "v1alpha3":
+        return False
+    apply_tenant_cutover_lock(client)
+    deleted = False
+    try:
+        require_clean_controller_state(root, client)
+        stop_controller(config, client)
+        require_clean_controller_state(root, client)
+        client.kubectl(
+            "delete",
+            f"crd/{TENANT_CRD}",
+            "--wait=true",
+            f"--timeout={config['DELETE_TIMEOUT']}",
+        )
+        deleted = True
+        return True
+    except Exception:
+        if not deleted:
+            remove_tenant_cutover_lock(config, client)
+        raise
 
 
 def rust_toolchain(root: Path) -> tuple[str, str]:
@@ -560,7 +621,12 @@ def verify_controller_crd(client: ManagementClient) -> None:
         raise RuntimeError("Tenant CRD must serve and store only v1alpha3 with a status subresource")
 
 
-def verify_controller_api(config: dict[str, str], client: ManagementClient) -> None:
+def verify_controller_api(
+    config: dict[str, str],
+    client: ManagementClient,
+    *,
+    require_allocation: bool = False,
+) -> None:
     name = f"contract-probe-{uuid.uuid4().hex[:12]}"
     probe = {
         "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
@@ -641,6 +707,22 @@ def verify_controller_api(config: dict[str, str], client: ManagementClient) -> N
         created = json.loads(response.stdout)
         if created.get("status"):
             raise RuntimeError("Tenant create must ignore user-supplied status")
+        if require_allocation:
+            def allocation_ready():
+                observed = client.json("get", f"tenant/{name}")
+                allocation = (
+                    observed.get("status", {})
+                    .get("provider", {})
+                    .get("allocation")
+                )
+                return True if isinstance(allocation, dict) and allocation.get("slotId") else None
+
+            wait_for(
+                "Tenant API cutover allocation probe",
+                parse_duration(config["CONDITION_TIMEOUT"]),
+                1,
+                allocation_ready,
+            )
         for patch in (
             {"workers": 2},
             {"provider": {"databases": 2}},
@@ -735,6 +817,7 @@ def reconcile_controller(
         ],
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
     )
+    cutover_locked = prepare_tenant_api_cutover(root, config, client)
     paths = (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
         root / "controller" / "config" / "crd" / "bases",
@@ -849,6 +932,9 @@ def reconcile_controller(
         )
         verify_running_controller(client, image, activation_token=token)
     except Exception as failure:
+        if cutover_locked:
+            apply_tenant_cutover_lock(client)
+            raise
         if replacement:
             accepted = client.kubectl(
                 "-n",
@@ -980,9 +1066,16 @@ def reconcile_controller(
                     f"candidate shutdown failed during rollback: {drain_error}"
                 )
         raise
-    verify_controller_image(config, client, image)
-    verify_controller_api(config, client)
     verify_controller_crd(client)
+    verify_controller_image(config, client, image)
+    if cutover_locked:
+        remove_tenant_cutover_lock(config, client)
+    try:
+        verify_controller_api(config, client, require_allocation=cutover_locked)
+    except Exception:
+        if cutover_locked:
+            apply_tenant_cutover_lock(client)
+        raise
 
 
 def delete_controller(

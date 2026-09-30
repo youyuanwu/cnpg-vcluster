@@ -6,6 +6,7 @@ use k8s_openapi::api::core::v1::{ConfigMap, Namespace};
 use kube::Api;
 use tenant_controller::activation;
 use tenant_controller::api::SUPPORTED_KUBERNETES_VERSION;
+use tenant_controller::azure_allocation::CONFIG_NAME as AZURE_ALLOCATION_CONFIG_NAME;
 use tenant_controller::docker::BollardDockerClient;
 use tenant_controller::error::ControllerError;
 use tenant_controller::foundation;
@@ -31,14 +32,10 @@ enum ProviderMode {
     Azure,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct StartupDependencies {
-    docker: bool,
-    local_foundation: bool,
-    local_assets: bool,
-    azure_configuration: bool,
-    management_watches: bool,
-}
+struct StartupDependencies { docker: bool, local_foundation: bool, local_assets: bool,
+    azure_configuration: bool, management_watches: bool }
 
 impl ProviderMode {
     const fn dependencies(self) -> StartupDependencies {
@@ -69,46 +66,31 @@ impl Drop for AbortControllerOnDrop {
     }
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ManagerConfig {
-    provider: ProviderMode,
-    probe_in_cluster: bool,
-    leader_elect: bool,
-    health_address: SocketAddr,
-    leader: LeaderConfig,
-    supported_kubernetes_version: String,
-    controller_image: String,
-    activation_token: String,
+    provider: ProviderMode, probe_in_cluster: bool, leader_elect: bool,
+    health_address: SocketAddr, leader: LeaderConfig, supported_kubernetes_version: String,
+    controller_image: String, activation_token: String,
 }
 
 impl Default for ManagerConfig {
+    #[rustfmt::skip]
     fn default() -> Self {
-        let namespace = std::env::var("POD_NAMESPACE")
-            .unwrap_or_else(|_| DEFAULT_LEADER_ELECTION_NAMESPACE.into());
-        let base_identity = std::env::var("POD_NAME")
-            .or_else(|_| std::env::var("HOSTNAME"))
+        let namespace = std::env::var("POD_NAMESPACE").unwrap_or_else(|_| DEFAULT_LEADER_ELECTION_NAMESPACE.into());
+        let base_identity = std::env::var("POD_NAME").or_else(|_| std::env::var("HOSTNAME"))
             .unwrap_or_else(|_| format!("tenant-controller-{}", std::process::id()));
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("system clock must be after the Unix epoch")
-            .as_nanos();
+        let nonce = SystemTime::now().duration_since(UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch").as_nanos();
         let identity = format!("{base_identity}-{nonce:x}");
         Self {
-            provider: ProviderMode::Local,
-            probe_in_cluster: false,
-            leader_elect: true,
-            health_address: DEFAULT_HEALTH_ADDRESS
-                .parse()
-                .expect("default health address is valid"),
+            provider: ProviderMode::Local, probe_in_cluster: false, leader_elect: true,
+            health_address: DEFAULT_HEALTH_ADDRESS.parse().expect("default health address is valid"),
             leader: LeaderConfig {
-                lease_name: DEFAULT_LEADER_ELECTION_ID.into(),
-                namespace,
-                identity,
-                duration_seconds: DEFAULT_LEASE_DURATION_SECONDS,
-                grace_seconds: DEFAULT_LEASE_GRACE_SECONDS,
+                lease_name: DEFAULT_LEADER_ELECTION_ID.into(), namespace, identity,
+                duration_seconds: DEFAULT_LEASE_DURATION_SECONDS, grace_seconds: DEFAULT_LEASE_GRACE_SECONDS,
             },
-            supported_kubernetes_version: SUPPORTED_KUBERNETES_VERSION.into(),
-            controller_image: String::new(),
+            supported_kubernetes_version: SUPPORTED_KUBERNETES_VERSION.into(), controller_image: String::new(),
             activation_token: String::new(),
         }
     }
@@ -215,7 +197,15 @@ async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
                 Api::<ConfigMap>::namespaced(client.clone(), FOUNDATION_NAMESPACE)
                     .get(AZURE_CONFIG_NAME)
                     .await?;
-            let provider = AzureProvider::from_config_map(client.clone(), &provider_config)?;
+            let allocation_config =
+                Api::<ConfigMap>::namespaced(client.clone(), FOUNDATION_NAMESPACE)
+                    .get(AZURE_ALLOCATION_CONFIG_NAME)
+                    .await?;
+            let provider = AzureProvider::from_config_maps(
+                client.clone(),
+                &provider_config,
+                &allocation_config,
+            )?;
             let configured_version = provider
                 .configuration
                 .values

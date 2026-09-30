@@ -51,6 +51,7 @@ async fn patch_status(
         .map_err(|error| ControllerError::InvalidInput(error.to_string()))?;
     if clear_allocation {
         status["provider"]["allocation"] = Value::Null;
+        status["provider"]["networkAllocation"] = Value::Null;
     }
     let updated = Api::<Tenant>::all(client)
         .patch_status(
@@ -160,7 +161,11 @@ pub async fn replace_status(
 ) -> Result<(), ControllerError> {
     if (current.status.as_ref() == Some(status)
         || (current.status.is_none() && status == &TenantStatus::default()))
-        && (!clear_allocation || status.allocation().is_none())
+        && (!clear_allocation
+            || (status.allocation().is_none()
+                && status
+                    .azure()
+                    .is_none_or(|azure| azure.network_allocation.is_none())))
     {
         return Ok(());
     }

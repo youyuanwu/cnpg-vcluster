@@ -18,8 +18,12 @@ from scripts.lib.admin import (
 )
 from scripts.lib.controller import (
     build_azure_controller_image,
+    require_empty_tenant_cutover,
     require_tenant_api_cutover_ready,
     render_azure_controller_manager,
+    tenant_api_generation,
+    tenant_cutover_lock_cleanup_refs,
+    tenant_cutover_lock_documents,
 )
 
 ACR_PULL_ROLE_DEFINITION_ID = (
@@ -669,8 +673,9 @@ def _azure_allocation_configuration(
         raise RuntimeError(f"Azure Tenant allocation catalog is invalid: {exc}") from exc
     if (
         not isinstance(payload, dict)
-        or set(payload) != {"schema", "slots"}
+        or set(payload) != {"schema", "reservedCIDRs", "slots"}
         or payload.get("schema") != 1
+        or not isinstance(payload.get("reservedCIDRs"), list)
         or not isinstance(payload.get("slots"), list)
         or not payload["slots"]
     ):
@@ -710,6 +715,10 @@ def _azure_allocation_configuration(
             "AZURE_AKS_SERVICE_CIDR",
         )
     ]
+    if payload["reservedCIDRs"] != [str(network) for _, network in management]:
+        raise RuntimeError(
+            "Azure Tenant allocation reserved CIDRs do not match management configuration"
+        )
     for index, (label, network) in enumerate(networks):
         for other_label, other in networks[index + 1 :]:
             if network.overlaps(other):
@@ -728,12 +737,137 @@ def _azure_allocation_configuration(
     return payload, raw, digest
 
 
+def _azure_cutover_lock(root: Path, *, present: bool) -> None:
+    if present:
+        for document in tenant_cutover_lock_documents():
+            _kubectl(
+                root,
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(document),
+            )
+        return
+    for resource in tenant_cutover_lock_cleanup_refs():
+        _kubectl(
+            root,
+            "delete",
+            resource,
+            "--ignore-not-found=true",
+            "--wait=true",
+        )
+
+
+def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
+    tenants = json.loads(_kubectl(root, "get", "tenants", "-o", "json").stdout)
+    residue = []
+    for resource in (
+        "clusters.cluster.x-k8s.io",
+        "machinepools.cluster.x-k8s.io",
+        "azureclusters.infrastructure.cluster.x-k8s.io",
+        "azuremachinepools.infrastructure.cluster.x-k8s.io",
+        "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
+    ):
+        payload = json.loads(
+            _kubectl(root, "get", resource, "--all-namespaces", "-o", "json").stdout
+        )
+        for item in payload.get("items", []):
+            residue.append(
+                f"{item.get('kind', resource)}/{item.get('metadata', {}).get('name', '')}"
+            )
+    return tenants, residue
+
+
+def _prepare_azure_tenant_api_cutover(
+    root: Path,
+    config: Mapping[str, str],
+) -> bool:
+    observed = _get_management_resource(
+        root, None, "crd/tenants.tenancy.cnpg-vcluster.io"
+    )
+    if observed is None or tenant_api_generation(observed) == "v1alpha3":
+        return False
+    _azure_cutover_lock(root, present=True)
+    deleted = False
+    try:
+        tenants, residue = _azure_cutover_inventory(root)
+        require_empty_tenant_cutover(tenants, residue)
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "delete",
+            "deployment/tenant-controller",
+            "--ignore-not-found=true",
+            "--wait=true",
+        )
+        tenants, residue = _azure_cutover_inventory(root)
+        require_empty_tenant_cutover(tenants, residue)
+        _kubectl(
+            root,
+            "delete",
+            "crd/tenants.tenancy.cnpg-vcluster.io",
+            "--wait=true",
+            f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
+        )
+        deleted = True
+        return True
+    except Exception:
+        if not deleted:
+            _azure_cutover_lock(root, present=False)
+        raise
+
+
+def _verify_azure_cutover_probe(
+    root: Path,
+    config: Mapping[str, str],
+) -> None:
+    name = f"cutover-probe-{uuid.uuid4().hex[:12]}"
+    document = {
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
+        "kind": "Tenant",
+        "metadata": {"name": name},
+        "spec": {
+            "kubernetesVersion": config[
+                "AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"
+            ],
+            "workers": 1,
+            "provider": {"type": "azure"},
+        },
+    }
+    _kubectl(root, "create", "-f", "-", input_text=json.dumps(document))
+    deadline = time.monotonic() + parse_duration(config["AZURE_CONTROLLER_TIMEOUT"])
+    try:
+        while time.monotonic() < deadline:
+            tenant = json.loads(_kubectl(root, "get", f"tenant/{name}", "-o", "json").stdout)
+            allocation = tenant.get("status", {}).get("provider", {}).get(
+                "networkAllocation"
+            )
+            if isinstance(allocation, dict) and allocation.get("slotId"):
+                return
+            time.sleep(2)
+        raise RuntimeError("Azure Tenant cutover allocation probe timed out")
+    finally:
+        _kubectl(
+            root,
+            "delete",
+            f"tenant/{name}",
+            "--ignore-not-found=true",
+            "--wait=true",
+            f"--timeout={config['AZURE_TENANT_TIMEOUT']}",
+        )
+
+
 def _install_tenant_controller(
     root: Path,
     config: Mapping[str, str],
     inventory: Mapping[str, object],
 ) -> tuple[str, str, str]:
     require_tenant_api_cutover_ready()
+    cutover_locked = _prepare_azure_tenant_api_cutover(root, config)
     image = _push_controller_image(root, config, inventory)
     for path in (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
@@ -852,6 +986,13 @@ def _install_tenant_controller(
     )
     if not isinstance(allocation_uid, str) or not allocation_uid:
         raise RuntimeError("Azure Tenant allocation ConfigMap UID is absent")
+    if cutover_locked:
+        _azure_cutover_lock(root, present=False)
+        try:
+            _verify_azure_cutover_probe(root, config)
+        except Exception:
+            _azure_cutover_lock(root, present=True)
+            raise
     return image, uid, allocation_uid
 
 

@@ -80,199 +80,115 @@ pub struct LocalProviderStatus {
     #[serde(skip_serializing_if = "Option::is_none", rename = "clusterUID")] pub cluster_uid: Option<String>,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureProviderStatus {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub binding: Option<AzureBindingStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub network_allocation: Option<AzureAllocationStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub management: Option<AzureManagementStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub kubeconfig: Option<AzureKubeconfigStatus>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub vmss: Option<AzureVmssStatus>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub nodes: Vec<AzureNodeIdentity>,
-    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub addon_components: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub provider_resources: Vec<AzureProviderResourceIdentity>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub deletion: Option<AzureDeletionStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub binding: Option<AzureBindingStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub network_allocation: Option<AzureAllocationStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub endpoint: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub management: Option<AzureManagementStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub kubeconfig: Option<AzureKubeconfigStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub vmss: Option<AzureVmssStatus>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub nodes: Vec<AzureNodeIdentity>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")] pub addon_components: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub provider_resources: Vec<AzureProviderResourceIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub deletion: Option<AzureDeletionStatus>,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureAllocationStatus {
-    pub slot_id: String,
-    #[serde(rename = "podCIDR")]
-    pub pod_cidr: String,
-    #[serde(rename = "serviceCIDR")]
-    pub service_cidr: String,
-    #[serde(rename = "catalogUID")]
-    pub catalog_uid: String,
-    pub catalog_sha256: String,
-    pub lease_name: String,
-    #[serde(rename = "leaseUID")]
-    pub lease_uid: String,
+    pub slot_id: String, #[serde(rename = "podCIDR")] pub pod_cidr: String,
+    #[serde(rename = "serviceCIDR")] pub service_cidr: String,
+    #[serde(rename = "catalogUID")] pub catalog_uid: String, pub catalog_sha256: String,
+    pub lease_name: String, #[serde(rename = "leaseUID")] pub lease_uid: String,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureBindingStatus {
-    #[serde(rename = "tenantUID")]
-    pub tenant_uid: String,
-    pub specification_sha256: String,
-    #[serde(rename = "providerConfigUID")]
-    pub provider_config_uid: String,
-    pub provider_config_sha256: String,
-    pub foundation_sha256: String,
-    pub foundation_defaults_sha256: String,
-    pub controller_image: String,
-    pub resource_group_id: String,
-    pub virtual_network_id: String,
-    pub tenant_subnet_id: String,
-    pub identity_id: String,
-    pub operation_id: String,
+    #[serde(rename = "tenantUID")] pub tenant_uid: String, pub specification_sha256: String,
+    #[serde(rename = "providerConfigUID")] pub provider_config_uid: String, pub provider_config_sha256: String,
+    pub foundation_sha256: String, pub foundation_defaults_sha256: String, pub controller_image: String,
+    pub resource_group_id: String, pub virtual_network_id: String, pub tenant_subnet_id: String,
+    pub identity_id: String, pub operation_id: String,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureManagementStatus {
-    #[serde(skip_serializing_if = "Option::is_none", rename = "namespaceUID")]
-    pub namespace_uid: Option<String>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        rename = "azureClusterIdentityUID"
-    )]
-    pub azure_cluster_identity_uid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "clusterUID")]
-    pub cluster_uid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "azureClusterUID")]
-    pub azure_cluster_uid: Option<String>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        rename = "kamajiControlPlaneUID"
-    )]
-    pub kamaji_control_plane_uid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "kubeadmConfigUID")]
-    pub kubeadm_config_uid: Option<String>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        rename = "azureMachinePoolUID"
-    )]
-    pub azure_machine_pool_uid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "machinePoolUID")]
-    pub machine_pool_uid: Option<String>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        rename = "cloudValuesConfigMapUID"
-    )]
-    pub cloud_values_config_map_uid: Option<String>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        rename = "networkValuesConfigMapUID"
-    )]
-    pub network_values_config_map_uid: Option<String>,
-    #[serde(
-        skip_serializing_if = "Option::is_none",
-        rename = "statusProbeDeploymentUID"
-    )]
-    pub status_probe_deployment_uid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "addonJobUID")]
-    pub addon_job_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "namespaceUID")] pub namespace_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "azureClusterIdentityUID")] pub azure_cluster_identity_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "clusterUID")] pub cluster_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "azureClusterUID")] pub azure_cluster_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "kamajiControlPlaneUID")] pub kamaji_control_plane_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "kubeadmConfigUID")] pub kubeadm_config_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "azureMachinePoolUID")] pub azure_machine_pool_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "machinePoolUID")] pub machine_pool_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "cloudValuesConfigMapUID")] pub cloud_values_config_map_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "networkValuesConfigMapUID")] pub network_values_config_map_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "statusProbeDeploymentUID")] pub status_probe_deployment_uid: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "addonJobUID")] pub addon_job_uid: Option<String>,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
-pub struct AzureKubeconfigStatus {
-    #[serde(rename = "secretUID")]
-    pub secret_uid: String,
-    pub content_sha256: String,
-}
+pub struct AzureKubeconfigStatus { #[serde(rename = "secretUID")] pub secret_uid: String, pub content_sha256: String }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureVmssStatus {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub instance_ids: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub instance_ids: Vec<String>,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureNodeIdentity {
-    pub name: String,
-    #[serde(rename = "uid")]
-    pub uid: String,
-    #[serde(rename = "providerID")]
-    pub provider_id: String,
-    #[serde(rename = "internalIP")]
-    pub internal_ip: String,
+    pub name: String, #[serde(rename = "uid")] pub uid: String,
+    #[serde(rename = "providerID")] pub provider_id: String,
+    #[serde(rename = "internalIP")] pub internal_ip: String,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureProviderResourceIdentity {
-    pub api_version: String,
-    pub kind: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub namespace: Option<String>,
-    pub name: String,
-    #[serde(rename = "uid")]
-    pub uid: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub resource_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "ownerUIDs")]
-    pub owner_uids: Vec<String>,
+    pub api_version: String, pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")] pub namespace: Option<String>,
+    pub name: String, #[serde(rename = "uid")] pub uid: String,
+    #[serde(skip_serializing_if = "Option::is_none")] pub resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "ownerUIDs")] pub owner_uids: Vec<String>,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct AzureDeletionStatus {
-    #[serde(
-        default,
-        skip_serializing_if = "BTreeMap::is_empty",
-        rename = "resourceVersions"
-    )]
-    pub resource_versions: BTreeMap<String, String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub verified_azure_resource_ids: Vec<String>,
-    #[serde(
-        default,
-        skip_serializing_if = "Vec::is_empty",
-        rename = "verifiedProviderUIDs"
-    )]
-    pub verified_provider_uids: Vec<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty", rename = "resourceVersions")] pub resource_versions: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")] pub verified_azure_resource_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty", rename = "verifiedProviderUIDs")] pub verified_provider_uids: Vec<String>,
 }
 
+#[rustfmt::skip]
 #[derive(JsonSchema)]
 #[allow(dead_code)]
 struct TenantProviderStatusSchema {
-    #[schemars(rename = "type")]
-    provider_type: ProviderTypeSchema,
-    allocation: Option<AllocationStatus>,
-    #[schemars(rename = "foundationHash")]
-    foundation_hash: Option<String>,
-    #[schemars(rename = "clusterUID")]
-    cluster_uid: Option<String>,
-    binding: Option<AzureBindingStatus>,
-    #[schemars(rename = "networkAllocation")]
-    network_allocation: Option<AzureAllocationStatus>,
-    endpoint: Option<String>,
-    management: Option<AzureManagementStatus>,
-    kubeconfig: Option<AzureKubeconfigStatus>,
-    vmss: Option<AzureVmssStatus>,
-    nodes: Option<Vec<AzureNodeIdentity>>,
-    #[schemars(rename = "addonComponents")]
-    addon_components: Option<BTreeMap<String, String>>,
-    #[schemars(rename = "providerResources")]
-    provider_resources: Option<Vec<AzureProviderResourceIdentity>>,
+    #[schemars(rename = "type")] provider_type: ProviderTypeSchema, allocation: Option<AllocationStatus>,
+    #[schemars(rename = "foundationHash")] foundation_hash: Option<String>,
+    #[schemars(rename = "clusterUID")] cluster_uid: Option<String>, binding: Option<AzureBindingStatus>,
+    #[schemars(rename = "networkAllocation")] network_allocation: Option<AzureAllocationStatus>,
+    endpoint: Option<String>, management: Option<AzureManagementStatus>, kubeconfig: Option<AzureKubeconfigStatus>,
+    vmss: Option<AzureVmssStatus>, nodes: Option<Vec<AzureNodeIdentity>>,
+    #[schemars(rename = "addonComponents")] addon_components: Option<BTreeMap<String, String>>,
+    #[schemars(rename = "providerResources")] provider_resources: Option<Vec<AzureProviderResourceIdentity>>,
     deletion: Option<AzureDeletionStatus>,
 }
 #[rustfmt::skip]

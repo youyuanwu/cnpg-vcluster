@@ -4,12 +4,14 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tenant_controller::{
-    api::{
-        AzureAllocationStatus, Tenant, TenantPhase, TenantProviderSpec, TenantSpec, TenantStatus,
-    },
+    api::{Tenant, TenantPhase, TenantProviderSpec, TenantSpec, TenantStatus, spec_hash},
     azure::{AzureConfiguration, CONFIG_KEY},
+    azure_allocation::{
+        self, APPROVED_SHA256_ANNOTATION, AzureAllocationCatalog, AzureAllocationDocument,
+        AzureClaimIdentity, AzureNetworkSlot,
+    },
     management::{self, AZURE_MANAGEMENT_RESOURCES, ResourceClass},
-    reconcile::{AzureProvider, Config, Reconciler},
+    reconcile::{AzureProvider, Config, ReconcileError, Reconciler},
 };
 
 use crate::creation_support::{FakeAccess, Server};
@@ -17,11 +19,14 @@ use crate::creation_support::{FakeAccess, Server};
 const TENANT_PATH: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a";
 const PROVIDER_CONFIG_PATH: &str =
     "/api/v1/namespaces/tenant-system/configmaps/tenant-azure-provider";
+const ALLOCATION_CONFIG_PATH: &str =
+    "/api/v1/namespaces/tenant-system/configmaps/tenant-azure-allocation";
 
 struct Fixture {
     management: Server,
     workload: Server,
     configuration: AzureConfiguration,
+    allocation: AzureAllocationCatalog,
 }
 
 impl Fixture {
@@ -52,14 +57,23 @@ impl Fixture {
                 resource.kind,
             );
         }
+        management.allow_typed_list(
+            "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases",
+            "coordination.k8s.io/v1",
+            "Lease",
+        );
         workload.allow_typed_list("/api/v1/nodes", "v1", "Node");
         let config = provider_config();
         management.insert(PROVIDER_CONFIG_PATH, config.clone());
         let configuration = AzureConfiguration::from_config_map(&config).unwrap();
+        let allocation_config = allocation_config();
+        management.insert(ALLOCATION_CONFIG_PATH, allocation_config.clone());
+        let allocation = AzureAllocationCatalog::from_config_map(&allocation_config).unwrap();
         Self {
             management,
             workload,
             configuration,
+            allocation,
         }
     }
 
@@ -68,6 +82,10 @@ impl Fixture {
     }
 
     async fn step(&self) {
+        self.try_step().await.unwrap();
+    }
+
+    async fn try_step(&self) -> Result<(), ReconcileError> {
         let client = self.management.client();
         let reconciler = Reconciler::new(
             client.clone(),
@@ -79,26 +97,11 @@ impl Fixture {
             AzureProvider {
                 client,
                 configuration: self.configuration.clone(),
+                allocation: self.allocation.clone(),
                 access: FakeAccess(self.workload.client()),
             },
         );
-        reconciler.reconcile_name("tenant-a").await.unwrap();
-        let mut tenant = self.current();
-        if let Some(provider) = tenant.status.as_mut() {
-            let status = provider.azure_mut().unwrap();
-            if status.binding.is_some() && status.network_allocation.is_none() {
-                status.network_allocation = Some(AzureAllocationStatus {
-                    slot_id: "azure-01".into(),
-                    pod_cidr: "10.244.0.0/16".into(),
-                    service_cidr: "10.96.0.0/16".into(),
-                    catalog_uid: "catalog-uid".into(),
-                    catalog_sha256: "catalog-sha".into(),
-                    lease_name: "tenant-azure-slot-a".into(),
-                    lease_uid: "lease-uid".into(),
-                });
-                self.management.insert(TENANT_PATH, tenant);
-            }
-        }
+        reconciler.reconcile_name("tenant-a").await.map(|_| ())
     }
 
     fn settle(&self) {
@@ -325,6 +328,37 @@ impl Fixture {
     }
 }
 
+fn allocation_config() -> ConfigMap {
+    let values = AzureAllocationDocument {
+        schema: 1,
+        reserved_cidrs: vec![
+            "10.220.0.0/16".into(),
+            "10.221.0.0/16".into(),
+            "10.222.0.0/16".into(),
+        ],
+        slots: vec![AzureNetworkSlot {
+            slot_id: "azure-01".into(),
+            pod_cidr: "10.244.0.0/16".into(),
+            service_cidr: "10.96.0.0/16".into(),
+        }],
+    };
+    let raw = serde_json::to_string(&values).unwrap();
+    let hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&serde_json::to_value(&values).unwrap()).unwrap(),
+    ));
+    ConfigMap {
+        metadata: kube::api::ObjectMeta {
+            name: Some("tenant-azure-allocation".into()),
+            namespace: Some("tenant-system".into()),
+            uid: Some("catalog-uid".into()),
+            annotations: Some(BTreeMap::from([(APPROVED_SHA256_ANNOTATION.into(), hash)])),
+            ..Default::default()
+        },
+        data: Some(BTreeMap::from([("slots.json".into(), raw)])),
+        ..Default::default()
+    }
+}
+
 fn provider_config() -> ConfigMap {
     let mut value = json!({
         "schema":1,"subscriptionId":"subscription","tenantId":"tenant","location":"region",
@@ -403,6 +437,205 @@ fn management_count(tenant: &Tenant) -> usize {
         .and_then(TenantStatus::azure)
         .and_then(|status| status.management.as_ref())
         .map_or(0, |status| status.recorded_uids().len())
+}
+
+#[tokio::test]
+async fn allocation_is_durable_before_any_provider_write() {
+    let fixture = Fixture::new();
+    fixture.step().await;
+    fixture.step().await;
+    fixture.management.take_calls();
+    fixture.step().await;
+    let tenant = fixture.current();
+    let allocation = tenant
+        .status
+        .as_ref()
+        .and_then(TenantStatus::azure)
+        .and_then(|status| status.network_allocation.as_ref())
+        .unwrap();
+    assert_eq!(allocation.slot_id, "azure-01");
+    assert_eq!(allocation.catalog_uid, "catalog-uid");
+    let calls = fixture.management.take_calls();
+    assert!(calls.iter().any(|call| {
+        call.method == "POST"
+            && call.path == "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases"
+    }));
+    assert!(!calls.iter().any(|call| {
+        call.method == "POST"
+            && call.path != format!("{TENANT_PATH}/status")
+            && !call.path.contains("/leases")
+    }));
+}
+
+#[tokio::test]
+async fn concurrent_azure_claims_never_share_the_only_slot() {
+    let fixture = Fixture::new();
+    let first_hash = "a".repeat(64);
+    let second_hash = "b".repeat(64);
+    let (first, second) = tokio::join!(
+        azure_allocation::claim(
+            fixture.management.client(),
+            &fixture.allocation,
+            AzureClaimIdentity {
+                tenant_name: "tenant-a",
+                tenant_uid: "uid-a",
+                spec_hash: &first_hash,
+            },
+        ),
+        azure_allocation::claim(
+            fixture.management.client(),
+            &fixture.allocation,
+            AzureClaimIdentity {
+                tenant_name: "tenant-b",
+                tenant_uid: "uid-b",
+                spec_hash: &second_hash,
+            },
+        )
+    );
+    assert_eq!(usize::from(first.is_ok()) + usize::from(second.is_ok()), 1);
+    assert!([first, second].into_iter().any(|result| matches!(
+        result,
+        Err(tenant_controller::allocation::AllocationError::Exhausted)
+    )));
+}
+
+#[tokio::test]
+async fn released_azure_slot_retry_never_touches_successor_claim() {
+    let fixture = Fixture::new();
+    let first_hash = "a".repeat(64);
+    let first = AzureClaimIdentity {
+        tenant_name: "tenant-a",
+        tenant_uid: "uid-a",
+        spec_hash: &first_hash,
+    };
+    let first_status =
+        azure_allocation::claim(fixture.management.client(), &fixture.allocation, first)
+            .await
+            .unwrap();
+    assert!(matches!(
+        azure_allocation::release(
+            fixture.management.client(),
+            first,
+            Some(&first_status),
+            true,
+        )
+        .await
+        .unwrap(),
+        tenant_controller::allocation::ReleaseDecision::Pending
+    ));
+    let second_hash = "b".repeat(64);
+    let second = AzureClaimIdentity {
+        tenant_name: "tenant-b",
+        tenant_uid: "uid-b",
+        spec_hash: &second_hash,
+    };
+    let second_status =
+        azure_allocation::claim(fixture.management.client(), &fixture.allocation, second)
+            .await
+            .unwrap();
+    assert!(matches!(
+        azure_allocation::release(
+            fixture.management.client(),
+            first,
+            Some(&first_status),
+            true,
+        )
+        .await
+        .unwrap(),
+        tenant_controller::allocation::ReleaseDecision::Complete
+    ));
+    azure_allocation::validate_recorded(fixture.management.client(), second, &second_status)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn deleting_tenant_recovers_claim_created_before_status() {
+    let fixture = Fixture::new();
+    fixture.step().await;
+    fixture.step().await;
+    let tenant = fixture.current();
+    let uid = tenant.metadata.uid.as_deref().unwrap();
+    let hash = spec_hash(&tenant.spec);
+    azure_allocation::claim(
+        fixture.management.client(),
+        &fixture.allocation,
+        AzureClaimIdentity {
+            tenant_name: "tenant-a",
+            tenant_uid: uid,
+            spec_hash: &hash,
+        },
+    )
+    .await
+    .unwrap();
+    fixture.mark_deleting();
+    for _ in 0..6 {
+        fixture.step().await;
+        if !fixture
+            .current()
+            .metadata
+            .finalizers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|value| value == tenant_controller::api::FINALIZER)
+        {
+            break;
+        }
+    }
+    assert!(
+        !fixture
+            .current()
+            .metadata
+            .finalizers
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .any(|value| value == tenant_controller::api::FINALIZER)
+    );
+}
+
+#[tokio::test]
+async fn ready_tenant_observation_survives_invalid_current_catalog() {
+    let fixture = Fixture::new();
+    fixture.until_ready().await;
+    let mut config = allocation_config();
+    config
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert(APPROVED_SHA256_ANNOTATION.into(), "0".repeat(64));
+    fixture.management.insert(ALLOCATION_CONFIG_PATH, config);
+    fixture.step().await;
+    assert_eq!(
+        fixture
+            .current()
+            .status
+            .as_ref()
+            .and_then(|status| status.phase),
+        Some(TenantPhase::Ready)
+    );
+}
+
+#[tokio::test]
+async fn invalid_current_catalog_blocks_ready_tenant_repair() {
+    let fixture = Fixture::new();
+    fixture.until_ready().await;
+    let mut config = allocation_config();
+    config
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert(APPROVED_SHA256_ANNOTATION.into(), "0".repeat(64));
+    fixture.management.insert(ALLOCATION_CONFIG_PATH, config);
+    fixture.remove_kinds(&["Job"]);
+    fixture.management.take_calls();
+    fixture.try_step().await.unwrap();
+    assert!(!fixture.management.calls().iter().any(|call| {
+        call.method == "POST" && call.path == "/apis/batch/v1/namespaces/tenant-a/jobs"
+    }));
 }
 
 #[tokio::test]
@@ -588,6 +821,16 @@ async fn finalization_records_then_deletes_in_exact_order() {
             }]
         }}),
     );
+    let mut invalid_catalog = allocation_config();
+    invalid_catalog
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert(APPROVED_SHA256_ANNOTATION.into(), "0".repeat(64));
+    fixture
+        .management
+        .insert(ALLOCATION_CONFIG_PATH, invalid_catalog);
     fixture.mark_deleting();
     fixture.management.take_calls();
 
@@ -692,7 +935,7 @@ async fn finalization_records_then_deletes_in_exact_order() {
         fixture.step().await;
     }
     fixture.remove_kinds(&["Pod", "ReplicaSet"]);
-    for _ in 0..5 {
+    for _ in 0..9 {
         fixture.step().await;
         if !fixture
             .current()
@@ -721,6 +964,7 @@ async fn finalization_records_then_deletes_in_exact_order() {
             "/apis/apps/v1/namespaces/tenant-a/deployments/tenant-a-status-probe",
             "/apis/infrastructure.cluster.x-k8s.io/v1beta1/namespaces/tenant-a/azureclusteridentities/tenant-a-identity",
             "/api/v1/namespaces/tenant-a",
+            "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases/tenant-azure-slot-7b50dafae5a3a57dff1f006158a88bbffd0ac92301b48",
         ]
     );
     let finalizer_patch = calls
