@@ -132,17 +132,27 @@ def require_tenant_api_cutover_ready() -> None:
         )
 
 
-def apply_tenant_cutover_lock(client: ManagementClient) -> None:
-    for document in tenant_cutover_lock_documents():
-        client.kubectl(
-            "apply",
-            "--server-side",
-            "--field-manager=cnpg-vcluster-tenant-api-cutover",
-            "--force-conflicts",
-            "-f",
-            "-",
-            input_text=json.dumps(document),
-        )
+def apply_tenant_cutover_lock(
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    try:
+        for document in tenant_cutover_lock_documents():
+            client.kubectl(
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(document),
+            )
+    except Exception as failure:
+        try:
+            remove_tenant_cutover_lock(config, client)
+        except Exception as cleanup:
+            failure.add_note(f"partial Tenant cutover lock cleanup failed: {cleanup}")
+        raise
 
 
 def remove_tenant_cutover_lock(config: dict[str, str], client: ManagementClient) -> None:
@@ -173,7 +183,7 @@ def prepare_tenant_api_cutover(
     generation = tenant_api_generation(json.loads(observed))
     if generation == "v1alpha3":
         return False
-    apply_tenant_cutover_lock(client)
+    apply_tenant_cutover_lock(config, client)
     deleted = False
     try:
         require_clean_controller_state(root, client)
@@ -933,7 +943,7 @@ def reconcile_controller(
         verify_running_controller(client, image, activation_token=token)
     except Exception as failure:
         if cutover_locked:
-            apply_tenant_cutover_lock(client)
+            apply_tenant_cutover_lock(config, client)
             raise
         if replacement:
             accepted = client.kubectl(
@@ -1074,7 +1084,7 @@ def reconcile_controller(
         verify_controller_api(config, client, require_allocation=cutover_locked)
     except Exception:
         if cutover_locked:
-            apply_tenant_cutover_lock(client)
+            apply_tenant_cutover_lock(config, client)
         raise
 
 

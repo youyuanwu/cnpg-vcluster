@@ -739,17 +739,26 @@ def _azure_allocation_configuration(
 
 def _azure_cutover_lock(root: Path, *, present: bool) -> None:
     if present:
-        for document in tenant_cutover_lock_documents():
-            _kubectl(
-                root,
-                "apply",
-                "--server-side",
-                "--field-manager=cnpg-vcluster-tenant-api-cutover",
-                "--force-conflicts",
-                "-f",
-                "-",
-                input_text=json.dumps(document),
-            )
+        try:
+            for document in tenant_cutover_lock_documents():
+                _kubectl(
+                    root,
+                    "apply",
+                    "--server-side",
+                    "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                    "--force-conflicts",
+                    "-f",
+                    "-",
+                    input_text=json.dumps(document),
+                )
+        except Exception as failure:
+            try:
+                _azure_cutover_lock(root, present=False)
+            except Exception as cleanup:
+                failure.add_note(
+                    f"partial Azure Tenant cutover lock cleanup failed: {cleanup}"
+                )
+            raise
         return
     for resource in tenant_cutover_lock_cleanup_refs():
         _kubectl(
@@ -763,21 +772,59 @@ def _azure_cutover_lock(root: Path, *, present: bool) -> None:
 
 def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
     tenants = json.loads(_kubectl(root, "get", "tenants", "-o", "json").stdout)
-    residue = []
-    for resource in (
-        "clusters.cluster.x-k8s.io",
-        "machinepools.cluster.x-k8s.io",
-        "azureclusters.infrastructure.cluster.x-k8s.io",
-        "azuremachinepools.infrastructure.cluster.x-k8s.io",
-        "kamajicontrolplanes.controlplane.cluster.x-k8s.io",
-    ):
+    catalog = json.loads(
+        (root / "controller" / "config" / "azure-management-resources.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    resources = []
+    for entry in catalog:
+        group = entry["apiVersion"].partition("/")[0] if "/" in entry["apiVersion"] else ""
+        resources.append(f"{entry['plural']}.{group}" if group else entry["plural"])
+    resources.append("leases.coordination.k8s.io")
+    items = []
+    for resource in sorted(set(resources)):
         payload = json.loads(
             _kubectl(root, "get", resource, "--all-namespaces", "-o", "json").stdout
         )
-        for item in payload.get("items", []):
-            residue.append(
-                f"{item.get('kind', resource)}/{item.get('metadata', {}).get('name', '')}"
-            )
+        items.extend(payload.get("items", []))
+    owned_uids = set()
+    owned_namespaces = set()
+    for item in items:
+        metadata = item.get("metadata", {})
+        annotations = metadata.get("annotations") or {}
+        labels = metadata.get("labels") or {}
+        if (
+            annotations.get("lifecycle.cnpg-vcluster.capi/profile") == "azure"
+            or annotations.get("lifecycle.cnpg-vcluster.capi/tenant")
+            or labels.get("cnpg-vcluster-tenant")
+            or str(metadata.get("name", "")).startswith("tenant-azure-slot-")
+        ):
+            if metadata.get("uid"):
+                owned_uids.add(metadata["uid"])
+            if metadata.get("namespace"):
+                owned_namespaces.add(metadata["namespace"])
+            if item.get("kind") == "Namespace":
+                owned_namespaces.add(metadata.get("name"))
+    changed = True
+    while changed:
+        changed = False
+        for item in items:
+            metadata = item.get("metadata", {})
+            if metadata.get("uid") in owned_uids:
+                continue
+            owners = metadata.get("ownerReferences") or []
+            if metadata.get("namespace") in owned_namespaces or any(
+                owner.get("uid") in owned_uids for owner in owners
+            ):
+                if metadata.get("uid"):
+                    owned_uids.add(metadata["uid"])
+                changed = True
+    residue = [
+        f"{item.get('kind', 'resource')}/{item.get('metadata', {}).get('name', '')}"
+        for item in items
+        if item.get("metadata", {}).get("uid") in owned_uids
+    ]
     return tenants, residue
 
 
@@ -859,6 +906,54 @@ def _verify_azure_cutover_probe(
             "--wait=true",
             f"--timeout={config['AZURE_TENANT_TIMEOUT']}",
         )
+
+
+def _verify_azure_controller_allocation_readiness(root: Path) -> None:
+    pods = json.loads(
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=tenant-controller",
+            "-o",
+            "json",
+        ).stdout
+    ).get("items", [])
+    ready = [
+        pod
+        for pod in pods
+        if not pod.get("metadata", {}).get("deletionTimestamp")
+        and any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in pod.get("status", {}).get("conditions", [])
+        )
+    ]
+    if len(ready) != 1:
+        raise RuntimeError("Azure Tenant controller has no exact Ready Pod")
+    pod_name = ready[0]["metadata"]["name"]
+    _kubectl(
+        root,
+        "get",
+        "--raw",
+        f"/api/v1/namespaces/tenant-system/pods/{pod_name}:8081/proxy/readyz",
+    )
+    lease = json.loads(
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "get",
+            "lease/tenant-controller.tenancy.cnpg-vcluster.io",
+            "-o",
+            "json",
+        ).stdout
+    )
+    spec = lease.get("spec", {})
+    if not spec.get("holderIdentity") or not spec.get("renewTime"):
+        raise RuntimeError("Azure Tenant controller leader Lease is not active")
 
 
 def _install_tenant_controller(
@@ -987,6 +1082,7 @@ def _install_tenant_controller(
     if not isinstance(allocation_uid, str) or not allocation_uid:
         raise RuntimeError("Azure Tenant allocation ConfigMap UID is absent")
     if cutover_locked:
+        _verify_azure_controller_allocation_readiness(root)
         _azure_cutover_lock(root, present=False)
         try:
             _verify_azure_cutover_probe(root, config)

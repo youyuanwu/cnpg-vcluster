@@ -27,6 +27,7 @@ pub(crate) const SLOT_LABEL: &str = "tenancy.cnpg-vcluster.io/slot-id";
 pub(crate) const ENDPOINT_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/endpoint";
 pub(crate) const POD_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/pod-cidr";
 pub(crate) const SERVICE_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/service-cidr";
+pub(crate) const AZURE_CATALOG_UID_LABEL: &str = "tenancy.cnpg-vcluster.io/allocation-catalog-uid";
 
 #[derive(Clone, Copy)]
 pub struct ClaimContext<'a> {
@@ -327,28 +328,21 @@ pub fn recover_allocation(
         .transpose()
 }
 
-fn validate_successor(
-    context: &ClaimContext<'_>,
-    lease: &Lease,
-    leases: &[Lease],
-    allocation: &AllocationStatus,
-) -> Result<(), AllocationError> {
+#[rustfmt::skip]
+fn validate_successor(context: &ClaimContext<'_>, lease: &Lease, leases: &[Lease],
+    allocation: &AllocationStatus) -> Result<(), AllocationError> {
+    let rotated = context.ownership_label == AZURE_CATALOG_UID_LABEL;
+    let lab_prefix = if rotated { lease.metadata.labels.as_ref().and_then(|labels| labels.get(context.ownership_label))
+        .map(String::as_str).filter(|value| !value.is_empty()).ok_or_else(||
+            AllocationError::Claim(lease.metadata.name.clone().unwrap_or_default()))? } else { context.lab_prefix };
+    let foundation_hash = if rotated { annotation(lease, FOUNDATION_ANNOTATION)? } else { context.foundation_hash };
     let successor = ClaimContext {
-        tenant_name: annotation(lease, TENANT_ANNOTATION)?,
-        tenant_uid: annotation(lease, TENANT_UID_ANNOTATION)?,
-        spec_hash: annotation(lease, SPEC_HASH_ANNOTATION)?,
-        ..*context
+        lab_prefix, tenant_name: annotation(lease, TENANT_ANNOTATION)?,
+        tenant_uid: annotation(lease, TENANT_UID_ANNOTATION)?, spec_hash: annotation(lease, SPEC_HASH_ANNOTATION)?, foundation_hash, ..*context
     };
-    valid_identity(&successor)?;
-    validate_claim(&successor, allocation, lease)?;
-    if leases
-        .iter()
-        .filter(|lease| {
-            annotation(lease, TENANT_UID_ANNOTATION).is_ok_and(|uid| uid == successor.tenant_uid)
-        })
-        .count()
-        != 1
-    {
+    valid_identity(&successor)?; validate_claim(&successor, allocation, lease)?;
+    if leases.iter().filter(|lease| annotation(lease, TENANT_UID_ANNOTATION)
+        .is_ok_and(|uid| uid == successor.tenant_uid)).count() != 1 {
         return Err(AllocationError::Duplicate);
     }
     Ok(())

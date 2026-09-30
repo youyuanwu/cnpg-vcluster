@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::{
-    allocation::{self, AllocationError, ClaimContext, ReleaseDecision},
+    allocation::{self, AZURE_CATALOG_UID_LABEL, AllocationError, ClaimContext, ReleaseDecision},
     api::{AllocationStatus, AzureAllocationStatus},
     foundation::AllocationSlot,
     ownership::{FOUNDATION_ANNOTATION, TENANT_UID_ANNOTATION},
@@ -16,7 +16,6 @@ use crate::{
 
 pub const CONFIG_NAME: &str = "tenant-azure-allocation";
 pub const APPROVED_SHA256_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/approved-allocation-sha256";
-const CATALOG_UID_LABEL: &str = "tenancy.cnpg-vcluster.io/allocation-catalog-uid";
 const PLACEHOLDER_ENDPOINT: &str = "0.0.0.0";
 
 #[rustfmt::skip]
@@ -55,13 +54,12 @@ impl AzureAllocationCatalog {
         let raw = config.data.as_ref().and_then(|data| data.get("slots.json")).ok_or(AzureAllocationError::Missing)?;
         let values: AzureAllocationDocument = serde_json::from_str(raw).map_err(|error| AzureAllocationError::Json(error.to_string()))?;
         values.validate()?;
-        let value = serde_json::to_value(&values).map_err(|error| AzureAllocationError::Json(error.to_string()))?;
-        let canonical = serde_json::to_vec(&value).map_err(|error| AzureAllocationError::Json(error.to_string()))?;
+        let canonical = serde_json::to_vec(&serde_json::to_value(&values)
+            .map_err(|error| AzureAllocationError::Json(error.to_string()))?)
+            .map_err(|error| AzureAllocationError::Json(error.to_string()))?;
         let sha256 = hex::encode(Sha256::digest(canonical));
         if config.metadata.annotations.as_ref().and_then(|annotations| annotations.get(APPROVED_SHA256_ANNOTATION))
-            .map(String::as_str) != Some(sha256.as_str()) {
-            return Err(AzureAllocationError::Approval);
-        }
+            .map(String::as_str) != Some(sha256.as_str()) { return Err(AzureAllocationError::Approval); }
         let config_map_uid = config.metadata.uid.clone().filter(|value| !value.is_empty()).ok_or(AzureAllocationError::Uid)?;
         Ok(Self { values, config_map_uid, sha256 })
     }
@@ -73,13 +71,11 @@ impl AzureAllocationDocument {
         if self.schema != 1 { return Err(AzureAllocationError::Schema); }
         let mut ids = std::collections::BTreeSet::new();
         let mut networks = Vec::new();
-        let reserved: Result<Vec<Ipv4Net>, _> = self.reserved_cidrs.iter().map(|value| value.parse()).collect();
-        let reserved = reserved.map_err(|_| AzureAllocationError::Management("invalid".into()))?;
+        let reserved: Vec<Ipv4Net> = self.reserved_cidrs.iter().map(|value| value.parse())
+            .collect::<Result<_, _>>().map_err(|_| AzureAllocationError::Management("invalid".into()))?;
         for slot in &self.slots {
-            if !slot.slot_id.starts_with("azure-") || !valid_name(&slot.slot_id)
-                || !ids.insert(slot.slot_id.as_str()) {
-                return Err(AzureAllocationError::Slot(slot.slot_id.clone()));
-            }
+            if !slot.slot_id.starts_with("azure-") || !valid_name(&slot.slot_id) || !ids.insert(slot.slot_id.as_str())
+                { return Err(AzureAllocationError::Slot(slot.slot_id.clone())); }
             let pod = network(&slot.pod_cidr, &slot.slot_id)?;
             let service = network(&slot.service_cidr, &slot.slot_id)?;
             if service.prefix_len() > 28 { return Err(AzureAllocationError::Slot(slot.slot_id.clone())); }
@@ -87,9 +83,8 @@ impl AzureAllocationDocument {
         }
         for (index, network) in networks.iter().enumerate() {
             if networks[index + 1..].iter().any(|candidate| overlaps(network, candidate)) { return Err(AzureAllocationError::Overlap); }
-            if let Some(conflict) = reserved.iter().find(|candidate| overlaps(network, candidate)) {
-                return Err(AzureAllocationError::Management(conflict.to_string()));
-            }
+            if let Some(conflict) = reserved.iter().find(|candidate| overlaps(network, candidate))
+                { return Err(AzureAllocationError::Management(conflict.to_string())); }
         }
         Ok(())
     }
@@ -97,10 +92,29 @@ impl AzureAllocationDocument {
 
 #[rustfmt::skip]
 pub async fn claim(client: Client, catalog: &AzureAllocationCatalog, identity: AzureClaimIdentity<'_>) -> Result<AzureAllocationStatus, AllocationError> {
-    let slots = slots(&catalog.values);
-    let context = context(identity, &catalog.config_map_uid, &catalog.sha256, &slots);
-    let claim = allocation::allocate(client, &context, None).await?;
-    Ok(status(catalog, &claim.slot, &claim.lease_uid))
+    validate_active_claims(client.clone(), catalog).await?;
+    let slots = slots(&catalog.values); let context = context(identity, &catalog.config_map_uid, &catalog.sha256, &slots);
+    let claim = allocation::allocate(client, &context, None).await?; Ok(status(catalog, &claim.slot, &claim.lease_uid))
+}
+
+#[rustfmt::skip]
+async fn validate_active_claims(client: Client, catalog: &AzureAllocationCatalog) -> Result<(), AllocationError> {
+    let api: Api<Lease> = Api::namespaced(client, FOUNDATION_NAMESPACE); for lease in api.list(&ListParams::default()).await?.items.into_iter()
+        .filter(|lease| lease.metadata.name.as_deref().is_some_and(|name| name.starts_with("tenant-azure-slot-"))) {
+        let name = lease.metadata.name.clone().unwrap_or_default();
+        let pod: Ipv4Net = metadata(&lease, false, allocation::POD_CIDR_ANNOTATION).and_then(|value| value.parse().ok())
+            .ok_or_else(|| AllocationError::Claim(name.clone()))?;
+        let service: Ipv4Net = metadata(&lease, false, allocation::SERVICE_CIDR_ANNOTATION).and_then(|value| value.parse().ok())
+            .ok_or_else(|| AllocationError::Claim(name.clone()))?;
+        for slot in &catalog.values.slots {
+            let exact = name == allocation::lease_name(&slot.slot_id) && slot.pod_cidr == pod.to_string() && slot.service_cidr == service.to_string();
+            let slot_pod: Ipv4Net = slot.pod_cidr.parse().map_err(|_| AllocationError::InvalidPool)?;
+            let slot_service: Ipv4Net = slot.service_cidr.parse().map_err(|_| AllocationError::InvalidPool)?;
+            if !exact && [pod, service].iter().any(|active| overlaps(active, &slot_pod) || overlaps(active, &slot_service))
+                { return Err(AllocationError::Claim(name)); }
+        }
+    }
+    Ok(())
 }
 
 #[rustfmt::skip]
@@ -122,7 +136,7 @@ pub async fn recover(client: Client, identity: AzureClaimIdentity<'_>) -> Result
     let Some(lease) = matching.next() else { return Ok(None); };
     if matching.next().is_some() { return Err(AllocationError::Duplicate); }
     let name = lease.metadata.name.clone().unwrap_or_default();
-    let catalog_uid = metadata(lease, true, CATALOG_UID_LABEL).ok_or_else(|| AllocationError::Claim(name.clone()))?;
+    let catalog_uid = metadata(lease, true, AZURE_CATALOG_UID_LABEL).ok_or_else(|| AllocationError::Claim(name.clone()))?;
     let catalog_sha = metadata(lease, false, FOUNDATION_ANNOTATION).ok_or_else(|| AllocationError::Claim(name.clone()))?;
     let context = context(identity, catalog_uid, catalog_sha, &[]);
     let allocation = allocation::recover_allocation(&context, &leases)?.ok_or(AllocationError::Missing)?;
@@ -147,6 +161,11 @@ pub async fn release(client: Client, identity: AzureClaimIdentity<'_>, recorded:
             recorded
         }
     };
+    let api: Api<Lease> = Api::namespaced(client.clone(), FOUNDATION_NAMESPACE);
+    if let Some(live) = api.get_opt(&recorded.lease_name).await? && metadata(&live, false, TENANT_UID_ANNOTATION) == Some(identity.tenant_uid)
+        && live.metadata.uid.as_deref() != Some(recorded.lease_uid.as_str()) {
+        return Err(AllocationError::StatusMismatch);
+    }
     let context = context(identity, &recorded.catalog_uid, &recorded.catalog_sha256, &[]);
     allocation::release(client, &context, Some(&local(recorded)), residue_absent).await
 }
@@ -154,55 +173,42 @@ pub async fn release(client: Client, identity: AzureClaimIdentity<'_>, recorded:
 #[rustfmt::skip]
 fn slots(document: &AzureAllocationDocument) -> Vec<AllocationSlot> {
     document.slots.iter().map(|slot| AllocationSlot {
-        slot_id: slot.slot_id.clone(), vip_ordinal: 0, endpoint: PLACEHOLDER_ENDPOINT.into(),
-        pod_cidr: slot.pod_cidr.clone(), service_cidr: slot.service_cidr.clone(),
+        slot_id: slot.slot_id.clone(), vip_ordinal: 0, endpoint: PLACEHOLDER_ENDPOINT.into(), pod_cidr: slot.pod_cidr.clone(), service_cidr: slot.service_cidr.clone(),
     }).collect()
 }
 #[rustfmt::skip]
 fn slot(status: &AzureAllocationStatus) -> AllocationSlot {
-    AllocationSlot { slot_id: status.slot_id.clone(), vip_ordinal: 0, endpoint: PLACEHOLDER_ENDPOINT.into(),
-        pod_cidr: status.pod_cidr.clone(), service_cidr: status.service_cidr.clone() }
+    AllocationSlot { slot_id: status.slot_id.clone(), vip_ordinal: 0, endpoint: PLACEHOLDER_ENDPOINT.into(), pod_cidr: status.pod_cidr.clone(), service_cidr: status.service_cidr.clone() }
 }
 #[rustfmt::skip]
 fn local(status: &AzureAllocationStatus) -> AllocationStatus {
-    AllocationStatus { slot_id: status.slot_id.clone(), endpoint: PLACEHOLDER_ENDPOINT.into(),
-        pod_cidr: status.pod_cidr.clone(), service_cidr: status.service_cidr.clone() }
+    AllocationStatus { slot_id: status.slot_id.clone(), endpoint: PLACEHOLDER_ENDPOINT.into(), pod_cidr: status.pod_cidr.clone(), service_cidr: status.service_cidr.clone() }
 }
 #[rustfmt::skip]
 fn context<'a>(identity: AzureClaimIdentity<'a>, catalog_uid: &'a str, catalog_sha: &'a str, slots: &'a [AllocationSlot]) -> ClaimContext<'a> {
-    ClaimContext {
-        namespace: FOUNDATION_NAMESPACE, ownership_label: CATALOG_UID_LABEL, lab_prefix: catalog_uid,
-        tenant_name: identity.tenant_name, tenant_uid: identity.tenant_uid, spec_hash: identity.spec_hash,
-        foundation_hash: catalog_sha, slots,
-    }
+    ClaimContext { namespace: FOUNDATION_NAMESPACE, ownership_label: AZURE_CATALOG_UID_LABEL, lab_prefix: catalog_uid,
+        tenant_name: identity.tenant_name, tenant_uid: identity.tenant_uid, spec_hash: identity.spec_hash, foundation_hash: catalog_sha, slots }
 }
 #[rustfmt::skip]
 fn status(catalog: &AzureAllocationCatalog, slot: &AllocationSlot, lease_uid: &str) -> AzureAllocationStatus {
-    AzureAllocationStatus {
-        slot_id: slot.slot_id.clone(), pod_cidr: slot.pod_cidr.clone(), service_cidr: slot.service_cidr.clone(),
-        catalog_uid: catalog.config_map_uid.clone(), catalog_sha256: catalog.sha256.clone(),
-        lease_name: allocation::lease_name(&slot.slot_id), lease_uid: lease_uid.into(),
-    }
+    AzureAllocationStatus { slot_id: slot.slot_id.clone(), pod_cidr: slot.pod_cidr.clone(), service_cidr: slot.service_cidr.clone(),
+        catalog_uid: catalog.config_map_uid.clone(), catalog_sha256: catalog.sha256.clone(), lease_name: allocation::lease_name(&slot.slot_id), lease_uid: lease_uid.into() }
 }
 #[rustfmt::skip]
 fn metadata<'a>(lease: &'a Lease, label: bool, key: &str) -> Option<&'a str> {
-    (if label { lease.metadata.labels.as_ref() } else { lease.metadata.annotations.as_ref() })
-        .and_then(|values| values.get(key)).map(String::as_str).filter(|value| !value.is_empty())
+    (if label { lease.metadata.labels.as_ref() } else { lease.metadata.annotations.as_ref() }).and_then(|values| values.get(key)).map(String::as_str).filter(|value| !value.is_empty())
 }
 #[rustfmt::skip]
 fn network(value: &str, slot: &str) -> Result<Ipv4Net, AzureAllocationError> {
-    value.parse::<Ipv4Net>().ok().filter(|network| network.addr() == network.network())
-        .ok_or_else(|| AzureAllocationError::Slot(slot.into()))
+    value.parse::<Ipv4Net>().ok().filter(|network| network.addr() == network.network()).ok_or_else(|| AzureAllocationError::Slot(slot.into()))
 }
 #[rustfmt::skip]
 fn overlaps(left: &Ipv4Net, right: &Ipv4Net) -> bool { left.contains(&right.network()) || right.contains(&left.network()) }
 #[rustfmt::skip]
 fn valid_name(value: &str) -> bool {
     let bytes = value.as_bytes();
-    (1..=63).contains(&bytes.len())
-        && bytes.first().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        && bytes.last().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
-        && bytes.iter().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
+    (1..=63).contains(&bytes.len()) && bytes.first().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit())
+        && bytes.last().is_some_and(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit()) && bytes.iter().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
 #[cfg(test)]

@@ -500,6 +500,41 @@ async fn concurrent_azure_claims_never_share_the_only_slot() {
 }
 
 #[tokio::test]
+async fn rotated_catalog_cannot_relabel_an_active_network() {
+    let fixture = Fixture::new();
+    let first_hash = "a".repeat(64);
+    azure_allocation::claim(
+        fixture.management.client(),
+        &fixture.allocation,
+        AzureClaimIdentity {
+            tenant_name: "tenant-a",
+            tenant_uid: "uid-a",
+            spec_hash: &first_hash,
+        },
+    )
+    .await
+    .unwrap();
+    let mut rotated = fixture.allocation.clone();
+    rotated.config_map_uid = "catalog-rotated".into();
+    rotated.sha256 = "c".repeat(64);
+    rotated.values.slots[0].slot_id = "azure-rotated".into();
+    let second_hash = "b".repeat(64);
+    assert!(matches!(
+        azure_allocation::claim(
+            fixture.management.client(),
+            &rotated,
+            AzureClaimIdentity {
+                tenant_name: "tenant-b",
+                tenant_uid: "uid-b",
+                spec_hash: &second_hash,
+            },
+        )
+        .await,
+        Err(tenant_controller::allocation::AllocationError::Claim(_))
+    ));
+}
+
+#[tokio::test]
 async fn released_azure_slot_retry_never_touches_successor_claim() {
     let fixture = Fixture::new();
     let first_hash = "a".repeat(64);
@@ -529,10 +564,12 @@ async fn released_azure_slot_retry_never_touches_successor_claim() {
         tenant_uid: "uid-b",
         spec_hash: &second_hash,
     };
-    let second_status =
-        azure_allocation::claim(fixture.management.client(), &fixture.allocation, second)
-            .await
-            .unwrap();
+    let mut rotated = fixture.allocation.clone();
+    rotated.config_map_uid = "catalog-rotated".into();
+    rotated.sha256 = "c".repeat(64);
+    let second_status = azure_allocation::claim(fixture.management.client(), &rotated, second)
+        .await
+        .unwrap();
     assert!(matches!(
         azure_allocation::release(
             fixture.management.client(),
@@ -547,6 +584,33 @@ async fn released_azure_slot_retry_never_touches_successor_claim() {
     azure_allocation::validate_recorded(fixture.management.client(), second, &second_status)
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn release_rejects_same_tenant_annotations_with_replaced_lease_uid() {
+    let fixture = Fixture::new();
+    let hash = "a".repeat(64);
+    let identity = AzureClaimIdentity {
+        tenant_name: "tenant-a",
+        tenant_uid: "uid-a",
+        spec_hash: &hash,
+    };
+    let status =
+        azure_allocation::claim(fixture.management.client(), &fixture.allocation, identity)
+            .await
+            .unwrap();
+    let path = format!(
+        "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases/{}",
+        status.lease_name
+    );
+    let mut lease = fixture.management.get(&path);
+    lease["metadata"]["uid"] = json!("replacement-uid");
+    fixture.management.insert(&path, lease);
+    assert!(matches!(
+        azure_allocation::release(fixture.management.client(), identity, Some(&status), true,)
+            .await,
+        Err(tenant_controller::allocation::AllocationError::StatusMismatch)
+    ));
 }
 
 #[tokio::test]

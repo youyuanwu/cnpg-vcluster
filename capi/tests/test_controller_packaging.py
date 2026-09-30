@@ -158,6 +158,25 @@ class PackagingTests(unittest.TestCase):
                 any(args[:2] == ("delete", resource) for args, _ in client.calls)
             )
 
+    def test_partial_cutover_lock_application_is_cleaned_up(self):
+        apply_count = 0
+
+        def handle(*args, **_kwargs):
+            nonlocal apply_count
+            if args and args[0] == "apply":
+                apply_count += 1
+                if apply_count == 2:
+                    return response(code=1, error="binding rejected")
+            return response()
+
+        client = Client(handle)
+        with self.assertRaises(RuntimeError):
+            packaging.apply_tenant_cutover_lock(CONFIG, client)
+        for resource in packaging.tenant_cutover_lock_cleanup_refs():
+            self.assertTrue(
+                any(args[:2] == ("delete", resource) for args, _ in client.calls)
+            )
+
     def setUp(self):
         (ROOT / ".runtime").mkdir(exist_ok=True)
         self.directory = tempfile.TemporaryDirectory(dir=ROOT / ".runtime")

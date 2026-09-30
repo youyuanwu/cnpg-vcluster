@@ -28,7 +28,9 @@ from scripts.lib.azure.foundation import (
     TENANT_CONTROLLER_CONFIG_KEY,
     _azure_provider_configuration,
     _azure_allocation_configuration,
+    _azure_cutover_lock,
     _prepare_azure_tenant_api_cutover,
+    _verify_azure_controller_allocation_readiness,
     _verify_azure_cutover_probe,
     _foundation_identity,
     _inspect_admin,
@@ -88,9 +90,34 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         self.assertTrue(any(arguments[0] == "create" for arguments in calls))
         self.assertTrue(any(arguments[0] == "delete" for arguments in calls))
 
+    def test_azure_cutover_readiness_proves_ready_pod_and_leader_lease(self):
+        root = self.make_root()
+
+        def kubectl(_root, *arguments, **_kwargs):
+            if "pods" in arguments:
+                return completed(json.dumps({"items": [{
+                    "metadata": {"name": "tenant-controller-pod"},
+                    "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                }]}))
+            if any(str(value).startswith("lease/") for value in arguments):
+                return completed(json.dumps({
+                    "spec": {"holderIdentity": "pod", "renewTime": "now"}
+                }))
+            return completed("ok")
+
+        with patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl):
+            _verify_azure_controller_allocation_readiness(root)
+
     def test_azure_cutover_locks_checks_residue_and_replaces_only_empty_crd(self):
         root = self.make_root()
         config = load_azure_configuration(root)
+        catalog = root / "controller" / "config"
+        catalog.mkdir(parents=True)
+        (catalog / "azure-management-resources.json").write_text(
+            (ROOT / "controller" / "config" / "azure-management-resources.json")
+            .read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
         old = {
             "spec": {
                 "versions": [
@@ -128,6 +155,35 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             calls,
         )
 
+    def test_partial_azure_cutover_lock_application_is_cleaned_up(self):
+        root = self.make_root()
+        calls = []
+        apply_count = 0
+
+        def kubectl(_root, *arguments, **_kwargs):
+            nonlocal apply_count
+            calls.append(arguments)
+            if arguments and arguments[0] == "apply":
+                apply_count += 1
+                if apply_count == 2:
+                    raise RuntimeError("binding rejected")
+            return completed()
+
+        with (
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            self.assertRaisesRegex(RuntimeError, "binding rejected"),
+        ):
+            _azure_cutover_lock(root, present=True)
+        self.assertTrue(
+            any(
+                arguments[:2]
+                == (
+                    "delete",
+                    "validatingadmissionpolicybinding/tenant-api-cutover-create-lock",
+                )
+                for arguments in calls
+            )
+        )
     def test_existing_complete_capi_stack_skips_clusterctl_init(self) -> None:
         root = self.make_root()
         config = load_azure_configuration(root)
