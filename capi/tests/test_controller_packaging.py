@@ -101,9 +101,10 @@ class PackagingTests(unittest.TestCase):
             if args[:2] == ("create", "--dry-run=server"):
                 return response(code=1, error="Tenant identity is unavailable or not Ready")
             return result
-        packaging.verify_database_activation_lock(
-            Client(webhook_first), namespace="tenant-system",
-        )
+        with self.assertRaisesRegex(RuntimeError, "not effective"):
+            packaging.verify_database_activation_lock(
+                Client(webhook_first), namespace="tenant-system",
+            )
         with self.assertRaisesRegex(RuntimeError, "not effective"):
             packaging.verify_database_activation_lock(
                 Client(lambda *args, **kwargs: (
@@ -132,6 +133,18 @@ class PackagingTests(unittest.TestCase):
             packaging.verify_database_activation_lock(
                 Client(lambda *args, **kwargs: (
                     response(excluded_policy)
+                    if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.DATABASE_ACTIVATION_POLICY}")
+                    else webhook_first(*args, **kwargs)
+                )), namespace="tenant-system",
+            )
+        selected_policy = copy.deepcopy(policy)
+        selected_policy["spec"]["matchConstraints"]["namespaceSelector"] = {
+            "matchLabels": {"tenant-database-gates": "excluded"}
+        }
+        with self.assertRaisesRegex(RuntimeError, "contract is malformed"):
+            packaging.verify_database_activation_lock(
+                Client(lambda *args, **kwargs: (
+                    response(selected_policy)
                     if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.DATABASE_ACTIVATION_POLICY}")
                     else webhook_first(*args, **kwargs)
                 )), namespace="tenant-system",

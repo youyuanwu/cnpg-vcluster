@@ -794,6 +794,9 @@ async fn review_create(
     {
         return Err(AdmissionError::Request);
     }
+    if activation_lock_probe(&request) {
+        return Ok(None);
+    }
     let mut database: TenantDatabase =
         serde_json::from_value(request.object).map_err(|_| AdmissionError::Spec)?;
     if database.metadata.uid.is_some()
@@ -862,6 +865,30 @@ async fn review_create(
         .map_err(|_| AdmissionError::Gate)?;
     validate_injected_reservation(&database, &gate)?;
     Ok(None)
+}
+
+fn activation_lock_probe(request: &AdmissionRequest) -> bool {
+    // A dry-run probe cannot persist; letting it pass the webhook isolates policy denial.
+    let name = request
+        .object
+        .pointer("/metadata/name")
+        .and_then(Value::as_str);
+    request.dry_run
+        && request.namespace.as_deref() == Some("tenant-system")
+        && request
+            .object
+            .pointer("/metadata/namespace")
+            .and_then(Value::as_str)
+            == Some("tenant-system")
+        && name
+            .and_then(|name| name.strip_prefix("database-lock-probe-"))
+            .is_some_and(|suffix| {
+                suffix.len() == 8 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+        && request.object.get("spec")
+            == Some(&json!({
+                "tenantName": "database-lock-probe", "tenantUID": "probe", "instances": 1
+            }))
 }
 
 fn validate_injected_metadata(
@@ -1457,5 +1484,69 @@ mod tests {
             username: "system:serviceaccount:tenant-system:tenant-controller".into(),
         });
         assert!(review_update(trusted).is_ok());
+    }
+
+    #[tokio::test]
+    async fn activation_probe_bypasses_webhook_only_when_nonpersisting_and_exact() {
+        let client = Client::new(
+            service_fn(|_request: Request<Body>| async {
+                Ok::<_, std::convert::Infallible>(
+                    Response::builder().status(503)
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"apiVersion":"v1","kind":"Status","status":"Failure","code":503,"reason":"ServiceUnavailable","message":"unavailable"}"#.as_bytes().to_vec()))
+                        .unwrap()
+                )
+            }),
+            "test",
+        );
+        let probe = AdmissionRequest {
+            uid: "1234-5678".into(),
+            kind: GroupVersionKind {
+                group: crate::api::GROUP.into(),
+                version: crate::api::VERSION.into(),
+                kind: "TenantDatabase".into(),
+            },
+            resource: GroupVersionResource {
+                group: crate::api::GROUP.into(),
+                version: crate::api::VERSION.into(),
+                resource: "tenantdatabases".into(),
+            },
+            operation: "CREATE".into(),
+            namespace: Some("tenant-system".into()),
+            dry_run: true,
+            object: json!({
+                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1", "kind": "TenantDatabase",
+                "metadata": {"name": "database-lock-probe-1234abcd", "namespace": "tenant-system"},
+                "spec": {"tenantName": "database-lock-probe", "tenantUID": "probe", "instances": 1}
+            }),
+            old_object: None,
+            user_info: None,
+        };
+        assert_eq!(
+            review_create(client.clone(), probe.clone(), false)
+                .await
+                .unwrap(),
+            None
+        );
+        assert_eq!(
+            review_create(client.clone(), probe.clone(), true)
+                .await
+                .unwrap(),
+            None
+        );
+        let mut persistent = probe.clone();
+        persistent.dry_run = false;
+        assert_eq!(
+            review_create(client.clone(), persistent, false)
+                .await
+                .unwrap_err(),
+            AdmissionError::Tenant
+        );
+        let mut different = probe;
+        different.object["metadata"]["name"] = json!("database-lock-probe-other");
+        assert_eq!(
+            review_create(client, different, false).await.unwrap_err(),
+            AdmissionError::Tenant
+        );
     }
 }

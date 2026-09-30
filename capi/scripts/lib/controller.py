@@ -136,12 +136,20 @@ def verify_database_activation_lock(
     )
     expected_spec = expected_policy["spec"]
     policy_spec = policy.get("spec", {})
+    constraints = policy_spec.get("matchConstraints", {})
     if (
         policy.get("metadata", {}).get("name") != DATABASE_ACTIVATION_POLICY
         or policy_spec.get("failurePolicy") != "Fail"
-        or policy_spec.get("matchConstraints", {}).get("resourceRules")
-        != expected_spec["matchConstraints"]["resourceRules"]
-        or policy_spec.get("matchConstraints", {}).get("excludeResourceRules")
+        or not isinstance(constraints, dict)
+        or constraints.get("resourceRules") != expected_spec["matchConstraints"]["resourceRules"]
+        or set(constraints) - {
+            "resourceRules", "excludeResourceRules", "namespaceSelector",
+            "objectSelector", "matchPolicy",
+        }
+        or constraints.get("excludeResourceRules")
+        or constraints.get("namespaceSelector")
+        or constraints.get("objectSelector")
+        or constraints.get("matchPolicy", "Equivalent") not in ("Equivalent", "Exact")
         or policy_spec.get("validations") != expected_spec["validations"]
         or policy_spec.get("matchConditions")
         or policy_spec.get("paramKind")
@@ -167,16 +175,9 @@ def verify_database_activation_lock(
             "create", "--dry-run=server", "-f", "-",
             input_text=json.dumps(document), check=False,
         )
-        if (
-            result.returncode == 0
-            or not any(
-                message in result.stderr
-                for message in (
-                    "TenantDatabase creation is locked until both providers are ready",
-                    "Tenant identity is unavailable or not Ready",
-                )
-            )
-        ):
+        if (result.returncode == 0
+            or "TenantDatabase creation is locked until both providers are ready"
+            not in result.stderr):
             raise RuntimeError("TenantDatabase activation create lock is not effective")
 
 
