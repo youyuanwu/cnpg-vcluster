@@ -21,9 +21,13 @@ from scripts.lib.azure.common import (
 from scripts.lib.azure.foundation import (
     ACR_PULL_ROLE_DEFINITION_ID,
     CAPI_CAPZ_DEPLOYMENTS,
+    TENANT_ALLOCATION_APPROVAL,
+    TENANT_ALLOCATION_CONFIG,
+    TENANT_ALLOCATION_CONFIG_KEY,
     TENANT_CONTROLLER_CONFIG,
     TENANT_CONTROLLER_CONFIG_KEY,
     _azure_provider_configuration,
+    _azure_allocation_configuration,
     _foundation_identity,
     _inspect_admin,
     _install_capi_capz,
@@ -101,10 +105,37 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             "1.32.13",
         )
         self.assertEqual(config["AZURE_CONTROLLER_REPOSITORY"], "tenant-controller")
-        self.assertEqual(config["AZURE_CONTROLLER_TAG"], "v1alpha2")
+        self.assertEqual(config["AZURE_CONTROLLER_TAG"], "v1alpha3")
         self.assertEqual(config["AZURE_ADMIN_REPOSITORY"], "tenant-admin")
         self.assertEqual(config["AZURE_ADMIN_TAG"], "v1alpha1")
+        self.assertRegex(
+            config["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"],
+            r"^[0-9a-f]{64}$",
+        )
         self.assertEqual(config["AZURE_PREFIX"].replace("-", "") + "acr", "yycvacr")
+
+    def test_allocation_catalog_requires_exact_approval_and_disjoint_ranges(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        payload, raw, digest = _azure_allocation_configuration(root, config)
+        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(json.loads(raw), payload)
+        self.assertEqual(
+            digest,
+            config["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"],
+        )
+        stale = dict(config)
+        stale["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"] = "0" * 64
+        with self.assertRaisesRegex(RuntimeError, "approval"):
+            _azure_allocation_configuration(root, stale)
+        slots = payload["slots"]
+        slots[1]["podCIDR"] = "10.142.128.0/17"
+        (root / "config" / "azure" / "tenant-allocation-slots.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(RuntimeError, "overlap"):
+            _azure_allocation_configuration(root, config)
     def test_bicep_defines_exact_acr_and_kubelet_pull_outputs(self):
         foundation = (ROOT / "infra" / "azure" / "foundation.bicep").read_text()
         acr_pull = (ROOT / "infra" / "azure" / "acr-pull.bicep").read_text()
@@ -196,6 +227,15 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                             separators=(",", ":"),
                         )
                     },
+                }
+            if selected == f"configmap/{TENANT_ALLOCATION_CONFIG}":
+                _, raw, digest = _azure_allocation_configuration(root, config)
+                return {
+                    "metadata": {
+                        "uid": inventory["azureAllocationConfigUid"],
+                        "annotations": {TENANT_ALLOCATION_APPROVAL: digest},
+                    },
+                    "data": {TENANT_ALLOCATION_CONFIG_KEY: raw},
                 }
             if selected.startswith("mutatingwebhookconfiguration/"):
                 return {
@@ -336,7 +376,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ) as build,
             patch(
                 "scripts.lib.azure.foundation.run",
-                return_value=completed(f"v1alpha2: digest: {digest} size: 123\n"),
+                return_value=completed(f"v1alpha3: digest: {digest} size: 123\n"),
             ) as run_command,
             patch(
                 "scripts.lib.azure.foundation._az",
@@ -344,7 +384,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ) as az,
         ):
             image = _push_controller_image(root, config, inventory)
-        tagged = "yycvacr.azurecr.io/tenant-controller:v1alpha2"
+        tagged = "yycvacr.azurecr.io/tenant-controller:v1alpha3"
         build.assert_called_once_with(
             root,
             {"COMMAND_TIMEOUT": "1s"},
@@ -425,7 +465,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             [
                 "docker",
                 "tag",
-                "yycvacr.azurecr.io/tenant-controller:v1alpha2",
+                "yycvacr.azurecr.io/tenant-controller:v1alpha3",
                 unique,
             ],
         )
@@ -1177,7 +1217,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             defaults = root / "config" / "azure" / "defaults.env"
             original = {
                 "AZURE_CONTROLLER_REPOSITORY": "tenant-controller",
-                "AZURE_CONTROLLER_TAG": "v1alpha2",
+                "AZURE_CONTROLLER_TAG": "v1alpha3",
                 "AZURE_ADMIN_REPOSITORY": "tenant-admin",
                 "AZURE_ADMIN_TAG": "v1alpha1",
             }[key]
@@ -1287,7 +1327,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 "scripts.lib.azure.foundation._install_tenant_controller",
                 side_effect=lambda *_: (
                     calls.append("controller")
-                    or (inventory["controllerImage"], "provider-config-uid")
+                    or (
+                        inventory["controllerImage"],
+                        "provider-config-uid",
+                        "allocation-config-uid",
+                    )
                 ),
             ),
             patch(
@@ -1344,6 +1388,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return_value=(
                     inventory["controllerImage"],
                     inventory["azureProviderConfigUid"],
+                    inventory["azureAllocationConfigUid"],
                 ),
             ),
             patch(

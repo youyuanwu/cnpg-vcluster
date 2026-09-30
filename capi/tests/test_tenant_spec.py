@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import ipaddress
 import json
 import tempfile
 import unittest
@@ -10,7 +9,6 @@ from scripts.lib.tenant_spec import (
     TenantSpec,
     TenantSpecError,
     load_tenant_spec,
-    require_non_overlapping_networks,
 )
 
 
@@ -20,8 +18,6 @@ AZURE = {
     "name": "tenant-c",
     "kubernetesVersion": "1.32.13",
     "workers": 1,
-    "podCIDR": "10.72.0.0/16",
-    "serviceCIDR": "10.142.0.0/16",
 }
 
 
@@ -32,7 +28,6 @@ class TenantSpecTests(unittest.TestCase):
             supported_versions={"azure": "v1.32.13"},
         )
         self.assertEqual(spec.namespace, "tenant-c")
-        self.assertEqual(spec.dns_service_ip, "10.142.0.10")
         self.assertEqual(spec.cluster_domain, "cluster.local")
         self.assertEqual(spec, TenantSpec.from_mapping(spec.to_mapping()))
         self.assertEqual(len(spec.sha256()), 64)
@@ -78,21 +73,9 @@ class TenantSpecTests(unittest.TestCase):
                 supported_versions={"azure": "1.35.0"},
             )
 
-    def test_rejects_invalid_or_overlapping_networks(self) -> None:
-        with self.assertRaisesRegex(TenantSpecError, "overlap"):
-            TenantSpec.from_mapping(
-                AZURE | {"serviceCIDR": AZURE["podCIDR"]}
-            )
-        with self.assertRaisesRegex(TenantSpecError, "IPv4"):
-            TenantSpec.from_mapping(
-                AZURE | {"podCIDR": "2001:db8::/64"}
-            )
-        spec = TenantSpec.from_mapping(AZURE)
-        with self.assertRaisesRegex(TenantSpecError, "shared-pods"):
-            require_non_overlapping_networks(
-                spec,
-                {"shared-pods": ipaddress.ip_network("10.72.1.0/24")},
-            )
+    def test_rejects_removed_network_fields(self) -> None:
+        with self.assertRaisesRegex(TenantSpecError, "unknown"):
+            TenantSpec.from_mapping(AZURE | {"podCIDR": "10.72.0.0/16"})
 
     def test_canonical_digest_ignores_json_formatting(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

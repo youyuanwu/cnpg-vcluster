@@ -4,7 +4,9 @@ use k8s_openapi::api::core::v1::ConfigMap;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tenant_controller::{
-    api::{Tenant, TenantPhase, TenantProviderSpec, TenantSpec, TenantStatus},
+    api::{
+        AzureAllocationStatus, Tenant, TenantPhase, TenantProviderSpec, TenantSpec, TenantStatus,
+    },
     azure::{AzureConfiguration, CONFIG_KEY},
     management::{self, AZURE_MANAGEMENT_RESOURCES, ResourceClass},
     reconcile::{AzureProvider, Config, Reconciler},
@@ -12,7 +14,7 @@ use tenant_controller::{
 
 use crate::creation_support::{FakeAccess, Server};
 
-const TENANT_PATH: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a";
+const TENANT_PATH: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a";
 const PROVIDER_CONFIG_PATH: &str =
     "/api/v1/namespaces/tenant-system/configmaps/tenant-azure-provider";
 
@@ -31,10 +33,7 @@ impl Fixture {
             TenantSpec {
                 kubernetes_version: "1.32.13".into(),
                 workers: 3,
-                provider: TenantProviderSpec::Azure {
-                    pod_cidr: "10.244.0.0/16".into(),
-                    service_cidr: "10.96.0.0/16".into(),
-                },
+                provider: TenantProviderSpec::Azure,
             },
         );
         tenant.metadata.uid = Some("tenant-uid".into());
@@ -84,6 +83,22 @@ impl Fixture {
             },
         );
         reconciler.reconcile_name("tenant-a").await.unwrap();
+        let mut tenant = self.current();
+        if let Some(provider) = tenant.status.as_mut() {
+            let status = provider.azure_mut().unwrap();
+            if status.binding.is_some() && status.network_allocation.is_none() {
+                status.network_allocation = Some(AzureAllocationStatus {
+                    slot_id: "azure-01".into(),
+                    pod_cidr: "10.244.0.0/16".into(),
+                    service_cidr: "10.96.0.0/16".into(),
+                    catalog_uid: "catalog-uid".into(),
+                    catalog_sha256: "catalog-sha".into(),
+                    lease_name: "tenant-azure-slot-a".into(),
+                    lease_uid: "lease-uid".into(),
+                });
+                self.management.insert(TENANT_PATH, tenant);
+            }
+        }
     }
 
     fn settle(&self) {

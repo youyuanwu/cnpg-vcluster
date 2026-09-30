@@ -2,6 +2,7 @@ pub mod activation;
 pub mod allocation;
 pub mod api;
 pub mod azure;
+pub mod azure_allocation;
 pub mod docker;
 pub mod error;
 pub mod finalize;

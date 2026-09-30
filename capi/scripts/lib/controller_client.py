@@ -13,7 +13,7 @@ def tenant_manifest_document(
     config: dict[str, str], name: str, *, workers: int = 1, databases: int = 1,
 ) -> dict[str, object]:
     return {
-        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
         "kind": "Tenant",
         "metadata": {"name": name},
         "spec": {

@@ -27,6 +27,11 @@ ACR_PULL_ROLE_DEFINITION_ID = (
 )
 TENANT_CONTROLLER_CONFIG = "tenant-azure-provider"
 TENANT_CONTROLLER_CONFIG_KEY = "provider.json"
+TENANT_ALLOCATION_CONFIG = "tenant-azure-allocation"
+TENANT_ALLOCATION_CONFIG_KEY = "slots.json"
+TENANT_ALLOCATION_APPROVAL = (
+    "tenancy.cnpg-vcluster.io/approved-allocation-sha256"
+)
 ADMIN_NAME = "tenant-admin"
 ADMIN_NAMESPACE = "tenant-system"
 ADMIN_SERVICE_PROXY = (
@@ -652,11 +657,81 @@ def _azure_provider_configuration(
     return provider
 
 
+def _azure_allocation_configuration(
+    root: Path,
+    config: Mapping[str, str],
+) -> tuple[dict[str, object], str, str]:
+    path = root / "config" / "azure" / "tenant-allocation-slots.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Azure Tenant allocation catalog is invalid: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema", "slots"}
+        or payload.get("schema") != 1
+        or not isinstance(payload.get("slots"), list)
+        or not payload["slots"]
+    ):
+        raise RuntimeError("Azure Tenant allocation catalog has an invalid schema")
+    ids = set()
+    networks: list[tuple[str, ipaddress.IPv4Network]] = []
+    for slot in payload["slots"]:
+        if (
+            not isinstance(slot, dict)
+            or set(slot) != {"slotId", "podCIDR", "serviceCIDR"}
+            or not isinstance(slot.get("slotId"), str)
+            or re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", slot["slotId"])
+            is None
+            or slot["slotId"] in ids
+        ):
+            raise RuntimeError("Azure Tenant allocation slot identity is invalid")
+        ids.add(slot["slotId"])
+        for field in ("podCIDR", "serviceCIDR"):
+            try:
+                network = ipaddress.ip_network(slot.get(field), strict=True)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Azure Tenant allocation slot {slot['slotId']} {field} is invalid"
+                ) from exc
+            if not isinstance(network, ipaddress.IPv4Network):
+                raise RuntimeError("Azure Tenant allocation networks must be IPv4")
+            if field == "serviceCIDR" and network.num_addresses <= 11:
+                raise RuntimeError("Azure Tenant Service CIDR is too small")
+            networks.append((f"{slot['slotId']} {field}", network))
+    management = [
+        (key, ipaddress.ip_network(config[key], strict=True))
+        for key in (
+            "AZURE_VNET_CIDR",
+            "AZURE_AKS_SUBNET_CIDR",
+            "AZURE_TENANT_SUBNET_CIDR",
+            "AZURE_AKS_POD_CIDR",
+            "AZURE_AKS_SERVICE_CIDR",
+        )
+    ]
+    for index, (label, network) in enumerate(networks):
+        for other_label, other in networks[index + 1 :]:
+            if network.overlaps(other):
+                raise RuntimeError(
+                    f"Azure Tenant allocation networks overlap: {label} and {other_label}"
+                )
+        for management_label, management_network in management:
+            if network.overlaps(management_network):
+                raise RuntimeError(
+                    f"Azure Tenant allocation network {label} overlaps {management_label}"
+                )
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    if digest != config["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"]:
+        raise RuntimeError("Azure Tenant allocation catalog approval is missing or stale")
+    return payload, raw, digest
+
+
 def _install_tenant_controller(
     root: Path,
     config: Mapping[str, str],
     inventory: Mapping[str, object],
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
     image = _push_controller_image(root, config, inventory)
     for path in (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
@@ -683,6 +758,7 @@ def _install_tenant_controller(
         timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
     )
     provider_config = _azure_provider_configuration(config, inventory, image)
+    _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(root, config)
     config_map = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -707,6 +783,26 @@ def _install_tenant_controller(
         "-f",
         "-",
         input_text=json.dumps(config_map),
+    )
+    allocation_config_map = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": TENANT_ALLOCATION_CONFIG,
+            "namespace": "tenant-system",
+            "annotations": {TENANT_ALLOCATION_APPROVAL: allocation_sha256},
+        },
+        "data": {TENANT_ALLOCATION_CONFIG_KEY: allocation_raw},
+    }
+    _kubectl(
+        root,
+        "apply",
+        "--server-side",
+        "--field-manager=cnpg-vcluster-azure-controller",
+        "--force-conflicts",
+        "-f",
+        "-",
+        input_text=json.dumps(allocation_config_map),
     )
     manager = render_azure_controller_manager(
         root,
@@ -742,7 +838,19 @@ def _install_tenant_controller(
     uid = observed.get("metadata", {}).get("uid")
     if not isinstance(uid, str) or not uid:
         raise RuntimeError("Azure provider configuration ConfigMap UID is absent")
-    return image, uid
+    allocation = _get_management_resource(
+        root,
+        "tenant-system",
+        f"configmap/{TENANT_ALLOCATION_CONFIG}",
+    )
+    allocation_uid = (
+        allocation.get("metadata", {}).get("uid")
+        if isinstance(allocation, dict)
+        else None
+    )
+    if not isinstance(allocation_uid, str) or not allocation_uid:
+        raise RuntimeError("Azure Tenant allocation ConfigMap UID is absent")
+    return image, uid, allocation_uid
 
 
 def _admin_deployment_blockers(
@@ -1399,7 +1507,7 @@ def create_management(root: Path, config: Mapping[str, str]) -> None:
             f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
             timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
         )
-    controller_image, provider_config_uid = _install_tenant_controller(
+    controller_image, provider_config_uid, allocation_config_uid = _install_tenant_controller(
         root,
         config,
         inventory,
@@ -1413,6 +1521,7 @@ def create_management(root: Path, config: Mapping[str, str]) -> None:
     updated["controllers"] = _controller_identities(root)
     updated["controllerImage"] = controller_image
     updated["azureProviderConfigUid"] = provider_config_uid
+    updated["azureAllocationConfigUid"] = allocation_config_uid
     updated["adminImage"] = admin_image
     updated["adminDeploymentUid"] = admin_deployment_uid
     _write_inventory(root, updated)
@@ -1475,6 +1584,7 @@ def load_inventory(
     for key in (
         "controllerImage",
         "azureProviderConfigUid",
+        "azureAllocationConfigUid",
         "adminImage",
         "adminDeploymentUid",
     ):
@@ -1535,6 +1645,7 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
         raise RuntimeError("Azure management controller inventory is incomplete")
     controller_image = inventory.get("controllerImage")
     provider_config_uid = inventory.get("azureProviderConfigUid")
+    allocation_config_uid = inventory.get("azureAllocationConfigUid")
     if (
         not isinstance(controller_image, str)
         or not re.fullmatch(
@@ -1544,12 +1655,15 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
         or not controller_image.startswith(f"{outputs['acrLoginServer']}/")
         or not isinstance(provider_config_uid, str)
         or not provider_config_uid
+        or not isinstance(allocation_config_uid, str)
+        or not allocation_config_uid
     ):
         raise RuntimeError("Azure Tenant controller inventory is incomplete")
     identity = {
         "foundationDefaultsSha256": str(inventory["foundationDefaultsSha256"]),
         "controllerImage": controller_image,
         "azureProviderConfigUid": provider_config_uid,
+        "azureAllocationConfigUid": allocation_config_uid,
         **{key: str(outputs[key]) for key in required_outputs},
         **{
             f"controller:{key}": str(value)
@@ -1930,6 +2044,36 @@ def _inspect_foundation(
                 observed_config = None
             if observed_config != _azure_provider_configuration(config, inventory):
                 blockers.append("Azure provider configuration changed")
+        allocation_config = _get_management_resource(
+            root,
+            "tenant-system",
+            f"configmap/{TENANT_ALLOCATION_CONFIG}",
+        )
+        if allocation_config is None:
+            blockers.append("Azure Tenant allocation ConfigMap is absent")
+        else:
+            if (
+                allocation_config.get("metadata", {}).get("uid")
+                != inventory.get("azureAllocationConfigUid")
+            ):
+                blockers.append("Azure Tenant allocation identity changed")
+            try:
+                _, expected_raw, expected_sha256 = _azure_allocation_configuration(
+                    root, config
+                )
+            except RuntimeError:
+                expected_raw = expected_sha256 = None
+            if (
+                allocation_config.get("data", {}).get(
+                    TENANT_ALLOCATION_CONFIG_KEY
+                )
+                != expected_raw
+                or allocation_config.get("metadata", {})
+                .get("annotations", {})
+                .get(TENANT_ALLOCATION_APPROVAL)
+                != expected_sha256
+            ):
+                blockers.append("Azure Tenant allocation configuration changed")
         webhook = _get_management_resource(
             root,
             None,

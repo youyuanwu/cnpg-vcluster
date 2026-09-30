@@ -31,7 +31,69 @@ if TYPE_CHECKING:
 CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
+TENANT_CUTOVER_POLICY = "tenant-api-cutover-create-lock"
 STATIC_MANAGER_FLAGS = ("-C", "target-feature=+crt-static")
+
+
+def tenant_cutover_lock_documents() -> list[dict[str, object]]:
+    policy = {
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicy",
+        "metadata": {"name": TENANT_CUTOVER_POLICY},
+        "spec": {
+            "failurePolicy": "Fail",
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                        "apiVersions": ["v1alpha2", "v1alpha3"],
+                        "operations": ["CREATE"],
+                        "resources": ["tenants"],
+                        "scope": "Cluster",
+                    }
+                ]
+            },
+            "validations": [
+                {
+                    "expression": "false",
+                    "message": "Tenant creation is locked during API cutover",
+                }
+            ],
+        },
+    }
+    binding = {
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicyBinding",
+        "metadata": {"name": TENANT_CUTOVER_POLICY},
+        "spec": {
+            "policyName": TENANT_CUTOVER_POLICY,
+            "validationActions": ["Deny"],
+        },
+    }
+    return [policy, binding]
+
+
+def tenant_cutover_lock_cleanup_refs() -> tuple[str, str]:
+    return (
+        f"validatingadmissionpolicybinding/{TENANT_CUTOVER_POLICY}",
+        f"validatingadmissionpolicy/{TENANT_CUTOVER_POLICY}",
+    )
+
+
+def require_empty_tenant_cutover(
+    tenants: object,
+    provider_residue: list[str],
+) -> None:
+    items = tenants.get("items") if isinstance(tenants, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("Tenant cutover inventory is invalid")
+    if items:
+        raise RuntimeError("retained Tenants block Tenant API cutover")
+    if provider_residue:
+        raise RuntimeError(
+            "provider residue blocks Tenant API cutover: "
+            + ", ".join(sorted(provider_residue))
+        )
 
 
 def rust_toolchain(root: Path) -> tuple[str, str]:
@@ -465,7 +527,7 @@ def verify_controller_crd(client: ManagementClient) -> None:
 def verify_controller_api(config: dict[str, str], client: ManagementClient) -> None:
     name = f"contract-probe-{uuid.uuid4().hex[:12]}"
     probe = {
-        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
         "kind": "Tenant",
         "metadata": {"name": name},
         "spec": {

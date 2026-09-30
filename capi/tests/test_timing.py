@@ -73,7 +73,7 @@ class TimingTests(unittest.TestCase):
         spec = root / "config" / "tenants" / "examples" / "local.yaml"
         spec.parent.mkdir(parents=True)
         spec.write_text(
-            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2\n"
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha3\n"
             "kind: Tenant\nmetadata:\n  name: tenant-example\n",
             encoding="utf-8",
         )

@@ -250,7 +250,7 @@ fn aggregate_conditions_are_current_and_established_recovery_remains_degraded() 
     assert_eq!(READY_INTERVAL.as_secs(), 300);
 }
 
-const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a";
+const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a";
 
 #[tokio::test]
 async fn status_conflict_preserves_concurrent_fields_without_unneeded_initial_get() {
@@ -356,7 +356,7 @@ async fn status_patch_rejects_a_replacement_response() {
     let server = Server::default();
     let tenant = tenant();
     server.insert(TENANT, serde_json::to_value(&tenant).unwrap());
-    let successor = json!({"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha2",
+    let successor = json!({"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
         "kind":"Tenant","metadata":{"name":"tenant-a","uid":"successor",
         "resourceVersion":"2","generation":2},"spec":tenant.spec,"status":{}});
     server.respond("PATCH", &format!("{TENANT}/status"), 200, successor);
@@ -402,7 +402,7 @@ async fn finalizer_patch_is_exact_noop_aware_and_rejects_replacement_response() 
     );
     assert!(server.take_calls().is_empty());
 
-    let successor = json!({"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha2",
+    let successor = json!({"apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
         "kind":"Tenant","metadata":{"name":"tenant-a","uid":"successor",
         "resourceVersion":"3","generation":2},"spec":tenant.spec});
     server.respond("PATCH", TENANT, 200, successor);

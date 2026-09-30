@@ -106,7 +106,7 @@ pub fn project_summary(mode: ProviderMode, tenant: &Tenant) -> TenantSummary {
         requested_workers: nonnegative(tenant.spec.workers),
         requested_databases: match tenant.spec.provider {
             TenantProviderSpec::Local { databases } => Some(nonnegative(databases)),
-            TenantProviderSpec::Azure { .. } => None,
+            TenantProviderSpec::Azure => None,
         },
         endpoint,
         created_at: tenant
@@ -119,7 +119,7 @@ pub fn project_summary(mode: ProviderMode, tenant: &Tenant) -> TenantSummary {
 }
 
 fn trusted_azure_status(tenant: &Tenant) -> Option<&tenant_controller::api::AzureProviderStatus> {
-    if !matches!(tenant.spec.provider, TenantProviderSpec::Azure { .. }) {
+    if !matches!(tenant.spec.provider, TenantProviderSpec::Azure) {
         return None;
     }
     let tenant_uid = tenant
@@ -242,7 +242,7 @@ fn accepted_local<'a>(
                 foundation_hash,
             )
             || object.owner_references().iter().any(|owner| {
-                owner.kind == "Tenant" && owner.api_version == "tenancy.cnpg-vcluster.io/v1alpha2"
+                owner.kind == "Tenant" && owner.api_version == "tenancy.cnpg-vcluster.io/v1alpha3"
             })
             || (definition.kind == "Cluster"
                 && recorded_cluster_uid.is_some()
@@ -568,7 +568,7 @@ fn provider_status_matches(tenant: &Tenant) -> bool {
             .and_then(|status| status.provider.as_ref()),
     ) {
         (TenantProviderSpec::Local { .. }, Some(TenantProviderStatus::Local(_))) => true,
-        (TenantProviderSpec::Azure { .. }, Some(TenantProviderStatus::Azure(_))) => {
+        (TenantProviderSpec::Azure, Some(TenantProviderStatus::Azure(_))) => {
             trusted_azure_status(tenant).is_some()
         }
         _ => false,
@@ -578,7 +578,7 @@ fn provider_status_matches(tenant: &Tenant) -> bool {
 fn provider(specification: &TenantProviderSpec) -> TenantProvider {
     match specification {
         TenantProviderSpec::Local { .. } => TenantProvider::Local,
-        TenantProviderSpec::Azure { .. } => TenantProvider::Azure,
+        TenantProviderSpec::Azure => TenantProvider::Azure,
     }
 }
 
@@ -587,13 +587,7 @@ fn specification(tenant: &Tenant) -> TenantSpecificationView {
         TenantProviderSpec::Local { databases } => ProviderSpecificationView::Local {
             databases: nonnegative(*databases),
         },
-        TenantProviderSpec::Azure {
-            pod_cidr,
-            service_cidr,
-        } => ProviderSpecificationView::Azure {
-            pod_cidr: bounded(pod_cidr, MAX_IDENTITY),
-            service_cidr: bounded(service_cidr, MAX_IDENTITY),
-        },
+        TenantProviderSpec::Azure => ProviderSpecificationView::Azure,
     };
     TenantSpecificationView {
         kubernetes_version: bounded(&tenant.spec.kubernetes_version, MAX_IDENTITY),
@@ -604,7 +598,7 @@ fn specification(tenant: &Tenant) -> TenantSpecificationView {
 
 fn provider_status(tenant: &Tenant) -> ProviderStatusView {
     if let Some(status) = trusted_azure_status(tenant) {
-        return ProviderStatusView::Azure(azure_provider_view(tenant, status));
+        return ProviderStatusView::Azure(Box::new(azure_provider_view(tenant, status)));
     }
     match (
         &tenant.spec.provider,
@@ -640,12 +634,12 @@ fn provider_status(tenant: &Tenant) -> ProviderStatusView {
         (specification, observed) => ProviderStatusView::Unknown(UnknownProviderView {
             provider_type: match specification {
                 TenantProviderSpec::Local { .. } => "local",
-                TenantProviderSpec::Azure { .. } => "azure",
+                TenantProviderSpec::Azure => "azure",
             }
             .into(),
             summary: Some(
                 match (specification, observed) {
-                    (TenantProviderSpec::Azure { .. }, Some(TenantProviderStatus::Azure(_))) => {
+                    (TenantProviderSpec::Azure, Some(TenantProviderStatus::Azure(_))) => {
                         "provider status binding does not match current Tenant identity"
                     }
                     (_, Some(TenantProviderStatus::Local(_))) => {
@@ -803,6 +797,13 @@ fn azure_provider_view(
     });
     AzureProviderView {
         binding,
+        allocation: status.network_allocation.as_ref().map(|allocation| {
+            tenant_admin_shared::query::AzureAllocationView {
+                slot_id: bounded(&allocation.slot_id, MAX_IDENTITY),
+                pod_cidr: bounded(&allocation.pod_cidr, MAX_IDENTITY),
+                service_cidr: bounded(&allocation.service_cidr, MAX_IDENTITY),
+            }
+        }),
         endpoint: status
             .endpoint
             .as_deref()
@@ -1048,7 +1049,7 @@ fn topology(
         label: summary.name.clone(),
         health: classification_health(summary.classification),
         resource: Some(ResourceIdentityView {
-            api_version: "tenancy.cnpg-vcluster.io/v1alpha2".into(),
+            api_version: "tenancy.cnpg-vcluster.io/v1alpha3".into(),
             kind: "Tenant".into(),
             namespace: None,
             name: summary.name.clone(),
@@ -1142,7 +1143,7 @@ fn topology(
                 database,
             );
         }
-        TenantProviderSpec::Azure { .. } => {
+        TenantProviderSpec::Azure => {
             if let Some(status) = trusted_azure_status(tenant) {
                 add_azure_status_nodes(
                     tenant,
@@ -1992,10 +1993,7 @@ mod tests {
             TenantSpec {
                 kubernetes_version: "1.36.4".into(),
                 workers: 1,
-                provider: TenantProviderSpec::Azure {
-                    pod_cidr: "10.0.0.0/16".into(),
-                    service_cidr: "10.1.0.0/16".into(),
-                },
+                provider: TenantProviderSpec::Azure,
             },
         );
         tenant.metadata.uid = Some("tenant-uid".into());
@@ -2023,6 +2021,17 @@ mod tests {
                         identity_id: "/subscriptions/sub/resourceGroups/group/identity".into(),
                         operation_id: "operation".into(),
                     }),
+                    network_allocation: Some(
+                        tenant_controller::api::AzureAllocationStatus {
+                            slot_id: "azure-01".into(),
+                            pod_cidr: "10.72.0.0/16".into(),
+                            service_cidr: "10.142.0.0/16".into(),
+                            catalog_uid: "catalog-uid".into(),
+                            catalog_sha256: "catalog-sha".into(),
+                            lease_name: "tenant-azure-slot-a".into(),
+                            lease_uid: "lease-uid".into(),
+                        },
+                    ),
                     endpoint: Some("https://tenant.example".into()),
                     management: Some(AzureManagementStatus {
                         cluster_uid: Some("cluster-uid".into()),

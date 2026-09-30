@@ -493,7 +493,7 @@ pub async fn finalize(
         .ok_or_else(|| blocked("Tenant UID is missing"))?;
     let spec: CanonicalSpec = canonical_spec(&name, &tenant.spec, supported_version)
         .map_err(|error| ReconcileError::InvalidInput(error.to_string()))?;
-    if !matches!(spec.provider, TenantProviderSpec::Azure { .. }) {
+    if !matches!(spec.provider, TenantProviderSpec::Azure) {
         return Err(blocked("Azure finalizer received a non-Azure Tenant"));
     }
     let specification_sha256 = spec_hash(&spec);
@@ -504,6 +504,10 @@ pub async fn finalize(
         .as_ref()
         .and_then(|status| status.azure())
         .ok_or_else(|| blocked("Azure typed provider status is absent"))?;
+    let allocation = azure_status
+        .network_allocation
+        .as_ref()
+        .ok_or_else(|| blocked("Azure network allocation status is absent"))?;
     validate_binding(
         azure_status
             .binding
@@ -519,6 +523,7 @@ pub async fn finalize(
         foundation_sha256: &configuration.values.foundation_sha256,
         operation_id: &operation,
         configuration: &configuration.values,
+        allocation,
     };
     let desired = desired_objects(&context)
         .map_err(|error| ReconcileError::InvalidInput(error.to_string()))?;

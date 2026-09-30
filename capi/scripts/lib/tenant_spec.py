@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import hashlib
-import ipaddress
 import json
 import re
 from dataclasses import dataclass
@@ -19,8 +18,6 @@ COMMON_FIELDS = frozenset(
         "name",
         "kubernetesVersion",
         "workers",
-        "podCIDR",
-        "serviceCIDR",
     }
 )
 
@@ -62,25 +59,12 @@ def _required_count(payload: Mapping[str, object], field: str) -> int:
     return value
 
 
-def _network(payload: Mapping[str, object], field: str) -> ipaddress.IPv4Network:
-    value = _required_string(payload, field)
-    try:
-        network = ipaddress.ip_network(value, strict=True)
-    except ValueError as exc:
-        raise TenantSpecError(f"invalid tenant IPv4 network for {field}: {value}") from exc
-    if not isinstance(network, ipaddress.IPv4Network):
-        raise TenantSpecError(f"tenant network must be IPv4: {field}")
-    return network
-
-
 @dataclass(frozen=True)
 class TenantSpec:
     profile: str
     name: str
     kubernetes_version: str
     workers: int
-    pod_network: ipaddress.IPv4Network
-    service_network: ipaddress.IPv4Network
 
     @classmethod
     def from_mapping(
@@ -124,30 +108,16 @@ class TenantSpec:
                 raise TenantSpecError(
                     f"unsupported {profile} tenant Kubernetes version: {version}"
                 )
-        pod_network = _network(payload, "podCIDR")
-        service_network = _network(payload, "serviceCIDR")
-        if pod_network.overlaps(service_network):
-            raise TenantSpecError("tenant Pod and Service CIDRs overlap")
-        if service_network.num_addresses <= 11:
-            raise TenantSpecError(
-                "tenant Service CIDR is too small for the derived DNS service IP"
-            )
         return cls(
             profile=profile,
             name=name,
             kubernetes_version=version,
             workers=_required_count(payload, "workers"),
-            pod_network=pod_network,
-            service_network=service_network,
         )
 
     @property
     def namespace(self) -> str:
         return self.name
-
-    @property
-    def dns_service_ip(self) -> str:
-        return str(self.service_network.network_address + 10)
 
     @property
     def cluster_domain(self) -> str:
@@ -160,8 +130,6 @@ class TenantSpec:
             "name": self.name,
             "kubernetesVersion": self.kubernetes_version,
             "workers": self.workers,
-            "podCIDR": str(self.pod_network),
-            "serviceCIDR": str(self.service_network),
         }
         return result
 
@@ -197,14 +165,3 @@ def load_tenant_spec(
         expected_profile=expected_profile,
         supported_versions=supported_versions,
     )
-
-
-def require_non_overlapping_networks(
-    spec: TenantSpec,
-    networks: Mapping[str, ipaddress.IPv4Network],
-) -> None:
-    for label, network in networks.items():
-        if spec.pod_network.overlaps(network):
-            raise TenantSpecError(f"tenant Pod CIDR overlaps {label}")
-        if spec.service_network.overlaps(network):
-            raise TenantSpecError(f"tenant Service CIDR overlaps {label}")

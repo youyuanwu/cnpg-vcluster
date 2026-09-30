@@ -251,7 +251,7 @@ impl KubeDataSource {
     ) -> DatabaseObservation {
         let observed_at = observed_at();
         if provider == ProviderMode::Azure
-            || matches!(tenant.spec.provider, TenantProviderSpec::Azure { .. })
+            || matches!(tenant.spec.provider, TenantProviderSpec::Azure)
         {
             return not_applicable(
                 observed_at,
@@ -1454,7 +1454,7 @@ mod tests {
 
     fn local_tenant() -> Tenant {
         serde_json::from_value(json!({
-            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha2",
+            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
             "kind":"Tenant",
             "metadata":{"name":"tenant-a","uid":"tenant-uid","generation":4},
             "spec":{
@@ -1483,7 +1483,7 @@ mod tests {
 
     fn azure_tenant() -> Tenant {
         serde_json::from_value(json!({
-            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha2",
+            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
             "kind":"Tenant",
             "metadata":{"name":"tenant-a","uid":"tenant-uid","generation":4},
             "spec":{

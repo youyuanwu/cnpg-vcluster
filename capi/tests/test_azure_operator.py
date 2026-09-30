@@ -26,17 +26,13 @@ class AzureOperatorTests(AzureFixtureMixin, unittest.TestCase):
         spec = self.spec(workers=3)
         self.assertEqual(
             {
-                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
                 "kind": "Tenant",
                 "metadata": {"name": "tenant-c"},
                 "spec": {
                     "kubernetesVersion": "1.32.13",
                     "workers": 3,
-                    "provider": {
-                        "type": "azure",
-                        "podCIDR": "10.72.0.0/16",
-                        "serviceCIDR": "10.142.0.0/16",
-                    },
+                    "provider": {"type": "azure"},
                 },
             },
             tenant_document(spec),
@@ -144,14 +140,10 @@ class AzureProofTests(AzureFixtureMixin, unittest.TestCase):
                 {
                     "kubernetesVersion": "v1.36.4",
                     "workers": 3,
-                    "provider": {
-                        "type": "azure",
-                        "podCIDR": "10.244.0.0/16",
-                        "serviceCIDR": "10.96.0.0/16",
-                    },
+                    "provider": {"type": "azure"},
                 }
             ),
-            "61bf78756f6c9cc847f31de706048bae68b07b1cf8c0cd856142931854ac1885",
+            "7e036f99fc089a965b47a27d5364797bcce1eb75701585e2faee89d9815b0fac",
         )
 
     def test_capture_binds_operator_foundation_and_resource_ids(self) -> None:
@@ -162,14 +154,11 @@ class AzureProofTests(AzureFixtureMixin, unittest.TestCase):
         foundation = dict(FOUNDATION)
         foundation["controllerImage"] = CONTROLLER_IMAGE
         foundation["azureProviderConfigUid"] = "azure-provider-config-uid"
+        foundation["azureAllocationConfigUid"] = "azure-allocation-config-uid"
         specification = {
             "kubernetesVersion": "1.32.13",
             "workers": 1,
-            "provider": {
-                "type": "azure",
-                "podCIDR": "10.72.0.0/16",
-                "serviceCIDR": "10.142.0.0/16",
-            },
+            "provider": {"type": "azure"},
         }
         specification_sha256 = _specification_sha256(specification)
         operation_id = "tenant-" + hashlib.sha256(

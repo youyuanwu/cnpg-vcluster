@@ -43,6 +43,34 @@ class Client:
 
 
 class PackagingTests(unittest.TestCase):
+    def test_cutover_lock_denies_create_for_old_and_new_api_generations(self):
+        policy, binding = packaging.tenant_cutover_lock_documents()
+        self.assertEqual(policy["metadata"]["name"], packaging.TENANT_CUTOVER_POLICY)
+        rule = policy["spec"]["matchConstraints"]["resourceRules"][0]
+        self.assertEqual(rule["apiVersions"], ["v1alpha2", "v1alpha3"])
+        self.assertEqual(rule["operations"], ["CREATE"])
+        self.assertEqual(policy["spec"]["failurePolicy"], "Fail")
+        self.assertEqual(binding["spec"]["policyName"], packaging.TENANT_CUTOVER_POLICY)
+        self.assertEqual(binding["spec"]["validationActions"], ["Deny"])
+        self.assertEqual(
+            packaging.tenant_cutover_lock_cleanup_refs(),
+            (
+                f"validatingadmissionpolicybinding/{packaging.TENANT_CUTOVER_POLICY}",
+                f"validatingadmissionpolicy/{packaging.TENANT_CUTOVER_POLICY}",
+            ),
+        )
+
+    def test_cutover_preflight_requires_empty_tenant_and_provider_inventory(self):
+        packaging.require_empty_tenant_cutover({"items": []}, [])
+        with self.assertRaisesRegex(RuntimeError, "retained Tenants"):
+            packaging.require_empty_tenant_cutover({"items": [{}]}, [])
+        with self.assertRaisesRegex(RuntimeError, "provider residue"):
+            packaging.require_empty_tenant_cutover(
+                {"items": []}, ["AzureCluster/tenant-a"]
+            )
+        with self.assertRaisesRegex(RuntimeError, "inventory is invalid"):
+            packaging.require_empty_tenant_cutover({}, [])
+
     def setUp(self):
         (ROOT / ".runtime").mkdir(exist_ok=True)
         self.directory = tempfile.TemporaryDirectory(dir=ROOT / ".runtime")

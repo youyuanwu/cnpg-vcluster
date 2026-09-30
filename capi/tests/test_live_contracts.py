@@ -38,7 +38,7 @@ class LiveAPIContractsTests(unittest.TestCase):
             },
             document["spec"],
         )
-        self.assertEqual("tenancy.cnpg-vcluster.io/v1alpha2", document["apiVersion"])
+        self.assertEqual("tenancy.cnpg-vcluster.io/v1alpha3", document["apiVersion"])
         apply_tenant_document(client, document)
         self.assertIn("--validate=strict", client.kubectl.call_args.args)
         self.assertIn("--server-side", client.kubectl.call_args.args)

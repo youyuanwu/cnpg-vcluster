@@ -1168,12 +1168,8 @@ fn provider_specification_rows(specification: ProviderSpecificationView) -> AnyV
             <dd>{format!("{databases} local database{}", plural(databases))}</dd>
         }
         .into_any(),
-        ProviderSpecificationView::Azure {
-            pod_cidr,
-            service_cidr,
-        } => view! {
-            <dt>"Pod CIDR"</dt><dd>{pod_cidr}</dd>
-            <dt>"Service CIDR"</dt><dd>{service_cidr}</dd>
+        ProviderSpecificationView::Azure => view! {
+            <dt>"Provider configuration"</dt><dd>"Controller-managed Azure networking"</dd>
         }
         .into_any(),
         ProviderSpecificationView::Unknown { provider_type } => view! {
@@ -1294,7 +1290,7 @@ fn provider_panel(status: ProviderStatusView) -> AnyView {
                     }
                     .into_any()
                 }
-                ProviderStatusView::Azure(azure) => azure_provider_view(azure),
+                ProviderStatusView::Azure(azure) => azure_provider_view(*azure),
                 ProviderStatusView::Unknown(unknown) => view! {
                     <dl class="definition-list">
                         <dt>"Provider type"</dt><dd>{unknown.provider_type}</dd>
@@ -1326,6 +1322,15 @@ fn azure_provider_view(mut azure: AzureProviderView) -> AnyView {
             </dl>
         }
     });
+    let allocation = azure.allocation.map(|allocation| {
+        view! {
+            <dl class="definition-list">
+                <dt>"Slot"</dt><dd>{allocation.slot_id}</dd>
+                <dt>"Pod CIDR"</dt><dd>{allocation.pod_cidr}</dd>
+                <dt>"Service CIDR"</dt><dd>{allocation.service_cidr}</dd>
+            </dl>
+        }
+    });
     let worker_pool = azure.worker_pool.map(|pool| view! {
         <dl class="definition-list">
             <dt>"Name"</dt><dd>{pool.name}</dd>
@@ -1354,6 +1359,12 @@ fn azure_provider_view(mut azure: AzureProviderView) -> AnyView {
                 {worker_pool
                     .map(|view| view.into_any())
                     .unwrap_or_else(|| view! { <p>"Worker pool is not available yet."</p> }.into_any())}
+            </div>
+            <div>
+                <h3>"Network allocation"</h3>
+                {allocation
+                    .map(|view| view.into_any())
+                    .unwrap_or_else(|| view! { <p>"Network allocation is not available yet."</p> }.into_any())}
             </div>
             <div>
                 <h3>"Management identities"</h3>

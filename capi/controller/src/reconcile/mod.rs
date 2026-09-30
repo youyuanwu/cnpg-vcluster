@@ -149,7 +149,7 @@ impl<P: ProviderLifecycle> Reconciler<P> {
             crate::api::TenantProviderSpec::Local { .. } => {
                 (TenantProviderStatus::Local(Default::default()), "Local")
             }
-            crate::api::TenantProviderSpec::Azure { .. } => {
+            crate::api::TenantProviderSpec::Azure => {
                 (TenantProviderStatus::Azure(Default::default()), "Azure")
             }
         };

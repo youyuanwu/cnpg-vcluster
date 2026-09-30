@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use crate::{
     api::{
-        AzureBindingStatus, AzureManagementStatus, AzureProviderResourceIdentity, CanonicalSpec,
-        Tenant, TenantProviderSpec,
+        AzureAllocationStatus, AzureBindingStatus, AzureManagementStatus,
+        AzureProviderResourceIdentity, CanonicalSpec, Tenant,
     },
     resources::dns_service_ip,
 };
@@ -274,6 +274,7 @@ pub struct AzureContext<'a> {
     pub foundation_sha256: &'a str,
     pub operation_id: &'a str,
     pub configuration: &'a AzureProviderConfiguration,
+    pub allocation: &'a AzureAllocationStatus,
 }
 
 impl AzureContext<'_> {
@@ -353,13 +354,8 @@ impl AzureContext<'_> {
 }
 
 pub fn desired_objects(context: &AzureContext<'_>) -> Result<Vec<DynamicObject>, AzureBuildError> {
-    let TenantProviderSpec::Azure {
-        pod_cidr,
-        service_cidr,
-    } = &context.spec.provider
-    else {
-        return Err(AzureBuildError::Provider);
-    };
+    let pod_cidr = &context.allocation.pod_cidr;
+    let service_cidr = &context.allocation.service_cidr;
     let names = context.names();
     let namespace = names.namespace.as_str();
     let config = context.configuration;
@@ -627,8 +623,6 @@ helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AzureBuildError {
-    #[error("Azure builders require an Azure Tenant specification")]
-    Provider,
     #[error("derive Azure DNS service address: {0}")]
     Dns(String),
 }
@@ -893,12 +887,21 @@ mod tests {
             TenantSpec {
                 kubernetes_version: "1.32.13".into(),
                 workers: 3,
-                provider: TenantProviderSpec::Azure {
-                    pod_cidr: "10.72.0.0/16".into(),
-                    service_cidr: "10.142.0.0/16".into(),
-                },
+                provider: crate::api::TenantProviderSpec::Azure,
             },
         )
+    }
+
+    fn allocation() -> crate::api::AzureAllocationStatus {
+        crate::api::AzureAllocationStatus {
+            slot_id: "azure-01".into(),
+            pod_cidr: "10.72.0.0/16".into(),
+            service_cidr: "10.142.0.0/16".into(),
+            catalog_uid: "catalog-uid".into(),
+            catalog_sha256: "catalog-sha".into(),
+            lease_name: "tenant-azure-slot-a".into(),
+            lease_uid: "lease-uid".into(),
+        }
     }
 
     #[test]
@@ -962,6 +965,7 @@ mod tests {
             foundation_sha256: &config.values.foundation_sha256,
             operation_id: "operation-1",
             configuration: &config.values,
+            allocation: &allocation(),
         })
         .unwrap();
         let identities: Vec<_> = objects
@@ -1127,6 +1131,7 @@ mod tests {
             foundation_sha256: &config.values.foundation_sha256,
             operation_id: "operation-1",
             configuration: &config.values,
+            allocation: &allocation(),
         })
         .unwrap()
         .remove(2);

@@ -298,23 +298,16 @@ pub struct TenantSpecificationView {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "provider", rename_all = "lowercase")]
 pub enum ProviderSpecificationView {
-    Local {
-        databases: u32,
-    },
-    Azure {
-        pod_cidr: String,
-        service_cidr: String,
-    },
-    Unknown {
-        provider_type: String,
-    },
+    Local { databases: u32 },
+    Azure,
+    Unknown { provider_type: String },
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "provider", content = "status", rename_all = "lowercase")]
 pub enum ProviderStatusView {
     Local(LocalProviderView),
-    Azure(AzureProviderView),
+    Azure(Box<AzureProviderView>),
     Unknown(UnknownProviderView),
 }
 
@@ -339,12 +332,21 @@ pub struct LocalAllocationView {
 #[serde(rename_all = "camelCase")]
 pub struct AzureProviderView {
     pub binding: Option<AzureBindingView>,
+    pub allocation: Option<AzureAllocationView>,
     pub endpoint: Option<String>,
     pub management: Option<AzureManagementView>,
     pub worker_pool: Option<AzureWorkerPoolView>,
     pub nodes: Vec<AzureNodeView>,
     pub add_ons: Vec<ResourceIdentityView>,
     pub resources: Vec<AzureResourceView>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AzureAllocationView {
+    pub slot_id: String,
+    pub pod_cidr: String,
+    pub service_cidr: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]

@@ -378,9 +378,9 @@ def check_repository_boundaries() -> None:
     crd = (controller / "config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml").read_text(
         encoding="utf-8"
     )
-    check("name: v1alpha2" in crd and "name: v1alpha1" not in crd
+    check("name: v1alpha3" in crd and "name: v1alpha2" not in crd
           and "controller-gen.kubebuilder.io" not in crd,
-          "the authoritative Tenant CRD is not Rust v1alpha2")
+          "the authoritative Tenant CRD is not Rust v1alpha3")
     generator = (controller / "src/bin/generate.rs").read_text(encoding="utf-8")
     check('join("config")' in generator and
           '"crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml"' in generator,
@@ -672,7 +672,7 @@ def check_repository_boundaries() -> None:
     ):
         manifest = (ROOT / relative).read_text(encoding="utf-8")
         check(
-            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2" in manifest
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha3" in manifest
             and "kind: Tenant" in manifest
             and f"name: {expected_name}" in manifest
             and set(re.findall(r"^  ([a-zA-Z]+):", manifest.split("spec:\n")[1], re.MULTILINE))

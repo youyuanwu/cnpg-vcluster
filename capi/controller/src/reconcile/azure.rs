@@ -53,7 +53,7 @@ impl AzureProvider {
 
 impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
     fn supports(&self, provider: &TenantProviderSpec) -> bool {
-        matches!(provider, TenantProviderSpec::Azure { .. })
+        matches!(provider, TenantProviderSpec::Azure)
     }
 
     async fn validate_mutation(&self) -> Result<(), ReconcileError> {
@@ -94,6 +94,15 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
         if status::set_finalizer(self.client.clone(), tenant, tenant, FINALIZER, true).await? {
             return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
+        let Some(allocation) = current.and_then(|status| status.network_allocation.as_ref()) else {
+            return self
+                .waiting(
+                    tenant,
+                    "AzureAllocationReady",
+                    "Azure network allocation is pending",
+                )
+                .await;
+        };
 
         let context = AzureContext {
             tenant,
@@ -102,6 +111,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             foundation_sha256: &self.configuration.values.foundation_sha256,
             operation_id: &operation_id,
             configuration: &self.configuration.values,
+            allocation,
         };
         let desired = desired_objects(&context)
             .map_err(|error| ReconcileError::InvalidInput(error.to_string()))?;
@@ -591,7 +601,8 @@ pub(super) async fn require_current_configuration(
 }
 
 fn has_durable_state(status: &AzureProviderStatus) -> bool {
-    status.endpoint.is_some()
+    status.network_allocation.is_some()
+        || status.endpoint.is_some()
         || status.management.is_some()
         || status.kubeconfig.is_some()
         || status.vmss.is_some()
