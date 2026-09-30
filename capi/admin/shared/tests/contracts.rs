@@ -1,6 +1,11 @@
 use tenant_admin_shared::{
     ADMIN_CONTAINER_PORT, ADMIN_NAMESPACE, ADMIN_RESOURCE_NAME, ADMIN_SERVICE_PORT,
     API_SCHEMA_NAME, API_SCHEMA_VERSION, ApiEnvelope, ApiError, ApiErrorCode, ApiErrorEnvelope,
+    lifecycle::{
+        CreationCapability, TenantCreateRequest, TenantCreateResponse, TenantDeleteRequest,
+        TenantDeleteResponse, TenantDeleteState, TenantField, TenantFieldError,
+        TenantMutationIdentity,
+    },
     query::{
         ConditionStatus, DatabaseClusterIdentity, DatabaseClusterObservation, DatabaseCondition,
         DatabaseInstanceObservation, DatabaseInstanceRole, DatabaseNotApplicableReason,
@@ -12,16 +17,17 @@ use tenant_admin_shared::{
         TopologyNodeKind, UnknownProviderView,
     },
     routes::{
-        API_OVERVIEW_PATH, API_PREFIX, API_TENANT_DATABASE_QUERY_PATH, API_TENANT_PATH,
-        API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH, FRONTEND_FALLBACK_PATH, HEALTH_PATH,
-        READINESS_PATH, TENANT_ADMIN_UNSAFE_REQUEST_HEADER, TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
+        API_OVERVIEW_PATH, API_PREFIX, API_TENANT_CREATE_PATH, API_TENANT_DATABASE_QUERY_PATH,
+        API_TENANT_DELETE_PATH, API_TENANT_PATH, API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH,
+        FRONTEND_FALLBACK_PATH, HEALTH_PATH, READINESS_PATH, TENANT_ADMIN_UNSAFE_REQUEST_HEADER,
+        TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
     },
 };
 
 #[test]
 fn deployment_and_route_constants_are_exact() {
     assert_eq!(API_SCHEMA_NAME, "tenant-admin");
-    assert_eq!(API_SCHEMA_VERSION, 3);
+    assert_eq!(API_SCHEMA_VERSION, 4);
     assert_eq!(ADMIN_RESOURCE_NAME, "tenant-admin");
     assert_eq!(ADMIN_NAMESPACE, "tenant-system");
     assert_eq!(ADMIN_CONTAINER_PORT, 8080);
@@ -30,6 +36,8 @@ fn deployment_and_route_constants_are_exact() {
     assert_eq!(API_OVERVIEW_PATH, "/api/v1/overview");
     assert_eq!(API_TENANTS_PATH, "/api/v1/tenants");
     assert_eq!(API_TENANT_PATH, "/api/v1/tenants/{name}");
+    assert_eq!(API_TENANT_CREATE_PATH, API_TENANTS_PATH);
+    assert_eq!(API_TENANT_DELETE_PATH, API_TENANT_PATH);
     assert_eq!(API_TENANT_TOPOLOGY_PATH, "/api/v1/tenants/{name}/topology");
     assert_eq!(
         API_TENANT_DATABASE_QUERY_PATH,
@@ -46,11 +54,61 @@ fn deployment_and_route_constants_are_exact() {
 }
 
 #[test]
+fn lifecycle_contracts_are_versioned_provider_neutral_and_uid_bound() {
+    let create = TenantCreateRequest {
+        name: "demo".into(),
+        workers: 2,
+        databases: Some(1),
+    };
+    assert_eq!(
+        serde_json::to_string(&create).unwrap(),
+        r#"{"name":"demo","workers":2,"databases":1}"#
+    );
+    let identity = TenantMutationIdentity {
+        name: "demo".into(),
+        uid: "tenant-uid".into(),
+        generation: Some(1),
+    };
+    let created = ApiEnvelope::new(TenantCreateResponse {
+        identity: identity.clone(),
+        provider: TenantProvider::Local,
+        kubernetes_version: "1.36.4".into(),
+    });
+    let deleted = ApiEnvelope::new(TenantDeleteResponse {
+        identity,
+        state: TenantDeleteState::Accepted,
+    });
+    let request = TenantDeleteRequest {
+        uid: "tenant-uid".into(),
+        confirmation: "demo".into(),
+    };
+    assert_eq!(serde_json::to_value(created).unwrap()["schemaVersion"], 4);
+    assert_eq!(
+        serde_json::to_value(deleted).unwrap()["data"]["state"],
+        "accepted"
+    );
+    assert_eq!(
+        serde_json::to_string(&request).unwrap(),
+        r#"{"uid":"tenant-uid","confirmation":"demo"}"#
+    );
+    let error = ApiError::new(ApiErrorCode::InvalidRequest, "invalid fields", false)
+        .with_field_errors(vec![TenantFieldError {
+            field: TenantField::Workers,
+            code: "invalid-count".into(),
+            message: "Workers must be from 1 through 3.".into(),
+        }]);
+    assert_eq!(
+        serde_json::to_value(ApiErrorEnvelope::new(error)).unwrap()["error"]["fieldErrors"][0]["field"],
+        "workers"
+    );
+}
+
+#[test]
 fn envelopes_have_stable_versioned_json() {
     let success = ApiEnvelope::new(vec!["alpha", "beta"]);
     assert_eq!(
         serde_json::to_string(&success).expect("success envelope serializes"),
-        r#"{"schemaVersion":3,"data":["alpha","beta"]}"#
+        r#"{"schemaVersion":4,"data":["alpha","beta"]}"#
     );
 
     let error = ApiErrorEnvelope::new(ApiError::new(
@@ -60,7 +118,7 @@ fn envelopes_have_stable_versioned_json() {
     ));
     assert_eq!(
         serde_json::to_string(&error).expect("error envelope serializes"),
-        r#"{"schemaVersion":3,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
+        r#"{"schemaVersion":4,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
     );
 
     let decoded: ApiErrorEnvelope =
@@ -135,6 +193,7 @@ fn page_snapshots_keep_identity_and_page_data_together() {
     let overview = OverviewSnapshot {
         overview: ManagementOverview {
             provider_mode: ProviderMode::Local,
+            creation: CreationCapability::available("1.36.4"),
             tenants: TenantCounts {
                 total: 1,
                 progressing: 1,
@@ -362,7 +421,7 @@ fn database_query_contract_supports_unrestricted_multi_result_sql_without_creden
         .expect("query response serializes");
     assert_eq!(
         json,
-        r#"{"schemaVersion":3,"data":{"tenant":"demo","cluster":"capi-postgres","instance":"capi-postgres-1","database":"postgres","executedAt":"2026-09-29T22:40:00Z","durationMs":17,"truncated":false,"results":[{"columns":[],"rows":[],"affectedRows":0,"truncated":false},{"columns":["value"],"rows":[[null]],"affectedRows":1,"truncated":false}]}}"#
+        r#"{"schemaVersion":4,"data":{"tenant":"demo","cluster":"capi-postgres","instance":"capi-postgres-1","database":"postgres","executedAt":"2026-09-29T22:40:00Z","durationMs":17,"truncated":false,"results":[{"columns":[],"rows":[],"affectedRows":0,"truncated":false},{"columns":["value"],"rows":[[null]],"affectedRows":1,"truncated":false}]}}"#
     );
     for forbidden in ["password", "username", "uri", "pgpass", "kubeconfig"] {
         assert!(

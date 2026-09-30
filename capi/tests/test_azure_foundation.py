@@ -21,9 +21,19 @@ from scripts.lib.azure.common import (
 from scripts.lib.azure.foundation import (
     ACR_PULL_ROLE_DEFINITION_ID,
     CAPI_CAPZ_DEPLOYMENTS,
+    TENANT_ALLOCATION_APPROVAL,
+    TENANT_ALLOCATION_CONFIG,
+    TENANT_ALLOCATION_CONFIG_KEY,
     TENANT_CONTROLLER_CONFIG,
     TENANT_CONTROLLER_CONFIG_KEY,
     _azure_provider_configuration,
+    _azure_allocation_configuration,
+    _azure_cutover_lock,
+    _azure_cutover_inventory,
+    _validated_azure_list,
+    _prepare_azure_tenant_api_cutover,
+    _verify_azure_controller_allocation_readiness,
+    _verify_azure_cutover_probe,
     _foundation_identity,
     _inspect_admin,
     _install_capi_capz,
@@ -37,6 +47,7 @@ from scripts.lib.azure.foundation import (
     preflight,
 )
 from scripts.lib.config import ConfigError
+from scripts.lib.controller import tenant_cutover_lock_cleanup_refs
 from scripts.lib.files import write_private_file
 from scripts.lib.locking import azure_lock
 from scripts.lib.tenant_spec import TenantSpecError
@@ -51,6 +62,482 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
+    def test_azure_cutover_probe_requires_allocation_and_always_deletes(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        calls = []
+
+        def kubectl(_root, *arguments, **_kwargs):
+            calls.append(arguments)
+            if arguments[:2] == ("get", next(
+                (value for value in arguments if value.startswith("tenant/")),
+                "",
+            )):
+                return completed(json.dumps({
+                    "status": {
+                        "provider": {
+                            "networkAllocation": {"slotId": "azure-01"}
+                        }
+                    }
+                }))
+            return completed()
+
+        with (
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            patch(
+                "scripts.lib.azure.foundation.uuid.uuid4",
+                return_value=type("Uuid", (), {"hex": "1234567890abcdef"})(),
+            ),
+        ):
+            _verify_azure_cutover_probe(root, config)
+        self.assertTrue(any(arguments[0] == "create" for arguments in calls))
+        self.assertTrue(any(arguments[0] == "delete" for arguments in calls))
+
+    def test_azure_cutover_readiness_proves_ready_pod_and_leader_lease(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(
+            root, config
+        )
+
+        def kubectl(_root, *arguments, **_kwargs):
+            if any(str(value).startswith("configmap/") for value in arguments):
+                return completed(json.dumps({
+                    "metadata": {
+                        "annotations": {
+                            TENANT_ALLOCATION_APPROVAL: allocation_sha256
+                        }
+                    },
+                    "data": {TENANT_ALLOCATION_CONFIG_KEY: allocation_raw},
+                }))
+            if arguments and arguments[0] == "auth":
+                return completed("yes\n")
+            if "pods" in arguments:
+                return completed(json.dumps({"items": [{
+                    "metadata": {"name": "tenant-controller-pod"},
+                    "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+                }]}))
+            if any(str(value).startswith("lease/") for value in arguments):
+                return completed(json.dumps({
+                    "spec": {"holderIdentity": "pod", "renewTime": "now"}
+                }))
+            return completed("ok")
+
+        with patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl):
+            _verify_azure_controller_allocation_readiness(
+                root,
+                allocation_raw,
+                allocation_sha256,
+            )
+
+    def test_azure_cutover_locks_checks_residue_and_replaces_only_empty_crd(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        catalog = root / "controller" / "config"
+        catalog.mkdir(parents=True)
+        (catalog / "azure-management-resources.json").write_text(
+            (ROOT / "controller" / "config" / "azure-management-resources.json")
+            .read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+        old = {
+            "spec": {
+                "versions": [
+                    {"name": "v1alpha2", "served": True, "storage": True}
+                ]
+            },
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        calls = []
+        entries = json.loads(
+            (catalog / "azure-management-resources.json").read_text()
+        )
+        definitions = {
+            (
+                f"{entry['plural']}.{entry['apiVersion'].partition('/')[0]}"
+                if "/" in entry["apiVersion"]
+                else entry["plural"]
+            ): (entry["apiVersion"], entry["kind"])
+            for entry in entries
+        }
+        definitions["leases.coordination.k8s.io"] = (
+            "coordination.k8s.io/v1", "Lease"
+        )
+        desired = {
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "tenants.tenancy.cnpg-vcluster.io"},
+            "spec": {
+                "versions": [{
+                    "name": "v1alpha3",
+                    "served": True,
+                    "storage": True,
+                    "schema": {"openAPIV3Schema": {"type": "object"}},
+                }]
+            },
+        }
+
+        def kubectl(_root, *arguments, **_kwargs):
+            calls.append(arguments)
+            if arguments[:2] == ("create", "--dry-run=client"):
+                return completed(json.dumps(desired))
+            if arguments[:2] == ("get", "tenants"):
+                return completed(json.dumps({
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+                    "kind": "TenantList",
+                    "metadata": {"continue": ""},
+                    "items": [],
+                }))
+            if arguments and arguments[0] == "get" and "--all-namespaces" in arguments:
+                resource = arguments[1]
+                api_version, kind = definitions[resource]
+                items = []
+                if arguments[:2] == ("get", "configmaps"):
+                    items = [{
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "tenant-azure-provider",
+                            "namespace": "tenant-system",
+                            "uid": "shared-config",
+                        },
+                    }]
+                return completed(json.dumps({
+                    "apiVersion": api_version,
+                    "kind": f"{kind}List",
+                    "metadata": {"continue": ""},
+                    "items": items,
+                }))
+            return completed()
+
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=old,
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_lock") as fence,
+        ):
+            self.assertTrue(_prepare_azure_tenant_api_cutover(root, config))
+        self.assertEqual(2, fence.call_count)
+        self.assertNotIn(
+            ("delete", "crd/tenants.tenancy.cnpg-vcluster.io", "--wait=true",
+             f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}"),
+            calls,
+        )
+        self.assertTrue(any(
+            arguments[:2]
+            == ("patch", "crd/tenants.tenancy.cnpg-vcluster.io")
+            and "--subresource=status" in arguments
+            for arguments in calls
+        ))
+        self.assertIn(
+            ("-n", "tenant-system", "scale", "deployment/tenant-controller",
+             "--replicas=0"),
+            calls,
+        )
+
+    def test_partial_azure_cutover_lock_application_is_cleaned_up(self):
+        root = self.make_root()
+        calls = []
+        apply_count = 0
+
+        def kubectl(_root, *arguments, **_kwargs):
+            nonlocal apply_count
+            calls.append(arguments)
+            if arguments and arguments[0] == "apply":
+                apply_count += 1
+                if apply_count == 2:
+                    raise RuntimeError("binding rejected")
+            return completed()
+
+        with (
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            self.assertRaisesRegex(RuntimeError, "binding rejected"),
+        ):
+            _azure_cutover_lock(root, present=True)
+        self.assertTrue(
+            any(
+                arguments[:2]
+                == (
+                    "delete",
+                    "validatingadmissionpolicybinding/tenant-api-cutover-create-lock",
+                )
+                for arguments in calls
+            )
+        )
+
+    def test_azure_cutover_second_inventory_failure_restores_controller(self):
+        root = self.make_root()
+        config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        desired = {
+            "spec": {"versions": [{
+                "name": "v1alpha3", "served": True, "storage": True,
+            }]}
+        }
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=old,
+            ),
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                return_value=completed(json.dumps(desired)),
+            ),
+            patch("scripts.lib.azure.foundation._azure_cutover_lock") as lock,
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_lock_present",
+                return_value=False,
+            ),
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_lock"),
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_inventory",
+                side_effect=[
+                    ({"items": []}, []),
+                    RuntimeError("late Tenant"),
+                ],
+            ),
+            patch("scripts.lib.azure.foundation._scale_azure_controller") as scale,
+            self.assertRaisesRegex(RuntimeError, "late Tenant"),
+        ):
+            _prepare_azure_tenant_api_cutover(root, config)
+        self.assertEqual(
+            [(root, config, 0), (root, config, 1)],
+            [call.args for call in scale.call_args_list],
+        )
+        self.assertEqual(
+            [((root,), {"present": True}), ((root,), {"present": False})],
+            [(call.args, call.kwargs) for call in lock.call_args_list],
+        )
+
+    def test_azure_cutover_crd_render_failure_does_not_install_lock(self):
+        root = self.make_root()
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=old,
+            ),
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                return_value=completed("not json"),
+            ),
+            patch("scripts.lib.azure.foundation._azure_cutover_lock") as lock,
+            self.assertRaisesRegex(RuntimeError, "generated Azure Tenant CRD"),
+        ):
+            _prepare_azure_tenant_api_cutover(
+                root,
+                {"AZURE_CONTROLLER_TIMEOUT": "1s"},
+            )
+        lock.assert_not_called()
+
+    def test_azure_cutover_restore_failure_retains_lock(self):
+        root = self.make_root()
+        config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        desired = {
+            "spec": {"versions": [{
+                "name": "v1alpha3", "served": True, "storage": True,
+            }]}
+        }
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=old,
+            ),
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                return_value=completed(json.dumps(desired)),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_lock"
+            ) as lock,
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_lock_present",
+                return_value=False,
+            ),
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_lock"),
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_inventory",
+                side_effect=[
+                    ({"items": []}, []),
+                    RuntimeError("late Tenant"),
+                ],
+            ),
+            patch(
+                "scripts.lib.azure.foundation._scale_azure_controller",
+                side_effect=[None, RuntimeError("restore failed")],
+            ),
+            self.assertRaisesRegex(RuntimeError, "restore failed"),
+        ):
+            _prepare_azure_tenant_api_cutover(root, config)
+        self.assertEqual(
+            [((root,), {"present": True})],
+            [(call.args, call.kwargs) for call in lock.call_args_list],
+        )
+
+    def test_azure_cutover_preserves_adopted_lock_on_retry_failure(self):
+        root = self.make_root()
+        config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        desired = {
+            "spec": {"versions": [{
+                "name": "v1alpha3", "served": True, "storage": True,
+            }]}
+        }
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=old,
+            ),
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                return_value=completed(json.dumps(desired)),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_lock_present",
+                return_value=True,
+            ),
+            patch("scripts.lib.azure.foundation._azure_cutover_lock") as lock,
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_lock"),
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_inventory",
+                side_effect=[
+                    ({"items": []}, []),
+                    RuntimeError("late Tenant"),
+                ],
+            ),
+            patch("scripts.lib.azure.foundation._scale_azure_controller"),
+            self.assertRaisesRegex(RuntimeError, "late Tenant"),
+        ):
+            _prepare_azure_tenant_api_cutover(root, config)
+        lock.assert_not_called()
+
+    def test_azure_cutover_rerun_adopts_existing_lock_after_crd_deletion(self):
+        refs = set(tenant_cutover_lock_cleanup_refs())
+
+        def kubectl(_root, *arguments, **_kwargs):
+            if arguments and arguments[0] == "get" and arguments[1] in refs:
+                return completed(arguments[1])
+            return completed()
+
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=None,
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+        ):
+            self.assertTrue(
+                _prepare_azure_tenant_api_cutover(
+                    self.make_root(),
+                    {"AZURE_CONTROLLER_TIMEOUT": "1s"},
+                )
+            )
+
+    def test_azure_cutover_inventory_blocks_unmarked_provider_root(self):
+        root = self.make_root()
+        catalog = root / "controller" / "config"
+        catalog.mkdir(parents=True)
+        (catalog / "azure-management-resources.json").write_text(
+            (ROOT / "controller" / "config" / "azure-management-resources.json")
+            .read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        def kubectl(_root, *arguments, **_kwargs):
+            if arguments[:2] == ("get", "tenants"):
+                return completed(json.dumps({
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+                    "kind": "TenantList",
+                    "metadata": {"continue": ""},
+                    "items": [],
+                }))
+            items = []
+            resource = arguments[1]
+            entries = json.loads(
+                (catalog / "azure-management-resources.json").read_text()
+            )
+            definitions = {
+                (
+                    f"{entry['plural']}.{entry['apiVersion'].partition('/')[0]}"
+                    if "/" in entry["apiVersion"]
+                    else entry["plural"]
+                ): (entry["apiVersion"], entry["kind"])
+                for entry in entries
+            }
+            definitions["leases.coordination.k8s.io"] = (
+                "coordination.k8s.io/v1", "Lease"
+            )
+            if arguments[:2] == (
+                "get",
+                "azureclusters.infrastructure.cluster.x-k8s.io",
+            ):
+                items = [{
+                    "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta1",
+                    "kind": "AzureCluster",
+                    "metadata": {"name": "foreign", "namespace": "foreign", "uid": "uid"},
+                }]
+            elif arguments[:2] == ("get", "configmaps"):
+                items = [{
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "tenant-azure-provider",
+                        "namespace": "tenant-system",
+                        "uid": "shared-config",
+                    },
+                }]
+            api_version, kind = definitions[resource]
+            return completed(json.dumps({
+                "apiVersion": api_version,
+                "kind": f"{kind}List",
+                "metadata": {"continue": ""},
+                "items": items,
+            }))
+
+        with patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl):
+            tenants, residue = _azure_cutover_inventory(root)
+        self.assertEqual(tenants["items"], [])
+        self.assertEqual(residue, ["AzureCluster/foreign"])
+
+    def test_azure_cutover_inventory_rejects_malformed_or_paginated_lists(self):
+        valid = {
+            "apiVersion": "v1",
+            "kind": "ConfigMapList",
+            "metadata": {"continue": ""},
+            "items": [],
+        }
+        self.assertEqual([], _validated_azure_list(valid, "v1", "ConfigMap"))
+        for malformed in (
+            {**valid, "items": {}},
+            {**valid, "metadata": {"continue": "next"}},
+            {**valid, "kind": "List"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "inventory"):
+                _validated_azure_list(malformed, "v1", "ConfigMap")
+
     def test_existing_complete_capi_stack_skips_clusterctl_init(self) -> None:
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -101,10 +588,37 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             "1.32.13",
         )
         self.assertEqual(config["AZURE_CONTROLLER_REPOSITORY"], "tenant-controller")
-        self.assertEqual(config["AZURE_CONTROLLER_TAG"], "v1alpha2")
+        self.assertEqual(config["AZURE_CONTROLLER_TAG"], "v1alpha3")
         self.assertEqual(config["AZURE_ADMIN_REPOSITORY"], "tenant-admin")
         self.assertEqual(config["AZURE_ADMIN_TAG"], "v1alpha1")
+        self.assertRegex(
+            config["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"],
+            r"^[0-9a-f]{64}$",
+        )
         self.assertEqual(config["AZURE_PREFIX"].replace("-", "") + "acr", "yycvacr")
+
+    def test_allocation_catalog_requires_exact_approval_and_disjoint_ranges(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        payload, raw, digest = _azure_allocation_configuration(root, config)
+        self.assertEqual(payload["schema"], 1)
+        self.assertEqual(json.loads(raw), payload)
+        self.assertEqual(
+            digest,
+            config["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"],
+        )
+        stale = dict(config)
+        stale["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"] = "0" * 64
+        with self.assertRaisesRegex(RuntimeError, "approval"):
+            _azure_allocation_configuration(root, stale)
+        slots = payload["slots"]
+        slots[1]["podCIDR"] = "10.142.128.0/17"
+        (root / "config" / "azure" / "tenant-allocation-slots.json").write_text(
+            json.dumps(payload),
+            encoding="utf-8",
+        )
+        with self.assertRaisesRegex(RuntimeError, "overlap"):
+            _azure_allocation_configuration(root, config)
     def test_bicep_defines_exact_acr_and_kubelet_pull_outputs(self):
         foundation = (ROOT / "infra" / "azure" / "foundation.bicep").read_text()
         acr_pull = (ROOT / "infra" / "azure" / "acr-pull.bicep").read_text()
@@ -196,6 +710,15 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                             separators=(",", ":"),
                         )
                     },
+                }
+            if selected == f"configmap/{TENANT_ALLOCATION_CONFIG}":
+                _, raw, digest = _azure_allocation_configuration(root, config)
+                return {
+                    "metadata": {
+                        "uid": inventory["azureAllocationConfigUid"],
+                        "annotations": {TENANT_ALLOCATION_APPROVAL: digest},
+                    },
+                    "data": {TENANT_ALLOCATION_CONFIG_KEY: raw},
                 }
             if selected.startswith("mutatingwebhookconfiguration/"):
                 return {
@@ -336,7 +859,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ) as build,
             patch(
                 "scripts.lib.azure.foundation.run",
-                return_value=completed(f"v1alpha2: digest: {digest} size: 123\n"),
+                return_value=completed(f"v1alpha3: digest: {digest} size: 123\n"),
             ) as run_command,
             patch(
                 "scripts.lib.azure.foundation._az",
@@ -344,7 +867,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             ) as az,
         ):
             image = _push_controller_image(root, config, inventory)
-        tagged = "yycvacr.azurecr.io/tenant-controller:v1alpha2"
+        tagged = "yycvacr.azurecr.io/tenant-controller:v1alpha3"
         build.assert_called_once_with(
             root,
             {"COMMAND_TIMEOUT": "1s"},
@@ -425,7 +948,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             [
                 "docker",
                 "tag",
-                "yycvacr.azurecr.io/tenant-controller:v1alpha2",
+                "yycvacr.azurecr.io/tenant-controller:v1alpha3",
                 unique,
             ],
         )
@@ -574,6 +1097,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     root
                     / "admin/config/rbac/cluster-role-binding-azure.json"
                 ),
+                str(root / "admin/config/rbac/controller-role.json"),
+                str(root / "admin/config/rbac/controller-role-binding.json"),
                 str(root / "admin/config/service/service.json"),
                 str(rendered),
             ],
@@ -683,6 +1208,9 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         role = json.loads(
             (ROOT / "admin/config/rbac/cluster-role-azure.json").read_text()
         )
+        controller_role = json.loads(
+            (ROOT / "admin/config/rbac/controller-role.json").read_text()
+        )
         binding = json.loads(
             (
                 ROOT / "admin/config/rbac/cluster-role-binding-azure.json"
@@ -742,6 +1270,9 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 namespace: copy.deepcopy(rules_review)
                 for namespace in namespaces
             }
+            reviews["tenant-system"]["status"]["resourceRules"].extend(
+                copy.deepcopy(controller_role["rules"])
+            )
             if review_mutator is not None:
                 review_mutator(reviews[review_namespace])
             api = dict(api_overrides or {})
@@ -774,7 +1305,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                         return completed(json.dumps(payload))
                 if path.endswith("/api/v1/overview"):
                     return completed(json.dumps({
-                        "schemaVersion": 3,
+                        "schemaVersion": 4,
                         "data": {
                             "overview": {
                                 "providerMode": "azure",
@@ -785,7 +1316,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     }))
                 if path.endswith("/api/v1/tenants"):
                     return completed(
-                        json.dumps({"schemaVersion": 3, "data": []})
+                        json.dumps({"schemaVersion": 4, "data": []})
                     )
                 return completed()
 
@@ -849,7 +1380,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         }
         api_overrides = {
             "/api/v1/overview": {
-                "schemaVersion": 3,
+                "schemaVersion": 4,
                 "data": {
                     "overview": {
                         "providerMode": "azure",
@@ -859,14 +1390,14 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 },
             },
             "/api/v1/tenants": {
-                "schemaVersion": 3,
+                "schemaVersion": 4,
                 "data": [{
                     "name": "tenant-a",
                     "classification": "progressing",
                 }],
             },
             "/api/v1/tenants/tenant-a": {
-                "schemaVersion": 3,
+                "schemaVersion": 4,
                 "data": {
                     "identity": {
                         "uid": "tenant-uid",
@@ -889,7 +1420,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 },
             },
             "/api/v1/tenants/tenant-a/topology": {
-                "schemaVersion": 3,
+                "schemaVersion": 4,
                 "data": {
                     "tenantName": "tenant-a",
                     "provider": "azure",
@@ -919,7 +1450,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
 
         populated_overview = api_overrides["/api/v1/overview"]
         empty_overview = {
-            "schemaVersion": 3,
+            "schemaVersion": 4,
             "data": {
                 "overview": {
                     "providerMode": "azure",
@@ -1177,7 +1708,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             defaults = root / "config" / "azure" / "defaults.env"
             original = {
                 "AZURE_CONTROLLER_REPOSITORY": "tenant-controller",
-                "AZURE_CONTROLLER_TAG": "v1alpha2",
+                "AZURE_CONTROLLER_TAG": "v1alpha3",
                 "AZURE_ADMIN_REPOSITORY": "tenant-admin",
                 "AZURE_ADMIN_TAG": "v1alpha1",
             }[key]
@@ -1287,7 +1818,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 "scripts.lib.azure.foundation._install_tenant_controller",
                 side_effect=lambda *_: (
                     calls.append("controller")
-                    or (inventory["controllerImage"], "provider-config-uid")
+                    or (
+                        inventory["controllerImage"],
+                        "provider-config-uid",
+                        "allocation-config-uid",
+                    )
                 ),
             ),
             patch(
@@ -1344,6 +1879,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return_value=(
                     inventory["controllerImage"],
                     inventory["azureProviderConfigUid"],
+                    inventory["azureAllocationConfigUid"],
                 ),
             ),
             patch(

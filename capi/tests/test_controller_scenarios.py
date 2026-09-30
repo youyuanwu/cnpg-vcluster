@@ -312,7 +312,7 @@ class ControllerScenarioTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "custom.yaml"
             path.write_text(
-                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2\n"
+                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha3\n"
                 "kind: Tenant\n"
                 "metadata:\n"
                 "  labels:\n"
@@ -529,7 +529,7 @@ class ControllerScenarioTests(unittest.TestCase):
             root = Path(temporary)
             manifest = root / "tenant.yaml"
             manifest.write_text(
-                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2\n"
+                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha3\n"
                 "kind: Tenant\nmetadata:\n  name: tenant-a\n",
                 encoding="utf-8",
             )
@@ -613,7 +613,7 @@ class ControllerScenarioTests(unittest.TestCase):
             root = Path(temporary)
             manifest = root / "tenant.yaml"
             manifest.write_text(
-                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2\n"
+                "apiVersion: tenancy.cnpg-vcluster.io/v1alpha3\n"
                 "kind: Tenant\nmetadata:\n  name: tenant-a\n",
                 encoding="utf-8",
             )

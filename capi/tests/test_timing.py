@@ -73,7 +73,7 @@ class TimingTests(unittest.TestCase):
         spec = root / "config" / "tenants" / "examples" / "local.yaml"
         spec.parent.mkdir(parents=True)
         spec.write_text(
-            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2\n"
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha3\n"
             "kind: Tenant\nmetadata:\n  name: tenant-example\n",
             encoding="utf-8",
         )
@@ -84,20 +84,20 @@ class TimingTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = self._root(temporary)
 
-            def run_just(*args, **_kwargs):
-                if "local-tenant-apply" in args:
-                    raise RuntimeError("injected tenant setup failure")
-
             with (
                 patch("scripts.test_e2e.ROOT", root),
                 patch("scripts.test_e2e.load_configuration", return_value={}),
                 patch("scripts.test_e2e.read_inotify", return_value=1),
-                patch("scripts.test_e2e.run_just", side_effect=run_just),
+                patch("scripts.test_e2e.run_just"),
                 patch("scripts.test_e2e.verify_all_inputs"),
                 patch("scripts.test_e2e.verify_no_lab_residue"),
                 patch("scripts.test_e2e.wait_tenant_ready"),
                 patch("scripts.test_e2e.ManagementClient", return_value=object()),
                 patch("scripts.test_e2e.verify_admin_api"),
+                patch(
+                    "scripts.test_e2e.create_tenant_via_admin",
+                    side_effect=RuntimeError("injected tenant setup failure"),
+                ),
                 redirect_stdout(output),
             ):
                 with self.assertRaisesRegex(RuntimeError, "tenant setup failure"):
@@ -117,8 +117,6 @@ class TimingTests(unittest.TestCase):
 
             def run_just_failure(*args, **_kwargs):
                 nonlocal calls
-                if "local-tenant-apply" in args:
-                    raise RuntimeError("injected primary failure")
                 if args[-1] == "destroy":
                     calls += 1
                     if calls == 2:
@@ -136,6 +134,10 @@ class TimingTests(unittest.TestCase):
                 patch("scripts.test_e2e.wait_tenant_ready"),
                 patch("scripts.test_e2e.ManagementClient", return_value=object()),
                 patch("scripts.test_e2e.verify_admin_api"),
+                patch(
+                    "scripts.test_e2e.create_tenant_via_admin",
+                    side_effect=RuntimeError("injected primary failure"),
+                ),
             ):
                 with self.assertRaisesRegex(
                     RuntimeError,
@@ -316,13 +318,20 @@ class TimingTests(unittest.TestCase):
                 patch("scripts.test_e2e.wait_tenant_ready", return_value=document),
                 patch("scripts.test_e2e.tenant_from_document", return_value=tenant),
                 patch("scripts.test_e2e.ManagementClient", return_value=client),
+                patch.multiple(
+                    "scripts.test_e2e",
+                    create_tenant_via_admin=Mock(
+                        side_effect=lambda *_args, **_kwargs: calls.append("admin-create")
+                    ),
+                    delete_tenant_via_admin=Mock(side_effect=delete_tenant),
+                    wait_tenant_absent=Mock(),
+                ),
                 patch("scripts.test_e2e.export_tenant_kubeconfig") as export,
                 patch("scripts.test_e2e._sql", side_effect=sql),
                 patch("scripts.test_e2e.verify_restart_persistence", side_effect=lambda *_: calls.append("persistence")),
                 patch("scripts.test_e2e.capture_tenant_deletion_identity", side_effect=capture),
                 patch("scripts.test_e2e.verify_tenant_deletion", side_effect=verify),
                 patch("scripts.test_e2e.run", return_value=CompletedProcess([], 0, stdout="", stderr="")),
-                patch("scripts.test_e2e.delete_controller_tenant", side_effect=delete_tenant),
                 patch(
                     "scripts.test_e2e.verify_admin_api",
                     side_effect=lambda *_args, **kwargs: calls.append(
@@ -347,7 +356,7 @@ class TimingTests(unittest.TestCase):
         }
         self.assertEqual("passed", timings["management_teardown_host_restoration"])
         if sql_result == "1":
-            delete.assert_called_once_with(root, {}, "tenant-example")
+            delete.assert_called_once_with(client, "tenant-example", "tenant-uid")
             expected = ["sql", "persistence", "identity", "finalization"]
             if not deletion_failure:
                 expected.append("verify-absence")

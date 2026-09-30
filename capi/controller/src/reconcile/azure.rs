@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
+    allocation::AllocationError,
     api::{
         AzureBindingStatus, AzureKubeconfigStatus, AzureManagementStatus, AzureNodeIdentity,
         AzureProviderResourceIdentity, AzureProviderStatus, AzureVmssStatus, CanonicalSpec, Tenant,
@@ -20,6 +21,7 @@ use crate::{
         self, ANNOTATION_FOUNDATION, ANNOTATION_OPERATION, ANNOTATION_PROFILE, ANNOTATION_SPEC,
         AzureConfiguration, AzureContext, AzureOwnershipError, TENANT_ANNOTATION, desired_objects,
     },
+    azure_allocation::{self, AzureAllocationCatalog, AzureClaimIdentity},
     error::ControllerError,
     management::{self, ResourceClass},
     readiness::{self, set_condition},
@@ -37,15 +39,24 @@ pub use crate::azure::CONFIG_NAME;
 pub struct AzureProvider<A = LiveTenantAccess> {
     pub client: Client,
     pub configuration: AzureConfiguration,
+    pub allocation: Option<AzureAllocationCatalog>,
     pub access: A,
 }
+#[rustfmt::skip]
+enum AllocationStep { Ready(crate::api::AzureAllocationStatus), Stored, Exhausted }
 
 impl AzureProvider {
-    pub fn from_config_map(client: Client, config: &ConfigMap) -> Result<Self, ControllerError> {
+    pub fn from_config_maps(
+        client: Client,
+        config: &ConfigMap,
+        allocation: Option<&ConfigMap>,
+    ) -> Result<Self, ControllerError> {
         Ok(Self {
             client,
             configuration: AzureConfiguration::from_config_map(config)
                 .map_err(|error| ControllerError::Configuration(error.to_string()))?,
+            allocation: allocation
+                .and_then(|config| AzureAllocationCatalog::from_config_map(config).ok()),
             access: LiveTenantAccess,
         })
     }
@@ -53,7 +64,7 @@ impl AzureProvider {
 
 impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
     fn supports(&self, provider: &TenantProviderSpec) -> bool {
-        matches!(provider, TenantProviderSpec::Azure { .. })
+        matches!(provider, TenantProviderSpec::Azure)
     }
 
     async fn validate_mutation(&self) -> Result<(), ReconcileError> {
@@ -94,6 +105,33 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
         if status::set_finalizer(self.client.clone(), tenant, tenant, FINALIZER, true).await? {
             return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
+        let identity = AzureClaimIdentity {
+            tenant_name: &name,
+            tenant_uid: &tenant_uid,
+            spec_hash: &specification_sha256,
+        };
+        let allocation = match self
+            .ensure_allocation(
+                tenant,
+                &binding,
+                identity,
+                current.and_then(|status| status.network_allocation.as_ref()),
+            )
+            .await?
+        {
+            AllocationStep::Ready(allocation) => allocation,
+            AllocationStep::Stored => return self.progress(tenant, PROGRESS_INTERVAL).await,
+            AllocationStep::Exhausted => {
+                return self
+                    .waiting(
+                        tenant,
+                        "AzureAllocationReady",
+                        "Azure network allocation slots are exhausted",
+                    )
+                    .await;
+            }
+        };
+        let mutations_allowed = self.require_current_allocation().await.is_ok();
 
         let context = AzureContext {
             tenant,
@@ -102,13 +140,14 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             foundation_sha256: &self.configuration.values.foundation_sha256,
             operation_id: &operation_id,
             configuration: &self.configuration.values,
+            allocation: &allocation,
         };
         let desired = desired_objects(&context)
             .map_err(|error| ReconcileError::InvalidInput(error.to_string()))?;
         let mut live = Vec::new();
         for object in &desired[..8] {
             if self
-                .write_barrier(tenant, &binding, object, &mut live)
+                .write_barrier(tenant, &binding, object, &mut live, mutations_allowed)
                 .await?
             {
                 return self.progress(tenant, PROGRESS_INTERVAL).await;
@@ -163,7 +202,15 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
                 .await;
         }
         self.validate_mutation().await?;
-        if patch_cluster_bridge(self.client.clone(), &cluster, &azure_cluster, &endpoint).await? {
+        if patch_cluster_bridge(
+            self.client.clone(),
+            &cluster,
+            &azure_cluster,
+            &endpoint,
+            self.require_current_allocation().await.is_ok(),
+        )
+        .await?
+        {
             return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
         self.record_endpoint(tenant, &binding, &endpoint).await?;
@@ -185,7 +232,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
 
         for object in &desired[8..11] {
             if self
-                .write_barrier(tenant, &binding, object, &mut live)
+                .write_barrier(tenant, &binding, object, &mut live, mutations_allowed)
                 .await?
             {
                 return self.progress(tenant, PROGRESS_INTERVAL).await;
@@ -202,7 +249,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
                 .await;
         }
         if self
-            .write_barrier(tenant, &binding, &desired[11], &mut live)
+            .write_barrier(tenant, &binding, &desired[11], &mut live, mutations_allowed)
             .await?
         {
             return self.progress(tenant, PROGRESS_INTERVAL).await;
@@ -348,41 +395,60 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
 }
 
 impl<A: TenantAccess> AzureProvider<A> {
-    async fn progress(
-        &self,
-        tenant: &Tenant,
-        interval: std::time::Duration,
-    ) -> Result<Action, ReconcileError> {
+    #[rustfmt::skip]
+    async fn ensure_allocation(&self, tenant: &Tenant, binding: &AzureBindingStatus,
+        identity: AzureClaimIdentity<'_>, recorded: Option<&crate::api::AzureAllocationStatus>)
+        -> Result<AllocationStep, ReconcileError> {
+        if let Some(recorded) = recorded {
+            azure_allocation::validate_recorded(self.client.clone(), identity, recorded).await.map_err(allocation_error)?;
+            return Ok(AllocationStep::Ready(recorded.clone()));
+        }
+        self.require_current_allocation().await?;
+        let allocation = match azure_allocation::recover(self.client.clone(), identity).await.map_err(allocation_error)? {
+            Some(allocation) => allocation,
+            None => match azure_allocation::claim(self.client.clone(),
+                self.allocation.as_ref().ok_or_else(|| catalog_block("new allocations"))?, identity).await {
+                Ok(allocation) => allocation, Err(AllocationError::Exhausted) => return Ok(AllocationStep::Exhausted),
+                Err(error) => return Err(allocation_error(error)),
+            },
+        };
+        self.update(tenant, |status| {
+            validate_status_binding(status, binding)?;
+            if status.network_allocation.as_ref().is_some_and(|value| value != &allocation) {
+                return Err(ControllerError::OwnershipInvalid("Azure network allocation identity changed".into()));
+            }
+            status.network_allocation = Some(allocation.clone()); Ok(())
+        }).await?;
+        Ok(AllocationStep::Stored)
+    }
+
+    #[rustfmt::skip]
+    async fn progress(&self, tenant: &Tenant, interval: std::time::Duration) -> Result<Action, ReconcileError> {
         self.validate_mutation().await?;
         status::update_status(self.client.clone(), tenant, |status| {
-            readiness::progress_status(status, tenant);
-            Ok(())
-        })
-        .await?;
+            readiness::progress_status(status, tenant); Ok(())
+        }).await?;
         Ok(Action::requeue(interval))
     }
 
-    async fn update(
-        &self,
-        tenant: &Tenant,
-        mutate: impl Fn(&mut AzureProviderStatus) -> Result<(), ControllerError>,
-    ) -> Result<(), ReconcileError> {
+    #[rustfmt::skip]
+    async fn update(&self, tenant: &Tenant,
+        mutate: impl Fn(&mut AzureProviderStatus) -> Result<(), ControllerError>) -> Result<(), ReconcileError> {
         self.validate_mutation().await?;
         status::update_status(self.client.clone(), tenant, |status| {
-            mutate(status.azure_mut()?)?;
-            readiness::progress_status(status, tenant);
-            Ok(())
-        })
-        .await?;
+            mutate(status.azure_mut()?)?; readiness::progress_status(status, tenant); Ok(())
+        }).await?;
         Ok(())
     }
 
+    #[rustfmt::skip]
     async fn write_barrier(
         &self,
         tenant: &Tenant,
         binding: &AzureBindingStatus,
         desired: &DynamicObject,
         live: &mut Vec<DynamicObject>,
+        mutations_allowed: bool,
     ) -> Result<bool, ReconcileError> {
         let name = tenant.name_any();
         let kind = desired
@@ -400,8 +466,11 @@ impl<A: TenantAccess> AzureProvider<A> {
             .unwrap_or_default();
         let recorded = management.uid_for(kind, &object_name, &name);
         self.validate_mutation().await?;
-        let mut ensured =
-            objects::read_or_create(self.client.clone(), desired, None, recorded.is_some()).await?;
+        let mut ensured = if mutations_allowed {
+            self.require_current_allocation().await?; objects::read_or_create(self.client.clone(), desired, None, recorded.is_some()).await?
+        } else {
+            let object = objects::object_api(self.client.clone(), desired)?.get_opt(&object_name).await?.ok_or_else(|| catalog_block("provider writes"))?; objects::Ensured { object, created: false }
+        };
         if !ensured.created {
             azure::validate_live_identity(desired, &ensured.object, recorded)
                 .map_err(azure_ownership)?;
@@ -410,9 +479,9 @@ impl<A: TenantAccess> AzureProvider<A> {
                 if !matches!(error, AzureOwnershipError::Desired(_)) {
                     return Err(azure_ownership(error));
                 }
-                self.validate_mutation().await?;
-                ensured.object =
-                    objects::apply_exact(self.client.clone(), desired, &ensured.object).await?;
+                if !mutations_allowed { return Err(catalog_block("provider repair")); }
+                self.validate_mutation().await?; self.require_current_allocation().await?;
+                ensured.object = objects::apply_exact(self.client.clone(), desired, &ensured.object).await?;
                 azure::validate_live_object(desired, &ensured.object, recorded)
                     .map_err(azure_ownership)?;
                 validate_parent(&ensured.object, &management, &name)?;
@@ -424,7 +493,8 @@ impl<A: TenantAccess> AzureProvider<A> {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| ownership("Azure management object UID is missing"))?;
         if recorded.is_none() {
-            let kind = kind.to_owned();
+            if !mutations_allowed { return Err(catalog_block("provider identity writes")); }
+            self.require_current_allocation().await?; let kind = kind.to_owned();
             let object_name = object_name.clone();
             self.update(tenant, |status| {
                 validate_status_binding(status, binding)?;
@@ -434,6 +504,7 @@ impl<A: TenantAccess> AzureProvider<A> {
             .await?;
             return Ok(true);
         }
+
         live.retain(|object| {
             object.types != ensured.object.types
                 || object.metadata.name != ensured.object.metadata.name
@@ -442,16 +513,21 @@ impl<A: TenantAccess> AzureProvider<A> {
         Ok(false)
     }
 
-    async fn record_endpoint(
-        &self,
-        tenant: &Tenant,
-        binding: &AzureBindingStatus,
-        endpoint: &str,
-    ) -> Result<(), ReconcileError> {
-        let recorded = tenant
-            .status
-            .as_ref()
-            .and_then(|status| status.azure())
+    #[rustfmt::skip]
+    async fn require_current_allocation(&self) -> Result<(), ReconcileError> {
+        let live = Api::<ConfigMap>::namespaced(self.client.clone(), FOUNDATION_NAMESPACE)
+            .get(azure_allocation::CONFIG_NAME).await.map_err(|error| catalog_invalid(
+                format!("cannot read {FOUNDATION_NAMESPACE}/{}: {error}", azure_allocation::CONFIG_NAME)))?;
+        let actual = AzureAllocationCatalog::from_config_map(&live).map_err(|error| catalog_invalid(
+            format!("{FOUNDATION_NAMESPACE}/{} is invalid: {error}", azure_allocation::CONFIG_NAME)))?;
+        if self.allocation.as_ref() != Some(&actual) { return Err(catalog_invalid(format!("{FOUNDATION_NAMESPACE}/{} differs from the startup configuration", azure_allocation::CONFIG_NAME))); }
+        Ok(())
+    }
+
+    #[rustfmt::skip]
+    async fn record_endpoint(&self, tenant: &Tenant, binding: &AzureBindingStatus,
+        endpoint: &str) -> Result<(), ReconcileError> {
+        let recorded = tenant.status.as_ref().and_then(|status| status.azure())
             .and_then(|status| status.endpoint.as_deref());
         if recorded.is_some_and(|value| value != endpoint) {
             return Err(ownership("Azure endpoint identity changed"));
@@ -459,70 +535,40 @@ impl<A: TenantAccess> AzureProvider<A> {
         if recorded.is_none() {
             self.update(tenant, |status| {
                 validate_status_binding(status, binding)?;
-                if status
-                    .endpoint
-                    .as_deref()
-                    .is_some_and(|value| value != endpoint)
-                {
-                    return Err(ControllerError::OwnershipInvalid(
-                        "Azure endpoint identity changed".into(),
-                    ));
+                if status.endpoint.as_deref().is_some_and(|value| value != endpoint) {
+                    return Err(ControllerError::OwnershipInvalid("Azure endpoint identity changed".into()));
                 }
-                status.endpoint = Some(endpoint.into());
-                Ok(())
-            })
-            .await?;
+                status.endpoint = Some(endpoint.into()); Ok(())
+            }).await?;
         }
         Ok(())
     }
 
-    async fn record_kubeconfig(
-        &self,
-        tenant: &Tenant,
-        binding: &AzureBindingStatus,
-        cluster: &DynamicObject,
-        control_plane: &DynamicObject,
-    ) -> Result<bool, ReconcileError> {
+    #[rustfmt::skip]
+    async fn record_kubeconfig(&self, tenant: &Tenant, binding: &AzureBindingStatus,
+        cluster: &DynamicObject, control_plane: &DynamicObject) -> Result<bool, ReconcileError> {
         let name = tenant.name_any();
         let secret = Api::<Secret>::namespaced(self.client.clone(), &name)
-            .get_opt(&format!("{name}-kubeconfig"))
-            .await?
+            .get_opt(&format!("{name}-kubeconfig")).await?
             .ok_or_else(|| ReconcileError::Pending("tenant kubeconfig Secret is absent".into()))?;
-        let uid = secret
-            .uid()
-            .filter(|value| !value.is_empty())
+        let uid = secret.uid().filter(|value| !value.is_empty())
             .ok_or_else(|| ownership("tenant kubeconfig Secret UID is missing"))?;
-        let owners: Vec<_> = secret
-            .owner_references()
-            .iter()
-            .filter(|owner| owner.controller == Some(true))
-            .collect();
+        let owners: Vec<_> = secret.owner_references().iter().filter(|owner| owner.controller == Some(true)).collect();
         if owners.len() != 1
             || ![cluster, control_plane].iter().any(|object| {
                 owners[0].uid == object.uid().unwrap_or_default()
                     && owners[0].name == object.name_any()
-                    && object.types.as_ref().is_some_and(|types| {
-                        owners[0].api_version == types.api_version && owners[0].kind == types.kind
-                    })
+                    && object.types.as_ref().is_some_and(|types| owners[0].api_version == types.api_version && owners[0].kind == types.kind)
             })
             || secret.type_.as_deref() != Some("cluster.x-k8s.io/secret")
         {
             return Err(ownership("tenant kubeconfig Secret ownership is invalid"));
         }
-        let content = secret
-            .data
-            .as_ref()
-            .and_then(|data| data.get("value"))
+        let content = secret.data.as_ref().and_then(|data| data.get("value"))
             .filter(|value| !value.0.is_empty())
             .ok_or_else(|| ownership("tenant kubeconfig Secret content is incomplete"))?;
-        let observed = AzureKubeconfigStatus {
-            secret_uid: uid,
-            content_sha256: hex::encode(Sha256::digest(&content.0)),
-        };
-        let recorded = tenant
-            .status
-            .as_ref()
-            .and_then(|status| status.azure())
+        let observed = AzureKubeconfigStatus { secret_uid: uid, content_sha256: hex::encode(Sha256::digest(&content.0)) };
+        let recorded = tenant.status.as_ref().and_then(|status| status.azure())
             .and_then(|status| status.kubeconfig.as_ref());
         if recorded.is_some_and(|value| value != &observed) {
             return Err(ownership("tenant kubeconfig Secret identity changed"));
@@ -530,57 +576,34 @@ impl<A: TenantAccess> AzureProvider<A> {
         if recorded.is_none() {
             self.update(tenant, |status| {
                 validate_status_binding(status, binding)?;
-                if status
-                    .kubeconfig
-                    .as_ref()
-                    .is_some_and(|value| value != &observed)
-                {
-                    return Err(ControllerError::OwnershipInvalid(
-                        "tenant kubeconfig Secret identity changed".into(),
-                    ));
+                if status.kubeconfig.as_ref().is_some_and(|value| value != &observed) {
+                    return Err(ControllerError::OwnershipInvalid("tenant kubeconfig Secret identity changed".into()));
                 }
-                status.kubeconfig = Some(observed.clone());
-                Ok(())
-            })
-            .await?;
+                status.kubeconfig = Some(observed.clone()); Ok(())
+            }).await?;
             return Ok(true);
         }
         Ok(false)
     }
 
-    async fn waiting(
-        &self,
-        tenant: &Tenant,
-        condition: &str,
-        message: &str,
-    ) -> Result<Action, ReconcileError> {
+    #[rustfmt::skip]
+    async fn waiting(&self, tenant: &Tenant, condition: &str, message: &str) -> Result<Action, ReconcileError> {
         self.validate_mutation().await?;
         status::update_status(self.client.clone(), tenant, |status| {
             readiness::progress_status(status, tenant);
-            set_condition(status, tenant, condition, false, "NotReady", message);
-            Ok(())
-        })
-        .await?;
+            set_condition(status, tenant, condition, false, "NotReady", message); Ok(())
+        }).await?;
         Ok(Action::requeue(DEPENDENCY_INTERVAL))
     }
 }
 
-pub(super) async fn require_current_configuration(
-    client: Client,
-    expected: &AzureConfiguration,
-) -> Result<(), ReconcileError> {
+#[rustfmt::skip]
+pub(super) async fn require_current_configuration(client: Client, expected: &AzureConfiguration) -> Result<(), ReconcileError> {
     let live = Api::<ConfigMap>::namespaced(client, FOUNDATION_NAMESPACE)
-        .get(CONFIG_NAME)
-        .await
-        .map_err(|error| {
-            ReconcileError::MutationGuard(format!(
-                "cannot read {FOUNDATION_NAMESPACE}/{CONFIG_NAME}: {error}"
-            ))
-        })?;
+        .get(CONFIG_NAME).await.map_err(|error| ReconcileError::MutationGuard(
+            format!("cannot read {FOUNDATION_NAMESPACE}/{CONFIG_NAME}: {error}")))?;
     let actual = AzureConfiguration::from_config_map(&live).map_err(|error| {
-        ReconcileError::MutationGuard(format!(
-            "{FOUNDATION_NAMESPACE}/{CONFIG_NAME} is invalid: {error}"
-        ))
+        ReconcileError::MutationGuard(format!("{FOUNDATION_NAMESPACE}/{CONFIG_NAME} is invalid: {error}"))
     })?;
     if &actual != expected {
         return Err(ReconcileError::MutationGuard(format!(
@@ -591,7 +614,8 @@ pub(super) async fn require_current_configuration(
 }
 
 fn has_durable_state(status: &AzureProviderStatus) -> bool {
-    status.endpoint.is_some()
+    status.network_allocation.is_some()
+        || status.endpoint.is_some()
         || status.management.is_some()
         || status.kubeconfig.is_some()
         || status.vmss.is_some()
@@ -614,9 +638,23 @@ fn ownership(message: impl Into<String>) -> ReconcileError {
     ReconcileError::OwnershipInvalid(message.into())
 }
 
+#[rustfmt::skip]
+fn catalog_block(action: &str) -> ReconcileError { catalog_invalid(format!("Azure allocation catalog is invalid; {action} are blocked")) }
+
+#[rustfmt::skip]
+fn catalog_invalid(message: String) -> ReconcileError { ReconcileError::Degraded { reason: "AzureAllocationInvalid", message } }
+
 fn azure_ownership(error: AzureOwnershipError) -> ReconcileError {
     match error {
         AzureOwnershipError::Deleting => ReconcileError::Pending(error.to_string()),
+        _ => ownership(error.to_string()),
+    }
+}
+
+fn allocation_error(error: AllocationError) -> ReconcileError {
+    match error {
+        AllocationError::Api(error) => error.into(),
+        AllocationError::Exhausted => ReconcileError::Pending(error.to_string()),
         _ => ownership(error.to_string()),
     }
 }
@@ -793,6 +831,7 @@ async fn patch_cluster_bridge(
     cluster: &DynamicObject,
     azure_cluster: &DynamicObject,
     endpoint: &str,
+    mutations_allowed: bool,
 ) -> Result<bool, ReconcileError> {
     let (host, port) = endpoint
         .rsplit_once(':')
@@ -820,6 +859,9 @@ async fn patch_cluster_bridge(
             .and_then(Value::as_u64)
             != Some(u64::from(port))
     {
+        if !mutations_allowed {
+            return Err(catalog_block("endpoint repair"));
+        }
         let updated = api
             .patch(
                 &cluster.name_any(),
@@ -839,6 +881,9 @@ async fn patch_cluster_bridge(
         .and_then(Value::as_bool)
         == Some(true);
     if !infrastructure_ready && readiness::object_ready(azure_cluster) {
+        if !mutations_allowed {
+            return Err(catalog_block("status repair"));
+        }
         let updated = api
             .patch_status(
                 &cluster.name_any(),

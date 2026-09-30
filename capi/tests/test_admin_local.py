@@ -1,16 +1,19 @@
 from __future__ import annotations
 
 import copy
+import http.server
 import json
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from subprocess import CompletedProcess
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts import admin as admin_cli
 from scripts import destroy as destroy_script
 from scripts.lib import admin_local
+from scripts.lib.kube import ManagementClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -71,6 +74,11 @@ class FakeClient:
                 encoding="utf-8"
             )
         )
+        self.controller_role = json.loads(
+            (ROOT / "admin/config/rbac/controller-role.json").read_text(
+                encoding="utf-8"
+            )
+        )
         self.binding = json.loads(
             (
                 ROOT / "admin/config/rbac/cluster-role-binding-local.json"
@@ -122,6 +130,9 @@ class FakeClient:
             namespace: copy.deepcopy(self.rules_review)
             for namespace in self.namespaces
         }
+        self.rules_reviews["tenant-system"]["status"]["resourceRules"].extend(
+            copy.deepcopy(self.controller_role["rules"])
+        )
         self.tenant_names = tenant_names
         self.failed_proxy_paths: set[str] = set()
         self.delete_on_proxy_failure: set[str] = set()
@@ -263,10 +274,15 @@ class FakeClient:
         if path.endswith("/api/v1/overview"):
             return json.dumps(
                 {
-                    "schemaVersion": 3,
+                    "schemaVersion": 4,
                     "data": {
                         "overview": {
                             "providerMode": "local",
+                            "creation": {
+                                "available": True,
+                                "supportedKubernetesVersion": "1.36.4",
+                                "reason": None,
+                            },
                             "tenants": {
                                 "total": len(self.tenant_names),
                                 "ready": len(self.tenant_names),
@@ -286,7 +302,7 @@ class FakeClient:
         if path.endswith("/api/v1/tenants"):
             return json.dumps(
                 {
-                    "schemaVersion": 3,
+                    "schemaVersion": 4,
                     "data": [
                         tenant_summary(name) for name in self.tenant_names
                     ],
@@ -296,14 +312,14 @@ class FakeClient:
             if path.endswith(f"/api/v1/tenants/{name}/topology"):
                 return json.dumps(
                     {
-                        "schemaVersion": 3,
+                        "schemaVersion": 4,
                         "data": topology(name),
                     }
                 )
             if path.endswith(f"/api/v1/tenants/{name}"):
                 return json.dumps(
                     {
-                        "schemaVersion": 3,
+                        "schemaVersion": 4,
                         "data": {
                             "identity": {
                                 "uid": f"{name}-uid",
@@ -344,9 +360,24 @@ class FakeClient:
             return response(self._proxy_response(path))
         if arguments[:2] == ("create", "--raw"):
             request = json.loads(kwargs["input_text"])
+            if arguments[2].endswith("/api/v1/tenants"):
+                name = request["name"]
+                self.tenant_names = tuple(sorted((*self.tenant_names, name)))
+                return response(json.dumps({
+                    "schemaVersion": 4,
+                    "data": {
+                        "identity": {
+                            "name": name,
+                            "uid": f"{name}-uid",
+                            "generation": 1,
+                        },
+                        "provider": "local",
+                        "kubernetesVersion": "1.36.4",
+                    },
+                }))
             tenant_name = arguments[2].split("/tenants/", 1)[1].split("/", 1)[0]
             return response(json.dumps({
-                "schemaVersion": 3,
+                "schemaVersion": 4,
                 "data": {
                     "tenant": tenant_name,
                     "cluster": "capi-postgres",
@@ -363,14 +394,179 @@ class FakeClient:
                     }],
                 },
             }))
+        if arguments[:2] == ("delete", "--raw"):
+            request = json.loads(kwargs["input_text"])
+            name = arguments[2].rsplit("/", 1)[-1]
+            self.tenant_names = tuple(
+                tenant for tenant in self.tenant_names if tenant != name
+            )
+            return response(json.dumps({
+                "schemaVersion": 4,
+                "data": {
+                    "identity": {
+                        "name": name,
+                        "uid": request["uid"],
+                        "generation": 1,
+                    },
+                    "state": "accepted",
+                },
+            }))
         if arguments[0] == "create" and "-f" in arguments:
             request = json.loads(kwargs["input_text"])
             namespace = request["spec"]["namespace"]
             return response(json.dumps(self.rules_reviews[namespace]))
         return response()
 
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object],
+    ):
+        self.calls.append(
+            ("raw-json", method, path, json.dumps(payload, sort_keys=True))
+        )
+        if method == "POST" and path.endswith("/api/v1/tenants"):
+            name = payload["name"]
+            self.tenant_names = tuple(sorted((*self.tenant_names, name)))
+            return response(json.dumps({
+                "schemaVersion": 4,
+                "data": {
+                    "identity": {
+                        "name": name,
+                        "uid": f"{name}-uid",
+                        "generation": 1,
+                    },
+                    "provider": "local",
+                    "kubernetesVersion": "1.36.4",
+                },
+            }))
+        if method == "DELETE":
+            name = path.rsplit("/", 1)[-1]
+            self.tenant_names = tuple(
+                tenant for tenant in self.tenant_names if tenant != name
+            )
+            return response(json.dumps({
+                "schemaVersion": 4,
+                "data": {
+                    "identity": {
+                        "name": name,
+                        "uid": payload["uid"],
+                        "generation": 1,
+                    },
+                    "state": "accepted",
+                },
+            }))
+        tenant_name = path.split("/tenants/", 1)[1].split("/", 1)[0]
+        return response(json.dumps({
+            "schemaVersion": 4,
+            "data": {
+                "tenant": tenant_name,
+                "cluster": "capi-postgres",
+                "instance": payload["instance"],
+                "database": payload["database"],
+                "executedAt": "2026-09-29T22:40:00Z",
+                "durationMs": 7,
+                "truncated": False,
+                "results": [{
+                    "columns": ["value"],
+                    "rows": [["1"]],
+                    "affectedRows": 1,
+                    "truncated": False,
+                }],
+            },
+        }))
+
 
 class AdminLocalTests(unittest.TestCase):
+    def test_management_json_request_sends_post_and_delete_bodies(self):
+        received = []
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def handle_request(self):
+                size = int(self.headers.get("content-length", "0"))
+                received.append((
+                    self.command,
+                    self.path,
+                    self.headers.get("Authorization"),
+                    self.headers.get("Content-Type"),
+                    json.loads(self.rfile.read(size)),
+                ))
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"ok":true}')
+
+            do_POST = handle_request
+            do_DELETE = handle_request
+
+            def log_message(self, *_args):
+                pass
+
+        server = http.server.HTTPServer(("127.0.0.1", 0), Handler)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        client = ManagementClient.__new__(ManagementClient)
+        client.timeout = 2
+        client.kubectl = Mock(return_value=response(json.dumps({
+            "clusters": [{
+                "cluster": {
+                    "server": f"http://127.0.0.1:{server.server_port}",
+                }
+            }],
+            "users": [{"user": {"token": "test-token"}}],
+        })))
+        try:
+            self.assertEqual(
+                0,
+                client.request_json("POST", "/create", {"name": "tenant-a"})
+                .returncode,
+            )
+            self.assertEqual(
+                0,
+                client.request_json("DELETE", "/delete", {"uid": "uid-a"})
+                .returncode,
+            )
+        finally:
+            server.shutdown()
+            thread.join()
+            server.server_close()
+        self.assertEqual([
+            (
+                "POST",
+                "/create",
+                "Bearer test-token",
+                "application/json",
+                {"name": "tenant-a"},
+            ),
+            (
+                "DELETE",
+                "/delete",
+                "Bearer test-token",
+                "application/json",
+                {"uid": "uid-a"},
+            ),
+        ], received)
+        self.assertIn("--flatten", client.kubectl.call_args.args)
+
+    def test_admin_lifecycle_helpers_validate_create_and_delete_contracts(self):
+        client = FakeClient()
+        created = admin_local.create_tenant_via_admin(
+            client,
+            "tenant-new",
+            workers=2,
+            databases=1,
+        )
+        self.assertEqual(created["identity"]["uid"], "tenant-new-uid")
+        self.assertIn("tenant-new", client.tenant_names)
+        deleted = admin_local.delete_tenant_via_admin(
+            client,
+            "tenant-new",
+            "tenant-new-uid",
+        )
+        self.assertEqual(deleted["state"], "accepted")
+        self.assertNotIn("tenant-new", client.tenant_names)
+
     def setUp(self) -> None:
         (ROOT / ".runtime").mkdir(exist_ok=True)
 
@@ -439,6 +635,8 @@ class AdminLocalTests(unittest.TestCase):
                 ROOT / "admin/config/rbac/service-account.json",
                 ROOT / "admin/config/rbac/cluster-role-local.json",
                 ROOT / "admin/config/rbac/cluster-role-binding-local.json",
+                ROOT / "admin/config/rbac/controller-role.json",
+                ROOT / "admin/config/rbac/controller-role-binding.json",
                 ROOT / "admin/config/service/service.json",
                 rendered,
             ],
@@ -739,7 +937,7 @@ class AdminLocalTests(unittest.TestCase):
         query_calls = [
             arguments
             for arguments in queried.calls
-            if arguments[:2] == ("create", "--raw")
+            if arguments[:2] == ("raw-json", "POST")
         ]
         self.assertEqual(1, len(query_calls))
         self.assertTrue(
@@ -754,11 +952,11 @@ class AdminLocalTests(unittest.TestCase):
             if path.endswith("/api/v1/tenants"):
                 summary = tenant_summary("tenant-a")
                 summary["classification"] = "progressing"
-                return json.dumps({"schemaVersion": 3, "data": [summary]})
+                return json.dumps({"schemaVersion": 4, "data": [summary]})
             if path.endswith("/api/v1/tenants/tenant-a/topology"):
                 topology = json.loads(original_transition(path))["data"]
                 topology["nodes"][0]["health"] = "progressing"
-                return json.dumps({"schemaVersion": 3, "data": topology})
+                return json.dumps({"schemaVersion": 4, "data": topology})
             return original_transition(path)
 
         with patch.object(
@@ -832,7 +1030,7 @@ class AdminLocalTests(unittest.TestCase):
 
         def malformed_response(path: str) -> str:
             if path.endswith("/api/v1/overview"):
-                return '{"schemaVersion":3,"data":[]}'
+                return '{"schemaVersion":4,"data":[]}'
             return original(path)
 
         with patch.object(

@@ -5,11 +5,16 @@ use axum::{
     http::StatusCode,
     response::{IntoResponse, Response},
 };
-use tenant_admin_shared::{ApiError, ApiErrorCode, ApiErrorEnvelope};
+use tenant_admin_shared::{ApiError, ApiErrorCode, ApiErrorEnvelope, lifecycle::TenantFieldError};
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum SourceError {
     KubernetesUnavailable,
+    CreationUnavailable,
+    Conflict,
+    StaleIdentity,
+    Forbidden,
+    Rejected,
     ResponseTooLarge,
     DatabaseUnavailable {
         message: String,
@@ -28,6 +33,11 @@ impl fmt::Display for SourceError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter.write_str(match self {
             Self::KubernetesUnavailable => "Kubernetes API request failed",
+            Self::CreationUnavailable => "Tenant creation is temporarily unavailable",
+            Self::Conflict => "Tenant already exists or changed concurrently",
+            Self::StaleIdentity => "Tenant identity changed",
+            Self::Forbidden => "Tenant lifecycle request is forbidden",
+            Self::Rejected => "Kubernetes rejected the Tenant lifecycle request",
             Self::ResponseTooLarge => "Kubernetes API response exceeded the service limit",
             Self::DatabaseUnavailable { message, .. } => message,
             Self::QueryFailed { .. } => "PostgreSQL query failed",
@@ -51,6 +61,14 @@ impl AppError {
         Self {
             status: StatusCode::BAD_REQUEST,
             error: ApiError::new(ApiErrorCode::InvalidRequest, message, false),
+        }
+    }
+
+    pub fn invalid_fields(message: impl Into<String>, field_errors: Vec<TenantFieldError>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            error: ApiError::new(ApiErrorCode::InvalidRequest, message, false)
+                .with_field_errors(field_errors),
         }
     }
 
@@ -82,6 +100,26 @@ impl From<SourceError> for AppError {
             SourceError::KubernetesUnavailable => Self {
                 status: StatusCode::SERVICE_UNAVAILABLE,
                 error: ApiError::new(ApiErrorCode::KubernetesUnavailable, error.to_string(), true),
+            },
+            SourceError::CreationUnavailable => Self {
+                status: StatusCode::SERVICE_UNAVAILABLE,
+                error: ApiError::new(ApiErrorCode::CreationUnavailable, error.to_string(), true),
+            },
+            SourceError::Conflict => Self {
+                status: StatusCode::CONFLICT,
+                error: ApiError::new(ApiErrorCode::Conflict, error.to_string(), false),
+            },
+            SourceError::StaleIdentity => Self {
+                status: StatusCode::CONFLICT,
+                error: ApiError::new(ApiErrorCode::StaleIdentity, error.to_string(), false),
+            },
+            SourceError::Forbidden => Self {
+                status: StatusCode::FORBIDDEN,
+                error: ApiError::new(ApiErrorCode::Forbidden, error.to_string(), false),
+            },
+            SourceError::Rejected => Self {
+                status: StatusCode::BAD_REQUEST,
+                error: ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false),
             },
             SourceError::ResponseTooLarge => Self::internal(error.to_string()),
             SourceError::DatabaseUnavailable { message, retryable } => {

@@ -3,6 +3,7 @@
 pub mod database_console;
 pub mod error;
 pub mod format;
+pub mod lifecycle;
 pub mod route;
 pub mod topology;
 

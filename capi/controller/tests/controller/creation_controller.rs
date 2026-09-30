@@ -21,7 +21,7 @@ use tenant_controller::{
     },
 };
 
-const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a";
+const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a";
 const FOUNDATION: &str = "/api/v1/namespaces/tenant-system/configmaps/tenant-foundation";
 const LEASES: &str = "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases";
 const CLUSTER: &str = "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/clusters/tenant-a";
@@ -329,10 +329,7 @@ async fn valid_azure_spec_stops_before_finalizer_or_local_dependencies() {
     Arc::make_mut(&mut fixture.reconciler.provider.foundation).creation =
         Err(FoundationError::Invalid("must not be observed".into()));
     let mut tenant = fixture.current();
-    tenant.spec.provider = TenantProviderSpec::Azure {
-        pod_cidr: "10.244.0.0/16".into(),
-        service_cidr: "10.96.0.0/16".into(),
-    };
+    tenant.spec.provider = TenantProviderSpec::Azure;
     fixture.management.insert(TENANT, tenant);
     fixture.step().await;
     let current = fixture.current();
@@ -376,10 +373,7 @@ async fn valid_azure_spec_stops_before_finalizer_or_local_dependencies() {
 async fn deleting_azure_without_controller_finalizer_is_read_only() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.current();
-    tenant.spec.provider = TenantProviderSpec::Azure {
-        pod_cidr: "10.244.0.0/16".into(),
-        service_cidr: "10.96.0.0/16".into(),
-    };
+    tenant.spec.provider = TenantProviderSpec::Azure;
     tenant.metadata.deletion_timestamp =
         Some(serde_json::from_value(json!("2026-09-28T00:00:00Z")).unwrap());
     tenant.metadata.finalizers = Some(vec!["example.com/third-party".into()]);
@@ -552,10 +546,7 @@ async fn provider_status_mismatch_blocks_deletion_and_retains_finalizer() {
 async fn azure_status_mismatch_blocks_before_unsupported_reporting() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.current();
-    tenant.spec.provider = TenantProviderSpec::Azure {
-        pod_cidr: "10.244.0.0/16".into(),
-        service_cidr: "10.96.0.0/16".into(),
-    };
+    tenant.spec.provider = TenantProviderSpec::Azure;
     tenant.status = Some(TenantStatus {
         provider: Some(TenantProviderStatus::Local(LocalProviderStatus::default())),
         ..Default::default()
@@ -585,10 +576,7 @@ async fn azure_status_mismatch_blocks_before_unsupported_reporting() {
 async fn azure_spec_with_controller_finalizer_fails_closed_without_local_cleanup() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.current();
-    tenant.spec.provider = TenantProviderSpec::Azure {
-        pod_cidr: "10.244.0.0/16".into(),
-        service_cidr: "10.96.0.0/16".into(),
-    };
+    tenant.spec.provider = TenantProviderSpec::Azure;
     tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
     tenant.status = Some(TenantStatus {
         provider: Some(TenantProviderStatus::Azure(Default::default())),
@@ -648,10 +636,7 @@ async fn azure_spec_with_controller_finalizer_fails_closed_without_local_cleanup
 async fn deleting_azure_with_controller_finalizer_reports_blocked_deletion() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.current();
-    tenant.spec.provider = TenantProviderSpec::Azure {
-        pod_cidr: "10.244.0.0/16".into(),
-        service_cidr: "10.96.0.0/16".into(),
-    };
+    tenant.spec.provider = TenantProviderSpec::Azure;
     tenant.metadata.deletion_timestamp =
         Some(serde_json::from_value(json!("2026-09-28T00:00:00Z")).unwrap());
     tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);
@@ -686,10 +671,7 @@ async fn deleting_azure_with_controller_finalizer_reports_blocked_deletion() {
 async fn deleting_azure_status_mismatch_retains_finalizer_as_invalid_ownership() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.current();
-    tenant.spec.provider = TenantProviderSpec::Azure {
-        pod_cidr: "10.244.0.0/16".into(),
-        service_cidr: "10.96.0.0/16".into(),
-    };
+    tenant.spec.provider = TenantProviderSpec::Azure;
     tenant.metadata.deletion_timestamp =
         Some(serde_json::from_value(json!("2026-09-28T00:00:00Z")).unwrap());
     tenant.metadata.finalizers = Some(vec![FINALIZER.into()]);

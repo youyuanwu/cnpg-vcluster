@@ -34,6 +34,32 @@ where
             kind: crate::error::UiErrorKind::InvalidRequest,
             message: format!("The request could not be encoded: {error}"),
             retryable: false,
+            field_errors: Vec::new(),
+        })?;
+    let response = request
+        .send()
+        .await
+        .map_err(|error| UiError::network(error.to_string()))?;
+    read_envelope_response(response).await
+}
+
+pub async fn delete_envelope<TRequest, TResponse>(
+    path: &str,
+    payload: &TRequest,
+) -> Result<TResponse, UiError>
+where
+    TRequest: serde::Serialize,
+    TResponse: serde::de::DeserializeOwned,
+{
+    let (header, value) = unsafe_request_header();
+    let request = Request::delete(path)
+        .header(header, value)
+        .json(payload)
+        .map_err(|error| UiError {
+            kind: crate::error::UiErrorKind::InvalidRequest,
+            message: format!("The request could not be encoded: {error}"),
+            retryable: false,
+            field_errors: Vec::new(),
         })?;
     let response = request
         .send()

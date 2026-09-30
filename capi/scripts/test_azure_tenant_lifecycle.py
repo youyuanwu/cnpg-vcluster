@@ -17,10 +17,11 @@ from scripts.azure import _run_profile_mutation
 from scripts.lib.azure.common import (
     _az,
     _json,
+    _kubectl,
     load_azure_configuration,
     names,
 )
-from scripts.lib.azure.foundation import _inspect_foundation
+from scripts.lib.azure.foundation import ADMIN_SERVICE_PROXY, _inspect_foundation
 from scripts.lib.azure.gate import (
     WorkerSnapshot,
     build_worker_snapshot,
@@ -28,7 +29,6 @@ from scripts.lib.azure.gate import (
     require_replacement,
 )
 from scripts.lib.azure.operator import (
-    create_tenant,
     read_tenant,
     tenant_document,
     tenant_status,
@@ -41,6 +41,7 @@ from scripts.lib.azure.proof import (
     prove_operator_deletion,
 )
 from scripts.lib.config import parse_duration
+from scripts.lib.kube import kubeconfig_json_request
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
 from scripts.lib.tenant_spec import load_tenant_spec
@@ -48,6 +49,7 @@ from scripts.tenant import supported_versions
 
 
 T = TypeVar("T")
+ADMIN_API_SCHEMA_VERSION = 4
 
 
 def _tenant_command(*arguments: str) -> str:
@@ -57,12 +59,85 @@ def _tenant_command(*arguments: str) -> str:
     ).stdout
 
 
-def _create_tenant(config: Mapping[str, str], spec) -> None:
-    _run_profile_mutation(
+def _admin_mutation(
+    method: str,
+    path: str,
+    payload: Mapping[str, object],
+) -> dict[str, object]:
+    config = _kubectl(
         ROOT,
-        config,
-        lambda root, _config: create_tenant(root, spec),
+        "config",
+        "view",
+        "--raw",
+        "--flatten",
+        "--minify",
+        "-o",
+        "json",
+        check=False,
     )
+    response = kubeconfig_json_request(
+        config,
+        method,
+        f"{ADMIN_SERVICE_PROXY}/{path.lstrip('/')}",
+        dict(payload),
+        300,
+    )
+    if response.returncode != 0:
+        raise RuntimeError(f"Azure Tenant Admin {method} {path} failed")
+    envelope = json.loads(response.stdout)
+    if (
+        not isinstance(envelope, dict)
+        or set(envelope) != {"schemaVersion", "data"}
+        or envelope.get("schemaVersion") != ADMIN_API_SCHEMA_VERSION
+        or not isinstance(envelope.get("data"), dict)
+    ):
+        raise RuntimeError("Azure Tenant Admin lifecycle response is invalid")
+    return envelope["data"]
+
+
+def _admin_create_tenant(spec) -> dict[str, object]:
+    created = _admin_mutation(
+        "POST",
+        "api/v1/tenants",
+        {"name": spec.name, "workers": spec.workers, "databases": None},
+    )
+    identity = created.get("identity")
+    if (
+        set(created) != {"identity", "provider", "kubernetesVersion"}
+        or not isinstance(identity, dict)
+        or set(identity) != {"name", "uid", "generation"}
+        or identity.get("name") != spec.name
+        or not isinstance(identity.get("uid"), str)
+        or not identity["uid"]
+        or type(identity.get("generation")) is not int
+        or created.get("provider") != "azure"
+        or created.get("kubernetesVersion") != spec.kubernetes_version
+    ):
+        raise RuntimeError("Azure Tenant Admin create response is invalid")
+    return created
+
+
+def _admin_delete_tenant(name: str, uid: str) -> dict[str, object]:
+    deleted = _admin_mutation(
+        "DELETE",
+        f"api/v1/tenants/{name}",
+        {"uid": uid, "confirmation": name},
+    )
+    identity = deleted.get("identity")
+    if (
+        set(deleted) != {"identity", "state"}
+        or not isinstance(identity, dict)
+        or set(identity) != {"name", "uid", "generation"}
+        or identity.get("name") != name
+        or identity.get("uid") != uid
+        or (
+            identity.get("generation") is not None
+            and type(identity.get("generation")) is not int
+        )
+        or deleted.get("state") not in {"accepted", "completed"}
+    ):
+        raise RuntimeError("Azure Tenant Admin delete response is invalid")
+    return deleted
 
 
 def _require_status(tenant: str, classification: str) -> dict[str, object]:
@@ -86,7 +161,8 @@ def _ensure_tenant_ready(config: Mapping[str, str], spec) -> dict[str, object]:
         wait_tenant_absent(ROOT, spec.name)
         existing = None
     if existing is None:
-        _create_tenant(config, spec)
+        _admin_create_tenant(spec)
+        wait_tenant_ready(ROOT, spec.name)
     else:
         if existing.get("spec") != tenant_document(spec)["spec"]:
             raise RuntimeError(
@@ -210,6 +286,43 @@ def _wait_ready_snapshot(
     raise RuntimeError("Azure worker recovery timed out: " + last)
 
 
+def _require_recreated_identity(
+    recreated: Mapping[str, object],
+    old_tenant_uid: object,
+    old_lease_uid: str,
+) -> None:
+    metadata = recreated.get("metadata")
+    allocation = _provider(recreated).get("networkAllocation")
+    new_lease_uid = (
+        allocation.get("leaseUID") if isinstance(allocation, dict) else None
+    )
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(metadata.get("uid"), str)
+        or not metadata["uid"]
+        or metadata.get("uid") == old_tenant_uid
+        or not isinstance(new_lease_uid, str)
+        or not new_lease_uid
+        or new_lease_uid == old_lease_uid
+    ):
+        raise RuntimeError("Azure Tenant recreation retained old identity")
+
+
+def _require_allocation_lease_absent(lease_name: str) -> None:
+    response = _kubectl(
+        ROOT,
+        "-n",
+        "tenant-system",
+        "get",
+        f"lease/{lease_name}",
+        "--ignore-not-found=true",
+        "-o",
+        "name",
+    )
+    if response.stdout.strip():
+        raise RuntimeError("Azure Tenant allocation Lease remained after deletion")
+
+
 def _source_sha256(spec_path: Path) -> str:
     tracked = run(
         ["git", "status", "--porcelain", "--untracked-files=no"],
@@ -286,6 +399,24 @@ def main(arguments: list[str]) -> int:
         raise RuntimeError("Azure Tenant identity is incomplete before injection")
     tenant_uid = metadata.get("uid")
     provider_operation_id = binding.get("operationId")
+    allocation = _provider(tenant).get("networkAllocation")
+    if (
+        not isinstance(allocation, dict)
+        or not isinstance(allocation.get("slotId"), str)
+        or not allocation["slotId"]
+        or not isinstance(allocation.get("podCIDR"), str)
+        or not isinstance(allocation.get("serviceCIDR"), str)
+    ):
+        raise RuntimeError("Azure Tenant allocation status is incomplete")
+    allocation_lease_uid = allocation.get("leaseUID")
+    allocation_lease_name = allocation.get("leaseName")
+    if (
+        not isinstance(allocation_lease_uid, str)
+        or not allocation_lease_uid
+        or not isinstance(allocation_lease_name, str)
+        or not allocation_lease_name
+    ):
+        raise RuntimeError("Azure Tenant allocation Lease identity is incomplete")
 
     if _source_sha256(spec_path) != source_sha256:
         raise RuntimeError(
@@ -340,18 +471,18 @@ def main(arguments: list[str]) -> int:
     phase(
         "ordinary-tenant-deletion",
         lambda: (
-            _tenant_command(
-                "delete",
-                "azure",
-                spec.name,
-                f"azure/{spec.name}",
-            ),
+            _admin_delete_tenant(spec.name, str(tenant_uid)),
+            wait_tenant_absent(ROOT, spec.name),
             _require_status(spec.name, "absent"),
         ),
     )
     phase(
         "external-absence-proof",
         lambda: prove_operator_deletion(ROOT, config, proof),
+    )
+    phase(
+        "allocation-release-proof",
+        lambda: _require_allocation_lease_absent(allocation_lease_name),
     )
 
     def verify_foundation() -> None:
@@ -364,14 +495,17 @@ def main(arguments: list[str]) -> int:
             )
 
     phase("foundation-verification", verify_foundation)
-    phase(
-        "recreation",
-        lambda: (
-            _create_tenant(config, spec),
-            _require_status(spec.name, "ready"),
-            _ready_snapshot(config, spec),
-        ),
-    )
+    def verify_recreation() -> None:
+        _admin_create_tenant(spec)
+        wait_tenant_ready(ROOT, spec.name)
+        recreated, _, _ = _ready_snapshot(config, spec)
+        _require_recreated_identity(
+            recreated,
+            tenant_uid,
+            allocation_lease_uid,
+        )
+
+    phase("recreation", verify_recreation)
     return 0
 
 

@@ -55,8 +55,6 @@ class TenantCLITests(unittest.TestCase):
                         "name": "tenant-a",
                         "kubernetesVersion": "1.32.13",
                         "workers": 3,
-                        "podCIDR": "10.72.0.0/16",
-                        "serviceCIDR": "10.142.0.0/16",
                     }
                 ),
                 encoding="utf-8",

@@ -29,8 +29,9 @@ AZURE_KAMAJI_CAPI_VERSION=v0.19.0
 AZURE_KAMAJI_CHART_VERSION=26.8.6-edge
 AZURE_CLOUD_PROVIDER_VERSION=v1.32.3
 AZURE_CALICO_VERSION=v3.32.2
+AZURE_TENANT_ALLOCATION_APPROVED_SHA256=eac0369f0c6b8cdf73671a1c70da7c3b2db1ef7b4ae8bde0abb3d4c5aa018b02
 AZURE_CONTROLLER_REPOSITORY=tenant-controller
-AZURE_CONTROLLER_TAG=v1alpha2
+AZURE_CONTROLLER_TAG=v1alpha3
 AZURE_ADMIN_REPOSITORY=tenant-admin
 AZURE_ADMIN_TAG=v1alpha1
 AZURE_DEPLOY_TIMEOUT=30m
@@ -83,6 +84,38 @@ class AzureFixtureMixin:
             DEFAULTS,
             encoding="utf-8",
         )
+        (root / "config" / "azure" / "tenant-allocation-slots.json").write_text(
+            json.dumps(
+                {
+                    "schema": 1,
+                    "reservedCIDRs": [
+                        "10.220.0.0/16",
+                        "10.220.0.0/20",
+                        "10.220.16.0/20",
+                        "10.221.0.0/16",
+                        "10.222.0.0/16",
+                    ],
+                    "slots": [
+                        {
+                            "slotId": "azure-01",
+                            "podCIDR": "10.72.0.0/16",
+                            "serviceCIDR": "10.142.0.0/16",
+                        },
+                        {
+                            "slotId": "azure-02",
+                            "podCIDR": "10.73.0.0/16",
+                            "serviceCIDR": "10.143.0.0/16",
+                        },
+                        {
+                            "slotId": "azure-03",
+                            "podCIDR": "10.74.0.0/16",
+                            "serviceCIDR": "10.144.0.0/16",
+                        },
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
         local = root / "config" / "azure.local.env"
         local.write_text(
             f"AZURE_SUBSCRIPTION_ID={SUBSCRIPTION}\n"
@@ -101,8 +134,6 @@ class AzureFixtureMixin:
             "name": name,
             "kubernetesVersion": "1.32.13",
             "workers": 1,
-            "podCIDR": "10.72.0.0/16",
-            "serviceCIDR": "10.142.0.0/16",
         }
         payload.update(overrides)
         return TenantSpec.from_mapping(
@@ -157,6 +188,7 @@ class AzureFixtureMixin:
             "controllers": controllers,
             "controllerImage": CONTROLLER_IMAGE,
             "azureProviderConfigUid": "azure-provider-config-uid",
+            "azureAllocationConfigUid": "azure-allocation-config-uid",
         }
 
     def write_inventory(self, root: Path, payload: dict[str, object]) -> Path:

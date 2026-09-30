@@ -29,18 +29,13 @@ def _specification_sha256(specification: Mapping[str, object]) -> str:
         or provider.get("type") != "azure"
         or not isinstance(specification.get("kubernetesVersion"), str)
         or type(specification.get("workers")) is not int
-        or not isinstance(provider.get("podCIDR"), str)
-        or not isinstance(provider.get("serviceCIDR"), str)
+        or set(provider) != {"type"}
     ):
         raise RuntimeError("Azure operator Tenant specification is invalid")
     canonical = {
         "kubernetesVersion": specification["kubernetesVersion"].removeprefix("v"),
         "workers": specification["workers"],
-        "provider": {
-            "type": "azure",
-            "podCIDR": provider["podCIDR"],
-            "serviceCIDR": provider["serviceCIDR"],
-        },
+        "provider": {"type": "azure"},
     }
     return hashlib.sha256(
         json.dumps(canonical, separators=(",", ":")).encode()

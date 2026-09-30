@@ -1,6 +1,6 @@
 # Rust Tenant contracts
 
-`tenancy.cnpg-vcluster.io/v1alpha2` is the only installed Tenant API.
+`tenancy.cnpg-vcluster.io/v1alpha3` is the only installed Tenant API.
 Rust `src/bin/generate.rs` produces the checked-in
 `config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml` and
 provider-specific `config/rbac/role.yaml` and
@@ -9,8 +9,11 @@ permissions; Azure RBAC contains common plus Azure catalog permissions and its
 Cluster status/Machine patch extras. Both roles keep the same name because
 they are installed in separate clusters. `just controller-verify` compares those artifacts
 against generation without rewriting them. The v1alpha1 CRD, Go manager and
-admission webhook are not installation inputs; unsupported legacy state blocks
-the current installer and is not migrated or deleted. See
+admission webhook are not installation inputs. The breaking v1alpha2 cutover
+requires ordinary Tenant deletion, a temporary create-deny admission lock,
+repeated clean-state checks, old-controller shutdown, and an in-place storage
+version transition that disables `v1alpha2` before removing it; retained
+legacy state is not converted. See
 [`API_COMPATIBILITY.md`](API_COMPATIBILITY.md) for the public contract.
 The repository-root Cargo workspace owns the shared dependency versions,
 release profile, and lockfile; this crate inherits its dependencies from that
@@ -56,13 +59,21 @@ before test-only modules and rejects growth above the 12,000-line workflow ceili
 Installation uses one `Recreate` replica, a separate leader-election Lease,
 and HTTP `/healthz` and `/readyz`, without admission ports or TLS mounts.
 Local mode additionally uses Docker, the schema-3 local foundation, and staged
-assets. Azure mode uses the schema-1 Azure provider ConfigMap and no Docker
+assets. Azure mode uses the schema-1 Azure provider ConfigMap plus the approved
+`tenant-azure-allocation` slot ConfigMap and no Docker
 socket or Azure credentials. Before every Azure mutation, the manager re-reads
 the ConfigMap and requires its UID and canonical typed content to equal the
 startup snapshot; drift or an unreadable replacement blocks without status,
 finalizer, or resource writes. The same binary accepts
 `--provider=local|azure`; one deployment installs exactly one lifecycle
 implementation.
+
+Azure Tenant specs do not carry Pod or Service CIDRs. The controller claims an
+ordered approved network slot with a `tenant-azure-slot-*` Lease, records the
+catalog/Lease/CIDR identity in status before provider writes, and releases only
+after exact terminal cleanup. Invalid or absent current allocation
+configuration blocks new claims and repair writes but cannot prevent
+observation or finalization from recorded identity.
 
 The generated management-resource JSON is the cross-language local operator
 contract. Entries declare exact served API identity and scope,

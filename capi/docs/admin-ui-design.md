@@ -6,7 +6,9 @@ Tenant Admin is an administrative application deployed once in each local
 Kind or Azure AKS management cluster. It gives administrators a browser view
 of the same `Tenant` resources, conditions, provider status, and management
 resources used by the lifecycle controller. Local Tenant detail pages also
-provide an explicitly unsafe PostgreSQL superuser console.
+provide an explicitly unsafe PostgreSQL superuser console. The overview can
+create provider-compatible Tenants, and detail pages can delete the exact
+displayed Tenant identity.
 
 Kubernetes is the only durable data source. The application has no database,
 filesystem journal, watch cache, persisted Tenant kubeconfig, Azure
@@ -20,18 +22,20 @@ and generated superuser Secret, and opens an ephemeral Kubernetes API
 port-forward to PostgreSQL. SQL and result data are transient and are not
 persisted.
 
-Browser query requests must have a same-authority `Origin`/`Host` pair and the
+Browser mutation requests must have a same-authority `Origin`/`Host` pair and the
 `X-Tenant-Admin-Unsafe-Request: 1` header emitted by the Leptos client. The
 host must be `localhost` or an IPv4/IPv6 literal, preserving local and WSL
 access while rejecting DNS names that can be rebound to the forwarded service.
 The custom header also blocks simple cross-origin form requests. No-`Origin`
 Kubernetes service-proxy requests remain available for operational validation.
 
-The management-cluster ServiceAccount remains read-only. The SQL endpoint is a
-separate, deliberately unsafe data-plane capability obtained through the
+The management-cluster ServiceAccount can create and delete only top-level
+Tenant resources. It also reads the exact named controller Deployment to
+discover provider/version capability; it has no allocation-Lease or downstream
+infrastructure mutation authority. The SQL endpoint is a separate,
+deliberately unsafe data-plane capability obtained through the
 validated Tenant administrative kubeconfig. It can execute DDL, DML,
-transaction control, and multiple statements as PostgreSQL superuser. It does
-not add Tenant create/delete or Kubernetes mutation routes.
+transaction control, and multiple statements as PostgreSQL superuser.
 
 ## Architecture
 
@@ -77,7 +81,8 @@ process is an Axum server. The Cargo workspace contains three crates:
 
 The server listens on `0.0.0.0:8080`. The generated Deployment,
 ServiceAccount, ClusterRoleBinding, and ClusterIP Service are named
-`tenant-admin` in `tenant-system`. Local installs the
+`tenant-admin` in `tenant-system`; a namespace-scoped capability Role and
+RoleBinding are named `tenant-admin-controller-capability`. Local installs the
 `tenant-admin-local` ClusterRole and Azure installs `tenant-admin-azure`.
 The Service exposes port `80`. These checked-in resources and deployment
 templates are canonical indented JSON, generated and validated with only the
@@ -92,9 +97,12 @@ concurrency. Kubernetes errors become typed service errors; oversized results
 fail rather than being silently truncated.
 
 Secrets remain excluded from management-resource inventory and responses.
-Provider-specific
-ClusterRoles are derived from the matching management-resource catalog:
-Tenants receive `get` and `list`, the deterministic cluster-scoped Namespace
+Provider-specific ClusterRoles are derived from the matching
+management-resource catalog. Tenants receive `get`, `list`, `create`, and
+`delete`; Leases are excluded from Admin inventory and authority. A separate
+Role in `tenant-system` grants named `get` for the exact `tenant-controller`
+Deployment, preventing capability discovery from reading same-named
+Deployments elsewhere. The deterministic cluster-scoped Namespace
 receives `get`, and every provider resource actually scanned receives `list`.
 Local mode additionally receives only `get` on core Secrets so it can fetch
 the deterministic `<tenant>-kubeconfig` Secret. Kubernetes RBAC cannot scope a
@@ -111,9 +119,9 @@ disabled. Detail observations perform an exact GET of
 additionally exact-GET the selected instance Pod and
 `database/capi-postgres-superuser` Secret, then use the Pod port-forward
 subresource through the Tenant client. They never list Tenant workloads or
-Secrets. Each management role otherwise grants only exact `get` and `list`
-verbs and no provider-irrelevant resource, wildcard, subresource, watch,
-create, update, patch, or delete access.
+Secrets. Each management role otherwise grants only exact read verbs and no
+provider-irrelevant resource, wildcard, subresource, watch, update, patch, or
+downstream delete access.
 
 Installation and health checks compare the owned ServiceAccount, binding, and
 selected ClusterRole with the tracked generated resources. They also submit
@@ -138,7 +146,10 @@ Azure APIs.
 
 The overview reports provider mode, total Tenant count, Ready, Progressing,
 Degraded, Failed, and Deleting counts, plus the available management component
-summary.
+summary. It also reports creation capability independently from Tenant reads.
+The create form uses the controller-supported Kubernetes version and accepts
+name/workers plus local-only database count; Azure CIDRs are controller
+allocated.
 
 ### Tenant table
 
@@ -158,6 +169,11 @@ placement, PVC health, conditions, and sorted primary/standby instances. The
 topology includes the exact CNPG Cluster and observed instances when available,
 or an explicit unavailable node when Tenant access is pending or fails.
 Azure reports database observation as not applicable.
+
+The detail page also exposes destructive Tenant deletion. The administrator
+must type the exact Tenant name, and the server binds deletion to the displayed
+UID and current resourceVersion. Same-name replacements are rejected.
+Deletion is asynchronous; refresh shows Deleting conditions and blockers.
 
 When a local database observation is available, the detail page also shows an
 unsafe SQL console. The administrator selects an observed primary, standby, or
@@ -188,11 +204,11 @@ returns a typed not-found response and a non-fatal link back to the overview.
 Every successful JSON response is:
 
 ```json
-{"schemaVersion":3,"data":{}}
+{"schemaVersion":4,"data":{}}
 ```
 
-Errors use schema version 3 plus a typed error code, sanitized message, and
-retryable flag. The routes are:
+Errors use schema version 4 plus a typed error code, sanitized message,
+retryable flag, and optional bounded field errors. The routes are:
 
 | Route | Response |
 |---|---|
@@ -200,7 +216,9 @@ retryable flag. The routes are:
 | `GET /readyz` | Management Kubernetes API readiness. |
 | `GET /api/v1/overview` | One `OverviewSnapshot` containing the overview and sorted Tenant summaries from the same list operation. |
 | `GET /api/v1/tenants` | Sorted `TenantSummary[]`. |
+| `POST /api/v1/tenants` | Create one Tenant for the configured provider using the active supported version. |
 | `GET /api/v1/tenants/{name}` | One `TenantSnapshot` containing detail, live database observation, and topology from the same Tenant UID/generation/resource read. |
+| `DELETE /api/v1/tenants/{name}` | Delete the exact displayed Tenant UID with typed-name confirmation. |
 | `GET /api/v1/tenants/{name}/topology` | `TopologyGraph`. |
 | `POST /api/v1/tenants/{name}/database/query` | Execute unrestricted SQL as CNPG PostgreSQL superuser on one exact observed instance and return bounded ordered results. |
 | `GET /*` | Static asset or `index.html` fallback for browser routes. |
@@ -224,6 +242,8 @@ The shared DTOs include:
   Services, conditions, and observation timestamp;
 - database query request, ordered result sets, NULL values, affected-row
   counts, timing, and truncation state without credentials;
+- creation capability, provider-neutral create request/result, UID-bound
+  delete request/result, and field-associated validation errors;
 - Azure binding, management roots, worker pool, Nodes, add-ons, and recorded
   provider resources;
 - topology nodes, edges, health, display attributes, and exact resource

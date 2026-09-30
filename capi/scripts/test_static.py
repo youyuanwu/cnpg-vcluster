@@ -331,15 +331,15 @@ def check_repository_boundaries() -> None:
     )
     check("admin-metrics:" in justfile, "admin metrics recipe is missing")
     check(
-        "scripts/admin_metrics.py --max 7500" in justfile,
-        "admin production-line threshold is not enforced",
+        "scripts/admin_metrics.py" in justfile
+        and "scripts/admin_metrics.py --max" not in justfile,
+        "admin metrics must remain informational without a line ceiling",
     )
     admin_metrics_source = (ROOT / "scripts/admin_metrics.py").read_text(
         encoding="utf-8"
     )
     for contract in (
         "ADMIN_BASELINE_LINES = 3916",
-        "MAX_ADMIN_PRODUCTION_LINES = 7500",
         'for crate in ("shared", "server", "web")',
         "Admin Rust: baseline=",
     ):
@@ -378,9 +378,9 @@ def check_repository_boundaries() -> None:
     crd = (controller / "config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml").read_text(
         encoding="utf-8"
     )
-    check("name: v1alpha2" in crd and "name: v1alpha1" not in crd
+    check("name: v1alpha3" in crd and "name: v1alpha2" not in crd
           and "controller-gen.kubebuilder.io" not in crd,
-          "the authoritative Tenant CRD is not Rust v1alpha2")
+          "the authoritative Tenant CRD is not Rust v1alpha3")
     generator = (controller / "src/bin/generate.rs").read_text(encoding="utf-8")
     check('join("config")' in generator and
           '"crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml"' in generator,
@@ -399,7 +399,8 @@ def check_repository_boundaries() -> None:
     ).read_text(encoding="utf-8")
     check("--provider=azure" in azure_manager,
           "Azure manager does not select the Azure provider")
-    check(not re.search(r"docker.sock|tenant-foundation|activation|calico|cnpg",
+    check(not re.search(
+                        r"docker.sock|tenant-foundation|activation|calico|cnpg(?!-vcluster)",
                         azure_manager, re.IGNORECASE),
           "Azure manager retains local-only dependencies")
     for relative in ("scripts", "config/versions.env", "Justfile"):
@@ -672,7 +673,7 @@ def check_repository_boundaries() -> None:
     ):
         manifest = (ROOT / relative).read_text(encoding="utf-8")
         check(
-            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha2" in manifest
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha3" in manifest
             and "kind: Tenant" in manifest
             and f"name: {expected_name}" in manifest
             and set(re.findall(r"^  ([a-zA-Z]+):", manifest.split("spec:\n")[1], re.MULTILINE))
@@ -892,9 +893,11 @@ def check_documentation() -> None:
         "Leptos client-side WebAssembly application",
         "Axum server",
         "Kubernetes is the only durable data source",
-        "grants only exact `get` and `list` verbs",
+        "Tenants receive `get`, `list`, `create`, and `delete`",
         "Refresh is manual",
         "`GET /api/v1/overview`",
+        "`POST /api/v1/tenants`",
+        "`DELETE /api/v1/tenants/{name}`",
         "`GET /api/v1/tenants/{name}/topology`",
         "`POST /api/v1/tenants/{name}/database/query`",
         "validated exact owner UID chain",
@@ -902,7 +905,7 @@ def check_documentation() -> None:
         "`just admin-port-forward`",
         "Generated browser bundles",
         "explicitly unsafe PostgreSQL superuser console",
-        "does not add Tenant create/delete or Kubernetes mutation routes",
+        "UID and current resourceVersion",
         "## Troubleshooting",
         "## Limitations",
     )

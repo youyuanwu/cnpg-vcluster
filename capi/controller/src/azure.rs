@@ -11,8 +11,8 @@ use thiserror::Error;
 
 use crate::{
     api::{
-        AzureBindingStatus, AzureManagementStatus, AzureProviderResourceIdentity, CanonicalSpec,
-        Tenant, TenantProviderSpec,
+        AzureAllocationStatus, AzureBindingStatus, AzureManagementStatus,
+        AzureProviderResourceIdentity, CanonicalSpec, Tenant,
     },
     resources::dns_service_ip,
 };
@@ -31,42 +31,23 @@ pub(crate) const ANNOTATION_SPEC: &str = "lifecycle.cnpg-vcluster.capi/specifica
 pub(crate) const ANNOTATION_FOUNDATION: &str = "lifecycle.cnpg-vcluster.capi/foundation-sha256";
 pub(crate) const ANNOTATION_OPERATION: &str = "lifecycle.cnpg-vcluster.capi/operation-id";
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct AzureProviderConfiguration {
-    pub schema: u8,
-    pub subscription_id: String,
-    pub tenant_id: String,
-    pub location: String,
-    pub resource_group_name: String,
-    pub resource_group_id: String,
-    pub vnet_name: String,
-    pub vnet_id: String,
-    pub tenant_subnet_name: String,
-    pub tenant_subnet_id: String,
-    pub identity_name: String,
-    pub identity_id: String,
-    pub identity_client_id: String,
-    pub supported_kubernetes_version: String,
-    pub worker_sku: String,
-    pub capi_version: String,
-    pub capz_version: String,
-    pub kamaji_capi_version: String,
-    pub kamaji_chart_version: String,
-    pub aso_version: String,
-    pub cloud_provider_version: String,
-    pub calico_version: String,
-    pub controller_image: String,
-    pub foundation_defaults_sha256: String,
+    pub schema: u8, pub subscription_id: String, pub tenant_id: String, pub location: String,
+    pub resource_group_name: String, pub resource_group_id: String, pub vnet_name: String, pub vnet_id: String,
+    pub tenant_subnet_name: String, pub tenant_subnet_id: String, pub identity_name: String,
+    pub identity_id: String, pub identity_client_id: String, pub supported_kubernetes_version: String,
+    pub worker_sku: String, pub capi_version: String, pub capz_version: String, pub kamaji_capi_version: String,
+    pub kamaji_chart_version: String, pub aso_version: String, pub cloud_provider_version: String,
+    pub calico_version: String, pub controller_image: String, pub foundation_defaults_sha256: String,
     pub foundation_sha256: String,
 }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct AzureConfiguration {
-    pub values: AzureProviderConfiguration,
-    pub config_map_uid: String,
-    pub sha256: String,
-}
+pub struct AzureConfiguration { pub values: AzureProviderConfiguration, pub config_map_uid: String, pub sha256: String }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AzureConfigurationError {
@@ -85,33 +66,19 @@ pub enum AzureConfigurationError {
 }
 
 impl AzureConfiguration {
+    #[rustfmt::skip]
     pub fn from_config_map(config: &ConfigMap) -> Result<Self, AzureConfigurationError> {
-        let raw = config
-            .data
-            .as_ref()
-            .and_then(|data| data.get(CONFIG_KEY))
-            .ok_or(AzureConfigurationError::Missing)?;
+        let raw = config.data.as_ref().and_then(|data| data.get(CONFIG_KEY)).ok_or(AzureConfigurationError::Missing)?;
         let values: AzureProviderConfiguration = serde_json::from_str(raw)
             .map_err(|error| AzureConfigurationError::Json(error.to_string()))?;
-        let config_map_uid = config
-            .metadata
-            .uid
-            .clone()
-            .filter(|value| !value.is_empty())
-            .ok_or(AzureConfigurationError::Uid)?;
+        let config_map_uid = config.metadata.uid.clone().filter(|value| !value.is_empty()).ok_or(AzureConfigurationError::Uid)?;
         values.validate()?;
-        let canonical = serde_json::to_vec(
-            &serde_json::to_value(&values)
-                .map_err(|error| AzureConfigurationError::Json(error.to_string()))?,
-        )
-        .map_err(|error| AzureConfigurationError::Json(error.to_string()))?;
-        Ok(Self {
-            values,
-            config_map_uid,
-            sha256: hex::encode(Sha256::digest(canonical)),
-        })
+        let value = serde_json::to_value(&values).map_err(|error| AzureConfigurationError::Json(error.to_string()))?;
+        let canonical = serde_json::to_vec(&value).map_err(|error| AzureConfigurationError::Json(error.to_string()))?;
+        Ok(Self { values, config_map_uid, sha256: hex::encode(Sha256::digest(canonical)) })
     }
 
+    #[rustfmt::skip]
     pub fn binding(
         &self,
         tenant_uid: impl Into<String>,
@@ -119,57 +86,34 @@ impl AzureConfiguration {
         operation_id: impl Into<String>,
     ) -> AzureBindingStatus {
         AzureBindingStatus {
-            tenant_uid: tenant_uid.into(),
-            specification_sha256: specification_sha256.into(),
-            provider_config_uid: self.config_map_uid.clone(),
-            provider_config_sha256: self.sha256.clone(),
+            tenant_uid: tenant_uid.into(), specification_sha256: specification_sha256.into(),
+            provider_config_uid: self.config_map_uid.clone(), provider_config_sha256: self.sha256.clone(),
             foundation_sha256: self.values.foundation_sha256.clone(),
             foundation_defaults_sha256: self.values.foundation_defaults_sha256.clone(),
-            controller_image: self.values.controller_image.clone(),
-            resource_group_id: self.values.resource_group_id.clone(),
-            virtual_network_id: self.values.vnet_id.clone(),
-            tenant_subnet_id: self.values.tenant_subnet_id.clone(),
-            identity_id: self.values.identity_id.clone(),
-            operation_id: operation_id.into(),
+            controller_image: self.values.controller_image.clone(), resource_group_id: self.values.resource_group_id.clone(),
+            virtual_network_id: self.values.vnet_id.clone(), tenant_subnet_id: self.values.tenant_subnet_id.clone(),
+            identity_id: self.values.identity_id.clone(), operation_id: operation_id.into(),
         }
     }
 }
 
 impl AzureProviderConfiguration {
+    #[rustfmt::skip]
     fn validate(&self) -> Result<(), AzureConfigurationError> {
-        if self.schema != 1 {
-            return Err(AzureConfigurationError::Schema);
-        }
+        if self.schema != 1 { return Err(AzureConfigurationError::Schema); }
         for (name, value) in [
-            ("subscriptionId", self.subscription_id.as_str()),
-            ("tenantId", self.tenant_id.as_str()),
-            ("location", self.location.as_str()),
-            ("resourceGroupName", self.resource_group_name.as_str()),
-            ("resourceGroupId", self.resource_group_id.as_str()),
-            ("vnetName", self.vnet_name.as_str()),
-            ("vnetId", self.vnet_id.as_str()),
-            ("tenantSubnetName", self.tenant_subnet_name.as_str()),
-            ("tenantSubnetId", self.tenant_subnet_id.as_str()),
-            ("identityName", self.identity_name.as_str()),
-            ("identityId", self.identity_id.as_str()),
-            ("identityClientId", self.identity_client_id.as_str()),
-            (
-                "supportedKubernetesVersion",
-                self.supported_kubernetes_version.as_str(),
-            ),
-            ("workerSku", self.worker_sku.as_str()),
-            ("capiVersion", self.capi_version.as_str()),
-            ("capzVersion", self.capz_version.as_str()),
-            ("kamajiCapiVersion", self.kamaji_capi_version.as_str()),
-            ("kamajiChartVersion", self.kamaji_chart_version.as_str()),
-            ("asoVersion", self.aso_version.as_str()),
-            ("cloudProviderVersion", self.cloud_provider_version.as_str()),
-            ("calicoVersion", self.calico_version.as_str()),
-            ("controllerImage", self.controller_image.as_str()),
-            (
-                "foundationDefaultsSha256",
-                self.foundation_defaults_sha256.as_str(),
-            ),
+            ("subscriptionId", self.subscription_id.as_str()), ("tenantId", self.tenant_id.as_str()),
+            ("location", self.location.as_str()), ("resourceGroupName", self.resource_group_name.as_str()),
+            ("resourceGroupId", self.resource_group_id.as_str()), ("vnetName", self.vnet_name.as_str()),
+            ("vnetId", self.vnet_id.as_str()), ("tenantSubnetName", self.tenant_subnet_name.as_str()),
+            ("tenantSubnetId", self.tenant_subnet_id.as_str()), ("identityName", self.identity_name.as_str()),
+            ("identityId", self.identity_id.as_str()), ("identityClientId", self.identity_client_id.as_str()),
+            ("supportedKubernetesVersion", self.supported_kubernetes_version.as_str()), ("workerSku", self.worker_sku.as_str()),
+            ("capiVersion", self.capi_version.as_str()), ("capzVersion", self.capz_version.as_str()),
+            ("kamajiCapiVersion", self.kamaji_capi_version.as_str()), ("kamajiChartVersion", self.kamaji_chart_version.as_str()),
+            ("asoVersion", self.aso_version.as_str()), ("cloudProviderVersion", self.cloud_provider_version.as_str()),
+            ("calicoVersion", self.calico_version.as_str()), ("controllerImage", self.controller_image.as_str()),
+            ("foundationDefaultsSha256", self.foundation_defaults_sha256.as_str()),
             ("foundationSha256", self.foundation_sha256.as_str()),
         ] {
             if value.is_empty() || value.trim() != value {
@@ -180,10 +124,7 @@ impl AzureProviderConfiguration {
             return Err(AzureConfigurationError::Field("supportedKubernetesVersion"));
         }
         for (name, value) in [
-            (
-                "foundationDefaultsSha256",
-                self.foundation_defaults_sha256.as_str(),
-            ),
+            ("foundationDefaultsSha256", self.foundation_defaults_sha256.as_str()),
             ("foundationSha256", self.foundation_sha256.as_str()),
         ] {
             if !sha256(value) {
@@ -198,16 +139,10 @@ impl AzureProviderConfiguration {
         {
             return Err(AzureConfigurationError::Field("Azure resource identity"));
         }
-        let mut value = serde_json::to_value(self)
-            .map_err(|error| AzureConfigurationError::Json(error.to_string()))?;
-        value
-            .as_object_mut()
-            .expect("configuration serializes as an object")
-            .remove("foundationSha256");
-        let hash = hex::encode(Sha256::digest(
-            serde_json::to_vec(&value)
-                .map_err(|error| AzureConfigurationError::Json(error.to_string()))?,
-        ));
+        let mut value = serde_json::to_value(self).map_err(|error| AzureConfigurationError::Json(error.to_string()))?;
+        value.as_object_mut().expect("configuration serializes as an object").remove("foundationSha256");
+        let hash = hex::encode(Sha256::digest(serde_json::to_vec(&value)
+            .map_err(|error| AzureConfigurationError::Json(error.to_string()))?));
         if hash != self.foundation_sha256 {
             return Err(AzureConfigurationError::FoundationHash);
         }
@@ -215,72 +150,45 @@ impl AzureProviderConfiguration {
     }
 }
 
-fn three_part_version(value: &str) -> bool {
-    value
-        .strip_prefix('v')
-        .unwrap_or(value)
-        .split('.')
-        .collect::<Vec<_>>()
-        .as_slice()
-        .iter()
-        .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
-        && value.strip_prefix('v').unwrap_or(value).split('.').count() == 3
-}
+#[rustfmt::skip]
+fn three_part_version(value: &str) -> bool { let value = value.strip_prefix('v').unwrap_or(value);
+    value.split('.').count() == 3 && value.split('.').all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit())) }
 
-fn sha256(value: &str) -> bool {
-    value.len() == 64
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
-}
+#[rustfmt::skip]
+fn sha256(value: &str) -> bool { value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)) }
 
+#[rustfmt::skip]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AzureNames {
-    pub namespace: String,
-    pub identity: String,
-    pub cluster: String,
-    pub azure_cluster: String,
-    pub control_plane: String,
-    pub pool: String,
-    pub cloud_values: String,
-    pub network_values: String,
-    pub status_probe: String,
-    pub addon_job: String,
-    pub kubeconfig: String,
+    pub namespace: String, pub identity: String, pub cluster: String, pub azure_cluster: String,
+    pub control_plane: String, pub pool: String, pub cloud_values: String, pub network_values: String,
+    pub status_probe: String, pub addon_job: String, pub kubeconfig: String,
 }
 
 impl AzureNames {
+    #[rustfmt::skip]
     pub fn new(tenant: &str) -> Self {
         Self {
-            namespace: tenant.into(),
-            identity: format!("{tenant}-identity"),
-            cluster: tenant.into(),
-            azure_cluster: tenant.into(),
-            control_plane: tenant.into(),
-            pool: format!("{tenant}-worker"),
-            cloud_values: format!("{tenant}-azure-cloud-provider-values"),
-            network_values: format!("{tenant}-calico-values"),
-            status_probe: format!("{tenant}-status-probe"),
-            addon_job: format!("{tenant}-install-addons"),
+            namespace: tenant.into(), identity: format!("{tenant}-identity"), cluster: tenant.into(),
+            azure_cluster: tenant.into(), control_plane: tenant.into(), pool: format!("{tenant}-worker"),
+            cloud_values: format!("{tenant}-azure-cloud-provider-values"), network_values: format!("{tenant}-calico-values"),
+            status_probe: format!("{tenant}-status-probe"), addon_job: format!("{tenant}-install-addons"),
             kubeconfig: format!("{tenant}-kubeconfig"),
         }
     }
 }
 
+#[rustfmt::skip]
 pub struct AzureContext<'a> {
-    pub tenant: &'a Tenant,
-    pub spec: &'a CanonicalSpec,
-    pub specification_sha256: &'a str,
-    pub foundation_sha256: &'a str,
-    pub operation_id: &'a str,
-    pub configuration: &'a AzureProviderConfiguration,
+    pub tenant: &'a Tenant, pub spec: &'a CanonicalSpec, pub specification_sha256: &'a str,
+    pub foundation_sha256: &'a str, pub operation_id: &'a str,
+    pub configuration: &'a AzureProviderConfiguration, pub allocation: &'a AzureAllocationStatus,
 }
 
 impl AzureContext<'_> {
     pub fn name(&self) -> &str {
         self.tenant.metadata.name.as_deref().unwrap_or("")
     }
-
     pub fn names(&self) -> AzureNames {
         AzureNames::new(self.name())
     }
@@ -353,13 +261,8 @@ impl AzureContext<'_> {
 }
 
 pub fn desired_objects(context: &AzureContext<'_>) -> Result<Vec<DynamicObject>, AzureBuildError> {
-    let TenantProviderSpec::Azure {
-        pod_cidr,
-        service_cidr,
-    } = &context.spec.provider
-    else {
-        return Err(AzureBuildError::Provider);
-    };
+    let pod_cidr = &context.allocation.pod_cidr;
+    let service_cidr = &context.allocation.service_cidr;
     let names = context.names();
     let namespace = names.namespace.as_str();
     let config = context.configuration;
@@ -627,8 +530,6 @@ helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum AzureBuildError {
-    #[error("Azure builders require an Azure Tenant specification")]
-    Provider,
     #[error("derive Azure DNS service address: {0}")]
     Dns(String),
 }
@@ -893,12 +794,21 @@ mod tests {
             TenantSpec {
                 kubernetes_version: "1.32.13".into(),
                 workers: 3,
-                provider: TenantProviderSpec::Azure {
-                    pod_cidr: "10.72.0.0/16".into(),
-                    service_cidr: "10.142.0.0/16".into(),
-                },
+                provider: crate::api::TenantProviderSpec::Azure,
             },
         )
+    }
+
+    fn allocation() -> crate::api::AzureAllocationStatus {
+        crate::api::AzureAllocationStatus {
+            slot_id: "azure-01".into(),
+            pod_cidr: "10.72.0.0/16".into(),
+            service_cidr: "10.142.0.0/16".into(),
+            catalog_uid: "catalog-uid".into(),
+            catalog_sha256: "catalog-sha".into(),
+            lease_name: "tenant-azure-slot-a".into(),
+            lease_uid: "lease-uid".into(),
+        }
     }
 
     #[test]
@@ -962,6 +872,7 @@ mod tests {
             foundation_sha256: &config.values.foundation_sha256,
             operation_id: "operation-1",
             configuration: &config.values,
+            allocation: &allocation(),
         })
         .unwrap();
         let identities: Vec<_> = objects
@@ -1127,6 +1038,7 @@ mod tests {
             foundation_sha256: &config.values.foundation_sha256,
             operation_id: "operation-1",
             configuration: &config.values,
+            allocation: &allocation(),
         })
         .unwrap()
         .remove(2);

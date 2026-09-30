@@ -181,6 +181,8 @@
         "tenants"
       ],
       "verbs": [
+        "create",
+        "delete",
         "get",
         "list"
       ]

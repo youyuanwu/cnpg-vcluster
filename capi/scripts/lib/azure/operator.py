@@ -17,17 +17,13 @@ FIELD_MANAGER = "cnpg-vcluster-azure-tenant-client"
 
 def tenant_document(spec: TenantSpec) -> dict[str, object]:
     return {
-        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
         "kind": "Tenant",
         "metadata": {"name": spec.name},
         "spec": {
             "kubernetesVersion": spec.kubernetes_version,
             "workers": spec.workers,
-            "provider": {
-                "type": "azure",
-                "podCIDR": str(spec.pod_network),
-                "serviceCIDR": str(spec.service_network),
-            },
+            "provider": {"type": "azure"},
         },
     }
 

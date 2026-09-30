@@ -1,0 +1,20 @@
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "RoleBinding",
+  "metadata": {
+    "name": "tenant-admin-controller-capability",
+    "namespace": "tenant-system"
+  },
+  "roleRef": {
+    "apiGroup": "rbac.authorization.k8s.io",
+    "kind": "Role",
+    "name": "tenant-admin-controller-capability"
+  },
+  "subjects": [
+    {
+      "kind": "ServiceAccount",
+      "name": "tenant-admin",
+      "namespace": "tenant-system"
+    }
+  ]
+}

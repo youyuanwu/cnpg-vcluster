@@ -25,7 +25,7 @@ use tenant_controller::{
 const NAME: &str = "tenant-a";
 const UID: &str = "tenant-uid";
 const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
-const TENANT_PATH: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants/tenant-a";
+const TENANT_PATH: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a";
 const LEASES: &str = "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases";
 const NAMESPACE: &str = "/api/v1/namespaces/tenant-a";
 

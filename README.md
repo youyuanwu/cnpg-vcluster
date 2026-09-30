@@ -15,7 +15,8 @@ management cluster also runs a Leptos/Axum Tenant Admin UI. Overview data
 comes from the management API; a selected local Tenant detail view uses its
 validated administrative kubeconfig in memory to read live CNPG metadata and
 provides an explicitly unsafe PostgreSQL superuser console for exact CNPG
-instances:
+instances. The overview can create local or Azure Tenants, and detail pages
+delete the exact displayed Tenant UID:
 
 ```sh
 cd capi
@@ -31,7 +32,7 @@ just local-tenant-delete tenant-example
 just destroy
 ```
 
-Local tenants are declarative `tenancy.cnpg-vcluster.io/v1alpha2` resources
+Local tenants are declarative `tenancy.cnpg-vcluster.io/v1alpha3` resources
 reconciled by a Rust/kube-rs operator. Their immutable specs contain common
 `kubernetesVersion` and `workers` fields plus a tagged provider; local
 manifests use `provider.type: local` and `provider.databases`. The controller
@@ -41,8 +42,10 @@ Kubernetes conditions and live component health. Ordinary DELETE runs a
 fail-closed finalizer that does not require tenant API access. Apply is
 asynchronous; repeat `local-tenant-status` until it exits zero.
 
-The provider-discriminated shape is a breaking in-place redesign of
-experimental `v1alpha2`; flat `databases` fields, flat local status, and the
+The provider-discriminated shape intentionally replaces experimental
+`v1alpha2`; retained Tenants must be normally deleted before the clean,
+create-locked in-place CRD storage-version transition. Flat `databases`
+fields, flat local status, and the
 former Python Azure tenant runtime are not migrated or converted. Existing
 objects must be deleted and recreated, and installation requires a clean
 environment. The same Rust manager runs in an explicit `local` or `azure`

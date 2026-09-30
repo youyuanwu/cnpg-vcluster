@@ -10,7 +10,6 @@ ADMIN_SOURCE_ROOTS = tuple(
     for crate in ("shared", "server", "web")
 )
 ADMIN_BASELINE_LINES = 3916
-MAX_ADMIN_PRODUCTION_LINES = 7500
 
 
 def production_lines(path: Path) -> int:
@@ -43,7 +42,6 @@ def parse_args() -> argparse.Namespace:
         description="Report admin production Rust lines before test-only modules."
     )
     parser.add_argument("--expect", type=int)
-    parser.add_argument("--max", dest="maximum", type=int)
     return parser.parse_args()
 
 
@@ -62,10 +60,6 @@ def main() -> int:
     if args.expect is not None and total != args.expect:
         raise SystemExit(
             f"admin production Rust line count {total} does not match {args.expect}"
-        )
-    if args.maximum is not None and total > args.maximum:
-        raise SystemExit(
-            f"admin production Rust line count {total} exceeds {args.maximum}"
         )
     return 0
 

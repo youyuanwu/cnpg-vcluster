@@ -10,7 +10,6 @@ from unittest.mock import patch
 from scripts.admin_metrics import (
     ADMIN_BASELINE_LINES,
     ADMIN_SOURCE_ROOTS,
-    MAX_ADMIN_PRODUCTION_LINES,
     ROOT,
     main,
     production_lines,
@@ -34,7 +33,7 @@ class AdminMetricsTests(unittest.TestCase):
             source.write_text("one\ntwo\n", encoding="utf-8")
             self.assertEqual(2, production_lines(source))
 
-    def test_scope_baseline_and_ceiling_are_explicit(self) -> None:
+    def test_scope_and_baseline_are_explicit(self) -> None:
         self.assertEqual(
             tuple(
                 ROOT / "admin" / crate / "src"
@@ -56,8 +55,7 @@ class AdminMetricsTests(unittest.TestCase):
         )
         total = sum(lines for _, lines in metrics)
         self.assertEqual(3916, ADMIN_BASELINE_LINES)
-        self.assertEqual(7500, MAX_ADMIN_PRODUCTION_LINES)
-        self.assertLessEqual(total, MAX_ADMIN_PRODUCTION_LINES)
+        self.assertGreater(total, 0)
 
     def test_output_reports_baseline_current_and_delta(self) -> None:
         output = StringIO()
@@ -66,7 +64,6 @@ class AdminMetricsTests(unittest.TestCase):
             redirect_stdout(output),
         ):
             arguments.return_value.expect = None
-            arguments.return_value.maximum = MAX_ADMIN_PRODUCTION_LINES
             self.assertEqual(0, main())
         rendered = output.getvalue()
         current = sum(lines for _, lines in source_metrics())

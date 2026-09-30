@@ -12,6 +12,8 @@ spec:
       app.kubernetes.io/name: tenant-controller
   template:
     metadata:
+      annotations:
+        tenancy.cnpg-vcluster.io/allocation-sha256: ${TENANT_ALLOCATION_SHA256}
       labels:
         app.kubernetes.io/name: tenant-controller
     spec:

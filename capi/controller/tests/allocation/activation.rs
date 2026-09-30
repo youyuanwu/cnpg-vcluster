@@ -16,7 +16,7 @@ use tenant_controller::{
 const CONFIG_MAPS: &str = "/api/v1/namespaces/tenant-system/configmaps";
 const STATE: &str = "/api/v1/namespaces/tenant-system/configmaps/tenant-controller-state";
 const TICKET: &str = "/api/v1/namespaces/tenant-system/configmaps/tenant-controller-activation";
-const TENANTS: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha2/tenants";
+const TENANTS: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants";
 const NAMESPACES: &str = "/api/v1/namespaces";
 const SECRETS: &str = "/api/v1/secrets";
 const LEASES: &str = "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases";

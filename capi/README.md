@@ -19,7 +19,8 @@ CAPZ/ASO.
 
 Both management profiles install the provider-neutral `tenant-admin`
 application: a Leptos WebAssembly frontend served by an Axum/kube-rs backend.
-It reads management topology through exact provider-specific read-only RBAC.
+It reads management topology and creates/deletes only top-level Tenants through
+exact provider-specific lifecycle RBAC.
 For a selected local Tenant detail page, it also reads the exact
 provider-owned kubeconfig Secret, validates its ownership and endpoint, and
 uses it only in memory for exact live CNPG reads. An explicitly unsafe SQL
@@ -107,6 +108,9 @@ just destroy
 Local tenants are declared through versioned YAML resources. Reapplying a
 manifest is the reconcile/retry path, status reads generation-aware Kubernetes
 conditions, and ordinary deletion is completed by the controller finalizer.
+The Tenant Admin overview provides the equivalent provider-aware create action,
+and each detail page provides UID-bound destructive deletion. The CLI commands
+remain available for automation and recovery.
 Apply is asynchronous; repeat `just local-tenant-status tenant-example` until
 it exits zero. Tenant specifications are immutable; delete and recreate to
 change capacity or versions. Local manifests select `provider.type: local`;
@@ -124,32 +128,33 @@ just test-e2e
 
 ## Tenant specifications and runtime configuration
 
-The cluster-scoped `tenancy.cnpg-vcluster.io/v1alpha2` API requires a name and
+The cluster-scoped `tenancy.cnpg-vcluster.io/v1alpha3` API requires a name and
 an immutable spec with common `kubernetesVersion` and `workers` fields plus
 one tagged `provider`. Local manifests use `type: local` and `databases`
-(counts 1-3). Azure placeholders use `type: azure` with canonical,
-non-overlapping IPv4 `podCIDR` and `serviceCIDR` networks; the Service CIDR
-must be at least `/28`. A schema-3 foundation supplies ordered local slots
+(counts 1-3). Azure requests use only `type: azure`; the controller claims
+canonical, non-overlapping Pod and Service CIDRs from the approved finite
+Azure allocation catalog. A schema-3 foundation supplies ordered local slots
 that bind one endpoint, Pod CIDR, and Service CIDR per Tenant; those values
 appear in `status.provider.allocation`. OpenAPI/CEL reject invalid names,
-counts, version syntax, provider fields, CIDRs, and spec updates. The
-controller checks the supported Kubernetes version (`1.36.4`). The API server
+counts, version syntax, provider fields, and spec updates. The Azure controller
+separately validates the approved allocation catalog and active claims. Each
+controller checks its configured supported Kubernetes version. The API server
 prunes unknown fields under `fieldValidation=Warn` or `Ignore`, but rejects
 them under `Strict`, as used by the repository's local clients. No validating
 webhook is installed.
 
-This provider-discriminated contract is a breaking in-place redesign of the
-experimental `v1alpha2` API. There is no conversion or migration from the
-earlier flat local spec/status: existing Tenant objects must be deleted and
-recreated with the new shape. Azure-mode managers reconcile only Azure Tenants; local-mode managers reconcile
+The v1alpha3 contract intentionally replaces experimental v1alpha2. There is
+no conversion or migration: existing Tenant objects must be deleted and
+recreated after the create-locked clean CRD cutover. Azure-mode managers
+reconcile only Azure Tenants; local-mode managers reconcile
 only local Tenants. Provider mismatches remain unsupported and do not acquire a
 new finalizer. Azure lifecycle commands continue to accept schema `1` JSON
 specifications and translate them to the CRD. Safe examples are in
 [`config/tenants/examples/`](config/tenants/examples/).
 
 The lifecycle does not infer a singleton tenant from environment variables.
-The current installer supports only v1alpha2 and does not migrate or delete
-legacy controller state. The manager loads one foundation snapshot at startup.
+The current installer supports only v1alpha3 and never deletes retained
+Tenants during cutover. The manager loads one foundation snapshot at startup.
 Same-identity restarts resume active Tenants; changed configuration requires
 an empty Tenant/provider/host inventory and a candidate-bound activation
 ticket. Failed pre-activation replacement restores the prior controller.
@@ -198,10 +203,10 @@ just test-tenant-lifecycle
 | `just admin-status` | Validate the local admin Deployment, Service, provider-specific effective RBAC, health, and typed API responses. |
 | `just admin-port-forward` | Forward `tenant-system/tenant-admin` to `127.0.0.1:8080` until interrupted. |
 | `just admin-fetch` | Fetch the locked workspace dependency graph. |
-| `just admin-generate-check` | Verify generated read-only admin resources are current. |
+| `just admin-generate-check` | Verify generated least-privilege admin lifecycle resources are current. |
 | `just admin-lint` | Run Rust formatting and Clippy for all admin crates. |
 | `just admin-test` | Run locked/offline tests for shared DTOs, Axum projection, and Leptos view logic. |
-| `just admin-metrics` | Report the separate admin production-Rust baseline and enforce the 7,500-line ceiling. |
+| `just admin-metrics` | Report the informational admin production-Rust baseline and delta. |
 | `just admin-package-check` | Build the static server and browser bundle twice offline and compare the exact output inventory. |
 | `just dev-bootstrap` | Prepare and bind a retained management context to the current user, host, Docker daemon, branch, revision, configuration, and exact management identity. |
 | `just dev-clean` | Run authoritative cleanup for retained tenant, management, runtime, and host state. |

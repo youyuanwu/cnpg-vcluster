@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 import unittest
 from pathlib import Path
+from subprocess import CompletedProcess
 from unittest.mock import patch
 
 from scripts.lib.azure.gate import (
@@ -10,7 +12,14 @@ from scripts.lib.azure.gate import (
     require_owned_resource_delta,
     require_replacement,
 )
-from scripts.test_azure_tenant_lifecycle import _ensure_tenant_ready
+from scripts.test_azure_tenant_lifecycle import (
+    _admin_create_tenant,
+    _admin_delete_tenant,
+    _admin_mutation,
+    _ensure_tenant_ready,
+    _require_allocation_lease_absent,
+    _require_recreated_identity,
+)
 
 
 VMSS = (
@@ -43,6 +52,122 @@ def readiness(identifiers=(0, 1, 2)):
 
 
 class AzureGateTests(unittest.TestCase):
+    def test_admin_mutation_uses_authenticated_json_transport(self) -> None:
+        config = CompletedProcess([], 0, "{}", "")
+        response = CompletedProcess(
+            [],
+            0,
+            json.dumps({"schemaVersion": 4, "data": {"state": "accepted"}}),
+            "",
+        )
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle._kubectl",
+                return_value=config,
+            ) as kubectl,
+            patch(
+                "scripts.test_azure_tenant_lifecycle.kubeconfig_json_request",
+                return_value=response,
+            ) as request,
+        ):
+            self.assertEqual(
+                {"state": "accepted"},
+                _admin_mutation("DELETE", "api/v1/tenants/tenant-c", {
+                    "uid": "uid-c",
+                    "confirmation": "tenant-c",
+                }),
+            )
+        self.assertIn("--flatten", kubectl.call_args.args)
+        request.assert_called_once()
+        self.assertEqual("DELETE", request.call_args.args[1])
+        self.assertEqual(
+            {"uid": "uid-c", "confirmation": "tenant-c"},
+            request.call_args.args[3],
+        )
+
+    def test_admin_lifecycle_responses_are_exact_and_credential_free(self) -> None:
+        spec = type(
+            "Spec",
+            (),
+            {
+                "name": "tenant-c",
+                "workers": 3,
+                "kubernetes_version": "1.32.13",
+            },
+        )()
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle._admin_mutation",
+                return_value={
+                    "identity": {
+                        "name": "tenant-c",
+                        "uid": "uid",
+                        "generation": True,
+                    },
+                    "provider": "azure",
+                    "kubernetesVersion": "1.32.13",
+                    "password": "forbidden",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "create response"),
+        ):
+            _admin_create_tenant(spec)
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle._admin_mutation",
+                return_value={
+                    "identity": {
+                        "name": "tenant-c",
+                        "uid": "uid",
+                        "generation": "bad",
+                    },
+                    "state": "accepted",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "delete response"),
+        ):
+            _admin_delete_tenant("tenant-c", "uid")
+
+    def test_recreated_identity_requires_new_nonempty_tenant_and_lease_uids(self):
+        valid = {
+            "metadata": {"uid": "tenant-new"},
+            "status": {
+                "provider": {
+                    "type": "azure",
+                    "networkAllocation": {"leaseUID": "lease-new"},
+                }
+            },
+        }
+        _require_recreated_identity(valid, "tenant-old", "lease-old")
+        for value in (None, "", "lease-old"):
+            invalid = json.loads(json.dumps(valid))
+            if value is None:
+                invalid["status"]["provider"]["networkAllocation"].pop("leaseUID")
+            else:
+                invalid["status"]["provider"]["networkAllocation"]["leaseUID"] = value
+            with self.subTest(value=value), self.assertRaisesRegex(
+                RuntimeError, "retained old identity"
+            ):
+                _require_recreated_identity(
+                    invalid,
+                    "tenant-old",
+                    "lease-old",
+                )
+
+    def test_allocation_release_proof_rejects_retained_lease(self):
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle._kubectl",
+                return_value=type(
+                    "Result",
+                    (),
+                    {"stdout": "lease.coordination.k8s.io/tenant-azure-slot-old\n"},
+                )(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "Lease remained"),
+        ):
+            _require_allocation_lease_absent("tenant-azure-slot-old")
+
     def test_ready_gate_reuses_parsed_spec_after_terminating_tenant(self) -> None:
         spec = type("Spec", (), {"name": "tenant-c"})()
         events = []
@@ -61,8 +186,12 @@ class AzureGateTests(unittest.TestCase):
                 side_effect=lambda *_args: events.append("absent"),
             ),
             patch(
-                "scripts.test_azure_tenant_lifecycle._create_tenant",
-                side_effect=lambda _config, observed: events.append(observed),
+                "scripts.test_azure_tenant_lifecycle._admin_create_tenant",
+                side_effect=lambda observed: events.append(observed),
+            ),
+            patch(
+                "scripts.test_azure_tenant_lifecycle.wait_tenant_ready",
+                side_effect=lambda *_args: events.append("ready"),
             ),
             patch(
                 "scripts.test_azure_tenant_lifecycle._require_status",
@@ -73,7 +202,7 @@ class AzureGateTests(unittest.TestCase):
                 {"classification": "ready"},
                 _ensure_tenant_ready({}, spec),
             )
-        self.assertEqual(["absent", spec], events)
+        self.assertEqual(["absent", spec, "ready"], events)
 
     def test_exact_mapping_checkpoint_and_non_primary_selection(self) -> None:
         snapshot = build_worker_snapshot(
@@ -202,7 +331,7 @@ class AzureGateTests(unittest.TestCase):
         self.assertIn("ordinary-tenant-deletion", source)
         self.assertIn("external-absence-proof", source)
         self.assertEqual(2, source.count("_source_sha256(spec_path)"))
-        self.assertEqual(2, source.count("_create_tenant(config, spec)"))
+        self.assertEqual(3, source.count("_admin_create_tenant"))
         self.assertNotIn('_tenant_command("create"', source)
         self.assertNotIn(".runtime", source)
         self.assertNotIn("checkpoint", source.lower())

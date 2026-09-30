@@ -27,7 +27,6 @@ EXPECTED_RBAC = {
             ("kamajicontrolplanes",),
             ("list",),
         ),
-        ("coordination.k8s.io", ("leases",), ("list",)),
         (
             "infrastructure.cluster.x-k8s.io",
             ("devclusters", "devmachines", "devmachinetemplates"),
@@ -185,23 +184,49 @@ class AdminResourceTests(unittest.TestCase):
                 self.assertNotEqual("*", group)
                 resources = tuple(rule["resources"])
                 verbs = tuple(rule["verbs"])
+                names = tuple(rule.get("resourceNames", []))
                 self.assertNotIn("*", resources)
                 self.assertTrue(
                     all("/" not in resource for resource in resources)
                 )
-                self.assertTrue(set(verbs).issubset({"get", "list"}))
                 if "secrets" in resources:
                     self.assertEqual("local", provider)
                     self.assertEqual(
                         ("", ("secrets",), ("get",)),
                         (group, resources, verbs),
                     )
-                actual.add((group, resources, verbs))
-            self.assertEqual(EXPECTED_RBAC[provider], actual)
+                actual.add((group, resources, verbs, names))
+            expected = {
+                (group, resources, verbs, ())
+                for group, resources, verbs in EXPECTED_RBAC[provider]
+                if group != "tenancy.cnpg-vcluster.io"
+            }
+            expected.update({
+                (
+                    "tenancy.cnpg-vcluster.io",
+                    ("tenants",),
+                    ("create", "delete", "get", "list"),
+                    (),
+                ),
+            })
+            self.assertEqual(expected, actual)
             self.assertEqual(
-                tuple(sorted(EXPECTED_RBAC[provider])),
+                tuple(sorted(expected)),
                 generator.provider_rules(ROOT, provider),
             )
+
+        controller_role = load("admin/config/rbac/controller-role.json")
+        self.assertEqual("Role", controller_role["kind"])
+        self.assertEqual("tenant-system", controller_role["metadata"]["namespace"])
+        self.assertEqual(
+            [{
+                "apiGroups": ["apps"],
+                "resourceNames": ["tenant-controller"],
+                "resources": ["deployments"],
+                "verbs": ["get"],
+            }],
+            controller_role["rules"],
+        )
 
     def test_deployments_are_provider_specific_and_hardened(self) -> None:
         images = set()

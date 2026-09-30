@@ -66,17 +66,6 @@
     },
     {
       "apiGroups": [
-        "coordination.k8s.io"
-      ],
-      "resources": [
-        "leases"
-      ],
-      "verbs": [
-        "list"
-      ]
-    },
-    {
-      "apiGroups": [
         "infrastructure.cluster.x-k8s.io"
       ],
       "resources": [
@@ -107,6 +96,8 @@
         "tenants"
       ],
       "verbs": [
+        "create",
+        "delete",
         "get",
         "list"
       ]

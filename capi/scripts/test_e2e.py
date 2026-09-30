@@ -23,12 +23,16 @@ from scripts.lib.redaction import redact
 from scripts.tools import verify_all_inputs
 from scripts.lib.timing import PhaseTimings
 from scripts.lib.registry import registry_name
-from scripts.lib.admin_local import verify_admin_api
+from scripts.lib.admin_local import (
+    create_tenant_via_admin,
+    delete_tenant_via_admin,
+    verify_admin_api,
+)
 from scripts.lib.controller_scenarios import (
-    delete_controller_tenant,
     tenant_from_document,
     tenant_snapshot,
     verify_allocation_released,
+    wait_tenant_absent,
     wait_tenant_ready,
 )
 from scripts.lib.tenants import export_tenant_kubeconfig
@@ -274,7 +278,6 @@ def run_e2e() -> int:
     }
     failure = None
     timings = PhaseTimings()
-    manifest = ROOT / "config" / "tenants" / "examples" / "local.yaml"
     tenant_name = "tenant-example"
     try:
         with timings.phase("tools_cache"):
@@ -292,7 +295,13 @@ def run_e2e() -> int:
             )
 
         with timings.phase("tenant_convergence"):
-            run_just(ROOT, config, "local-tenant-apply", str(manifest))
+            client = ManagementClient(ROOT, config)
+            create_tenant_via_admin(
+                client,
+                tenant_name,
+                workers=1,
+                databases=1,
+            )
             document = wait_tenant_ready(ROOT, config, tenant_name)
             verify_admin_api(
                 ManagementClient(ROOT, config),
@@ -313,7 +322,8 @@ def run_e2e() -> int:
         with timings.phase("tenant_deletion_finalization"):
             client = ManagementClient(ROOT, config)
             identity = capture_tenant_deletion_identity(config, client, document)
-            delete_controller_tenant(ROOT, config, identity["name"])
+            delete_tenant_via_admin(client, identity["name"], identity["uid"])
+            wait_tenant_absent(ROOT, config, identity["name"])
             verify_tenant_deletion(client, identity)
             verify_admin_api(client, expected_tenant_names=())
             print("exact Tenant/root/Lease/container/volume absence verified before management teardown")

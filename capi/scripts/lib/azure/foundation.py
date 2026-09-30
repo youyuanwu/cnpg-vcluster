@@ -18,7 +18,14 @@ from scripts.lib.admin import (
 )
 from scripts.lib.controller import (
     build_azure_controller_image,
+    require_empty_tenant_cutover,
+    require_tenant_api_cutover_ready,
     render_azure_controller_manager,
+    tenant_api_generation,
+    tenant_api_cutover_state,
+    tenant_crd_transition_document,
+    tenant_cutover_lock_cleanup_refs,
+    tenant_cutover_lock_documents,
 )
 
 ACR_PULL_ROLE_DEFINITION_ID = (
@@ -27,13 +34,18 @@ ACR_PULL_ROLE_DEFINITION_ID = (
 )
 TENANT_CONTROLLER_CONFIG = "tenant-azure-provider"
 TENANT_CONTROLLER_CONFIG_KEY = "provider.json"
+TENANT_ALLOCATION_CONFIG = "tenant-azure-allocation"
+TENANT_ALLOCATION_CONFIG_KEY = "slots.json"
+TENANT_ALLOCATION_APPROVAL = (
+    "tenancy.cnpg-vcluster.io/approved-allocation-sha256"
+)
 ADMIN_NAME = "tenant-admin"
 ADMIN_NAMESPACE = "tenant-system"
 ADMIN_SERVICE_PROXY = (
     "/api/v1/namespaces/tenant-system/"
     "services/http:tenant-admin:http/proxy"
 )
-ADMIN_API_SCHEMA_VERSION = 3
+ADMIN_API_SCHEMA_VERSION = 4
 CAPI_CAPZ_DEPLOYMENTS = (
     ("capi-system", "capi-controller-manager"),
     (
@@ -652,12 +664,546 @@ def _azure_provider_configuration(
     return provider
 
 
+def _azure_allocation_configuration(
+    root: Path,
+    config: Mapping[str, str],
+) -> tuple[dict[str, object], str, str]:
+    path = root / "config" / "azure" / "tenant-allocation-slots.json"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Azure Tenant allocation catalog is invalid: {exc}") from exc
+    if (
+        not isinstance(payload, dict)
+        or set(payload) != {"schema", "reservedCIDRs", "slots"}
+        or payload.get("schema") != 1
+        or not isinstance(payload.get("reservedCIDRs"), list)
+        or not isinstance(payload.get("slots"), list)
+        or not payload["slots"]
+    ):
+        raise RuntimeError("Azure Tenant allocation catalog has an invalid schema")
+    ids = set()
+    networks: list[tuple[str, ipaddress.IPv4Network]] = []
+    for slot in payload["slots"]:
+        if (
+            not isinstance(slot, dict)
+            or set(slot) != {"slotId", "podCIDR", "serviceCIDR"}
+            or not isinstance(slot.get("slotId"), str)
+            or re.fullmatch(r"[a-z0-9](?:[-a-z0-9]{0,61}[a-z0-9])?", slot["slotId"])
+            is None
+            or slot["slotId"] in ids
+        ):
+            raise RuntimeError("Azure Tenant allocation slot identity is invalid")
+        ids.add(slot["slotId"])
+        for field in ("podCIDR", "serviceCIDR"):
+            try:
+                network = ipaddress.ip_network(slot.get(field), strict=True)
+            except (TypeError, ValueError) as exc:
+                raise RuntimeError(
+                    f"Azure Tenant allocation slot {slot['slotId']} {field} is invalid"
+                ) from exc
+            if not isinstance(network, ipaddress.IPv4Network):
+                raise RuntimeError("Azure Tenant allocation networks must be IPv4")
+            if field == "serviceCIDR" and network.num_addresses <= 11:
+                raise RuntimeError("Azure Tenant Service CIDR is too small")
+            networks.append((f"{slot['slotId']} {field}", network))
+    management = [
+        (key, ipaddress.ip_network(config[key], strict=True))
+        for key in (
+            "AZURE_VNET_CIDR",
+            "AZURE_AKS_SUBNET_CIDR",
+            "AZURE_TENANT_SUBNET_CIDR",
+            "AZURE_AKS_POD_CIDR",
+            "AZURE_AKS_SERVICE_CIDR",
+        )
+    ]
+    if payload["reservedCIDRs"] != [str(network) for _, network in management]:
+        raise RuntimeError(
+            "Azure Tenant allocation reserved CIDRs do not match management configuration"
+        )
+    for index, (label, network) in enumerate(networks):
+        for other_label, other in networks[index + 1 :]:
+            if network.overlaps(other):
+                raise RuntimeError(
+                    f"Azure Tenant allocation networks overlap: {label} and {other_label}"
+                )
+        for management_label, management_network in management:
+            if network.overlaps(management_network):
+                raise RuntimeError(
+                    f"Azure Tenant allocation network {label} overlaps {management_label}"
+                )
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    digest = hashlib.sha256(raw.encode()).hexdigest()
+    if digest != config["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"]:
+        raise RuntimeError("Azure Tenant allocation catalog approval is missing or stale")
+    return payload, raw, digest
+
+
+def _azure_cutover_lock(root: Path, *, present: bool) -> None:
+    if present:
+        try:
+            for document in tenant_cutover_lock_documents():
+                _kubectl(
+                    root,
+                    "apply",
+                    "--server-side",
+                    "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                    "--force-conflicts",
+                    "-f",
+                    "-",
+                    input_text=json.dumps(document),
+                )
+        except Exception as failure:
+            try:
+                _azure_cutover_lock(root, present=False)
+            except Exception as cleanup:
+                failure.add_note(
+                    f"partial Azure Tenant cutover lock cleanup failed: {cleanup}"
+                )
+            raise
+        return
+    for resource in tenant_cutover_lock_cleanup_refs():
+        _kubectl(
+            root,
+            "delete",
+            resource,
+            "--ignore-not-found=true",
+            "--wait=true",
+        )
+
+
+def _azure_cutover_lock_present(root: Path) -> bool:
+    present = [
+        bool(_kubectl(
+            root, "get", resource, "--ignore-not-found=true", "-o", "name",
+        ).stdout.strip())
+        for resource in tenant_cutover_lock_cleanup_refs()
+    ]
+    if present[0] != present[1]:
+        raise RuntimeError("Azure Tenant cutover lock is partially installed")
+    return present[0]
+
+
+def _verify_azure_cutover_lock(root: Path, generation: str) -> None:
+    document = {
+        "apiVersion": f"tenancy.cnpg-vcluster.io/{generation}",
+        "kind": "Tenant",
+        "metadata": {"name": f"cutover-lock-probe-{uuid.uuid4().hex[:12]}"},
+        "spec": {
+            "kubernetesVersion": "1.36.4",
+            "workers": 1,
+            "provider": {"type": "local", "databases": 1},
+        },
+    }
+    for _ in range(5):
+        response = _kubectl(
+            root, "create", "--dry-run=server", "-f", "-",
+            input_text=json.dumps(document), check=False,
+        )
+        if (
+            response.returncode == 0
+            or "Tenant creation is locked during API cutover"
+            not in response.stderr
+        ):
+            raise RuntimeError("Azure Tenant cutover create lock is not effective")
+
+
+def _validated_azure_list(
+    payload: object,
+    api_version: str,
+    kind: str,
+) -> list[dict[str, object]]:
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("apiVersion") != api_version
+        or payload.get("kind") != f"{kind}List"
+        or not isinstance(metadata, dict)
+        or metadata.get("continue", "") != ""
+        or not isinstance(items, list)
+    ):
+        raise RuntimeError(f"Azure cutover {kind} inventory is malformed")
+    for item in items:
+        item_metadata = item.get("metadata") if isinstance(item, dict) else None
+        if (
+            item.get("apiVersion") != api_version
+            or item.get("kind") != kind
+            or not isinstance(item_metadata, dict)
+            or not isinstance(item_metadata.get("name"), str)
+            or not item_metadata["name"]
+            or not isinstance(item_metadata.get("uid"), str)
+            or not item_metadata["uid"]
+        ):
+            raise RuntimeError(f"Azure cutover {kind} inventory is invalid")
+    return items
+
+
+def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
+    tenants = json.loads(_kubectl(root, "get", "tenants", "-o", "json").stdout)
+    tenant_api_version = (
+        tenants.get("apiVersion") if isinstance(tenants, dict) else None
+    )
+    if (
+        not isinstance(tenant_api_version, str)
+        or not tenant_api_version.startswith("tenancy.cnpg-vcluster.io/")
+    ):
+        raise RuntimeError("Azure cutover Tenant inventory is malformed")
+    _validated_azure_list(tenants, tenant_api_version, "Tenant")
+    catalog = json.loads(
+        (root / "controller" / "config" / "azure-management-resources.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    resources = {}
+    for entry in catalog:
+        group = entry["apiVersion"].partition("/")[0] if "/" in entry["apiVersion"] else ""
+        resource = f"{entry['plural']}.{group}" if group else entry["plural"]
+        resources[resource] = (
+            entry["inventoryPolicy"],
+            entry["class"],
+            entry["kind"],
+            entry["apiVersion"],
+        )
+    resources["leases.coordination.k8s.io"] = (
+        "allocation-markers",
+        "typed",
+        "Lease",
+        "coordination.k8s.io/v1",
+    )
+    items = []
+    for resource, policy in sorted(resources.items()):
+        payload = json.loads(
+            _kubectl(root, "get", resource, "--all-namespaces", "-o", "json").stdout
+        )
+        inventory_policy, resource_class, kind, api_version = policy
+        items.extend(
+            (item, inventory_policy, resource_class, kind)
+            for item in _validated_azure_list(payload, api_version, kind)
+        )
+    owned_uids = set()
+    owned_namespaces = set()
+    shared_core_kinds = {
+        "Namespace", "ConfigMap", "Secret", "Deployment", "Job",
+        "Role", "RoleBinding", "PodDisruptionBudget",
+    }
+    for item, policy, resource_class, catalog_kind in items:
+        metadata = item.get("metadata", {})
+        annotations = metadata.get("annotations") or {}
+        labels = metadata.get("labels") or {}
+        if (
+            annotations.get("lifecycle.cnpg-vcluster.capi/profile") == "azure"
+            or annotations.get("lifecycle.cnpg-vcluster.capi/tenant")
+            or labels.get("cnpg-vcluster-tenant")
+            or str(metadata.get("name", "")).startswith("tenant-azure-slot-")
+            or (
+                policy == "block-any-instance"
+                and resource_class == "root"
+                and catalog_kind not in shared_core_kinds
+            )
+        ):
+            if metadata.get("uid"):
+                owned_uids.add(metadata["uid"])
+            if metadata.get("namespace"):
+                owned_namespaces.add(metadata["namespace"])
+            if item.get("kind") == "Namespace":
+                owned_namespaces.add(metadata.get("name"))
+    changed = True
+    while changed:
+        changed = False
+        for item, _, _, _ in items:
+            metadata = item.get("metadata", {})
+            if metadata.get("uid") in owned_uids:
+                continue
+            owners = metadata.get("ownerReferences") or []
+            if metadata.get("namespace") in owned_namespaces or any(
+                owner.get("uid") in owned_uids for owner in owners
+            ):
+                if metadata.get("uid"):
+                    owned_uids.add(metadata["uid"])
+                changed = True
+    residue = [
+        f"{item.get('kind', 'resource')}/{item.get('metadata', {}).get('name', '')}"
+        for item, _, _, _ in items
+        if item.get("metadata", {}).get("uid") in owned_uids
+    ]
+    return tenants, residue
+
+
+def _scale_azure_controller(
+    root: Path,
+    config: Mapping[str, str],
+    replicas: int,
+) -> None:
+    _kubectl(
+        root,
+        "-n",
+        "tenant-system",
+        "scale",
+        "deployment/tenant-controller",
+        f"--replicas={replicas}",
+    )
+    if replicas:
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "rollout",
+            "status",
+            "deployment/tenant-controller",
+            f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
+        )
+    else:
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "wait",
+            "--for=delete",
+            "pod",
+            "-l",
+            "app.kubernetes.io/name=tenant-controller",
+            f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
+        )
+
+
+def _prepare_azure_tenant_api_cutover(
+    root: Path,
+    config: Mapping[str, str],
+) -> bool:
+    observed = _get_management_resource(
+        root, None, "crd/tenants.tenancy.cnpg-vcluster.io"
+    )
+    if observed is None:
+        return _azure_cutover_lock_present(root)
+    generation = tenant_api_cutover_state(observed)
+    if generation == "v1alpha3":
+        return _azure_cutover_lock_present(root)
+    rendered = _kubectl(
+        root,
+        "create",
+        "--dry-run=client",
+        "-f",
+        str(
+            root
+            / "controller/config/crd/bases"
+            / "tenancy.cnpg-vcluster.io_tenants.yaml"
+        ),
+        "-o",
+        "json",
+    ).stdout
+    try:
+        desired = json.loads(rendered)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("generated Azure Tenant CRD is invalid") from exc
+    if not isinstance(desired, dict):
+        raise RuntimeError("generated Azure Tenant CRD is invalid")
+    transition = generation == "transitioning"
+    transition_document = (
+        None
+        if transition
+        else tenant_crd_transition_document(observed, desired)
+    )
+    acquired_lock = False
+    if transition:
+        if not _azure_cutover_lock_present(root):
+            raise RuntimeError("Azure Tenant CRD transition is missing its create lock")
+    else:
+        if not _azure_cutover_lock_present(root):
+            _azure_cutover_lock(root, present=True)
+            acquired_lock = True
+    try:
+        _verify_azure_cutover_lock(
+            root,
+            "v1alpha3" if transition else generation,
+        )
+        if not transition:
+            tenants, residue = _azure_cutover_inventory(root)
+            require_empty_tenant_cutover(tenants, residue)
+        _scale_azure_controller(root, config, 0)
+        tenants, residue = _azure_cutover_inventory(root)
+        require_empty_tenant_cutover(tenants, residue)
+        if not transition:
+            transition = True
+            _kubectl(
+                root,
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(transition_document),
+            )
+        _verify_azure_cutover_lock(root, "v1alpha3")
+        tenants, residue = _azure_cutover_inventory(root)
+        require_empty_tenant_cutover(tenants, residue)
+        _kubectl(
+            root,
+            "patch",
+            "crd/tenants.tenancy.cnpg-vcluster.io",
+            "--subresource=status",
+            "--type=merge",
+            "-p",
+            json.dumps({"status": {"storedVersions": ["v1alpha3"]}}),
+        )
+        _kubectl(
+            root,
+            "apply",
+            "--server-side",
+            "--field-manager=cnpg-vcluster-azure-controller",
+            "--force-conflicts",
+            "-f",
+            "-",
+            input_text=json.dumps(desired),
+        )
+        tenants, residue = _azure_cutover_inventory(root)
+        require_empty_tenant_cutover(tenants, residue)
+        return True
+    except Exception:
+        if not transition:
+            _scale_azure_controller(root, config, 1)
+            if acquired_lock:
+                _azure_cutover_lock(root, present=False)
+        raise
+
+
+def _verify_azure_cutover_probe(
+    root: Path,
+    config: Mapping[str, str],
+) -> None:
+    name = f"cutover-probe-{uuid.uuid4().hex[:12]}"
+    document = {
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
+        "kind": "Tenant",
+        "metadata": {"name": name},
+        "spec": {
+            "kubernetesVersion": config[
+                "AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"
+            ],
+            "workers": 1,
+            "provider": {"type": "azure"},
+        },
+    }
+    _kubectl(root, "create", "-f", "-", input_text=json.dumps(document))
+    deadline = time.monotonic() + parse_duration(config["AZURE_CONTROLLER_TIMEOUT"])
+    try:
+        while time.monotonic() < deadline:
+            tenant = json.loads(_kubectl(root, "get", f"tenant/{name}", "-o", "json").stdout)
+            allocation = tenant.get("status", {}).get("provider", {}).get(
+                "networkAllocation"
+            )
+            if isinstance(allocation, dict) and allocation.get("slotId"):
+                return
+            time.sleep(2)
+        raise RuntimeError("Azure Tenant cutover allocation probe timed out")
+    finally:
+        _kubectl(
+            root,
+            "delete",
+            f"tenant/{name}",
+            "--ignore-not-found=true",
+            "--wait=true",
+            f"--timeout={config['AZURE_TENANT_TIMEOUT']}",
+        )
+
+
+def _verify_azure_controller_allocation_readiness(
+    root: Path,
+    allocation_raw: str,
+    allocation_sha256: str,
+) -> None:
+    allocation = json.loads(
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "get",
+            f"configmap/{TENANT_ALLOCATION_CONFIG}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    if (
+        allocation.get("data", {}).get(TENANT_ALLOCATION_CONFIG_KEY)
+        != allocation_raw
+        or allocation.get("metadata", {}).get("annotations", {}).get(
+            TENANT_ALLOCATION_APPROVAL
+        )
+        != allocation_sha256
+    ):
+        raise RuntimeError("Azure Tenant allocation ConfigMap approval is not current")
+    for verb in ("create", "delete", "get", "list"):
+        allowed = _kubectl(
+            root,
+            "auth",
+            "can-i",
+            verb,
+            "leases.coordination.k8s.io",
+            "--as=system:serviceaccount:tenant-system:tenant-controller",
+            "--namespace=tenant-system",
+        ).stdout.strip()
+        if allowed != "yes":
+            raise RuntimeError(
+                f"Azure Tenant controller cannot {verb} allocation Leases"
+            )
+    pods = json.loads(
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "get",
+            "pods",
+            "-l",
+            "app.kubernetes.io/name=tenant-controller",
+            "-o",
+            "json",
+        ).stdout
+    ).get("items", [])
+    ready = [
+        pod
+        for pod in pods
+        if not pod.get("metadata", {}).get("deletionTimestamp")
+        and any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in pod.get("status", {}).get("conditions", [])
+        )
+    ]
+    if len(ready) != 1:
+        raise RuntimeError("Azure Tenant controller has no exact Ready Pod")
+    pod_name = ready[0]["metadata"]["name"]
+    _kubectl(
+        root,
+        "get",
+        "--raw",
+        f"/api/v1/namespaces/tenant-system/pods/{pod_name}:8081/proxy/readyz",
+    )
+    lease = json.loads(
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "get",
+            "lease/tenant-controller.tenancy.cnpg-vcluster.io",
+            "-o",
+            "json",
+        ).stdout
+    )
+    spec = lease.get("spec", {})
+    if not spec.get("holderIdentity") or not spec.get("renewTime"):
+        raise RuntimeError("Azure Tenant controller leader Lease is not active")
+
+
 def _install_tenant_controller(
     root: Path,
     config: Mapping[str, str],
     inventory: Mapping[str, object],
-) -> tuple[str, str]:
+) -> tuple[str, str, str]:
+    require_tenant_api_cutover_ready()
     image = _push_controller_image(root, config, inventory)
+    provider_config = _azure_provider_configuration(config, inventory, image)
+    _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(root, config)
+    cutover_locked = _prepare_azure_tenant_api_cutover(root, config)
     for path in (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
         root / "controller" / "config" / "crd" / "bases",
@@ -682,7 +1228,6 @@ def _install_tenant_controller(
         f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
         timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
     )
-    provider_config = _azure_provider_configuration(config, inventory, image)
     config_map = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -708,10 +1253,31 @@ def _install_tenant_controller(
         "-",
         input_text=json.dumps(config_map),
     )
+    allocation_config_map = {
+        "apiVersion": "v1",
+        "kind": "ConfigMap",
+        "metadata": {
+            "name": TENANT_ALLOCATION_CONFIG,
+            "namespace": "tenant-system",
+            "annotations": {TENANT_ALLOCATION_APPROVAL: allocation_sha256},
+        },
+        "data": {TENANT_ALLOCATION_CONFIG_KEY: allocation_raw},
+    }
+    _kubectl(
+        root,
+        "apply",
+        "--server-side",
+        "--field-manager=cnpg-vcluster-azure-controller",
+        "--force-conflicts",
+        "-f",
+        "-",
+        input_text=json.dumps(allocation_config_map),
+    )
     manager = render_azure_controller_manager(
         root,
         config["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
         image,
+        allocation_sha256,
     )
     _kubectl(
         root,
@@ -742,7 +1308,31 @@ def _install_tenant_controller(
     uid = observed.get("metadata", {}).get("uid")
     if not isinstance(uid, str) or not uid:
         raise RuntimeError("Azure provider configuration ConfigMap UID is absent")
-    return image, uid
+    allocation = _get_management_resource(
+        root,
+        "tenant-system",
+        f"configmap/{TENANT_ALLOCATION_CONFIG}",
+    )
+    allocation_uid = (
+        allocation.get("metadata", {}).get("uid")
+        if isinstance(allocation, dict)
+        else None
+    )
+    if not isinstance(allocation_uid, str) or not allocation_uid:
+        raise RuntimeError("Azure Tenant allocation ConfigMap UID is absent")
+    if cutover_locked:
+        _verify_azure_controller_allocation_readiness(
+            root,
+            allocation_raw,
+            allocation_sha256,
+        )
+        _azure_cutover_lock(root, present=False)
+        try:
+            _verify_azure_cutover_probe(root, config)
+        except Exception:
+            _azure_cutover_lock(root, present=True)
+            raise
+    return image, uid, allocation_uid
 
 
 def _admin_deployment_blockers(
@@ -891,27 +1481,34 @@ def _tracked_admin_resource(
 
 def _normalized_admin_rules(
     value: object,
-) -> list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] | None:
+) -> list[
+    tuple[
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+    ]
+] | None:
     if not isinstance(value, list):
         return None
     normalized = []
     for rule in value:
-        if not isinstance(rule, dict) or set(rule) != {
-            "apiGroups",
-            "resources",
-            "verbs",
-        }:
+        if not isinstance(rule, dict) or not set(rule).issubset({
+            "apiGroups", "resources", "verbs", "resourceNames",
+        }):
             return None
         groups = rule["apiGroups"]
         resources = rule["resources"]
         verbs = rule["verbs"]
+        names = rule.get("resourceNames", [])
         if (
             not isinstance(groups, list)
             or not isinstance(resources, list)
             or not isinstance(verbs, list)
+            or not isinstance(names, list)
             or not all(
                 isinstance(item, str)
-                for item in (*groups, *resources, *verbs)
+                for item in (*groups, *resources, *verbs, *names)
             )
         ):
             return None
@@ -920,6 +1517,7 @@ def _normalized_admin_rules(
                 tuple(sorted(groups)),
                 tuple(sorted(resources)),
                 tuple(sorted(verbs)),
+                tuple(sorted(names)),
             )
         )
     return sorted(normalized)
@@ -1017,7 +1615,7 @@ def _admin_authorization_blockers(root: Path) -> list[str]:
             ]
         try:
             review = json.loads(response.stdout)
-            validate_admin_effective_rules(root, "azure", review)
+            validate_admin_effective_rules(root, "azure", review, namespace)
         except (json.JSONDecodeError, RuntimeError) as exc:
             return [str(exc).replace("Tenant Admin", "Azure admin", 1)]
     return []
@@ -1399,7 +1997,7 @@ def create_management(root: Path, config: Mapping[str, str]) -> None:
             f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
             timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
         )
-    controller_image, provider_config_uid = _install_tenant_controller(
+    controller_image, provider_config_uid, allocation_config_uid = _install_tenant_controller(
         root,
         config,
         inventory,
@@ -1413,6 +2011,7 @@ def create_management(root: Path, config: Mapping[str, str]) -> None:
     updated["controllers"] = _controller_identities(root)
     updated["controllerImage"] = controller_image
     updated["azureProviderConfigUid"] = provider_config_uid
+    updated["azureAllocationConfigUid"] = allocation_config_uid
     updated["adminImage"] = admin_image
     updated["adminDeploymentUid"] = admin_deployment_uid
     _write_inventory(root, updated)
@@ -1475,6 +2074,7 @@ def load_inventory(
     for key in (
         "controllerImage",
         "azureProviderConfigUid",
+        "azureAllocationConfigUid",
         "adminImage",
         "adminDeploymentUid",
     ):
@@ -1535,6 +2135,7 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
         raise RuntimeError("Azure management controller inventory is incomplete")
     controller_image = inventory.get("controllerImage")
     provider_config_uid = inventory.get("azureProviderConfigUid")
+    allocation_config_uid = inventory.get("azureAllocationConfigUid")
     if (
         not isinstance(controller_image, str)
         or not re.fullmatch(
@@ -1544,12 +2145,15 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
         or not controller_image.startswith(f"{outputs['acrLoginServer']}/")
         or not isinstance(provider_config_uid, str)
         or not provider_config_uid
+        or not isinstance(allocation_config_uid, str)
+        or not allocation_config_uid
     ):
         raise RuntimeError("Azure Tenant controller inventory is incomplete")
     identity = {
         "foundationDefaultsSha256": str(inventory["foundationDefaultsSha256"]),
         "controllerImage": controller_image,
         "azureProviderConfigUid": provider_config_uid,
+        "azureAllocationConfigUid": allocation_config_uid,
         **{key: str(outputs[key]) for key in required_outputs},
         **{
             f"controller:{key}": str(value)
@@ -1930,6 +2534,36 @@ def _inspect_foundation(
                 observed_config = None
             if observed_config != _azure_provider_configuration(config, inventory):
                 blockers.append("Azure provider configuration changed")
+        allocation_config = _get_management_resource(
+            root,
+            "tenant-system",
+            f"configmap/{TENANT_ALLOCATION_CONFIG}",
+        )
+        if allocation_config is None:
+            blockers.append("Azure Tenant allocation ConfigMap is absent")
+        else:
+            if (
+                allocation_config.get("metadata", {}).get("uid")
+                != inventory.get("azureAllocationConfigUid")
+            ):
+                blockers.append("Azure Tenant allocation identity changed")
+            try:
+                _, expected_raw, expected_sha256 = _azure_allocation_configuration(
+                    root, config
+                )
+            except RuntimeError:
+                expected_raw = expected_sha256 = None
+            if (
+                allocation_config.get("data", {}).get(
+                    TENANT_ALLOCATION_CONFIG_KEY
+                )
+                != expected_raw
+                or allocation_config.get("metadata", {})
+                .get("annotations", {})
+                .get(TENANT_ALLOCATION_APPROVAL)
+                != expected_sha256
+            ):
+                blockers.append("Azure Tenant allocation configuration changed")
         webhook = _get_management_resource(
             root,
             None,

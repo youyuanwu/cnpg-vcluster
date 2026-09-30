@@ -1,27 +1,28 @@
 # Tenant API compatibility
 
-`tenancy.cnpg-vcluster.io/v1alpha2` is the only served and stored Tenant
-version. It is experimental and was redesigned in place from the earlier flat
-local shape to the provider-discriminated contract described below. This is a
-breaking change: there is no conversion or migration for old flat `v1alpha2`
-objects or `v1alpha1` Go-managed objects. Existing objects must be deleted and
-recreated, and the current installer requires unsupported legacy state to be
-removed manually. It verifies both `spec.versions` and
-`status.storedVersions`, then starts the manager with one immutable foundation
-snapshot and accepted configuration identity. Future incompatible changes
-require an explicit version transition rather than another in-place redesign.
+`tenancy.cnpg-vcluster.io/v1alpha3` is the only served and stored Tenant
+version. It intentionally replaces experimental `v1alpha2`; there is no
+conversion or migration. Existing objects must complete ordinary deletion
+before cutover. The installer denies new Tenant creation, verifies empty
+Tenant/provider inventories around old-controller shutdown, applies an
+in-place dual-version CRD with `v1alpha2` no longer served, rechecks emptiness,
+advances `status.storedVersions`, installs the single v1alpha3 generation,
+verifies the allocator-capable controller, and then removes the create lock.
+A request admitted through a lagging API server is retained and blocks
+completion rather than being deleted by CRD replacement. The installer
+verifies both `spec.versions` and `status.storedVersions`.
 
 A Tenant is cluster-scoped. Its immutable spec has common
 `kubernetesVersion` and `workers` fields plus exactly one tagged `provider`.
 The local variant contains `type: local` and `databases`; the Azure variant
-contains `type: azure`, `podCIDR`, and `serviceCIDR`. OpenAPI requires numeric
-three-part version syntax (optional leading `v`), integer counts from one to
-three, provider-specific fields, canonical IPv4 Azure networks, non-overlap,
-and an Azure Service CIDR no smaller than `/28`. CEL constrains the name to a
+contains only `type: azure`. OpenAPI requires numeric three-part version syntax
+(optional leading `v`), integer counts from one to three, and provider-specific
+fields. Azure networks come from the separately approved allocation catalog.
+CEL constrains the name to a
 1-30 character lowercase DNS label and compares the *whole literal spec* to
-`oldSelf.spec` on updates. The controller checks the supported version
-(`1.36.4`) separately and normalizes an initial `v` for the canonical spec
-hash. A `v` spelling change on an existing object is still prohibited by CEL.
+`oldSelf.spec` on updates. Each controller checks its configured supported version separately and
+normalizes an initial `v` for the canonical spec hash. A `v` spelling change
+on an existing object is still prohibited by CEL.
 Change a spec by ordinary DELETE and recreate, not by in-place update.
 
 The structural CRD prunes unsupported fields under
@@ -37,7 +38,8 @@ CIDR under `status.provider.allocation`, plus
 `status.provider.clusterUID`. Azure status contains the exact immutable
 foundation/specification binding, endpoint, management UIDs, kubeconfig
 UID/hash, VMSS and Node identities, add-on identities, provider descendants,
-and deletion barriers. Clients must compare `metadata.generation`,
+deletion barriers, and `networkAllocation` with slot, CIDRs, catalog
+UID/hash, and Lease name/UID. Clients must compare `metadata.generation`,
 `status.observedGeneration`, and the Ready condition's observed generation;
 do not depend on condition order, cached True conditions, or an internal
 reconciliation stage. A provider/status discriminator mismatch is invalid
@@ -52,13 +54,20 @@ exact read; finalizer conflicts wait for another reconciliation pass.
 Unchanged status/finalizer state is a no-op, and clearing allocation emits an
 explicit JSON `null`.
 
-Python resolves the tracked slot catalog and publishes a checksum-verified
-schema-3 foundation. One non-expiring namespaced allocation Lease claims the
+Python resolves the tracked local slot catalog and publishes a
+checksum-verified schema-3 foundation. One non-expiring namespaced allocation Lease claims the
 endpoint/Pod CIDR/Service CIDR tuple. Its exact name and markers bind Tenant
 UID, canonical spec hash, foundation hash and slot identity; a restart can
 recover a claim created before status publication. A missing, malformed,
 foreign, or changed status-bound claim fails closed during creation and
 nonterminal deletion. Leader election uses a distinct renewable Lease.
+
+Azure uses the same durable claim pattern with approved
+`tenant-azure-allocation` content and `tenant-azure-slot-*` Leases. Catalog
+validation covers every slot pair, reserved management networks, active-claim
+network overlap, and exact operator-approved hash. Existing recorded
+allocations remain observable and finalizable when the current catalog is
+missing or invalid; new allocation and repair writes fail closed.
 
 Static tenant resources are created when absent but are not continuously
 repaired or generically content-audited. Existing resources must retain exact

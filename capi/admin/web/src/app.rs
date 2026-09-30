@@ -1,19 +1,23 @@
 use leptos::prelude::*;
 use tenant_admin_shared::{
     API_SCHEMA_VERSION,
+    lifecycle::{
+        CreationCapability, TenantCreateResponse, TenantDeleteRequest, TenantDeleteResponse,
+        TenantDeleteState, TenantField, TenantFieldError,
+    },
     query::{
         AzureProviderView, ConditionStatus, DatabaseClusterObservation, DatabaseCondition,
         DatabaseInstanceObservation, DatabaseObservation, DatabaseObservationFreshness,
         DatabaseQueryRequest, DatabaseQueryResponse, DatabaseQueryResult, OverviewSnapshot,
-        ProviderSpecificationView, ProviderStatusView, TenantCondition, TenantSnapshot,
-        TenantSummary, TopologyGraph,
+        ProviderMode, ProviderSpecificationView, ProviderStatusView, TenantCondition,
+        TenantSnapshot, TenantSummary, TopologyGraph,
     },
     routes::{API_OVERVIEW_PATH, API_PREFIX},
 };
 use wasm_bindgen_futures::spawn_local;
 
 use crate::{
-    api::{get_envelope, post_envelope},
+    api::{delete_envelope, get_envelope, post_envelope},
     database_console::{
         DEFAULT_DATABASE, DEFAULT_SQL, QueryResultPresentation, format_query_duration,
         project_query_result, selectable_database_instances,
@@ -27,7 +31,14 @@ use crate::{
         node_kind_label, optional_text, provider_label, provider_mode_label,
         sort_database_instances,
     },
-    route::{AppRoute, parse_route, tenant_database_query_path, tenant_href},
+    lifecycle::{
+        CreateRecovery, DeleteRecovery, create_recovery, create_request, delete_enabled,
+        delete_recovery, requires_authoritative_read,
+    },
+    route::{
+        AppRoute, parse_route, tenant_create_path, tenant_database_query_path, tenant_delete_path,
+        tenant_href,
+    },
     topology::layout_graph,
 };
 
@@ -36,6 +47,14 @@ enum LoadState<T> {
     Loading,
     Ready(T),
     Error(UiError),
+}
+
+#[derive(Clone)]
+enum MutationState {
+    Idle,
+    Running,
+    Error(UiError),
+    Uncertain { message: String, href: String },
 }
 
 #[component]
@@ -50,7 +69,7 @@ pub fn App() -> impl IntoView {
                 <div class="site-header__inner">
                     <a class="brand" href="/">
                         "Tenant Admin"
-                        <span>"Read-only management view"</span>
+                        <span>"Tenant lifecycle and database administration"</span>
                     </a>
                 </div>
             </header>
@@ -86,7 +105,7 @@ fn OverviewPage() -> impl IntoView {
                     <p class="eyebrow">"Management cluster"</p>
                     <h1>"Tenant overview"</h1>
                     <p class="lede">
-                        "Live, sanitized status from the management Kubernetes API. Data changes only when this page is loaded or refreshed."
+                        "Create, inspect, and delete Tenants through the management Kubernetes API. Data changes only when this page is loaded or refreshed."
                     </p>
                 </div>
                 <RefreshButton state refresh/>
@@ -128,7 +147,7 @@ fn TenantPage(name: String) -> impl IntoView {
                     <p class="eyebrow">"Tenant detail"</p>
                     <h1>{name}</h1>
                     <p class="lede">
-                        "Specification, reconciliation status, live Tenant database metadata, management resources, and provider-neutral topology. Credentials are excluded from browser responses."
+                        "Specification, lifecycle controls, reconciliation status, live Tenant database metadata, management resources, and provider-neutral topology. Credentials are excluded from browser responses."
                     </p>
                 </div>
                 <RefreshButton state refresh/>
@@ -217,7 +236,9 @@ fn dashboard_view(mut data: OverviewSnapshot) -> AnyView {
         .sort_by(|left, right| left.name.cmp(&right.name));
     let counts = data.overview.tenants.clone();
     let components = data.overview.components;
-    let provider = provider_mode_label(data.overview.provider_mode);
+    let provider_mode = data.overview.provider_mode;
+    let creation = data.overview.creation;
+    let provider = provider_mode_label(provider_mode);
     let tenants = data.tenants;
 
     view! {
@@ -237,6 +258,8 @@ fn dashboard_view(mut data: OverviewSnapshot) -> AnyView {
                 <Metric label="Deleting" value=counts.deleting/>
             </div>
         </section>
+
+        <TenantCreatePanel provider=provider_mode capability=creation/>
 
         <section class="panel" aria-labelledby="tenants-heading">
             <div class="panel__header">
@@ -301,6 +324,184 @@ fn dashboard_view(mut data: OverviewSnapshot) -> AnyView {
         </section>
     }
     .into_any()
+}
+
+#[component]
+fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> impl IntoView {
+    let name = RwSignal::new(String::new());
+    let workers = RwSignal::new("1".to_owned());
+    let databases = RwSignal::new("1".to_owned());
+    let field_errors = RwSignal::new(Vec::<TenantFieldError>::new());
+    let state = RwSignal::new(MutationState::Idle);
+    let capability_available = capability.available;
+    let version = capability
+        .supported_kubernetes_version
+        .clone()
+        .unwrap_or_else(|| "Unavailable".into());
+    let unavailable_reason = capability.reason.clone();
+
+    let submit = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        if !capability_available || matches!(state.get(), MutationState::Running) {
+            return;
+        }
+        let request = match create_request(
+            provider,
+            &name.get_untracked(),
+            &workers.get_untracked(),
+            &databases.get_untracked(),
+        ) {
+            Ok(request) => request,
+            Err(errors) => {
+                field_errors.set(errors);
+                return;
+            }
+        };
+        field_errors.set(Vec::new());
+        state.set(MutationState::Running);
+        spawn_local(async move {
+            match post_envelope::<_, TenantCreateResponse>(tenant_create_path(), &request).await {
+                Ok(response) => navigate_to_tenant(&response.identity.name),
+                Err(error) if requires_authoritative_read(error.kind) => {
+                    match fetch_tenant_page(&request.name).await {
+                        Ok(_) => match create_recovery(true) {
+                            CreateRecovery::InspectExisting => {
+                                state.set(MutationState::Uncertain {
+                                    message: "A Tenant with this name exists after an uncertain create response. Inspect its current identity and specification before retrying.".into(),
+                                    href: tenant_href(&request.name).unwrap_or_else(|| "/".into()),
+                                });
+                            }
+                            CreateRecovery::PreserveError => unreachable!(),
+                        },
+                        Err(observed) if observed.kind == UiErrorKind::NotFound => {
+                            state.set(MutationState::Error(error));
+                        }
+                        Err(_) => state.set(MutationState::Error(UiError {
+                            kind: UiErrorKind::Conflict,
+                            message: format!(
+                                "The create outcome is uncertain. Inspect Tenant {} before retrying.",
+                                request.name
+                            ),
+                            retryable: false,
+                            field_errors: Vec::new(),
+                        })),
+                    }
+                }
+                Err(error) => {
+                    field_errors.set(error.field_errors.clone());
+                    state.set(MutationState::Error(error));
+                }
+            }
+        });
+    };
+
+    view! {
+        <section class="panel lifecycle-panel" aria-labelledby="create-tenant-heading">
+            <div class="panel__header">
+                <div>
+                    <h2 id="create-tenant-heading">"Create Tenant"</h2>
+                    <p>"Submit one immutable Tenant request to the active lifecycle controller."</p>
+                </div>
+            </div>
+            {unavailable_reason.map(|reason| view! {
+                <div class="lifecycle-notice" role="status">
+                    <strong>"Creation unavailable"</strong>
+                    <p>{reason}</p>
+                </div>
+            })}
+            <form class="lifecycle-form" novalidate=true on:submit=submit>
+                <div class="form-field">
+                    <label for="tenant-create-name">"Tenant name"</label>
+                    <input
+                        id="tenant-create-name"
+                        type="text"
+                        maxlength="30"
+                        disabled=move || !capability_available || matches!(state.get(), MutationState::Running)
+                        aria-describedby="tenant-create-name-error"
+                        on:input=move |event| name.set(event_target_value(&event))
+                    />
+                    <FieldError id="tenant-create-name-error" errors=field_errors field=TenantField::Name/>
+                </div>
+                <div class="form-field">
+                    <label for="tenant-create-workers">"Workers"</label>
+                    <input
+                        id="tenant-create-workers"
+                        type="number"
+                        min="1"
+                        max="3"
+                        value="1"
+                        disabled=move || !capability_available || matches!(state.get(), MutationState::Running)
+                        aria-describedby="tenant-create-workers-error"
+                        on:input=move |event| workers.set(event_target_value(&event))
+                    />
+                    <FieldError id="tenant-create-workers-error" errors=field_errors field=TenantField::Workers/>
+                </div>
+                {matches!(provider, ProviderMode::Local).then(|| view! {
+                    <div class="form-field">
+                        <label for="tenant-create-databases">"Databases"</label>
+                        <input
+                            id="tenant-create-databases"
+                            type="number"
+                            min="1"
+                            max="3"
+                            value="1"
+                            disabled=move || !capability_available || matches!(state.get(), MutationState::Running)
+                            aria-describedby="tenant-create-databases-error"
+                            on:input=move |event| databases.set(event_target_value(&event))
+                        />
+                        <FieldError id="tenant-create-databases-error" errors=field_errors field=TenantField::Databases/>
+                    </div>
+                })}
+                <div class="form-field">
+                    <span class="form-label">"Kubernetes version"</span>
+                    <strong>{version}</strong>
+                </div>
+                <div class="form-actions">
+                    <button
+                        type="submit"
+                        disabled=move || !capability_available || matches!(state.get(), MutationState::Running)
+                    >
+                        {move || if matches!(state.get(), MutationState::Running) {
+                            "Creating…"
+                        } else {
+                            "Create Tenant"
+                        }}
+                    </button>
+                </div>
+                <div aria-live="polite">
+                    {move || match state.get() {
+                        MutationState::Error(error) => Some(view! {
+                            <p class="form-error" role="alert">{error.message}</p>
+                        }.into_any()),
+                        MutationState::Running => Some(view! {
+                            <p class="secondary" role="status">"Submitting Tenant creation…"</p>
+                        }.into_any()),
+                        MutationState::Uncertain { message, href } => Some(view! {
+                            <p class="form-error" role="alert">
+                                {message}
+                                " "
+                                <a href=href>"Inspect Tenant"</a>
+                            </p>
+                        }.into_any()),
+                        MutationState::Idle => None,
+                    }}
+                </div>
+            </form>
+        </section>
+    }
+}
+
+#[component]
+fn FieldError(
+    id: &'static str,
+    errors: RwSignal<Vec<TenantFieldError>>,
+    field: TenantField,
+) -> impl IntoView {
+    view! {
+        <p id=id class="field-error">
+            {move || errors.get().into_iter().find(|error| error.field == field).map(|error| error.message)}
+        </p>
+    }
 }
 
 #[component]
@@ -387,6 +588,7 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
     let status_class = classification_class(classification);
     let provider_specification = detail.specification.provider.clone();
     let provider_status = detail.provider_status.clone();
+    let tenant_uid = detail.uid.clone();
     let generation_status = match detail.observed_generation {
         Some(observed) if observed == detail.generation => {
             format!("Current (generation {})", detail.generation)
@@ -432,6 +634,8 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
 
         {database_panel(tenant_name, database)}
 
+        <TenantDeletePanel name=summary.name.clone() uid=tenant_uid/>
+
         <div class="detail-grid">
             <section class="panel" aria-labelledby="specification-heading">
                 <h2 id="specification-heading">"Immutable specification"</h2>
@@ -466,6 +670,141 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
         {topology_panel(topology)}
     }
     .into_any()
+}
+
+#[component]
+fn TenantDeletePanel(name: String, uid: String) -> impl IntoView {
+    let confirmation = RwSignal::new(String::new());
+    let state = RwSignal::new(MutationState::Idle);
+    let requested_name = name.clone();
+    let requested_uid = uid.clone();
+    let submit = move |event: leptos::ev::SubmitEvent| {
+        event.prevent_default();
+        if !delete_enabled(
+            &requested_name,
+            &confirmation.get_untracked(),
+            matches!(state.get_untracked(), MutationState::Running),
+        ) {
+            return;
+        }
+        state.set(MutationState::Running);
+        let name = requested_name.clone();
+        let uid = requested_uid.clone();
+        spawn_local(async move {
+            let Some(path) = tenant_delete_path(&name) else {
+                state.set(MutationState::Error(UiError {
+                    kind: UiErrorKind::InvalidRequest,
+                    message: "The Tenant name is invalid.".into(),
+                    retryable: false,
+                    field_errors: Vec::new(),
+                }));
+                return;
+            };
+            let request = TenantDeleteRequest {
+                uid: uid.clone(),
+                confirmation: name.clone(),
+            };
+            match delete_envelope::<_, TenantDeleteResponse>(&path, &request).await {
+                Ok(response) => match response.state {
+                    TenantDeleteState::Completed => navigate_to_overview(),
+                    TenantDeleteState::Accepted => reload_page(),
+                },
+                Err(error) if requires_authoritative_read(error.kind) => {
+                    match fetch_tenant_page(&name).await {
+                        Ok(snapshot) => match delete_recovery(
+                            &uid,
+                            Some((
+                                &snapshot.identity.uid,
+                                snapshot.detail.summary.classification,
+                            )),
+                        ) {
+                            DeleteRecovery::StaleIdentity => state
+                                .set(MutationState::Error(UiError {
+                                kind: UiErrorKind::StaleIdentity,
+                                message:
+                                    "A replacement Tenant now uses this name; it was not deleted."
+                                        .into(),
+                                retryable: false,
+                                field_errors: Vec::new(),
+                            })),
+                            DeleteRecovery::Reload => reload_page(),
+                            DeleteRecovery::Overview => navigate_to_overview(),
+                            DeleteRecovery::InspectCurrent => reload_page(),
+                        },
+                        Err(observed) if observed.kind == UiErrorKind::NotFound => {
+                            match delete_recovery(&uid, None) {
+                                DeleteRecovery::Overview => navigate_to_overview(),
+                                _ => unreachable!(),
+                            }
+                        }
+                        Err(_) => state.set(MutationState::Error(error)),
+                    }
+                }
+                Err(error) => state.set(MutationState::Error(error)),
+            }
+        });
+    };
+    let button_name = name.clone();
+
+    view! {
+        <section class="panel lifecycle-panel lifecycle-panel--danger" aria-labelledby="delete-tenant-heading">
+            <div class="panel__header">
+                <div>
+                    <h2 id="delete-tenant-heading">"Delete Tenant"</h2>
+                    <p>"Deletion is asynchronous and permanently removes the Tenant's owned infrastructure and databases."</p>
+                </div>
+            </div>
+            <div class="destructive-warning" role="alert">
+                <strong>"Destructive administrator action"</strong>
+                <p>"Type the exact Tenant name to confirm. A stale page cannot delete a same-name replacement."</p>
+            </div>
+            <form class="lifecycle-form" on:submit=submit>
+                <div class="form-field">
+                    <label for="tenant-delete-confirmation">
+                        {format!("Type {name} to confirm")}
+                    </label>
+                    <input
+                        id="tenant-delete-confirmation"
+                        type="text"
+                        autocomplete="off"
+                        disabled=move || matches!(state.get(), MutationState::Running)
+                        on:input=move |event| confirmation.set(event_target_value(&event))
+                    />
+                </div>
+                <div class="form-actions">
+                    <button
+                        class="button--danger"
+                        type="submit"
+                        disabled=move || !delete_enabled(
+                            &button_name,
+                            &confirmation.get(),
+                            matches!(state.get(), MutationState::Running),
+                        )
+                    >
+                        {move || if matches!(state.get(), MutationState::Running) {
+                            "Deleting…"
+                        } else {
+                            "Delete Tenant"
+                        }}
+                    </button>
+                </div>
+                <div aria-live="polite">
+                    {move || match state.get() {
+                        MutationState::Error(error) => Some(view! {
+                            <p class="form-error" role="alert">{error.message}</p>
+                        }.into_any()),
+                        MutationState::Running => Some(view! {
+                            <p class="secondary" role="status">"Submitting Tenant deletion…"</p>
+                        }.into_any()),
+                        MutationState::Uncertain { message, href } => Some(view! {
+                            <p class="form-error" role="alert">{message}" "<a href=href>"Inspect Tenant"</a></p>
+                        }.into_any()),
+                        MutationState::Idle => None,
+                    }}
+                </div>
+            </form>
+        </section>
+    }
 }
 
 const MAX_DATABASE_CONDITIONS: usize = 8;
@@ -729,6 +1068,7 @@ fn DatabaseConsole(tenant: String, instances: Vec<DatabaseInstanceObservation>) 
                 kind: UiErrorKind::InvalidRequest,
                 message: "The Tenant name is not valid.".to_owned(),
                 retryable: false,
+                field_errors: Vec::new(),
             }));
             return;
         };
@@ -1168,12 +1508,8 @@ fn provider_specification_rows(specification: ProviderSpecificationView) -> AnyV
             <dd>{format!("{databases} local database{}", plural(databases))}</dd>
         }
         .into_any(),
-        ProviderSpecificationView::Azure {
-            pod_cidr,
-            service_cidr,
-        } => view! {
-            <dt>"Pod CIDR"</dt><dd>{pod_cidr}</dd>
-            <dt>"Service CIDR"</dt><dd>{service_cidr}</dd>
+        ProviderSpecificationView::Azure => view! {
+            <dt>"Provider configuration"</dt><dd>"Controller-managed Azure networking"</dd>
         }
         .into_any(),
         ProviderSpecificationView::Unknown { provider_type } => view! {
@@ -1294,7 +1630,7 @@ fn provider_panel(status: ProviderStatusView) -> AnyView {
                     }
                     .into_any()
                 }
-                ProviderStatusView::Azure(azure) => azure_provider_view(azure),
+                ProviderStatusView::Azure(azure) => azure_provider_view(*azure),
                 ProviderStatusView::Unknown(unknown) => view! {
                     <dl class="definition-list">
                         <dt>"Provider type"</dt><dd>{unknown.provider_type}</dd>
@@ -1326,6 +1662,15 @@ fn azure_provider_view(mut azure: AzureProviderView) -> AnyView {
             </dl>
         }
     });
+    let allocation = azure.allocation.map(|allocation| {
+        view! {
+            <dl class="definition-list">
+                <dt>"Slot"</dt><dd>{allocation.slot_id}</dd>
+                <dt>"Pod CIDR"</dt><dd>{allocation.pod_cidr}</dd>
+                <dt>"Service CIDR"</dt><dd>{allocation.service_cidr}</dd>
+            </dl>
+        }
+    });
     let worker_pool = azure.worker_pool.map(|pool| view! {
         <dl class="definition-list">
             <dt>"Name"</dt><dd>{pool.name}</dd>
@@ -1354,6 +1699,12 @@ fn azure_provider_view(mut azure: AzureProviderView) -> AnyView {
                 {worker_pool
                     .map(|view| view.into_any())
                     .unwrap_or_else(|| view! { <p>"Worker pool is not available yet."</p> }.into_any())}
+            </div>
+            <div>
+                <h3>"Network allocation"</h3>
+                {allocation
+                    .map(|view| view.into_any())
+                    .unwrap_or_else(|| view! { <p>"Network allocation is not available yet."</p> }.into_any())}
             </div>
             <div>
                 <h3>"Management identities"</h3>
@@ -1621,12 +1972,27 @@ async fn fetch_dashboard() -> Result<OverviewSnapshot, UiError> {
     get_envelope(API_OVERVIEW_PATH).await
 }
 
+fn navigate_to_tenant(name: &str) {
+    if let Some(href) = tenant_href(name) {
+        let _ = web_sys::window().map(|window| window.location().set_href(&href));
+    }
+}
+
+fn navigate_to_overview() {
+    let _ = web_sys::window().map(|window| window.location().set_href("/"));
+}
+
+fn reload_page() {
+    let _ = web_sys::window().map(|window| window.location().reload());
+}
+
 async fn fetch_tenant_page(name: &str) -> Result<TenantSnapshot, UiError> {
     let Some(href) = tenant_href(name) else {
         return Err(UiError {
             kind: UiErrorKind::InvalidRequest,
             message: "The Tenant name is not valid.".to_owned(),
             retryable: false,
+            field_errors: Vec::new(),
         });
     };
     let detail_path = format!("{API_PREFIX}{href}");

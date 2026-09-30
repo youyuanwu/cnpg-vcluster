@@ -1,0 +1,24 @@
+{
+  "apiVersion": "rbac.authorization.k8s.io/v1",
+  "kind": "Role",
+  "metadata": {
+    "name": "tenant-admin-controller-capability",
+    "namespace": "tenant-system"
+  },
+  "rules": [
+    {
+      "apiGroups": [
+        "apps"
+      ],
+      "resourceNames": [
+        "tenant-controller"
+      ],
+      "resources": [
+        "deployments"
+      ],
+      "verbs": [
+        "get"
+      ]
+    }
+  ]
+}

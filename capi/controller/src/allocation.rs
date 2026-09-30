@@ -22,10 +22,12 @@ use crate::{
 };
 
 const PREFIX: &str = "tenant-slot-";
-const SLOT_LABEL: &str = "tenancy.cnpg-vcluster.io/slot-id";
-const ENDPOINT_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/endpoint";
-const POD_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/pod-cidr";
-const SERVICE_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/service-cidr";
+const AZURE_PREFIX: &str = "tenant-azure-slot-";
+pub(crate) const SLOT_LABEL: &str = "tenancy.cnpg-vcluster.io/slot-id";
+pub(crate) const ENDPOINT_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/endpoint";
+pub(crate) const POD_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/pod-cidr";
+pub(crate) const SERVICE_CIDR_ANNOTATION: &str = "tenancy.cnpg-vcluster.io/service-cidr";
+pub(crate) const AZURE_CATALOG_UID_LABEL: &str = "tenancy.cnpg-vcluster.io/allocation-catalog-uid";
 
 #[derive(Clone, Copy)]
 pub struct ClaimContext<'a> {
@@ -101,7 +103,12 @@ pub enum ReleaseDecision {
 #[must_use]
 pub fn lease_name(slot_id: &str) -> String {
     let digest = hex::encode(Sha256::digest(slot_id.as_bytes()));
-    format!("{PREFIX}{}", &digest[..63 - PREFIX.len()])
+    let prefix = if slot_id.starts_with("azure-") {
+        AZURE_PREFIX
+    } else {
+        PREFIX
+    };
+    format!("{prefix}{}", &digest[..63 - prefix.len()])
 }
 
 fn status_matches(slot: &AllocationSlot, status: &AllocationStatus) -> bool {
@@ -321,32 +328,25 @@ pub fn recover_allocation(
         .transpose()
 }
 
-fn validate_successor(
-    context: &ClaimContext<'_>,
-    lease: &Lease,
-    leases: &[Lease],
-    allocation: &AllocationStatus,
-) -> Result<(), AllocationError> {
+#[rustfmt::skip]
+fn validate_successor(context: &ClaimContext<'_>, lease: &Lease, leases: &[Lease],
+    allocation: &AllocationStatus) -> Result<(), AllocationError> {
+    let rotated = context.ownership_label == AZURE_CATALOG_UID_LABEL;
+    let lab_prefix = if rotated { lease.metadata.labels.as_ref().and_then(|labels| labels.get(context.ownership_label))
+        .map(String::as_str).filter(|value| !value.is_empty()).ok_or_else(||
+            AllocationError::Claim(lease.metadata.name.clone().unwrap_or_default()))? } else { context.lab_prefix };
+    let foundation_hash = if rotated { annotation(lease, FOUNDATION_ANNOTATION)? } else { context.foundation_hash };
     let successor = ClaimContext {
-        tenant_name: annotation(lease, TENANT_ANNOTATION)?,
-        tenant_uid: annotation(lease, TENANT_UID_ANNOTATION)?,
-        spec_hash: annotation(lease, SPEC_HASH_ANNOTATION)?,
-        ..*context
+        lab_prefix, tenant_name: annotation(lease, TENANT_ANNOTATION)?,
+        tenant_uid: annotation(lease, TENANT_UID_ANNOTATION)?, spec_hash: annotation(lease, SPEC_HASH_ANNOTATION)?, foundation_hash, ..*context
     };
-    valid_identity(&successor)?;
-    validate_claim(&successor, allocation, lease)?;
-    if leases
-        .iter()
-        .filter(|lease| {
-            annotation(lease, TENANT_UID_ANNOTATION).is_ok_and(|uid| uid == successor.tenant_uid)
-        })
-        .count()
-        != 1
-    {
-        return Err(AllocationError::Duplicate);
-    }
+    valid_identity(&successor)?; validate_claim(&successor, allocation, lease)?;
+    if leases.iter().filter(|lease| annotation(lease, TENANT_UID_ANNOTATION)
+        .is_ok_and(|uid| uid == successor.tenant_uid)).count() != 1 { return Err(AllocationError::Duplicate); }
     Ok(())
 }
+#[rustfmt::skip]
+fn successor_allocation(context: &ClaimContext<'_>, lease: &Lease, bound: &AllocationStatus) -> Result<AllocationStatus, AllocationError> { if context.ownership_label == AZURE_CATALOG_UID_LABEL { annotated_allocation(lease) } else { Ok(bound.clone()) } }
 
 fn matching_claim<'a, 'b>(
     context: &'b ClaimContext<'_>,
@@ -477,7 +477,8 @@ pub fn decide_release(
                 && all_old_residue_absent
                 && existing.is_none()
             {
-                validate_successor(context, lease, leases, bound)?;
+                let successor = successor_allocation(context, lease, bound)?;
+                validate_successor(context, lease, leases, &successor)?;
                 return Ok(ReleaseDecision::Complete);
             }
             let verified = validate_claim(context, bound, lease)?;

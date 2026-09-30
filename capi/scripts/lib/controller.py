@@ -31,7 +31,354 @@ if TYPE_CHECKING:
 CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
+TENANT_CUTOVER_POLICY = "tenant-api-cutover-create-lock"
+TENANT_API_CUTOVER_READY = True
 STATIC_MANAGER_FLAGS = ("-C", "target-feature=+crt-static")
+
+
+def tenant_cutover_lock_documents() -> list[dict[str, object]]:
+    policy = {
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicy",
+        "metadata": {"name": TENANT_CUTOVER_POLICY},
+        "spec": {
+            "failurePolicy": "Fail",
+            "matchConstraints": {
+                "resourceRules": [
+                    {
+                        "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                        "apiVersions": ["v1alpha2", "v1alpha3"],
+                        "operations": ["CREATE"],
+                        "resources": ["tenants"],
+                        "scope": "Cluster",
+                    }
+                ]
+            },
+            "validations": [
+                {
+                    "expression": "false",
+                    "message": "Tenant creation is locked during API cutover",
+                }
+            ],
+        },
+    }
+    binding = {
+        "apiVersion": "admissionregistration.k8s.io/v1",
+        "kind": "ValidatingAdmissionPolicyBinding",
+        "metadata": {"name": TENANT_CUTOVER_POLICY},
+        "spec": {
+            "policyName": TENANT_CUTOVER_POLICY,
+            "validationActions": ["Deny"],
+        },
+    }
+    return [policy, binding]
+
+
+def tenant_cutover_lock_cleanup_refs() -> tuple[str, str]:
+    return (
+        f"validatingadmissionpolicybinding/{TENANT_CUTOVER_POLICY}",
+        f"validatingadmissionpolicy/{TENANT_CUTOVER_POLICY}",
+    )
+
+
+def require_empty_tenant_cutover(
+    tenants: object,
+    provider_residue: list[str],
+) -> None:
+    items = tenants.get("items") if isinstance(tenants, dict) else None
+    if not isinstance(items, list):
+        raise RuntimeError("Tenant cutover inventory is invalid")
+    if items:
+        raise RuntimeError("retained Tenants block Tenant API cutover")
+    if provider_residue:
+        raise RuntimeError(
+            "provider residue blocks Tenant API cutover: "
+            + ", ".join(sorted(provider_residue))
+        )
+
+
+def tenant_api_generation(crd: object) -> str:
+    if not isinstance(crd, dict):
+        raise RuntimeError("Tenant CRD inventory is invalid")
+    versions = crd.get("spec", {}).get("versions")
+    stored = crd.get("status", {}).get("storedVersions")
+    if not isinstance(versions, list) or len(versions) != 1:
+        raise RuntimeError("Tenant CRD version inventory is invalid")
+    version = versions[0]
+    name = version.get("name") if isinstance(version, dict) else None
+    if (
+        name not in {"v1alpha2", "v1alpha3"}
+        or version.get("served") is not True
+        or version.get("storage") is not True
+        or stored != [name]
+    ):
+        raise RuntimeError("Tenant CRD generation is inconsistent")
+    return name
+
+
+def require_tenant_cutover_double_check(
+    first_tenants: object,
+    second_tenants: object,
+    provider_residue: list[str],
+) -> None:
+    require_empty_tenant_cutover(first_tenants, provider_residue)
+    require_empty_tenant_cutover(second_tenants, provider_residue)
+
+
+def tenant_api_cutover_state(crd: object) -> str:
+    if not isinstance(crd, dict):
+        raise RuntimeError("Tenant CRD inventory is invalid")
+    versions = crd.get("spec", {}).get("versions")
+    stored = crd.get("status", {}).get("storedVersions")
+    if not isinstance(versions, list) or not isinstance(stored, list):
+        raise RuntimeError("Tenant CRD version inventory is invalid")
+    names = {
+        version.get("name")
+        for version in versions
+        if isinstance(version, dict)
+    }
+    if names == {"v1alpha2", "v1alpha3"} and stored in (
+        ["v1alpha2"],
+        ["v1alpha2", "v1alpha3"],
+        ["v1alpha3"],
+    ):
+        return "transitioning"
+    return tenant_api_generation(crd)
+
+
+def tenant_crd_transition_document(
+    observed: dict[str, object],
+    desired: dict[str, object],
+) -> dict[str, object]:
+    if tenant_api_generation(observed) != "v1alpha2":
+        raise RuntimeError("Tenant CRD transition source is invalid")
+    if tenant_api_generation({
+        **desired,
+        "status": {"storedVersions": ["v1alpha3"]},
+    }) != "v1alpha3":
+        raise RuntimeError("Tenant CRD transition target is invalid")
+    old = json.loads(json.dumps(observed["spec"]["versions"][0]))
+    old["served"] = False
+    old["storage"] = False
+    transition = json.loads(json.dumps(desired))
+    transition["spec"]["versions"] = [
+        old,
+        transition["spec"]["versions"][0],
+    ]
+    return transition
+
+
+def desired_tenant_crd(
+    root: Path,
+    client: ManagementClient,
+) -> dict[str, object]:
+    rendered = client.kubectl(
+        "create",
+        "--dry-run=client",
+        "-f",
+        str(
+            root
+            / "controller/config/crd/bases"
+            / "tenancy.cnpg-vcluster.io_tenants.yaml"
+        ),
+        "-o",
+        "json",
+    ).stdout
+    try:
+        document = json.loads(rendered)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("generated Tenant CRD is invalid") from exc
+    if not isinstance(document, dict):
+        raise RuntimeError("generated Tenant CRD is invalid")
+    return document
+
+
+def require_tenant_api_cutover_ready() -> None:
+    if not TENANT_API_CUTOVER_READY:
+        raise RuntimeError(
+            "Tenant API v1alpha3 activation is blocked until the Azure allocation lifecycle is complete"
+        )
+
+
+def apply_tenant_cutover_lock(
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    try:
+        for document in tenant_cutover_lock_documents():
+            client.kubectl(
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(document),
+            )
+    except Exception as failure:
+        try:
+            remove_tenant_cutover_lock(config, client)
+        except Exception as cleanup:
+            failure.add_note(f"partial Tenant cutover lock cleanup failed: {cleanup}")
+        raise
+
+
+def tenant_cutover_lock_present(client: ManagementClient) -> bool:
+    present = []
+    for resource in tenant_cutover_lock_cleanup_refs():
+        present.append(bool(client.kubectl(
+            "get", resource, "--ignore-not-found=true", "-o", "name",
+        ).stdout.strip()))
+    if present[0] != present[1]:
+        raise RuntimeError("Tenant cutover lock is partially installed")
+    return present[0]
+
+
+def verify_tenant_cutover_lock(client: ManagementClient, generation: str) -> None:
+    document = {
+        "apiVersion": f"tenancy.cnpg-vcluster.io/{generation}",
+        "kind": "Tenant",
+        "metadata": {"name": f"cutover-lock-probe-{uuid.uuid4().hex[:12]}"},
+        "spec": {
+            "kubernetesVersion": "1.36.4",
+            "workers": 1,
+            "provider": {"type": "local", "databases": 1},
+        },
+    }
+    for _ in range(5):
+        response = client.kubectl(
+            "create", "--dry-run=server", "-f", "-",
+            input_text=json.dumps(document), check=False,
+        )
+        if (
+            response.returncode == 0
+            or "Tenant creation is locked during API cutover"
+            not in response.stderr
+        ):
+            raise RuntimeError("Tenant cutover create lock is not effective")
+
+
+def remove_tenant_cutover_lock(config: dict[str, str], client: ManagementClient) -> None:
+    for resource in tenant_cutover_lock_cleanup_refs():
+        client.kubectl(
+            "delete",
+            resource,
+            "--ignore-not-found=true",
+            "--wait=true",
+            f"--timeout={config['DELETE_TIMEOUT']}",
+        )
+
+
+def restore_controller(
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    deployment = client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "get",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        check=False,
+    )
+    if deployment.returncode != 0:
+        raise RuntimeError("old Tenant controller cannot be restored")
+    client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "scale",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        "--replicas=1",
+    )
+    client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "rollout",
+        "status",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        f"--timeout={config['CONDITION_TIMEOUT']}",
+    )
+
+
+def prepare_tenant_api_cutover(
+    root: Path,
+    config: dict[str, str],
+    client: ManagementClient,
+) -> bool:
+    observed = client.kubectl(
+        "get",
+        f"crd/{TENANT_CRD}",
+        "--ignore-not-found=true",
+        "-o",
+        "json",
+    ).stdout.strip()
+    if not observed:
+        return tenant_cutover_lock_present(client)
+    current = json.loads(observed)
+    generation = tenant_api_cutover_state(current)
+    if generation == "v1alpha3":
+        return tenant_cutover_lock_present(client)
+    desired = desired_tenant_crd(root, client)
+    transition = generation == "transitioning"
+    transition_document = (
+        None
+        if transition
+        else tenant_crd_transition_document(current, desired)
+    )
+    acquired_lock = False
+    if transition:
+        if not tenant_cutover_lock_present(client):
+            raise RuntimeError("Tenant CRD transition is missing its create lock")
+    else:
+        if not tenant_cutover_lock_present(client):
+            apply_tenant_cutover_lock(config, client)
+            acquired_lock = True
+    try:
+        verify_tenant_cutover_lock(
+            client,
+            "v1alpha3" if transition else generation,
+        )
+        if not transition:
+            require_clean_controller_state(root, client)
+        stop_controller(config, client)
+        require_clean_controller_state(root, client)
+        if not transition:
+            transition = True
+            client.kubectl(
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(transition_document),
+            )
+        verify_tenant_cutover_lock(client, "v1alpha3")
+        require_clean_controller_state(root, client)
+        client.kubectl(
+            "patch",
+            f"crd/{TENANT_CRD}",
+            "--subresource=status",
+            "--type=merge",
+            "-p",
+            json.dumps({"status": {"storedVersions": ["v1alpha3"]}}),
+        )
+        client.kubectl(
+            "apply",
+            "--server-side",
+            "--field-manager=cnpg-vcluster-controller",
+            "--force-conflicts",
+            "-f",
+            "-",
+            input_text=json.dumps(desired),
+        )
+        require_clean_controller_state(root, client)
+        return True
+    except Exception:
+        if not transition:
+            restore_controller(config, client)
+            if acquired_lock:
+                remove_tenant_cutover_lock(config, client)
+        raise
 
 
 def rust_toolchain(root: Path) -> tuple[str, str]:
@@ -286,6 +633,7 @@ def render_azure_controller_manager(
     root: Path,
     supported_kubernetes_version: str,
     image: str,
+    allocation_sha256: str,
 ) -> Path:
     template = (
         root / "controller" / "config" / "manager" / "manager-azure.yaml.tpl"
@@ -296,6 +644,7 @@ def render_azure_controller_manager(
             "${SUPPORTED_KUBERNETES_VERSION}",
             supported_kubernetes_version.removeprefix("v"),
         )
+        .replace("${TENANT_ALLOCATION_SHA256}", allocation_sha256)
     )
     destination = (
         root / ".runtime" / "rendered" / "azure-controller" / "manager.yaml"
@@ -453,19 +802,24 @@ def verify_controller_crd(client: ManagementClient) -> None:
     crd = client.json("get", f"crd/{TENANT_CRD}")
     versions = crd["spec"].get("versions", [])
     if (
-        len(versions) != 1 or versions[0].get("name") != "v1alpha2"
+        len(versions) != 1 or versions[0].get("name") != "v1alpha3"
         or versions[0].get("served") is not True or versions[0].get("storage") is not True
-        or crd.get("status", {}).get("storedVersions") != ["v1alpha2"]
+        or crd.get("status", {}).get("storedVersions") != ["v1alpha3"]
         or "status" not in versions[0].get("subresources", {})
         or crd["spec"].get("conversion", {}).get("strategy", "None") != "None"
     ):
-        raise RuntimeError("Tenant CRD must serve and store only v1alpha2 with a status subresource")
+        raise RuntimeError("Tenant CRD must serve and store only v1alpha3 with a status subresource")
 
 
-def verify_controller_api(config: dict[str, str], client: ManagementClient) -> None:
+def verify_controller_api(
+    config: dict[str, str],
+    client: ManagementClient,
+    *,
+    require_allocation: bool = False,
+) -> None:
     name = f"contract-probe-{uuid.uuid4().hex[:12]}"
     probe = {
-        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
         "kind": "Tenant",
         "metadata": {"name": name},
         "spec": {
@@ -522,39 +876,17 @@ def verify_controller_api(config: dict[str, str], client: ManagementClient) -> N
     azure_spec = {
         "kubernetesVersion": probe["spec"]["kubernetesVersion"],
         "workers": 3,
-        "provider": {
-            "type": "azure",
-            "podCIDR": "10.244.0.0/16",
-            "serviceCIDR": "10.96.0.0/16",
-        },
+        "provider": {"type": "azure"},
     }
     create_dry({**probe, "spec": azure_spec}, expected_spec=azure_spec)
-    for invalid_provider in (
-        {"type": "azure", "serviceCIDR": "10.96.0.0/16"},
-        {
-            "type": "azure",
-            "podCIDR": "10.244.0.1/16",
-            "serviceCIDR": "10.96.0.0/16",
-        },
-        {
-            "type": "azure",
-            "podCIDR": "2001:db8::/64",
-            "serviceCIDR": "10.96.0.0/16",
-        },
-        {
-            "type": "azure",
-            "podCIDR": "10.244.0.0/16",
-            "serviceCIDR": "10.244.128.0/17",
-        },
-        {
-            "type": "azure",
-            "podCIDR": "10.244.0.0/16",
-            "serviceCIDR": "10.96.0.0/29",
-        },
+    for invalid_provider, rejected in (
+        ({"type": "azure", "databases": 1}, "databases"),
+        ({"type": "azure", "podCIDR": "10.244.0.0/16"}, "unknown field"),
+        ({"type": "azure", "serviceCIDR": "10.96.0.0/16"}, "unknown field"),
     ):
         create_dry(
             {**probe, "spec": {**azure_spec, "provider": invalid_provider}},
-            rejected="CIDR",
+            rejected=rejected,
         )
 
     response = client.kubectl(
@@ -565,6 +897,22 @@ def verify_controller_api(config: dict[str, str], client: ManagementClient) -> N
         created = json.loads(response.stdout)
         if created.get("status"):
             raise RuntimeError("Tenant create must ignore user-supplied status")
+        if require_allocation:
+            def allocation_ready():
+                observed = client.json("get", f"tenant/{name}")
+                allocation = (
+                    observed.get("status", {})
+                    .get("provider", {})
+                    .get("allocation")
+                )
+                return True if isinstance(allocation, dict) and allocation.get("slotId") else None
+
+            wait_for(
+                "Tenant API cutover allocation probe",
+                parse_duration(config["CONDITION_TIMEOUT"]),
+                1,
+                allocation_ready,
+            )
         for patch in (
             {"workers": 2},
             {"provider": {"databases": 2}},
@@ -638,6 +986,7 @@ def reconcile_controller(
     verified_cache: VerifiedCache,
     registry: dict[str, object] | None,
 ) -> None:
+    require_tenant_api_cutover_ready()
     image = build_controller_image(root, config)
     foundation = _foundation_payload(
         root, config, network, image, verified_cache, registry,
@@ -658,6 +1007,7 @@ def reconcile_controller(
         ],
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
     )
+    cutover_locked = prepare_tenant_api_cutover(root, config, client)
     paths = (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
         root / "controller" / "config" / "crd" / "bases",
@@ -772,6 +1122,10 @@ def reconcile_controller(
         )
         verify_running_controller(client, image, activation_token=token)
     except Exception as failure:
+        if cutover_locked:
+            if not tenant_cutover_lock_present(client):
+                apply_tenant_cutover_lock(config, client)
+            raise
         if replacement:
             accepted = client.kubectl(
                 "-n",
@@ -903,9 +1257,16 @@ def reconcile_controller(
                     f"candidate shutdown failed during rollback: {drain_error}"
                 )
         raise
-    verify_controller_image(config, client, image)
-    verify_controller_api(config, client)
     verify_controller_crd(client)
+    verify_controller_image(config, client, image)
+    if cutover_locked:
+        remove_tenant_cutover_lock(config, client)
+    try:
+        verify_controller_api(config, client, require_allocation=cutover_locked)
+    except Exception:
+        if cutover_locked:
+            apply_tenant_cutover_lock(config, client)
+        raise
 
 
 def delete_controller(

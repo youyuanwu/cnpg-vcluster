@@ -24,7 +24,7 @@ PROVIDER_CATALOGS = {
 }
 PROVIDER_EXPLICIT_RULES = {
     "azure": (),
-    "local": (("", ("secrets",), ("get",)),),
+    "local": (("", ("secrets",), ("get",), ()),),
 }
 
 OUTPUT_PATHS = (
@@ -34,6 +34,8 @@ OUTPUT_PATHS = (
     Path("admin/config/rbac/cluster-role-binding-azure.json"),
     Path("admin/config/rbac/cluster-role-binding-local.json"),
     Path("admin/config/rbac/cluster-role-local.json"),
+    Path("admin/config/rbac/controller-role-binding.json"),
+    Path("admin/config/rbac/controller-role.json"),
     Path("admin/config/rbac/service-account.json"),
     Path("admin/config/service/service.json"),
 )
@@ -44,6 +46,8 @@ LEGACY_OUTPUT_PATHS = (
     Path("admin/config/rbac/cluster-role-binding-azure.yaml"),
     Path("admin/config/rbac/cluster-role-binding-local.yaml"),
     Path("admin/config/rbac/cluster-role-local.yaml"),
+    Path("admin/config/rbac/controller-role-binding.yaml"),
+    Path("admin/config/rbac/controller-role.yaml"),
     Path("admin/config/rbac/service-account.yaml"),
     Path("admin/config/service/service.yaml"),
 )
@@ -64,7 +68,9 @@ def cluster_role_binding_path(provider: str) -> Path:
 def provider_rules(
     root: Path,
     provider: str,
-) -> tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]:
+) -> tuple[
+    tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...
+]:
     if provider not in PROVIDERS:
         raise ValueError(f"unsupported admin provider: {provider}")
     catalog_path = root / PROVIDER_CATALOGS[provider]
@@ -96,7 +102,7 @@ def provider_rules(
             raise RuntimeError(
                 f"admin provider catalog is invalid: {catalog_path}"
             )
-        if kind == "Secret":
+        if kind in {"Lease", "Secret"}:
             continue
         api_group = api_version.split("/", 1)[0] if "/" in api_version else ""
         if not namespaced:
@@ -114,14 +120,19 @@ def provider_rules(
         else:
             listed.setdefault(api_group, set()).add(plural)
     rules = [
-        ("tenancy.cnpg-vcluster.io", ("tenants",), ("get", "list")),
+        (
+            "tenancy.cnpg-vcluster.io",
+            ("tenants",),
+            ("create", "delete", "get", "list"),
+            (),
+        ),
         *PROVIDER_EXPLICIT_RULES[provider],
         *(
-            (group, tuple(sorted(resources)), ("get",))
+            (group, tuple(sorted(resources)), ("get",), ())
             for group, resources in exact_gets.items()
         ),
         *(
-            (group, tuple(sorted(resources)), ("list",))
+            (group, tuple(sorted(resources)), ("list",), ())
             for group, resources in listed.items()
         ),
     ]
@@ -138,14 +149,22 @@ def _cluster_role(root: Path, provider: str) -> dict[str, object]:
         "kind": "ClusterRole",
         "metadata": {"name": ADMIN_ROLE_NAMES[provider]},
         "rules": [
-            {
+            ({
                 "apiGroups": [api_group],
                 "resources": list(resources),
                 "verbs": list(verbs),
-            }
-            for api_group, resources, verbs in provider_rules(root, provider)
+            } | ({"resourceNames": list(resource_names)} if resource_names else {}))
+            for api_group, resources, verbs, resource_names in provider_rules(root, provider)
         ],
     }
+
+
+def controller_role_path() -> Path:
+    return Path("admin/config/rbac/controller-role.json")
+
+
+def controller_role_binding_path() -> Path:
+    return Path("admin/config/rbac/controller-role-binding.json")
 
 
 def _deployment(provider: str) -> dict[str, object]:
@@ -261,6 +280,46 @@ def generated_documents(root: Path = ROOT) -> dict[Path, str]:
                     "namespace": ADMIN_NAMESPACE,
                 },
                 "automountServiceAccountToken": False,
+            }
+        ),
+        controller_role_path(): _render_json(
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "Role",
+                "metadata": {
+                    "name": "tenant-admin-controller-capability",
+                    "namespace": ADMIN_NAMESPACE,
+                },
+                "rules": [
+                    {
+                        "apiGroups": ["apps"],
+                        "resources": ["deployments"],
+                        "resourceNames": ["tenant-controller"],
+                        "verbs": ["get"],
+                    }
+                ],
+            }
+        ),
+        controller_role_binding_path(): _render_json(
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "RoleBinding",
+                "metadata": {
+                    "name": "tenant-admin-controller-capability",
+                    "namespace": ADMIN_NAMESPACE,
+                },
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": "tenant-admin-controller-capability",
+                },
+                "subjects": [
+                    {
+                        "kind": "ServiceAccount",
+                        "name": ADMIN_NAME,
+                        "namespace": ADMIN_NAMESPACE,
+                    }
+                ],
             }
         ),
         Path("admin/config/service/service.json"): _render_json(

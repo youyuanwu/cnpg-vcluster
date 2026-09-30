@@ -101,7 +101,7 @@ def assert_tenant_api_validation(root: Path, config: dict[str, str]) -> None:
         if unknown:
             spec["unknown"] = True
         return {
-            "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+            "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
             "kind": "Tenant",
             "metadata": {"name": "validation-fixture"},
             "spec": spec,

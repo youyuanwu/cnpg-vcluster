@@ -34,7 +34,6 @@ from .images import WORKER_IMAGE_KEYS, verify_container_images
 from .tenant_spec import (
     TenantSpec,
     load_tenant_spec,
-    require_non_overlapping_networks,
 )
 
 
