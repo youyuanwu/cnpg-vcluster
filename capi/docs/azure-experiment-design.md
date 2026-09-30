@@ -91,7 +91,7 @@ flowchart TB
   ACR[Shared ACR]
   Controllers[CAPI, CABPK, CAPZ, Kamaji CAPI provider]
   TenantOperator[Rust Tenant operator in Azure mode]
-  Admin[Tenant Admin read-only UI]
+  Admin[Tenant Admin lifecycle UI]
   TenantCR[Azure Tenant CR]
   Kamaji[Kamaji and datastore]
   TenantAPI[Kamaji tenant API internal LoadBalancer]
@@ -274,7 +274,7 @@ Python does not imperatively create tenant management resources or patch CAPZ
 compatibility state. Bicep owns the management foundation, the Rust operator
 owns the Kubernetes desired state, and CAPZ/ASO own Azure tenant mutation.
 The explicit JSON TenantSpec is translated to
-`tenancy.cnpg-vcluster.io/v1alpha2`; there is no second Python tenant runtime.
+`tenancy.cnpg-vcluster.io/v1alpha3`; there is no second Python tenant runtime.
 Local allocation, Docker, storage, and CNPG semantics remain local-only.
 
 Terraform/OpenTofu, Pulumi, Ansible, Crossplane, and Azure Developer CLI are
@@ -292,7 +292,7 @@ Bicep, Python, or `just` recipes. Configuration is split into:
 |---|---|---|
 | `config/azure/defaults.env` | Foundation sizing/network defaults, controller ACR repository/tag, supported tenant version, worker SKU, component versions, and timeouts. | Yes |
 | `config/azure.local.env` | Subscription ID, location, and operator-selected resource prefix. | No |
-| Explicit Azure TenantSpec JSON | Tenant name, Kubernetes version, worker count, Pod CIDR, and Service CIDR. | Yes when stored as a non-secret example |
+| Explicit Azure TenantSpec JSON | Tenant name, Kubernetes version, and worker count. | Yes when stored as a non-secret example |
 | Active `az` login | Tenant identity and authentication tokens. | No |
 | `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, ACR and AcrPull identity, immutable controller/admin digests, Deployment/configuration identities, and foundation checksum. | No |
 
@@ -342,7 +342,7 @@ AKS cluster, AKS-managed node resource group, VNet, subnets, identity, role
 assignments, and federated credentials are atomically recorded in
 `.runtime/azure/resources.json`. Controller UIDs are added after management
 installation. The optional `adminImage` and `adminDeploymentUid` fields are
-added together only after the read-only admin Deployment, Service, RBAC,
+added together only after the admin Deployment, Service, lifecycle RBAC,
 health endpoints, overview, and Tenant list pass validation. A healthy
 pre-admin foundation remains loadable until management installation records
 both fields.
@@ -452,7 +452,10 @@ The Kamaji tenant controller manager also runs with
 
 ## Tenant networking
 
-Calico runs in VXLAN mode:
+Calico runs in VXLAN mode. Azure Tenant specs do not contain CIDRs; the
+controller claims one ordered entry from the approved
+`tenant-azure-allocation` catalog and records its exact catalog/Lease/network
+identity in Tenant status.
 
 - IP-in-IP is disabled because Azure networking does not carry IP-in-IP
   traffic;
@@ -477,7 +480,7 @@ an in-VNet `kubectl` execution point, allowing generic status to inspect Nodes
 and add-ons without making the private tenant API public or creating resources
 during a status request.
 
-The Pod, Service, VNet, and AKS address ranges must not overlap. The tenant
+The catalog's Pod, Service, VNet, and AKS address ranges must not overlap. The tenant
 subnet must reach the Kamaji API port, and VMSS workers must be able to
 exchange VXLAN traffic on UDP 4789.
 
@@ -511,8 +514,8 @@ The proposed interface remains `just`:
 | `just azure-preflight` | Verify Azure CLI login, subscription, required providers, tools, version pins, and configuration. |
 | `just azure-create-foundation` | Create the resource group, VNet, identity, AKS, shared ACR, and exact kubelet AcrPull assignment. |
 | `just azure-create-management` | Install CAPI/CAPZ/Kamaji/ASO, build and push the static Tenant manager and Tenant Admin images, verify their ACR digests, and deploy immutable references. |
-| `just azure-foundation-status` | Report shared Azure foundation health, including the recorded admin repository, digest, Deployment UID, rollout, provider mode, Service, read-only RBAC, and API health when installed. |
-| `just tenant-create azure <spec.json>` | Strictly submit the JSON-derived Azure Tenant and wait for operator Ready. |
+| `just azure-foundation-status` | Report shared Azure foundation health, including the recorded admin repository, digest, Deployment UID, rollout, provider mode, Service, lifecycle RBAC, and API health when installed. |
+| `just tenant-create azure <spec.json>` | Strictly submit the JSON-derived Azure Tenant without CIDRs and wait for operator Ready. |
 | `just tenant-status azure <tenant>` | Report generation-aware operator status through the provider-neutral envelope. |
 | `just tenant-delete azure <tenant> azure/<tenant>` | Issue ordinary Tenant deletion and wait for Kubernetes/CAPI/CAPZ finalization and Tenant absence. |
 | `just azure-test-tenant-lifecycle` | Destructively prove three-worker readiness, exact non-primary VMSS instance replacement, targeted tenant deletion, absence, foundation preservation, and recreation. |

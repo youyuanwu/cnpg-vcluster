@@ -19,7 +19,7 @@ an explicit provider mode and installs exactly one `ProviderLifecycle`.
 flowchart TB
   User[just and kubectl]
   Mgmt[kind management cluster]
-  TenantCR[Tenant v1alpha2]
+  TenantCR[Tenant v1alpha3]
   Controller[Rust kube-rs controller]
   Slots[Allocation Leases]
   Providers[CAPI, CABPK, CAPD, Kamaji provider]
@@ -60,8 +60,9 @@ kubeconfig Secret, creates an in-memory Tenant client, and performs an exact
 live read of `database/capi-postgres`.
 
 The generated admin ClusterRole grants exact `get` and `list` permissions,
-contains no write verb, and excludes subresources. Local mode deliberately
-adds only `get` on core Secrets; it never grants Secret list or watch.
+plus top-level Tenant `create`/`delete` and exact named controller Deployment
+`get`, and excludes subresources. Local mode deliberately adds only `get` on
+core Secrets; it never grants Secret list or watch.
 Application logic accepts only the selected Tenant's deterministic kubeconfig
 Secret after endpoint, marker, and owner validation. Local topology accepts
 exact controller markers and owner UID chains, while live CNPG topology comes
@@ -87,17 +88,17 @@ See [`admin-ui-design.md`](admin-ui-design.md).
 ## Tenant API and controller
 
 The cluster-scoped API is
-`tenancy.cnpg-vcluster.io/v1alpha2`, kind `Tenant`. The immutable spec contains
+`tenancy.cnpg-vcluster.io/v1alpha3`, kind `Tenant`. The immutable spec contains
 common `kubernetesVersion` and `workers` fields plus one tagged `provider`:
 
 - `type: local` with `databases`, from one through three; or
-- `type: azure` with canonical, non-overlapping IPv4 `podCIDR` and
-  `serviceCIDR` networks.
+- `type: azure`; the controller assigns reviewed Pod and Service networks from
+  the approved Azure allocation catalog.
 
 OpenAPI and CEL reject invalid names, counts, version syntax, types, and
 any spec update. A leading `v` is accepted on creation, but a spelling change
-is still an immutable-spec update. The controller checks the supported
-version (`1.36.4`); schema-3 slot validation rejects overlapping or
+is still an immutable-spec update. The controller checks its configured
+supported version; slot validation rejects overlapping or
 non-canonical networks. Unknown fields are pruned under
 `fieldValidation=Warn` or `Ignore` and rejected under `Strict`, used by the
 repository clients. There is no Tenant validating webhook.
@@ -111,7 +112,8 @@ provider-specific state. Local status contains
 `status.provider.clusterUID`. Azure status binds the exact foundation,
 specification, operation, management UIDs, kubeconfig identity, endpoint,
 VMSS/Node inventory, add-on components, provider descendants, and deletion
-barriers.
+barriers. `status.provider.networkAllocation` records the Azure slot,
+Pod/Service CIDRs, catalog hash/UID, and exact Lease identity.
 There is no persisted creation
 stage, tenant-API cleanup checkpoint, child-resource UID ledger,
 worker-container evidence, or Docker volume identity.
@@ -319,7 +321,7 @@ Cluster, control plane, or workers were never created. An observed root Cluster
 UID is recorded before deletion. Ownership conflicts, failed management/host
 inspection, and foundation hash changes still block destructive progress.
 The current-only installer does not migrate or automatically remove
-Go-managed API or host state. The CRD serves and stores only v1alpha2.
+Go-managed API or host state. The CRD serves and stores only v1alpha3.
 The foundation identity excludes controller image identity, allowing
 same-configuration controller rebuilds while resource-affecting inputs remain
 immutable. Creation-only foundation errors block creation without preventing
@@ -410,6 +412,6 @@ do not appear in the management API.
 CAPD workers are privileged Docker containers sharing the host kernel, Docker
 daemon, storage hardware, network, power, and failure domain. This is not a
 hostile-tenant security boundary. The management node and Tenant controller
-also have Docker socket access. The API is experimental `v1alpha2`; this work
+also have Docker socket access. The API is experimental `v1alpha3`; this work
 intentionally replaces the earlier flat local spec. Existing Tenant objects
 must be deleted and recreated with the provider-discriminated shape.
