@@ -4,10 +4,13 @@
 version. It intentionally replaces experimental `v1alpha2`; there is no
 conversion or migration. Existing objects must complete ordinary deletion
 before cutover. The installer denies new Tenant creation, verifies empty
-Tenant/provider inventories twice around old-controller shutdown, deletes the
-empty old CRD, installs the single v1alpha3 generation, verifies the
-allocator-capable controller, and then removes the create lock. It verifies
-both `spec.versions` and `status.storedVersions`.
+Tenant/provider inventories around old-controller shutdown, applies an
+in-place dual-version CRD with `v1alpha2` no longer served, rechecks emptiness,
+advances `status.storedVersions`, installs the single v1alpha3 generation,
+verifies the allocator-capable controller, and then removes the create lock.
+A request admitted through a lagging API server is retained and blocks
+completion rather than being deleted by CRD replacement. The installer
+verifies both `spec.versions` and `status.storedVersions`.
 
 A Tenant is cluster-scoped. Its immutable spec has common
 `kubernetesVersion` and `workers` fields plus exactly one tagged `provider`.

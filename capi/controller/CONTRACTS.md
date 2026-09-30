@@ -11,8 +11,9 @@ they are installed in separate clusters. `just controller-verify` compares those
 against generation without rewriting them. The v1alpha1 CRD, Go manager and
 admission webhook are not installation inputs. The breaking v1alpha2 cutover
 requires ordinary Tenant deletion, a temporary create-deny admission lock,
-two clean-state checks, old-controller shutdown, and replacement of the empty
-old CRD; retained legacy state is not converted. See
+repeated clean-state checks, old-controller shutdown, and an in-place storage
+version transition that disables `v1alpha2` before removing it; retained
+legacy state is not converted. See
 [`API_COMPATIBILITY.md`](API_COMPATIBILITY.md) for the public contract.
 The repository-root Cargo workspace owns the shared dependency versions,
 release profile, and lockfile; this crate inherits its dependencies from that

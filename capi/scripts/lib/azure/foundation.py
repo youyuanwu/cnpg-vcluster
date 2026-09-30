@@ -22,6 +22,8 @@ from scripts.lib.controller import (
     require_tenant_api_cutover_ready,
     render_azure_controller_manager,
     tenant_api_generation,
+    tenant_api_cutover_state,
+    tenant_crd_transition_document,
     tenant_cutover_lock_cleanup_refs,
     tenant_cutover_lock_documents,
 )
@@ -829,7 +831,9 @@ def _validated_azure_list(
             or item.get("kind") != kind
             or not isinstance(item_metadata, dict)
             or not isinstance(item_metadata.get("name"), str)
+            or not item_metadata["name"]
             or not isinstance(item_metadata.get("uid"), str)
+            or not item_metadata["uid"]
         ):
             raise RuntimeError(f"Azure cutover {kind} inventory is invalid")
     return items
@@ -935,15 +939,42 @@ def _prepare_azure_tenant_api_cutover(
     )
     if observed is None:
         return _azure_cutover_lock_present(root)
-    generation = tenant_api_generation(observed)
+    generation = tenant_api_cutover_state(observed)
     if generation == "v1alpha3":
         return _azure_cutover_lock_present(root)
-    _azure_cutover_lock(root, present=True)
-    deleted = False
+    transition = generation == "transitioning"
+    if transition:
+        if not _azure_cutover_lock_present(root):
+            raise RuntimeError("Azure Tenant CRD transition is missing its create lock")
+    else:
+        _azure_cutover_lock(root, present=True)
+    rendered = _kubectl(
+        root,
+        "create",
+        "--dry-run=client",
+        "-f",
+        str(
+            root
+            / "controller/config/crd/bases"
+            / "tenancy.cnpg-vcluster.io_tenants.yaml"
+        ),
+        "-o",
+        "json",
+    ).stdout
     try:
-        _verify_azure_cutover_lock(root, generation)
-        tenants, residue = _azure_cutover_inventory(root)
-        require_empty_tenant_cutover(tenants, residue)
+        desired = json.loads(rendered)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("generated Azure Tenant CRD is invalid") from exc
+    if not isinstance(desired, dict):
+        raise RuntimeError("generated Azure Tenant CRD is invalid")
+    try:
+        _verify_azure_cutover_lock(
+            root,
+            "v1alpha3" if transition else generation,
+        )
+        if not transition:
+            tenants, residue = _azure_cutover_inventory(root)
+            require_empty_tenant_cutover(tenants, residue)
         _kubectl(
             root,
             "-n",
@@ -955,18 +986,47 @@ def _prepare_azure_tenant_api_cutover(
         )
         tenants, residue = _azure_cutover_inventory(root)
         require_empty_tenant_cutover(tenants, residue)
-        _verify_azure_cutover_lock(root, generation)
+        if not transition:
+            _kubectl(
+                root,
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(
+                    tenant_crd_transition_document(observed, desired)
+                ),
+            )
+            transition = True
+        _verify_azure_cutover_lock(root, "v1alpha3")
+        tenants, residue = _azure_cutover_inventory(root)
+        require_empty_tenant_cutover(tenants, residue)
         _kubectl(
             root,
-            "delete",
+            "patch",
             "crd/tenants.tenancy.cnpg-vcluster.io",
-            "--wait=true",
-            f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
+            "--subresource=status",
+            "--type=merge",
+            "-p",
+            json.dumps({"status": {"storedVersions": ["v1alpha3"]}}),
         )
-        deleted = True
+        _kubectl(
+            root,
+            "apply",
+            "--server-side",
+            "--field-manager=cnpg-vcluster-azure-controller",
+            "--force-conflicts",
+            "-f",
+            "-",
+            input_text=json.dumps(desired),
+        )
+        tenants, residue = _azure_cutover_inventory(root)
+        require_empty_tenant_cutover(tenants, residue)
         return True
     except Exception:
-        if not deleted:
+        if not transition:
             _azure_cutover_lock(root, present=False)
         raise
 

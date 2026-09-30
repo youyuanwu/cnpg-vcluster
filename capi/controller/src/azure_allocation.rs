@@ -101,11 +101,11 @@ pub async fn claim(client: Client, catalog: &AzureAllocationCatalog, identity: A
 
 #[rustfmt::skip]
 async fn validate_status_claims(client: Client, catalog: &AzureAllocationCatalog, identity: AzureClaimIdentity<'_>) -> Result<(), AllocationError> {
-    let tenants = Api::<Tenant>::all(client).list(&ListParams::default()).await?.items; for tenant in tenants {
-        let Some(active) = tenant.status.as_ref().and_then(|status| status.azure()).and_then(|status| status.network_allocation.as_ref()) else { continue; }; if tenant.metadata.uid.as_deref() == Some(identity.tenant_uid) { continue; }
-        let name = tenant.metadata.name.clone().unwrap_or_default(); let pod: Ipv4Net = active.pod_cidr.parse().map_err(|_| AllocationError::Claim(name.clone()))?; let service: Ipv4Net = active.service_cidr.parse().map_err(|_| AllocationError::Claim(name))?;
+    let leases = Api::<Lease>::namespaced(client.clone(), FOUNDATION_NAMESPACE).list(&ListParams::default()).await?.items; let tenants = Api::<Tenant>::all(client).list(&ListParams::default()).await?.items; for tenant in tenants {
+        let Some(active) = tenant.status.as_ref().and_then(|status| status.azure()).and_then(|status| status.network_allocation.as_ref()) else { continue; }; if tenant.metadata.uid.as_deref() == Some(identity.tenant_uid) { continue; } let name = tenant.metadata.name.clone().unwrap_or_default(); let pod: Ipv4Net = active.pod_cidr.parse().map_err(|_| AllocationError::Claim(name.clone()))?; let service: Ipv4Net = active.service_cidr.parse().map_err(|_| AllocationError::Claim(name))?;
         for slot in &catalog.values.slots { let slot_pod: Ipv4Net = slot.pod_cidr.parse().map_err(|_| AllocationError::InvalidPool)?; let slot_service: Ipv4Net = slot.service_cidr.parse().map_err(|_| AllocationError::InvalidPool)?;
-            if [pod, service].iter().any(|active| overlaps(active, &slot_pod) || overlaps(active, &slot_service)) { return Err(AllocationError::Claim(active.slot_id.clone())); }
+            if [pod, service].iter().any(|active| overlaps(active, &slot_pod) || overlaps(active, &slot_service)) && !leases.iter().any(|lease| lease.metadata.name.as_deref() == Some(active.lease_name.as_str()) && lease.metadata.uid.as_deref() == Some(active.lease_uid.as_str())
+                && metadata(lease, false, TENANT_UID_ANNOTATION) == tenant.metadata.uid.as_deref() && metadata(lease, false, allocation::POD_CIDR_ANNOTATION) == Some(active.pod_cidr.as_str()) && metadata(lease, false, allocation::SERVICE_CIDR_ANNOTATION) == Some(active.service_cidr.as_str())) { return Err(AllocationError::Claim(active.slot_id.clone())); }
         }
     } Ok(())
 }

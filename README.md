@@ -43,8 +43,9 @@ fail-closed finalizer that does not require tenant API access. Apply is
 asynchronous; repeat `local-tenant-status` until it exits zero.
 
 The provider-discriminated shape intentionally replaces experimental
-`v1alpha2`; retained Tenants must be normally deleted before the clean CRD
-cutover. Flat `databases` fields, flat local status, and the
+`v1alpha2`; retained Tenants must be normally deleted before the clean,
+create-locked in-place CRD storage-version transition. Flat `databases`
+fields, flat local status, and the
 former Python Azure tenant runtime are not migrated or converted. Existing
 objects must be deleted and recreated, and installation requires a clean
 environment. The same Rust manager runs in an explicit `local` or `azure`

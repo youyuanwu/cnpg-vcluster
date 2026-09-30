@@ -542,6 +542,59 @@ async fn durable_status_reserves_a_slot_after_its_lease_disappears() {
 }
 
 #[tokio::test]
+async fn durable_status_allows_a_distinct_free_slot_with_a_healthy_lease() {
+    let mut fixture = Fixture::new();
+    let mut values: AzureAllocationDocument = serde_json::from_str(
+        fixture.management.get(ALLOCATION_CONFIG_PATH)["data"]["slots.json"]
+            .as_str()
+            .unwrap(),
+    )
+    .unwrap();
+    values.slots.push(AzureNetworkSlot {
+        slot_id: "azure-02".into(),
+        pod_cidr: "10.245.0.0/16".into(),
+        service_cidr: "10.97.0.0/16".into(),
+    });
+    let raw = serde_json::to_string(&values).unwrap();
+    let hash = hex::encode(Sha256::digest(
+        serde_json::to_vec(&serde_json::to_value(&values).unwrap()).unwrap(),
+    ));
+    let mut config = allocation_config();
+    config
+        .data
+        .as_mut()
+        .unwrap()
+        .insert("slots.json".into(), raw);
+    config
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert(APPROVED_SHA256_ANNOTATION.into(), hash);
+    fixture
+        .management
+        .insert(ALLOCATION_CONFIG_PATH, config.clone());
+    fixture.allocation = AzureAllocationCatalog::from_config_map(&config).unwrap();
+    fixture.provider_allocation = Some(fixture.allocation.clone());
+    fixture.step().await;
+    fixture.step().await;
+    fixture.step().await;
+    let hash = "b".repeat(64);
+    let second = azure_allocation::claim(
+        fixture.management.client(),
+        &fixture.allocation,
+        AzureClaimIdentity {
+            tenant_name: "tenant-b",
+            tenant_uid: "uid-b",
+            spec_hash: &hash,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(second.slot_id, "azure-02");
+}
+
+#[tokio::test]
 async fn rotated_catalog_cannot_relabel_an_active_network() {
     let fixture = Fixture::new();
     let first_hash = "a".repeat(64);

@@ -125,6 +125,74 @@ def require_tenant_cutover_double_check(
     require_empty_tenant_cutover(second_tenants, provider_residue)
 
 
+def tenant_api_cutover_state(crd: object) -> str:
+    if not isinstance(crd, dict):
+        raise RuntimeError("Tenant CRD inventory is invalid")
+    versions = crd.get("spec", {}).get("versions")
+    stored = crd.get("status", {}).get("storedVersions")
+    if not isinstance(versions, list) or not isinstance(stored, list):
+        raise RuntimeError("Tenant CRD version inventory is invalid")
+    names = {
+        version.get("name")
+        for version in versions
+        if isinstance(version, dict)
+    }
+    if names == {"v1alpha2", "v1alpha3"} and stored in (
+        ["v1alpha2"],
+        ["v1alpha2", "v1alpha3"],
+        ["v1alpha3"],
+    ):
+        return "transitioning"
+    return tenant_api_generation(crd)
+
+
+def tenant_crd_transition_document(
+    observed: dict[str, object],
+    desired: dict[str, object],
+) -> dict[str, object]:
+    if tenant_api_generation(observed) != "v1alpha2":
+        raise RuntimeError("Tenant CRD transition source is invalid")
+    if tenant_api_generation({
+        **desired,
+        "status": {"storedVersions": ["v1alpha3"]},
+    }) != "v1alpha3":
+        raise RuntimeError("Tenant CRD transition target is invalid")
+    old = json.loads(json.dumps(observed["spec"]["versions"][0]))
+    old["served"] = False
+    old["storage"] = False
+    transition = json.loads(json.dumps(desired))
+    transition["spec"]["versions"] = [
+        old,
+        transition["spec"]["versions"][0],
+    ]
+    return transition
+
+
+def desired_tenant_crd(
+    root: Path,
+    client: ManagementClient,
+) -> dict[str, object]:
+    rendered = client.kubectl(
+        "create",
+        "--dry-run=client",
+        "-f",
+        str(
+            root
+            / "controller/config/crd/bases"
+            / "tenancy.cnpg-vcluster.io_tenants.yaml"
+        ),
+        "-o",
+        "json",
+    ).stdout
+    try:
+        document = json.loads(rendered)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("generated Tenant CRD is invalid") from exc
+    if not isinstance(document, dict):
+        raise RuntimeError("generated Tenant CRD is invalid")
+    return document
+
+
 def require_tenant_api_cutover_ready() -> None:
     if not TENANT_API_CUTOVER_READY:
         raise RuntimeError(
@@ -215,27 +283,62 @@ def prepare_tenant_api_cutover(
     ).stdout.strip()
     if not observed:
         return tenant_cutover_lock_present(client)
-    generation = tenant_api_generation(json.loads(observed))
+    current = json.loads(observed)
+    generation = tenant_api_cutover_state(current)
     if generation == "v1alpha3":
         return tenant_cutover_lock_present(client)
-    apply_tenant_cutover_lock(config, client)
-    deleted = False
+    transition = generation == "transitioning"
+    if transition:
+        if not tenant_cutover_lock_present(client):
+            raise RuntimeError("Tenant CRD transition is missing its create lock")
+    else:
+        apply_tenant_cutover_lock(config, client)
+    desired = desired_tenant_crd(root, client)
     try:
-        verify_tenant_cutover_lock(client, generation)
-        require_clean_controller_state(root, client)
+        verify_tenant_cutover_lock(
+            client,
+            "v1alpha3" if transition else generation,
+        )
+        if not transition:
+            require_clean_controller_state(root, client)
         stop_controller(config, client)
         require_clean_controller_state(root, client)
-        verify_tenant_cutover_lock(client, generation)
+        if not transition:
+            client.kubectl(
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(
+                    tenant_crd_transition_document(current, desired)
+                ),
+            )
+            transition = True
+        verify_tenant_cutover_lock(client, "v1alpha3")
+        require_clean_controller_state(root, client)
         client.kubectl(
-            "delete",
+            "patch",
             f"crd/{TENANT_CRD}",
-            "--wait=true",
-            f"--timeout={config['DELETE_TIMEOUT']}",
+            "--subresource=status",
+            "--type=merge",
+            "-p",
+            json.dumps({"status": {"storedVersions": ["v1alpha3"]}}),
         )
-        deleted = True
+        client.kubectl(
+            "apply",
+            "--server-side",
+            "--field-manager=cnpg-vcluster-controller",
+            "--force-conflicts",
+            "-f",
+            "-",
+            input_text=json.dumps(desired),
+        )
+        require_clean_controller_state(root, client)
         return True
     except Exception:
-        if not deleted:
+        if not transition:
             remove_tenant_cutover_lock(config, client)
         raise
 

@@ -26,6 +26,22 @@ def response(value="", code=0, error=""):
     return CompletedProcess([], code, json.dumps(value) if isinstance(value, dict) else value, error)
 
 
+def desired_crd():
+    return {
+        "apiVersion": "apiextensions.k8s.io/v1",
+        "kind": "CustomResourceDefinition",
+        "metadata": {"name": packaging.TENANT_CRD},
+        "spec": {
+            "versions": [{
+                "name": "v1alpha3",
+                "served": True,
+                "storage": True,
+                "schema": {"openAPIV3Schema": {"type": "object"}},
+            }]
+        },
+    }
+
+
 class Client:
     def __init__(self, handler=None):
         self.calls = []
@@ -89,9 +105,28 @@ class PackagingTests(unittest.TestCase):
                 "status": {"storedVersions": [version]},
             }
             self.assertEqual(packaging.tenant_api_generation(crd), version)
+            self.assertEqual(packaging.tenant_api_cutover_state(crd), version)
+        transition = packaging.tenant_crd_transition_document(
+            {
+                "spec": {"versions": [{
+                    "name": "v1alpha2",
+                    "served": True,
+                    "storage": True,
+                }]},
+                "status": {"storedVersions": ["v1alpha2"]},
+            },
+            desired_crd(),
+        )
+        transition["status"] = {"storedVersions": ["v1alpha2"]}
+        self.assertEqual(
+            "transitioning",
+            packaging.tenant_api_cutover_state(transition),
+        )
+        self.assertFalse(transition["spec"]["versions"][0]["served"])
+        self.assertFalse(transition["spec"]["versions"][0]["storage"])
         packaging.require_tenant_api_cutover_ready()
 
-    def test_cutover_locks_double_checks_stops_and_deletes_old_crd(self):
+    def test_cutover_locks_checks_stops_and_transitions_old_crd(self):
         old = {
             "spec": {
                 "versions": [
@@ -111,19 +146,23 @@ class PackagingTests(unittest.TestCase):
             patch.object(packaging, "require_clean_controller_state") as clean,
             patch.object(packaging, "stop_controller") as stop,
             patch.object(packaging, "verify_tenant_cutover_lock") as fence,
+            patch.object(packaging, "desired_tenant_crd", return_value=desired_crd()),
         ):
             self.assertTrue(
                 packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)
             )
-        self.assertEqual(clean.call_count, 2)
+        self.assertEqual(clean.call_count, 4)
         stop.assert_called_once()
         self.assertEqual(2, fence.call_count)
-        self.assertTrue(
-            any(
-                args[:2] == ("delete", f"crd/{packaging.TENANT_CRD}")
-                for args, _ in client.calls
-            )
-        )
+        self.assertFalse(any(
+            args[:2] == ("delete", f"crd/{packaging.TENANT_CRD}")
+            for args, _ in client.calls
+        ))
+        self.assertTrue(any(
+            args[:2] == ("patch", f"crd/{packaging.TENANT_CRD}")
+            and "--subresource=status" in args
+            for args, _ in client.calls
+        ))
 
     def test_cutover_second_check_failure_removes_lock_before_crd_delete(self):
         old = {
@@ -147,6 +186,7 @@ class PackagingTests(unittest.TestCase):
             ),
             patch.object(packaging, "stop_controller"),
             patch.object(packaging, "verify_tenant_cutover_lock"),
+            patch.object(packaging, "desired_tenant_crd", return_value=desired_crd()),
             self.assertRaisesRegex(RuntimeError, "race"),
         ):
             packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)

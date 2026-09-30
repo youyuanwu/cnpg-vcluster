@@ -163,9 +163,24 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         definitions["leases.coordination.k8s.io"] = (
             "coordination.k8s.io/v1", "Lease"
         )
+        desired = {
+            "apiVersion": "apiextensions.k8s.io/v1",
+            "kind": "CustomResourceDefinition",
+            "metadata": {"name": "tenants.tenancy.cnpg-vcluster.io"},
+            "spec": {
+                "versions": [{
+                    "name": "v1alpha3",
+                    "served": True,
+                    "storage": True,
+                    "schema": {"openAPIV3Schema": {"type": "object"}},
+                }]
+            },
+        }
 
         def kubectl(_root, *arguments, **_kwargs):
             calls.append(arguments)
+            if arguments[:2] == ("create", "--dry-run=client"):
+                return completed(json.dumps(desired))
             if arguments[:2] == ("get", "tenants"):
                 return completed(json.dumps({
                     "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
@@ -205,11 +220,17 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         ):
             self.assertTrue(_prepare_azure_tenant_api_cutover(root, config))
         self.assertEqual(2, fence.call_count)
-        self.assertIn(
+        self.assertNotIn(
             ("delete", "crd/tenants.tenancy.cnpg-vcluster.io", "--wait=true",
              f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}"),
             calls,
         )
+        self.assertTrue(any(
+            arguments[:2]
+            == ("patch", "crd/tenants.tenancy.cnpg-vcluster.io")
+            and "--subresource=status" in arguments
+            for arguments in calls
+        ))
         self.assertIn(
             ("-n", "tenant-system", "delete", "deployment/tenant-controller",
              "--ignore-not-found=true", "--wait=true"),
