@@ -121,6 +121,21 @@ class PackagingTests(unittest.TestCase):
                     else reject(*args, **kwargs)
                 )), namespace="tenant-system",
             )
+        excluded_policy = copy.deepcopy(policy)
+        excluded_policy["spec"]["matchConstraints"]["excludeResourceRules"] = [{
+            "apiGroups": ["tenancy.cnpg-vcluster.io"],
+            "apiVersions": ["v1alpha1"],
+            "operations": ["CREATE"],
+            "resources": ["tenantdatabases"],
+        }]
+        with self.assertRaisesRegex(RuntimeError, "contract is malformed"):
+            packaging.verify_database_activation_lock(
+                Client(lambda *args, **kwargs: (
+                    response(excluded_policy)
+                    if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.DATABASE_ACTIVATION_POLICY}")
+                    else webhook_first(*args, **kwargs)
+                )), namespace="tenant-system",
+            )
 
     def test_cutover_lock_denies_create_for_old_and_new_api_generations(self):
         policy, binding = packaging.tenant_cutover_lock_documents()

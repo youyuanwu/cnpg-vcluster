@@ -190,6 +190,21 @@ pub fn validate_gate(gate: &ConfigMap, tenant_uid: &str) -> Result<(), Admission
         || gate.metadata.namespace.as_deref() != Some(GATE_NAMESPACE)
         || gate.metadata.uid.as_deref().is_none_or(str::is_empty)
         || gate.metadata.deletion_timestamp.is_some()
+        || gate.immutable == Some(true)
+        || gate
+            .binary_data
+            .as_ref()
+            .is_some_and(|data| !data.is_empty())
+        || gate
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
+        || gate
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|items| !items.is_empty())
         || gate
             .metadata
             .labels
@@ -635,6 +650,11 @@ pub fn validate_gate_update(
             .is_none_or(str::is_empty)
         || before.metadata.resource_version != after.metadata.resource_version
         || before.metadata.labels != after.metadata.labels
+        || before.metadata.annotations != after.metadata.annotations
+        || before.immutable != after.immutable
+        || before.binary_data != after.binary_data
+        || before.metadata.owner_references != after.metadata.owner_references
+        || before.metadata.finalizers != after.metadata.finalizers
     {
         return Err(AdmissionError::Gate);
     }
@@ -1269,6 +1289,26 @@ mod tests {
             .unwrap()
             .insert(GATE_STATE.into(), "closed".into());
         assert_eq!(validate_gate_update(&reserved, &closed, tenant), Ok(()));
+        let mut immutable = closed.clone();
+        immutable.immutable = Some(true);
+        assert_eq!(
+            validate_gate_update(&reserved, &immutable, tenant),
+            Err(AdmissionError::Gate)
+        );
+        let mut owned = closed.clone();
+        owned.metadata.owner_references = Some(vec![
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "v1".into(),
+                kind: "ConfigMap".into(),
+                name: "unrelated".into(),
+                uid: "foreign-uid".into(),
+                ..Default::default()
+            },
+        ]);
+        assert_eq!(
+            validate_gate_update(&reserved, &owned, tenant),
+            Err(AdmissionError::Gate)
+        );
         for actor in [admission, controller, "system:admin"] {
             assert_eq!(
                 validate_gate_update(&reserved, &closed, actor),

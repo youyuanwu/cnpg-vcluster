@@ -141,6 +141,7 @@ def verify_database_activation_lock(
         or policy_spec.get("failurePolicy") != "Fail"
         or policy_spec.get("matchConstraints", {}).get("resourceRules")
         != expected_spec["matchConstraints"]["resourceRules"]
+        or policy_spec.get("matchConstraints", {}).get("excludeResourceRules")
         or policy_spec.get("validations") != expected_spec["validations"]
         or policy_spec.get("matchConditions")
         or policy_spec.get("paramKind")
