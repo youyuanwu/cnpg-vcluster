@@ -29,20 +29,6 @@
     },
     {
       "apiGroups": [
-        "apps"
-      ],
-      "resourceNames": [
-        "tenant-controller"
-      ],
-      "resources": [
-        "deployments"
-      ],
-      "verbs": [
-        "get"
-      ]
-    },
-    {
-      "apiGroups": [
         "bootstrap.cluster.x-k8s.io"
       ],
       "resources": [
@@ -73,17 +59,6 @@
       ],
       "resources": [
         "kamajicontrolplanes"
-      ],
-      "verbs": [
-        "list"
-      ]
-    },
-    {
-      "apiGroups": [
-        "coordination.k8s.io"
-      ],
-      "resources": [
-        "leases"
       ],
       "verbs": [
         "list"

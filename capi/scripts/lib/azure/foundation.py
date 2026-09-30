@@ -770,8 +770,82 @@ def _azure_cutover_lock(root: Path, *, present: bool) -> None:
         )
 
 
+def _azure_cutover_lock_present(root: Path) -> bool:
+    present = [
+        bool(_kubectl(
+            root, "get", resource, "--ignore-not-found=true", "-o", "name",
+        ).stdout.strip())
+        for resource in tenant_cutover_lock_cleanup_refs()
+    ]
+    if present[0] != present[1]:
+        raise RuntimeError("Azure Tenant cutover lock is partially installed")
+    return present[0]
+
+
+def _verify_azure_cutover_lock(root: Path, generation: str) -> None:
+    document = {
+        "apiVersion": f"tenancy.cnpg-vcluster.io/{generation}",
+        "kind": "Tenant",
+        "metadata": {"name": f"cutover-lock-probe-{uuid.uuid4().hex[:12]}"},
+        "spec": {
+            "kubernetesVersion": "1.36.4",
+            "workers": 1,
+            "provider": {"type": "local", "databases": 1},
+        },
+    }
+    for _ in range(5):
+        response = _kubectl(
+            root, "create", "--dry-run=server", "-f", "-",
+            input_text=json.dumps(document), check=False,
+        )
+        if (
+            response.returncode == 0
+            or "Tenant creation is locked during API cutover"
+            not in response.stderr
+        ):
+            raise RuntimeError("Azure Tenant cutover create lock is not effective")
+
+
+def _validated_azure_list(
+    payload: object,
+    api_version: str,
+    kind: str,
+) -> list[dict[str, object]]:
+    metadata = payload.get("metadata") if isinstance(payload, dict) else None
+    items = payload.get("items") if isinstance(payload, dict) else None
+    if (
+        not isinstance(payload, dict)
+        or payload.get("apiVersion") != api_version
+        or payload.get("kind") != f"{kind}List"
+        or not isinstance(metadata, dict)
+        or metadata.get("continue", "") != ""
+        or not isinstance(items, list)
+    ):
+        raise RuntimeError(f"Azure cutover {kind} inventory is malformed")
+    for item in items:
+        item_metadata = item.get("metadata") if isinstance(item, dict) else None
+        if (
+            item.get("apiVersion") != api_version
+            or item.get("kind") != kind
+            or not isinstance(item_metadata, dict)
+            or not isinstance(item_metadata.get("name"), str)
+            or not isinstance(item_metadata.get("uid"), str)
+        ):
+            raise RuntimeError(f"Azure cutover {kind} inventory is invalid")
+    return items
+
+
 def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
     tenants = json.loads(_kubectl(root, "get", "tenants", "-o", "json").stdout)
+    tenant_api_version = (
+        tenants.get("apiVersion") if isinstance(tenants, dict) else None
+    )
+    if (
+        not isinstance(tenant_api_version, str)
+        or not tenant_api_version.startswith("tenancy.cnpg-vcluster.io/")
+    ):
+        raise RuntimeError("Azure cutover Tenant inventory is malformed")
+    _validated_azure_list(tenants, tenant_api_version, "Tenant")
     catalog = json.loads(
         (root / "controller" / "config" / "azure-management-resources.json").read_text(
             encoding="utf-8"
@@ -785,18 +859,24 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
             entry["inventoryPolicy"],
             entry["class"],
             entry["kind"],
+            entry["apiVersion"],
         )
     resources["leases.coordination.k8s.io"] = (
         "allocation-markers",
         "typed",
         "Lease",
+        "coordination.k8s.io/v1",
     )
     items = []
     for resource, policy in sorted(resources.items()):
         payload = json.loads(
             _kubectl(root, "get", resource, "--all-namespaces", "-o", "json").stdout
         )
-        items.extend((item, *policy) for item in payload.get("items", []))
+        inventory_policy, resource_class, kind, api_version = policy
+        items.extend(
+            (item, inventory_policy, resource_class, kind)
+            for item in _validated_azure_list(payload, api_version, kind)
+        )
     owned_uids = set()
     owned_namespaces = set()
     shared_core_kinds = {
@@ -853,11 +933,15 @@ def _prepare_azure_tenant_api_cutover(
     observed = _get_management_resource(
         root, None, "crd/tenants.tenancy.cnpg-vcluster.io"
     )
-    if observed is None or tenant_api_generation(observed) == "v1alpha3":
-        return False
+    if observed is None:
+        return _azure_cutover_lock_present(root)
+    generation = tenant_api_generation(observed)
+    if generation == "v1alpha3":
+        return _azure_cutover_lock_present(root)
     _azure_cutover_lock(root, present=True)
     deleted = False
     try:
+        _verify_azure_cutover_lock(root, generation)
         tenants, residue = _azure_cutover_inventory(root)
         require_empty_tenant_cutover(tenants, residue)
         _kubectl(
@@ -871,6 +955,7 @@ def _prepare_azure_tenant_api_cutover(
         )
         tenants, residue = _azure_cutover_inventory(root)
         require_empty_tenant_cutover(tenants, residue)
+        _verify_azure_cutover_lock(root, generation)
         _kubectl(
             root,
             "delete",
@@ -1018,8 +1103,10 @@ def _install_tenant_controller(
     inventory: Mapping[str, object],
 ) -> tuple[str, str, str]:
     require_tenant_api_cutover_ready()
-    cutover_locked = _prepare_azure_tenant_api_cutover(root, config)
     image = _push_controller_image(root, config, inventory)
+    provider_config = _azure_provider_configuration(config, inventory, image)
+    _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(root, config)
+    cutover_locked = _prepare_azure_tenant_api_cutover(root, config)
     for path in (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
         root / "controller" / "config" / "crd" / "bases",
@@ -1044,8 +1131,6 @@ def _install_tenant_controller(
         f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
         timeout=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]) + 60,
     )
-    provider_config = _azure_provider_configuration(config, inventory, image)
-    _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(root, config)
     config_map = {
         "apiVersion": "v1",
         "kind": "ConfigMap",
@@ -1432,7 +1517,7 @@ def _admin_authorization_blockers(root: Path) -> list[str]:
             ]
         try:
             review = json.loads(response.stdout)
-            validate_admin_effective_rules(root, "azure", review)
+            validate_admin_effective_rules(root, "azure", review, namespace)
         except (json.JSONDecodeError, RuntimeError) as exc:
             return [str(exc).replace("Tenant Admin", "Azure admin", 1)]
     return []

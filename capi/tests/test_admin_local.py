@@ -71,6 +71,11 @@ class FakeClient:
                 encoding="utf-8"
             )
         )
+        self.controller_role = json.loads(
+            (ROOT / "admin/config/rbac/controller-role.json").read_text(
+                encoding="utf-8"
+            )
+        )
         self.binding = json.loads(
             (
                 ROOT / "admin/config/rbac/cluster-role-binding-local.json"
@@ -122,6 +127,9 @@ class FakeClient:
             namespace: copy.deepcopy(self.rules_review)
             for namespace in self.namespaces
         }
+        self.rules_reviews["tenant-system"]["status"]["resourceRules"].extend(
+            copy.deepcopy(self.controller_role["rules"])
+        )
         self.tenant_names = tenant_names
         self.failed_proxy_paths: set[str] = set()
         self.delete_on_proxy_failure: set[str] = set()
@@ -494,6 +502,8 @@ class AdminLocalTests(unittest.TestCase):
                 ROOT / "admin/config/rbac/service-account.json",
                 ROOT / "admin/config/rbac/cluster-role-local.json",
                 ROOT / "admin/config/rbac/cluster-role-binding-local.json",
+                ROOT / "admin/config/rbac/controller-role.json",
+                ROOT / "admin/config/rbac/controller-role-binding.json",
                 ROOT / "admin/config/service/service.json",
                 rendered,
             ],

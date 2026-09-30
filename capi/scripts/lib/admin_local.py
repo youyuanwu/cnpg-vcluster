@@ -415,7 +415,7 @@ def _verify_effective_rbac(root: Path, client: ManagementClient) -> None:
             raise RuntimeError(
                 f"Tenant Admin effective RBAC review is invalid in {namespace}"
             ) from exc
-        validate_admin_effective_rules(root, "local", review)
+        validate_admin_effective_rules(root, "local", review, namespace)
 
 
 def _service_proxy_response(client: ManagementClient, path: str):

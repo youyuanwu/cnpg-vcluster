@@ -34,6 +34,8 @@ OUTPUT_PATHS = (
     Path("admin/config/rbac/cluster-role-binding-azure.json"),
     Path("admin/config/rbac/cluster-role-binding-local.json"),
     Path("admin/config/rbac/cluster-role-local.json"),
+    Path("admin/config/rbac/controller-role-binding.json"),
+    Path("admin/config/rbac/controller-role.json"),
     Path("admin/config/rbac/service-account.json"),
     Path("admin/config/service/service.json"),
 )
@@ -44,6 +46,8 @@ LEGACY_OUTPUT_PATHS = (
     Path("admin/config/rbac/cluster-role-binding-azure.yaml"),
     Path("admin/config/rbac/cluster-role-binding-local.yaml"),
     Path("admin/config/rbac/cluster-role-local.yaml"),
+    Path("admin/config/rbac/controller-role-binding.yaml"),
+    Path("admin/config/rbac/controller-role.yaml"),
     Path("admin/config/rbac/service-account.yaml"),
     Path("admin/config/service/service.yaml"),
 )
@@ -98,7 +102,7 @@ def provider_rules(
             raise RuntimeError(
                 f"admin provider catalog is invalid: {catalog_path}"
             )
-        if kind == "Secret":
+        if kind in {"Lease", "Secret"}:
             continue
         api_group = api_version.split("/", 1)[0] if "/" in api_version else ""
         if not namespaced:
@@ -122,7 +126,6 @@ def provider_rules(
             ("create", "delete", "get", "list"),
             (),
         ),
-        ("apps", ("deployments",), ("get",), ("tenant-controller",)),
         *PROVIDER_EXPLICIT_RULES[provider],
         *(
             (group, tuple(sorted(resources)), ("get",), ())
@@ -154,6 +157,14 @@ def _cluster_role(root: Path, provider: str) -> dict[str, object]:
             for api_group, resources, verbs, resource_names in provider_rules(root, provider)
         ],
     }
+
+
+def controller_role_path() -> Path:
+    return Path("admin/config/rbac/controller-role.json")
+
+
+def controller_role_binding_path() -> Path:
+    return Path("admin/config/rbac/controller-role-binding.json")
 
 
 def _deployment(provider: str) -> dict[str, object]:
@@ -269,6 +280,46 @@ def generated_documents(root: Path = ROOT) -> dict[Path, str]:
                     "namespace": ADMIN_NAMESPACE,
                 },
                 "automountServiceAccountToken": False,
+            }
+        ),
+        controller_role_path(): _render_json(
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "Role",
+                "metadata": {
+                    "name": "tenant-admin-controller-capability",
+                    "namespace": ADMIN_NAMESPACE,
+                },
+                "rules": [
+                    {
+                        "apiGroups": ["apps"],
+                        "resources": ["deployments"],
+                        "resourceNames": ["tenant-controller"],
+                        "verbs": ["get"],
+                    }
+                ],
+            }
+        ),
+        controller_role_binding_path(): _render_json(
+            {
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "RoleBinding",
+                "metadata": {
+                    "name": "tenant-admin-controller-capability",
+                    "namespace": ADMIN_NAMESPACE,
+                },
+                "roleRef": {
+                    "apiGroup": "rbac.authorization.k8s.io",
+                    "kind": "Role",
+                    "name": "tenant-admin-controller-capability",
+                },
+                "subjects": [
+                    {
+                        "kind": "ServiceAccount",
+                        "name": ADMIN_NAME,
+                        "namespace": ADMIN_NAMESPACE,
+                    }
+                ],
             }
         ),
         Path("admin/config/service/service.json"): _render_json(

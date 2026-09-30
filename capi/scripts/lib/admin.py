@@ -148,6 +148,8 @@ def admin_rbac_resource_paths(root: Path, provider: str) -> tuple[Path, ...]:
         root / "admin/config/rbac/service-account.json",
         root / admin_resource_generator.cluster_role_path(provider),
         root / admin_resource_generator.cluster_role_binding_path(provider),
+        root / admin_resource_generator.controller_role_path(),
+        root / admin_resource_generator.controller_role_binding_path(),
         root / "admin/config/service/service.json",
     )
 
@@ -253,6 +255,7 @@ def validate_admin_effective_rules(
     root: Path,
     provider: str,
     review: object,
+    namespace: str,
 ) -> None:
     if not isinstance(review, dict):
         raise RuntimeError("Tenant Admin effective RBAC review is invalid")
@@ -287,6 +290,26 @@ def validate_admin_effective_rules(
         role.get("rules"),
         "generated ClusterRole",
     )
+    if namespace == ADMIN_NAMESPACE:
+        controller_role_path = root / admin_resource_generator.controller_role_path()
+        try:
+            controller_role = json.loads(
+                controller_role_path.read_text(encoding="utf-8")
+            )
+        except (OSError, json.JSONDecodeError) as exc:
+            raise RuntimeError(
+                f"Tenant Admin generated Role is invalid: {controller_role_path}"
+            ) from exc
+        if not isinstance(controller_role, dict):
+            raise RuntimeError(
+                f"Tenant Admin generated Role is invalid: {controller_role_path}"
+            )
+        expected.update(
+            _admin_resource_permission_atoms(
+                controller_role.get("rules"),
+                "generated Role",
+            )
+        )
     for group, resource, verb, resource_name in expected:
         tenant_mutation = (
             group == "tenancy.cnpg-vcluster.io"

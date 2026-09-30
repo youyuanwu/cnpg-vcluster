@@ -13,6 +13,8 @@ pub enum SourceError {
     CreationUnavailable,
     Conflict,
     StaleIdentity,
+    Forbidden,
+    Rejected,
     ResponseTooLarge,
     DatabaseUnavailable {
         message: String,
@@ -34,6 +36,8 @@ impl fmt::Display for SourceError {
             Self::CreationUnavailable => "Tenant creation is temporarily unavailable",
             Self::Conflict => "Tenant already exists or changed concurrently",
             Self::StaleIdentity => "Tenant identity changed",
+            Self::Forbidden => "Tenant lifecycle request is forbidden",
+            Self::Rejected => "Kubernetes rejected the Tenant lifecycle request",
             Self::ResponseTooLarge => "Kubernetes API response exceeded the service limit",
             Self::DatabaseUnavailable { message, .. } => message,
             Self::QueryFailed { .. } => "PostgreSQL query failed",
@@ -108,6 +112,14 @@ impl From<SourceError> for AppError {
             SourceError::StaleIdentity => Self {
                 status: StatusCode::CONFLICT,
                 error: ApiError::new(ApiErrorCode::StaleIdentity, error.to_string(), false),
+            },
+            SourceError::Forbidden => Self {
+                status: StatusCode::FORBIDDEN,
+                error: ApiError::new(ApiErrorCode::Forbidden, error.to_string(), false),
+            },
+            SourceError::Rejected => Self {
+                status: StatusCode::BAD_REQUEST,
+                error: ApiError::new(ApiErrorCode::InvalidRequest, error.to_string(), false),
             },
             SourceError::ResponseTooLarge => Self::internal(error.to_string()),
             SourceError::DatabaseUnavailable { message, retryable } => {

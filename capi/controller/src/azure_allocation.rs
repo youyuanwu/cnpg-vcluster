@@ -8,7 +8,7 @@ use thiserror::Error;
 
 use crate::{
     allocation::{self, AZURE_CATALOG_UID_LABEL, AllocationError, ClaimContext, ReleaseDecision},
-    api::{AllocationStatus, AzureAllocationStatus},
+    api::{AllocationStatus, AzureAllocationStatus, Tenant},
     foundation::AllocationSlot,
     ownership::{FOUNDATION_ANNOTATION, TENANT_UID_ANNOTATION},
     reconcile::FOUNDATION_NAMESPACE,
@@ -69,6 +69,7 @@ impl AzureAllocationDocument {
     #[rustfmt::skip]
     pub fn validate(&self) -> Result<(), AzureAllocationError> {
         if self.schema != 1 { return Err(AzureAllocationError::Schema); }
+        if self.slots.is_empty() { return Err(AzureAllocationError::Slot("empty".into())); }
         let mut ids = std::collections::BTreeSet::new();
         let mut networks = Vec::new();
         let reserved: Vec<Ipv4Net> = self.reserved_cidrs.iter().map(|value| value.parse())
@@ -92,9 +93,21 @@ impl AzureAllocationDocument {
 
 #[rustfmt::skip]
 pub async fn claim(client: Client, catalog: &AzureAllocationCatalog, identity: AzureClaimIdentity<'_>) -> Result<AzureAllocationStatus, AllocationError> {
+    validate_status_claims(client.clone(), catalog, identity).await?;
     validate_active_claims(client.clone(), catalog).await?;
     let slots = slots(&catalog.values); let context = context(identity, &catalog.config_map_uid, &catalog.sha256, &slots);
     let claim = allocation::allocate(client, &context, None).await?; Ok(status(catalog, &claim.slot, &claim.lease_uid))
+}
+
+#[rustfmt::skip]
+async fn validate_status_claims(client: Client, catalog: &AzureAllocationCatalog, identity: AzureClaimIdentity<'_>) -> Result<(), AllocationError> {
+    let tenants = Api::<Tenant>::all(client).list(&ListParams::default()).await?.items; for tenant in tenants {
+        let Some(active) = tenant.status.as_ref().and_then(|status| status.azure()).and_then(|status| status.network_allocation.as_ref()) else { continue; }; if tenant.metadata.uid.as_deref() == Some(identity.tenant_uid) { continue; }
+        let name = tenant.metadata.name.clone().unwrap_or_default(); let pod: Ipv4Net = active.pod_cidr.parse().map_err(|_| AllocationError::Claim(name.clone()))?; let service: Ipv4Net = active.service_cidr.parse().map_err(|_| AllocationError::Claim(name))?;
+        for slot in &catalog.values.slots { let slot_pod: Ipv4Net = slot.pod_cidr.parse().map_err(|_| AllocationError::InvalidPool)?; let slot_service: Ipv4Net = slot.service_cidr.parse().map_err(|_| AllocationError::InvalidPool)?;
+            if [pod, service].iter().any(|active| overlaps(active, &slot_pod) || overlaps(active, &slot_service)) { return Err(AllocationError::Claim(active.slot_id.clone())); }
+        }
+    } Ok(())
 }
 
 #[rustfmt::skip]

@@ -59,10 +59,12 @@ API. A selected local Tenant detail request validates the exact provider-owned
 kubeconfig Secret, creates an in-memory Tenant client, and performs an exact
 live read of `database/capi-postgres`.
 
-The generated admin ClusterRole grants exact `get` and `list` permissions,
-plus top-level Tenant `create`/`delete` and exact named controller Deployment
-`get`, and excludes subresources. Local mode deliberately adds only `get` on
-core Secrets; it never grants Secret list or watch.
+The generated admin ClusterRole grants exact `get` and `list` permissions plus
+top-level Tenant `create`/`delete`, and excludes subresources and Leases. A
+separate `tenant-system` Role grants named `get` only for the
+`tenant-controller` Deployment, so capability discovery cannot read a
+same-named Deployment in another namespace. Local mode deliberately adds only
+`get` on core Secrets; it never grants Secret list or watch.
 Application logic accepts only the selected Tenant's deterministic kubeconfig
 Secret after endpoint, marker, and owner validation. Local topology accepts
 exact controller markers and owner UID chains, while live CNPG topology comes

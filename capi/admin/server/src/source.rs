@@ -269,16 +269,7 @@ impl KubeDataSource {
         Api::<Tenant>::all(self.client.clone())
             .create(&PostParams::default(), &tenant)
             .await
-            .map_err(|error| match error {
-                kube::Error::Api(status) if status.code == 409 => SourceError::Conflict,
-                error => {
-                    tracing::warn!(
-                        error = %tenant_controller::sanitize::text(&error.to_string()),
-                        "Tenant create failed"
-                    );
-                    SourceError::KubernetesUnavailable
-                }
-            })
+            .map_err(mutation_error)
     }
 
     async fn delete_exact_tenant(
@@ -287,68 +278,61 @@ impl KubeDataSource {
         expected_uid: &str,
     ) -> Result<TenantDeleteResponse, SourceError> {
         let api = Api::<Tenant>::all(self.client.clone());
-        let Some(tenant) = api
-            .get_opt(name)
-            .await
-            .map_err(|_| SourceError::KubernetesUnavailable)?
-        else {
-            return Ok(delete_response(
-                name,
-                expected_uid,
-                None,
-                TenantDeleteState::Completed,
-            ));
-        };
-        let uid = tenant
-            .uid()
-            .filter(|value| !value.is_empty())
-            .ok_or(SourceError::StaleIdentity)?;
-        if uid != expected_uid {
-            return Err(SourceError::StaleIdentity);
-        }
-        let generation = tenant.metadata.generation;
-        if tenant.metadata.deletion_timestamp.is_some() {
-            return Ok(delete_response(
-                name,
-                &uid,
-                generation,
-                TenantDeleteState::Accepted,
-            ));
-        }
-        let resource_version = tenant
-            .resource_version()
-            .filter(|value| !value.is_empty())
-            .ok_or(SourceError::Conflict)?;
-        let params = DeleteParams {
-            preconditions: Some(Preconditions {
-                uid: Some(uid.clone()),
-                resource_version: Some(resource_version),
-            }),
-            propagation_policy: Some(PropagationPolicy::Background),
-            ..DeleteParams::default()
-        };
-        match api.delete(name, &params).await {
-            Ok(_) => Ok(delete_response(
-                name,
-                &uid,
-                generation,
-                TenantDeleteState::Accepted,
-            )),
-            Err(kube::Error::Api(status)) if status.code == 404 => Ok(delete_response(
-                name,
-                &uid,
-                generation,
-                TenantDeleteState::Completed,
-            )),
-            Err(kube::Error::Api(status)) if status.code == 409 => Err(SourceError::Conflict),
-            Err(error) => {
-                tracing::warn!(
-                    error = %tenant_controller::sanitize::text(&error.to_string()),
-                    "Tenant delete failed"
-                );
-                Err(SourceError::KubernetesUnavailable)
+        for attempt in 0..3 {
+            let Some(tenant) = api.get_opt(name).await.map_err(mutation_error)? else {
+                return Ok(delete_response(
+                    name,
+                    expected_uid,
+                    None,
+                    TenantDeleteState::Completed,
+                ));
+            };
+            let uid = tenant
+                .uid()
+                .filter(|value| !value.is_empty())
+                .ok_or(SourceError::StaleIdentity)?;
+            if uid != expected_uid {
+                return Err(SourceError::StaleIdentity);
+            }
+            let generation = tenant.metadata.generation;
+            if tenant.metadata.deletion_timestamp.is_some() {
+                return Ok(delete_response(
+                    name,
+                    &uid,
+                    generation,
+                    TenantDeleteState::Accepted,
+                ));
+            }
+            let params = DeleteParams {
+                preconditions: Some(Preconditions {
+                    uid: Some(uid.clone()),
+                    resource_version: tenant.resource_version(),
+                }),
+                propagation_policy: Some(PropagationPolicy::Background),
+                ..DeleteParams::default()
+            };
+            match api.delete(name, &params).await {
+                Ok(_) => {
+                    return Ok(delete_response(
+                        name,
+                        &uid,
+                        generation,
+                        TenantDeleteState::Accepted,
+                    ));
+                }
+                Err(kube::Error::Api(status)) if status.code == 404 => {
+                    return Ok(delete_response(
+                        name,
+                        &uid,
+                        generation,
+                        TenantDeleteState::Completed,
+                    ));
+                }
+                Err(kube::Error::Api(status)) if status.code == 409 && attempt < 2 => continue,
+                Err(error) => return Err(mutation_error(error)),
             }
         }
+        Err(SourceError::Conflict)
     }
 
     async fn list_definition(
@@ -1412,6 +1396,21 @@ fn delete_response(
     }
 }
 
+fn mutation_error(error: kube::Error) -> SourceError {
+    match error {
+        kube::Error::Api(status) if status.code == 409 => SourceError::Conflict,
+        kube::Error::Api(status) if status.code == 403 => SourceError::Forbidden,
+        kube::Error::Api(status) if matches!(status.code, 400 | 422) => SourceError::Rejected,
+        error => {
+            tracing::warn!(
+                error = %tenant_controller::sanitize::text(&error.to_string()),
+                "Tenant lifecycle mutation failed"
+            );
+            SourceError::KubernetesUnavailable
+        }
+    }
+}
+
 impl DataSource for KubeDataSource {
     fn list_tenants(&self) -> SourceFuture<'_, Vec<Tenant>> {
         Box::pin(async move {
@@ -1478,7 +1477,7 @@ impl DataSource for KubeDataSource {
             let definitions: Vec<_> = catalog
                 .iter()
                 .copied()
-                .filter(|definition| definition.kind != "Secret")
+                .filter(|definition| !matches!(definition.kind, "Lease" | "Secret"))
                 .filter(|definition| {
                     unique.insert((
                         definition.api_version,
@@ -2882,6 +2881,18 @@ mod tests {
                 .await,
             Err(SourceError::Conflict)
         );
+        for (code, expected) in [(403, SourceError::Forbidden), (422, SourceError::Rejected)] {
+            let status = json!({
+                "apiVersion":"v1","kind":"Status","status":"Failure","code":code
+            });
+            let (client, _) = fixture_client(vec![(code, status)]);
+            assert_eq!(
+                KubeDataSource::new(client)
+                    .create_tenant(tenant.clone())
+                    .await,
+                Err(expected)
+            );
+        }
 
         let serialized = serde_json::to_value(&tenant).unwrap();
         let (client, calls) = fixture_client(vec![(200, serialized.clone())]);
@@ -2926,6 +2937,31 @@ mod tests {
             .unwrap();
         assert_eq!(response.state, TenantDeleteState::Completed);
         assert_eq!(calls.lock().unwrap().len(), 1);
+
+        let mut refreshed = tenant.clone();
+        refreshed.metadata.resource_version = Some("8".into());
+        let conflict = json!({
+            "apiVersion":"v1","kind":"Status","status":"Failure",
+            "reason":"Conflict","code":409
+        });
+        let deleted = json!({
+            "apiVersion":"v1","kind":"Status","status":"Success","code":200
+        });
+        let (client, calls) = fixture_client(vec![
+            (200, serde_json::to_value(&tenant).unwrap()),
+            (409, conflict),
+            (200, serde_json::to_value(refreshed).unwrap()),
+            (200, deleted),
+        ]);
+        assert_eq!(
+            KubeDataSource::new(client)
+                .delete_tenant("tenant-a", "tenant-uid")
+                .await
+                .unwrap()
+                .state,
+            TenantDeleteState::Accepted
+        );
+        assert_eq!(calls.lock().unwrap().len(), 4);
 
         let mut deleting = tenant;
         deleting.metadata.deletion_timestamp =

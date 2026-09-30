@@ -33,20 +33,6 @@
       "apiGroups": [
         "apps"
       ],
-      "resourceNames": [
-        "tenant-controller"
-      ],
-      "resources": [
-        "deployments"
-      ],
-      "verbs": [
-        "get"
-      ]
-    },
-    {
-      "apiGroups": [
-        "apps"
-      ],
       "resources": [
         "deployments",
         "statefulsets"

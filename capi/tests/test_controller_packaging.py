@@ -110,12 +110,14 @@ class PackagingTests(unittest.TestCase):
         with (
             patch.object(packaging, "require_clean_controller_state") as clean,
             patch.object(packaging, "stop_controller") as stop,
+            patch.object(packaging, "verify_tenant_cutover_lock") as fence,
         ):
             self.assertTrue(
                 packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)
             )
         self.assertEqual(clean.call_count, 2)
         stop.assert_called_once()
+        self.assertEqual(2, fence.call_count)
         self.assertTrue(
             any(
                 args[:2] == ("delete", f"crd/{packaging.TENANT_CRD}")
@@ -144,6 +146,7 @@ class PackagingTests(unittest.TestCase):
                 side_effect=[None, RuntimeError("race")],
             ),
             patch.object(packaging, "stop_controller"),
+            patch.object(packaging, "verify_tenant_cutover_lock"),
             self.assertRaisesRegex(RuntimeError, "race"),
         ):
             packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)
@@ -176,6 +179,32 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(
                 any(args[:2] == ("delete", resource) for args, _ in client.calls)
             )
+
+    def test_cutover_rerun_adopts_existing_lock_after_crd_deletion(self):
+        refs = set(packaging.tenant_cutover_lock_cleanup_refs())
+
+        def handle(*args, **_kwargs):
+            if args[:2] == ("get", f"crd/{packaging.TENANT_CRD}"):
+                return response()
+            if args and args[0] == "get" and args[1] in refs:
+                return response(args[1])
+            return response()
+
+        self.assertTrue(
+            packaging.prepare_tenant_api_cutover(
+                Path("."), CONFIG, Client(handle)
+            )
+        )
+
+    def test_cutover_lock_probe_requires_admission_denial(self):
+        client = Client(
+            lambda *_args, **_kwargs: response(
+                code=1,
+                error="Tenant creation is locked during API cutover",
+            )
+        )
+        packaging.verify_tenant_cutover_lock(client, "v1alpha2")
+        self.assertEqual(5, len(client.calls))
 
     def setUp(self):
         (ROOT / ".runtime").mkdir(exist_ok=True)

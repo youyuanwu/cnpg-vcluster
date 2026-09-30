@@ -207,7 +207,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             &cluster,
             &azure_cluster,
             &endpoint,
-            mutations_allowed,
+            self.require_current_allocation().await.is_ok(),
         )
         .await?
         {
@@ -441,6 +441,7 @@ impl<A: TenantAccess> AzureProvider<A> {
         Ok(())
     }
 
+    #[rustfmt::skip]
     async fn write_barrier(
         &self,
         tenant: &Tenant,
@@ -465,16 +466,11 @@ impl<A: TenantAccess> AzureProvider<A> {
             .unwrap_or_default();
         let recorded = management.uid_for(kind, &object_name, &name);
         self.validate_mutation().await?;
-        if !mutations_allowed
-            && objects::object_api(self.client.clone(), desired)?
-                .get_opt(&object_name)
-                .await?
-                .is_none()
-        {
-            return Err(catalog_block("provider writes"));
-        }
-        let mut ensured =
-            objects::read_or_create(self.client.clone(), desired, None, recorded.is_some()).await?;
+        let mut ensured = if mutations_allowed {
+            self.require_current_allocation().await?; objects::read_or_create(self.client.clone(), desired, None, recorded.is_some()).await?
+        } else {
+            let object = objects::object_api(self.client.clone(), desired)?.get_opt(&object_name).await?.ok_or_else(|| catalog_block("provider writes"))?; objects::Ensured { object, created: false }
+        };
         if !ensured.created {
             azure::validate_live_identity(desired, &ensured.object, recorded)
                 .map_err(azure_ownership)?;
@@ -483,12 +479,9 @@ impl<A: TenantAccess> AzureProvider<A> {
                 if !matches!(error, AzureOwnershipError::Desired(_)) {
                     return Err(azure_ownership(error));
                 }
-                if !mutations_allowed {
-                    return Err(catalog_block("provider repair"));
-                }
-                self.validate_mutation().await?;
-                ensured.object =
-                    objects::apply_exact(self.client.clone(), desired, &ensured.object).await?;
+                if !mutations_allowed { return Err(catalog_block("provider repair")); }
+                self.validate_mutation().await?; self.require_current_allocation().await?;
+                ensured.object = objects::apply_exact(self.client.clone(), desired, &ensured.object).await?;
                 azure::validate_live_object(desired, &ensured.object, recorded)
                     .map_err(azure_ownership)?;
                 validate_parent(&ensured.object, &management, &name)?;
@@ -500,10 +493,8 @@ impl<A: TenantAccess> AzureProvider<A> {
             .filter(|value| !value.is_empty())
             .ok_or_else(|| ownership("Azure management object UID is missing"))?;
         if recorded.is_none() {
-            if !mutations_allowed {
-                return Err(catalog_block("provider identity writes"));
-            }
-            let kind = kind.to_owned();
+            if !mutations_allowed { return Err(catalog_block("provider identity writes")); }
+            self.require_current_allocation().await?; let kind = kind.to_owned();
             let object_name = object_name.clone();
             self.update(tenant, |status| {
                 validate_status_binding(status, binding)?;
@@ -525,14 +516,11 @@ impl<A: TenantAccess> AzureProvider<A> {
     #[rustfmt::skip]
     async fn require_current_allocation(&self) -> Result<(), ReconcileError> {
         let live = Api::<ConfigMap>::namespaced(self.client.clone(), FOUNDATION_NAMESPACE)
-            .get(azure_allocation::CONFIG_NAME).await.map_err(|error| ReconcileError::MutationGuard(
+            .get(azure_allocation::CONFIG_NAME).await.map_err(|error| catalog_invalid(
                 format!("cannot read {FOUNDATION_NAMESPACE}/{}: {error}", azure_allocation::CONFIG_NAME)))?;
-        let actual = AzureAllocationCatalog::from_config_map(&live).map_err(|error| {
-            ReconcileError::MutationGuard(format!("{FOUNDATION_NAMESPACE}/{} is invalid: {error}", azure_allocation::CONFIG_NAME))
-        })?;
-        if self.allocation.as_ref() != Some(&actual) {
-            return Err(ReconcileError::MutationGuard(format!("{FOUNDATION_NAMESPACE}/{} differs from the startup configuration", azure_allocation::CONFIG_NAME)));
-        }
+        let actual = AzureAllocationCatalog::from_config_map(&live).map_err(|error| catalog_invalid(
+            format!("{FOUNDATION_NAMESPACE}/{} is invalid: {error}", azure_allocation::CONFIG_NAME)))?;
+        if self.allocation.as_ref() != Some(&actual) { return Err(catalog_invalid(format!("{FOUNDATION_NAMESPACE}/{} differs from the startup configuration", azure_allocation::CONFIG_NAME))); }
         Ok(())
     }
 
@@ -650,11 +638,11 @@ fn ownership(message: impl Into<String>) -> ReconcileError {
     ReconcileError::OwnershipInvalid(message.into())
 }
 
-fn catalog_block(action: &str) -> ReconcileError {
-    ReconcileError::MutationGuard(format!(
-        "Azure allocation catalog is invalid; {action} are blocked"
-    ))
-}
+#[rustfmt::skip]
+fn catalog_block(action: &str) -> ReconcileError { catalog_invalid(format!("Azure allocation catalog is invalid; {action} are blocked")) }
+
+#[rustfmt::skip]
+fn catalog_invalid(message: String) -> ReconcileError { ReconcileError::Degraded { reason: "AzureAllocationInvalid", message } }
 
 fn azure_ownership(error: AzureOwnershipError) -> ReconcileError {
     match error {

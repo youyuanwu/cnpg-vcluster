@@ -63,6 +63,11 @@ impl Fixture {
             "coordination.k8s.io/v1",
             "Lease",
         );
+        management.allow_typed_list(
+            "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants",
+            "tenancy.cnpg-vcluster.io/v1alpha3",
+            "Tenant",
+        );
         workload.allow_typed_list("/api/v1/nodes", "v1", "Node");
         let config = provider_config();
         management.insert(PROVIDER_CONFIG_PATH, config.clone());
@@ -502,6 +507,41 @@ async fn concurrent_azure_claims_never_share_the_only_slot() {
 }
 
 #[tokio::test]
+async fn durable_status_reserves_a_slot_after_its_lease_disappears() {
+    let fixture = Fixture::new();
+    fixture.step().await;
+    fixture.step().await;
+    fixture.step().await;
+    let allocation = fixture
+        .current()
+        .status
+        .unwrap()
+        .azure()
+        .unwrap()
+        .network_allocation
+        .clone()
+        .unwrap();
+    fixture.management.remove(&format!(
+        "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases/{}",
+        allocation.lease_name
+    ));
+    let hash = "b".repeat(64);
+    assert!(matches!(
+        azure_allocation::claim(
+            fixture.management.client(),
+            &fixture.allocation,
+            AzureClaimIdentity {
+                tenant_name: "tenant-b",
+                tenant_uid: "uid-b",
+                spec_hash: &hash,
+            },
+        )
+        .await,
+        Err(tenant_controller::allocation::AllocationError::Claim(_))
+    ));
+}
+
+#[tokio::test]
 async fn rotated_catalog_cannot_relabel_an_active_network() {
     let fixture = Fixture::new();
     let first_hash = "a".repeat(64);
@@ -704,6 +744,43 @@ async fn invalid_current_catalog_blocks_ready_tenant_repair() {
     assert!(!fixture.management.calls().iter().any(|call| {
         call.method == "POST" && call.path == "/apis/batch/v1/namespaces/tenant-a/jobs"
     }));
+    let status = fixture.current().status.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Degraded));
+    assert!(status.conditions.iter().any(|condition| {
+        condition.type_ == "Ready"
+            && condition.status == "False"
+            && condition.reason == "AzureAllocationInvalid"
+    }));
+}
+
+#[tokio::test]
+async fn invalid_current_catalog_is_visible_on_a_new_tenant() {
+    let fixture = Fixture::new();
+    let mut config = allocation_config();
+    config
+        .metadata
+        .annotations
+        .as_mut()
+        .unwrap()
+        .insert(APPROVED_SHA256_ANNOTATION.into(), "0".repeat(64));
+    fixture.management.insert(ALLOCATION_CONFIG_PATH, config);
+    for _ in 0..4 {
+        fixture.step().await;
+    }
+    let status = fixture.current().status.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Degraded));
+    assert!(status.conditions.iter().any(|condition| {
+        condition.type_ == "Ready"
+            && condition.status == "False"
+            && condition.reason == "AzureAllocationInvalid"
+    }));
+    assert!(
+        !fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| { call.method == "POST" && !call.path.ends_with("/status") })
+    );
 }
 
 #[tokio::test]

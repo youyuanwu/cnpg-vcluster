@@ -27,7 +27,6 @@ EXPECTED_RBAC = {
             ("kamajicontrolplanes",),
             ("list",),
         ),
-        ("coordination.k8s.io", ("leases",), ("list",)),
         (
             "infrastructure.cluster.x-k8s.io",
             ("devclusters", "devmachines", "devmachinetemplates"),
@@ -209,13 +208,25 @@ class AdminResourceTests(unittest.TestCase):
                     ("create", "delete", "get", "list"),
                     (),
                 ),
-                ("apps", ("deployments",), ("get",), ("tenant-controller",)),
             })
             self.assertEqual(expected, actual)
             self.assertEqual(
                 tuple(sorted(expected)),
                 generator.provider_rules(ROOT, provider),
             )
+
+        controller_role = load("admin/config/rbac/controller-role.json")
+        self.assertEqual("Role", controller_role["kind"])
+        self.assertEqual("tenant-system", controller_role["metadata"]["namespace"])
+        self.assertEqual(
+            [{
+                "apiGroups": ["apps"],
+                "resourceNames": ["tenant-controller"],
+                "resources": ["deployments"],
+                "verbs": ["get"],
+            }],
+            controller_role["rules"],
+        )
 
     def test_deployments_are_provider_specific_and_hardened(self) -> None:
         images = set()

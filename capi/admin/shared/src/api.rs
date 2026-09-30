@@ -71,6 +71,7 @@ pub enum ApiErrorCode {
     CreationUnavailable,
     Conflict,
     StaleIdentity,
+    Forbidden,
     DatabaseUnavailable,
     QueryFailed,
     QueryResponseTooLarge,

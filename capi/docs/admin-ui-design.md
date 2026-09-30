@@ -81,7 +81,8 @@ process is an Axum server. The Cargo workspace contains three crates:
 
 The server listens on `0.0.0.0:8080`. The generated Deployment,
 ServiceAccount, ClusterRoleBinding, and ClusterIP Service are named
-`tenant-admin` in `tenant-system`. Local installs the
+`tenant-admin` in `tenant-system`; a namespace-scoped capability Role and
+RoleBinding are named `tenant-admin-controller-capability`. Local installs the
 `tenant-admin-local` ClusterRole and Azure installs `tenant-admin-azure`.
 The Service exposes port `80`. These checked-in resources and deployment
 templates are canonical indented JSON, generated and validated with only the
@@ -98,8 +99,10 @@ fail rather than being silently truncated.
 Secrets remain excluded from management-resource inventory and responses.
 Provider-specific ClusterRoles are derived from the matching
 management-resource catalog. Tenants receive `get`, `list`, `create`, and
-`delete`; the exact `tenant-controller` Deployment receives named `get`; the
-deterministic cluster-scoped Namespace
+`delete`; Leases are excluded from Admin inventory and authority. A separate
+Role in `tenant-system` grants named `get` for the exact `tenant-controller`
+Deployment, preventing capability discovery from reading same-named
+Deployments elsewhere. The deterministic cluster-scoped Namespace
 receives `get`, and every provider resource actually scanned receives `list`.
 Local mode additionally receives only `get` on core Secrets so it can fetch
 the deterministic `<tenant>-kubeconfig` Secret. Kubernetes RBAC cannot scope a

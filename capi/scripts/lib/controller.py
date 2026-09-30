@@ -155,6 +155,41 @@ def apply_tenant_cutover_lock(
         raise
 
 
+def tenant_cutover_lock_present(client: ManagementClient) -> bool:
+    present = []
+    for resource in tenant_cutover_lock_cleanup_refs():
+        present.append(bool(client.kubectl(
+            "get", resource, "--ignore-not-found=true", "-o", "name",
+        ).stdout.strip()))
+    if present[0] != present[1]:
+        raise RuntimeError("Tenant cutover lock is partially installed")
+    return present[0]
+
+
+def verify_tenant_cutover_lock(client: ManagementClient, generation: str) -> None:
+    document = {
+        "apiVersion": f"tenancy.cnpg-vcluster.io/{generation}",
+        "kind": "Tenant",
+        "metadata": {"name": f"cutover-lock-probe-{uuid.uuid4().hex[:12]}"},
+        "spec": {
+            "kubernetesVersion": "1.36.4",
+            "workers": 1,
+            "provider": {"type": "local", "databases": 1},
+        },
+    }
+    for _ in range(5):
+        response = client.kubectl(
+            "create", "--dry-run=server", "-f", "-",
+            input_text=json.dumps(document), check=False,
+        )
+        if (
+            response.returncode == 0
+            or "Tenant creation is locked during API cutover"
+            not in response.stderr
+        ):
+            raise RuntimeError("Tenant cutover create lock is not effective")
+
+
 def remove_tenant_cutover_lock(config: dict[str, str], client: ManagementClient) -> None:
     for resource in tenant_cutover_lock_cleanup_refs():
         client.kubectl(
@@ -179,16 +214,18 @@ def prepare_tenant_api_cutover(
         "json",
     ).stdout.strip()
     if not observed:
-        return False
+        return tenant_cutover_lock_present(client)
     generation = tenant_api_generation(json.loads(observed))
     if generation == "v1alpha3":
-        return False
+        return tenant_cutover_lock_present(client)
     apply_tenant_cutover_lock(config, client)
     deleted = False
     try:
+        verify_tenant_cutover_lock(client, generation)
         require_clean_controller_state(root, client)
         stop_controller(config, client)
         require_clean_controller_state(root, client)
+        verify_tenant_cutover_lock(client, generation)
         client.kubectl(
             "delete",
             f"crd/{TENANT_CRD}",

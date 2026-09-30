@@ -30,6 +30,7 @@ from scripts.lib.azure.foundation import (
     _azure_allocation_configuration,
     _azure_cutover_lock,
     _azure_cutover_inventory,
+    _validated_azure_list,
     _prepare_azure_tenant_api_cutover,
     _verify_azure_controller_allocation_readiness,
     _verify_azure_cutover_probe,
@@ -46,6 +47,7 @@ from scripts.lib.azure.foundation import (
     preflight,
 )
 from scripts.lib.config import ConfigError
+from scripts.lib.controller import tenant_cutover_lock_cleanup_refs
 from scripts.lib.files import write_private_file
 from scripts.lib.locking import azure_lock
 from scripts.lib.tenant_spec import TenantSpecError
@@ -147,14 +149,36 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             "status": {"storedVersions": ["v1alpha2"]},
         }
         calls = []
+        entries = json.loads(
+            (catalog / "azure-management-resources.json").read_text()
+        )
+        definitions = {
+            (
+                f"{entry['plural']}.{entry['apiVersion'].partition('/')[0]}"
+                if "/" in entry["apiVersion"]
+                else entry["plural"]
+            ): (entry["apiVersion"], entry["kind"])
+            for entry in entries
+        }
+        definitions["leases.coordination.k8s.io"] = (
+            "coordination.k8s.io/v1", "Lease"
+        )
 
         def kubectl(_root, *arguments, **_kwargs):
             calls.append(arguments)
-            if arguments[:2] == ("get", "tenants") or (
-                arguments and arguments[0] == "get" and "--all-namespaces" in arguments
-            ):
+            if arguments[:2] == ("get", "tenants"):
+                return completed(json.dumps({
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+                    "kind": "TenantList",
+                    "metadata": {"continue": ""},
+                    "items": [],
+                }))
+            if arguments and arguments[0] == "get" and "--all-namespaces" in arguments:
+                resource = arguments[1]
+                api_version, kind = definitions[resource]
+                items = []
                 if arguments[:2] == ("get", "configmaps"):
-                    return completed(json.dumps({"items": [{
+                    items = [{
                         "apiVersion": "v1",
                         "kind": "ConfigMap",
                         "metadata": {
@@ -162,8 +186,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                             "namespace": "tenant-system",
                             "uid": "shared-config",
                         },
-                    }]}))
-                return completed(json.dumps({"items": []}))
+                    }]
+                return completed(json.dumps({
+                    "apiVersion": api_version,
+                    "kind": f"{kind}List",
+                    "metadata": {"continue": ""},
+                    "items": items,
+                }))
             return completed()
 
         with (
@@ -172,8 +201,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return_value=old,
             ),
             patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_lock") as fence,
         ):
             self.assertTrue(_prepare_azure_tenant_api_cutover(root, config))
+        self.assertEqual(2, fence.call_count)
         self.assertIn(
             ("delete", "crd/tenants.tenancy.cnpg-vcluster.io", "--wait=true",
              f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}"),
@@ -215,6 +246,28 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             )
         )
 
+    def test_azure_cutover_rerun_adopts_existing_lock_after_crd_deletion(self):
+        refs = set(tenant_cutover_lock_cleanup_refs())
+
+        def kubectl(_root, *arguments, **_kwargs):
+            if arguments and arguments[0] == "get" and arguments[1] in refs:
+                return completed(arguments[1])
+            return completed()
+
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=None,
+            ),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+        ):
+            self.assertTrue(
+                _prepare_azure_tenant_api_cutover(
+                    self.make_root(),
+                    {"AZURE_CONTROLLER_TIMEOUT": "1s"},
+                )
+            )
+
     def test_azure_cutover_inventory_blocks_unmarked_provider_root(self):
         root = self.make_root()
         catalog = root / "controller" / "config"
@@ -227,8 +280,28 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
 
         def kubectl(_root, *arguments, **_kwargs):
             if arguments[:2] == ("get", "tenants"):
-                return completed(json.dumps({"items": []}))
+                return completed(json.dumps({
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+                    "kind": "TenantList",
+                    "metadata": {"continue": ""},
+                    "items": [],
+                }))
             items = []
+            resource = arguments[1]
+            entries = json.loads(
+                (catalog / "azure-management-resources.json").read_text()
+            )
+            definitions = {
+                (
+                    f"{entry['plural']}.{entry['apiVersion'].partition('/')[0]}"
+                    if "/" in entry["apiVersion"]
+                    else entry["plural"]
+                ): (entry["apiVersion"], entry["kind"])
+                for entry in entries
+            }
+            definitions["leases.coordination.k8s.io"] = (
+                "coordination.k8s.io/v1", "Lease"
+            )
             if arguments[:2] == (
                 "get",
                 "azureclusters.infrastructure.cluster.x-k8s.io",
@@ -248,12 +321,34 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                         "uid": "shared-config",
                     },
                 }]
-            return completed(json.dumps({"items": items}))
+            api_version, kind = definitions[resource]
+            return completed(json.dumps({
+                "apiVersion": api_version,
+                "kind": f"{kind}List",
+                "metadata": {"continue": ""},
+                "items": items,
+            }))
 
         with patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl):
             tenants, residue = _azure_cutover_inventory(root)
-        self.assertEqual(tenants, {"items": []})
+        self.assertEqual(tenants["items"], [])
         self.assertEqual(residue, ["AzureCluster/foreign"])
+
+    def test_azure_cutover_inventory_rejects_malformed_or_paginated_lists(self):
+        valid = {
+            "apiVersion": "v1",
+            "kind": "ConfigMapList",
+            "metadata": {"continue": ""},
+            "items": [],
+        }
+        self.assertEqual([], _validated_azure_list(valid, "v1", "ConfigMap"))
+        for malformed in (
+            {**valid, "items": {}},
+            {**valid, "metadata": {"continue": "next"}},
+            {**valid, "kind": "List"},
+        ):
+            with self.assertRaisesRegex(RuntimeError, "inventory"):
+                _validated_azure_list(malformed, "v1", "ConfigMap")
 
     def test_existing_complete_capi_stack_skips_clusterctl_init(self) -> None:
         root = self.make_root()
@@ -814,6 +909,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     root
                     / "admin/config/rbac/cluster-role-binding-azure.json"
                 ),
+                str(root / "admin/config/rbac/controller-role.json"),
+                str(root / "admin/config/rbac/controller-role-binding.json"),
                 str(root / "admin/config/service/service.json"),
                 str(rendered),
             ],
@@ -923,6 +1020,9 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         role = json.loads(
             (ROOT / "admin/config/rbac/cluster-role-azure.json").read_text()
         )
+        controller_role = json.loads(
+            (ROOT / "admin/config/rbac/controller-role.json").read_text()
+        )
         binding = json.loads(
             (
                 ROOT / "admin/config/rbac/cluster-role-binding-azure.json"
@@ -982,6 +1082,9 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 namespace: copy.deepcopy(rules_review)
                 for namespace in namespaces
             }
+            reviews["tenant-system"]["status"]["resourceRules"].extend(
+                copy.deepcopy(controller_role["rules"])
+            )
             if review_mutator is not None:
                 review_mutator(reviews[review_namespace])
             api = dict(api_overrides or {})
