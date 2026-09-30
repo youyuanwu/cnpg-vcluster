@@ -93,8 +93,23 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
 
     def test_azure_cutover_readiness_proves_ready_pod_and_leader_lease(self):
         root = self.make_root()
+        config = load_azure_configuration(root)
+        _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(
+            root, config
+        )
 
         def kubectl(_root, *arguments, **_kwargs):
+            if any(str(value).startswith("configmap/") for value in arguments):
+                return completed(json.dumps({
+                    "metadata": {
+                        "annotations": {
+                            TENANT_ALLOCATION_APPROVAL: allocation_sha256
+                        }
+                    },
+                    "data": {TENANT_ALLOCATION_CONFIG_KEY: allocation_raw},
+                }))
+            if arguments and arguments[0] == "auth":
+                return completed("yes\n")
             if "pods" in arguments:
                 return completed(json.dumps({"items": [{
                     "metadata": {"name": "tenant-controller-pod"},
@@ -107,7 +122,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             return completed("ok")
 
         with patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl):
-            _verify_azure_controller_allocation_readiness(root)
+            _verify_azure_controller_allocation_readiness(
+                root,
+                allocation_raw,
+                allocation_sha256,
+            )
 
     def test_azure_cutover_locks_checks_residue_and_replaces_only_empty_crd(self):
         root = self.make_root()

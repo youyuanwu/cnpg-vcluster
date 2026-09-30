@@ -926,7 +926,45 @@ def _verify_azure_cutover_probe(
         )
 
 
-def _verify_azure_controller_allocation_readiness(root: Path) -> None:
+def _verify_azure_controller_allocation_readiness(
+    root: Path,
+    allocation_raw: str,
+    allocation_sha256: str,
+) -> None:
+    allocation = json.loads(
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "get",
+            f"configmap/{TENANT_ALLOCATION_CONFIG}",
+            "-o",
+            "json",
+        ).stdout
+    )
+    if (
+        allocation.get("data", {}).get(TENANT_ALLOCATION_CONFIG_KEY)
+        != allocation_raw
+        or allocation.get("metadata", {}).get("annotations", {}).get(
+            TENANT_ALLOCATION_APPROVAL
+        )
+        != allocation_sha256
+    ):
+        raise RuntimeError("Azure Tenant allocation ConfigMap approval is not current")
+    for verb in ("create", "delete", "get", "list"):
+        allowed = _kubectl(
+            root,
+            "auth",
+            "can-i",
+            verb,
+            "leases.coordination.k8s.io",
+            "--as=system:serviceaccount:tenant-system:tenant-controller",
+            "--namespace=tenant-system",
+        ).stdout.strip()
+        if allowed != "yes":
+            raise RuntimeError(
+                f"Azure Tenant controller cannot {verb} allocation Leases"
+            )
     pods = json.loads(
         _kubectl(
             root,
@@ -1100,7 +1138,11 @@ def _install_tenant_controller(
     if not isinstance(allocation_uid, str) or not allocation_uid:
         raise RuntimeError("Azure Tenant allocation ConfigMap UID is absent")
     if cutover_locked:
-        _verify_azure_controller_allocation_readiness(root)
+        _verify_azure_controller_allocation_readiness(
+            root,
+            allocation_raw,
+            allocation_sha256,
+        )
         _azure_cutover_lock(root, present=False)
         try:
             _verify_azure_cutover_probe(root, config)
