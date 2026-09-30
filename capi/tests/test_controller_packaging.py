@@ -233,6 +233,66 @@ class PackagingTests(unittest.TestCase):
             args and args[0] == "apply" for args, _ in client.calls
         ))
 
+    def test_cutover_restore_failure_retains_lock(self):
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        client = Client(
+            lambda *args, **_kwargs: response(old)
+            if args[:2] == ("get", f"crd/{packaging.TENANT_CRD}")
+            else response()
+        )
+        with (
+            patch.object(packaging, "desired_tenant_crd", return_value=desired_crd()),
+            patch.object(packaging, "require_clean_controller_state",
+                         side_effect=[None, RuntimeError("late Tenant")]),
+            patch.object(packaging, "stop_controller"),
+            patch.object(
+                packaging,
+                "restore_controller",
+                side_effect=RuntimeError("restore failed"),
+            ),
+            patch.object(packaging, "remove_tenant_cutover_lock") as remove,
+            self.assertRaisesRegex(RuntimeError, "restore failed"),
+        ):
+            packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)
+        remove.assert_not_called()
+
+    def test_cutover_preserves_existing_lock_without_reapply(self):
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        refs = set(packaging.tenant_cutover_lock_cleanup_refs())
+
+        def handle(*args, **_kwargs):
+            if args[:2] == ("get", f"crd/{packaging.TENANT_CRD}"):
+                return response(old)
+            if args and args[0] == "get" and args[1] in refs:
+                return response(args[1])
+            return response()
+
+        with (
+            patch.object(packaging, "desired_tenant_crd", return_value=desired_crd()),
+            patch.object(packaging, "apply_tenant_cutover_lock") as apply_lock,
+            patch.object(packaging, "verify_tenant_cutover_lock"),
+            patch.object(
+                packaging,
+                "require_clean_controller_state",
+                side_effect=RuntimeError("not clean"),
+            ),
+            patch.object(packaging, "restore_controller"),
+            patch.object(packaging, "remove_tenant_cutover_lock"),
+            self.assertRaisesRegex(RuntimeError, "not clean"),
+        ):
+            packaging.prepare_tenant_api_cutover(Path("."), CONFIG, Client(handle))
+        apply_lock.assert_not_called()
+
     def test_partial_cutover_lock_application_is_cleaned_up(self):
         apply_count = 0
 

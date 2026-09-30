@@ -999,11 +999,17 @@ def _prepare_azure_tenant_api_cutover(
     if not isinstance(desired, dict):
         raise RuntimeError("generated Azure Tenant CRD is invalid")
     transition = generation == "transitioning"
+    transition_document = (
+        None
+        if transition
+        else tenant_crd_transition_document(observed, desired)
+    )
     if transition:
         if not _azure_cutover_lock_present(root):
             raise RuntimeError("Azure Tenant CRD transition is missing its create lock")
     else:
-        _azure_cutover_lock(root, present=True)
+        if not _azure_cutover_lock_present(root):
+            _azure_cutover_lock(root, present=True)
     try:
         _verify_azure_cutover_lock(
             root,
@@ -1025,9 +1031,7 @@ def _prepare_azure_tenant_api_cutover(
                 "--force-conflicts",
                 "-f",
                 "-",
-                input_text=json.dumps(
-                    tenant_crd_transition_document(observed, desired)
-                ),
+                input_text=json.dumps(transition_document),
             )
         _verify_azure_cutover_lock(root, "v1alpha3")
         tenants, residue = _azure_cutover_inventory(root)
@@ -1056,10 +1060,8 @@ def _prepare_azure_tenant_api_cutover(
         return True
     except Exception:
         if not transition:
-            try:
-                _scale_azure_controller(root, config, 1)
-            finally:
-                _azure_cutover_lock(root, present=False)
+            _scale_azure_controller(root, config, 1)
+            _azure_cutover_lock(root, present=False)
         raise
 
 

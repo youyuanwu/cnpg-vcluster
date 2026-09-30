@@ -319,11 +319,17 @@ def prepare_tenant_api_cutover(
         return tenant_cutover_lock_present(client)
     desired = desired_tenant_crd(root, client)
     transition = generation == "transitioning"
+    transition_document = (
+        None
+        if transition
+        else tenant_crd_transition_document(current, desired)
+    )
     if transition:
         if not tenant_cutover_lock_present(client):
             raise RuntimeError("Tenant CRD transition is missing its create lock")
     else:
-        apply_tenant_cutover_lock(config, client)
+        if not tenant_cutover_lock_present(client):
+            apply_tenant_cutover_lock(config, client)
     try:
         verify_tenant_cutover_lock(
             client,
@@ -342,9 +348,7 @@ def prepare_tenant_api_cutover(
                 "--force-conflicts",
                 "-f",
                 "-",
-                input_text=json.dumps(
-                    tenant_crd_transition_document(current, desired)
-                ),
+                input_text=json.dumps(transition_document),
             )
         verify_tenant_cutover_lock(client, "v1alpha3")
         require_clean_controller_state(root, client)
@@ -369,10 +373,8 @@ def prepare_tenant_api_cutover(
         return True
     except Exception:
         if not transition:
-            try:
-                restore_controller(config, client)
-            finally:
-                remove_tenant_cutover_lock(config, client)
+            restore_controller(config, client)
+            remove_tenant_cutover_lock(config, client)
         raise
 
 
