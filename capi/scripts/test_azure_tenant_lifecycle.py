@@ -41,6 +41,7 @@ from scripts.lib.azure.proof import (
     prove_operator_deletion,
 )
 from scripts.lib.config import parse_duration
+from scripts.lib.kube import kubeconfig_json_request
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
 from scripts.lib.tenant_spec import load_tenant_spec
@@ -63,16 +64,23 @@ def _admin_mutation(
     path: str,
     payload: Mapping[str, object],
 ) -> dict[str, object]:
-    command = "create" if method == "POST" else "delete"
-    response = _kubectl(
+    config = _kubectl(
         ROOT,
-        command,
+        "config",
+        "view",
         "--raw",
-        f"{ADMIN_SERVICE_PROXY}/{path.lstrip('/')}",
-        "-f",
-        "-",
-        input_text=json.dumps(payload),
+        "--flatten",
+        "--minify",
+        "-o",
+        "json",
         check=False,
+    )
+    response = kubeconfig_json_request(
+        config,
+        method,
+        f"{ADMIN_SERVICE_PROXY}/{path.lstrip('/')}",
+        dict(payload),
+        300,
     )
     if response.returncode != 0:
         raise RuntimeError(f"Azure Tenant Admin {method} {path} failed")

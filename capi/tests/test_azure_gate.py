@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import unittest
 from pathlib import Path
+from subprocess import CompletedProcess
 from unittest.mock import patch
 
 from scripts.lib.azure.gate import (
@@ -14,6 +15,7 @@ from scripts.lib.azure.gate import (
 from scripts.test_azure_tenant_lifecycle import (
     _admin_create_tenant,
     _admin_delete_tenant,
+    _admin_mutation,
     _ensure_tenant_ready,
     _require_allocation_lease_absent,
     _require_recreated_identity,
@@ -50,6 +52,39 @@ def readiness(identifiers=(0, 1, 2)):
 
 
 class AzureGateTests(unittest.TestCase):
+    def test_admin_mutation_uses_authenticated_json_transport(self) -> None:
+        config = CompletedProcess([], 0, "{}", "")
+        response = CompletedProcess(
+            [],
+            0,
+            json.dumps({"schemaVersion": 4, "data": {"state": "accepted"}}),
+            "",
+        )
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle._kubectl",
+                return_value=config,
+            ) as kubectl,
+            patch(
+                "scripts.test_azure_tenant_lifecycle.kubeconfig_json_request",
+                return_value=response,
+            ) as request,
+        ):
+            self.assertEqual(
+                {"state": "accepted"},
+                _admin_mutation("DELETE", "api/v1/tenants/tenant-c", {
+                    "uid": "uid-c",
+                    "confirmation": "tenant-c",
+                }),
+            )
+        self.assertIn("--flatten", kubectl.call_args.args)
+        request.assert_called_once()
+        self.assertEqual("DELETE", request.call_args.args[1])
+        self.assertEqual(
+            {"uid": "uid-c", "confirmation": "tenant-c"},
+            request.call_args.args[3],
+        )
+
     def test_admin_lifecycle_responses_are_exact_and_credential_free(self) -> None:
         spec = type(
             "Spec",

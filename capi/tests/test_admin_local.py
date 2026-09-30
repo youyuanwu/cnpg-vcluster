@@ -488,6 +488,8 @@ class AdminLocalTests(unittest.TestCase):
                 received.append((
                     self.command,
                     self.path,
+                    self.headers.get("Authorization"),
+                    self.headers.get("Content-Type"),
                     json.loads(self.rfile.read(size)),
                 ))
                 self.send_response(200)
@@ -512,7 +514,7 @@ class AdminLocalTests(unittest.TestCase):
                     "server": f"http://127.0.0.1:{server.server_port}",
                 }
             }],
-            "users": [{"user": {}}],
+            "users": [{"user": {"token": "test-token"}}],
         })))
         try:
             self.assertEqual(
@@ -530,9 +532,22 @@ class AdminLocalTests(unittest.TestCase):
             thread.join()
             server.server_close()
         self.assertEqual([
-            ("POST", "/create", {"name": "tenant-a"}),
-            ("DELETE", "/delete", {"uid": "uid-a"}),
+            (
+                "POST",
+                "/create",
+                "Bearer test-token",
+                "application/json",
+                {"name": "tenant-a"},
+            ),
+            (
+                "DELETE",
+                "/delete",
+                "Bearer test-token",
+                "application/json",
+                {"uid": "uid-a"},
+            ),
         ], received)
+        self.assertIn("--flatten", client.kubectl.call_args.args)
 
     def test_admin_lifecycle_helpers_validate_create_and_delete_contracts(self):
         client = FakeClient()
