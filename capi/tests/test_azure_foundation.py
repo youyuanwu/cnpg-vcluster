@@ -134,6 +134,16 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             if arguments[:2] == ("get", "tenants") or (
                 arguments and arguments[0] == "get" and "--all-namespaces" in arguments
             ):
+                if arguments[:2] == ("get", "configmaps"):
+                    return completed(json.dumps({"items": [{
+                        "apiVersion": "v1",
+                        "kind": "ConfigMap",
+                        "metadata": {
+                            "name": "tenant-azure-provider",
+                            "namespace": "tenant-system",
+                            "uid": "shared-config",
+                        },
+                    }]}))
                 return completed(json.dumps({"items": []}))
             return completed()
 
@@ -208,6 +218,16 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta1",
                     "kind": "AzureCluster",
                     "metadata": {"name": "foreign", "namespace": "foreign", "uid": "uid"},
+                }]
+            elif arguments[:2] == ("get", "configmaps"):
+                items = [{
+                    "apiVersion": "v1",
+                    "kind": "ConfigMap",
+                    "metadata": {
+                        "name": "tenant-azure-provider",
+                        "namespace": "tenant-system",
+                        "uid": "shared-config",
+                    },
                 }]
             return completed(json.dumps({"items": items}))
 
