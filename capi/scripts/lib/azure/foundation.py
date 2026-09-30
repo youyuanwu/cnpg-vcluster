@@ -930,6 +930,43 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
     return tenants, residue
 
 
+def _scale_azure_controller(
+    root: Path,
+    config: Mapping[str, str],
+    replicas: int,
+) -> None:
+    _kubectl(
+        root,
+        "-n",
+        "tenant-system",
+        "scale",
+        "deployment/tenant-controller",
+        f"--replicas={replicas}",
+    )
+    if replicas:
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "rollout",
+            "status",
+            "deployment/tenant-controller",
+            f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
+        )
+    else:
+        _kubectl(
+            root,
+            "-n",
+            "tenant-system",
+            "wait",
+            "--for=delete",
+            "pod",
+            "-l",
+            "app.kubernetes.io/name=tenant-controller",
+            f"--timeout={config['AZURE_CONTROLLER_TIMEOUT']}",
+        )
+
+
 def _prepare_azure_tenant_api_cutover(
     root: Path,
     config: Mapping[str, str],
@@ -942,12 +979,6 @@ def _prepare_azure_tenant_api_cutover(
     generation = tenant_api_cutover_state(observed)
     if generation == "v1alpha3":
         return _azure_cutover_lock_present(root)
-    transition = generation == "transitioning"
-    if transition:
-        if not _azure_cutover_lock_present(root):
-            raise RuntimeError("Azure Tenant CRD transition is missing its create lock")
-    else:
-        _azure_cutover_lock(root, present=True)
     rendered = _kubectl(
         root,
         "create",
@@ -967,6 +998,12 @@ def _prepare_azure_tenant_api_cutover(
         raise RuntimeError("generated Azure Tenant CRD is invalid") from exc
     if not isinstance(desired, dict):
         raise RuntimeError("generated Azure Tenant CRD is invalid")
+    transition = generation == "transitioning"
+    if transition:
+        if not _azure_cutover_lock_present(root):
+            raise RuntimeError("Azure Tenant CRD transition is missing its create lock")
+    else:
+        _azure_cutover_lock(root, present=True)
     try:
         _verify_azure_cutover_lock(
             root,
@@ -975,18 +1012,11 @@ def _prepare_azure_tenant_api_cutover(
         if not transition:
             tenants, residue = _azure_cutover_inventory(root)
             require_empty_tenant_cutover(tenants, residue)
-        _kubectl(
-            root,
-            "-n",
-            "tenant-system",
-            "delete",
-            "deployment/tenant-controller",
-            "--ignore-not-found=true",
-            "--wait=true",
-        )
+        _scale_azure_controller(root, config, 0)
         tenants, residue = _azure_cutover_inventory(root)
         require_empty_tenant_cutover(tenants, residue)
         if not transition:
+            transition = True
             _kubectl(
                 root,
                 "apply",
@@ -999,7 +1029,6 @@ def _prepare_azure_tenant_api_cutover(
                     tenant_crd_transition_document(observed, desired)
                 ),
             )
-            transition = True
         _verify_azure_cutover_lock(root, "v1alpha3")
         tenants, residue = _azure_cutover_inventory(root)
         require_empty_tenant_cutover(tenants, residue)
@@ -1027,7 +1056,10 @@ def _prepare_azure_tenant_api_cutover(
         return True
     except Exception:
         if not transition:
-            _azure_cutover_lock(root, present=False)
+            try:
+                _scale_azure_controller(root, config, 1)
+            finally:
+                _azure_cutover_lock(root, present=False)
         raise
 
 
@@ -1240,6 +1272,7 @@ def _install_tenant_controller(
         root,
         config["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"],
         image,
+        allocation_sha256,
     )
     _kubectl(
         root,

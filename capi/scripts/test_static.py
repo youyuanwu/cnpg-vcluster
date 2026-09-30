@@ -399,7 +399,8 @@ def check_repository_boundaries() -> None:
     ).read_text(encoding="utf-8")
     check("--provider=azure" in azure_manager,
           "Azure manager does not select the Azure provider")
-    check(not re.search(r"docker.sock|tenant-foundation|activation|calico|cnpg",
+    check(not re.search(
+                        r"docker.sock|tenant-foundation|activation|calico|cnpg(?!-vcluster)",
                         azure_manager, re.IGNORECASE),
           "Azure manager retains local-only dependencies")
     for relative in ("scripts", "config/versions.env", "Justfile"):

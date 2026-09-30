@@ -269,6 +269,36 @@ def remove_tenant_cutover_lock(config: dict[str, str], client: ManagementClient)
         )
 
 
+def restore_controller(
+    config: dict[str, str],
+    client: ManagementClient,
+) -> None:
+    deployment = client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "get",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        check=False,
+    )
+    if deployment.returncode != 0:
+        raise RuntimeError("old Tenant controller cannot be restored")
+    client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "scale",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        "--replicas=1",
+    )
+    client.kubectl(
+        "-n",
+        CONTROLLER_NAMESPACE,
+        "rollout",
+        "status",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        f"--timeout={config['CONDITION_TIMEOUT']}",
+    )
+
+
 def prepare_tenant_api_cutover(
     root: Path,
     config: dict[str, str],
@@ -287,13 +317,13 @@ def prepare_tenant_api_cutover(
     generation = tenant_api_cutover_state(current)
     if generation == "v1alpha3":
         return tenant_cutover_lock_present(client)
+    desired = desired_tenant_crd(root, client)
     transition = generation == "transitioning"
     if transition:
         if not tenant_cutover_lock_present(client):
             raise RuntimeError("Tenant CRD transition is missing its create lock")
     else:
         apply_tenant_cutover_lock(config, client)
-    desired = desired_tenant_crd(root, client)
     try:
         verify_tenant_cutover_lock(
             client,
@@ -304,6 +334,7 @@ def prepare_tenant_api_cutover(
         stop_controller(config, client)
         require_clean_controller_state(root, client)
         if not transition:
+            transition = True
             client.kubectl(
                 "apply",
                 "--server-side",
@@ -315,7 +346,6 @@ def prepare_tenant_api_cutover(
                     tenant_crd_transition_document(current, desired)
                 ),
             )
-            transition = True
         verify_tenant_cutover_lock(client, "v1alpha3")
         require_clean_controller_state(root, client)
         client.kubectl(
@@ -339,7 +369,10 @@ def prepare_tenant_api_cutover(
         return True
     except Exception:
         if not transition:
-            remove_tenant_cutover_lock(config, client)
+            try:
+                restore_controller(config, client)
+            finally:
+                remove_tenant_cutover_lock(config, client)
         raise
 
 
@@ -595,6 +628,7 @@ def render_azure_controller_manager(
     root: Path,
     supported_kubernetes_version: str,
     image: str,
+    allocation_sha256: str,
 ) -> Path:
     template = (
         root / "controller" / "config" / "manager" / "manager-azure.yaml.tpl"
@@ -605,6 +639,7 @@ def render_azure_controller_manager(
             "${SUPPORTED_KUBERNETES_VERSION}",
             supported_kubernetes_version.removeprefix("v"),
         )
+        .replace("${TENANT_ALLOCATION_SHA256}", allocation_sha256)
     )
     destination = (
         root / ".runtime" / "rendered" / "azure-controller" / "manager.yaml"

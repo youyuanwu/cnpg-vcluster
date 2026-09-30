@@ -232,8 +232,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             for arguments in calls
         ))
         self.assertIn(
-            ("-n", "tenant-system", "delete", "deployment/tenant-controller",
-             "--ignore-not-found=true", "--wait=true"),
+            ("-n", "tenant-system", "scale", "deployment/tenant-controller",
+             "--replicas=0"),
             calls,
         )
 
@@ -266,6 +266,77 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 for arguments in calls
             )
         )
+
+    def test_azure_cutover_second_inventory_failure_restores_controller(self):
+        root = self.make_root()
+        config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        desired = {
+            "spec": {"versions": [{
+                "name": "v1alpha3", "served": True, "storage": True,
+            }]}
+        }
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=old,
+            ),
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                return_value=completed(json.dumps(desired)),
+            ),
+            patch("scripts.lib.azure.foundation._azure_cutover_lock") as lock,
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_lock"),
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_inventory",
+                side_effect=[
+                    ({"items": []}, []),
+                    RuntimeError("late Tenant"),
+                ],
+            ),
+            patch("scripts.lib.azure.foundation._scale_azure_controller") as scale,
+            self.assertRaisesRegex(RuntimeError, "late Tenant"),
+        ):
+            _prepare_azure_tenant_api_cutover(root, config)
+        self.assertEqual(
+            [(root, config, 0), (root, config, 1)],
+            [call.args for call in scale.call_args_list],
+        )
+        self.assertEqual(
+            [((root,), {"present": True}), ((root,), {"present": False})],
+            [(call.args, call.kwargs) for call in lock.call_args_list],
+        )
+
+    def test_azure_cutover_crd_render_failure_does_not_install_lock(self):
+        root = self.make_root()
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=old,
+            ),
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                return_value=completed("not json"),
+            ),
+            patch("scripts.lib.azure.foundation._azure_cutover_lock") as lock,
+            self.assertRaisesRegex(RuntimeError, "generated Azure Tenant CRD"),
+        ):
+            _prepare_azure_tenant_api_cutover(
+                root,
+                {"AZURE_CONTROLLER_TIMEOUT": "1s"},
+            )
+        lock.assert_not_called()
 
     def test_azure_cutover_rerun_adopts_existing_lock_after_crd_deletion(self):
         refs = set(tenant_cutover_lock_cleanup_refs())

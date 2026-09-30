@@ -200,6 +200,38 @@ class PackagingTests(unittest.TestCase):
             self.assertTrue(
                 any(args[:2] == ("delete", resource) for args, _ in client.calls)
             )
+        self.assertTrue(any(
+            args[:4]
+            == ("-n", packaging.CONTROLLER_NAMESPACE, "scale",
+                f"deployment/{packaging.CONTROLLER_DEPLOYMENT}")
+            and "--replicas=1" in args
+            for args, _ in client.calls
+        ))
+
+    def test_cutover_crd_render_failure_does_not_install_lock(self):
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        client = Client(
+            lambda *args, **_kwargs: response(old)
+            if args[:2] == ("get", f"crd/{packaging.TENANT_CRD}")
+            else response()
+        )
+        with (
+            patch.object(
+                packaging,
+                "desired_tenant_crd",
+                side_effect=RuntimeError("render failed"),
+            ),
+            self.assertRaisesRegex(RuntimeError, "render failed"),
+        ):
+            packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)
+        self.assertFalse(any(
+            args and args[0] == "apply" for args, _ in client.calls
+        ))
 
     def test_partial_cutover_lock_application_is_cleaned_up(self):
         apply_count = 0
@@ -462,17 +494,22 @@ class PackagingTests(unittest.TestCase):
             ROOT,
             "v1.32.13",
             image,
+            "2" * 64,
         )
         content = rendered.read_text()
         self.assertIn("--provider=azure", content)
         self.assertIn(f"image: {image}", content)
         self.assertIn("--supported-kubernetes-version=1.32.13", content)
+        self.assertIn(
+            "tenancy.cnpg-vcluster.io/allocation-sha256: " + "2" * 64,
+            content,
+        )
         for absent in (
             "docker.sock",
             "tenant-foundation",
             "activation-token",
             "calico",
-            "cnpg",
+            "cnpg.yaml",
             "imagePullPolicy: Never",
         ):
             self.assertNotIn(absent, content.lower())
