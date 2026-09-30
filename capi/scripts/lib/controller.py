@@ -324,12 +324,14 @@ def prepare_tenant_api_cutover(
         if transition
         else tenant_crd_transition_document(current, desired)
     )
+    acquired_lock = False
     if transition:
         if not tenant_cutover_lock_present(client):
             raise RuntimeError("Tenant CRD transition is missing its create lock")
     else:
         if not tenant_cutover_lock_present(client):
             apply_tenant_cutover_lock(config, client)
+            acquired_lock = True
     try:
         verify_tenant_cutover_lock(
             client,
@@ -374,7 +376,8 @@ def prepare_tenant_api_cutover(
     except Exception:
         if not transition:
             restore_controller(config, client)
-            remove_tenant_cutover_lock(config, client)
+            if acquired_lock:
+                remove_tenant_cutover_lock(config, client)
         raise
 
 
@@ -1120,7 +1123,8 @@ def reconcile_controller(
         verify_running_controller(client, image, activation_token=token)
     except Exception as failure:
         if cutover_locked:
-            apply_tenant_cutover_lock(config, client)
+            if not tenant_cutover_lock_present(client):
+                apply_tenant_cutover_lock(config, client)
             raise
         if replacement:
             accepted = client.kubectl(

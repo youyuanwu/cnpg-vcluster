@@ -287,11 +287,15 @@ class PackagingTests(unittest.TestCase):
                 side_effect=RuntimeError("not clean"),
             ),
             patch.object(packaging, "restore_controller"),
-            patch.object(packaging, "remove_tenant_cutover_lock"),
+            patch.object(
+                packaging,
+                "remove_tenant_cutover_lock",
+            ) as remove_lock,
             self.assertRaisesRegex(RuntimeError, "not clean"),
         ):
             packaging.prepare_tenant_api_cutover(Path("."), CONFIG, Client(handle))
         apply_lock.assert_not_called()
+        remove_lock.assert_not_called()
 
     def test_partial_cutover_lock_application_is_cleaned_up(self):
         apply_count = 0

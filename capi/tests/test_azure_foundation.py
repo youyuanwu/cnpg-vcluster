@@ -392,6 +392,48 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             [(call.args, call.kwargs) for call in lock.call_args_list],
         )
 
+    def test_azure_cutover_preserves_adopted_lock_on_retry_failure(self):
+        root = self.make_root()
+        config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
+        old = {
+            "spec": {"versions": [{
+                "name": "v1alpha2", "served": True, "storage": True,
+            }]},
+            "status": {"storedVersions": ["v1alpha2"]},
+        }
+        desired = {
+            "spec": {"versions": [{
+                "name": "v1alpha3", "served": True, "storage": True,
+            }]}
+        }
+        with (
+            patch(
+                "scripts.lib.azure.foundation._get_management_resource",
+                return_value=old,
+            ),
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                return_value=completed(json.dumps(desired)),
+            ),
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_lock_present",
+                return_value=True,
+            ),
+            patch("scripts.lib.azure.foundation._azure_cutover_lock") as lock,
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_lock"),
+            patch(
+                "scripts.lib.azure.foundation._azure_cutover_inventory",
+                side_effect=[
+                    ({"items": []}, []),
+                    RuntimeError("late Tenant"),
+                ],
+            ),
+            patch("scripts.lib.azure.foundation._scale_azure_controller"),
+            self.assertRaisesRegex(RuntimeError, "late Tenant"),
+        ):
+            _prepare_azure_tenant_api_cutover(root, config)
+        lock.assert_not_called()
+
     def test_azure_cutover_rerun_adopts_existing_lock_after_crd_deletion(self):
         refs = set(tenant_cutover_lock_cleanup_refs())
 

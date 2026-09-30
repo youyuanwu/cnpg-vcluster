@@ -1004,12 +1004,14 @@ def _prepare_azure_tenant_api_cutover(
         if transition
         else tenant_crd_transition_document(observed, desired)
     )
+    acquired_lock = False
     if transition:
         if not _azure_cutover_lock_present(root):
             raise RuntimeError("Azure Tenant CRD transition is missing its create lock")
     else:
         if not _azure_cutover_lock_present(root):
             _azure_cutover_lock(root, present=True)
+            acquired_lock = True
     try:
         _verify_azure_cutover_lock(
             root,
@@ -1061,7 +1063,8 @@ def _prepare_azure_tenant_api_cutover(
     except Exception:
         if not transition:
             _scale_azure_controller(root, config, 1)
-            _azure_cutover_lock(root, present=False)
+            if acquired_lock:
+                _azure_cutover_lock(root, present=False)
         raise
 
 
