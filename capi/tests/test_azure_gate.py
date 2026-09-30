@@ -61,8 +61,8 @@ class AzureGateTests(unittest.TestCase):
                 side_effect=lambda *_args: events.append("absent"),
             ),
             patch(
-                "scripts.test_azure_tenant_lifecycle._create_tenant",
-                side_effect=lambda _config, observed: events.append(observed),
+                "scripts.test_azure_tenant_lifecycle._admin_create_tenant",
+                side_effect=lambda observed: events.append(observed),
             ),
             patch(
                 "scripts.test_azure_tenant_lifecycle._require_status",
@@ -202,7 +202,7 @@ class AzureGateTests(unittest.TestCase):
         self.assertIn("ordinary-tenant-deletion", source)
         self.assertIn("external-absence-proof", source)
         self.assertEqual(2, source.count("_source_sha256(spec_path)"))
-        self.assertEqual(2, source.count("_create_tenant(config, spec)"))
+        self.assertEqual(3, source.count("_admin_create_tenant"))
         self.assertNotIn('_tenant_command("create"', source)
         self.assertNotIn(".runtime", source)
         self.assertNotIn("checkpoint", source.lower())

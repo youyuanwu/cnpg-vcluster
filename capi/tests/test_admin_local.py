@@ -349,6 +349,21 @@ class FakeClient:
             return response(self._proxy_response(path))
         if arguments[:2] == ("create", "--raw"):
             request = json.loads(kwargs["input_text"])
+            if arguments[2].endswith("/api/v1/tenants"):
+                name = request["name"]
+                self.tenant_names = tuple(sorted((*self.tenant_names, name)))
+                return response(json.dumps({
+                    "schemaVersion": 4,
+                    "data": {
+                        "identity": {
+                            "name": name,
+                            "uid": f"{name}-uid",
+                            "generation": 1,
+                        },
+                        "provider": "local",
+                        "kubernetesVersion": "1.36.4",
+                    },
+                }))
             tenant_name = arguments[2].split("/tenants/", 1)[1].split("/", 1)[0]
             return response(json.dumps({
                 "schemaVersion": 4,
@@ -368,6 +383,23 @@ class FakeClient:
                     }],
                 },
             }))
+        if arguments[:2] == ("delete", "--raw"):
+            request = json.loads(kwargs["input_text"])
+            name = arguments[2].rsplit("/", 1)[-1]
+            self.tenant_names = tuple(
+                tenant for tenant in self.tenant_names if tenant != name
+            )
+            return response(json.dumps({
+                "schemaVersion": 4,
+                "data": {
+                    "identity": {
+                        "name": name,
+                        "uid": request["uid"],
+                        "generation": 1,
+                    },
+                    "state": "accepted",
+                },
+            }))
         if arguments[0] == "create" and "-f" in arguments:
             request = json.loads(kwargs["input_text"])
             namespace = request["spec"]["namespace"]
@@ -376,6 +408,24 @@ class FakeClient:
 
 
 class AdminLocalTests(unittest.TestCase):
+    def test_admin_lifecycle_helpers_validate_create_and_delete_contracts(self):
+        client = FakeClient()
+        created = admin_local.create_tenant_via_admin(
+            client,
+            "tenant-new",
+            workers=2,
+            databases=1,
+        )
+        self.assertEqual(created["identity"]["uid"], "tenant-new-uid")
+        self.assertIn("tenant-new", client.tenant_names)
+        deleted = admin_local.delete_tenant_via_admin(
+            client,
+            "tenant-new",
+            "tenant-new-uid",
+        )
+        self.assertEqual(deleted["state"], "accepted")
+        self.assertNotIn("tenant-new", client.tenant_names)
+
     def setUp(self) -> None:
         (ROOT / ".runtime").mkdir(exist_ok=True)
 

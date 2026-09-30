@@ -450,6 +450,22 @@ def _service_proxy_post(
     )
 
 
+def _service_proxy_delete(
+    client: ManagementClient,
+    path: str,
+    payload: dict[str, object],
+):
+    return client.kubectl(
+        "delete",
+        "--raw",
+        f"{ADMIN_SERVICE_PROXY}/{path.lstrip('/')}",
+        "-f",
+        "-",
+        input_text=json.dumps(payload),
+        check=False,
+    )
+
+
 def _envelope(raw: str, description: str) -> object:
     try:
         envelope = json.loads(raw)
@@ -462,6 +478,77 @@ def _envelope(raw: str, description: str) -> object:
     ):
         raise RuntimeError(f"Tenant Admin {description} response envelope is invalid")
     return envelope["data"]
+
+
+def create_tenant_via_admin(
+    client: ManagementClient,
+    name: str,
+    *,
+    workers: int,
+    databases: int,
+) -> dict[str, object]:
+    response = _service_proxy_post(
+        client,
+        "api/v1/tenants",
+        {"name": name, "workers": workers, "databases": databases},
+    )
+    if response.returncode != 0:
+        raise RuntimeError("Tenant Admin create API is unavailable")
+    created = _required_mapping(
+        _envelope(response.stdout, "Tenant create"),
+        "Tenant create data",
+    )
+    identity = _required_mapping(created.get("identity"), "created Tenant identity")
+    if (
+        set(created) != {"identity", "provider", "kubernetesVersion"}
+        or set(identity) != {"name", "uid", "generation"}
+        or identity.get("name") != name
+        or not isinstance(identity.get("uid"), str)
+        or not identity["uid"]
+        or not _is_integer(identity.get("generation"))
+        or created.get("provider") != "local"
+        or not isinstance(created.get("kubernetesVersion"), str)
+        or not created["kubernetesVersion"]
+    ):
+        raise RuntimeError("Tenant Admin create response is invalid")
+    if any(
+        token in response.stdout.lower()
+        for token in ("password", "clientsecret", "kubeconfig", "pgpass")
+    ):
+        raise RuntimeError("Tenant Admin create response contains credential material")
+    return created
+
+
+def delete_tenant_via_admin(
+    client: ManagementClient,
+    name: str,
+    uid: str,
+) -> dict[str, object]:
+    response = _service_proxy_delete(
+        client,
+        f"api/v1/tenants/{name}",
+        {"uid": uid, "confirmation": name},
+    )
+    if response.returncode != 0:
+        raise RuntimeError("Tenant Admin delete API is unavailable")
+    deleted = _required_mapping(
+        _envelope(response.stdout, "Tenant delete"),
+        "Tenant delete data",
+    )
+    identity = _required_mapping(deleted.get("identity"), "deleted Tenant identity")
+    if (
+        set(deleted) != {"identity", "state"}
+        or set(identity) != {"name", "uid", "generation"}
+        or identity.get("name") != name
+        or identity.get("uid") != uid
+        or (
+            identity.get("generation") is not None
+            and not _is_integer(identity.get("generation"))
+        )
+        or deleted.get("state") not in {"accepted", "completed"}
+    ):
+        raise RuntimeError("Tenant Admin delete response is invalid")
+    return deleted
 
 
 def _validate_database_query(

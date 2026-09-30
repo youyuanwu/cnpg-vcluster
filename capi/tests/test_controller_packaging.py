@@ -775,6 +775,8 @@ class CurrentControllerPackagingTests(unittest.TestCase):
                 if incoming["kubernetesVersion"] == "bad":
                     return response(code=1, error="Invalid kubernetesVersion")
                 if provider["type"] == "azure":
+                    if "databases" in provider:
+                        return response(code=1, error="Invalid databases")
                     if provider != {"type": "azure"}:
                         return response(code=1, error="unknown field")
                     return response({**value, "spec": incoming})

@@ -699,14 +699,14 @@ def verify_controller_api(
         "provider": {"type": "azure"},
     }
     create_dry({**probe, "spec": azure_spec}, expected_spec=azure_spec)
-    for invalid_provider in (
-        {"type": "azure", "databases": 1},
-        {"type": "azure", "podCIDR": "10.244.0.0/16"},
-        {"type": "azure", "serviceCIDR": "10.96.0.0/16"},
+    for invalid_provider, rejected in (
+        ({"type": "azure", "databases": 1}, "databases"),
+        ({"type": "azure", "podCIDR": "10.244.0.0/16"}, "unknown field"),
+        ({"type": "azure", "serviceCIDR": "10.96.0.0/16"}, "unknown field"),
     ):
         create_dry(
             {**probe, "spec": {**azure_spec, "provider": invalid_provider}},
-            rejected="unknown field",
+            rejected=rejected,
         )
 
     response = client.kubectl(
