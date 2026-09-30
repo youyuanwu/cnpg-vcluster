@@ -127,6 +127,31 @@ def ensure_database_activation_lock(client: ManagementClient) -> None:
 def verify_database_activation_lock(
     client: ManagementClient, *, namespace: str,
 ) -> None:
+    expected_policy, expected_binding = database_activation_lock_documents()
+    policy = client.json(
+        "get", f"validatingadmissionpolicy/{DATABASE_ACTIVATION_POLICY}",
+    )
+    binding = client.json(
+        "get", f"validatingadmissionpolicybinding/{DATABASE_ACTIVATION_POLICY}",
+    )
+    expected_spec = expected_policy["spec"]
+    policy_spec = policy.get("spec", {})
+    if (
+        policy.get("metadata", {}).get("name") != DATABASE_ACTIVATION_POLICY
+        or policy_spec.get("failurePolicy") != "Fail"
+        or policy_spec.get("matchConstraints", {}).get("resourceRules")
+        != expected_spec["matchConstraints"]["resourceRules"]
+        or policy_spec.get("validations") != expected_spec["validations"]
+        or policy_spec.get("matchConditions")
+        or policy_spec.get("paramKind")
+        or binding.get("metadata", {}).get("name") != DATABASE_ACTIVATION_POLICY
+        or binding.get("spec", {}).get("policyName")
+        != expected_binding["spec"]["policyName"]
+        or binding.get("spec", {}).get("validationActions") != ["Deny"]
+        or binding.get("spec", {}).get("matchResources")
+        or binding.get("spec", {}).get("paramRef")
+    ):
+        raise RuntimeError("TenantDatabase activation lock contract is malformed")
     document = {
         "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
         "kind": "TenantDatabase",
@@ -143,8 +168,13 @@ def verify_database_activation_lock(
         )
         if (
             result.returncode == 0
-            or "TenantDatabase creation is locked until both providers are ready"
-            not in result.stderr
+            or not any(
+                message in result.stderr
+                for message in (
+                    "TenantDatabase creation is locked until both providers are ready",
+                    "Tenant identity is unavailable or not Ready",
+                )
+            )
         ):
             raise RuntimeError("TenantDatabase activation create lock is not effective")
 
@@ -958,13 +988,13 @@ def install_database_admission(
         ):
             configuration = client.json("get", resource)
             webhooks = configuration.get("webhooks", [])
-            if len(webhooks) != 1:
+            if len(webhooks) != (3 if "validating" in resource else 1):
                 raise RuntimeError("database admission webhook configuration is malformed")
-            webhook = webhooks[0]
-            if webhook.get("failurePolicy") != "Fail":
-                raise RuntimeError("database admission webhook must fail closed")
-            if not webhook.get("clientConfig", {}).get("caBundle"):
-                return None
+            for webhook in webhooks:
+                if webhook.get("failurePolicy") != "Fail":
+                    raise RuntimeError("database admission webhook must fail closed")
+                if not webhook.get("clientConfig", {}).get("caBundle"):
+                    return None
         return True
     wait_for(
         "database admission CA injection",

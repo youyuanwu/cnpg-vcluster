@@ -84,6 +84,10 @@ class PackagingTests(unittest.TestCase):
 
         def reject(*args, **kwargs):
             calls.append((args, kwargs))
+            if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.DATABASE_ACTIVATION_POLICY}"):
+                return response(policy)
+            if args[:2] == ("get", f"validatingadmissionpolicybinding/{packaging.DATABASE_ACTIVATION_POLICY}"):
+                return response(binding)
             if args[:2] == ("create", "--dry-run=server"):
                 return response(code=1, error="TenantDatabase creation is locked until both providers are ready")
             return response()
@@ -92,9 +96,30 @@ class PackagingTests(unittest.TestCase):
         packaging.ensure_database_activation_lock(client)
         packaging.verify_database_activation_lock(client, namespace="tenant-system")
         self.assertEqual(len([args for args, _ in calls if args[0] == "create"]), 5)
+        def webhook_first(*args, **kwargs):
+            result = reject(*args, **kwargs)
+            if args[:2] == ("create", "--dry-run=server"):
+                return response(code=1, error="Tenant identity is unavailable or not Ready")
+            return result
+        packaging.verify_database_activation_lock(
+            Client(webhook_first), namespace="tenant-system",
+        )
         with self.assertRaisesRegex(RuntimeError, "not effective"):
             packaging.verify_database_activation_lock(
-                Client(lambda *_a, **_k: response()), namespace="tenant-system",
+                Client(lambda *args, **kwargs: (
+                    reject(*args, **kwargs)
+                    if args[:1] == ("get",) else response()
+                )), namespace="tenant-system",
+            )
+        invalid_policy = copy.deepcopy(policy)
+        invalid_policy["spec"]["validations"][0]["expression"] = "true"
+        with self.assertRaisesRegex(RuntimeError, "contract is malformed"):
+            packaging.verify_database_activation_lock(
+                Client(lambda *args, **kwargs: (
+                    response(invalid_policy)
+                    if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.DATABASE_ACTIVATION_POLICY}")
+                    else reject(*args, **kwargs)
+                )), namespace="tenant-system",
             )
 
     def test_cutover_lock_denies_create_for_old_and_new_api_generations(self):

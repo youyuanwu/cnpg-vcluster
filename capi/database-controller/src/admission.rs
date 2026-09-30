@@ -468,7 +468,7 @@ pub struct AdmissionReview {
     pub request: AdmissionRequest,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AdmissionRequest {
     pub uid: String,
@@ -479,16 +479,25 @@ pub struct AdmissionRequest {
     #[serde(default)]
     pub dry_run: bool,
     pub object: Value,
+    #[serde(default)]
+    pub old_object: Option<Value>,
+    #[serde(default)]
+    pub user_info: Option<AdmissionUser>,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
+pub struct AdmissionUser {
+    pub username: String,
+}
+
+#[derive(Clone, Deserialize)]
 pub struct GroupVersionKind {
     pub group: String,
     pub version: String,
     pub kind: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct GroupVersionResource {
     pub group: String,
     pub version: String,
@@ -558,8 +567,192 @@ impl AdmissionAnswer {
 pub async fn review(client: Client, review: AdmissionReview, validating: bool) -> AdmissionAnswer {
     let request = review.request;
     let uid = request.uid.clone();
-    let result = review_create(client, request, validating).await;
+    let result = if validating && request.operation == "UPDATE" {
+        review_update(request)
+    } else {
+        review_create(client, request, validating).await
+    };
     AdmissionAnswer::decision(uid, result)
+}
+
+fn review_update(request: AdmissionRequest) -> Result<Option<Value>, AdmissionError> {
+    if request.uid.is_empty() || !valid_request_uid(&request.uid) {
+        return Err(AdmissionError::Request);
+    }
+    let username = request
+        .user_info
+        .as_ref()
+        .map(|user| user.username.as_str())
+        .ok_or(AdmissionError::Request)?;
+    let old = request.old_object.ok_or(AdmissionError::Request)?;
+    if request.kind.group.is_empty()
+        && request.kind.version == "v1"
+        && request.kind.kind == "ConfigMap"
+        && request.resource.group.is_empty()
+        && request.resource.version == "v1"
+        && request.resource.resource == "configmaps"
+        && request.namespace.as_deref() == Some(GATE_NAMESPACE)
+    {
+        let before: ConfigMap = serde_json::from_value(old).map_err(|_| AdmissionError::Gate)?;
+        let after: ConfigMap =
+            serde_json::from_value(request.object).map_err(|_| AdmissionError::Gate)?;
+        validate_gate_update(&before, &after, username)?;
+    } else if request.kind.group == crate::api::GROUP
+        && request.kind.version == crate::api::VERSION
+        && request.kind.kind == "TenantDatabase"
+        && request.resource.group == crate::api::GROUP
+        && request.resource.version == crate::api::VERSION
+        && request.resource.resource == "tenantdatabases"
+    {
+        let before: TenantDatabase =
+            serde_json::from_value(old).map_err(|_| AdmissionError::Request)?;
+        let after: TenantDatabase =
+            serde_json::from_value(request.object).map_err(|_| AdmissionError::Request)?;
+        validate_database_update(&before, &after, username, request.namespace.as_deref())?;
+    } else {
+        return Err(AdmissionError::Request);
+    }
+    Ok(None)
+}
+
+pub fn validate_gate_update(
+    before: &ConfigMap,
+    after: &ConfigMap,
+    username: &str,
+) -> Result<(), AdmissionError> {
+    let tenant_uid = before
+        .data
+        .as_ref()
+        .and_then(|data| data.get(GATE_TENANT_UID))
+        .ok_or(AdmissionError::Gate)?;
+    validate_gate(before, tenant_uid)?;
+    validate_gate(after, tenant_uid)?;
+    if before.metadata.uid != after.metadata.uid
+        || before
+            .metadata
+            .resource_version
+            .as_deref()
+            .is_none_or(str::is_empty)
+        || before.metadata.resource_version != after.metadata.resource_version
+        || before.metadata.labels != after.metadata.labels
+    {
+        return Err(AdmissionError::Gate);
+    }
+    let old_state = before
+        .data
+        .as_ref()
+        .and_then(|data| data.get(GATE_STATE))
+        .ok_or(AdmissionError::Gate)?;
+    let new_state = after
+        .data
+        .as_ref()
+        .and_then(|data| data.get(GATE_STATE))
+        .ok_or(AdmissionError::Gate)?;
+    let old_entries = gate_entries(before)?;
+    let new_entries = gate_entries(after)?;
+    match username {
+        "system:serviceaccount:tenant-system:database-admission" => {
+            if old_state != "open"
+                || new_state != "open"
+                || old_entries
+                    .iter()
+                    .any(|(uid, entry)| new_entries.get(uid) != Some(entry))
+            {
+                return Err(AdmissionError::Gate);
+            }
+        }
+        "system:serviceaccount:tenant-system:database-controller" => {
+            if old_state != new_state
+                || new_entries.iter().any(|(uid, entry)| {
+                    old_entries.get(uid).is_none_or(|previous| {
+                        let mut expected = previous.clone();
+                        if expected.bound_uid.is_none() {
+                            expected.bound_uid = entry.bound_uid.clone();
+                        }
+                        entry != &expected
+                    })
+                })
+                || old_entries
+                    .iter()
+                    .any(|(uid, entry)| !new_entries.contains_key(uid) && entry.bound_uid.is_none())
+            {
+                return Err(AdmissionError::Gate);
+            }
+        }
+        "system:serviceaccount:tenant-system:tenant-controller" => {
+            if new_state != "closed"
+                || old_entries.iter().any(|(uid, entry)| {
+                    new_entries.get(uid).is_some_and(|current| current != entry)
+                })
+                || new_entries.keys().any(|uid| !old_entries.contains_key(uid))
+                || (old_state == "open" && old_entries != new_entries)
+                || old_entries
+                    .iter()
+                    .any(|(uid, entry)| !new_entries.contains_key(uid) && entry.bound_uid.is_some())
+            {
+                return Err(AdmissionError::Gate);
+            }
+        }
+        _ => return Err(AdmissionError::Gate),
+    }
+    Ok(())
+}
+
+pub fn validate_database_update(
+    before: &TenantDatabase,
+    after: &TenantDatabase,
+    username: &str,
+    namespace: Option<&str>,
+) -> Result<(), AdmissionError> {
+    let old_annotations = before
+        .metadata
+        .annotations
+        .as_ref()
+        .ok_or(AdmissionError::Reservation)?;
+    let new_annotations = after
+        .metadata
+        .annotations
+        .as_ref()
+        .ok_or(AdmissionError::Reservation)?;
+    if before.metadata.name != after.metadata.name
+        || before.metadata.namespace.as_deref() != namespace
+        || after.metadata.namespace.as_deref() != namespace
+        || before.metadata.uid.as_deref().is_none_or(str::is_empty)
+        || before.metadata.uid != after.metadata.uid
+        || before.metadata.deletion_timestamp != after.metadata.deletion_timestamp
+        || before.spec != after.spec
+        || after
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|owners| !owners.is_empty())
+        || before
+            .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|owners| !owners.is_empty())
+        || [GATE_UID, TENANT_UID, ADMISSION_UID, SPEC_SHA256]
+            .iter()
+            .any(|key| {
+                old_annotations.get(*key).is_none_or(String::is_empty)
+                    || old_annotations.get(*key) != new_annotations.get(*key)
+            })
+        || old_annotations.get(TENANT_UID) != Some(&before.spec.tenant_uid)
+        || old_annotations.get(SPEC_SHA256).map(String::as_str)
+            != Some(canonical_spec_hash(before)?.as_str())
+        || before.metadata.finalizers.as_deref() != Some(&[crate::api::FINALIZER.into()])
+    {
+        return Err(AdmissionError::Reservation);
+    }
+    let new_finalizers = after.metadata.finalizers.as_deref().unwrap_or(&[]);
+    if new_finalizers != [crate::api::FINALIZER]
+        && !(username == "system:serviceaccount:tenant-system:database-controller"
+            && before.metadata.deletion_timestamp.is_some()
+            && new_finalizers.is_empty())
+    {
+        return Err(AdmissionError::Reservation);
+    }
+    Ok(())
 }
 
 async fn review_create(
@@ -792,6 +985,18 @@ mod tests {
             .as_mut()
             .unwrap()
             .remove("requests.cpu");
+        quota.spec.as_mut().unwrap().scopes = Some(vec!["BestEffort".into()]);
+        assert_eq!(
+            validate_request(&database, &tenant, &namespace, &quota, &gate),
+            Err(AdmissionError::Quota)
+        );
+        quota.spec.as_mut().unwrap().scopes = None;
+        quota.metadata.uid = Some("successor-quota".into());
+        assert_eq!(
+            validate_request(&database, &tenant, &namespace, &quota, &gate),
+            Err(AdmissionError::Quota)
+        );
+        quota.metadata.uid = Some("quota-uid".into());
         assert_eq!(
             validate_request(&database, &tenant, &namespace, &quota, &gate),
             Ok(())
@@ -1017,5 +1222,200 @@ mod tests {
                 assert_eq!(validate_injected_reservation(&database, &closed), Ok(()));
             }
         }
+    }
+
+    #[test]
+    fn gate_update_authorizes_only_each_actors_entry_transition() {
+        let mut database = TenantDatabase::new(
+            "orders",
+            crate::api::TenantDatabaseSpec {
+                tenant_name: "test".into(),
+                tenant_uid: "uid-1".into(),
+                instances: 1,
+            },
+        );
+        database.metadata.namespace = Some("tenant-db-test".into());
+        let open = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some(gate_name("uid-1")),
+                namespace: Some(GATE_NAMESPACE.into()),
+                uid: Some("gate-uid".into()),
+                resource_version: Some("1".into()),
+                labels: Some(BTreeMap::from([(TENANT_UID.into(), "uid-1".into())])),
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([
+                (GATE_TENANT_UID.into(), "uid-1".into()),
+                (GATE_STATE.into(), "open".into()),
+                (GATE_ENTRIES.into(), "{}".into()),
+            ])),
+            ..Default::default()
+        };
+        let admission = "system:serviceaccount:tenant-system:database-admission";
+        let controller = "system:serviceaccount:tenant-system:database-controller";
+        let tenant = "system:serviceaccount:tenant-system:tenant-controller";
+        let reserved = reservation_update(&open, &database, "1234-5678")
+            .unwrap()
+            .unwrap();
+        assert_eq!(validate_gate_update(&open, &reserved, admission), Ok(()));
+        assert_eq!(
+            validate_gate_update(&open, &reserved, controller),
+            Err(AdmissionError::Gate)
+        );
+        let mut closed = reserved.clone();
+        closed
+            .data
+            .as_mut()
+            .unwrap()
+            .insert(GATE_STATE.into(), "closed".into());
+        assert_eq!(validate_gate_update(&reserved, &closed, tenant), Ok(()));
+        for actor in [admission, controller, "system:admin"] {
+            assert_eq!(
+                validate_gate_update(&reserved, &closed, actor),
+                Err(AdmissionError::Gate)
+            );
+        }
+        let mut bound = closed.clone();
+        let mut entries = gate_entries(&closed).unwrap();
+        entries.get_mut("1234-5678").unwrap().bound_uid = Some("database-uid".into());
+        bound.data.as_mut().unwrap().insert(
+            GATE_ENTRIES.into(),
+            serde_json::to_string(&entries).unwrap(),
+        );
+        assert_eq!(validate_gate_update(&closed, &bound, controller), Ok(()));
+        assert_eq!(
+            validate_gate_update(&closed, &bound, admission),
+            Err(AdmissionError::Gate)
+        );
+        let mut drained = bound.clone();
+        drained
+            .data
+            .as_mut()
+            .unwrap()
+            .insert(GATE_ENTRIES.into(), "{}".into());
+        assert_eq!(validate_gate_update(&bound, &drained, controller), Ok(()));
+        assert_eq!(
+            validate_gate_update(&bound, &drained, tenant),
+            Err(AdmissionError::Gate)
+        );
+    }
+
+    #[test]
+    fn admitted_metadata_cannot_be_changed_or_unfinalized_by_other_actors() {
+        let mut original = TenantDatabase::new(
+            "orders",
+            crate::api::TenantDatabaseSpec {
+                tenant_name: "test".into(),
+                tenant_uid: "uid-1".into(),
+                instances: 1,
+            },
+        );
+        original.metadata.namespace = Some("tenant-db-test".into());
+        original.metadata.uid = Some("database-uid".into());
+        original.metadata.finalizers = Some(vec![crate::api::FINALIZER.into()]);
+        original.metadata.annotations = Some(BTreeMap::from([
+            (TENANT_UID.into(), "uid-1".into()),
+            (GATE_UID.into(), "gate-uid".into()),
+            (ADMISSION_UID.into(), "1234-5678".into()),
+            (SPEC_SHA256.into(), canonical_spec_hash(&original).unwrap()),
+        ]));
+        let namespace = Some("tenant-db-test");
+        let admin = "system:serviceaccount:tenant-system:tenant-admin";
+        let controller = "system:serviceaccount:tenant-system:database-controller";
+        assert_eq!(
+            validate_database_update(&original, &original, admin, namespace),
+            Ok(())
+        );
+        let mut modified = original.clone();
+        modified
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .remove(GATE_UID);
+        assert_eq!(
+            validate_database_update(&original, &modified, controller, namespace),
+            Err(AdmissionError::Reservation)
+        );
+        let mut modified = original.clone();
+        modified.metadata.finalizers = None;
+        assert_eq!(
+            validate_database_update(&original, &modified, admin, namespace),
+            Err(AdmissionError::Reservation)
+        );
+        assert_eq!(
+            validate_database_update(&original, &modified, controller, namespace),
+            Err(AdmissionError::Reservation)
+        );
+        original.metadata.deletion_timestamp =
+            Some(serde_json::from_str(r#""2026-01-01T00:00:00Z""#).unwrap());
+        modified.metadata.deletion_timestamp = original.metadata.deletion_timestamp.clone();
+        assert_eq!(
+            validate_database_update(&original, &modified, controller, namespace),
+            Ok(())
+        );
+        assert_eq!(
+            validate_database_update(&original, &modified, admin, namespace),
+            Err(AdmissionError::Reservation)
+        );
+    }
+
+    #[test]
+    fn validating_review_rejects_untrusted_gate_close_and_missing_old_object() {
+        let gate = ConfigMap {
+            metadata: ObjectMeta {
+                name: Some(gate_name("uid-1")),
+                namespace: Some(GATE_NAMESPACE.into()),
+                uid: Some("gate-uid".into()),
+                resource_version: Some("1".into()),
+                labels: Some(BTreeMap::from([(TENANT_UID.into(), "uid-1".into())])),
+                ..Default::default()
+            },
+            data: Some(BTreeMap::from([
+                (GATE_TENANT_UID.into(), "uid-1".into()),
+                (GATE_STATE.into(), "open".into()),
+                (GATE_ENTRIES.into(), "{}".into()),
+            ])),
+            ..Default::default()
+        };
+        let mut closed = gate.clone();
+        closed
+            .data
+            .as_mut()
+            .unwrap()
+            .insert(GATE_STATE.into(), "closed".into());
+        let request = AdmissionRequest {
+            uid: "1234-5678".into(),
+            kind: GroupVersionKind {
+                group: String::new(),
+                version: "v1".into(),
+                kind: "ConfigMap".into(),
+            },
+            resource: GroupVersionResource {
+                group: String::new(),
+                version: "v1".into(),
+                resource: "configmaps".into(),
+            },
+            operation: "UPDATE".into(),
+            namespace: Some(GATE_NAMESPACE.into()),
+            dry_run: false,
+            object: serde_json::to_value(&closed).unwrap(),
+            old_object: Some(serde_json::to_value(&gate).unwrap()),
+            user_info: Some(AdmissionUser {
+                username: "system:serviceaccount:tenant-system:database-admission".into(),
+            }),
+        };
+        let mut missing = request.clone();
+        missing.old_object = None;
+        assert_eq!(review_update(missing).unwrap_err(), AdmissionError::Request);
+        assert_eq!(
+            review_update(request.clone()).unwrap_err(),
+            AdmissionError::Gate
+        );
+        let mut trusted = request;
+        trusted.user_info = Some(AdmissionUser {
+            username: "system:serviceaccount:tenant-system:tenant-controller".into(),
+        });
+        assert!(review_update(trusted).is_ok());
     }
 }

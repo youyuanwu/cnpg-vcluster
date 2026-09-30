@@ -29,3 +29,52 @@ webhooks:
     scope: Namespaced
   sideEffects: NoneOnDryRun
   timeoutSeconds: 30
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: database-admission
+      namespace: tenant-system
+      path: /validate
+      port: 443
+  failurePolicy: Fail
+  matchPolicy: Exact
+  name: tenantdatabases-update.tenancy.cnpg-vcluster.io
+  rules:
+  - apiGroups:
+    - tenancy.cnpg-vcluster.io
+    apiVersions:
+    - v1alpha1
+    operations:
+    - UPDATE
+    resources:
+    - tenantdatabases
+    scope: Namespaced
+  sideEffects: NoneOnDryRun
+  timeoutSeconds: 30
+- admissionReviewVersions:
+  - v1
+  clientConfig:
+    service:
+      name: database-admission
+      namespace: tenant-system
+      path: /validate
+      port: 443
+  failurePolicy: Fail
+  matchConditions:
+  - expression: request.namespace == 'tenant-database-gates'
+    name: gate-namespace
+  matchPolicy: Exact
+  name: tenant-database-gates.tenancy.cnpg-vcluster.io
+  rules:
+  - apiGroups:
+    - ''
+    apiVersions:
+    - v1
+    operations:
+    - UPDATE
+    resources:
+    - configmaps
+    scope: Namespaced
+  sideEffects: NoneOnDryRun
+  timeoutSeconds: 30

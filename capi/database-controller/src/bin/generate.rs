@@ -62,6 +62,22 @@ fn admission_webhook(name: &str, path: &str, mutating: bool) -> Value {
     webhook
 }
 
+fn update_webhook(name: &str, gate: bool) -> Value {
+    let mut webhook = admission_webhook(name, "/validate", false);
+    let rule = &mut webhook["rules"][0];
+    rule["operations"] = json!(["UPDATE"]);
+    if gate {
+        rule["apiGroups"] = json!([""]);
+        rule["apiVersions"] = json!(["v1"]);
+        rule["resources"] = json!(["configmaps"]);
+        webhook["matchConditions"] = json!([{
+            "name": "gate-namespace",
+            "expression": "request.namespace == 'tenant-database-gates'"
+        }]);
+    }
+    webhook
+}
+
 fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
     let management_resources = json!([
         {"group": "tenancy.cnpg-vcluster.io", "version": "v1alpha1", "kind": "TenantDatabase", "resource": "tenantdatabases", "scope": "Namespaced"},
@@ -250,9 +266,11 @@ fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
             "kind": "ValidatingWebhookConfiguration",
             "metadata": {"name": "database-admission",
                 "annotations": {"cert-manager.io/inject-ca-from": "tenant-system/database-admission-ca"}},
-            "webhooks": [admission_webhook(
-                "tenantdatabases.tenancy.cnpg-vcluster.io", "/validate", false
-            )]}),
+            "webhooks": [
+                admission_webhook("tenantdatabases.tenancy.cnpg-vcluster.io", "/validate", false),
+                update_webhook("tenantdatabases-update.tenancy.cnpg-vcluster.io", false),
+                update_webhook("tenant-database-gates.tenancy.cnpg-vcluster.io", true),
+            ]}),
         ),
     ] {
         resources.push((name, yaml(&resource)?));
@@ -363,20 +381,41 @@ mod tests {
             "admission/validating-webhook.yaml",
         ] {
             let webhook = find(path);
-            let rule = &webhook["webhooks"][0];
-            assert_eq!(rule["failurePolicy"], "Fail");
-            assert_eq!(rule["sideEffects"], "NoneOnDryRun");
-            assert_eq!(rule["rules"][0]["operations"], json!(["CREATE"]));
-            assert_eq!(rule["rules"][0]["resources"], json!(["tenantdatabases"]));
+            for rule in webhook["webhooks"].as_array().unwrap() {
+                assert_eq!(rule["failurePolicy"], "Fail");
+                assert_eq!(rule["sideEffects"], "NoneOnDryRun");
+                assert_eq!(
+                    rule["clientConfig"]["service"]["namespace"],
+                    "tenant-system"
+                );
+            }
             assert_eq!(
-                rule["clientConfig"]["service"]["namespace"],
-                "tenant-system"
+                webhook["webhooks"][0]["rules"][0]["operations"],
+                json!(["CREATE"])
+            );
+            assert_eq!(
+                webhook["webhooks"][0]["rules"][0]["resources"],
+                json!(["tenantdatabases"])
             );
             assert_eq!(
                 webhook["metadata"]["annotations"]["cert-manager.io/inject-ca-from"],
                 "tenant-system/database-admission-ca"
             );
         }
+        let validating = find("admission/validating-webhook.yaml");
+        assert_eq!(validating["webhooks"].as_array().unwrap().len(), 3);
+        assert_eq!(
+            validating["webhooks"][1]["rules"][0]["operations"],
+            json!(["UPDATE"])
+        );
+        assert_eq!(
+            validating["webhooks"][2]["rules"][0]["resources"],
+            json!(["configmaps"])
+        );
+        assert_eq!(
+            validating["webhooks"][2]["matchConditions"][0]["expression"],
+            "request.namespace == 'tenant-database-gates'"
+        );
         assert!(artifacts.iter().all(|(_, contents)| {
             !String::from_utf8_lossy(contents).contains("tenant-database-reservations")
         }));
