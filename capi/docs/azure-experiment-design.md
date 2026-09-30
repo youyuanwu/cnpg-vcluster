@@ -480,7 +480,9 @@ an in-VNet `kubectl` execution point, allowing generic status to inspect Nodes
 and add-ons without making the private tenant API public or creating resources
 during a status request.
 
-The catalog's Pod, Service, VNet, and AKS address ranges must not overlap. The tenant
+Each catalog Pod/Service CIDR must be disjoint from every other slot network
+and reserved management range. Management subnets may remain contained within
+the management VNet. The tenant
 subnet must reach the Kamaji API port, and VMSS workers must be able to
 exchange VXLAN traffic on UDP 4789.
 
