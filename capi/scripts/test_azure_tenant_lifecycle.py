@@ -97,9 +97,11 @@ def _admin_create_tenant(spec) -> dict[str, object]:
     if (
         set(created) != {"identity", "provider", "kubernetesVersion"}
         or not isinstance(identity, dict)
+        or set(identity) != {"name", "uid", "generation"}
         or identity.get("name") != spec.name
         or not isinstance(identity.get("uid"), str)
         or not identity["uid"]
+        or type(identity.get("generation")) is not int
         or created.get("provider") != "azure"
         or created.get("kubernetesVersion") != spec.kubernetes_version
     ):
@@ -117,8 +119,13 @@ def _admin_delete_tenant(name: str, uid: str) -> dict[str, object]:
     if (
         set(deleted) != {"identity", "state"}
         or not isinstance(identity, dict)
+        or set(identity) != {"name", "uid", "generation"}
         or identity.get("name") != name
         or identity.get("uid") != uid
+        or (
+            identity.get("generation") is not None
+            and type(identity.get("generation")) is not int
+        )
         or deleted.get("state") not in {"accepted", "completed"}
     ):
         raise RuntimeError("Azure Tenant Admin delete response is invalid")
@@ -147,6 +154,7 @@ def _ensure_tenant_ready(config: Mapping[str, str], spec) -> dict[str, object]:
         existing = None
     if existing is None:
         _admin_create_tenant(spec)
+        wait_tenant_ready(ROOT, spec.name)
     else:
         if existing.get("spec") != tenant_document(spec)["spec"]:
             raise RuntimeError(
@@ -355,6 +363,9 @@ def main(arguments: list[str]) -> int:
         or not isinstance(allocation.get("serviceCIDR"), str)
     ):
         raise RuntimeError("Azure Tenant allocation status is incomplete")
+    allocation_lease_uid = allocation.get("leaseUID")
+    if not isinstance(allocation_lease_uid, str) or not allocation_lease_uid:
+        raise RuntimeError("Azure Tenant allocation Lease identity is incomplete")
 
     if _source_sha256(spec_path) != source_sha256:
         raise RuntimeError(
@@ -410,6 +421,7 @@ def main(arguments: list[str]) -> int:
         "ordinary-tenant-deletion",
         lambda: (
             _admin_delete_tenant(spec.name, str(tenant_uid)),
+            wait_tenant_absent(ROOT, spec.name),
             _require_status(spec.name, "absent"),
         ),
     )
@@ -428,14 +440,21 @@ def main(arguments: list[str]) -> int:
             )
 
     phase("foundation-verification", verify_foundation)
-    phase(
-        "recreation",
-        lambda: (
-            _admin_create_tenant(spec),
-            _require_status(spec.name, "ready"),
-            _ready_snapshot(config, spec),
-        ),
-    )
+    def verify_recreation() -> None:
+        _admin_create_tenant(spec)
+        wait_tenant_ready(ROOT, spec.name)
+        recreated, _, _ = _ready_snapshot(config, spec)
+        metadata = recreated.get("metadata")
+        allocation = _provider(recreated).get("networkAllocation")
+        if (
+            not isinstance(metadata, dict)
+            or metadata.get("uid") == tenant_uid
+            or not isinstance(allocation, dict)
+            or allocation.get("leaseUID") == allocation_lease_uid
+        ):
+            raise RuntimeError("Azure Tenant recreation retained old identity")
+
+    phase("recreation", verify_recreation)
     return 0
 
 

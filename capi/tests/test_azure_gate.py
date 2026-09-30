@@ -10,7 +10,11 @@ from scripts.lib.azure.gate import (
     require_owned_resource_delta,
     require_replacement,
 )
-from scripts.test_azure_tenant_lifecycle import _ensure_tenant_ready
+from scripts.test_azure_tenant_lifecycle import (
+    _admin_create_tenant,
+    _admin_delete_tenant,
+    _ensure_tenant_ready,
+)
 
 
 VMSS = (
@@ -43,6 +47,49 @@ def readiness(identifiers=(0, 1, 2)):
 
 
 class AzureGateTests(unittest.TestCase):
+    def test_admin_lifecycle_responses_are_exact_and_credential_free(self) -> None:
+        spec = type(
+            "Spec",
+            (),
+            {
+                "name": "tenant-c",
+                "workers": 3,
+                "kubernetes_version": "1.32.13",
+            },
+        )()
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle._admin_mutation",
+                return_value={
+                    "identity": {
+                        "name": "tenant-c",
+                        "uid": "uid",
+                        "generation": True,
+                    },
+                    "provider": "azure",
+                    "kubernetesVersion": "1.32.13",
+                    "password": "forbidden",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "create response"),
+        ):
+            _admin_create_tenant(spec)
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle._admin_mutation",
+                return_value={
+                    "identity": {
+                        "name": "tenant-c",
+                        "uid": "uid",
+                        "generation": "bad",
+                    },
+                    "state": "accepted",
+                },
+            ),
+            self.assertRaisesRegex(RuntimeError, "delete response"),
+        ):
+            _admin_delete_tenant("tenant-c", "uid")
+
     def test_ready_gate_reuses_parsed_spec_after_terminating_tenant(self) -> None:
         spec = type("Spec", (), {"name": "tenant-c"})()
         events = []
@@ -65,6 +112,10 @@ class AzureGateTests(unittest.TestCase):
                 side_effect=lambda observed: events.append(observed),
             ),
             patch(
+                "scripts.test_azure_tenant_lifecycle.wait_tenant_ready",
+                side_effect=lambda *_args: events.append("ready"),
+            ),
+            patch(
                 "scripts.test_azure_tenant_lifecycle._require_status",
                 return_value={"classification": "ready"},
             ),
@@ -73,7 +124,7 @@ class AzureGateTests(unittest.TestCase):
                 {"classification": "ready"},
                 _ensure_tenant_ready({}, spec),
             )
-        self.assertEqual(["absent", spec], events)
+        self.assertEqual(["absent", spec, "ready"], events)
 
     def test_exact_mapping_checkpoint_and_non_primary_selection(self) -> None:
         snapshot = build_worker_snapshot(
