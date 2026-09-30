@@ -47,17 +47,17 @@ The management node mounts `/var/run/docker.sock`. The controller uses it only
 for exact local volume ownership and provider-container observation; CAPD
 remains responsible for worker and load-balancer creation and deletion.
 
-## Read-only Tenant Admin
+## Tenant Admin and unsafe SQL console
 
 Each management cluster also runs one `tenant-admin` Deployment and ClusterIP
 Service in `tenant-system`. A Leptos client-side WebAssembly application calls
 an Axum/kube-rs server for overview, sorted Tenant list, detail, and
-deterministic topology data. Kubernetes is the only durable data source; the
-server performs live bounded reads and has no database, filesystem state,
-watch cache, or Azure credentials. Overview and management topology use only
-the management API. A selected local Tenant detail request validates the exact
-provider-owned kubeconfig Secret, creates an in-memory Tenant client, and
-performs an exact live read of `database/capi-postgres`.
+deterministic topology data. Kubernetes is the only durable platform data
+source; the server has no application database, filesystem state, watch cache,
+or Azure credentials. Overview and management topology use only the management
+API. A selected local Tenant detail request validates the exact provider-owned
+kubeconfig Secret, creates an in-memory Tenant client, and performs an exact
+live read of `database/capi-postgres`.
 
 The generated admin ClusterRole grants exact `get` and `list` permissions,
 contains no write verb, and excludes subresources. Local mode deliberately
@@ -68,6 +68,15 @@ exact controller markers and owner UID chains, while live CNPG topology comes
 only from the exact managed Cluster. Azure topology requires durable status
 UIDs, binding markers, and recorded owner UIDs and never reads Tenant
 credentials. Ambiguous or foreign resources are omitted. Refresh is manual.
+
+Local detail pages also expose an explicitly unsafe administrator SQL console.
+Each execution repeats the Tenant and CNPG ownership checks, validates the
+selected instance Pod and deterministic CNPG superuser Secret, opens an
+ephemeral Kubernetes port-forward to that exact Pod, and executes arbitrary
+multi-statement SQL as PostgreSQL superuser. Passwords, connection strings,
+Tenant kubeconfigs, and raw Secrets remain server-side. The console has bounded
+request, execution-time, and response-memory limits, but no SQL authorization
+or read-only enforcement. It is unavailable for Azure Tenants.
 
 The provider-neutral scratch image contains the static native server and the
 generated browser bundle. Local management loads it into Kind; Azure

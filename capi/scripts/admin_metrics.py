@@ -10,7 +10,7 @@ ADMIN_SOURCE_ROOTS = tuple(
     for crate in ("shared", "server", "web")
 )
 ADMIN_BASELINE_LINES = 3916
-MAX_ADMIN_PRODUCTION_LINES = 6000
+MAX_ADMIN_PRODUCTION_LINES = 7500
 
 
 def production_lines(path: Path) -> int:

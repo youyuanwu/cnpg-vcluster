@@ -115,6 +115,7 @@ pub fn cnpg_cluster(
         "cnpg",
         json!({
             "instances":context.database_count, "imageName":postgres_image,
+            "enableSuperuserAccess":true,
             "affinity":{"enablePodAntiAffinity":true,"podAntiAffinityType":affinity,"topologyKey":"kubernetes.io/hostname"},
             "bootstrap":{"initdb":{"database":"app","owner":"app"}},
             "storage":{"size":"1Gi","storageClass":storage_class},

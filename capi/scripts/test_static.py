@@ -331,7 +331,7 @@ def check_repository_boundaries() -> None:
     )
     check("admin-metrics:" in justfile, "admin metrics recipe is missing")
     check(
-        "scripts/admin_metrics.py --max 6000" in justfile,
+        "scripts/admin_metrics.py --max 7500" in justfile,
         "admin production-line threshold is not enforced",
     )
     admin_metrics_source = (ROOT / "scripts/admin_metrics.py").read_text(
@@ -339,7 +339,7 @@ def check_repository_boundaries() -> None:
     )
     for contract in (
         "ADMIN_BASELINE_LINES = 3916",
-        "MAX_ADMIN_PRODUCTION_LINES = 6000",
+        "MAX_ADMIN_PRODUCTION_LINES = 7500",
         'for crate in ("shared", "server", "web")',
         "Admin Rust: baseline=",
     ):
@@ -850,7 +850,7 @@ def check_documentation() -> None:
         "Azure tenants are not separate AKS clusters",
         "`just test-e2e-offline`",
         "materialized from the verified active cache",
-        "## Read-only Tenant Admin",
+        "## Tenant Admin and unsafe SQL console",
         "exact `get` and `list` permissions",
     )
     for token in required_readme:
@@ -896,11 +896,13 @@ def check_documentation() -> None:
         "Refresh is manual",
         "`GET /api/v1/overview`",
         "`GET /api/v1/tenants/{name}/topology`",
+        "`POST /api/v1/tenants/{name}/database/query`",
         "validated exact owner UID chain",
         "`adminImage` and `adminDeploymentUid`",
         "`just admin-port-forward`",
         "Generated browser bundles",
-        "Future create or delete support",
+        "explicitly unsafe PostgreSQL superuser console",
+        "does not add Tenant create/delete or Kubernetes mutation routes",
         "## Troubleshooting",
         "## Limitations",
     )
@@ -939,7 +941,8 @@ def check_documentation() -> None:
     )
     check(
         "capi/docs/admin-ui-design.md" in root_readme
-        and "read-only Leptos/Axum Tenant Admin UI" in root_readme,
+        and "Leptos/Axum Tenant Admin UI" in root_readme
+        and "unsafe PostgreSQL superuser console" in root_readme,
         "root README omits the Tenant Admin entry point",
     )
     check(

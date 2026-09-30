@@ -298,6 +298,7 @@ def run_e2e() -> int:
                 ManagementClient(ROOT, config),
                 expected_tenant_names=(tenant_name,),
                 require_available_databases=True,
+                verify_database_queries=True,
             )
         run_just(ROOT, config, "local-tenant-status", tenant_name)
         with timings.phase("tenant_sql_probe"):

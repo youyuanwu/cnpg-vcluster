@@ -345,6 +345,206 @@ button:disabled {
   font-weight: 700;
 }
 
+.database-console {
+  margin-top: 1.5rem;
+  border: 2px solid #b84413;
+  border-left-width: 0.45rem;
+  border-radius: 0.65rem;
+  padding: clamp(1rem, 2.5vw, 1.5rem);
+  background: #fff8f1;
+}
+
+.database-console__warning {
+  border-bottom: 1px solid #e8b98e;
+  padding-bottom: 1rem;
+}
+
+.database-console__warning .eyebrow {
+  color: #9a3d14;
+}
+
+.database-console__warning h3 {
+  margin: 0;
+  color: #8a2f0b;
+  font-size: 1.2rem;
+}
+
+.database-console__warning p:last-child {
+  max-width: 72rem;
+  margin: 0.4rem 0 0;
+  color: #5d2a13;
+  font-weight: 650;
+}
+
+.database-console__form {
+  margin-top: 1rem;
+}
+
+.database-console__controls {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(12rem, 1fr));
+  gap: 1rem;
+}
+
+.database-console label,
+.database-console__sql {
+  display: grid;
+  gap: 0.35rem;
+  color: var(--ink);
+  font-weight: 800;
+}
+
+.database-console input,
+.database-console select,
+.database-console textarea {
+  width: 100%;
+  border: 1px solid #9aabb7;
+  border-radius: 0.4rem;
+  padding: 0.65rem 0.7rem;
+  color: var(--ink);
+  background: #fff;
+  font: inherit;
+}
+
+.database-console textarea {
+  min-height: 10rem;
+  resize: vertical;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  line-height: 1.45;
+  tab-size: 2;
+}
+
+.database-console__sql {
+  margin-top: 1rem;
+}
+
+.database-console__actions {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.database-console__actions p {
+  margin: 0;
+}
+
+.database-console__execute {
+  flex: 0 0 auto;
+  border-color: #9a2d16;
+  background: #a63219;
+}
+
+.database-console__execute:hover:not(:disabled) {
+  background: #7e2412;
+}
+
+.database-console__output {
+  margin-top: 1.25rem;
+  border-top: 1px solid #e8b98e;
+  padding-top: 1.25rem;
+}
+
+.database-console__placeholder,
+.database-console__notice {
+  margin: 0;
+  color: var(--muted);
+}
+
+.database-console__running {
+  display: flex;
+  align-items: center;
+  gap: 0.7rem;
+  margin: 0;
+  font-weight: 800;
+}
+
+.database-console__running .loading-indicator {
+  width: 1.2rem;
+  height: 1.2rem;
+}
+
+.database-console__error {
+  border: 1px solid #df8c93;
+  border-left: 0.35rem solid var(--failed);
+  border-radius: 0.5rem;
+  padding: 1rem;
+  background: #ffedef;
+}
+
+.database-console__error h4,
+.database-console__success h4,
+.database-console__result h5 {
+  margin: 0;
+  color: var(--brand-strong);
+}
+
+.database-console__error p,
+.database-console__success p {
+  margin: 0.35rem 0 0;
+}
+
+.database-console__result-header {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.database-console__identity {
+  grid-template-columns: minmax(8rem, 0.3fr) 1fr;
+  max-width: 56rem;
+}
+
+.database-console__results {
+  display: grid;
+  gap: 1rem;
+  margin-top: 1rem;
+}
+
+.database-console__result {
+  min-width: 0;
+  border: 1px solid #d7c2b6;
+  border-radius: 0.5rem;
+  padding: 1rem;
+  background: #fff;
+}
+
+.database-console__table {
+  min-width: 28rem;
+  margin-top: 0.75rem;
+}
+
+.database-console__table td {
+  max-width: 34rem;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.database-console__null {
+  color: #6a4c74;
+  font-family: ui-monospace, SFMono-Regular, Consolas, "Liberation Mono", monospace;
+  font-size: 0.82rem;
+  font-style: italic;
+  font-weight: 800;
+}
+
+.database-console__affected {
+  font-variant-numeric: tabular-nums;
+}
+
+.database-console__affected strong {
+  font-size: 1.4rem;
+}
+
+.database-console__truncation {
+  border-left: 0.3rem solid var(--degraded);
+  padding: 0.65rem 0.8rem;
+  color: #6d3706;
+  background: #fff0e3;
+  font-weight: 750;
+}
+
 .metrics {
   display: grid;
   grid-template-columns: repeat(6, minmax(8rem, 1fr));
@@ -661,6 +861,10 @@ tbody tr:hover {
     grid-template-columns: 1fr 1fr;
   }
 
+  .database-console__controls {
+    grid-template-columns: 1fr;
+  }
+
   .database-detail-grid--secondary {
     grid-template-columns: 1fr;
   }
@@ -711,6 +915,12 @@ tbody tr:hover {
   .brand span {
     display: block;
     margin-left: 0;
+  }
+
+  .database-console__actions,
+  .database-console__result-header {
+    align-items: stretch;
+    flex-direction: column;
   }
 }
 

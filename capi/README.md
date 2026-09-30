@@ -22,9 +22,12 @@ application: a Leptos WebAssembly frontend served by an Axum/kube-rs backend.
 It reads management topology through exact provider-specific read-only RBAC.
 For a selected local Tenant detail page, it also reads the exact
 provider-owned kubeconfig Secret, validates its ownership and endpoint, and
-uses it only in memory for an exact live CNPG Cluster read. The service
-validates its complete effective rules and has no Azure credentials, database,
-persistent cache, browser credential exposure, or mutation route. See
+uses it only in memory for exact live CNPG reads. An explicitly unsafe SQL
+console can connect to a selected CNPG instance through an ephemeral
+Kubernetes port-forward and execute unrestricted SQL as the generated
+PostgreSQL superuser. The service validates its complete effective management
+rules and has no Azure credentials, application database, persistent cache, or
+browser credential exposure. See
 [`docs/admin-ui-design.md`](docs/admin-ui-design.md).
 
 The proposed minimal Azure experiment is documented in
@@ -198,7 +201,7 @@ just test-tenant-lifecycle
 | `just admin-generate-check` | Verify generated read-only admin resources are current. |
 | `just admin-lint` | Run Rust formatting and Clippy for all admin crates. |
 | `just admin-test` | Run locked/offline tests for shared DTOs, Axum projection, and Leptos view logic. |
-| `just admin-metrics` | Report the separate admin production-Rust baseline and enforce the 6,000-line ceiling. |
+| `just admin-metrics` | Report the separate admin production-Rust baseline and enforce the 7,500-line ceiling. |
 | `just admin-package-check` | Build the static server and browser bundle twice offline and compare the exact output inventory. |
 | `just dev-bootstrap` | Prepare and bind a retained management context to the current user, host, Docker daemon, branch, revision, configuration, and exact management identity. |
 | `just dev-clean` | Run authoritative cleanup for retained tenant, management, runtime, and host state. |

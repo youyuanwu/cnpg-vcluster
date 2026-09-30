@@ -56,7 +56,7 @@ class AdminMetricsTests(unittest.TestCase):
         )
         total = sum(lines for _, lines in metrics)
         self.assertEqual(3916, ADMIN_BASELINE_LINES)
-        self.assertEqual(6000, MAX_ADMIN_PRODUCTION_LINES)
+        self.assertEqual(7500, MAX_ADMIN_PRODUCTION_LINES)
         self.assertLessEqual(total, MAX_ADMIN_PRODUCTION_LINES)
 
     def test_output_reports_baseline_current_and_delta(self) -> None:

@@ -2,24 +2,36 @@
 
 ## Purpose and boundary
 
-Tenant Admin is a read-only application deployed once in each local Kind or
-Azure AKS management cluster. It gives administrators a browser view of the
-same `Tenant` resources, conditions, provider status, and management resources
-used by the lifecycle controller.
+Tenant Admin is an administrative application deployed once in each local
+Kind or Azure AKS management cluster. It gives administrators a browser view
+of the same `Tenant` resources, conditions, provider status, and management
+resources used by the lifecycle controller. Local Tenant detail pages also
+provide an explicitly unsafe PostgreSQL superuser console.
 
 Kubernetes is the only durable data source. The application has no database,
 filesystem journal, watch cache, persisted Tenant kubeconfig, Azure
 credentials, or direct browser-to-Kubernetes connection. Overview requests
 perform bounded reads against the management Kubernetes API. A selected local
 Tenant detail request additionally validates the exact provider-owned
-kubeconfig Secret, constructs an in-memory Tenant client, and performs one
-exact live read of the managed CNPG Cluster before returning sanitized DTOs.
+kubeconfig Secret, constructs an in-memory Tenant client, and performs exact
+live reads of the managed CNPG Cluster before returning sanitized DTOs. A
+query request repeats that trust validation, reads the exact CNPG instance Pod
+and generated superuser Secret, and opens an ephemeral Kubernetes API
+port-forward to PostgreSQL. SQL and result data are transient and are not
+persisted.
 
-The first release has no mutation routes, forms, or write permissions. Future
-create or delete support must be designed as separate authenticated command
-endpoints with explicit authorization, idempotency, validation, audit, and
-ownership contracts. It must not be added by broadening the current read-only
-ServiceAccount.
+Browser query requests must have a same-authority `Origin`/`Host` pair and the
+`X-Tenant-Admin-Unsafe-Request: 1` header emitted by the Leptos client. The
+host must be `localhost` or an IPv4/IPv6 literal, preserving local and WSL
+access while rejecting DNS names that can be rebound to the forwarded service.
+The custom header also blocks simple cross-origin form requests. No-`Origin`
+Kubernetes service-proxy requests remain available for operational validation.
+
+The management-cluster ServiceAccount remains read-only. The SQL endpoint is a
+separate, deliberately unsafe data-plane capability obtained through the
+validated Tenant administrative kubeconfig. It can execute DDL, DML,
+transaction control, and multiple statements as PostgreSQL superuser. It does
+not add Tenant create/delete or Kubernetes mutation routes.
 
 ## Architecture
 
@@ -33,6 +45,9 @@ flowchart LR
   Kube[Management Kubernetes API]
   TenantAPI[Selected local Tenant API]
   CNPG[database/capi-postgres]
+  Pod[Selected CNPG instance Pod]
+  Secret[capi-postgres-superuser Secret]
+  Postgres[PostgreSQL]
   Tenant[Tenant resources and status]
   Resources[CAPI, provider, and add-on resources]
 
@@ -46,6 +61,9 @@ flowchart LR
   Kube -->|validated kubeconfig Secret| Axum
   Axum -->|exact live GET| TenantAPI
   TenantAPI --> CNPG
+  TenantAPI --> Pod
+  TenantAPI --> Secret
+  Axum -->|ephemeral port-forward| Pod --> Postgres
 ```
 
 The browser is a Leptos client-side WebAssembly application, and the native
@@ -88,10 +106,12 @@ lists or watches Secrets. Azure mode receives no Secret permission.
 
 The validated Tenant kubeconfig exists only in request memory. The resulting
 client has fixed connect/read/write timeouts, no proxy URL, and retries
-disabled. It performs an exact GET of
-`postgresql.cnpg.io/v1`, `Cluster`, `database/capi-postgres`; it does not list
-Tenant workloads, read database Secrets, execute SQL, scrape metrics, or
-persist credentials. Each role otherwise grants only exact `get` and `list`
+disabled. Detail observations perform an exact GET of
+`postgresql.cnpg.io/v1`, `Cluster`, `database/capi-postgres`. Query requests
+additionally exact-GET the selected instance Pod and
+`database/capi-postgres-superuser` Secret, then use the Pod port-forward
+subresource through the Tenant client. They never list Tenant workloads or
+Secrets. Each management role otherwise grants only exact `get` and `list`
 verbs and no provider-irrelevant resource, wildcard, subresource, watch,
 create, update, patch, or delete access.
 
@@ -104,9 +124,9 @@ RoleBindings outside `tenant-system`. Incomplete evaluations, extra bindings,
 mutations, subresources, wildcards, or provider-irrelevant rights fail health.
 Only the exact Kubernetes self-review permissions and bounded authenticated
 discovery URLs supplied by default cluster roles are accepted outside the
-generated contract. The browser receives no
-ServiceAccount token, kubeconfig, certificate, credential, or raw unbounded
-Kubernetes object.
+generated contract. The browser receives no ServiceAccount token, kubeconfig,
+certificate, PostgreSQL credential, connection URI, pgpass value, or raw
+unbounded Kubernetes object.
 
 Displayed strings and identities are bounded and sanitized. Azure resource
 IDs shown by the UI come from durable Tenant status; the server does not call
@@ -139,6 +159,23 @@ topology includes the exact CNPG Cluster and observed instances when available,
 or an explicit unavailable node when Tenant access is pending or fails.
 Azure reports database observation as not applicable.
 
+When a local database observation is available, the detail page also shows an
+unsafe SQL console. The administrator selects an observed primary, standby, or
+unknown-role instance, chooses the PostgreSQL database, and submits arbitrary
+SQL. The backend executes the request on that exact instance and returns
+ordered result sets with column names, text values, NULL values, affected-row
+counts, timing, and explicit truncation state. PostgreSQL errors remain
+visible with SQLSTATE and sanitized server messages.
+
+Execution has a 30-second transport deadline. On expiry the server opens a
+second UID-revalidated port-forward, sends a PostgreSQL cancellation request,
+and reaps the query connection. It reports a timeout only when termination is
+confirmed; otherwise it returns the explicit non-retryable
+`query-outcome-unknown` error so the administrator does not assume that a
+mutation stopped. PostgreSQL backend frames are length-checked before they are
+forwarded to the client decoder, preventing a single declared value from
+bypassing the response-memory boundary.
+
 Refresh is manual. Loading a page or selecting **Refresh** issues new API
 requests; there is no polling, SSE stream, browser persistence, or server-side
 cache. Overview and list requests never fan out to Tenant APIs. Tenant or CNPG
@@ -151,10 +188,10 @@ returns a typed not-found response and a non-fatal link back to the overview.
 Every successful JSON response is:
 
 ```json
-{"schemaVersion":2,"data":{}}
+{"schemaVersion":3,"data":{}}
 ```
 
-Errors use schema version 2 plus a typed error code, sanitized message, and
+Errors use schema version 3 plus a typed error code, sanitized message, and
 retryable flag. The routes are:
 
 | Route | Response |
@@ -165,6 +202,7 @@ retryable flag. The routes are:
 | `GET /api/v1/tenants` | Sorted `TenantSummary[]`. |
 | `GET /api/v1/tenants/{name}` | One `TenantSnapshot` containing detail, live database observation, and topology from the same Tenant UID/generation/resource read. |
 | `GET /api/v1/tenants/{name}/topology` | `TopologyGraph`. |
+| `POST /api/v1/tenants/{name}/database/query` | Execute unrestricted SQL as CNPG PostgreSQL superuser on one exact observed instance and return bounded ordered results. |
 | `GET /*` | Static asset or `index.html` fallback for browser routes. |
 
 `/overview` and `/tenants/{name}` are the coherent snapshot routes. The
@@ -184,6 +222,8 @@ The shared DTOs include:
 - explicit available, unavailable, or not-applicable database observation;
 - bounded CNPG identity, phase, primary/standby instances, placement, storage,
   Services, conditions, and observation timestamp;
+- database query request, ordered result sets, NULL values, affected-row
+  counts, timing, and truncation state without credentials;
 - Azure binding, management roots, worker pool, Nodes, add-ons, and recorded
   provider resources;
 - topology nodes, edges, health, display attributes, and exact resource
@@ -300,7 +340,8 @@ kubectl -n tenant-system port-forward service/tenant-admin 8080:80
 Open <http://127.0.0.1:8080/>. The Service is ClusterIP-only; there is no
 Ingress, public endpoint, or application authentication in this experiment.
 Access therefore depends on the operator's authenticated management-cluster
-kubeconfig and local port-forward process.
+kubeconfig and local port-forward process. Anyone who can load this UI can use
+the local SQL console as PostgreSQL superuser and can destroy Tenant data.
 
 ## Troubleshooting
 
@@ -334,15 +375,19 @@ kubeconfig and local port-forward process.
 
 ## Limitations
 
-This is an experimental administrative view, not a production control plane.
+This is an experimental administrative tool, not a production control plane.
 It has no Ingress, application authentication, authorization by Tenant,
 pagination UI, watch/poll stream, historical data, metrics backend, audit
-store, general Tenant workload topology, or mutation support. Local CNPG
-metadata is a point-in-time exact read, not monitoring: there are no LSN,
-replication-lag, SQL, or historical metrics. The local admin ServiceAccount can
+store, or general Tenant workload topology. Local CNPG metadata is a
+point-in-time exact read, not monitoring: there are no LSN, replication-lag,
+or historical metrics. The SQL console is intentionally unrestricted and can
+modify schemas, roles, configuration, and data. Transport and response limits
+protect the Admin process but are not a safety boundary. The local admin ServiceAccount can
 read any known Secret name because Kubernetes ClusterRole rules cannot filter
 dynamic Tenant Secret names; deployment compromise therefore has
 administrative Tenant impact despite application-level exact-name and
-ownership checks. Azure Disk and CloudNativePG remain outside the Azure
+ownership checks. The validated Tenant kubeconfig and CNPG superuser Secret
+raise that impact to complete local Tenant and PostgreSQL administration.
+Azure Disk and CloudNativePG remain outside the Azure
 experiment. The fixed list limits intentionally fail closed for larger
 management clusters and will require a separately designed pagination model.

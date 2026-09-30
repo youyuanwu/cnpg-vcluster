@@ -633,6 +633,7 @@ fn storage_and_cnpg_all_count_pairs_affinity_and_exact_prebinding() {
                 cluster.data,
                 json!({"spec":{
                     "instances":databases,"imageName":"postgres:exact",
+                    "enableSuperuserAccess":true,
                     "affinity":{"enablePodAntiAffinity":true,"podAntiAffinityType":if databases > workers {"preferred"} else {"required"},"topologyKey":"kubernetes.io/hostname"},
                     "bootstrap":{"initdb":{"database":"app","owner":"app"}},
                     "storage":{"size":"1Gi","storageClass":"capi-hostpath"},
