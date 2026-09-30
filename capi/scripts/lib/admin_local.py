@@ -439,14 +439,10 @@ def _service_proxy_post(
     path: str,
     payload: dict[str, object],
 ):
-    return client.kubectl(
-        "create",
-        "--raw",
+    return client.request_json(
+        "POST",
         f"{ADMIN_SERVICE_PROXY}/{path.lstrip('/')}",
-        "-f",
-        "-",
-        input_text=json.dumps(payload),
-        check=False,
+        payload,
     )
 
 
@@ -455,14 +451,10 @@ def _service_proxy_delete(
     path: str,
     payload: dict[str, object],
 ):
-    return client.kubectl(
-        "delete",
-        "--raw",
+    return client.request_json(
+        "DELETE",
         f"{ADMIN_SERVICE_PROXY}/{path.lstrip('/')}",
-        "-f",
-        "-",
-        input_text=json.dumps(payload),
-        check=False,
+        payload,
     )
 
 

@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+import base64
 import json
+import ssl
+import subprocess
+import tempfile
 import time
+import urllib.error
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 from typing import TypeVar
@@ -77,3 +83,80 @@ class ManagementClient:
 
     def json(self, *arguments: str) -> object:
         return json.loads(self.kubectl(*arguments, "-o", "json").stdout)
+
+    def request_json(
+        self,
+        method: str,
+        path: str,
+        payload: dict[str, object],
+    ) -> subprocess.CompletedProcess[str]:
+        config_response = self.kubectl(
+            "config", "view", "--raw", "--minify", "-o", "json",
+            check=False,
+        )
+        if config_response.returncode != 0:
+            return config_response
+        try:
+            config = json.loads(config_response.stdout)
+            cluster = config["clusters"][0]["cluster"]
+            user = config["users"][0]["user"]
+            server = cluster["server"].rstrip("/")
+        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
+            return subprocess.CompletedProcess(
+                ["kubernetes-json-request"],
+                1,
+                "",
+                f"management kubeconfig is invalid: {exc}",
+            )
+        headers = {"Content-Type": "application/json"}
+        token = user.get("token")
+        if isinstance(token, str) and token:
+            headers["Authorization"] = f"Bearer {token}"
+        request = urllib.request.Request(
+            f"{server}/{path.lstrip('/')}",
+            data=json.dumps(payload, separators=(",", ":")).encode(),
+            headers=headers,
+            method=method,
+        )
+        try:
+            with tempfile.TemporaryDirectory() as directory:
+                context = ssl.create_default_context()
+                ca_data = cluster.get("certificate-authority-data")
+                if isinstance(ca_data, str) and ca_data:
+                    context.load_verify_locations(
+                        cadata=base64.b64decode(ca_data).decode()
+                    )
+                cert_data = user.get("client-certificate-data")
+                key_data = user.get("client-key-data")
+                if isinstance(cert_data, str) and isinstance(key_data, str):
+                    cert = Path(directory) / "client.crt"
+                    key = Path(directory) / "client.key"
+                    cert.write_bytes(base64.b64decode(cert_data))
+                    key.write_bytes(base64.b64decode(key_data))
+                    key.chmod(0o600)
+                    context.load_cert_chain(cert, key)
+                opener = urllib.request.build_opener(
+                    urllib.request.ProxyHandler({}),
+                    urllib.request.HTTPSHandler(context=context),
+                )
+                with opener.open(request, timeout=self.timeout) as response:
+                    return subprocess.CompletedProcess(
+                        ["kubernetes-json-request"],
+                        0,
+                        response.read().decode(),
+                        "",
+                    )
+        except urllib.error.HTTPError as exc:
+            return subprocess.CompletedProcess(
+                ["kubernetes-json-request"],
+                1,
+                exc.read().decode(),
+                f"HTTP {exc.code}: {exc.reason}",
+            )
+        except (OSError, ValueError, urllib.error.URLError) as exc:
+            return subprocess.CompletedProcess(
+                ["kubernetes-json-request"],
+                1,
+                "",
+                f"Kubernetes JSON request failed: {exc}",
+            )
