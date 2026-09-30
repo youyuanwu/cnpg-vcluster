@@ -777,20 +777,21 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
             encoding="utf-8"
         )
     )
-    resources = []
+    resources = {}
     for entry in catalog:
         group = entry["apiVersion"].partition("/")[0] if "/" in entry["apiVersion"] else ""
-        resources.append(f"{entry['plural']}.{group}" if group else entry["plural"])
-    resources.append("leases.coordination.k8s.io")
+        resource = f"{entry['plural']}.{group}" if group else entry["plural"]
+        resources[resource] = (entry["inventoryPolicy"], entry["class"])
+    resources["leases.coordination.k8s.io"] = ("allocation-markers", "typed")
     items = []
-    for resource in sorted(set(resources)):
+    for resource, policy in sorted(resources.items()):
         payload = json.loads(
             _kubectl(root, "get", resource, "--all-namespaces", "-o", "json").stdout
         )
-        items.extend(payload.get("items", []))
+        items.extend((item, *policy) for item in payload.get("items", []))
     owned_uids = set()
     owned_namespaces = set()
-    for item in items:
+    for item, policy, resource_class in items:
         metadata = item.get("metadata", {})
         annotations = metadata.get("annotations") or {}
         labels = metadata.get("labels") or {}
@@ -799,6 +800,7 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
             or annotations.get("lifecycle.cnpg-vcluster.capi/tenant")
             or labels.get("cnpg-vcluster-tenant")
             or str(metadata.get("name", "")).startswith("tenant-azure-slot-")
+            or (policy == "block-any-instance" and resource_class == "root")
         ):
             if metadata.get("uid"):
                 owned_uids.add(metadata["uid"])
@@ -809,7 +811,7 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
     changed = True
     while changed:
         changed = False
-        for item in items:
+        for item, _, _ in items:
             metadata = item.get("metadata", {})
             if metadata.get("uid") in owned_uids:
                 continue
@@ -822,7 +824,7 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
                 changed = True
     residue = [
         f"{item.get('kind', 'resource')}/{item.get('metadata', {}).get('name', '')}"
-        for item in items
+        for item, _, _ in items
         if item.get("metadata", {}).get("uid") in owned_uids
     ]
     return tenants, residue

@@ -39,27 +39,24 @@ pub use crate::azure::CONFIG_NAME;
 pub struct AzureProvider<A = LiveTenantAccess> {
     pub client: Client,
     pub configuration: AzureConfiguration,
-    pub allocation: AzureAllocationCatalog,
+    pub allocation: Option<AzureAllocationCatalog>,
     pub access: A,
 }
-enum AllocationStep {
-    Ready(crate::api::AzureAllocationStatus),
-    Stored,
-    Exhausted,
-}
+#[rustfmt::skip]
+enum AllocationStep { Ready(crate::api::AzureAllocationStatus), Stored, Exhausted }
 
 impl AzureProvider {
     pub fn from_config_maps(
         client: Client,
         config: &ConfigMap,
-        allocation: &ConfigMap,
+        allocation: Option<&ConfigMap>,
     ) -> Result<Self, ControllerError> {
         Ok(Self {
             client,
             configuration: AzureConfiguration::from_config_map(config)
                 .map_err(|error| ControllerError::Configuration(error.to_string()))?,
-            allocation: AzureAllocationCatalog::from_config_map(allocation)
-                .map_err(|error| ControllerError::Configuration(error.to_string()))?,
+            allocation: allocation
+                .and_then(|config| AzureAllocationCatalog::from_config_map(config).ok()),
             access: LiveTenantAccess,
         })
     }
@@ -409,7 +406,8 @@ impl<A: TenantAccess> AzureProvider<A> {
         self.require_current_allocation().await?;
         let allocation = match azure_allocation::recover(self.client.clone(), identity).await.map_err(allocation_error)? {
             Some(allocation) => allocation,
-            None => match azure_allocation::claim(self.client.clone(), &self.allocation, identity).await {
+            None => match azure_allocation::claim(self.client.clone(),
+                self.allocation.as_ref().ok_or_else(|| catalog_block("new allocations"))?, identity).await {
                 Ok(allocation) => allocation, Err(AllocationError::Exhausted) => return Ok(AllocationStep::Exhausted),
                 Err(error) => return Err(allocation_error(error)),
             },
@@ -532,7 +530,7 @@ impl<A: TenantAccess> AzureProvider<A> {
         let actual = AzureAllocationCatalog::from_config_map(&live).map_err(|error| {
             ReconcileError::MutationGuard(format!("{FOUNDATION_NAMESPACE}/{} is invalid: {error}", azure_allocation::CONFIG_NAME))
         })?;
-        if actual != self.allocation {
+        if self.allocation.as_ref() != Some(&actual) {
             return Err(ReconcileError::MutationGuard(format!("{FOUNDATION_NAMESPACE}/{} differs from the startup configuration", azure_allocation::CONFIG_NAME)));
         }
         Ok(())

@@ -199,12 +199,12 @@ async fn run(config: ManagerConfig) -> Result<(), ControllerError> {
                     .await?;
             let allocation_config =
                 Api::<ConfigMap>::namespaced(client.clone(), FOUNDATION_NAMESPACE)
-                    .get(AZURE_ALLOCATION_CONFIG_NAME)
+                    .get_opt(AZURE_ALLOCATION_CONFIG_NAME)
                     .await?;
             let provider = AzureProvider::from_config_maps(
                 client.clone(),
                 &provider_config,
-                &allocation_config,
+                allocation_config.as_ref(),
             )?;
             let configured_version = provider
                 .configuration

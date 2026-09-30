@@ -27,6 +27,7 @@ struct Fixture {
     workload: Server,
     configuration: AzureConfiguration,
     allocation: AzureAllocationCatalog,
+    provider_allocation: Option<AzureAllocationCatalog>,
 }
 
 impl Fixture {
@@ -73,6 +74,7 @@ impl Fixture {
             management,
             workload,
             configuration,
+            provider_allocation: Some(allocation.clone()),
             allocation,
         }
     }
@@ -97,7 +99,7 @@ impl Fixture {
             AzureProvider {
                 client,
                 configuration: self.configuration.clone(),
-                allocation: self.allocation.clone(),
+                allocation: self.provider_allocation.clone(),
                 access: FakeAccess(self.workload.client()),
             },
         );
@@ -567,6 +569,8 @@ async fn released_azure_slot_retry_never_touches_successor_claim() {
     let mut rotated = fixture.allocation.clone();
     rotated.config_map_uid = "catalog-rotated".into();
     rotated.sha256 = "c".repeat(64);
+    rotated.values.slots[0].pod_cidr = "10.75.0.0/16".into();
+    rotated.values.slots[0].service_cidr = "10.145.0.0/16".into();
     let second_status = azure_allocation::claim(fixture.management.client(), &rotated, second)
         .await
         .unwrap();
@@ -700,6 +704,24 @@ async fn invalid_current_catalog_blocks_ready_tenant_repair() {
     assert!(!fixture.management.calls().iter().any(|call| {
         call.method == "POST" && call.path == "/apis/batch/v1/namespaces/tenant-a/jobs"
     }));
+}
+
+#[tokio::test]
+async fn restart_without_catalog_can_begin_recorded_tenant_finalization() {
+    let mut fixture = Fixture::new();
+    fixture.until_ready().await;
+    fixture.provider_allocation = None;
+    fixture.management.remove(ALLOCATION_CONFIG_PATH);
+    fixture.mark_deleting();
+    fixture.step().await;
+    assert_eq!(
+        fixture
+            .current()
+            .status
+            .as_ref()
+            .and_then(|status| status.phase),
+        Some(TenantPhase::Deleting)
+    );
 }
 
 #[tokio::test]

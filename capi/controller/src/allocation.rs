@@ -342,11 +342,11 @@ fn validate_successor(context: &ClaimContext<'_>, lease: &Lease, leases: &[Lease
     };
     valid_identity(&successor)?; validate_claim(&successor, allocation, lease)?;
     if leases.iter().filter(|lease| annotation(lease, TENANT_UID_ANNOTATION)
-        .is_ok_and(|uid| uid == successor.tenant_uid)).count() != 1 {
-        return Err(AllocationError::Duplicate);
-    }
+        .is_ok_and(|uid| uid == successor.tenant_uid)).count() != 1 { return Err(AllocationError::Duplicate); }
     Ok(())
 }
+#[rustfmt::skip]
+fn successor_allocation(context: &ClaimContext<'_>, lease: &Lease, bound: &AllocationStatus) -> Result<AllocationStatus, AllocationError> { if context.ownership_label == AZURE_CATALOG_UID_LABEL { annotated_allocation(lease) } else { Ok(bound.clone()) } }
 
 fn matching_claim<'a, 'b>(
     context: &'b ClaimContext<'_>,
@@ -477,7 +477,8 @@ pub fn decide_release(
                 && all_old_residue_absent
                 && existing.is_none()
             {
-                validate_successor(context, lease, leases, bound)?;
+                let successor = successor_allocation(context, lease, bound)?;
+                validate_successor(context, lease, leases, &successor)?;
                 return Ok(ReleaseDecision::Complete);
             }
             let verified = validate_claim(context, bound, lease)?;

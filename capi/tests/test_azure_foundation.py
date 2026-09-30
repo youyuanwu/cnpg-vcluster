@@ -29,6 +29,7 @@ from scripts.lib.azure.foundation import (
     _azure_provider_configuration,
     _azure_allocation_configuration,
     _azure_cutover_lock,
+    _azure_cutover_inventory,
     _prepare_azure_tenant_api_cutover,
     _verify_azure_controller_allocation_readiness,
     _verify_azure_cutover_probe,
@@ -184,6 +185,37 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 for arguments in calls
             )
         )
+
+    def test_azure_cutover_inventory_blocks_unmarked_provider_root(self):
+        root = self.make_root()
+        catalog = root / "controller" / "config"
+        catalog.mkdir(parents=True)
+        (catalog / "azure-management-resources.json").write_text(
+            (ROOT / "controller" / "config" / "azure-management-resources.json")
+            .read_text(encoding="utf-8"),
+            encoding="utf-8",
+        )
+
+        def kubectl(_root, *arguments, **_kwargs):
+            if arguments[:2] == ("get", "tenants"):
+                return completed(json.dumps({"items": []}))
+            items = []
+            if arguments[:2] == (
+                "get",
+                "azureclusters.infrastructure.cluster.x-k8s.io",
+            ):
+                items = [{
+                    "apiVersion": "infrastructure.cluster.x-k8s.io/v1beta1",
+                    "kind": "AzureCluster",
+                    "metadata": {"name": "foreign", "namespace": "foreign", "uid": "uid"},
+                }]
+            return completed(json.dumps({"items": items}))
+
+        with patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl):
+            tenants, residue = _azure_cutover_inventory(root)
+        self.assertEqual(tenants, {"items": []})
+        self.assertEqual(residue, ["AzureCluster/foreign"])
+
     def test_existing_complete_capi_stack_skips_clusterctl_init(self) -> None:
         root = self.make_root()
         config = load_azure_configuration(root)
