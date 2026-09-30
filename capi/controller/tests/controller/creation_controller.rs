@@ -1413,7 +1413,9 @@ async fn unbound_gate_entry_waits_for_drain_deadline_and_two_absence_observation
     assert_eq!(entries["1234-5678"]["absenceChecks"], 2);
     fixture.step().await;
     let gate = fixture.management.get(&gate_path);
-    assert_eq!(gate["data"]["reservations"], "{}");
+    let entries: serde_json::Value =
+        serde_json::from_str(gate["data"]["reservations"].as_str().unwrap()).unwrap();
+    assert_eq!(entries["1234-5678"]["absenceChecks"], 2);
     assert!(
         fixture
             .management
@@ -1422,6 +1424,10 @@ async fn unbound_gate_entry_waits_for_drain_deadline_and_two_absence_observation
             .unwrap()
             .objects
             .contains_key("/api/v1/namespaces/tenant-db-tenant-a")
+    );
+    assert_eq!(
+        fixture.current().status.unwrap().phase,
+        Some(TenantPhase::OwnershipInvalid)
     );
 }
 

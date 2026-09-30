@@ -57,6 +57,8 @@ pub enum GateError {
     Identity,
     #[error("Tenant database gate is closed")]
     Closed,
+    #[error("TenantDatabase admission outcome remains unknown after the drain deadline")]
+    UnknownRequest,
     #[error(transparent)]
     Api(#[from] kube::Error),
 }
@@ -679,7 +681,8 @@ pub async fn finalize(
             }
             let item = next.get_mut(&request_uid).ok_or(GateError::Invalid)?;
             if unbound_entry_drained(item, now) {
-                next.remove(&request_uid);
+                // A timed-out API handler may still persist the admitted CREATE.
+                return Err(GateError::UnknownRequest);
             } else if now
                 .signed_duration_since(
                     chrono::DateTime::parse_from_rfc3339(&item.created_at)

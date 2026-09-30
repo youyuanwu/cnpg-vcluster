@@ -626,13 +626,7 @@ pub fn validate_gate_update(
                 })
                 || new_entries.keys().any(|uid| !old_entries.contains_key(uid))
                 || (old_state == "open" && old_entries != new_entries)
-                || old_entries.iter().any(|(uid, entry)| {
-                    !new_entries.contains_key(uid)
-                        && !tenant_database_runtime::unbound_entry_drained(
-                            entry,
-                            chrono::Utc::now(),
-                        )
-                })
+                || old_entries.keys().any(|uid| !new_entries.contains_key(uid))
             {
                 return Err(AdmissionError::Gate);
             }
@@ -1288,6 +1282,21 @@ mod tests {
         assert_eq!(validate_gate_update(&bound, &drained, controller), Ok(()));
         assert_eq!(
             validate_gate_update(&bound, &drained, tenant),
+            Err(AdmissionError::Gate)
+        );
+        let mut expired = closed.clone();
+        let mut unbound_entries = gate_entries(&expired).unwrap();
+        let entry = unbound_entries.get_mut("1234-5678").unwrap();
+        entry.created_at = (chrono::Utc::now() - chrono::Duration::seconds(130)).to_rfc3339();
+        entry.first_absent_at =
+            Some((chrono::Utc::now() - chrono::Duration::seconds(3)).to_rfc3339());
+        entry.absence_checks = 2;
+        expired.data.as_mut().unwrap().insert(
+            GATE_ENTRIES.into(),
+            serde_json::to_string(&unbound_entries).unwrap(),
+        );
+        assert_eq!(
+            validate_gate_update(&expired, &drained, tenant),
             Err(AdmissionError::Gate)
         );
     }
