@@ -937,9 +937,6 @@ mod tests {
         assert_eq!(calls.tenant_deletes.load(Ordering::Relaxed), 0);
 
         let delete = Request::delete("/api/v1/tenants/tenant-a")
-            .header("origin", "http://127.0.0.1:8080")
-            .header("host", "127.0.0.1:8080")
-            .header(TENANT_ADMIN_UNSAFE_REQUEST_HEADER, "1")
             .body(Body::from(
                 r#"{"uid":"tenant-uid","confirmation":"tenant-a"}"#,
             ))

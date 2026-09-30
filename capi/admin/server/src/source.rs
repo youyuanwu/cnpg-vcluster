@@ -221,10 +221,11 @@ impl KubeDataSource {
         };
         let replicas = spec.replicas.unwrap_or(1);
         let status = deployment.status.as_ref();
+        let generation = deployment.metadata.generation;
         if replicas < 1
+            || generation.is_none()
             || deployment.metadata.deletion_timestamp.is_some()
-            || deployment.metadata.generation
-                != status.and_then(|status| status.observed_generation)
+            || generation != status.and_then(|status| status.observed_generation)
             || status.and_then(|status| status.updated_replicas) != Some(replicas)
             || status.and_then(|status| status.ready_replicas) != Some(replicas)
             || status.and_then(|status| status.available_replicas) != Some(replicas)
@@ -242,18 +243,20 @@ impl KubeDataSource {
             return CreationCapability::unavailable("Tenant controller capability is malformed");
         };
         let args = manager.args.as_deref().unwrap_or_default();
+        let Some((configured_provider, configured_version)) = controller_arguments(args) else {
+            return CreationCapability::unavailable("Tenant controller arguments are malformed");
+        };
         let expected_provider = match provider {
             ProviderMode::Local => "local",
             ProviderMode::Azure => "azure",
         };
-        if exact_argument(args, "--provider") != Some(expected_provider) {
+        if configured_provider != expected_provider {
             return CreationCapability::unavailable(
                 "Tenant controller provider does not match Tenant Admin",
             );
         }
-        let Some(version) = exact_argument(args, "--supported-kubernetes-version")
-            .map(|value| value.trim_start_matches('v'))
-            .filter(|value| valid_version(value))
+        let Some(version) =
+            Some(configured_version.trim_start_matches('v')).filter(|value| valid_version(value))
         else {
             return CreationCapability::unavailable(
                 "Tenant controller supported version is unavailable",
@@ -1349,13 +1352,41 @@ fn bounded(value: &str, max: usize) -> String {
         .collect()
 }
 
-fn exact_argument<'a>(arguments: &'a [String], name: &str) -> Option<&'a str> {
-    let prefix = format!("{name}=");
-    let mut values = arguments
-        .iter()
-        .filter_map(|argument| argument.strip_prefix(&prefix));
-    let value = values.next()?;
-    values.next().is_none().then_some(value)
+fn controller_arguments(arguments: &[String]) -> Option<(&str, &str)> {
+    let mut provider = None;
+    let mut version = None;
+    let mut index = 0;
+    while index < arguments.len() {
+        let argument = arguments.get(index)?;
+        if argument == "--probe-in-cluster" {
+            index += 1;
+            continue;
+        }
+        let (flag, value) = match argument.split_once('=') {
+            Some((flag, value)) => (flag, value),
+            None => {
+                index += 1;
+                (argument.as_str(), arguments.get(index)?.as_str())
+            }
+        };
+        match flag {
+            "--provider" => provider = Some(value),
+            "--supported-kubernetes-version" => version = Some(value),
+            "--leader-elect"
+            | "--health-probe-bind-address"
+            | "--leader-election-id"
+            | "--leader-election-namespace"
+            | "--leader-election-identity"
+            | "--leader-lease-duration-seconds"
+            | "--leader-renew-grace-seconds"
+            | "--controller-image"
+            | "--activation-token"
+            | "--metrics-bind-address" => {}
+            _ => return None,
+        }
+        index += 1;
+    }
+    Some((provider?, version?))
 }
 
 fn valid_version(value: &str) -> bool {
@@ -1519,6 +1550,7 @@ mod tests {
     };
 
     use axum::http::{Method, Request, Response};
+    use http_body_util::BodyExt;
     use kube::client::Body;
     use serde_json::{Value, json};
     use tenant_controller::{
@@ -2771,6 +2803,66 @@ mod tests {
                 .unwrap()
                 .available
         );
+
+        let mixed = json!({
+            "apiVersion":"apps/v1","kind":"Deployment",
+            "metadata":{"name":"tenant-controller","namespace":"tenant-system","generation":5},
+            "spec":{"replicas":1,"template":{"spec":{"containers":[{
+                "name":"manager","image":"controller",
+                "args":[
+                    "--provider=azure","--provider","local",
+                    "--supported-kubernetes-version=1.35.0",
+                    "--supported-kubernetes-version","v1.36.4"
+                ]
+            }]}}},
+            "status":{"observedGeneration":5,"updatedReplicas":1,"readyReplicas":1,"availableReplicas":1}
+        });
+        let (client, _) = fixture_client(vec![(200, mixed.clone())]);
+        let capability = KubeDataSource::new(client)
+            .creation_capability(ProviderMode::Local)
+            .await
+            .unwrap();
+        assert!(capability.available);
+        assert_eq!(
+            capability.supported_kubernetes_version.as_deref(),
+            Some("1.36.4")
+        );
+        let (client, _) = fixture_client(vec![(200, mixed)]);
+        assert!(
+            !KubeDataSource::new(client)
+                .creation_capability(ProviderMode::Azure)
+                .await
+                .unwrap()
+                .available
+        );
+
+        let missing_generation = json!({
+            "apiVersion":"apps/v1","kind":"Deployment",
+            "metadata":{"name":"tenant-controller","namespace":"tenant-system"},
+            "spec":{"replicas":1,"template":{"spec":{"containers":[{
+                "name":"manager","args":["--provider=local","--supported-kubernetes-version=1.36.4"]
+            }]}}},
+            "status":{"updatedReplicas":1,"readyReplicas":1,"availableReplicas":1}
+        });
+        let (client, _) = fixture_client(vec![(200, missing_generation)]);
+        assert!(
+            !KubeDataSource::new(client)
+                .creation_capability(ProviderMode::Local)
+                .await
+                .unwrap()
+                .available
+        );
+        let (client, _) = fixture_client(vec![(
+            404,
+            json!({"apiVersion":"v1","kind":"Status","reason":"NotFound","code":404}),
+        )]);
+        assert!(
+            !KubeDataSource::new(client)
+                .creation_capability(ProviderMode::Local)
+                .await
+                .unwrap()
+                .available
+        );
     }
 
     #[tokio::test]
@@ -2823,5 +2915,75 @@ mod tests {
                 )
             ]
         );
+
+        let (client, calls) = fixture_client(vec![(
+            404,
+            json!({"apiVersion":"v1","kind":"Status","reason":"NotFound","code":404}),
+        )]);
+        let response = KubeDataSource::new(client)
+            .delete_tenant("tenant-a", "tenant-uid")
+            .await
+            .unwrap();
+        assert_eq!(response.state, TenantDeleteState::Completed);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        let mut deleting = tenant;
+        deleting.metadata.deletion_timestamp =
+            Some(serde_json::from_value(json!("2026-09-30T00:00:00Z")).unwrap());
+        let (client, calls) = fixture_client(vec![(200, serde_json::to_value(deleting).unwrap())]);
+        let response = KubeDataSource::new(client)
+            .delete_tenant("tenant-a", "tenant-uid")
+            .await
+            .unwrap();
+        assert_eq!(response.state, TenantDeleteState::Accepted);
+        assert_eq!(calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn tenant_delete_sends_uid_and_resource_version_preconditions() {
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+        tenant.metadata.uid = Some("tenant-uid".into());
+        tenant.metadata.resource_version = Some("17".into());
+        tenant.metadata.generation = Some(2);
+        let tenant = serde_json::to_vec(&tenant).unwrap();
+        let captured = Arc::new(Mutex::new(None));
+        let captured_body = captured.clone();
+        let client = Client::new(
+            service_fn(move |request: Request<Body>| {
+                let tenant = tenant.clone();
+                let captured = captured_body.clone();
+                async move {
+                    let (status, body) = if request.method() == Method::DELETE {
+                        let bytes = request.into_body().collect().await.unwrap().to_bytes();
+                        *captured.lock().unwrap() =
+                            Some(serde_json::from_slice::<Value>(&bytes).unwrap());
+                        (
+                            200,
+                            serde_json::to_vec(&json!({
+                                "apiVersion":"v1","kind":"Status","status":"Success","code":200
+                            }))
+                            .unwrap(),
+                        )
+                    } else {
+                        (200, tenant)
+                    };
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(status)
+                            .header("content-type", "application/json")
+                            .body(Body::from(body))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        );
+        KubeDataSource::new(client)
+            .delete_tenant("tenant-a", "tenant-uid")
+            .await
+            .unwrap();
+        let body = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(body["preconditions"]["uid"], "tenant-uid");
+        assert_eq!(body["preconditions"]["resourceVersion"], "17");
     }
 }
