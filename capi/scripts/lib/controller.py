@@ -32,6 +32,7 @@ CONTROLLER_NAMESPACE = "tenant-system"
 CONTROLLER_DEPLOYMENT = "tenant-controller"
 TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
 TENANT_CUTOVER_POLICY = "tenant-api-cutover-create-lock"
+TENANT_API_CUTOVER_READY = False
 STATIC_MANAGER_FLAGS = ("-C", "target-feature=+crt-static")
 
 
@@ -93,6 +94,41 @@ def require_empty_tenant_cutover(
         raise RuntimeError(
             "provider residue blocks Tenant API cutover: "
             + ", ".join(sorted(provider_residue))
+        )
+
+
+def tenant_api_generation(crd: object) -> str:
+    if not isinstance(crd, dict):
+        raise RuntimeError("Tenant CRD inventory is invalid")
+    versions = crd.get("spec", {}).get("versions")
+    stored = crd.get("status", {}).get("storedVersions")
+    if not isinstance(versions, list) or len(versions) != 1:
+        raise RuntimeError("Tenant CRD version inventory is invalid")
+    version = versions[0]
+    name = version.get("name") if isinstance(version, dict) else None
+    if (
+        name not in {"v1alpha2", "v1alpha3"}
+        or version.get("served") is not True
+        or version.get("storage") is not True
+        or stored != [name]
+    ):
+        raise RuntimeError("Tenant CRD generation is inconsistent")
+    return name
+
+
+def require_tenant_cutover_double_check(
+    first_tenants: object,
+    second_tenants: object,
+    provider_residue: list[str],
+) -> None:
+    require_empty_tenant_cutover(first_tenants, provider_residue)
+    require_empty_tenant_cutover(second_tenants, provider_residue)
+
+
+def require_tenant_api_cutover_ready() -> None:
+    if not TENANT_API_CUTOVER_READY:
+        raise RuntimeError(
+            "Tenant API v1alpha3 activation is blocked until the Azure allocation lifecycle is complete"
         )
 
 
@@ -515,13 +551,13 @@ def verify_controller_crd(client: ManagementClient) -> None:
     crd = client.json("get", f"crd/{TENANT_CRD}")
     versions = crd["spec"].get("versions", [])
     if (
-        len(versions) != 1 or versions[0].get("name") != "v1alpha2"
+        len(versions) != 1 or versions[0].get("name") != "v1alpha3"
         or versions[0].get("served") is not True or versions[0].get("storage") is not True
-        or crd.get("status", {}).get("storedVersions") != ["v1alpha2"]
+        or crd.get("status", {}).get("storedVersions") != ["v1alpha3"]
         or "status" not in versions[0].get("subresources", {})
         or crd["spec"].get("conversion", {}).get("strategy", "None") != "None"
     ):
-        raise RuntimeError("Tenant CRD must serve and store only v1alpha2 with a status subresource")
+        raise RuntimeError("Tenant CRD must serve and store only v1alpha3 with a status subresource")
 
 
 def verify_controller_api(config: dict[str, str], client: ManagementClient) -> None:
@@ -584,39 +620,17 @@ def verify_controller_api(config: dict[str, str], client: ManagementClient) -> N
     azure_spec = {
         "kubernetesVersion": probe["spec"]["kubernetesVersion"],
         "workers": 3,
-        "provider": {
-            "type": "azure",
-            "podCIDR": "10.244.0.0/16",
-            "serviceCIDR": "10.96.0.0/16",
-        },
+        "provider": {"type": "azure"},
     }
     create_dry({**probe, "spec": azure_spec}, expected_spec=azure_spec)
     for invalid_provider in (
+        {"type": "azure", "databases": 1},
+        {"type": "azure", "podCIDR": "10.244.0.0/16"},
         {"type": "azure", "serviceCIDR": "10.96.0.0/16"},
-        {
-            "type": "azure",
-            "podCIDR": "10.244.0.1/16",
-            "serviceCIDR": "10.96.0.0/16",
-        },
-        {
-            "type": "azure",
-            "podCIDR": "2001:db8::/64",
-            "serviceCIDR": "10.96.0.0/16",
-        },
-        {
-            "type": "azure",
-            "podCIDR": "10.244.0.0/16",
-            "serviceCIDR": "10.244.128.0/17",
-        },
-        {
-            "type": "azure",
-            "podCIDR": "10.244.0.0/16",
-            "serviceCIDR": "10.96.0.0/29",
-        },
     ):
         create_dry(
             {**probe, "spec": {**azure_spec, "provider": invalid_provider}},
-            rejected="CIDR",
+            rejected="unknown field",
         )
 
     response = client.kubectl(
@@ -700,6 +714,7 @@ def reconcile_controller(
     verified_cache: VerifiedCache,
     registry: dict[str, object] | None,
 ) -> None:
+    require_tenant_api_cutover_ready()
     image = build_controller_image(root, config)
     foundation = _foundation_payload(
         root, config, network, image, verified_cache, registry,

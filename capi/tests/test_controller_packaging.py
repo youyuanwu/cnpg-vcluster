@@ -70,6 +70,27 @@ class PackagingTests(unittest.TestCase):
             )
         with self.assertRaisesRegex(RuntimeError, "inventory is invalid"):
             packaging.require_empty_tenant_cutover({}, [])
+        packaging.require_tenant_cutover_double_check(
+            {"items": []}, {"items": []}, []
+        )
+        with self.assertRaisesRegex(RuntimeError, "retained Tenants"):
+            packaging.require_tenant_cutover_double_check(
+                {"items": []}, {"items": [{}]}, []
+            )
+
+    def test_cutover_generation_detection_and_phase_one_activation_block(self):
+        for version in ("v1alpha2", "v1alpha3"):
+            crd = {
+                "spec": {
+                    "versions": [
+                        {"name": version, "served": True, "storage": True}
+                    ]
+                },
+                "status": {"storedVersions": [version]},
+            }
+            self.assertEqual(packaging.tenant_api_generation(crd), version)
+        with self.assertRaisesRegex(RuntimeError, "activation is blocked"):
+            packaging.require_tenant_api_cutover_ready()
 
     def setUp(self):
         (ROOT / ".runtime").mkdir(exist_ok=True)
@@ -347,6 +368,11 @@ class PackagingTests(unittest.TestCase):
 
 
 class CurrentControllerPackagingTests(unittest.TestCase):
+    def setUp(self):
+        cutover = patch.object(packaging, "TENANT_API_CUTOVER_READY", True)
+        cutover.start()
+        self.addCleanup(cutover.stop)
+
     @staticmethod
     def foundation(image="rust:image"):
         raw = {"schema": 3, "controllerImage": image}
@@ -363,13 +389,13 @@ class CurrentControllerPackagingTests(unittest.TestCase):
     def test_crd_requires_exact_served_and_stored_version_and_status(self):
         valid = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True, "subresources": {"status": {}},
+                "name": "v1alpha3", "served": True, "storage": True, "subresources": {"status": {}},
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         packaging.verify_controller_crd(Client(lambda *_a, **_k: response(valid)))
         for change in (
-            lambda crd: crd["status"].update(storedVersions=["v1alpha1", "v1alpha2"]),
+            lambda crd: crd["status"].update(storedVersions=["v1alpha2", "v1alpha3"]),
             lambda crd: crd["status"].update(storedVersions=[]),
             lambda crd: crd["spec"]["versions"].append({"name": "v1alpha1"}),
             lambda crd: crd["spec"]["versions"][0].update(served=False),
@@ -378,7 +404,7 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         ):
             invalid = copy.deepcopy(valid)
             change(invalid)
-            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "only v1alpha2"):
+            with self.subTest(change=change), self.assertRaisesRegex(RuntimeError, "only v1alpha3"):
                 packaging.verify_controller_crd(Client(lambda *_a, **_k: response(invalid)))
 
     def test_pre_acceptance_failure_restores_previous_controller(self):
@@ -664,12 +690,8 @@ class CurrentControllerPackagingTests(unittest.TestCase):
                 if incoming["kubernetesVersion"] == "bad":
                     return response(code=1, error="Invalid kubernetesVersion")
                 if provider["type"] == "azure":
-                    if provider != {
-                        "type": "azure",
-                        "podCIDR": "10.244.0.0/16",
-                        "serviceCIDR": "10.96.0.0/16",
-                    }:
-                        return response(code=1, error="Invalid CIDR")
+                    if provider != {"type": "azure"}:
+                        return response(code=1, error="unknown field")
                     return response({**value, "spec": incoming})
                 if "unexpected" in incoming and "--validate=strict" in args:
                     return response(code=1, error="unknown field")
@@ -696,20 +718,11 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             and "--dry-run=server" in args
             and json.loads(kwargs["input_text"])["spec"]["provider"]["type"] == "azure"
         ]
-        self.assertEqual(len(azure_dry_runs), 6)
-        self.assertIn(
-            {
-                "type": "azure",
-                "podCIDR": "10.244.0.0/16",
-                "serviceCIDR": "10.96.0.0/16",
-            },
-            azure_dry_runs,
-        )
-        self.assertTrue(any("podCIDR" not in provider for provider in azure_dry_runs))
-        self.assertTrue(any(provider.get("podCIDR") == "10.244.0.1/16" for provider in azure_dry_runs))
-        self.assertTrue(any(provider.get("podCIDR") == "2001:db8::/64" for provider in azure_dry_runs))
-        self.assertTrue(any(provider.get("serviceCIDR") == "10.244.128.0/17" for provider in azure_dry_runs))
-        self.assertTrue(any(provider.get("serviceCIDR") == "10.96.0.0/29" for provider in azure_dry_runs))
+        self.assertEqual(len(azure_dry_runs), 4)
+        self.assertIn({"type": "azure"}, azure_dry_runs)
+        self.assertTrue(any("databases" in provider for provider in azure_dry_runs))
+        self.assertTrue(any("podCIDR" in provider for provider in azure_dry_runs))
+        self.assertTrue(any("serviceCIDR" in provider for provider in azure_dry_runs))
         patches = [args for args, _ in client.calls if "patch" in args]
         self.assertEqual(len(patches), 5)
         self.assertTrue(all("--dry-run=server" in args for args in patches))

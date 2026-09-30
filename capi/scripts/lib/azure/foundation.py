@@ -18,6 +18,7 @@ from scripts.lib.admin import (
 )
 from scripts.lib.controller import (
     build_azure_controller_image,
+    require_tenant_api_cutover_ready,
     render_azure_controller_manager,
 )
 
@@ -732,6 +733,7 @@ def _install_tenant_controller(
     config: Mapping[str, str],
     inventory: Mapping[str, object],
 ) -> tuple[str, str, str]:
+    require_tenant_api_cutover_ready()
     image = _push_controller_image(root, config, inventory)
     for path in (
         root / "controller" / "config" / "namespace" / "namespace.yaml",
