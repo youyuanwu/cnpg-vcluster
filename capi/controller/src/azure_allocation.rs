@@ -21,7 +21,7 @@ const PLACEHOLDER_ENDPOINT: &str = "0.0.0.0";
 #[rustfmt::skip]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct AzureAllocationDocument { pub schema: u8, pub reserved_cidrs: Vec<String>, pub slots: Vec<AzureNetworkSlot> }
+pub struct AzureAllocationDocument { pub schema: u8, #[serde(rename = "reservedCIDRs")] pub reserved_cidrs: Vec<String>, pub slots: Vec<AzureNetworkSlot> }
 
 #[rustfmt::skip]
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -256,6 +256,12 @@ mod tests {
     #[test]
     fn validates_all_pairs_and_management_ranges() {
         let values = document();
+        assert!(
+            serde_json::to_value(&values)
+                .unwrap()
+                .get("reservedCIDRs")
+                .is_some()
+        );
         values.validate().unwrap();
         let mut overlap = values.clone();
         overlap.slots[1].pod_cidr = "10.142.128.0/17".into();
