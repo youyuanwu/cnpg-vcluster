@@ -35,6 +35,7 @@ from scripts.lib.azure.foundation import (
     _verify_azure_controller_allocation_readiness,
     _verify_azure_cutover_probe,
     _foundation_identity,
+    _database_identity_blockers,
     _inspect_admin,
     _install_capi_capz,
     _install_admin,
@@ -43,6 +44,7 @@ from scripts.lib.azure.foundation import (
     _push_controller_image,
     create_management,
     create_foundation,
+    destroy,
     load_inventory,
     preflight,
 )
@@ -62,6 +64,130 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
+    def database_azure(self, outputs, *, change=None):
+        resources = {
+            "identity": {
+                "id": outputs["databaseIdentityId"],
+                "clientId": outputs["databaseIdentityClientId"],
+                "principalId": outputs["databaseIdentityPrincipalId"],
+            },
+            "disk role": {
+                "id": outputs["databaseDiskRoleId"],
+                "properties": {
+                    "type": "CustomRole",
+                    "assignableScopes": [outputs["resourceGroupId"]],
+                    "permissions": [{
+                        "actions": [
+                            "Microsoft.Compute/disks/read",
+                            "Microsoft.Compute/disks/delete",
+                        ],
+                        "notActions": [], "dataActions": [], "notDataActions": [],
+                    }],
+                },
+            },
+            "disk assignment": {
+                "id": outputs["databaseDiskAssignmentId"],
+                "properties": {
+                    "principalId": outputs["databaseIdentityPrincipalId"],
+                    "roleDefinitionId": outputs["databaseDiskRoleId"],
+                    "principalType": "ServicePrincipal",
+                },
+            },
+            "federated credential": {
+                "id": outputs["databaseFederationId"],
+                "properties": {
+                    "issuer": outputs["aksOidcIssuer"],
+                    "subject": "system:serviceaccount:tenant-system:database-controller",
+                    "audiences": ["api://AzureADTokenExchange"],
+                },
+            },
+        }
+        assignments = [{
+            "id": outputs["databaseDiskAssignmentId"],
+            "scope": outputs["resourceGroupId"],
+            "principalId": outputs["databaseIdentityPrincipalId"],
+            "roleDefinitionId": outputs["databaseDiskRoleId"],
+        }]
+        if change is not None:
+            change(resources, assignments)
+
+        def invoke(*arguments, **_kwargs):
+            if arguments[:2] == ("identity", "show"):
+                return completed(json.dumps(resources["identity"]))
+            if arguments[:2] == ("resource", "show"):
+                selected = arguments[arguments.index("--ids") + 1]
+                for key in ("disk role", "disk assignment", "federated credential"):
+                    if selected == outputs[{
+                        "disk role": "databaseDiskRoleId",
+                        "disk assignment": "databaseDiskAssignmentId",
+                        "federated credential": "databaseFederationId",
+                    }[key]]:
+                        return completed(json.dumps(resources[key]))
+            if arguments[:3] == ("role", "assignment", "list"):
+                return completed(json.dumps(assignments))
+            raise AssertionError(arguments)
+
+        return invoke
+
+    def test_database_addon_pins_and_foundation_version_drift(self):
+        root = self.make_root()
+        defaults = root / "config" / "azure" / "defaults.env"
+        original = defaults.read_text(encoding="utf-8")
+        original_hash = _foundation_defaults_checksum(root)
+        defaults.write_text(
+            original + "AZURE_CNPG_VERSION=1.30.0\n"
+            "AZURE_DISK_CSI_VERSION=v1.32.12\n", encoding="utf-8",
+        )
+        self.assertNotEqual(original_hash, _foundation_defaults_checksum(root))
+        self.assertEqual("1.30.0", load_azure_configuration(root)["AZURE_CNPG_VERSION"])
+        defaults.write_text(
+            defaults.read_text(encoding="utf-8").replace(
+                "AZURE_DISK_CSI_VERSION=v1.32.12",
+                "AZURE_DISK_CSI_VERSION=v1.32.11",
+            ), encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ConfigError, "AZURE_DISK_CSI_VERSION"):
+            load_azure_configuration(root)
+        defaults.write_text(
+            original + "AZURE_CNPG_VERSION=1.30.0\n"
+            "AZURE_DISK_CSI_VERSION=v1.32.12\n", encoding="utf-8",
+        )
+        self.assertEqual("v1.32.12", load_azure_configuration(root)["AZURE_DISK_CSI_VERSION"])
+
+        versions = (ROOT / "config" / "versions.env").read_text(encoding="utf-8")
+        installer = (ROOT / "controller" / "src" / "azure.rs").read_text(encoding="utf-8")
+        runtime = (ROOT / "database-runtime" / "src" / "azure_runtime.rs").read_text(encoding="utf-8")
+        for digest in (
+            "668e065ff53508d58238788fd35b355a925060843629a951df0e6a9362e6d32f",
+            "07b10ce708dc988d8315df1794f3fb913f8a1dd85b3fb93c64ca7de491eb095a",
+        ):
+            self.assertIn(digest, versions)
+            self.assertIn(digest, installer)
+        self.assertIn("cloudnative-pg-v0.29.0", installer)
+        self.assertIn("charts/v1.32.12/azuredisk-csi-driver-1.32.12.tgz", installer)
+        cnpg_image = next(
+            line.split("=", 1)[1] for line in versions.splitlines()
+            if line.startswith("CNPG_CONTROLLER_IMAGE=")
+        )
+        disk_image = next(
+            line.split("=", 1)[1] for line in versions.splitlines()
+            if line.startswith("AZURE_DISK_CSI_IMAGE=")
+        )
+        for image, repository_key, tag_key in (
+            (cnpg_image, "image.repository", "image.tag"),
+            (disk_image, "image.azuredisk.repository", "image.azuredisk.tag"),
+        ):
+            repository, tag = image.split(":", 1)
+            self.assertIn(
+                f"--set-string {repository_key}={repository} "
+                f"--set-string {tag_key}={tag}",
+                installer,
+            )
+            self.assertIn(image, runtime)
+        self.assertIn("disk.csi.azure.com", runtime)
+        self.assertIn("WaitForFirstConsumer", runtime)
+        self.assertIn("Retain", runtime)
+
     def test_azure_cutover_probe_requires_allocation_and_always_deletes(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -640,6 +766,23 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             "acrPullRoleAssignmentId",
         ):
             self.assertIn(f"output {output} string", main)
+
+    def test_database_bicep_outputs_bind_dedicated_disk_only_identity(self):
+        foundation = (ROOT / "infra" / "azure" / "foundation.bicep").read_text()
+        main = (ROOT / "infra" / "azure" / "main.bicep").read_text()
+        for output in (
+            "databaseIdentityId", "databaseIdentityClientId",
+            "databaseIdentityPrincipalId", "databaseDiskRoleId",
+            "databaseDiskAssignmentId", "databaseFederationId",
+        ):
+            self.assertIn(f"output {output} string", foundation)
+            self.assertIn(f"output {output} string = foundation.outputs.{output}", main)
+        self.assertIn("subject: 'system:serviceaccount:tenant-system:database-controller'", foundation)
+        self.assertIn("'Microsoft.Compute/disks/read'", foundation)
+        self.assertIn("'Microsoft.Compute/disks/delete'", foundation)
+        self.assertIn("roleDefinitionId: databaseDiskRole.id", foundation)
+        self.assertIn("principalId: databaseIdentity.properties.principalId", foundation)
+
     def test_foundation_identity_requires_acr_role_and_controller_digest(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -728,7 +871,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 }
             raise AssertionError(selected)
 
-        def azure(role_present=True, acr_present=True):
+        def azure(role_present=True, acr_present=True, database_change=None):
+            database = self.database_azure(outputs, change=database_change)
             def invoke(*arguments, **_kwargs):
                 if arguments[:2] == ("aks", "show"):
                     return completed(json.dumps({
@@ -755,6 +899,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                         "provisioningState": "Succeeded",
                     }))
                 if arguments[:3] == ("role", "assignment", "list"):
+                    if "--assignee-object-id" in arguments and (
+                        arguments[arguments.index("--assignee-object-id") + 1]
+                        == outputs["databaseIdentityPrincipalId"]
+                    ):
+                        return database(*arguments)
                     assignments = [] if not role_present else [{
                         "id": outputs["acrPullRoleAssignmentId"],
                         "principalId": outputs["aksKubeletPrincipalId"],
@@ -766,6 +915,12 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     }]
                     return completed(json.dumps(assignments))
                 if "--ids" in arguments:
+                    if arguments[arguments.index("--ids") + 1] in (
+                        outputs["databaseDiskRoleId"],
+                        outputs["databaseDiskAssignmentId"],
+                        outputs["databaseFederationId"],
+                    ):
+                        return database(*arguments)
                     return completed(arguments[arguments.index("--ids") + 1] + "\n")
                 if arguments[:2] == ("group", "show"):
                     return completed(outputs["resourceGroupId"] + "\n")
@@ -779,6 +934,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     )
                     return completed(selected + "\n")
                 if arguments[:2] == ("identity", "show"):
+                    if arguments[arguments.index("--name") + 1] == "yy-cv-database-controller":
+                        return database(*arguments)
                     return completed(outputs["identityId"] + "\n")
                 raise AssertionError(arguments)
             return invoke
@@ -809,6 +966,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         for missing, expected in (
             ({"acr_present": False}, "container registry is absent"),
             ({"role_present": False}, "AcrPull role assignment is absent"),
+            ({
+                "database_change": lambda resources, _: resources[
+                    "federated credential"
+                ]["properties"].update(subject="wrong-service-account")
+            }, "ServiceAccount federation changed"),
         ):
             with (
                 patch("scripts.lib.azure.foundation._validate_foundation_networks"),
@@ -1925,6 +2087,117 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         self.write_inventory(root, old)
         with self.assertRaisesRegex(RuntimeError, "pre-cutover.*clean foundation redeploy"):
             load_inventory(root, config)
+
+    def test_database_outputs_are_required_and_dedicated_before_use(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        outputs = inventory["outputs"]
+        for key in (
+            "databaseIdentityId", "databaseIdentityClientId",
+            "databaseIdentityPrincipalId", "databaseDiskRoleId",
+            "databaseDiskAssignmentId", "databaseFederationId",
+        ):
+            broken = copy.deepcopy(inventory)
+            broken["outputs"].pop(key)
+            self.write_inventory(root, broken)
+            with self.subTest(key=key), self.assertRaisesRegex(
+                RuntimeError, key + ".*clean foundation redeploy|clean foundation redeploy.*" + key
+            ):
+                load_inventory(root, config)
+        for key, value in (
+            ("databaseIdentityId", outputs["identityId"]),
+            ("databaseIdentityClientId", outputs["identityClientId"]),
+            ("databaseIdentityPrincipalId", outputs["identityPrincipalId"]),
+            ("databaseDiskRoleId", outputs["databaseDiskRoleId"].replace("yy-cv-rg", "other-rg")),
+            ("databaseDiskAssignmentId", outputs["roleAssignmentId"]),
+            ("databaseFederationId", outputs["capzFederationId"]),
+        ):
+            broken = copy.deepcopy(inventory)
+            broken["outputs"][key] = value
+            self.write_inventory(root, broken)
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, "mismatch"):
+                load_inventory(root, config)
+            with self.assertRaisesRegex(RuntimeError, "mismatch"):
+                _foundation_identity(broken)
+
+    def test_database_outputs_rejected_before_creating_inventory(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        outputs = self.inventory(root, config)["outputs"]
+        for key in ("databaseIdentityId", "databaseFederationId"):
+            deployment = {
+                "id": "deployment-id",
+                "properties": {
+                    "outputs": {
+                        name: {"value": value}
+                        for name, value in outputs.items() if name != key
+                    }
+                },
+            }
+            with (
+                self.subTest(key=key),
+                patch("scripts.lib.azure.foundation.preflight", return_value={}),
+                patch("scripts.lib.azure.foundation._json", return_value=deployment),
+                self.assertRaisesRegex(RuntimeError, "clean foundation redeploy"),
+            ):
+                create_foundation(root, config)
+            self.assertFalse((root / ".runtime" / "azure" / "resources.json").exists())
+
+    def test_database_federation_and_disk_authority_are_verified(self):
+        root = self.make_root()
+        outputs = self.inventory(root, load_azure_configuration(root))["outputs"]
+        with patch(
+            "scripts.lib.azure.foundation._az",
+            side_effect=self.database_azure(outputs),
+        ):
+            self.assertEqual([], _database_identity_blockers(outputs))
+
+        changes = (
+            (lambda resources, _: resources["identity"].update(
+                clientId="wrong-client"), "identity binding changed"),
+            (lambda resources, _: resources["disk role"]["properties"]["permissions"][0]["actions"].append(
+                "*"), "disk role permissions changed"),
+            (lambda resources, _: resources["disk role"]["properties"].update(
+                assignableScopes=["/subscriptions/redacted"]), "disk role permissions changed"),
+            (lambda resources, _: resources["disk assignment"]["properties"].update(
+                principalId="other"), "disk assignment changed"),
+            (lambda resources, _: resources["federated credential"]["properties"].update(
+                subject="system:serviceaccount:capz-system:capz-manager"),
+             "ServiceAccount federation changed"),
+            (lambda _, assignments: assignments.append({
+                "id": outputs["roleAssignmentId"],
+                "scope": outputs["resourceGroupId"],
+                "principalId": outputs["databaseIdentityPrincipalId"],
+                "roleDefinitionId": outputs["databaseDiskRoleId"],
+            }), "excess role authority"),
+        )
+        for change, expected in changes:
+            with (
+                self.subTest(expected=expected),
+                patch("scripts.lib.azure.foundation._az",
+                      side_effect=self.database_azure(outputs, change=change)),
+            ):
+                self.assertTrue(any(
+                    expected in blocker for blocker in _database_identity_blockers(outputs)
+                ))
+
+    def test_destroy_refuses_database_identity_drift(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        self.write_inventory(root, inventory)
+        outputs = inventory["outputs"]
+        def drift(resources, _):
+            resources["federated credential"]["properties"]["subject"] = "other"
+        with (
+            patch("scripts.lib.azure.foundation._active_subscription"),
+            patch("scripts.lib.azure.foundation._az",
+                  side_effect=self.database_azure(outputs, change=drift)) as azure,
+            self.assertRaisesRegex(RuntimeError, "ServiceAccount federation changed"),
+        ):
+            destroy(root, config)
+        self.assertFalse(any(call.args[:2] == ("group", "delete") for call in azure.call_args_list))
     def test_foundation_checksum_mismatch_requires_clean_redeploy(self):
         root = self.make_root()
         config = load_azure_configuration(root)

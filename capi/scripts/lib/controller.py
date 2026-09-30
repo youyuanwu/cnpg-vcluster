@@ -549,6 +549,8 @@ def controller_source_digest(root: Path, config: dict[str, str]) -> str:
     repository = root.parent
     inputs = [
         *controller.joinpath("src").rglob("*.rs"),
+        *root.joinpath("database-runtime", "src").rglob("*.rs"),
+        root / "database-runtime" / "Cargo.toml",
         repository / "Cargo.toml",
         repository / "Cargo.lock",
         repository / "rust-toolchain.toml",

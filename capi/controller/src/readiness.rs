@@ -8,6 +8,8 @@ use crate::{
     sanitize,
 };
 
+pub use tenant_database_runtime::readiness::{node_ready, object_ready, workload_available};
+
 fn integer(value: Option<&Value>) -> Result<Option<i64>, ReconcileError> {
     value
         .map(|value| {
@@ -56,68 +58,6 @@ pub fn management_conditions_ready(
         }
     }
     Ok(false)
-}
-
-pub fn object_ready(object: &DynamicObject) -> bool {
-    if object.metadata.deletion_timestamp.is_some() {
-        return false;
-    }
-    let generation = object.metadata.generation.unwrap_or_default();
-    let Ok(observed) = integer(object.data.pointer("/status/observedGeneration")) else {
-        return false;
-    };
-    if observed.is_some_and(|value| value < generation) {
-        return false;
-    }
-    object
-        .data
-        .pointer("/status/conditions")
-        .and_then(Value::as_array)
-        .is_some_and(|conditions| {
-            conditions.iter().any(|condition| {
-                condition["type"] == "Ready"
-                    && condition["status"] == "True"
-                    && integer(condition.get("observedGeneration"))
-                        .is_ok_and(|value| value.is_none_or(|value| value >= generation))
-            })
-        })
-}
-
-pub fn node_ready(object: &DynamicObject) -> bool {
-    object_ready(object)
-}
-
-pub fn workload_available(object: &DynamicObject) -> bool {
-    if object.metadata.deletion_timestamp.is_some()
-        || object
-            .data
-            .pointer("/status/observedGeneration")
-            .and_then(Value::as_i64)
-            .is_none_or(|value| value < object.metadata.generation.unwrap_or_default())
-    {
-        return false;
-    }
-    let daemon_set = object
-        .types
-        .as_ref()
-        .is_some_and(|types| types.kind == "DaemonSet");
-    let desired = object
-        .data
-        .pointer(if daemon_set {
-            "/status/desiredNumberScheduled"
-        } else {
-            "/spec/replicas"
-        })
-        .and_then(Value::as_i64);
-    let available = object
-        .data
-        .pointer(if daemon_set {
-            "/status/numberAvailable"
-        } else {
-            "/status/availableReplicas"
-        })
-        .and_then(Value::as_i64);
-    desired.is_some_and(|desired| desired > 0 && Some(desired) == available)
 }
 
 pub fn set_condition(

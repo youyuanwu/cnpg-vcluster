@@ -287,6 +287,9 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
             )
             for filename in ("Cargo.toml", "Dockerfile"):
                 (root / "controller" / filename).write_text(filename, encoding="utf-8")
+            runtime = root / "database-runtime"
+            runtime.mkdir()
+            (runtime / "Cargo.toml").write_text("runtime", encoding="utf-8")
             manager = root / "controller/config/manager/manager.yaml.tpl"
             manager.parent.mkdir(parents=True)
             manager.write_text("manager")

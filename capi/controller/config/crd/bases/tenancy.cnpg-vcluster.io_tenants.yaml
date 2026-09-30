@@ -107,6 +107,9 @@ spec:
                     type: string
                   reason:
                     type: string
+                  storageNamespaceUID:
+                    nullable: true
+                    type: string
                 required:
                 - available
                 - gateUID

@@ -242,13 +242,13 @@ impl Fixture {
     async fn until_ready(&self) {
         for _ in 0..25 {
             self.step().await;
-            if self
-                .current()
-                .status
-                .as_ref()
-                .and_then(|status| status.phase)
-                == Some(tenant_controller::api::TenantPhase::Ready)
-            {
+            if self.current().status.as_ref().is_some_and(|status| {
+                status.phase == Some(TenantPhase::Ready)
+                    && status
+                        .database_capability
+                        .as_ref()
+                        .is_some_and(|cap| cap.available)
+            }) {
                 return;
             }
             self.settle_provider();
@@ -1009,6 +1009,21 @@ async fn control_plane_aggregate_gates_credentials_volume_and_workers() {
 async fn full_pipeline_converges_then_observes_once_and_preserves_static_content_drift() {
     let fixture = Fixture::new(true);
     fixture.until_ready().await;
+    let storage = fixture
+        .workload
+        .get("/apis/storage.k8s.io/v1/storageclasses/capi-hostpath");
+    assert_eq!(storage["volumeBindingMode"], "Immediate");
+    assert_eq!(storage["reclaimPolicy"], "Retain");
+    assert_eq!(
+        fixture
+            .current()
+            .status
+            .unwrap()
+            .database_capability
+            .unwrap()
+            .reason,
+        "Ready"
+    );
     let config_path = "/api/v1/namespaces/kube-system/configmaps/capi-kube-proxy";
     let mut config = fixture.workload.get(config_path);
     config["data"]["config.conf"] = json!("owned drift is intentionally not repaired");
@@ -1191,6 +1206,300 @@ async fn tenant_readiness_does_not_depend_on_database_workloads() {
     assert!(fixture.workload.calls().iter().all(|call| {
         !call.path.contains("/postgresql.cnpg.io/") && !call.path.contains("/namespaces/database")
     }));
+}
+
+#[tokio::test]
+async fn database_runtime_capability_loss_preserves_infrastructure_ready() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    let credential_path =
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/tenant-a/roles/tenant-database-credentials";
+    let mut credential = fixture.management.get(credential_path);
+    assert_eq!(
+        credential["rules"][0]["resourceNames"],
+        json!(["tenant-a-kubeconfig"])
+    );
+    assert_eq!(credential["rules"][0]["verbs"], json!(["get"]));
+    let binding = fixture.management.get(
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/tenant-a/rolebindings/tenant-database-credentials"
+    );
+    assert_eq!(
+        binding["subjects"],
+        json!([
+            {"kind":"ServiceAccount","name":"tenant-admin","namespace":"tenant-system"},
+            {"kind":"ServiceAccount","name":"database-controller","namespace":"tenant-system"}
+        ])
+    );
+    credential["rules"][0]["resourceNames"] = json!(["unrelated-secret"]);
+    fixture.management.insert(credential_path, &credential);
+    fixture.step().await;
+    assert_eq!(
+        fixture.current().status.as_ref().unwrap().phase,
+        Some(TenantPhase::Ready)
+    );
+    assert!(
+        !fixture
+            .current()
+            .status
+            .unwrap()
+            .database_capability
+            .unwrap()
+            .available
+    );
+    credential["rules"][0]["resourceNames"] = json!(["tenant-a-kubeconfig"]);
+    fixture.management.insert(credential_path, credential);
+    let path = "/api/v1/namespaces/tenant-db-tenant-a/resourcequotas/tenant-database-limit";
+    let mut quota = fixture.management.get(path);
+    quota["spec"]["hard"]["count/tenantdatabases.tenancy.cnpg-vcluster.io"] = json!("4");
+    fixture.management.insert(path, &quota);
+    fixture.clear();
+    assert_eq!(
+        fixture.step().await,
+        Action::requeue(std::time::Duration::from_secs(5))
+    );
+    let status = fixture.current().status.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Ready));
+    assert!(!status.database_capability.unwrap().available);
+    quota["spec"]["hard"]["count/tenantdatabases.tenancy.cnpg-vcluster.io"] = json!("3");
+    fixture.management.insert(path, quota);
+    fixture.step().await;
+    assert!(
+        fixture
+            .current()
+            .status
+            .unwrap()
+            .database_capability
+            .unwrap()
+            .available
+    );
+}
+
+#[tokio::test]
+async fn tenant_deletion_closes_gate_and_drains_database_namespace_before_infrastructure() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    fixture.management.allow_typed_list(
+        "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases",
+        "tenancy.cnpg-vcluster.io/v1alpha1",
+        "TenantDatabase",
+    );
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+    let gate_path = format!(
+        "/api/v1/namespaces/tenant-database-gates/configmaps/{}",
+        tenant_database_runtime::gate_name("tenant-uid"),
+    );
+    fixture.clear();
+    fixture.step().await;
+    assert_eq!(
+        fixture.management.get(&gate_path)["data"]["state"],
+        "closed"
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
+    fixture.clear();
+    fixture.step().await;
+    assert!(fixture.management.calls().iter().any(|call| {
+        call.method == "DELETE" && call.path == "/api/v1/namespaces/tenant-db-tenant-a"
+    }));
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.path != CLUSTER)
+    );
+    fixture.clear();
+    fixture.step().await;
+    assert_eq!(
+        fixture
+            .current()
+            .status
+            .unwrap()
+            .database_capability
+            .unwrap()
+            .reason,
+        "Retiring"
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
+    fixture.clear();
+    fixture.step().await;
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| { call.method == "DELETE" && call.path == gate_path })
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.path != CLUSTER)
+    );
+}
+
+#[tokio::test]
+async fn unbound_gate_entry_waits_for_drain_deadline_and_two_absence_observations() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    fixture.management.allow_typed_list(
+        "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases",
+        "tenancy.cnpg-vcluster.io/v1alpha1",
+        "TenantDatabase",
+    );
+    let gate_path = format!(
+        "/api/v1/namespaces/tenant-database-gates/configmaps/{}",
+        tenant_database_runtime::gate_name("tenant-uid"),
+    );
+    let mut gate = fixture.management.get(&gate_path);
+    let entry = tenant_database_runtime::GateEntry {
+        namespace: "tenant-db-tenant-a".into(),
+        name: "orders".into(),
+        spec_sha256: "a".repeat(64),
+        created_at: (chrono::Utc::now() - chrono::Duration::seconds(130)).to_rfc3339(),
+        bound_uid: None,
+        first_absent_at: None,
+        absence_checks: 0,
+    };
+    gate["data"]["reservations"] = json!(
+        serde_json::to_string(&std::collections::BTreeMap::from([("1234-5678", entry)])).unwrap()
+    );
+    fixture.management.insert(&gate_path, gate);
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+    fixture.step().await;
+    fixture.step().await;
+    let gate = fixture.management.get(&gate_path);
+    let entries: serde_json::Value =
+        serde_json::from_str(gate["data"]["reservations"].as_str().unwrap()).unwrap();
+    assert_eq!(entries["1234-5678"]["absenceChecks"], 1);
+    assert!(
+        fixture
+            .management
+            .0
+            .lock()
+            .unwrap()
+            .objects
+            .contains_key("/api/v1/namespaces/tenant-db-tenant-a")
+    );
+    fixture.step().await;
+    let mut gate = fixture.management.get(&gate_path);
+    let mut entries: serde_json::Value =
+        serde_json::from_str(gate["data"]["reservations"].as_str().unwrap()).unwrap();
+    assert_eq!(entries["1234-5678"]["absenceChecks"], 1);
+    entries["1234-5678"]["firstAbsentAt"] =
+        json!((chrono::Utc::now() - chrono::Duration::seconds(3)).to_rfc3339());
+    gate["data"]["reservations"] = json!(entries.to_string());
+    fixture.management.insert(&gate_path, gate);
+    fixture.step().await;
+    let gate = fixture.management.get(&gate_path);
+    let entries: serde_json::Value =
+        serde_json::from_str(gate["data"]["reservations"].as_str().unwrap()).unwrap();
+    assert_eq!(entries["1234-5678"]["absenceChecks"], 2);
+    fixture.step().await;
+    let gate = fixture.management.get(&gate_path);
+    assert_eq!(gate["data"]["reservations"], "{}");
+    assert!(
+        fixture
+            .management
+            .0
+            .lock()
+            .unwrap()
+            .objects
+            .contains_key("/api/v1/namespaces/tenant-db-tenant-a")
+    );
+}
+
+#[tokio::test]
+async fn accepted_database_is_deleted_exactly_before_infrastructure_or_replacement_refused() {
+    for replacement in [false, true] {
+        let fixture = Fixture::new(true);
+        fixture.until_ready().await;
+        fixture.management.allow_typed_list(
+            "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases",
+            "tenancy.cnpg-vcluster.io/v1alpha1",
+            "TenantDatabase",
+        );
+        let gate_path = format!(
+            "/api/v1/namespaces/tenant-database-gates/configmaps/{}",
+            tenant_database_runtime::gate_name("tenant-uid"),
+        );
+        let mut gate = fixture.management.get(&gate_path);
+        let entry = tenant_database_runtime::GateEntry {
+            namespace: "tenant-db-tenant-a".into(),
+            name: "orders".into(),
+            spec_sha256: "a".repeat(64),
+            created_at: chrono::Utc::now().to_rfc3339(),
+            bound_uid: Some("database-uid".into()),
+            first_absent_at: None,
+            absence_checks: 0,
+        };
+        gate["data"]["reservations"] = json!(
+            serde_json::to_string(&std::collections::BTreeMap::from([("1234-5678", entry)]))
+                .unwrap()
+        );
+        let gate_uid = gate["metadata"]["uid"].clone();
+        fixture.management.insert(&gate_path, gate);
+        let database_path = "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases/orders";
+        fixture.management.insert(
+            database_path,
+            json!({
+                "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha1", "kind":"TenantDatabase",
+                "metadata":{"namespace":"tenant-db-tenant-a", "name":"orders",
+                    "uid":if replacement {"replacement-uid"} else {"database-uid"},
+                    "resourceVersion":"5",
+                    "finalizers":["tenancy.cnpg-vcluster.io/database-finalizer"],
+                    "annotations":{
+                        "tenancy.cnpg-vcluster.io/tenant-uid":"tenant-uid",
+                        "tenancy.cnpg-vcluster.io/admission-request-uid":"1234-5678",
+                        "tenancy.cnpg-vcluster.io/gate-uid":gate_uid,
+                        "tenancy.cnpg-vcluster.io/database-spec-sha256":"a".repeat(64)
+                    }},
+                "spec":{"tenantName":"tenant-a","tenantUID":"tenant-uid","instances":1}
+            }),
+        );
+        let mut tenant = fixture.management.get(TENANT);
+        tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+        fixture.management.insert(TENANT, tenant);
+        fixture.step().await;
+        fixture.clear();
+        fixture.step().await;
+        let deleted = fixture.management.calls().iter().any(|call| {
+            call.method == "DELETE"
+                && call.path == database_path
+                && call.body["preconditions"]["uid"] == "database-uid"
+                && call.body["preconditions"]["resourceVersion"] == "5"
+        });
+        assert_eq!(deleted, !replacement);
+        assert!(
+            fixture
+                .management
+                .calls()
+                .iter()
+                .all(|call| { !(call.method == "DELETE" && call.path == CLUSTER) })
+        );
+        if replacement {
+            assert_eq!(
+                fixture.current().status.unwrap().phase,
+                Some(TenantPhase::OwnershipInvalid)
+            );
+        }
+    }
 }
 
 #[tokio::test]

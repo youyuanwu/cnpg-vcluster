@@ -302,7 +302,14 @@ pub fn desired_objects(context: &AzureContext<'_>) -> Result<Vec<DynamicObject>,
 helm repo add projectcalico https://docs.tigera.io/calico/charts\n\
 helm upgrade --install cloud-provider-azure cloud-provider-azure/cloud-provider-azure --kubeconfig /tenant/value --version {} --namespace kube-system --values /values/cloud-provider.yaml --wait --timeout 10m\n\
 helm upgrade --install calico-crds projectcalico/crd.projectcalico.org.v1 --kubeconfig /tenant/value --version {} --namespace tigera-operator --create-namespace --wait --timeout 5m\n\
-helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant/value --version {} --namespace tigera-operator --create-namespace --values /values/calico.yaml --wait --timeout 10m",
+helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant/value --version {} --namespace tigera-operator --create-namespace --values /values/calico.yaml --wait --timeout 10m\n\
+mkdir -p /charts\n\
+if wget -q https://github.com/cloudnative-pg/charts/releases/download/cloudnative-pg-v0.29.0/cloudnative-pg-0.29.0.tgz -O /charts/cnpg.tgz && echo '668e065ff53508d58238788fd35b355a925060843629a951df0e6a9362e6d32f  /charts/cnpg.tgz' | sha256sum -c -; then\n\
+ helm upgrade --install cnpg /charts/cnpg.tgz --kubeconfig /tenant/value --namespace cnpg-system --create-namespace --set-string image.repository=ghcr.io/cloudnative-pg/cloudnative-pg --set-string image.tag=1.30.0@sha256:a2701eb97cdd2a34b1fdb2cb51987f544b706e40bec72ae7146cd8580efefebb --wait --timeout 10m || echo 'CNPG installation unavailable'\n\
+else echo 'CNPG pinned chart unavailable'; fi\n\
+if wget -q https://raw.githubusercontent.com/kubernetes-sigs/azuredisk-csi-driver/v1.32.12/charts/v1.32.12/azuredisk-csi-driver-1.32.12.tgz -O /charts/azuredisk.tgz && echo '07b10ce708dc988d8315df1794f3fb913f8a1dd85b3fb93c64ca7de491eb095a  /charts/azuredisk.tgz' | sha256sum -c -; then\n\
+ helm upgrade --install azuredisk /charts/azuredisk.tgz --kubeconfig /tenant/value --namespace kube-system --set controller.allowEmptyCloudConfig=true --set-string image.azuredisk.repository=mcr.microsoft.com/oss/v2/kubernetes-csi/azuredisk-csi --set-string image.azuredisk.tag=v1.32.12@sha256:96ed94bea5da1fc6bc1e9a75f8a666c467e95a4fe06079a7bbacf469cf6a4cbd --wait --timeout 10m || echo 'Azure Disk CSI installation unavailable'\n\
+else echo 'Azure Disk CSI pinned chart unavailable'; fi",
         config.cloud_provider_version.trim_start_matches('v'),
         config.calico_version,
         config.calico_version
@@ -1019,6 +1026,24 @@ mod tests {
             .unwrap();
         assert!(job.contains("--version 1.32.3"));
         assert!(job.contains("--version v3.32.2"));
+        for (image, repository_key, tag_key) in [
+            (
+                tenant_database_runtime::azure_runtime::CNPG_IMAGE,
+                "image.repository",
+                "image.tag",
+            ),
+            (
+                tenant_database_runtime::azure_runtime::AZURE_DISK_IMAGE,
+                "image.azuredisk.repository",
+                "image.azuredisk.tag",
+            ),
+        ] {
+            let (repository, tag) = image.split_once(':').unwrap();
+            assert!(job.contains(&format!(
+                "--set-string {repository_key}={repository} --set-string {tag_key}={tag}"
+            )));
+        }
+        assert!(job.contains("sha256sum -c -"));
         assert!(
             !serde_json::to_string(&objects)
                 .unwrap()

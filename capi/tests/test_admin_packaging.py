@@ -385,6 +385,8 @@ class AdminPackagingTests(unittest.TestCase):
             "controller/src/management.rs": "management",
             "controller/src/ownership.rs": "ownership",
             "controller/src/sanitize.rs": "sanitization",
+            "database-runtime/Cargo.toml": "[package]\nname = \"tenant-database-runtime\"",
+            "database-runtime/src/lib.rs": "shared runtime",
             "scripts/generate_admin_resources.py": "generator",
         }
         for name, content in files.items():

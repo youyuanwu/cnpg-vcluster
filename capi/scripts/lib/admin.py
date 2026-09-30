@@ -757,10 +757,14 @@ def admin_source_digest(root: Path, config: dict[str, str]) -> str:
     ):
         raise RuntimeError(f"controller source directory is invalid: {controller}")
     controller_inputs = _source_tree_inputs(controller / "src", "controller")
+    runtime = root / "database-runtime"
+    runtime_inputs = _source_tree_inputs(runtime / "src", "database runtime")
     inputs = [
         *admin_inputs,
         *controller_inputs,
+        *runtime_inputs,
         controller / "Cargo.toml",
+        runtime / "Cargo.toml",
         root / "scripts" / "generate_admin_resources.py",
         repository / "Cargo.toml",
         repository / "Cargo.lock",

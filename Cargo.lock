@@ -3394,6 +3394,7 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "tempfile",
+ "tenant-database-runtime",
  "thiserror 2.0.21",
  "tokio",
  "tower",
@@ -3422,11 +3423,26 @@ dependencies = [
  "serde_yaml",
  "sha2 0.10.9",
  "tenant-controller",
+ "tenant-database-runtime",
  "thiserror 2.0.21",
  "tokio",
  "tokio-rustls",
  "tower",
  "tracing",
+]
+
+[[package]]
+name = "tenant-database-runtime"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "hex",
+ "k8s-openapi",
+ "kube",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "thiserror 2.0.21",
 ]
 
 [[package]]

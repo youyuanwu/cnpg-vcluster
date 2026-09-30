@@ -7,20 +7,13 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use tenant_controller::api::{Tenant, TenantPhase};
+pub use tenant_database_runtime::{
+    ADMISSION_UID, GATE_ENTRIES, GATE_NAMESPACE, GATE_STATE, GATE_TENANT_UID, GATE_UID, GateEntry,
+    MAX_PENDING_REQUESTS, QUOTA_KEY, QUOTA_NAME, SPEC_SHA256, TENANT_UID, database_namespace,
+    gate_name, valid_request_uid,
+};
 
 use crate::api::{TenantDatabase, validate_spec};
-
-pub const GATE_NAMESPACE: &str = "tenant-database-gates";
-pub const QUOTA_NAME: &str = "tenant-database-limit";
-pub const QUOTA_KEY: &str = "count/tenantdatabases.tenancy.cnpg-vcluster.io";
-pub const TENANT_UID: &str = "tenancy.cnpg-vcluster.io/tenant-uid";
-pub const GATE_UID: &str = "tenancy.cnpg-vcluster.io/gate-uid";
-pub const ADMISSION_UID: &str = "tenancy.cnpg-vcluster.io/admission-request-uid";
-pub const SPEC_SHA256: &str = "tenancy.cnpg-vcluster.io/database-spec-sha256";
-pub const GATE_ENTRIES: &str = "reservations";
-pub const GATE_STATE: &str = "state";
-pub const GATE_TENANT_UID: &str = "tenantUID";
-const MAX_PENDING_REQUESTS: usize = 32;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum AdmissionError {
@@ -40,28 +33,6 @@ pub enum AdmissionError {
     Gate,
     #[error("database create gate entry is missing or replaced")]
     Reservation,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
-#[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct GateEntry {
-    pub namespace: String,
-    pub name: String,
-    pub spec_sha256: String,
-    pub created_at: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub bound_uid: Option<String>,
-}
-
-pub fn database_namespace(tenant_name: &str) -> String {
-    format!("tenant-db-{tenant_name}")
-}
-
-pub fn gate_name(tenant_uid: &str) -> String {
-    format!(
-        "tenant-db-gate-{}",
-        hex::encode(Sha256::digest(tenant_uid.as_bytes()))[..24].to_owned()
-    )
 }
 
 pub fn canonical_spec_hash(database: &TenantDatabase) -> Result<String, AdmissionError> {
@@ -186,81 +157,11 @@ fn validate_request_inner(
 }
 
 pub fn validate_gate(gate: &ConfigMap, tenant_uid: &str) -> Result<(), AdmissionError> {
-    if gate.name_any() != gate_name(tenant_uid)
-        || gate.metadata.namespace.as_deref() != Some(GATE_NAMESPACE)
-        || gate.metadata.uid.as_deref().is_none_or(str::is_empty)
-        || gate.metadata.deletion_timestamp.is_some()
-        || gate.immutable == Some(true)
-        || gate
-            .binary_data
-            .as_ref()
-            .is_some_and(|data| !data.is_empty())
-        || gate
-            .metadata
-            .finalizers
-            .as_ref()
-            .is_some_and(|items| !items.is_empty())
-        || gate
-            .metadata
-            .owner_references
-            .as_ref()
-            .is_some_and(|items| !items.is_empty())
-        || gate
-            .metadata
-            .labels
-            .as_ref()
-            .and_then(|labels| labels.get(TENANT_UID))
-            .map(String::as_str)
-            != Some(tenant_uid)
-        || gate
-            .data
-            .as_ref()
-            .and_then(|data| data.get(GATE_TENANT_UID))
-            .map(String::as_str)
-            != Some(tenant_uid)
-        || gate.data.as_ref().is_none_or(|data| data.len() != 3)
-        || !matches!(
-            gate.data
-                .as_ref()
-                .and_then(|data| data.get(GATE_STATE))
-                .map(String::as_str),
-            Some("open" | "closed")
-        )
-        || gate_entries(gate).is_err()
-    {
-        return Err(AdmissionError::Gate);
-    }
-    Ok(())
+    tenant_database_runtime::validate_gate(gate, tenant_uid).map_err(|_| AdmissionError::Gate)
 }
 
 pub fn gate_entries(gate: &ConfigMap) -> Result<BTreeMap<String, GateEntry>, AdmissionError> {
-    let encoded = gate
-        .data
-        .as_ref()
-        .and_then(|data| data.get(GATE_ENTRIES))
-        .ok_or(AdmissionError::Gate)?;
-    let entries: BTreeMap<String, GateEntry> =
-        serde_json::from_str(encoded).map_err(|_| AdmissionError::Gate)?;
-    if entries.len() > MAX_PENDING_REQUESTS
-        || entries.iter().any(|(uid, entry)| {
-            !valid_request_uid(uid)
-                || entry.namespace.is_empty()
-                || entry.name.is_empty()
-                || entry.spec_sha256.len() != 64
-                || chrono::DateTime::parse_from_rfc3339(&entry.created_at).is_err()
-                || entry.bound_uid.as_deref().is_some_and(str::is_empty)
-        })
-    {
-        return Err(AdmissionError::Gate);
-    }
-    Ok(entries)
-}
-
-fn valid_request_uid(uid: &str) -> bool {
-    (1..=64).contains(&uid.len())
-        && uid
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
+    tenant_database_runtime::gate_entries(gate).map_err(|_| AdmissionError::Gate)
 }
 
 fn entry_matches(entry: &GateEntry, database: &TenantDatabase) -> Result<bool, AdmissionError> {
@@ -312,6 +213,8 @@ fn reservation_update(
             spec_sha256: canonical_spec_hash(database)?,
             created_at: chrono::Utc::now().to_rfc3339(),
             bound_uid: None,
+            first_absent_at: None,
+            absence_checks: 0,
         },
     );
     let mut updated = gate.clone();
@@ -702,13 +605,34 @@ pub fn validate_gate_update(
         "system:serviceaccount:tenant-system:tenant-controller" => {
             if new_state != "closed"
                 || old_entries.iter().any(|(uid, entry)| {
-                    new_entries.get(uid).is_some_and(|current| current != entry)
+                    new_entries.get(uid).is_some_and(|current| {
+                        if current == entry {
+                            return false;
+                        }
+                        if old_state != "closed"
+                            || entry.bound_uid.is_some()
+                            || current.absence_checks != entry.absence_checks + 1
+                            || (entry.absence_checks == 0 && current.first_absent_at.is_none())
+                            || (entry.absence_checks > 0
+                                && current.first_absent_at != entry.first_absent_at)
+                        {
+                            return true;
+                        }
+                        let mut expected = entry.clone();
+                        expected.absence_checks = current.absence_checks;
+                        expected.first_absent_at = current.first_absent_at.clone();
+                        current != &expected
+                    })
                 })
                 || new_entries.keys().any(|uid| !old_entries.contains_key(uid))
                 || (old_state == "open" && old_entries != new_entries)
-                || old_entries
-                    .iter()
-                    .any(|(uid, entry)| !new_entries.contains_key(uid) && entry.bound_uid.is_some())
+                || old_entries.iter().any(|(uid, entry)| {
+                    !new_entries.contains_key(uid)
+                        && !tenant_database_runtime::unbound_entry_drained(
+                            entry,
+                            chrono::Utc::now(),
+                        )
+                })
             {
                 return Err(AdmissionError::Gate);
             }
@@ -960,6 +884,7 @@ mod tests {
                 namespace_uid: "namespace-uid".into(),
                 quota_uid: "quota-uid".into(),
                 gate_uid: "gate-uid".into(),
+                storage_namespace_uid: None,
             }),
             ..Default::default()
         });

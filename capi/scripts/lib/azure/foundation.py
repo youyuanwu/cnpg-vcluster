@@ -61,6 +61,67 @@ CAPI_CAPZ_DEPLOYMENTS = (
     ("capz-system", "capz-controller-manager"),
     ("capz-system", "azureserviceoperator-controller-manager"),
 )
+DATABASE_OUTPUTS = (
+    "databaseIdentityId",
+    "databaseIdentityClientId",
+    "databaseIdentityPrincipalId",
+    "databaseDiskRoleId",
+    "databaseDiskAssignmentId",
+    "databaseFederationId",
+)
+DATABASE_DISK_ACTIONS = {
+    "Microsoft.Compute/disks/read",
+    "Microsoft.Compute/disks/delete",
+}
+DATABASE_SERVICE_ACCOUNT = "system:serviceaccount:tenant-system:database-controller"
+
+
+def _validate_database_outputs(outputs: Mapping[str, object], prefix: str) -> None:
+    missing = [
+        key for key in DATABASE_OUTPUTS
+        if not isinstance(outputs.get(key), str) or not outputs[key]
+    ]
+    if missing:
+        raise RuntimeError(
+            "Azure database foundation inventory is incomplete; clean foundation "
+            "redeploy required: " + ", ".join(missing)
+        )
+    group = str(outputs.get("resourceGroupId", "")).rstrip("/")
+    group_name = f"{prefix}-rg"
+    identity = str(outputs["databaseIdentityId"]).rstrip("/")
+    expected_identity = (
+        f"{group}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
+        f"{prefix}-database-controller"
+    )
+    authorization = f"{group}/providers/Microsoft.Authorization"
+    if (
+        not group
+        or outputs.get("resourceGroupName") != group_name
+        or re.fullmatch(
+            rf"/subscriptions/[^/]+/resourceGroups/{re.escape(group_name)}",
+            group,
+            flags=re.IGNORECASE,
+        ) is None
+        or not _azure_id_equal(identity, expected_identity)
+        or _azure_id_equal(identity, outputs.get("identityId"))
+        or outputs["databaseIdentityClientId"] == outputs.get("identityClientId")
+        or outputs["databaseIdentityPrincipalId"] == outputs.get("identityPrincipalId")
+        or not str(outputs["databaseDiskRoleId"]).lower().startswith(
+            (authorization + "/roleDefinitions/").lower()
+        )
+        or not str(outputs["databaseDiskAssignmentId"]).lower().startswith(
+            (authorization + "/roleAssignments/").lower()
+        )
+        or not _azure_id_equal(
+            outputs["databaseFederationId"],
+            identity + "/federatedIdentityCredentials/database-controller",
+        )
+        or _azure_id_equal(
+            outputs["databaseDiskAssignmentId"], outputs.get("roleAssignmentId")
+        )
+    ):
+        raise RuntimeError("Azure database foundation identity or scope mismatch")
+
 
 def preflight(
     root: Path,
@@ -174,6 +235,7 @@ def create_foundation(root: Path, config: Mapping[str, str]) -> dict[str, object
         key: value["value"]
         for key, value in payload["properties"]["outputs"].items()
     }
+    _validate_database_outputs(outputs, config["AZURE_PREFIX"])
     record = {
         "schema": FOUNDATION_INVENTORY_SCHEMA,
         **expected,
@@ -2114,6 +2176,7 @@ def load_inventory(
         for key, value in outputs.items()
     ):
         raise RuntimeError("Azure foundation inventory outputs are invalid")
+    _validate_database_outputs(outputs, config["AZURE_PREFIX"])
     if not isinstance(controllers, dict) or not all(
         isinstance(key, str) and isinstance(value, str) and value
         for key, value in controllers.items()
@@ -2170,12 +2233,14 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
         "aksRoleAssignmentId",
         "capzFederationId",
         "asoFederationId",
+        *DATABASE_OUTPUTS,
     )
     missing = [key for key in required_outputs if not outputs.get(key)]
     if missing:
         raise RuntimeError(
             "Azure foundation inventory is incomplete: " + ", ".join(missing)
         )
+    _validate_database_outputs(outputs, str(inventory["prefix"]))
     if set(controllers) != {
         f"{namespace}/{deployment}"
         for namespace, deployment in CONTROLLER_DEPLOYMENTS
@@ -2272,6 +2337,149 @@ def _deployment_ready(payload: Mapping[str, object]) -> bool:
         and status.get("availableReplicas", 0) >= requested
         and status.get("updatedReplicas", 0) >= requested
     )
+
+
+def _database_identity_blockers(outputs: Mapping[str, str]) -> list[str]:
+    blockers: list[str] = []
+
+    def inspect(description: str, *arguments: str) -> dict[str, object] | None:
+        response = _az(*arguments, "--output", "json", check=False)
+        if response.returncode != 0:
+            blockers.append(f"recorded Azure database {description} is absent")
+            return None
+        try:
+            resource = json.loads(response.stdout)
+        except (ValueError, TypeError):
+            resource = None
+        if not isinstance(resource, dict):
+            blockers.append(f"Azure database {description} inspection failed")
+            return None
+        return resource
+
+    identity = inspect(
+        "identity", "identity", "show",
+        "--resource-group", outputs["resourceGroupName"],
+        "--name", outputs["resourceGroupName"].removesuffix("-rg")
+        + "-database-controller",
+    )
+    if identity is not None and (
+        not _azure_id_equal(identity.get("id"), outputs["databaseIdentityId"])
+        or not _azure_id_equal(
+            identity.get("clientId"), outputs["databaseIdentityClientId"]
+        )
+        or not _azure_id_equal(
+            identity.get("principalId"), outputs["databaseIdentityPrincipalId"]
+        )
+    ):
+        blockers.append("Azure database identity binding changed")
+
+    role = inspect(
+        "disk role", "resource", "show", "--ids", outputs["databaseDiskRoleId"],
+        "--api-version", "2022-04-01",
+    )
+    if role is not None:
+        properties = role.get("properties")
+        permissions = (
+            properties.get("permissions") if isinstance(properties, dict) else None
+        )
+        permission = (
+            permissions[0]
+            if isinstance(permissions, list) and len(permissions) == 1
+            else None
+        )
+        if (
+            not _azure_id_equal(role.get("id"), outputs["databaseDiskRoleId"])
+            or not isinstance(properties, dict)
+            or properties.get("type") != "CustomRole"
+            or not isinstance(properties.get("assignableScopes"), list)
+            or len(properties["assignableScopes"]) != 1
+            or not _azure_id_equal(
+                properties["assignableScopes"][0], outputs["resourceGroupId"]
+            )
+            or not isinstance(permission, dict)
+            or not isinstance(permission.get("actions"), list)
+            or len(permission["actions"]) != len(DATABASE_DISK_ACTIONS)
+            or {str(action).lower() for action in permission["actions"]}
+            != {action.lower() for action in DATABASE_DISK_ACTIONS}
+            or any(
+                permission.get(key) != []
+                for key in ("notActions", "dataActions", "notDataActions")
+            )
+        ):
+            blockers.append("Azure database disk role permissions changed")
+
+    assignment = inspect(
+        "disk assignment", "resource", "show",
+        "--ids", outputs["databaseDiskAssignmentId"],
+        "--api-version", "2022-04-01",
+    )
+    if assignment is not None:
+        properties = assignment.get("properties")
+        if (
+            not _azure_id_equal(assignment.get("id"), outputs["databaseDiskAssignmentId"])
+            or not isinstance(properties, dict)
+            or not _azure_id_equal(
+                properties.get("principalId"), outputs["databaseIdentityPrincipalId"]
+            )
+            or not _azure_id_equal(
+                properties.get("roleDefinitionId"), outputs["databaseDiskRoleId"]
+            )
+            or properties.get("principalType") != "ServicePrincipal"
+            or (
+                properties.get("scope") is not None
+                and not _azure_id_equal(properties["scope"], outputs["resourceGroupId"])
+            )
+        ):
+            blockers.append("Azure database disk assignment changed")
+
+    federation = inspect(
+        "federated credential", "resource", "show",
+        "--ids", outputs["databaseFederationId"],
+        "--api-version", "2023-01-31",
+    )
+    if federation is not None:
+        properties = federation.get("properties")
+        if (
+            not _azure_id_equal(federation.get("id"), outputs["databaseFederationId"])
+            or not isinstance(properties, dict)
+            or properties.get("issuer") != outputs["aksOidcIssuer"]
+            or properties.get("subject") != DATABASE_SERVICE_ACCOUNT
+            or properties.get("audiences") != ["api://AzureADTokenExchange"]
+        ):
+            blockers.append("Azure database ServiceAccount federation changed")
+
+    response = _az(
+        "role", "assignment", "list",
+        "--assignee-object-id", outputs["databaseIdentityPrincipalId"],
+        "--all", "--include-inherited", "--output", "json", check=False,
+    )
+    if response.returncode != 0:
+        blockers.append("Azure database identity role assignment inspection failed")
+    else:
+        try:
+            assignments = json.loads(response.stdout)
+        except (ValueError, TypeError):
+            assignments = None
+        if (
+            not isinstance(assignments, list)
+            or len(assignments) != 1
+            or not isinstance(assignments[0], dict)
+            or not _azure_id_equal(
+                assignments[0].get("id"), outputs["databaseDiskAssignmentId"]
+            )
+            or not _azure_id_equal(
+                assignments[0].get("scope"), outputs["resourceGroupId"]
+            )
+            or not _azure_id_equal(
+                assignments[0].get("principalId"),
+                outputs["databaseIdentityPrincipalId"],
+            )
+            or not _azure_id_equal(
+                assignments[0].get("roleDefinitionId"), outputs["databaseDiskRoleId"]
+            )
+        ):
+            blockers.append("Azure database identity has missing or excess role authority")
+    return blockers
 
 
 def _inspect_foundation(
@@ -2516,6 +2724,7 @@ def _inspect_foundation(
             blockers.append(f"recorded Azure {description} is absent")
         elif response.stdout.strip().lower() != str(expected_id).lower():
             blockers.append(f"Azure {description} identity changed")
+    blockers.extend(_database_identity_blockers(outputs))
     try:
         readyz = _kubectl(root, "get", "--raw=/readyz", check=False)
     except (OSError, RuntimeError):
@@ -2668,6 +2877,11 @@ def destroy(root: Path, config: Mapping[str, str]) -> None:
     inventory = load_inventory(root, config)
     outputs = inventory["outputs"]
     assert isinstance(outputs, dict)
+    database_blockers = _database_identity_blockers(outputs)
+    if database_blockers:
+        raise RuntimeError(
+            "Azure database foundation is unhealthy: " + "; ".join(database_blockers)
+        )
     resource_group_id = outputs["resourceGroupId"]
     observed = _az(
         "group",

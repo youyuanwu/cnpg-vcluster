@@ -16,6 +16,12 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
         ],
     ),
     ("", &["events"], &["create", "patch", "update"]),
+    ("", &["resourcequotas"], &["create", "get"]),
+    (
+        "rbac.authorization.k8s.io",
+        &["roles", "rolebindings"],
+        &["create", "get"],
+    ),
     (
         "tenancy.cnpg-vcluster.io",
         &["tenantdatabases"],

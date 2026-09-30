@@ -63,17 +63,23 @@ pub struct TenantStatus {
     #[serde(skip_serializing_if = "Option::is_none")] #[schemars(with = "Option<TenantProviderStatusSchema>")] pub provider: Option<TenantProviderStatus>,
 }
 
-#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[rustfmt::skip]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct DatabaseCapability {
-    pub available: bool,
-    pub reason: String,
-    #[serde(rename = "namespaceUID")]
-    pub namespace_uid: String,
-    #[serde(rename = "quotaUID")]
-    pub quota_uid: String,
-    #[serde(rename = "gateUID")]
-    pub gate_uid: String,
+    pub available: bool, pub reason: String,
+    #[serde(rename = "namespaceUID")] pub namespace_uid: String,
+    #[serde(rename = "quotaUID")] pub quota_uid: String,
+    #[serde(rename = "gateUID")] pub gate_uid: String,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "storageNamespaceUID")]
+    pub storage_namespace_uid: Option<String>,
+}
+
+#[rustfmt::skip]
+impl DatabaseCapability {
+    pub fn identity(&self) -> Option<tenant_database_runtime::GateIdentity> {
+        tenant_database_runtime::GateIdentity::from_recorded(&self.namespace_uid, &self.quota_uid, &self.gate_uid, self.storage_namespace_uid.as_deref())
+    }
 }
 
 #[rustfmt::skip]

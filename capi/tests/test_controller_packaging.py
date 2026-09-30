@@ -600,6 +600,8 @@ class PackagingTests(unittest.TestCase):
             "../rust-toolchain.toml": '[toolchain]\nchannel = "stable"',
             "controller/Cargo.toml": "[package]",
             "controller/src/lib.rs": "source", "controller/Dockerfile": "FROM scratch",
+            "database-runtime/Cargo.toml": "[package]",
+            "database-runtime/src/lib.rs": "shared source",
             "controller/config/manager/manager.yaml.tpl": "manager",
             "controller/config/crd/bases/tenant.yaml": "crd",
             "controller/config/rbac/role.yaml": "role",

@@ -14,11 +14,13 @@ def source_digest(root: Path) -> str:
     digest = hashlib.sha256()
     paths = sorted([
         *root.joinpath("database-controller", "src").rglob("*.rs"),
+        *root.joinpath("database-runtime", "src").rglob("*.rs"),
         *root.joinpath("database-controller", "config").rglob("*.yaml"),
         *root.joinpath("database-controller", "config").rglob("*.json"),
         *root.joinpath("database-controller", "config").rglob("*.tpl"),
         root / "database-controller" / "Dockerfile",
         root / "database-controller" / "Cargo.toml",
+        root / "database-runtime" / "Cargo.toml",
         root.parent / "Cargo.toml",
         root.parent / "Cargo.lock",
         root.parent / "rust-toolchain.toml",

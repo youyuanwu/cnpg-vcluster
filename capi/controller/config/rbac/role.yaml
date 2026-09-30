@@ -25,6 +25,21 @@ rules:
   - patch
   - update
 - apiGroups:
+  - ''
+  resources:
+  - resourcequotas
+  verbs:
+  - create
+  - get
+- apiGroups:
+  - rbac.authorization.k8s.io
+  resources:
+  - roles
+  - rolebindings
+  verbs:
+  - create
+  - get
+- apiGroups:
   - tenancy.cnpg-vcluster.io
   resources:
   - tenantdatabases

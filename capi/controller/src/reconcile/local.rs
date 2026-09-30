@@ -4,7 +4,7 @@ use kube::{Client, ResourceExt, core::DynamicObject, runtime::controller::Action
 
 use crate::{
     allocation::{self, ClaimContext},
-    api::{CanonicalSpec, Tenant, TenantProviderSpec, spec_hash},
+    api::{CanonicalSpec, DatabaseCapability, Tenant, TenantProviderSpec, spec_hash},
     docker::{BollardDockerClient, DockerClient, validate_volume},
     error::ControllerError,
     foundation::{Foundation, ImageArchive, RuntimeFoundation},
@@ -342,9 +342,26 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
             context.identity(),
         )
         .await?;
-        if storage.created || storage.object.metadata.deletion_timestamp.is_some() {
-            return self.progress(context.tenant, PROGRESS_INTERVAL).await;
-        }
+        let storage_ready = !storage.created
+            && storage.object.metadata.deletion_timestamp.is_none()
+            && storage
+                .object
+                .data
+                .get("provisioner")
+                .and_then(serde_json::Value::as_str)
+                == Some("kubernetes.io/no-provisioner")
+            && storage
+                .object
+                .data
+                .get("volumeBindingMode")
+                .and_then(serde_json::Value::as_str)
+                == Some("Immediate")
+            && storage
+                .object
+                .data
+                .get("reclaimPolicy")
+                .and_then(serde_json::Value::as_str)
+                == Some("Retain");
         let controller_image = image(foundation, "CNPG_CONTROLLER_IMAGE")?;
         let operator = resources::cnpg_operator(
             context,
@@ -353,9 +370,6 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
             &controller_image.reference,
         )?;
         let operator = objects::ensure_batch(client.clone(), &operator, context.identity()).await?;
-        if operator.created || operator.pending {
-            return self.progress(context.tenant, PROGRESS_INTERVAL).await;
-        }
         let deployment = operator.objects.iter().find(|object| {
             object
                 .types
@@ -364,26 +378,64 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
                 && object.metadata.namespace.as_deref() == Some("cnpg-system")
                 && object.name_any() == "cnpg-controller-manager"
         });
-        if deployment.is_none_or(|deployment| !readiness::workload_available(deployment)) {
-            return self.progress(context.tenant, DEPENDENCY_INTERVAL).await;
+        let runtime_ready = storage_ready
+            && !operator.created
+            && !operator.pending
+            && deployment.is_some_and(readiness::workload_available);
+        let previous = context
+            .tenant
+            .status
+            .as_ref()
+            .and_then(|status| status.database_capability.clone());
+        let expected = previous.as_ref().and_then(DatabaseCapability::identity);
+        let mut capability = previous.unwrap_or_default();
+        capability.available = false;
+        capability.reason = "RuntimeNotReady".into();
+        if runtime_ready {
+            let tenant_uid = context
+                .tenant
+                .uid()
+                .ok_or_else(|| ReconcileError::OwnershipInvalid("Tenant UID is missing".into()))?;
+            match tenant_database_runtime::ensure(
+                self.client.clone(),
+                context.name(),
+                &tenant_uid,
+                false,
+                expected.as_ref(),
+            )
+            .await
+            {
+                Ok(identity) => {
+                    capability.available = true;
+                    capability.reason = "Ready".into();
+                    capability.namespace_uid = identity.namespace_uid;
+                    capability.quota_uid = identity.quota_uid;
+                    capability.gate_uid = identity.gate_uid;
+                    capability.storage_namespace_uid = identity.storage_namespace_uid;
+                }
+                Err(error) => {
+                    tracing::warn!(tenant = %context.name(), reason = %error, "database capability unavailable");
+                    capability.reason = "GateUnavailable".into();
+                }
+            }
         }
         let components = Components {
             control_plane: readiness::management_conditions_ready(cluster, &["Available"])?,
             workers: workers.inventory_complete && workers.all_ready,
             network: workers.network_ready,
-            storage: storage
-                .object
-                .data
-                .get("provisioner")
-                .and_then(serde_json::Value::as_str)
-                == Some("kubernetes.io/no-provisioner"),
+            storage: true,
         };
         status::update_status(self.client.clone(), context.tenant, |status| {
             components.publish(status, context.tenant);
+            status.database_capability = Some(capability.clone());
             Ok(())
         })
         .await?;
-        Ok(Action::requeue(READY_INTERVAL))
+        Ok(Action::requeue(if capability.available {
+            READY_INTERVAL
+        } else {
+            DEPENDENCY_INTERVAL
+        }))
     }
 }
 fn image<'a>(foundation: &'a Foundation, key: &str) -> Result<&'a ImageArchive, ReconcileError> {
