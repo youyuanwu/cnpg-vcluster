@@ -577,7 +577,7 @@ mod tests {
         future::ready,
         path::PathBuf,
         sync::{
-            Arc,
+            Arc, Mutex,
             atomic::{AtomicUsize, Ordering},
         },
     };
@@ -630,6 +630,7 @@ mod tests {
         database_queries: AtomicUsize,
         tenant_creates: AtomicUsize,
         tenant_deletes: AtomicUsize,
+        created_tenants: Mutex<Vec<Tenant>>,
     }
 
     impl DataSource for MockSource {
@@ -652,6 +653,11 @@ mod tests {
 
         fn create_tenant(&self, mut tenant: Tenant) -> SourceFuture<'_, Tenant> {
             self.calls.tenant_creates.fetch_add(1, Ordering::Relaxed);
+            self.calls
+                .created_tenants
+                .lock()
+                .unwrap()
+                .push(tenant.clone());
             tenant.metadata.uid = Some("created-uid".into());
             tenant.metadata.generation = Some(1);
             Box::pin(ready(Ok(tenant)))
@@ -969,6 +975,36 @@ mod tests {
         let envelope: ApiErrorEnvelope = response_json(response).await;
         assert_eq!(envelope.error.field_errors[0].field, TenantField::Databases);
         assert_eq!(calls.tenant_creates.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn azure_tenant_create_uses_server_provider_and_supported_version() {
+        let source = MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(None),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router_with_provider(source, ProviderMode::Azure);
+        let request = Request::post(API_TENANTS_PATH)
+            .body(Body::from(
+                r#"{"name":"tenant-b","workers":2,"databases":null}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let created = calls.created_tenants.lock().unwrap();
+        assert_eq!(created.len(), 1);
+        assert_eq!(created[0].spec.kubernetes_version, "1.36.4");
+        assert_eq!(created[0].spec.workers, 2);
+        assert!(matches!(
+            created[0].spec.provider,
+            TenantProviderSpec::Azure
+        ));
     }
 
     #[tokio::test]
