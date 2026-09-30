@@ -300,6 +300,21 @@ def _require_recreated_identity(
         raise RuntimeError("Azure Tenant recreation retained old identity")
 
 
+def _require_allocation_lease_absent(lease_name: str) -> None:
+    response = _kubectl(
+        ROOT,
+        "-n",
+        "tenant-system",
+        "get",
+        f"lease/{lease_name}",
+        "--ignore-not-found=true",
+        "-o",
+        "name",
+    )
+    if response.stdout.strip():
+        raise RuntimeError("Azure Tenant allocation Lease remained after deletion")
+
+
 def _source_sha256(spec_path: Path) -> str:
     tracked = run(
         ["git", "status", "--porcelain", "--untracked-files=no"],
@@ -386,7 +401,13 @@ def main(arguments: list[str]) -> int:
     ):
         raise RuntimeError("Azure Tenant allocation status is incomplete")
     allocation_lease_uid = allocation.get("leaseUID")
-    if not isinstance(allocation_lease_uid, str) or not allocation_lease_uid:
+    allocation_lease_name = allocation.get("leaseName")
+    if (
+        not isinstance(allocation_lease_uid, str)
+        or not allocation_lease_uid
+        or not isinstance(allocation_lease_name, str)
+        or not allocation_lease_name
+    ):
         raise RuntimeError("Azure Tenant allocation Lease identity is incomplete")
 
     if _source_sha256(spec_path) != source_sha256:
@@ -450,6 +471,10 @@ def main(arguments: list[str]) -> int:
     phase(
         "external-absence-proof",
         lambda: prove_operator_deletion(ROOT, config, proof),
+    )
+    phase(
+        "allocation-release-proof",
+        lambda: _require_allocation_lease_absent(allocation_lease_name),
     )
 
     def verify_foundation() -> None:

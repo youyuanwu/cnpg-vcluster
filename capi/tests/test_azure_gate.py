@@ -15,6 +15,7 @@ from scripts.test_azure_tenant_lifecycle import (
     _admin_create_tenant,
     _admin_delete_tenant,
     _ensure_tenant_ready,
+    _require_allocation_lease_absent,
     _require_recreated_identity,
 )
 
@@ -117,6 +118,20 @@ class AzureGateTests(unittest.TestCase):
                     "tenant-old",
                     "lease-old",
                 )
+
+    def test_allocation_release_proof_rejects_retained_lease(self):
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle._kubectl",
+                return_value=type(
+                    "Result",
+                    (),
+                    {"stdout": "lease.coordination.k8s.io/tenant-azure-slot-old\n"},
+                )(),
+            ),
+            self.assertRaisesRegex(RuntimeError, "Lease remained"),
+        ):
+            _require_allocation_lease_absent("tenant-azure-slot-old")
 
     def test_ready_gate_reuses_parsed_spec_after_terminating_tenant(self) -> None:
         spec = type("Spec", (), {"name": "tenant-c"})()
