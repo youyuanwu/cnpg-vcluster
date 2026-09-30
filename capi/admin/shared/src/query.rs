@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use crate::lifecycle::CreationCapability;
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderMode {
@@ -60,6 +62,7 @@ pub struct TenantCounts {
 #[serde(rename_all = "camelCase")]
 pub struct ManagementOverview {
     pub provider_mode: ProviderMode,
+    pub creation: CreationCapability,
     pub tenants: TenantCounts,
     pub components: Vec<ManagementComponentView>,
 }

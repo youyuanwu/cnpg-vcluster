@@ -9,13 +9,19 @@ use std::{
 use axum::http::uri::Authority;
 use chrono::{SecondsFormat, Utc};
 use futures::{StreamExt, stream};
-use k8s_openapi::api::core::v1::{Pod, Secret};
+use k8s_openapi::api::{
+    apps::v1::Deployment,
+    core::v1::{Pod, Secret},
+};
 use kube::{
-    Api, Client,
-    api::{ListParams, ObjectList},
+    Api, Client, ResourceExt,
+    api::{DeleteParams, ListParams, ObjectList, PostParams, Preconditions, PropagationPolicy},
     core::{ApiResource, DynamicObject, GroupVersionKind},
 };
 use serde::Deserialize;
+use tenant_admin_shared::lifecycle::{
+    CreationCapability, TenantDeleteResponse, TenantDeleteState, TenantMutationIdentity,
+};
 use tenant_admin_shared::query::{
     ConditionStatus, DatabaseClusterIdentity, DatabaseClusterObservation, DatabaseCondition,
     DatabaseInstanceObservation, DatabaseInstanceRole, DatabaseNotApplicableReason,
@@ -59,6 +65,8 @@ const MAX_INSTANCE_BYTES: usize = 63;
 const MAX_DATABASE_USERNAME_BYTES: usize = 1_024;
 const MAX_DATABASE_PASSWORD_BYTES: usize = 16 * 1_024;
 const DATABASE_SUPERUSER_SECRET_NAME: &str = "capi-postgres-superuser";
+const CONTROLLER_NAMESPACE: &str = "tenant-system";
+const CONTROLLER_DEPLOYMENT: &str = "tenant-controller";
 
 pub type SourceFuture<'a, T> = Pin<Box<dyn Future<Output = Result<T, SourceError>> + Send + 'a>>;
 type TenantClientFuture<'a> =
@@ -98,6 +106,26 @@ impl TenantClientLoader for ValidatedTenantClientLoader {
 pub trait DataSource: Send + Sync {
     fn list_tenants(&self) -> SourceFuture<'_, Vec<Tenant>>;
     fn get_tenant(&self, name: &str) -> SourceFuture<'_, Option<Tenant>>;
+    fn creation_capability(&self, provider: ProviderMode) -> SourceFuture<'_, CreationCapability> {
+        let _ = provider;
+        Box::pin(async {
+            Ok(CreationCapability::unavailable(
+                "Tenant creation capability is unavailable",
+            ))
+        })
+    }
+    fn create_tenant(&self, tenant: Tenant) -> SourceFuture<'_, Tenant> {
+        let _ = tenant;
+        Box::pin(async { Err(SourceError::CreationUnavailable) })
+    }
+    fn delete_tenant<'a>(
+        &'a self,
+        name: &'a str,
+        uid: &'a str,
+    ) -> SourceFuture<'a, TenantDeleteResponse> {
+        let _ = (name, uid);
+        Box::pin(async { Err(SourceError::KubernetesUnavailable) })
+    }
     fn list_management_resources(
         &self,
         provider: ProviderMode,
@@ -169,6 +197,157 @@ impl KubeDataSource {
             })
     }
 
+    async fn load_creation_capability(&self, provider: ProviderMode) -> CreationCapability {
+        let api = Api::<Deployment>::namespaced(self.client.clone(), CONTROLLER_NAMESPACE);
+        let deployment = match api.get_opt(CONTROLLER_DEPLOYMENT).await {
+            Ok(Some(deployment)) => deployment,
+            Ok(None) => {
+                return CreationCapability::unavailable(
+                    "Tenant controller Deployment is unavailable",
+                );
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %tenant_controller::sanitize::text(&error.to_string()),
+                    "Tenant creation capability read failed"
+                );
+                return CreationCapability::unavailable(
+                    "Tenant controller capability is unavailable",
+                );
+            }
+        };
+        let Some(spec) = deployment.spec.as_ref() else {
+            return CreationCapability::unavailable("Tenant controller capability is malformed");
+        };
+        let replicas = spec.replicas.unwrap_or(1);
+        let status = deployment.status.as_ref();
+        if replicas < 1
+            || deployment.metadata.deletion_timestamp.is_some()
+            || deployment.metadata.generation
+                != status.and_then(|status| status.observed_generation)
+            || status.and_then(|status| status.updated_replicas) != Some(replicas)
+            || status.and_then(|status| status.ready_replicas) != Some(replicas)
+            || status.and_then(|status| status.available_replicas) != Some(replicas)
+        {
+            return CreationCapability::unavailable("Tenant controller rollout is not complete");
+        }
+        let mut managers = spec
+            .template
+            .spec
+            .as_ref()
+            .into_iter()
+            .flat_map(|pod| pod.containers.iter())
+            .filter(|container| container.name == "manager");
+        let Some(manager) = managers.next().filter(|_| managers.next().is_none()) else {
+            return CreationCapability::unavailable("Tenant controller capability is malformed");
+        };
+        let args = manager.args.as_deref().unwrap_or_default();
+        let expected_provider = match provider {
+            ProviderMode::Local => "local",
+            ProviderMode::Azure => "azure",
+        };
+        if exact_argument(args, "--provider") != Some(expected_provider) {
+            return CreationCapability::unavailable(
+                "Tenant controller provider does not match Tenant Admin",
+            );
+        }
+        let Some(version) = exact_argument(args, "--supported-kubernetes-version")
+            .map(|value| value.trim_start_matches('v'))
+            .filter(|value| valid_version(value))
+        else {
+            return CreationCapability::unavailable(
+                "Tenant controller supported version is unavailable",
+            );
+        };
+        CreationCapability::available(version)
+    }
+
+    async fn create_exact_tenant(&self, tenant: Tenant) -> Result<Tenant, SourceError> {
+        Api::<Tenant>::all(self.client.clone())
+            .create(&PostParams::default(), &tenant)
+            .await
+            .map_err(|error| match error {
+                kube::Error::Api(status) if status.code == 409 => SourceError::Conflict,
+                error => {
+                    tracing::warn!(
+                        error = %tenant_controller::sanitize::text(&error.to_string()),
+                        "Tenant create failed"
+                    );
+                    SourceError::KubernetesUnavailable
+                }
+            })
+    }
+
+    async fn delete_exact_tenant(
+        &self,
+        name: &str,
+        expected_uid: &str,
+    ) -> Result<TenantDeleteResponse, SourceError> {
+        let api = Api::<Tenant>::all(self.client.clone());
+        let Some(tenant) = api
+            .get_opt(name)
+            .await
+            .map_err(|_| SourceError::KubernetesUnavailable)?
+        else {
+            return Ok(delete_response(
+                name,
+                expected_uid,
+                None,
+                TenantDeleteState::Completed,
+            ));
+        };
+        let uid = tenant
+            .uid()
+            .filter(|value| !value.is_empty())
+            .ok_or(SourceError::StaleIdentity)?;
+        if uid != expected_uid {
+            return Err(SourceError::StaleIdentity);
+        }
+        let generation = tenant.metadata.generation;
+        if tenant.metadata.deletion_timestamp.is_some() {
+            return Ok(delete_response(
+                name,
+                &uid,
+                generation,
+                TenantDeleteState::Accepted,
+            ));
+        }
+        let resource_version = tenant
+            .resource_version()
+            .filter(|value| !value.is_empty())
+            .ok_or(SourceError::Conflict)?;
+        let params = DeleteParams {
+            preconditions: Some(Preconditions {
+                uid: Some(uid.clone()),
+                resource_version: Some(resource_version),
+            }),
+            propagation_policy: Some(PropagationPolicy::Background),
+            ..DeleteParams::default()
+        };
+        match api.delete(name, &params).await {
+            Ok(_) => Ok(delete_response(
+                name,
+                &uid,
+                generation,
+                TenantDeleteState::Accepted,
+            )),
+            Err(kube::Error::Api(status)) if status.code == 404 => Ok(delete_response(
+                name,
+                &uid,
+                generation,
+                TenantDeleteState::Completed,
+            )),
+            Err(kube::Error::Api(status)) if status.code == 409 => Err(SourceError::Conflict),
+            Err(error) => {
+                tracing::warn!(
+                    error = %tenant_controller::sanitize::text(&error.to_string()),
+                    "Tenant delete failed"
+                );
+                Err(SourceError::KubernetesUnavailable)
+            }
+        }
+    }
+
     async fn list_definition(
         client: Client,
         definition: ManagementResource,
@@ -195,6 +374,7 @@ impl KubeDataSource {
                     });
                     Ok(vec![object])
                 }
+
                 Ok(None) => Ok(Vec::new()),
                 Err(error) => {
                     tracing::warn!(
@@ -1169,6 +1349,38 @@ fn bounded(value: &str, max: usize) -> String {
         .collect()
 }
 
+fn exact_argument<'a>(arguments: &'a [String], name: &str) -> Option<&'a str> {
+    let prefix = format!("{name}=");
+    let mut values = arguments
+        .iter()
+        .filter_map(|argument| argument.strip_prefix(&prefix));
+    let value = values.next()?;
+    values.next().is_none().then_some(value)
+}
+
+fn valid_version(value: &str) -> bool {
+    value.split('.').count() == 3
+        && value
+            .split('.')
+            .all(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
+fn delete_response(
+    name: &str,
+    uid: &str,
+    generation: Option<i64>,
+    state: TenantDeleteState,
+) -> TenantDeleteResponse {
+    TenantDeleteResponse {
+        identity: TenantMutationIdentity {
+            name: name.into(),
+            uid: uid.into(),
+            generation,
+        },
+        state,
+    }
+}
+
 impl DataSource for KubeDataSource {
     fn list_tenants(&self) -> SourceFuture<'_, Vec<Tenant>> {
         Box::pin(async move {
@@ -1201,6 +1413,22 @@ impl DataSource for KubeDataSource {
                     SourceError::KubernetesUnavailable
                 })
         })
+    }
+
+    fn creation_capability(&self, provider: ProviderMode) -> SourceFuture<'_, CreationCapability> {
+        Box::pin(async move { Ok(self.load_creation_capability(provider).await) })
+    }
+
+    fn create_tenant(&self, tenant: Tenant) -> SourceFuture<'_, Tenant> {
+        Box::pin(async move { self.create_exact_tenant(tenant).await })
+    }
+
+    fn delete_tenant<'a>(
+        &'a self,
+        name: &'a str,
+        uid: &'a str,
+    ) -> SourceFuture<'a, TenantDeleteResponse> {
+        Box::pin(async move { self.delete_exact_tenant(name, uid).await })
     }
 
     fn list_management_resources(
@@ -1294,7 +1522,7 @@ mod tests {
     use kube::client::Body;
     use serde_json::{Value, json};
     use tenant_controller::{
-        api::{SUPPORTED_KUBERNETES_VERSION, canonical_spec, spec_hash},
+        api::{SUPPORTED_KUBERNETES_VERSION, TenantSpec, canonical_spec, spec_hash},
         ownership::{
             FOUNDATION_ANNOTATION, RESOURCE_ANNOTATION, SPEC_HASH_ANNOTATION, TENANT_ANNOTATION,
             TENANT_UID_ANNOTATION,
@@ -2497,6 +2725,103 @@ mod tests {
                 Method::GET,
                 "/api/v1/namespaces/tenant-a/secrets/tenant-a-kubeconfig".into()
             )]
+        );
+    }
+
+    #[tokio::test]
+    async fn creation_capability_requires_converged_matching_controller_deployment() {
+        let deployment = json!({
+            "apiVersion":"apps/v1","kind":"Deployment",
+            "metadata":{"name":"tenant-controller","namespace":"tenant-system","generation":3},
+            "spec":{"replicas":1,"template":{"spec":{"containers":[{
+                "name":"manager","image":"controller",
+                "args":["--provider=local","--supported-kubernetes-version=v1.36.4"]
+            }]}}},
+            "status":{"observedGeneration":3,"updatedReplicas":1,"readyReplicas":1,"availableReplicas":1}
+        });
+        let (client, calls) = fixture_client(vec![(200, deployment)]);
+        let capability = KubeDataSource::new(client)
+            .creation_capability(ProviderMode::Local)
+            .await
+            .unwrap();
+        assert!(capability.available);
+        assert_eq!(
+            capability.supported_kubernetes_version.as_deref(),
+            Some("1.36.4")
+        );
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [(
+                Method::GET,
+                "/apis/apps/v1/namespaces/tenant-system/deployments/tenant-controller".into()
+            )]
+        );
+
+        let rolling = json!({
+            "apiVersion":"apps/v1","kind":"Deployment",
+            "metadata":{"name":"tenant-controller","namespace":"tenant-system","generation":4},
+            "spec":{"replicas":1,"template":{"spec":{"containers":[]}}},
+            "status":{"observedGeneration":3,"updatedReplicas":1,"readyReplicas":1,"availableReplicas":1}
+        });
+        let (client, _) = fixture_client(vec![(200, rolling)]);
+        assert!(
+            !KubeDataSource::new(client)
+                .creation_capability(ProviderMode::Local)
+                .await
+                .unwrap()
+                .available
+        );
+    }
+
+    #[tokio::test]
+    async fn tenant_create_and_delete_classify_conflict_and_exact_identity() {
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+        tenant.metadata.uid = Some("tenant-uid".into());
+        tenant.metadata.resource_version = Some("7".into());
+        tenant.metadata.generation = Some(2);
+        let status = json!({
+            "apiVersion":"v1","kind":"Status","status":"Failure",
+            "reason":"AlreadyExists","code":409
+        });
+        let (client, _) = fixture_client(vec![(409, status)]);
+        assert_eq!(
+            KubeDataSource::new(client)
+                .create_tenant(tenant.clone())
+                .await,
+            Err(SourceError::Conflict)
+        );
+
+        let serialized = serde_json::to_value(&tenant).unwrap();
+        let (client, calls) = fixture_client(vec![(200, serialized.clone())]);
+        assert_eq!(
+            KubeDataSource::new(client)
+                .delete_tenant("tenant-a", "replacement-uid")
+                .await,
+            Err(SourceError::StaleIdentity)
+        );
+        assert_eq!(calls.lock().unwrap().len(), 1);
+
+        let deleted = json!({
+            "apiVersion":"v1","kind":"Status","status":"Success","code":200
+        });
+        let (client, calls) = fixture_client(vec![(200, serialized), (200, deleted)]);
+        let response = KubeDataSource::new(client)
+            .delete_tenant("tenant-a", "tenant-uid")
+            .await
+            .unwrap();
+        assert_eq!(response.state, TenantDeleteState::Accepted);
+        assert_eq!(
+            calls.lock().unwrap().as_slice(),
+            [
+                (
+                    Method::GET,
+                    "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a".into()
+                ),
+                (
+                    Method::DELETE,
+                    "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a".into()
+                )
+            ]
         );
     }
 }

@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::API_SCHEMA_VERSION;
+use crate::lifecycle::TenantFieldError;
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -40,6 +41,8 @@ pub struct ApiError {
     pub code: ApiErrorCode,
     pub message: String,
     pub retryable: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_errors: Vec<TenantFieldError>,
 }
 
 impl ApiError {
@@ -48,7 +51,13 @@ impl ApiError {
             code,
             message: message.into(),
             retryable,
+            field_errors: Vec::new(),
         }
+    }
+
+    pub fn with_field_errors(mut self, field_errors: Vec<TenantFieldError>) -> Self {
+        self.field_errors = field_errors;
+        self
     }
 }
 
@@ -59,6 +68,9 @@ pub enum ApiErrorCode {
     InvalidRequest,
     SchemaMismatch,
     KubernetesUnavailable,
+    CreationUnavailable,
+    Conflict,
+    StaleIdentity,
     DatabaseUnavailable,
     QueryFailed,
     QueryResponseTooLarge,

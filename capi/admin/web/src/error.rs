@@ -1,4 +1,6 @@
-use tenant_admin_shared::{API_SCHEMA_VERSION, ApiError, ApiErrorCode, ApiErrorEnvelope};
+use tenant_admin_shared::{
+    API_SCHEMA_VERSION, ApiError, ApiErrorCode, ApiErrorEnvelope, lifecycle::TenantFieldError,
+};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum UiErrorKind {
@@ -6,6 +8,9 @@ pub enum UiErrorKind {
     InvalidRequest,
     SchemaMismatch,
     KubernetesUnavailable,
+    CreationUnavailable,
+    Conflict,
+    StaleIdentity,
     DatabaseUnavailable,
     QueryFailed,
     QueryResponseTooLarge,
@@ -20,6 +25,7 @@ pub struct UiError {
     pub kind: UiErrorKind,
     pub message: String,
     pub retryable: bool,
+    pub field_errors: Vec<TenantFieldError>,
 }
 
 impl UiError {
@@ -28,6 +34,7 @@ impl UiError {
             kind: UiErrorKind::Network,
             message: message.into(),
             retryable: true,
+            field_errors: Vec::new(),
         }
     }
 
@@ -38,6 +45,7 @@ impl UiError {
                 "The server returned API schema version {actual}; this UI requires version {API_SCHEMA_VERSION}."
             ),
             retryable: false,
+            field_errors: Vec::new(),
         }
     }
 
@@ -47,6 +55,9 @@ impl UiError {
             UiErrorKind::InvalidRequest => "Invalid request",
             UiErrorKind::SchemaMismatch => "UI and server versions do not match",
             UiErrorKind::KubernetesUnavailable => "Kubernetes is unavailable",
+            UiErrorKind::CreationUnavailable => "Tenant creation is unavailable",
+            UiErrorKind::Conflict => "Tenant request conflicts with current state",
+            UiErrorKind::StaleIdentity => "Tenant identity changed",
             UiErrorKind::DatabaseUnavailable => "The database is unavailable",
             UiErrorKind::QueryFailed => "The SQL query failed",
             UiErrorKind::QueryResponseTooLarge => "The SQL response was too large",
@@ -65,6 +76,9 @@ impl From<ApiError> for UiError {
             ApiErrorCode::InvalidRequest => UiErrorKind::InvalidRequest,
             ApiErrorCode::SchemaMismatch => UiErrorKind::SchemaMismatch,
             ApiErrorCode::KubernetesUnavailable => UiErrorKind::KubernetesUnavailable,
+            ApiErrorCode::CreationUnavailable => UiErrorKind::CreationUnavailable,
+            ApiErrorCode::Conflict => UiErrorKind::Conflict,
+            ApiErrorCode::StaleIdentity => UiErrorKind::StaleIdentity,
             ApiErrorCode::DatabaseUnavailable => UiErrorKind::DatabaseUnavailable,
             ApiErrorCode::QueryFailed => UiErrorKind::QueryFailed,
             ApiErrorCode::QueryResponseTooLarge => UiErrorKind::QueryResponseTooLarge,
@@ -76,6 +90,7 @@ impl From<ApiError> for UiError {
             kind,
             message: error.message,
             retryable: error.retryable,
+            field_errors: error.field_errors,
         }
     }
 }
@@ -114,6 +129,7 @@ pub fn map_error_response(status: u16, body: &str) -> UiError {
         kind,
         message: message.to_owned(),
         retryable,
+        field_errors: Vec::new(),
     }
 }
 

@@ -34,7 +34,7 @@ ADMIN_LABEL = "app.kubernetes.io/name=tenant-admin"
 ADMIN_SERVICE_PROXY = (
     "/api/v1/namespaces/tenant-system/services/http:tenant-admin:80/proxy"
 )
-ADMIN_API_SCHEMA_VERSION = 3
+ADMIN_API_SCHEMA_VERSION = 4
 ADMIN_IMAGE_PATTERN = re.compile(
     r"[a-z0-9](?:[a-z0-9._/-]*[a-z0-9])?:"
     r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}"
@@ -186,19 +186,40 @@ def _normalized_rules(value: object) -> list[tuple[tuple[str, ...], ...]]:
     normalized = []
     for rule_value in rules:
         rule = _required_mapping(rule_value, "ClusterRole rule")
-        if set(rule) != {"apiGroups", "resources", "verbs"}:
+        if not set(rule).issubset(
+            {"apiGroups", "resources", "verbs", "resourceNames"}
+        ):
             raise RuntimeError("Tenant Admin ClusterRole rule has unexpected fields")
         raw_groups = _required_list(rule["apiGroups"], "RBAC API groups")
         raw_resources = _required_list(rule["resources"], "RBAC resources")
         raw_verbs = _required_list(rule["verbs"], "RBAC verbs")
+        raw_names = rule.get("resourceNames", [])
+        if not isinstance(raw_names, list):
+            raise RuntimeError("Tenant Admin ClusterRole resourceNames are invalid")
         if not all(
             isinstance(value, str)
-            for value in (*raw_groups, *raw_resources, *raw_verbs)
+            for value in (*raw_groups, *raw_resources, *raw_verbs, *raw_names)
         ):
             raise RuntimeError("Tenant Admin ClusterRole values are invalid")
         groups = tuple(sorted(raw_groups))
         resources = tuple(sorted(raw_resources))
         verbs = tuple(sorted(raw_verbs))
+        names = tuple(sorted(raw_names))
+        tenant_mutation = (
+            groups == ("tenancy.cnpg-vcluster.io",)
+            and resources == ("tenants",)
+            and set(verbs) == {"create", "delete", "get", "list"}
+            and not names
+        )
+        controller_read = (
+            groups == ("apps",)
+            and resources == ("deployments",)
+            and verbs == ("get",)
+            and names == ("tenant-controller",)
+        )
+        ordinary_read = (
+            set(verbs).issubset({"get", "list"}) and not names
+        )
         if (
             "*" in groups
             or "*" in resources
@@ -213,10 +234,10 @@ def _normalized_rules(value: object) -> list[tuple[tuple[str, ...], ...]]:
             )
             or any("/" in resource for resource in resources)
             or not verbs
-            or any(verb not in {"get", "list"} for verb in verbs)
+            or not (tenant_mutation or controller_read or ordinary_read)
         ):
             raise RuntimeError("Tenant Admin ClusterRole is not exact read-only RBAC")
-        normalized.append((groups, resources, verbs))
+        normalized.append((groups, resources, verbs, names))
     return sorted(normalized)
 
 
@@ -856,10 +877,27 @@ def _local_overview(
         overview_snapshot.get("overview"), "overview summary"
     )
     if (
-        set(overview) != {"providerMode", "tenants", "components"}
+        set(overview) != {"providerMode", "creation", "tenants", "components"}
         or overview.get("providerMode") != "local"
     ):
         raise RuntimeError("Tenant Admin overview response is invalid")
+    creation = _required_mapping(
+        overview.get("creation"), "overview creation capability"
+    )
+    if (
+        set(creation)
+        != {"available", "supportedKubernetesVersion", "reason"}
+        or not isinstance(creation.get("available"), bool)
+        or (
+            creation["available"]
+            and (
+                not isinstance(creation.get("supportedKubernetesVersion"), str)
+                or not creation["supportedKubernetesVersion"]
+                or creation.get("reason") is not None
+            )
+        )
+    ):
+        raise RuntimeError("Tenant Admin creation capability is invalid")
     counts = _required_mapping(overview.get("tenants"), "overview counts")
     if set(counts) != {
         "total",

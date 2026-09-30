@@ -43,7 +43,7 @@ ADMIN_SERVICE_PROXY = (
     "/api/v1/namespaces/tenant-system/"
     "services/http:tenant-admin:http/proxy"
 )
-ADMIN_API_SCHEMA_VERSION = 3
+ADMIN_API_SCHEMA_VERSION = 4
 CAPI_CAPZ_DEPLOYMENTS = (
     ("capi-system", "capi-controller-manager"),
     (
@@ -1298,27 +1298,34 @@ def _tracked_admin_resource(
 
 def _normalized_admin_rules(
     value: object,
-) -> list[tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]] | None:
+) -> list[
+    tuple[
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+        tuple[str, ...],
+    ]
+] | None:
     if not isinstance(value, list):
         return None
     normalized = []
     for rule in value:
-        if not isinstance(rule, dict) or set(rule) != {
-            "apiGroups",
-            "resources",
-            "verbs",
-        }:
+        if not isinstance(rule, dict) or not set(rule).issubset({
+            "apiGroups", "resources", "verbs", "resourceNames",
+        }):
             return None
         groups = rule["apiGroups"]
         resources = rule["resources"]
         verbs = rule["verbs"]
+        names = rule.get("resourceNames", [])
         if (
             not isinstance(groups, list)
             or not isinstance(resources, list)
             or not isinstance(verbs, list)
+            or not isinstance(names, list)
             or not all(
                 isinstance(item, str)
-                for item in (*groups, *resources, *verbs)
+                for item in (*groups, *resources, *verbs, *names)
             )
         ):
             return None
@@ -1327,6 +1334,7 @@ def _normalized_admin_rules(
                 tuple(sorted(groups)),
                 tuple(sorted(resources)),
                 tuple(sorted(verbs)),
+                tuple(sorted(names)),
             )
         )
     return sorted(normalized)

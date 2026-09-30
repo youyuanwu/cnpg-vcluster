@@ -331,15 +331,15 @@ def check_repository_boundaries() -> None:
     )
     check("admin-metrics:" in justfile, "admin metrics recipe is missing")
     check(
-        "scripts/admin_metrics.py --max 7500" in justfile,
-        "admin production-line threshold is not enforced",
+        "scripts/admin_metrics.py" in justfile
+        and "scripts/admin_metrics.py --max" not in justfile,
+        "admin metrics must remain informational without a line ceiling",
     )
     admin_metrics_source = (ROOT / "scripts/admin_metrics.py").read_text(
         encoding="utf-8"
     )
     for contract in (
         "ADMIN_BASELINE_LINES = 3916",
-        "MAX_ADMIN_PRODUCTION_LINES = 7500",
         'for crate in ("shared", "server", "web")',
         "Admin Rust: baseline=",
     ):

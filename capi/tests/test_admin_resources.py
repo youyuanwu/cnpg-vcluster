@@ -185,21 +185,35 @@ class AdminResourceTests(unittest.TestCase):
                 self.assertNotEqual("*", group)
                 resources = tuple(rule["resources"])
                 verbs = tuple(rule["verbs"])
+                names = tuple(rule.get("resourceNames", []))
                 self.assertNotIn("*", resources)
                 self.assertTrue(
                     all("/" not in resource for resource in resources)
                 )
-                self.assertTrue(set(verbs).issubset({"get", "list"}))
                 if "secrets" in resources:
                     self.assertEqual("local", provider)
                     self.assertEqual(
                         ("", ("secrets",), ("get",)),
                         (group, resources, verbs),
                     )
-                actual.add((group, resources, verbs))
-            self.assertEqual(EXPECTED_RBAC[provider], actual)
+                actual.add((group, resources, verbs, names))
+            expected = {
+                (group, resources, verbs, ())
+                for group, resources, verbs in EXPECTED_RBAC[provider]
+                if group != "tenancy.cnpg-vcluster.io"
+            }
+            expected.update({
+                (
+                    "tenancy.cnpg-vcluster.io",
+                    ("tenants",),
+                    ("create", "delete", "get", "list"),
+                    (),
+                ),
+                ("apps", ("deployments",), ("get",), ("tenant-controller",)),
+            })
+            self.assertEqual(expected, actual)
             self.assertEqual(
-                tuple(sorted(EXPECTED_RBAC[provider])),
+                tuple(sorted(expected)),
                 generator.provider_rules(ROOT, provider),
             )
 

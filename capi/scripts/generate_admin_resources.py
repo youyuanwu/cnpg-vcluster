@@ -24,7 +24,7 @@ PROVIDER_CATALOGS = {
 }
 PROVIDER_EXPLICIT_RULES = {
     "azure": (),
-    "local": (("", ("secrets",), ("get",)),),
+    "local": (("", ("secrets",), ("get",), ()),),
 }
 
 OUTPUT_PATHS = (
@@ -64,7 +64,9 @@ def cluster_role_binding_path(provider: str) -> Path:
 def provider_rules(
     root: Path,
     provider: str,
-) -> tuple[tuple[str, tuple[str, ...], tuple[str, ...]], ...]:
+) -> tuple[
+    tuple[str, tuple[str, ...], tuple[str, ...], tuple[str, ...]], ...
+]:
     if provider not in PROVIDERS:
         raise ValueError(f"unsupported admin provider: {provider}")
     catalog_path = root / PROVIDER_CATALOGS[provider]
@@ -114,14 +116,20 @@ def provider_rules(
         else:
             listed.setdefault(api_group, set()).add(plural)
     rules = [
-        ("tenancy.cnpg-vcluster.io", ("tenants",), ("get", "list")),
+        (
+            "tenancy.cnpg-vcluster.io",
+            ("tenants",),
+            ("create", "delete", "get", "list"),
+            (),
+        ),
+        ("apps", ("deployments",), ("get",), ("tenant-controller",)),
         *PROVIDER_EXPLICIT_RULES[provider],
         *(
-            (group, tuple(sorted(resources)), ("get",))
+            (group, tuple(sorted(resources)), ("get",), ())
             for group, resources in exact_gets.items()
         ),
         *(
-            (group, tuple(sorted(resources)), ("list",))
+            (group, tuple(sorted(resources)), ("list",), ())
             for group, resources in listed.items()
         ),
     ]
@@ -138,12 +146,12 @@ def _cluster_role(root: Path, provider: str) -> dict[str, object]:
         "kind": "ClusterRole",
         "metadata": {"name": ADMIN_ROLE_NAMES[provider]},
         "rules": [
-            {
+            ({
                 "apiGroups": [api_group],
                 "resources": list(resources),
                 "verbs": list(verbs),
-            }
-            for api_group, resources, verbs in provider_rules(root, provider)
+            } | ({"resourceNames": list(resource_names)} if resource_names else {}))
+            for api_group, resources, verbs, resource_names in provider_rules(root, provider)
         ],
     }
 

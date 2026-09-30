@@ -1,7 +1,9 @@
 pub const API_PREFIX: &str = "/api/v1";
 pub const API_OVERVIEW_PATH: &str = "/api/v1/overview";
 pub const API_TENANTS_PATH: &str = "/api/v1/tenants";
+pub const API_TENANT_CREATE_PATH: &str = API_TENANTS_PATH;
 pub const API_TENANT_PATH: &str = "/api/v1/tenants/{name}";
+pub const API_TENANT_DELETE_PATH: &str = API_TENANT_PATH;
 pub const API_TENANT_TOPOLOGY_PATH: &str = "/api/v1/tenants/{name}/topology";
 pub const API_TENANT_DATABASE_QUERY_PATH: &str = "/api/v1/tenants/{name}/database/query";
 pub const TENANT_ADMIN_UNSAFE_REQUEST_HEADER: &str = "x-tenant-admin-unsafe-request";

@@ -263,10 +263,15 @@ class FakeClient:
         if path.endswith("/api/v1/overview"):
             return json.dumps(
                 {
-                    "schemaVersion": 3,
+                    "schemaVersion": 4,
                     "data": {
                         "overview": {
                             "providerMode": "local",
+                            "creation": {
+                                "available": True,
+                                "supportedKubernetesVersion": "1.36.4",
+                                "reason": None,
+                            },
                             "tenants": {
                                 "total": len(self.tenant_names),
                                 "ready": len(self.tenant_names),
@@ -286,7 +291,7 @@ class FakeClient:
         if path.endswith("/api/v1/tenants"):
             return json.dumps(
                 {
-                    "schemaVersion": 3,
+                    "schemaVersion": 4,
                     "data": [
                         tenant_summary(name) for name in self.tenant_names
                     ],
@@ -296,14 +301,14 @@ class FakeClient:
             if path.endswith(f"/api/v1/tenants/{name}/topology"):
                 return json.dumps(
                     {
-                        "schemaVersion": 3,
+                        "schemaVersion": 4,
                         "data": topology(name),
                     }
                 )
             if path.endswith(f"/api/v1/tenants/{name}"):
                 return json.dumps(
                     {
-                        "schemaVersion": 3,
+                        "schemaVersion": 4,
                         "data": {
                             "identity": {
                                 "uid": f"{name}-uid",
@@ -346,7 +351,7 @@ class FakeClient:
             request = json.loads(kwargs["input_text"])
             tenant_name = arguments[2].split("/tenants/", 1)[1].split("/", 1)[0]
             return response(json.dumps({
-                "schemaVersion": 3,
+                "schemaVersion": 4,
                 "data": {
                     "tenant": tenant_name,
                     "cluster": "capi-postgres",
@@ -754,11 +759,11 @@ class AdminLocalTests(unittest.TestCase):
             if path.endswith("/api/v1/tenants"):
                 summary = tenant_summary("tenant-a")
                 summary["classification"] = "progressing"
-                return json.dumps({"schemaVersion": 3, "data": [summary]})
+                return json.dumps({"schemaVersion": 4, "data": [summary]})
             if path.endswith("/api/v1/tenants/tenant-a/topology"):
                 topology = json.loads(original_transition(path))["data"]
                 topology["nodes"][0]["health"] = "progressing"
-                return json.dumps({"schemaVersion": 3, "data": topology})
+                return json.dumps({"schemaVersion": 4, "data": topology})
             return original_transition(path)
 
         with patch.object(
@@ -832,7 +837,7 @@ class AdminLocalTests(unittest.TestCase):
 
         def malformed_response(path: str) -> str:
             if path.endswith("/api/v1/overview"):
-                return '{"schemaVersion":3,"data":[]}'
+                return '{"schemaVersion":4,"data":[]}'
             return original(path)
 
         with patch.object(

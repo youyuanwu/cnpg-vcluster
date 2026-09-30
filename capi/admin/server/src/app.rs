@@ -16,6 +16,10 @@ use axum::{
 };
 use tenant_admin_shared::{
     ApiEnvelope,
+    lifecycle::{
+        TenantCreateRequest, TenantCreateResponse, TenantDeleteRequest, TenantDeleteResponse,
+        TenantDeleteState, TenantField, TenantFieldError, TenantMutationIdentity,
+    },
     query::{
         DatabaseQueryRequest, DatabaseQueryResponse, ManagementComponentView, ManagementOverview,
         OverviewSnapshot, ProviderMode, TenantClassification, TenantCounts, TenantSnapshot,
@@ -27,16 +31,17 @@ use tenant_admin_shared::{
         TENANT_ADMIN_UNSAFE_REQUEST_HEADER, TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
     },
 };
-use tenant_controller::api::TenantProviderSpec;
+use tenant_controller::api::{Tenant, TenantProviderSpec, TenantSpec, canonical_spec};
 use tower::{ServiceExt, service_fn};
 use tower_http::{
     services::{ServeDir, ServeFile},
     trace::TraceLayer,
 };
 
-use crate::{AppError, DataSource, TenantProjection, project_summary};
+use crate::{AppError, DataSource, SourceError, TenantProjection, project_summary};
 
 const MAX_DATABASE_QUERY_BODY_BYTES: usize = 128 * 1_024;
+const MAX_TENANT_MUTATION_BODY_BYTES: usize = 16 * 1_024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -76,8 +81,18 @@ pub fn router(state: AppState, web_directory: PathBuf) -> Router {
         .route("/healthz", get(healthz))
         .route(READINESS_PATH, get(readyz))
         .route(API_OVERVIEW_PATH, get(overview))
-        .route(API_TENANTS_PATH, get(tenants))
-        .route(API_TENANT_PATH, get(tenant_detail))
+        .route(
+            API_TENANTS_PATH,
+            get(tenants)
+                .post(tenant_create)
+                .layer(DefaultBodyLimit::max(MAX_TENANT_MUTATION_BODY_BYTES)),
+        )
+        .route(
+            API_TENANT_PATH,
+            get(tenant_detail)
+                .delete(tenant_delete)
+                .layer(DefaultBodyLimit::max(MAX_TENANT_MUTATION_BODY_BYTES)),
+        )
         .route(API_TENANT_TOPOLOGY_PATH, get(tenant_topology))
         .route(
             API_TENANT_DATABASE_QUERY_PATH,
@@ -121,9 +136,11 @@ async fn overview(
     State(state): State<AppState>,
 ) -> Result<Json<ApiEnvelope<OverviewSnapshot>>, AppError> {
     let tenants = state.source.list_tenants().await?;
+    let creation = state.source.creation_capability(state.provider).await?;
     let summaries = sorted_summaries(state.provider, tenants);
     let overview = ManagementOverview {
         provider_mode: state.provider,
+        creation,
         tenants: counts(&summaries),
         components: vec![ManagementComponentView {
             name: "kubernetes-api".into(),
@@ -136,6 +153,89 @@ async fn overview(
         overview,
         tenants: summaries,
     })))
+}
+
+async fn tenant_create(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(StatusCode, Json<ApiEnvelope<TenantCreateResponse>>), AppError> {
+    validate_request_origin(&headers)?;
+    let body = body.map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    let request: TenantCreateRequest = serde_json::from_slice(&body)
+        .map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    let field_errors = validate_create_request(state.provider, &request);
+    if !field_errors.is_empty() {
+        return Err(AppError::invalid_fields(
+            "Tenant creation fields are invalid",
+            field_errors,
+        ));
+    }
+    let capability = state.source.creation_capability(state.provider).await?;
+    if !capability.available {
+        return Err(SourceError::CreationUnavailable.into());
+    }
+    let version = capability
+        .supported_kubernetes_version
+        .ok_or(SourceError::CreationUnavailable)?;
+    let provider = match state.provider {
+        ProviderMode::Local => TenantProviderSpec::Local {
+            databases: i32::try_from(request.databases.expect("validated"))
+                .map_err(|_| AppError::invalid_request("databases is invalid"))?,
+        },
+        ProviderMode::Azure => TenantProviderSpec::Azure,
+    };
+    let spec = TenantSpec {
+        kubernetes_version: version.clone(),
+        workers: i32::try_from(request.workers)
+            .map_err(|_| AppError::invalid_request("workers is invalid"))?,
+        provider,
+    };
+    let canonical = canonical_spec(&request.name, &spec, &version)
+        .map_err(|error| AppError::invalid_request(error.to_string()))?;
+    let created = state
+        .source
+        .create_tenant(Tenant::new(&request.name, canonical))
+        .await?;
+    let response = TenantCreateResponse {
+        identity: mutation_identity(&created)?,
+        provider: match state.provider {
+            ProviderMode::Local => tenant_admin_shared::query::TenantProvider::Local,
+            ProviderMode::Azure => tenant_admin_shared::query::TenantProvider::Azure,
+        },
+        kubernetes_version: version,
+    };
+    Ok((StatusCode::CREATED, Json(ApiEnvelope::new(response))))
+}
+
+async fn tenant_delete(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(StatusCode, Json<ApiEnvelope<TenantDeleteResponse>>), AppError> {
+    validate_tenant_name(&name)?;
+    validate_request_origin(&headers)?;
+    let body = body.map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    let request: TenantDeleteRequest = serde_json::from_slice(&body)
+        .map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    if request.confirmation != name {
+        return Err(AppError::invalid_request(
+            "Deletion confirmation must exactly match the Tenant name",
+        ));
+    }
+    if request.uid.is_empty()
+        || request.uid.len() > 128
+        || request.uid.chars().any(char::is_control)
+    {
+        return Err(AppError::invalid_request("Tenant UID is invalid"));
+    }
+    let response = state.source.delete_tenant(&name, &request.uid).await?;
+    let status = match response.state {
+        TenantDeleteState::Accepted => StatusCode::ACCEPTED,
+        TenantDeleteState::Completed => StatusCode::OK,
+    };
+    Ok((status, Json(ApiEnvelope::new(response))))
 }
 
 async fn tenants(
@@ -305,7 +405,7 @@ fn validate_request_origin(headers: &HeaderMap) -> Result<(), AppError> {
         .unwrap_or(hostname);
     if !hostname.eq_ignore_ascii_case("localhost") && ip_candidate.parse::<IpAddr>().is_err() {
         return Err(AppError::invalid_request(
-            "Request Host is not allowed for browser SQL requests",
+            "Request Host is not allowed for browser mutation requests",
         ));
     }
     Ok(())
@@ -350,19 +450,76 @@ fn counts(summaries: &[TenantSummary]) -> TenantCounts {
     counts
 }
 
-fn validate_tenant_name(name: &str) -> Result<(), AppError> {
+fn validate_create_request(
+    provider: ProviderMode,
+    request: &TenantCreateRequest,
+) -> Vec<TenantFieldError> {
+    let mut errors = Vec::new();
+    if !valid_tenant_name(&request.name) {
+        errors.push(TenantFieldError {
+            field: TenantField::Name,
+            code: "invalid-name".into(),
+            message: "Use a 1 to 30 character lowercase DNS label.".into(),
+        });
+    }
+    if !(1..=3).contains(&request.workers) {
+        errors.push(TenantFieldError {
+            field: TenantField::Workers,
+            code: "invalid-count".into(),
+            message: "Workers must be from 1 through 3.".into(),
+        });
+    }
+    match (provider, request.databases) {
+        (ProviderMode::Local, Some(databases)) if (1..=3).contains(&databases) => {}
+        (ProviderMode::Local, _) => errors.push(TenantFieldError {
+            field: TenantField::Databases,
+            code: "invalid-count".into(),
+            message: "Databases must be from 1 through 3.".into(),
+        }),
+        (ProviderMode::Azure, Some(_)) => errors.push(TenantFieldError {
+            field: TenantField::Databases,
+            code: "provider-inapplicable".into(),
+            message: "Databases are not accepted for Azure Tenants.".into(),
+        }),
+        (ProviderMode::Azure, None) => {}
+    }
+    errors.sort_by_key(|error| error.field);
+    errors
+}
+
+fn mutation_identity(tenant: &Tenant) -> Result<TenantMutationIdentity, AppError> {
+    Ok(TenantMutationIdentity {
+        name: tenant
+            .metadata
+            .name
+            .clone()
+            .ok_or_else(|| AppError::internal("Kubernetes returned a Tenant without a name"))?,
+        uid: tenant
+            .metadata
+            .uid
+            .clone()
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| AppError::internal("Kubernetes returned a Tenant without a UID"))?,
+        generation: tenant.metadata.generation,
+    })
+}
+
+fn valid_tenant_name(name: &str) -> bool {
     let bytes = name.as_bytes();
-    if !(1..=30).contains(&bytes.len())
-        || !bytes
+    (1..=30).contains(&bytes.len())
+        && bytes
             .first()
             .is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
-        || !bytes
+        && bytes
             .last()
             .is_some_and(|value| value.is_ascii_lowercase() || value.is_ascii_digit())
-        || !bytes
+        && bytes
             .iter()
             .all(|value| value.is_ascii_lowercase() || value.is_ascii_digit() || *value == b'-')
-    {
+}
+
+fn validate_tenant_name(name: &str) -> Result<(), AppError> {
+    if !valid_tenant_name(name) {
         return Err(AppError::invalid_request(
             "Tenant name must be a lowercase DNS label of at most 30 characters",
         ));
@@ -434,6 +591,9 @@ mod tests {
     use kube::core::DynamicObject;
     use tenant_admin_shared::{
         ApiErrorCode, ApiErrorEnvelope,
+        lifecycle::{
+            CreationCapability, TenantDeleteResponse, TenantDeleteState, TenantMutationIdentity,
+        },
         query::{
             ConditionStatus, DatabaseClusterIdentity, DatabaseClusterObservation,
             DatabaseCondition, DatabaseInstanceObservation, DatabaseInstanceRole,
@@ -468,6 +628,8 @@ mod tests {
         resource_lists: AtomicUsize,
         database_observations: AtomicUsize,
         database_queries: AtomicUsize,
+        tenant_creates: AtomicUsize,
+        tenant_deletes: AtomicUsize,
     }
 
     impl DataSource for MockSource {
@@ -479,6 +641,36 @@ mod tests {
         fn get_tenant(&self, _name: &str) -> SourceFuture<'_, Option<Tenant>> {
             self.calls.tenant_gets.fetch_add(1, Ordering::Relaxed);
             Box::pin(ready(self.tenant.clone()))
+        }
+
+        fn creation_capability(
+            &self,
+            _provider: ProviderMode,
+        ) -> SourceFuture<'_, CreationCapability> {
+            Box::pin(ready(Ok(CreationCapability::available("1.36.4"))))
+        }
+
+        fn create_tenant(&self, mut tenant: Tenant) -> SourceFuture<'_, Tenant> {
+            self.calls.tenant_creates.fetch_add(1, Ordering::Relaxed);
+            tenant.metadata.uid = Some("created-uid".into());
+            tenant.metadata.generation = Some(1);
+            Box::pin(ready(Ok(tenant)))
+        }
+
+        fn delete_tenant<'a>(
+            &'a self,
+            name: &'a str,
+            uid: &'a str,
+        ) -> SourceFuture<'a, TenantDeleteResponse> {
+            self.calls.tenant_deletes.fetch_add(1, Ordering::Relaxed);
+            Box::pin(ready(Ok(TenantDeleteResponse {
+                identity: TenantMutationIdentity {
+                    name: name.into(),
+                    uid: uid.into(),
+                    generation: Some(1),
+                },
+                state: TenantDeleteState::Accepted,
+            })))
         }
 
         fn list_management_resources(
@@ -677,6 +869,7 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         let envelope: ApiEnvelope<OverviewSnapshot> = response_json(response).await;
         assert_eq!(envelope.data.overview.tenants.total, 0);
+        assert!(envelope.data.overview.creation.available);
         assert!(envelope.data.tenants.is_empty());
         assert_eq!(calls.tenant_lists.load(Ordering::Relaxed), 1);
         let response = app
@@ -690,6 +883,133 @@ mod tests {
         let envelope: ApiEnvelope<Vec<TenantSummary>> = response_json(response).await;
         assert!(envelope.data.is_empty());
         assert_eq!(calls.tenant_lists.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn tenant_create_and_delete_are_guarded_provider_aware_and_uid_bound() {
+        let source = MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(Some(ready_tenant())),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router(source);
+        let create = Request::post(API_TENANTS_PATH)
+            .body(Body::from(
+                r#"{"name":"tenant-b","workers":2,"databases":1}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(create).await.unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let envelope: ApiEnvelope<TenantCreateResponse> = response_json(response).await;
+        assert_eq!(envelope.data.identity.name, "tenant-b");
+        assert_eq!(envelope.data.identity.uid, "created-uid");
+        assert_eq!(calls.tenant_creates.load(Ordering::Relaxed), 1);
+
+        let invalid = Request::post(API_TENANTS_PATH)
+            .header("origin", "http://127.0.0.1:8080")
+            .header("host", "127.0.0.1:8080")
+            .header(TENANT_ADMIN_UNSAFE_REQUEST_HEADER, "1")
+            .body(Body::from(
+                r#"{"name":"Invalid","workers":0,"databases":9}"#,
+            ))
+            .unwrap();
+        let response = app.clone().oneshot(invalid).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let envelope: ApiErrorEnvelope = response_json(response).await;
+        assert_eq!(envelope.error.field_errors.len(), 3);
+        assert_eq!(calls.tenant_creates.load(Ordering::Relaxed), 1);
+
+        let mismatched = Request::delete("/api/v1/tenants/tenant-a")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("host", "127.0.0.1:8080")
+            .header(TENANT_ADMIN_UNSAFE_REQUEST_HEADER, "1")
+            .body(Body::from(r#"{"uid":"tenant-uid","confirmation":"other"}"#))
+            .unwrap();
+        assert_eq!(
+            app.clone().oneshot(mismatched).await.unwrap().status(),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(calls.tenant_deletes.load(Ordering::Relaxed), 0);
+
+        let delete = Request::delete("/api/v1/tenants/tenant-a")
+            .header("origin", "http://127.0.0.1:8080")
+            .header("host", "127.0.0.1:8080")
+            .header(TENANT_ADMIN_UNSAFE_REQUEST_HEADER, "1")
+            .body(Body::from(
+                r#"{"uid":"tenant-uid","confirmation":"tenant-a"}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(delete).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(calls.tenant_deletes.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn tenant_create_rejects_provider_inapplicable_fields() {
+        let source = MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(None),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router_with_provider(source, ProviderMode::Azure);
+        let request = Request::post(API_TENANTS_PATH)
+            .body(Body::from(
+                r#"{"name":"tenant-b","workers":1,"databases":1}"#,
+            ))
+            .unwrap();
+        let response = app.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let envelope: ApiErrorEnvelope = response_json(response).await;
+        assert_eq!(envelope.error.field_errors[0].field, TenantField::Databases);
+        assert_eq!(calls.tenant_creates.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn every_browser_tenant_mutation_requires_the_unsafe_request_proof() {
+        let source = MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(None),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router(source);
+        for request in [
+            Request::post(API_TENANTS_PATH)
+                .header("origin", "http://127.0.0.1:8080")
+                .header("host", "127.0.0.1:8080")
+                .body(Body::from(
+                    r#"{"name":"tenant-b","workers":1,"databases":1}"#,
+                ))
+                .unwrap(),
+            Request::delete("/api/v1/tenants/tenant-a")
+                .header("origin", "http://127.0.0.1:8080")
+                .header("host", "127.0.0.1:8080")
+                .body(Body::from(
+                    r#"{"uid":"tenant-uid","confirmation":"tenant-a"}"#,
+                ))
+                .unwrap(),
+        ] {
+            assert_eq!(
+                app.clone().oneshot(request).await.unwrap().status(),
+                StatusCode::BAD_REQUEST
+            );
+        }
+        assert_eq!(calls.tenant_creates.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.tenant_deletes.load(Ordering::Relaxed), 0);
         assert_eq!(calls.database_observations.load(Ordering::Relaxed), 0);
     }
 
