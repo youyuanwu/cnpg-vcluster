@@ -282,6 +282,27 @@ spec:
                 x-kubernetes-validations:
                 - message: status identity must match its logical UID and terminal proof cannot have pending work
                   rule: self.all(uid, self[uid].logicalUID == uid && (!has(self[uid].finalization) || !self[uid].finalization.terminalVerified || size(self[uid].finalization.pending) == 0))
+              observer:
+                nullable: true
+                properties:
+                  catalogUID:
+                    type: string
+                  instanceId:
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  observedResourceVersion:
+                    type: string
+                  podUID:
+                    type: string
+                required:
+                - catalogUID
+                - instanceId
+                - observedGeneration
+                - observedResourceVersion
+                - podUID
+                type: object
             type: object
         required:
         - spec

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import tempfile
 import uuid
 from collections.abc import Callable
 
@@ -18,9 +20,12 @@ from scripts.lib.admin import (
 )
 from scripts.lib.controller import (
     CATALOG_LIFECYCLE_READY,
+    _catalog_activation_complete,
+    _catalog_lock_present,
     build_azure_controller_image,
     catalog_cutover_lock_documents,
     install_database_catalog,
+    release_catalog_and_tenant_cutover_locks,
     verify_catalog_cutover_lock,
     require_empty_tenant_cutover,
     require_tenant_api_cutover_ready,
@@ -32,7 +37,8 @@ from scripts.lib.controller import (
     tenant_cutover_lock_documents,
 )
 from scripts.lib.database_controller import (
-    CATALOG_CRD, require_absent_legacy_database_crd,
+    CATALOG_CRD, build_database_controller_image, install_database_controller,
+    install_azure_database_runtime, require_absent_legacy_database_crd,
 )
 
 ACR_PULL_ROLE_DEFINITION_ID = (
@@ -79,6 +85,97 @@ DATABASE_DISK_ACTIONS = {
     "Microsoft.Compute/disks/delete",
 }
 DATABASE_SERVICE_ACCOUNT = "system:serviceaccount:tenant-system:database-controller"
+
+
+def install_tenant_database_runtime(
+    root: Path, config: Mapping[str, str], tenant_name: str,
+) -> bool:
+    validate_tenant_name(tenant_name)
+
+    def current() -> tuple[dict, bytes]:
+        tenant = json.loads(
+            _kubectl(root, "get", f"tenant/{tenant_name}", "-o", "json").stdout
+        )
+        metadata = tenant.get("metadata", {})
+        status = tenant.get("status", {})
+        provider = status.get("provider", {})
+        management = provider.get("management", {})
+        bound = provider.get("kubeconfig", {})
+        if (
+            metadata.get("name") != tenant_name
+            or not metadata.get("uid")
+            or metadata.get("deletionTimestamp")
+            or status.get("phase") != "Ready"
+            or provider.get("type") != "azure"
+            or provider.get("binding", {}).get("tenantUID") != metadata["uid"]
+            or not management.get("namespaceUID")
+            or not (management.get("clusterUID") or management.get("kamajiControlPlaneUID"))
+            or not bound.get("secretUID")
+            or not bound.get("contentSha256")
+        ):
+            raise RuntimeError(f"Azure Tenant {tenant_name} is not ready for database install")
+        namespace = json.loads(
+            _kubectl(root, "get", f"namespace/{tenant_name}", "-o", "json").stdout
+        )
+        if namespace.get("metadata", {}).get("uid") != management.get("namespaceUID"):
+            raise RuntimeError("Azure database installer namespace identity changed")
+        secret = json.loads(
+            _kubectl(
+                root, "-n", tenant_name, "get",
+                f"secret/{tenant_name}-kubeconfig", "-o", "json",
+            ).stdout
+        )
+        secret_meta = secret.get("metadata", {})
+        expected_owners = {
+            ("cluster.x-k8s.io/v1beta1", "Cluster", tenant_name,
+             management.get("clusterUID")),
+            ("controlplane.cluster.x-k8s.io/v1alpha1", "KamajiControlPlane",
+             tenant_name, management.get("kamajiControlPlaneUID")),
+        }
+        expected_owners = {owner for owner in expected_owners if owner[3]}
+        owners = secret_meta.get("ownerReferences", [])
+        if (
+            secret_meta.get("namespace") != tenant_name
+            or secret_meta.get("uid") != bound["secretUID"]
+            or secret.get("type") != "cluster.x-k8s.io/secret"
+            or len(owners) != 1
+            or owners[0].get("controller") is not True
+            or (
+                owners[0].get("apiVersion"), owners[0].get("kind"),
+                owners[0].get("name"), owners[0].get("uid")
+            ) not in expected_owners
+        ):
+            raise RuntimeError("Azure database installer kubeconfig ownership changed")
+        try:
+            content = base64.b64decode(secret["data"]["value"], validate=True)
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError("Azure database installer kubeconfig is invalid") from exc
+        if not content or hashlib.sha256(content).hexdigest() != bound["contentSha256"]:
+            raise RuntimeError("Azure database installer kubeconfig digest changed")
+        return metadata, content
+
+    try:
+        identity, content = current()
+    except RuntimeError as exc:
+        if str(exc) == f"Azure Tenant {tenant_name} is not ready for database install":
+            return False
+        raise
+
+    scratch = root / ".runtime" / "azure-database-installer"
+    ensure_private_dir(scratch)
+    with tempfile.TemporaryDirectory(dir=scratch) as directory:
+        kubeconfig = Path(directory) / "tenant.kubeconfig"
+        write_private_file(kubeconfig, content)
+
+        def require_current() -> None:
+            latest, latest_content = current()
+            if latest["uid"] != identity["uid"] or latest_content != content:
+                raise RuntimeError("Azure database installer Tenant identity changed")
+
+        install_azure_database_runtime(
+            root, dict(config), kubeconfig, require_current=require_current,
+        )
+    return True
 
 
 def _validate_database_outputs(outputs: Mapping[str, object], prefix: str) -> None:
@@ -668,6 +765,26 @@ def _push_controller_image(
     )
 
 
+def _push_database_controller_image(
+    root: Path,
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> str:
+    database_config = load_configuration(root)
+    repository = config["AZURE_CONTROLLER_REPOSITORY"] + "-database"
+    if len(repository) > 255:
+        raise RuntimeError("Azure database controller repository exceeds OCI path limit")
+    return _push_acr_image(
+        root, config, inventory,
+        repository=repository,
+        tag=config["AZURE_CONTROLLER_TAG"],
+        description="database controller",
+        build=lambda image: build_database_controller_image(
+            root, database_config, image=image,
+        ),
+    )
+
+
 def _push_admin_image(
     root: Path,
     config: Mapping[str, str],
@@ -1057,22 +1174,34 @@ def _prepare_azure_tenant_api_cutover(
     config: Mapping[str, str],
 ) -> bool:
     class CutoverClient:
+        @property
+        def kubeconfig(self):
+            return _management_kubeconfig(root)
+
         def kubectl(self, *args, **kwargs):
             return _kubectl(root, *args, **kwargs)
 
         def json(self, *args):
             return json.loads(self.kubectl(*args, "-o", "json").stdout)
 
-    require_absent_legacy_database_crd(CutoverClient())
+    client = CutoverClient()
+    require_absent_legacy_database_crd(client)
+    observed = _get_management_resource(
+        root, None, "crd/tenants.tenancy.cnpg-vcluster.io"
+    )
+    if observed is not None and tenant_api_cutover_state(observed) == "v1alpha4":
+        if (
+            not _azure_cutover_lock_present(root)
+            and not _catalog_lock_present(client)
+            and _catalog_activation_complete(client)
+        ):
+            return False
     for document in catalog_cutover_lock_documents():
         _kubectl(
             root, "apply", "--server-side",
             "--field-manager=cnpg-vcluster-catalog-cutover",
             "--force-conflicts", "-f", "-", input_text=json.dumps(document),
         )
-    observed = _get_management_resource(
-        root, None, "crd/tenants.tenancy.cnpg-vcluster.io"
-    )
     if observed is None:
         if not _azure_cutover_lock_present(root):
             _azure_cutover_lock(root, present=True)
@@ -1300,6 +1429,7 @@ def _install_tenant_controller(
 ) -> tuple[str, str, str]:
     require_tenant_api_cutover_ready()
     image = _push_controller_image(root, config, inventory)
+    database_image = _push_database_controller_image(root, config, inventory)
     provider_config = _azure_provider_configuration(config, inventory, image)
     _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(root, config)
     cutover_locked = _prepare_azure_tenant_api_cutover(root, config)
@@ -1422,6 +1552,12 @@ def _install_tenant_controller(
     if not isinstance(allocation_uid, str) or not allocation_uid:
         raise RuntimeError("Azure Tenant allocation ConfigMap UID is absent")
     class AzureCatalogClient:
+        kubectl_path = root / ".tools" / "bin" / "kubectl"
+
+        @property
+        def kubeconfig(self):
+            return _management_kubeconfig(root)
+
         def kubectl(self, *args, **kwargs):
             return _kubectl(root, *args, **kwargs)
 
@@ -1430,9 +1566,16 @@ def _install_tenant_controller(
 
     catalog_config = load_configuration(root)
     catalog_config["CONDITION_TIMEOUT"] = config["AZURE_CONTROLLER_TIMEOUT"]
+    catalog_config["DELETE_TIMEOUT"] = config["AZURE_TENANT_TIMEOUT"]
+    catalog_config["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"] = config[
+        "AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"
+    ]
     install_database_catalog(
         root, catalog_config, AzureCatalogClient(),
-        azure=True,
+        azure=True, cutover_locked=cutover_locked,
+    )
+    install_database_controller(
+        root, AzureCatalogClient(), database_image,
     )
     if cutover_locked:
         verify_catalog_cutover_lock(
@@ -1445,12 +1588,11 @@ def _install_tenant_controller(
             allocation_sha256,
         )
         if CATALOG_LIFECYCLE_READY:
-            _azure_cutover_lock(root, present=False)
-            try:
-                _verify_azure_cutover_probe(root, config)
-            except Exception:
-                _azure_cutover_lock(root, present=True)
-                raise
+            release_catalog_and_tenant_cutover_locks(
+                catalog_config, AzureCatalogClient(), provider="azure",
+                tenant_image=image,
+                database_image=database_image,
+            )
     return image, uid, allocation_uid
 
 

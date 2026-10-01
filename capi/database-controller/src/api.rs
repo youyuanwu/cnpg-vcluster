@@ -48,6 +48,20 @@ pub struct CatalogEntry {
 pub struct CatalogStatus {
     #[serde(default)]
     pub entries: BTreeMap<String, EntryStatus>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub observer: Option<CatalogObservation>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogObservation {
+    #[serde(rename = "catalogUID")]
+    pub catalog_uid: String,
+    pub observed_generation: i64,
+    pub observed_resource_version: String,
+    #[serde(rename = "podUID")]
+    pub pod_uid: String,
+    pub instance_id: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
@@ -519,6 +533,7 @@ mod tests {
         next.spec.entries.remove(UID);
         next.status = Some(CatalogStatus {
             entries: BTreeMap::from([(UID.into(), terminal(UID))]),
+            observer: None,
         });
         assert_eq!(validate_transition(&old, &next), Err(CatalogError::Removal));
         let mut deleting = old.clone();
@@ -530,6 +545,7 @@ mod tests {
         );
         deleting.status = Some(CatalogStatus {
             entries: BTreeMap::from([(UID.into(), terminal(NEXT_UID))]),
+            observer: None,
         });
         assert_eq!(
             validate_transition(&deleting, &next),
@@ -636,6 +652,31 @@ mod tests {
             Err(CatalogError::Conflict)
         );
     }
+
+    #[test]
+    fn observer_receipt_is_separate_from_database_entries() {
+        let receipt = CatalogObservation {
+            catalog_uid: "catalog-uid".into(),
+            observed_generation: 4,
+            observed_resource_version: "17".into(),
+            pod_uid: "pod-uid".into(),
+            instance_id: "boot-uid".into(),
+        };
+        let status = CatalogStatus {
+            entries: BTreeMap::from([(UID.into(), terminal(UID))]),
+            observer: Some(receipt.clone()),
+        };
+        let encoded = serde_json::to_value(&status).unwrap();
+        assert_eq!(encoded["observer"]["catalogUID"], "catalog-uid");
+        assert_eq!(encoded["observer"]["observedResourceVersion"], "17");
+        assert_eq!(encoded["observer"]["podUID"], "pod-uid");
+        assert_eq!(encoded["observer"]["instanceId"], "boot-uid");
+        assert!(encoded["entries"].get(UID).is_some());
+        assert_eq!(
+            serde_json::from_value::<CatalogStatus>(encoded).unwrap(),
+            status
+        );
+    }
     #[test]
     fn crd_has_structural_status_and_old_status_transition() {
         let crd = catalog_crd();
@@ -658,6 +699,22 @@ mod tests {
             schema["properties"]["status"]["properties"]["entries"]["maxProperties"],
             3
         );
+        let observer = &schema["properties"]["status"]["properties"]["observer"];
+        for field in [
+            "catalogUID",
+            "observedGeneration",
+            "observedResourceVersion",
+            "podUID",
+            "instanceId",
+        ] {
+            assert!(
+                observer["required"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|required| required == field)
+            );
+        }
         assert_eq!(
             schema["properties"]["spec"]["properties"]["entries"]["additionalProperties"]["properties"]
                 ["instances"]["maximum"],

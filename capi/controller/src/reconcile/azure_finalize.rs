@@ -19,7 +19,8 @@ use crate::{
     },
     azure::{
         AzureConfiguration, AzureContext, EXTERNAL_CONTROL_PLANE_LABEL, desired_objects,
-        validate_binding, validate_desired_object, validate_live_identity,
+        provider_resource_identity, validate_binding, validate_desired_object,
+        validate_live_identity,
     },
     azure_allocation::{self, AzureClaimIdentity},
     error::ControllerError,
@@ -93,7 +94,22 @@ fn recorded_delete(
     })
 }
 
-async fn list(
+async fn delete_recorded(
+    client: Client,
+    configuration: &AzureConfiguration,
+    object: &DynamicObject,
+    deletion: &AzureDeletionStatus,
+) -> Result<(), ReconcileError> {
+    if object.metadata.deletion_timestamp.is_none() {
+        require_current_configuration(client.clone(), configuration).await?;
+        objects::object_api(client, object)?
+            .delete(&object.name_any(), &recorded_delete(object, deletion)?)
+            .await?;
+    }
+    Ok(())
+}
+
+pub(super) async fn list(
     client: Client,
     tenant: &str,
     definition: management::ManagementResource,
@@ -112,38 +128,33 @@ async fn list(
     Ok(items)
 }
 
+pub(super) fn unknown_inventory(inventory: &[DynamicObject], selected: &BTreeSet<usize>) -> String {
+    inventory
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| !selected.contains(index))
+        .map(|(_, object)| {
+            format!(
+                "{}/{}",
+                object
+                    .types
+                    .as_ref()
+                    .map_or("unknown", |types| types.kind.as_str()),
+                object.name_any()
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 fn resource_identity(
     object: &DynamicObject,
 ) -> Result<AzureProviderResourceIdentity, ReconcileError> {
-    let types = object
+    object
         .types
         .as_ref()
         .ok_or_else(|| blocked("Azure provider resource GVK is missing"))?;
-    let mut owner_uids: Vec<_> = object
-        .owner_references()
-        .iter()
-        .map(|owner| owner.uid.clone())
-        .collect();
-    owner_uids.sort();
-    owner_uids.dedup();
-    let resource_id = [
-        "/status/id",
-        "/status/resourceId",
-        "/status/providerID",
-        "/spec/providerID",
-    ]
-    .into_iter()
-    .find_map(|pointer| object.data.pointer(pointer).and_then(Value::as_str))
-    .map(Into::into);
-    Ok(AzureProviderResourceIdentity {
-        api_version: types.api_version.clone(),
-        kind: types.kind.clone(),
-        namespace: object.namespace(),
-        name: object.name_any(),
-        uid: uid(object)?,
-        resource_id,
-        owner_uids,
-    })
+    Ok(provider_resource_identity(object, uid(object)?))
 }
 
 fn same_resource(
@@ -204,8 +215,7 @@ fn record_uid(
         .types
         .as_ref()
         .ok_or_else(|| ControllerError::OwnershipInvalid("Azure object GVK is missing".into()))?;
-    super::azure::record_uid(
-        status,
+    status.record_uid(
         &types.kind,
         &object.name_any(),
         tenant,
@@ -257,22 +267,7 @@ fn descendants(
         }
     }
     if selected.len() != inventory.len() {
-        let unknown = inventory
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !selected.contains(index))
-            .map(|(_, object)| {
-                format!(
-                    "{}/{}",
-                    object
-                        .types
-                        .as_ref()
-                        .map_or("unknown", |types| types.kind.as_str()),
-                    object.name_any()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let unknown = unknown_inventory(inventory, &selected);
         return Err(blocked(format!(
             "unknown, foreign, or ownerless residue is present: {unknown}"
         )));
@@ -591,16 +586,9 @@ pub async fn finalize(
     }
     let mut inventory = Vec::new();
     let mut seen = BTreeSet::new();
-    for definition in management::AZURE_MANAGEMENT_RESOURCES
-        .iter()
-        .filter(|definition| {
-            definition.namespaced
-                && (definition.class == management::ResourceClass::Descendant
-                    || matches!(definition.kind, "ConfigMap" | "Deployment" | "Secret"))
-        })
-    {
+    for definition in management::azure_inventory() {
         if seen.insert((definition.api_version, definition.plural)) {
-            inventory.extend(list(client.clone(), &name, *definition).await?);
+            inventory.extend(list(client.clone(), &name, definition).await?);
         }
     }
     inventory.retain(|object| {
@@ -837,12 +825,7 @@ pub async fn finalize(
                 return Ok(Action::requeue(PROGRESS_INTERVAL));
             }
         }
-        if pool.metadata.deletion_timestamp.is_none() {
-            require_current_configuration(client.clone(), configuration).await?;
-            objects::object_api(client, pool)?
-                .delete(&pool.name_any(), &recorded_delete(pool, deletion)?)
-                .await?;
-        }
+        delete_recorded(client, configuration, pool, deletion).await?;
         return Ok(Action::requeue(DEPENDENCY_INTERVAL));
     }
     if !machines.is_empty()
@@ -857,12 +840,7 @@ pub async fn finalize(
         return Ok(Action::requeue(DEPENDENCY_INTERVAL));
     }
     if let Some(cluster) = explicit.get("Cluster").and_then(|objects| objects.first()) {
-        if cluster.metadata.deletion_timestamp.is_none() {
-            require_current_configuration(client.clone(), configuration).await?;
-            objects::object_api(client, cluster)?
-                .delete(&cluster.name_any(), &recorded_delete(cluster, deletion)?)
-                .await?;
-        }
+        delete_recorded(client, configuration, cluster, deletion).await?;
         return Ok(Action::requeue(DEPENDENCY_INTERVAL));
     }
     if let Some(azure_cluster) = explicit
@@ -902,10 +880,7 @@ pub async fn finalize(
         let mut deleted = false;
         for object in config_maps {
             if object.metadata.deletion_timestamp.is_none() {
-                require_current_configuration(client.clone(), configuration).await?;
-                objects::object_api(client.clone(), object)?
-                    .delete(&object.name_any(), &recorded_delete(object, deletion)?)
-                    .await?;
+                delete_recorded(client.clone(), configuration, object, deletion).await?;
                 deleted = true;
             }
         }
@@ -915,12 +890,7 @@ pub async fn finalize(
     }
     for kind in ["Job", "Deployment", "AzureClusterIdentity"] {
         if let Some(object) = explicit.get(kind).and_then(|objects| objects.first()) {
-            if object.metadata.deletion_timestamp.is_none() {
-                require_current_configuration(client.clone(), configuration).await?;
-                objects::object_api(client.clone(), object)?
-                    .delete(&object.name_any(), &recorded_delete(object, deletion)?)
-                    .await?;
-            }
+            delete_recorded(client.clone(), configuration, object, deletion).await?;
             return Ok(Action::requeue(DEPENDENCY_INTERVAL));
         }
     }
@@ -931,15 +901,7 @@ pub async fn finalize(
         .get("Namespace")
         .and_then(|objects| objects.first())
     {
-        if namespace.metadata.deletion_timestamp.is_none() {
-            require_current_configuration(client.clone(), configuration).await?;
-            objects::object_api(client.clone(), namespace)?
-                .delete(
-                    &namespace.name_any(),
-                    &recorded_delete(namespace, deletion)?,
-                )
-                .await?;
-        }
+        delete_recorded(client.clone(), configuration, namespace, deletion).await?;
         return Ok(Action::requeue(DEPENDENCY_INTERVAL));
     }
     match azure_allocation::release(client.clone(), claim_identity, actual_allocation, true)

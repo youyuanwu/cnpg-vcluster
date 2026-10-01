@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import base64
+import hashlib
 import io
 import json
 import os
@@ -39,9 +41,12 @@ from scripts.lib.azure.foundation import (
     _inspect_admin,
     _install_capi_capz,
     _install_admin,
+    _install_tenant_controller,
     _inspect_foundation,
+    install_tenant_database_runtime,
     _push_admin_image,
     _push_controller_image,
+    _push_database_controller_image,
     create_management,
     create_foundation,
     destroy,
@@ -51,6 +56,7 @@ from scripts.lib.azure.foundation import (
 from scripts.lib.config import ConfigError
 from scripts.lib.controller import tenant_cutover_lock_cleanup_refs
 from scripts.lib.database_controller import LEGACY_CRD, require_absent_legacy_database_crd
+from scripts.azure_database_runtime import reconcile_once
 from scripts.lib.files import write_private_file
 from scripts.lib.locking import azure_lock
 from scripts.lib.tenant_spec import TenantSpecError
@@ -70,6 +76,204 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         legacy = patch("scripts.lib.azure.foundation.require_absent_legacy_database_crd")
         legacy.start()
         self.addCleanup(legacy.stop)
+
+    def test_reinstall_of_activated_azure_controller_keeps_live_tenants_unlocked(self):
+        root = self.make_root()
+        crd = {
+            "spec": {"versions": [{"name": "v1alpha4", "served": True, "storage": True}]},
+            "status": {"storedVersions": ["v1alpha4"]},
+        }
+        with (
+            patch("scripts.lib.azure.foundation._get_management_resource",
+                  return_value=crd),
+            patch("scripts.lib.azure.foundation._azure_cutover_lock_present",
+                  return_value=False),
+            patch("scripts.lib.azure.foundation._catalog_lock_present",
+                  return_value=False),
+            patch("scripts.lib.azure.foundation._catalog_activation_complete",
+                  return_value=True),
+            patch("scripts.lib.azure.foundation._kubectl") as kubectl,
+        ):
+            self.assertFalse(_prepare_azure_tenant_api_cutover(root, {}))
+        kubectl.assert_not_called()
+
+    def test_database_installer_is_independent_of_tenant_ready_and_retries(self):
+        root = self.make_root()
+        config = {"DOWNLOAD_TIMEOUT": "1s"}
+        tenant_name = "tenant-c"
+        content = b"tenant kubeconfig"
+        tenant = {
+            "metadata": {"name": tenant_name, "uid": "tenant-uid"},
+            "status": {
+                "phase": "Ready",
+                "provider": {
+                    "type": "azure",
+                    "binding": {"tenantUID": "tenant-uid"},
+                    "management": {"namespaceUID": "ns-uid", "clusterUID": "cluster-uid"},
+                    "kubeconfig": {
+                        "secretUID": "secret-uid",
+                        "contentSha256": hashlib.sha256(content).hexdigest(),
+                    },
+                },
+            },
+        }
+        secret = {
+            "metadata": {
+                "namespace": tenant_name,
+                "uid": "secret-uid",
+                "ownerReferences": [{
+                    "apiVersion": "cluster.x-k8s.io/v1beta1", "kind": "Cluster",
+                    "name": tenant_name, "uid": "cluster-uid", "controller": True,
+                }],
+            },
+            "type": "cluster.x-k8s.io/secret",
+            "data": {"value": base64.b64encode(content).decode()},
+        }
+
+        def kubectl(_root, *args, **_kwargs):
+            if args[:2] == ("get", f"tenant/{tenant_name}"):
+                return completed(json.dumps(tenant))
+            if args[:2] == ("get", f"namespace/{tenant_name}"):
+                return completed(json.dumps({"metadata": {"uid": "ns-uid"}}))
+            if f"secret/{tenant_name}-kubeconfig" in args:
+                return completed(json.dumps(secret))
+            raise AssertionError(args)
+
+        failures = [RuntimeError("cnpg unavailable"), None]
+
+        def install(_root, _config, kubeconfig, *, require_current):
+            self.assertEqual(kubeconfig.read_bytes(), content)
+            require_current()
+            failure = failures.pop(0)
+            if failure:
+                raise failure
+
+        with (
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            patch("scripts.lib.azure.foundation.install_azure_database_runtime",
+                  side_effect=install) as installer,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cnpg unavailable"):
+                install_tenant_database_runtime(root, config, tenant_name)
+            self.assertEqual(tenant["status"]["phase"], "Ready")
+            self.assertTrue(install_tenant_database_runtime(root, config, tenant_name))
+            secret["metadata"]["uid"] = "replacement"
+            with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+                install_tenant_database_runtime(root, config, tenant_name)
+            tenant["status"]["phase"] = "Progressing"
+            self.assertFalse(install_tenant_database_runtime(root, config, tenant_name))
+        self.assertEqual(installer.call_count, 2)
+        self.assertFalse(any((root / ".runtime" / "azure-database-installer").iterdir()))
+
+    def test_database_install_worker_keeps_other_tenants_and_retries(self):
+        root = self.make_root()
+        listing = {"kind": "TenantList", "metadata": {}, "items": [
+            {"metadata": {"name": "tenant-a"}, "status": {
+                "phase": "Ready", "provider": {"type": "azure"}}},
+            {"metadata": {"name": "tenant-b"}, "status": {
+                "phase": "Ready", "provider": {"type": "azure"}}},
+            {"metadata": {"name": "tenant-c"}, "status": {
+                "phase": "Progressing", "provider": {"type": "azure"}}},
+        ]}
+        with (
+            patch("scripts.azure_database_runtime._kubectl",
+                  return_value=completed(json.dumps(listing))),
+            patch("scripts.azure_database_runtime.install_tenant_database_runtime",
+                  side_effect=[RuntimeError("CNPG unavailable"), True, True, True]) as install,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertFalse(reconcile_once(root, {}))
+            self.assertTrue(reconcile_once(root, {}))
+        self.assertEqual(
+            [call.args[2] for call in install.call_args_list],
+            ["tenant-a", "tenant-b", "tenant-a", "tenant-b"],
+        )
+
+    def test_database_image_publish_uses_pinned_registry_digest(self):
+        root = ROOT
+        config = {
+            "AZURE_CONTROLLER_REPOSITORY": "tenant-controller",
+            "AZURE_CONTROLLER_TAG": "test",
+        }
+        inventory = {}
+        selected = "registry.example/database@sha256:" + "a" * 64
+        def publish(_root, _config, _inventory, **kwargs):
+            kwargs["build"]("registry.example/database:tag")
+            return selected
+
+        with (
+            patch("scripts.lib.azure.foundation.load_configuration",
+                  return_value={"COMMAND_TIMEOUT": "1s"}),
+            patch("scripts.lib.azure.foundation._push_acr_image",
+                  side_effect=publish) as published,
+            patch("scripts.lib.azure.foundation.build_database_controller_image",
+                  return_value="registry.example/database:tag") as build,
+        ):
+            self.assertEqual(
+                _push_database_controller_image(root, config, inventory), selected,
+            )
+        self.assertEqual(
+            published.call_args.kwargs["repository"],
+            config["AZURE_CONTROLLER_REPOSITORY"] + "-database",
+        )
+        self.assertEqual(
+            published.call_args.kwargs["tag"], config["AZURE_CONTROLLER_TAG"],
+        )
+        build.assert_called_once_with(
+            root, {"COMMAND_TIMEOUT": "1s"}, image="registry.example/database:tag",
+        )
+
+    def test_azure_catalog_release_failure_preserves_both_fences_without_probe_cleanup(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        image = "registry.example/tenant@sha256:" + "1" * 64
+
+        def kubectl(*args, **kwargs):
+            if "configmap/tenant-azure-provider" in args:
+                return completed(json.dumps({"metadata": {"uid": "provider-uid"}}))
+            if "configmap/tenant-azure-allocation" in args:
+                return completed(json.dumps({"metadata": {"uid": "allocation-uid"}}))
+            return completed()
+
+        with (
+            patch("scripts.lib.azure.foundation.CATALOG_LIFECYCLE_READY", True),
+            patch("scripts.lib.azure.foundation._push_controller_image", return_value=image),
+            patch("scripts.lib.azure.foundation._push_database_controller_image",
+                  return_value="registry.example/database@sha256:" + "2" * 64),
+            patch("scripts.lib.azure.foundation._azure_provider_configuration",
+                  return_value={}),
+            patch("scripts.lib.azure.foundation._azure_allocation_configuration",
+                  return_value=({}, "{}", "allocation-sha")),
+            patch("scripts.lib.azure.foundation._prepare_azure_tenant_api_cutover",
+                  return_value=True),
+            patch("scripts.lib.azure.foundation.render_azure_controller_manager",
+                  return_value=root / "manager.yaml"),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl) as command,
+            patch("scripts.lib.azure.foundation.load_configuration",
+                  return_value={"DELETE_TIMEOUT": "1s", "CONDITION_TIMEOUT": "1s"}),
+            patch("scripts.lib.azure.foundation.install_database_catalog"),
+            patch("scripts.lib.azure.foundation.install_database_controller"),
+            patch("scripts.lib.azure.foundation.verify_catalog_cutover_lock"),
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_lock"),
+            patch("scripts.lib.azure.foundation._verify_azure_controller_allocation_readiness"),
+            patch("scripts.lib.azure.foundation.release_catalog_and_tenant_cutover_locks",
+                  side_effect=RuntimeError("release gates blocked")) as release,
+            patch("scripts.lib.azure.foundation._azure_cutover_lock") as tenant_unlock,
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_probe") as tenant_probe,
+            self.assertRaisesRegex(RuntimeError, "release gates blocked"),
+        ):
+            _install_tenant_controller(root, config, inventory)
+        release.assert_called_once()
+        self.assertEqual(release.call_args.kwargs["provider"], "azure")
+        self.assertEqual(release.call_args.kwargs["tenant_image"], image)
+        self.assertEqual(
+            release.call_args.kwargs["database_image"],
+            "registry.example/database@sha256:" + "2" * 64,
+        )
+        tenant_unlock.assert_not_called()
+        tenant_probe.assert_not_called()
+        self.assertFalse(any("delete" in call.args for call in command.call_args_list))
 
     def test_legacy_crd_blocks_azure_cutover_before_policy_mutation(self):
         root = self.make_root()
@@ -185,14 +389,21 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         versions = (ROOT / "config" / "versions.env").read_text(encoding="utf-8")
         installer = (ROOT / "controller" / "src" / "azure.rs").read_text(encoding="utf-8")
         runtime = (ROOT / "database-runtime" / "src" / "azure_runtime.rs").read_text(encoding="utf-8")
+        from scripts.tools import AZURE_CHART_INPUTS
+
         for digest in (
             "668e065ff53508d58238788fd35b355a925060843629a951df0e6a9362e6d32f",
             "07b10ce708dc988d8315df1794f3fb913f8a1dd85b3fb93c64ca7de491eb095a",
         ):
             self.assertIn(digest, versions)
-            self.assertIn(digest, installer)
-        self.assertIn("cloudnative-pg-v0.29.0", installer)
-        self.assertIn("charts/v1.32.12/azuredisk-csi-driver-1.32.12.tgz", installer)
+            self.assertNotIn(digest, installer)
+        self.assertNotIn("if wget -q", installer)
+        self.assertNotIn("helm upgrade --install cnpg", installer)
+        self.assertNotIn("helm upgrade --install azuredisk", installer)
+        self.assertEqual(len(AZURE_CHART_INPUTS), 2)
+        for _, url_key, checksum_key in AZURE_CHART_INPUTS:
+            self.assertIn(url_key + "=", versions)
+            self.assertIn(checksum_key + "=", versions)
         cnpg_image = next(
             line.split("=", 1)[1] for line in versions.splitlines()
             if line.startswith("CNPG_CONTROLLER_IMAGE=")
@@ -201,16 +412,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             line.split("=", 1)[1] for line in versions.splitlines()
             if line.startswith("AZURE_DISK_CSI_IMAGE=")
         )
-        for image, repository_key, tag_key in (
-            (cnpg_image, "image.repository", "image.tag"),
-            (disk_image, "image.azuredisk.repository", "image.azuredisk.tag"),
-        ):
-            repository, tag = image.split(":", 1)
-            self.assertIn(
-                f"--set-string {repository_key}={repository} "
-                f"--set-string {tag_key}={tag}",
-                installer,
-            )
+        for image in (cnpg_image, disk_image):
             self.assertIn(image, runtime)
         self.assertIn("disk.csi.azure.com", runtime)
         self.assertIn("WaitForFirstConsumer", runtime)

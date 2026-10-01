@@ -4,7 +4,7 @@ use kube::{Client, ResourceExt, core::DynamicObject, runtime::controller::Action
 
 use crate::{
     allocation::{self, ClaimContext},
-    api::{CanonicalSpec, Tenant, TenantProviderSpec, spec_hash},
+    api::{CanonicalSpec, Tenant, TenantPhase, TenantProviderSpec, spec_hash},
     docker::{BollardDockerClient, DockerClient, validate_volume},
     error::ControllerError,
     foundation::{Foundation, ImageArchive, RuntimeFoundation},
@@ -382,20 +382,38 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
             && !operator.created
             && !operator.pending
             && deployment.is_some_and(readiness::workload_available);
-        let mut capability = context
-            .tenant
-            .status
-            .as_ref()
-            .and_then(|status| status.database_capability.clone())
-            .unwrap_or_default();
+        let (mut capability, catalog_valid) = match super::ensure_database_catalog(
+            self.client.clone(),
+            context.tenant,
+            false,
+        )
+        .await
+        {
+            Ok(capability) => (capability, true),
+            Err(ReconcileError::Pending(_)) => {
+                return self.progress(context.tenant, PROGRESS_INTERVAL).await;
+            }
+            Err(error) => {
+                tracing::warn!(tenant = %context.name(), %error, "database catalog unavailable");
+                (
+                    context
+                        .tenant
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.database_capability.clone())
+                        .unwrap_or_default(),
+                    false,
+                )
+            }
+        };
         capability.available = false;
-        capability.namespace = tenant_database_runtime::database_namespace(context.name());
         capability.reason = if runtime_ready {
             let tenant_uid = context.tenant.uid()
                 .ok_or_else(|| ReconcileError::OwnershipInvalid("Tenant UID is missing".into()))?;
             match tenant_database_runtime::catalog_runtime::ensure_credentials(
                 self.client.clone(), context.name(), &tenant_uid, false,
             ).await {
+                Ok(()) if catalog_valid => "Ready",
                 Ok(()) => "CatalogNotReady",
                 Err(error) => {
                     tracing::warn!(tenant = %context.name(), %error, "database credential access unavailable");
@@ -406,6 +424,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
             "RuntimeNotReady"
         }
         .into();
+        capability.available = capability.reason == "Ready";
         let components = Components {
             control_plane: readiness::management_conditions_ready(cluster, &["Available"])?,
             workers: workers.inventory_complete && workers.all_ready,
@@ -414,15 +433,40 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
         };
         status::update_status(self.client.clone(), context.tenant, |status| {
             components.publish(status, context.tenant);
+            readiness::set_condition(
+                status,
+                context.tenant,
+                "CatalogReady",
+                catalog_valid,
+                if catalog_valid {
+                    "Ready"
+                } else {
+                    "CatalogNotReady"
+                },
+                "Tenant catalog identity is verified",
+            );
+            if !catalog_valid {
+                status.phase = Some(TenantPhase::Degraded);
+                readiness::set_condition(
+                    status,
+                    context.tenant,
+                    "Ready",
+                    false,
+                    "CatalogNotReady",
+                    "Tenant catalog identity is unavailable",
+                );
+            }
             status.database_capability = Some(capability.clone());
             Ok(())
         })
         .await?;
-        Ok(Action::requeue(if capability.available {
-            READY_INTERVAL
-        } else {
-            DEPENDENCY_INTERVAL
-        }))
+        Ok(Action::requeue(
+            if catalog_valid && capability.available && components.ready() {
+                READY_INTERVAL
+            } else {
+                DEPENDENCY_INTERVAL
+            },
+        ))
     }
 }
 fn image<'a>(foundation: &'a Foundation, key: &str) -> Result<&'a ImageArchive, ReconcileError> {

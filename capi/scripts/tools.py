@@ -5,6 +5,7 @@ import re
 import shutil
 import stat
 import hashlib
+import time
 import tarfile
 import tempfile
 import urllib.error
@@ -52,8 +53,16 @@ DOWNLOADS = (
     ("metallb-native.yaml", "METALLB_MANIFEST_URL", "METALLB_MANIFEST_SHA256"),
     ("calico.yaml", "CALICO_MANIFEST_URL", "CALICO_MANIFEST_SHA256"),
     ("cnpg.yaml", "CNPG_MANIFEST_URL", "CNPG_MANIFEST_SHA256"),
+    ("azure-cnpg-0.29.0.tgz", "AZURE_CNPG_CHART_URL", "AZURE_CNPG_CHART_SHA256"),
+    (
+        "azure-disk-csi-1.32.12.tgz",
+        "AZURE_DISK_CSI_CHART_URL",
+        "AZURE_DISK_CSI_CHART_SHA256",
+    ),
 )
 ADMIN_BUILD_DOWNLOADS = DOWNLOADS[:2]
+AZURE_CHART_INPUTS = DOWNLOADS[-2:]
+AZURE_CHART_MAX_BYTES = 8 * 1024 * 1024
 
 EXPECTED_MANIFEST_IMAGES = {
     "capi-core-components.yaml": "CAPI_CORE_IMAGE_TAGGED",
@@ -100,7 +109,13 @@ TAG_SOURCES = (
 )
 
 
-def _download(url: str, destination: Path, timeout: int) -> None:
+def _download(
+    url: str,
+    destination: Path,
+    timeout: int,
+    *,
+    max_bytes: int | None = None,
+) -> None:
     ensure_private_dir(destination.parent)
     descriptor, temporary_name = tempfile.mkstemp(prefix=f".{destination.name}.", dir=destination.parent)
     os.close(descriptor)
@@ -109,7 +124,18 @@ def _download(url: str, destination: Path, timeout: int) -> None:
         request = urllib.request.Request(url, headers={"User-Agent": "cnpg-vcluster-capi-lab"})
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response, temporary.open("wb") as output:
-                shutil.copyfileobj(response, output)
+                if max_bytes is None:
+                    shutil.copyfileobj(response, output)
+                else:
+                    size = 0
+                    deadline = time.monotonic() + timeout
+                    while chunk := response.read1(min(65536, max_bytes + 1 - size)):
+                        if time.monotonic() > deadline:
+                            raise IntegrityError(f"download exceeded {timeout}s: {url}")
+                        size += len(chunk)
+                        if size > max_bytes:
+                            raise IntegrityError(f"download exceeds {max_bytes} bytes: {url}")
+                        output.write(chunk)
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             raise IntegrityError(f"failed to download {url}: {exc}") from exc
         temporary.chmod(0o600)
@@ -124,17 +150,59 @@ def _ensure_download(
     url: str,
     expected_sha256: str,
     timeout: int,
+    *,
+    max_bytes: int | None = None,
 ) -> Path:
     destination = inputs_dir / filename
     if destination.exists():
         try:
-            verify_sha256(destination, expected_sha256)
+            if max_bytes is not None:
+                if destination.stat().st_size > max_bytes:
+                    raise IntegrityError(f"cached download exceeds {max_bytes} bytes: {destination}")
+                _verify_private_input(destination, expected_sha256)
+            else:
+                verify_sha256(destination, expected_sha256)
             return destination
         except IntegrityError:
             destination.unlink()
-    _download(url, destination, timeout)
-    verify_sha256(destination, expected_sha256)
+    if max_bytes is None:
+        _download(url, destination, timeout)
+    else:
+        _download(url, destination, timeout, max_bytes=max_bytes)
+    try:
+        verify_sha256(destination, expected_sha256)
+    except IntegrityError:
+        destination.unlink(missing_ok=True)
+        raise
     return destination
+
+
+def acquire_azure_charts(
+    root: Path,
+    config: dict[str, str],
+    *,
+    offline: bool = False,
+) -> tuple[Path, Path]:
+    require(config, "DOWNLOAD_TIMEOUT", *(
+        key for _, url_key, sha_key in AZURE_CHART_INPUTS
+        for key in (url_key, sha_key)
+    ))
+    timeout = parse_duration(config["DOWNLOAD_TIMEOUT"])
+    inputs = root / ".tools" / "inputs"
+    charts = []
+    for filename, url_key, sha_key in AZURE_CHART_INPUTS:
+        path = inputs / filename
+        if offline:
+            data = _verify_private_input(path, config[sha_key])
+            if len(data) > AZURE_CHART_MAX_BYTES:
+                raise IntegrityError(f"Azure chart exceeds {AZURE_CHART_MAX_BYTES} bytes: {path}")
+        else:
+            _ensure_download(
+                inputs, filename, config[url_key], config[sha_key], timeout,
+                max_bytes=AZURE_CHART_MAX_BYTES,
+            )
+        charts.append(path)
+    return charts[0], charts[1]
 
 
 def _install_copy(source: Path, destination: Path) -> None:
@@ -690,6 +758,8 @@ def acquire_tools(
             config[url_key],
             config[sha_key],
             timeout,
+            **({"max_bytes": AZURE_CHART_MAX_BYTES}
+               if (filename, url_key, sha_key) in AZURE_CHART_INPUTS else {}),
         )
 
     _install_binaries(root, config, inputs_dir=inputs_dir, bin_dir=bin_dir)

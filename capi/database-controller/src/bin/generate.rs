@@ -48,7 +48,7 @@ fn controller_rules(azure: bool) -> Vec<Value> {
         rules.push(rule(
             "compute.azure.com",
             &["disks"],
-            &["get", "list", "watch", "create", "delete"],
+            &["get", "list", "watch"],
         ));
     }
     rules
@@ -67,6 +67,42 @@ fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
         (
             "azure-management-resources.json",
             format!("{}\n", serde_json::to_string_pretty(&inventory(true))?).into_bytes(),
+        ),
+        (
+            "deployment/controller.yaml",
+            yaml(&json!({
+                "apiVersion": "apps/v1", "kind": "Deployment",
+                "metadata": {"name": "database-controller", "namespace": "tenant-system"},
+                "spec": {
+                    "replicas": 1, "strategy": {"type": "Recreate"},
+                    "selector": {"matchLabels": {"app": "database-controller"}},
+                    "template": {
+                        "metadata": {"labels": {"app": "database-controller"}},
+                        "spec": {
+                            "serviceAccountName": "database-controller",
+                            "automountServiceAccountToken": true,
+                            "containers": [{
+                                "name": "manager",
+                                "image": "database-controller:configure-before-install",
+                                "imagePullPolicy": "IfNotPresent",
+                                "env": [{
+                                    "name": "POD_UID",
+                                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}
+                                }],
+                                "ports": [{"name": "health", "containerPort": 8082}],
+                                "livenessProbe": {"httpGet": {"path": "/healthz", "port": "health"}},
+                                "readinessProbe": {"httpGet": {"path": "/readyz", "port": "health"}},
+                                "securityContext": {
+                                    "allowPrivilegeEscalation": false,
+                                    "readOnlyRootFilesystem": true,
+                                    "runAsNonRoot": true,
+                                    "capabilities": {"drop": ["ALL"]}
+                                }
+                            }]
+                        }
+                    }
+                }
+            }))?,
         ),
     ];
     for (path, resource) in [
@@ -121,7 +157,7 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
                 return Err(format!("generated fixture differs: {}", path.display()).into());
             }
         }
-        for dir in ["admission", "rbac", "crd/bases"] {
+        for dir in ["admission", "rbac", "crd/bases", "deployment"] {
             let path = output_dir.join(dir);
             if path.exists() {
                 for artifact in std::fs::read_dir(path)? {
@@ -231,12 +267,28 @@ mod tests {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|r| r["resources"] == json!(["disks"]))
+                .any(|r| r["resources"] == json!(["disks"])
+                    && r["verbs"] == json!(["get", "list", "watch"]))
         );
         assert!(
             artifacts
                 .iter()
                 .all(|(name, _)| !name.starts_with("admission/") && !name.contains("gates"))
+        );
+        let deployment: Value =
+            serde_yaml::from_slice(find(&artifacts, "deployment/controller.yaml")).unwrap();
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["serviceAccountName"],
+            "database-controller"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["readinessProbe"]["httpGet"]["path"],
+            "/readyz"
+        );
+        assert_eq!(
+            deployment["spec"]["template"]["spec"]["containers"][0]["env"][0]["valueFrom"]["fieldRef"]
+                ["fieldPath"],
+            "metadata.uid"
         );
     }
 }

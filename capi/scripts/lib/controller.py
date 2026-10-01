@@ -4,7 +4,11 @@ import hashlib
 import json
 import os
 import re
+import select
 import shutil
+import subprocess
+import urllib.error
+import urllib.request
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -20,9 +24,13 @@ from scripts.lib.controller_foundation import (
     foundation_payload as _foundation_payload,
 )
 from scripts.lib.database_controller import (
-    CATALOG_CRD, catalog_manifests, require_absent_legacy_database_crd,
+    CATALOG_CRD, build_database_controller_image, catalog_manifests,
+    inspect_catalog_inventory, install_database_controller,
+    require_absent_legacy_database_crd,
 )
-from scripts.lib.files import ensure_private_dir, write_private_file
+from scripts.lib.files import (
+    ensure_private_dir, read_private_file, unlink_private_file, write_private_file,
+)
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.process import run
 from scripts.tools import verify_all_inputs
@@ -78,7 +86,31 @@ def tenant_cutover_lock_documents() -> list[dict[str, object]]:
     }
     return [policy, binding]
 
-def catalog_cutover_lock_documents() -> list[dict[str, object]]:
+def catalog_cutover_lock_documents(
+    probe: tuple[str, str] | None = None,
+) -> list[dict[str, object]]:
+    expression = "false"
+    if probe is not None:
+        name, uid = probe
+        if not re.fullmatch(r"[a-z0-9-]+", name) or not re.fullmatch(r"[a-z0-9-]+", uid):
+            raise RuntimeError("invalid probe policy identity")
+        expression = (
+            "request.userInfo.username == 'system:serviceaccount:tenant-system:tenant-controller'"
+            f" && object.metadata.namespace == 'tenant-db-{name}'"
+            f" && object.metadata.name == '{name}'"
+            f" && object.spec.tenantName == '{name}'"
+            f" && object.spec.tenantUID == '{uid}'"
+            " && object.spec.closed == false"
+            " && object.spec.entries.size() == 0"
+            " && object.metadata.finalizers.size() == 1"
+            " && object.metadata.finalizers[0] == 'tenancy.cnpg-vcluster.io/database-catalog-finalizer'"
+            " && object.metadata.ownerReferences.size() == 1"
+            " && object.metadata.ownerReferences[0].kind == 'Tenant'"
+            " && object.metadata.ownerReferences[0].apiVersion == 'tenancy.cnpg-vcluster.io/v1alpha4'"
+            f" && object.metadata.ownerReferences[0].name == '{name}'"
+            f" && object.metadata.ownerReferences[0].uid == '{uid}'"
+        )
+        expression = f"({expression})"
     return [
         {
             "apiVersion": "admissionregistration.k8s.io/v1",
@@ -94,7 +126,7 @@ def catalog_cutover_lock_documents() -> list[dict[str, object]]:
                     "scope": "Namespaced",
                 }]},
                 "validations": [{
-                    "expression": "false",
+                    "expression": expression,
                     "message": "TenantDatabaseCatalog creation is locked during API cutover",
                 }],
             },
@@ -129,8 +161,10 @@ def ensure_catalog_cutover_lock(client: ManagementClient) -> None:
 
 def verify_catalog_cutover_lock(
     client: ManagementClient, *, namespace: str,
-) -> None:
-    expected_policy, expected_binding = catalog_cutover_lock_documents()
+    expected_identity: tuple[str, int, str, int] | None = None,
+    probe: tuple[str, str] | None = None,
+) -> tuple[str, int, str, int]:
+    expected_policy, expected_binding = catalog_cutover_lock_documents(probe)
     expected_spec = expected_policy["spec"]
 
     def current_identity() -> tuple[str, int, str, int]:
@@ -199,6 +233,8 @@ def verify_catalog_cutover_lock(
         )
 
     identity = current_identity()
+    if expected_identity is not None and identity != expected_identity:
+        raise RuntimeError("catalog cutover CREATE fence identity changed before release")
     name = f"database-lock-probe-{uuid.uuid4().hex[:8]}"
     document = {
         "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
@@ -223,6 +259,998 @@ def verify_catalog_cutover_lock(
             raise RuntimeError("catalog cutover CREATE fence is not effective")
     if current_identity() != identity:
         raise RuntimeError("catalog cutover CREATE fence identity changed during probing")
+    return identity
+
+
+def verify_catalog_release_deployment(
+        client: ManagementClient, *, name: str, image: str, service_account: str,
+        provider: str | None = None, probe: tuple[str, str] | None = None,
+) -> None:
+        if not image or not service_account:
+            raise RuntimeError(f"{name} release image or service account is not specified")
+        deployment = client.json(
+            "-n", CONTROLLER_NAMESPACE, "get", f"deployment/{name}",
+        )
+        meta = deployment.get("metadata", {})
+        spec = deployment.get("spec", {})
+        status = deployment.get("status", {})
+        template = spec.get("template", {}).get("spec", {})
+        selector = spec.get("selector", {}).get("matchLabels", {})
+        if (
+            not isinstance(meta, dict) or not isinstance(spec, dict)
+            or not isinstance(status, dict) or not isinstance(template, dict)
+            or not isinstance(selector, dict) or not selector
+            or not isinstance(meta.get("uid"), str) or not meta["uid"]
+            or not isinstance(meta.get("generation"), int)
+            or isinstance(meta["generation"], bool)
+            or status.get("observedGeneration") != meta["generation"]
+            or spec.get("replicas") != 1
+            or spec.get("strategy", {}).get("type") != "Recreate"
+            or status.get("replicas") != 1
+            or status.get("readyReplicas") != 1
+            or status.get("updatedReplicas") != 1
+            or status.get("availableReplicas") != 1
+            or template.get("serviceAccountName") != service_account
+            or not any(
+                isinstance(container, dict)
+                and container.get("name") == "manager"
+                and container.get("image") == image
+                and (
+                    provider is None or (
+                        isinstance(container.get("args"), list)
+                        and container["args"].count(f"--provider={provider}") == 1
+                        and container.get("args", []).count(f"--controller-image={image}") == 1
+                        and all(
+                            not isinstance(arg, str)
+                            or not arg.startswith(("--provider=", "--controller-image="))
+                            or arg in (f"--provider={provider}", f"--controller-image={image}")
+                            for arg in container["args"]
+                        )
+                    )
+                )
+                for container in template.get("containers", [])
+            )
+        ):
+            raise RuntimeError(f"{name} release rollout is not exact and Ready")
+        pods = client.json(
+            "-n", CONTROLLER_NAMESPACE, "get", "pods",
+            "-l", ",".join(f"{key}={value}" for key, value in sorted(selector.items())),
+        ).get("items")
+        if not isinstance(pods, list) or len(pods) != 1:
+            raise RuntimeError(f"{name} release rollout has no exact Ready Pod")
+        pod = pods[0]
+        pod_meta = pod.get("metadata", {})
+        pod_spec = pod.get("spec", {})
+        if (
+            not isinstance(pod_meta, dict) or not isinstance(pod_spec, dict)
+            or pod_meta.get("deletionTimestamp")
+            or pod_spec.get("serviceAccountName") != service_account
+            or not isinstance(pod_meta.get("uid"), str) or not pod_meta["uid"]
+            or not all(pod_meta.get("labels", {}).get(k) == v for k, v in selector.items())
+            or not any(
+                isinstance(container, dict)
+                and container.get("name") == "manager"
+                and container.get("image") == image
+                and (
+                    provider is None or (
+                        isinstance(container.get("args"), list)
+                        and container["args"].count(f"--provider={provider}") == 1
+                        and container.get("args", []).count(f"--controller-image={image}") == 1
+                        and all(
+                            not isinstance(arg, str)
+                            or not arg.startswith(("--provider=", "--controller-image="))
+                            or arg in (f"--provider={provider}", f"--controller-image={image}")
+                            for arg in container["args"]
+                        )
+                    )
+                )
+                for container in pod_spec.get("containers", [])
+            )
+            or not any(
+                condition.get("type") == "Ready" and condition.get("status") == "True"
+                for condition in pod.get("status", {}).get("conditions", [])
+            )
+        ):
+            raise RuntimeError(f"{name} release rollout has no exact Ready Pod")
+        owners = pod_meta.get("ownerReferences", [])
+        if (
+            not isinstance(owners, list) or len(owners) != 1
+            or owners[0].get("kind") != "ReplicaSet"
+            or owners[0].get("controller") is not True
+            or not isinstance(owners[0].get("uid"), str)
+            or not owners[0]["uid"]
+            or not isinstance(owners[0].get("name"), str)
+            or not owners[0]["name"]
+        ):
+            raise RuntimeError(f"{name} release Pod is not owned by an exact ReplicaSet")
+        replica_set = client.json(
+            "-n", CONTROLLER_NAMESPACE, "get", f"replicaset/{owners[0]['name']}",
+        )
+        replica_meta = replica_set.get("metadata", {})
+        if (
+            replica_meta.get("uid") != owners[0]["uid"]
+            or not any(
+                owner.get("kind") == "Deployment"
+                and owner.get("controller") is True
+                and owner.get("name") == name
+                and owner.get("uid") == meta["uid"]
+                for owner in replica_meta.get("ownerReferences", [])
+            )
+            or replica_set.get("status", {}).get("readyReplicas") != 1
+            or replica_set.get("spec", {}).get("replicas") != 1
+        ):
+            raise RuntimeError(f"{name} release ReplicaSet owner is not exact and Ready")
+        if name == "database-controller":
+            pod_name = pod_meta.get("name")
+            if not isinstance(pod_name, str) or not pod_name:
+                raise RuntimeError("database-controller Ready Pod name is absent")
+            if probe is None:
+                raise RuntimeError("database-controller readiness requires an exact catalog probe")
+            _verify_catalog_observation(client, pod_name, pod_meta["uid"], *probe)
+
+
+def _verify_catalog_observation(
+        client: ManagementClient, pod_name: str, pod_uid: str,
+        name: str, tenant_uid: str,
+) -> None:
+        namespace = f"tenant-db-{name}"
+        catalog = client.json("-n", namespace, "get", f"tenantdatabasecatalog/{name}")
+        metadata = catalog.get("metadata", {})
+        observer = catalog.get("status", {}).get("observer", {})
+        catalog_uid = metadata.get("uid")
+        resource_version = metadata.get("resourceVersion")
+        if (
+            metadata.get("namespace") != namespace or metadata.get("name") != name
+            or catalog.get("spec", {}).get("tenantUID") != tenant_uid
+            or catalog.get("spec", {}).get("entries") != {}
+            or catalog.get("status", {}).get("entries", {}) != {}
+            or not isinstance(catalog_uid, str) or not catalog_uid
+            or not isinstance(resource_version, str) or not resource_version
+            or not isinstance(observer, dict)
+            or observer.get("catalogUID") != catalog_uid
+            or observer.get("observedGeneration") != metadata.get("generation")
+            or observer.get("podUID") != pod_uid
+            or not isinstance(observer.get("instanceId"), str)
+            or not observer["instanceId"]
+            or not isinstance(observer.get("observedResourceVersion"), str)
+            or not observer["observedResourceVersion"]
+        ):
+            raise RuntimeError("database-controller has not observed the exact probe")
+        from urllib.parse import urlencode
+        query = urlencode({
+            "namespace": namespace, "name": name,
+            "catalogUID": catalog_uid, "resourceVersion": resource_version,
+        })
+        result = client.kubectl(
+            "get", "--raw",
+            f"/api/v1/namespaces/{CONTROLLER_NAMESPACE}/pods/{pod_name}:8082/proxy/observation?{query}",
+            check=False,
+        )
+        if result.returncode:
+            raise RuntimeError("database-controller exact probe observation is unavailable")
+        try:
+            receipt = json.loads(result.stdout)
+        except ValueError as exc:
+            raise RuntimeError("database-controller exact probe receipt is invalid") from exc
+        if (
+            not isinstance(receipt, dict)
+            or receipt.get("resourceVersion") != resource_version
+            or receipt.get("observer") != observer
+        ):
+            raise RuntimeError("database-controller exact probe receipt changed")
+
+
+def verify_catalog_release_rbac(
+        client: ManagementClient, *, namespace: str = CONTROLLER_NAMESPACE,
+) -> None:
+        rules = (
+            ("tenant-controller", "create", "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io", True),
+            ("tenant-controller", "get", "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io", True),
+            ("tenant-controller", "update", "tenants/status.tenancy.cnpg-vcluster.io", False),
+            ("tenant-controller", "create", "namespaces", False),
+            ("database-controller", "get", "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io", True),
+            ("database-controller", "list", "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io", False),
+            ("database-controller", "watch", "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io", False),
+            ("database-controller", "update", "tenantdatabasecatalogs/status.tenancy.cnpg-vcluster.io", True),
+            ("database-controller", "get", "tenants.tenancy.cnpg-vcluster.io", False),
+        )
+        for account, verb, resource, namespaced in rules:
+            arguments = (
+                "auth", "can-i", verb, resource,
+                f"--as=system:serviceaccount:{CONTROLLER_NAMESPACE}:{account}",
+                *(("--namespace=" + namespace,) if namespaced else ()),
+                *(("--all-namespaces=true",)
+                  if verb in ("list", "watch") and not namespaced else ()),
+            )
+            result = client.kubectl(*arguments, check=False)
+            if result.returncode or result.stdout.strip() != "yes":
+                raise RuntimeError(f"{account} effective RBAC cannot {verb} {resource}")
+
+
+def verify_catalog_release_capability(
+        client: ManagementClient, *, provider: str,
+        probe: tuple[str, str] | None = None,
+) -> None:
+        tenants = client.json("get", "tenants.tenancy.cnpg-vcluster.io")
+        items = tenants.get("items") if isinstance(tenants, dict) else None
+        if not isinstance(items, list) or not items:
+            raise RuntimeError("database provider capability has no live Tenant evidence")
+        if probe is not None and (
+            len(items) != 1
+            or items[0].get("metadata", {}).get("name") != probe[0]
+            or items[0].get("metadata", {}).get("uid") != probe[1]
+            or tenants.get("metadata", {}).get("continue", "") != ""
+        ):
+            raise RuntimeError("database provider capability has a foreign Tenant")
+        matched = False
+        for tenant in items:
+            metadata = tenant.get("metadata", {})
+            spec = tenant.get("spec", {})
+            status = tenant.get("status", {})
+            if not isinstance(spec, dict) or not isinstance(status, dict):
+                raise RuntimeError("database provider capability inventory is malformed")
+            if spec.get("provider", {}).get("type") != provider:
+                continue
+            if probe is not None and (
+                metadata.get("name") != probe[0] or metadata.get("uid") != probe[1]
+            ):
+                continue
+            matched = True
+            capability = status.get("databaseCapability", {})
+            if (
+                not isinstance(metadata, dict) or metadata.get("deletionTimestamp")
+                or not isinstance(capability, dict)
+                or capability.get("available") is not True
+                or not isinstance(capability.get("namespace"), str)
+                or not capability["namespace"]
+                or not isinstance(capability.get("namespaceUID"), str)
+                or not capability["namespaceUID"]
+                or not isinstance(capability.get("catalogUID"), str)
+                or not capability["catalogUID"]
+                or not isinstance(metadata.get("uid"), str)
+                or not metadata["uid"]
+            ):
+                raise RuntimeError("database provider capability is not Ready")
+            namespace = client.json("get", f"namespace/{capability['namespace']}")
+            catalog = client.json(
+                "-n", capability["namespace"], "get",
+                f"tenantdatabasecatalog/{metadata['name']}",
+            )
+            if (
+                namespace.get("metadata", {}).get("uid") != capability["namespaceUID"]
+                or catalog.get("metadata", {}).get("uid") != capability["catalogUID"]
+                or catalog.get("spec", {}).get("tenantUID") != metadata["uid"]
+                or catalog.get("spec", {}).get("tenantName") != metadata["name"]
+                or catalog.get("spec", {}).get("closed") is not False
+                or catalog.get("spec", {}).get("entries", {}) != {}
+                or catalog.get("status", {}).get("entries", {}) != {}
+                or catalog.get("metadata", {}).get("namespace") != capability["namespace"]
+                or catalog.get("metadata", {}).get("name") != metadata["name"]
+                or "tenancy.cnpg-vcluster.io/database-catalog-finalizer" not in (
+                    catalog.get("metadata", {}).get("finalizers") or []
+                )
+                or capability["namespace"] != f"tenant-db-{metadata['name']}"
+                or namespace.get("metadata", {}).get("name") != capability["namespace"]
+                or namespace.get("metadata", {}).get("ownerReferences")
+                or namespace.get("metadata", {}).get("labels", {}).get(
+                    "tenancy.cnpg-vcluster.io/tenant-uid"
+                ) != metadata["uid"]
+                or not isinstance(catalog.get("metadata", {}).get("ownerReferences"), list)
+                or len(catalog["metadata"]["ownerReferences"]) != 1
+                or any(
+                    catalog["metadata"]["ownerReferences"][0].get(key) != value
+                    for key, value in {
+                        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
+                        "kind": "Tenant", "name": metadata["name"], "uid": metadata["uid"],
+                    }.items()
+                )
+            ):
+                raise RuntimeError("database provider capability catalog identity is not exact")
+            if provider == "azure":
+                storage_name = f"tenant-db-storage-{metadata['name']}"
+                storage_uid = capability.get("storageNamespaceUID")
+                if not isinstance(storage_uid, str) or not storage_uid:
+                    raise RuntimeError("Azure database storage namespace UID is absent")
+                storage = client.json("get", f"namespace/{storage_name}")
+                if (
+                    storage.get("metadata", {}).get("uid") != storage_uid
+                    or storage.get("metadata", {}).get("name") != storage_name
+                    or storage.get("metadata", {}).get("ownerReferences")
+                    or storage.get("metadata", {}).get("labels", {}).get(
+                        "tenancy.cnpg-vcluster.io/tenant-uid"
+                    ) != metadata["uid"]
+                ):
+                    raise RuntimeError("Azure database storage namespace identity is not exact")
+            verify_catalog_release_rbac(
+                client, namespace=capability["namespace"],
+            )
+            if probe is not None:
+                response = client.kubectl(
+                    "get", "--raw=/apis/tenancy.cnpg-vcluster.io/v1alpha1/tenantdatabasecatalogs",
+                    check=False,
+                )
+                try:
+                    listing = json.loads(response.stdout)
+                except (ValueError, TypeError) as exc:
+                    raise RuntimeError("database provider capability catalog inventory is invalid") from exc
+                entries = listing.get("items") if isinstance(listing, dict) else None
+                if (
+                    response.returncode != 0 or not isinstance(listing, dict)
+                    or listing.get("kind") != "TenantDatabaseCatalogList"
+                    or listing.get("apiVersion") != "tenancy.cnpg-vcluster.io/v1alpha1"
+                    or listing.get("metadata", {}).get("continue", "") != ""
+                    or not isinstance(entries, list) or len(entries) != 1
+                    or entries[0].get("metadata", {}).get("uid") != capability["catalogUID"]
+                    or entries[0].get("metadata", {}).get("namespace") != capability["namespace"]
+                    or entries[0].get("metadata", {}).get("name") != metadata["name"]
+                ):
+                    raise RuntimeError("database provider capability has a foreign catalog")
+        if not matched:
+            raise RuntimeError(f"database provider capability for {provider} is unavailable")
+
+
+def verify_catalog_release_probe(
+        client: ManagementClient, *, namespace: str,
+) -> None:
+        name = f"database-release-probe-{uuid.uuid4().hex}"
+        reference = f"tenantdatabasecatalog/{name}"
+
+        def require_absent() -> None:
+            result = client.kubectl(
+                "-n", namespace, "get", reference,
+                "--ignore-not-found=true", "-o", "name", check=False,
+            )
+            if result.returncode or result.stdout.strip():
+                raise RuntimeError("catalog release probe was persisted or cannot be inspected")
+
+        require_absent()
+        document = {
+            "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+            "kind": "TenantDatabaseCatalog",
+            "metadata": {"name": name, "namespace": namespace},
+            "spec": {
+                "tenantName": name, "tenantUID": "release-probe",
+                "closed": False, "entries": {},
+            },
+        }
+        result = client.kubectl(
+            "create", "--dry-run=server", "-f", "-",
+            input_text=json.dumps(document), check=False,
+        )
+        require_absent()
+        if (
+            result.returncode == 0 or CATALOG_CUTOVER_POLICY not in result.stderr
+            or "TenantDatabaseCatalog creation is locked during API cutover"
+            not in result.stderr
+        ):
+            raise RuntimeError("catalog release probe did not receive the owned policy denial")
+
+
+def verify_catalog_release_gates(
+        client: ManagementClient, *, provider: str,
+        tenant_image: str, database_image: str,
+) -> tuple[str, int, str, int]:
+        identity = verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+        verify_catalog_release_deployment(
+            client, name=CONTROLLER_DEPLOYMENT, image=tenant_image,
+            service_account="tenant-controller", provider=provider,
+        )
+        verify_catalog_release_rbac(client)
+        verify_catalog_release_probe(client, namespace=CONTROLLER_NAMESPACE)
+        verify_catalog_cutover_lock(
+            client, namespace=CONTROLLER_NAMESPACE, expected_identity=identity,
+        )
+        return identity
+
+
+def verify_release_tenant_cutover_lock(client: ManagementClient) -> None:
+    expected_policy, expected_binding = tenant_cutover_lock_documents()
+
+    def identity() -> tuple[str, int, str, int]:
+        policy = client.json(
+            "get", f"validatingadmissionpolicy/{TENANT_CUTOVER_POLICY}",
+        )
+        binding = client.json(
+            "get", f"validatingadmissionpolicybinding/{TENANT_CUTOVER_POLICY}",
+        )
+        policy_meta = policy.get("metadata", {})
+        binding_meta = binding.get("metadata", {})
+        status = policy.get("status", {})
+        conditions = status.get("conditions", [])
+        policy_spec = policy.get("spec", {})
+        constraints = policy_spec.get("matchConstraints", {})
+        if (
+            not isinstance(policy_meta, dict)
+            or not isinstance(binding_meta, dict)
+            or not isinstance(status, dict)
+            or not isinstance(policy_spec, dict)
+            or not isinstance(constraints, dict)
+            or policy_meta.get("name") != TENANT_CUTOVER_POLICY
+            or binding_meta.get("name") != TENANT_CUTOVER_POLICY
+            or any(
+                not isinstance(meta.get("uid"), str) or not meta["uid"]
+                or not isinstance(meta.get("generation"), int)
+                or isinstance(meta["generation"], bool)
+                or meta["generation"] < 1
+                for meta in (policy_meta, binding_meta)
+            )
+            or policy_spec.get("failurePolicy") != "Fail"
+            or set(policy_spec) - {
+                "failurePolicy", "matchConstraints", "validations",
+                "matchConditions", "paramKind",
+            }
+            or constraints.get("resourceRules") != expected_policy["spec"]["matchConstraints"]["resourceRules"]
+            or set(constraints) - {
+                "resourceRules", "excludeResourceRules", "namespaceSelector",
+                "objectSelector", "matchPolicy",
+            }
+            or constraints.get("excludeResourceRules")
+            or constraints.get("namespaceSelector")
+            or constraints.get("objectSelector")
+            or constraints.get("matchPolicy", "Equivalent") != "Equivalent"
+            or policy_spec.get("validations") != expected_policy["spec"]["validations"]
+            or policy_spec.get("matchConditions")
+            or policy_spec.get("paramKind")
+            or binding.get("spec") != expected_binding["spec"]
+            or status.get("observedGeneration") != policy_meta["generation"]
+            or not isinstance(status.get("typeChecking"), dict)
+            or status["typeChecking"].get("expressionWarnings", []) != []
+            or not isinstance(conditions, list)
+            or any(
+                not isinstance(condition, dict)
+                or condition.get("observedGeneration") != policy_meta["generation"]
+                or condition.get("status") != "True"
+                for condition in conditions
+            )
+        ):
+            raise RuntimeError("Tenant cutover release fence contract is malformed")
+        return (
+            policy_meta["uid"], policy_meta["generation"],
+            binding_meta["uid"], binding_meta["generation"],
+        )
+
+    observed = identity()
+    document = {
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
+        "kind": "Tenant",
+        "metadata": {"name": f"release-lock-probe-{uuid.uuid4().hex[:12]}"},
+        "spec": {
+            "kubernetesVersion": "1.36.4", "workers": 1,
+            "provider": {"type": "local"},
+        },
+    }
+    for _ in range(5):
+        if identity() != observed:
+            raise RuntimeError("Tenant cutover release fence identity changed")
+        result = client.kubectl(
+            "create", "--dry-run=server", "-f", "-",
+            input_text=json.dumps(document), check=False,
+        )
+        if (
+            result.returncode == 0
+            or TENANT_CUTOVER_POLICY not in result.stderr
+            or "Tenant creation is locked during API cutover" not in result.stderr
+        ):
+            raise RuntimeError("Tenant cutover release fence is not effective")
+    if identity() != observed:
+        raise RuntimeError("Tenant cutover release fence identity changed")
+
+
+def release_catalog_and_tenant_cutover_locks(
+        config: dict[str, str], client: ManagementClient, *,
+        provider: str, tenant_image: str, database_image: str,
+) -> None:
+        if not CATALOG_LIFECYCLE_READY:
+            raise RuntimeError("catalog lifecycle release is not approved")
+        try:
+            if _probe_record_path(client).exists() or (
+                _catalog_lock_present(client) and not tenant_cutover_lock_present(client)
+            ):
+                apply_tenant_cutover_lock(config, client)
+                ensure_catalog_cutover_lock(client)
+            if not tenant_cutover_lock_present(client):
+                raise RuntimeError("Tenant cutover lock is absent before catalog release")
+            verify_release_tenant_cutover_lock(client)
+            identity = verify_catalog_release_gates(
+                client, provider=provider, tenant_image=tenant_image,
+                database_image=database_image,
+            )
+            verify_release_tenant_cutover_lock(client)
+            verify_catalog_cutover_lock(
+                client, namespace=CONTROLLER_NAMESPACE, expected_identity=identity,
+            )
+            run_catalog_lifecycle_probe(
+                config, client, provider=provider, database_image=database_image,
+            )
+            verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+            _record_catalog_activation(client)
+            remove_catalog_cutover_lock(config, client)
+        except Exception as failure:
+            def restore_catalog_fence() -> None:
+                ensure_catalog_cutover_lock(client)
+                verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+            for restore in (
+                lambda: apply_tenant_cutover_lock(config, client),
+                restore_catalog_fence,
+            ):
+                try:
+                    restore()
+                except Exception as error:
+                    failure.add_note(f"cutover fence restoration failed: {error}")
+            raise
+
+
+def _activation_record_path(client: ManagementClient) -> Path:
+    return _probe_record_path(client).with_name("catalog-activation.json")
+
+
+def _activation_identity(client: ManagementClient) -> dict[str, str]:
+    resources = (
+        ("clusterUID", "namespace/kube-system"),
+        ("tenantCRDUID", f"crd/{TENANT_CRD}"),
+        ("catalogCRDUID", "crd/tenantdatabasecatalogs.tenancy.cnpg-vcluster.io"),
+    )
+    identity = {}
+    for key, reference in resources:
+        resource = client.json("get", reference)
+        uid = resource.get("metadata", {}).get("uid") if isinstance(resource, dict) else None
+        if not isinstance(uid, str) or not re.fullmatch(r"[a-zA-Z0-9-]+", uid):
+            raise RuntimeError(f"catalog activation identity is unavailable: {reference}")
+        identity[key] = uid
+    return identity
+
+
+def _record_catalog_activation(client: ManagementClient) -> None:
+    identity = _activation_identity(client)
+    write_private_file(_activation_record_path(client), json.dumps({
+        "schema": 1, **identity,
+    }))
+
+
+def _catalog_activation_complete(client: ManagementClient) -> bool:
+    path = _activation_record_path(client)
+    if not path.exists():
+        return False
+    try:
+        record = json.loads(read_private_file(path))
+    except ValueError as exc:
+        raise RuntimeError("catalog activation record is malformed") from exc
+    if (
+        not isinstance(record, dict)
+        or set(record) != {"schema", "clusterUID", "tenantCRDUID", "catalogCRDUID"}
+        or record["schema"] != 1
+    ):
+        raise RuntimeError("catalog activation record is invalid")
+    if record != {"schema": 1, **_activation_identity(client)}:
+        raise RuntimeError("catalog activation belongs to another management cluster")
+    return True
+
+
+def _catalog_lock_present(client: ManagementClient) -> bool:
+    refs = (
+        f"validatingadmissionpolicy/{CATALOG_CUTOVER_POLICY}",
+        f"validatingadmissionpolicybinding/{CATALOG_CUTOVER_POLICY}",
+    )
+    present = [
+        bool(client.kubectl(
+            "get", reference, "--ignore-not-found=true", "-o", "name",
+        ).stdout.strip())
+        for reference in refs
+    ]
+    if present[0] != present[1]:
+        ensure_catalog_cutover_lock(client)
+        verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+        return True
+    return present[0]
+
+
+def _probe_record_path(client: ManagementClient) -> Path:
+    kubeconfig = getattr(client, "kubeconfig", None)
+    if not isinstance(kubeconfig, Path):
+        raise RuntimeError("bootstrap recovery requires a verified kubeconfig location")
+    return kubeconfig.parent / "catalog-bootstrap-probe.json"
+
+
+def _probe_record(client: ManagementClient) -> dict[str, object] | None:
+    path = _probe_record_path(client)
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(read_private_file(path))
+    except ValueError as exc:
+        raise RuntimeError("bootstrap recovery record is malformed") from exc
+    if (
+        not isinstance(record, dict) or record.get("schema") != 1
+        or record.get("name") != "catalog-bootstrap-probe"
+        or not isinstance(record.get("token"), str)
+        or not re.fullmatch(r"[0-9a-f]{32}", record["token"])
+        or record.get("provider") not in ("local", "azure")
+        or record.get("issued") not in (True, False)
+        or (record.get("uid") is not None and (
+            not isinstance(record["uid"], str)
+            or not re.fullmatch(r"[a-zA-Z0-9-]+", record["uid"])
+        ))
+    ):
+        raise RuntimeError("bootstrap recovery record is invalid")
+    return record
+
+
+def _probe_resource(
+    client: ManagementClient, reference: str, *, namespace: str | None = None,
+) -> dict[str, object] | None:
+    arguments = ("-n", namespace) if namespace else ()
+    result = client.kubectl(
+        *arguments, "get", reference, "--ignore-not-found=true", "-o", "json",
+        check=False,
+    )
+    if result.returncode:
+        raise RuntimeError(f"cannot inspect bootstrap identity {reference}: {result.stderr}")
+    if not result.stdout.strip():
+        return None
+    try:
+        payload = json.loads(result.stdout)
+    except ValueError as exc:
+        raise RuntimeError(f"bootstrap identity {reference} is invalid") from exc
+    if not isinstance(payload, dict) or not isinstance(payload.get("metadata"), dict):
+        raise RuntimeError(f"bootstrap identity {reference} is invalid")
+    return payload
+
+
+def _empty_database_namespace(client: ManagementClient, namespace: str) -> None:
+    for resource in (
+        "persistentvolumeclaims", "pods", "statefulsets.apps", "deployments.apps",
+    ):
+        arguments = ("-n", namespace)
+        listing = client.json(*arguments, "get", resource)
+        if (
+            not isinstance(listing, dict)
+            or not isinstance(listing.get("items"), list)
+            or listing.get("metadata", {}).get("continue", "") != ""
+            or listing["items"]
+        ):
+            raise RuntimeError(f"bootstrap database namespace has data or unknown inventory: {resource}")
+    pv = client.json("get", "persistentvolumes")
+    if (
+        not isinstance(pv, dict) or not isinstance(pv.get("items"), list)
+        or pv.get("metadata", {}).get("continue", "") != ""
+        or any(
+            item.get("spec", {}).get("claimRef", {}).get("namespace") == namespace
+            for item in pv["items"]
+        )
+    ):
+        raise RuntimeError("bootstrap namespace has persistent volume data or unknown inventory")
+    crd = client.kubectl(
+        "get", "crd/clusters.postgresql.cnpg.io",
+        "--ignore-not-found=true", "-o", "name", check=False,
+    )
+    if crd.returncode or (crd.stdout.strip() not in ("", "customresourcedefinition.apiextensions.k8s.io/clusters.postgresql.cnpg.io")):
+        raise RuntimeError("CNPG Cluster API discovery is uncertain")
+    if crd.stdout.strip():
+        clusters = client.json("-n", namespace, "get", "clusters.postgresql.cnpg.io")
+        if (
+            not isinstance(clusters, dict) or clusters.get("items") != []
+            or clusters.get("metadata", {}).get("continue", "") != ""
+        ):
+            raise RuntimeError("bootstrap namespace has CNPG clusters or unknown inventory")
+
+
+def _delete_probe_tenant_uid(
+    config: dict[str, str], client: ManagementClient, name: str, uid: str,
+) -> None:
+    kubeconfig = getattr(client, "kubeconfig", None)
+    kubectl = getattr(client, "kubectl_path", None)
+    if not isinstance(kubeconfig, Path) or not isinstance(kubectl, Path):
+        raise RuntimeError("UID-preconditioned bootstrap deletion needs a verified kubeconfig")
+    context = getattr(client, "context", None)
+    process = subprocess.Popen(
+        [str(kubectl), "--kubeconfig", str(kubeconfig),
+         *(["--context", context] if isinstance(context, str) and context else []),
+         "proxy", "--address=127.0.0.1", "--port=0",
+         "--accept-hosts=^127\\.0\\.0\\.1$"],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    try:
+        if process.stdout is None or not select.select(
+            [process.stdout], [], [], min(parse_duration(config["COMMAND_TIMEOUT"]), 30),
+        )[0]:
+            raise RuntimeError("bootstrap API proxy did not become ready")
+        started = process.stdout.readline().strip()
+        match = re.fullmatch(r"Starting to serve on 127\.0\.0\.1:(\d+)", started)
+        if not match or process.poll() is not None:
+            raise RuntimeError("bootstrap API proxy did not become ready")
+        request = urllib.request.Request(
+            f"http://127.0.0.1:{match[1]}/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/{name}",
+            data=json.dumps({
+                "apiVersion": "meta.k8s.io/v1", "kind": "DeleteOptions",
+                "preconditions": {"uid": uid},
+            }).encode(),
+            headers={"Content-Type": "application/json"},
+            method="DELETE",
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        with opener.open(request, timeout=parse_duration(config["COMMAND_TIMEOUT"])) as response:
+            outcome = json.load(response)
+        if not isinstance(outcome, dict) or outcome.get("status") == "Failure":
+            raise RuntimeError("UID-preconditioned bootstrap deletion was not accepted")
+    except (OSError, ValueError, urllib.error.URLError) as exc:
+        raise RuntimeError("UID-preconditioned bootstrap deletion failed") from exc
+    finally:
+        process.terminate()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+
+
+def _verify_probe_exception(
+    client: ManagementClient, name: str, uid: str,
+) -> None:
+    namespace = f"tenant-db-{name}"
+    existing = _probe_resource(client, f"tenantdatabasecatalog/{name}", namespace=namespace)
+    if existing is not None and (
+        existing.get("metadata", {}).get("name") != name
+        or existing.get("metadata", {}).get("namespace") != namespace
+        or not isinstance(existing.get("metadata", {}).get("uid"), str)
+        or not existing["metadata"]["uid"]
+        or existing.get("spec", {}).get("tenantUID") != uid
+        or existing.get("spec", {}).get("tenantName") != name
+        or existing.get("spec", {}).get("closed") is not False
+        or existing.get("spec", {}).get("entries", {}) != {}
+        or existing.get("status", {}).get("entries", {}) != {}
+        or existing.get("metadata", {}).get("finalizers") != [
+            "tenancy.cnpg-vcluster.io/database-catalog-finalizer"
+        ]
+        or len(existing.get("metadata", {}).get("ownerReferences", [])) != 1
+        or any(
+            existing["metadata"]["ownerReferences"][0].get(key) != value
+            for key, value in {
+                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
+                "kind": "Tenant", "name": name, "uid": uid,
+            }.items()
+        )
+    ):
+        raise RuntimeError("bootstrap catalog identity is occupied")
+    document = {
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+        "kind": "TenantDatabaseCatalog",
+        "metadata": {
+            "namespace": namespace, "name": name,
+            "finalizers": ["tenancy.cnpg-vcluster.io/database-catalog-finalizer"],
+            "ownerReferences": [{
+                "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
+                "kind": "Tenant", "name": name, "uid": uid,
+            }],
+        },
+        "spec": {"tenantName": name, "tenantUID": uid, "closed": False, "entries": {}},
+    }
+    actor = f"--as=system:serviceaccount:{CONTROLLER_NAMESPACE}:tenant-controller"
+    for candidate, allowed in ((document, True), (
+        {**document, "spec": {**document["spec"], "tenantUID": "foreign-uid"}}, False
+    )):
+        if allowed and existing is not None:
+            continue
+        result = client.kubectl(
+            actor, "create", "--dry-run=server", "-f", "-",
+            input_text=json.dumps(candidate), check=False,
+        )
+        if allowed:
+            if result.returncode:
+                raise RuntimeError("UID-bound bootstrap policy exception is ineffective")
+        elif (
+            result.returncode == 0 or CATALOG_CUTOVER_POLICY not in result.stderr
+            or "TenantDatabaseCatalog creation is locked during API cutover" not in result.stderr
+        ):
+            raise RuntimeError("UID-bound bootstrap policy permits a foreign catalog")
+
+
+def run_catalog_lifecycle_probe(
+    config: dict[str, str], client: ManagementClient, *,
+    provider: str, database_image: str,
+) -> None:
+    from scripts.lib.database_controller import inspect_catalog_inventory
+
+    name = "catalog-bootstrap-probe"
+    namespace = f"tenant-db-{name}"
+    storage_namespace = f"tenant-db-storage-{name}"
+    if provider not in ("local", "azure"):
+        raise RuntimeError("unknown bootstrap provider")
+    path = _probe_record_path(client)
+    record = _probe_record(client)
+    if record is not None and record["provider"] != provider:
+        raise RuntimeError("bootstrap provider differs from recovery record")
+    inventory = client.json("get", "tenants.tenancy.cnpg-vcluster.io")
+    current = _probe_resource(client, f"tenant/{name}") if record else None
+    if (
+        not isinstance(inventory, dict)
+        or not isinstance(inventory.get("items"), list)
+        or inventory.get("metadata", {}).get("continue", "") != ""
+        or (record is None and inventory["items"])
+        or (record is not None and (
+            len(inventory["items"]) > 1
+            or (len(inventory["items"]) == 1 and (
+                current is None or inventory["items"][0].get("metadata", {}).get("uid")
+                != current["metadata"].get("uid")
+            ))
+        ))
+    ):
+        raise RuntimeError("bootstrap requires an empty Tenant inventory")
+    if record is None:
+        inspect_catalog_inventory(client)
+        if _probe_resource(client, f"namespace/{namespace}") is not None:
+            raise RuntimeError("bootstrap namespace identity is occupied")
+        if _probe_resource(client, f"namespace/{storage_namespace}") is not None:
+            raise RuntimeError("bootstrap storage namespace identity is occupied")
+        record = {
+            "schema": 1, "name": name, "provider": provider,
+            "token": uuid.uuid4().hex, "uid": None, "issued": False,
+            "deleting": False,
+        }
+        write_private_file(path, json.dumps(record))
+    document = {
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
+        "kind": "Tenant",
+        "metadata": {"name": name, "annotations": {
+            "tenancy.cnpg-vcluster.io/catalog-bootstrap": "installer-owned",
+            "tenancy.cnpg-vcluster.io/catalog-bootstrap-token": record["token"],
+        }},
+        "spec": {
+            "kubernetesVersion": config[
+                "KUBERNETES_VERSION" if provider == "local"
+                else "AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"
+            ].removeprefix("v"),
+            "workers": 1, "provider": {"type": provider},
+        },
+    }
+    if current is None and record["issued"] and record["uid"] is None:
+        raise RuntimeError("bootstrap Tenant CREATE outcome is unknown; await exact identity")
+    if current is None and record["uid"] is not None and not record["deleting"]:
+        raise RuntimeError("bootstrap Tenant disappeared before UID-bound cleanup")
+    unlocked = False
+    if current is None and not record["issued"]:
+        remove_tenant_cutover_lock(config, client)
+        unlocked = True
+        record["issued"] = True
+        write_private_file(path, json.dumps(record))
+        try:
+            created = client.kubectl("create", "-f", "-", input_text=json.dumps(document))
+            current = json.loads(created.stdout)
+        except (RuntimeError, ValueError, KeyError, TypeError):
+            current = _probe_resource(client, f"tenant/{name}")
+            if current is None:
+                raise RuntimeError(
+                    "bootstrap Tenant creation outcome is unknown; do not delete it"
+                )
+    if current is not None and (
+        current.get("metadata", {}).get("name") != name
+        or current.get("metadata", {}).get("annotations", {}).get(
+            "tenancy.cnpg-vcluster.io/catalog-bootstrap-token"
+        ) != record["token"]
+        or current.get("metadata", {}).get("annotations", {}).get(
+            "tenancy.cnpg-vcluster.io/catalog-bootstrap"
+        ) != "installer-owned"
+        or current.get("spec") != document["spec"]
+        or not isinstance(current.get("metadata", {}).get("uid"), str)
+        or not re.fullmatch(r"[a-zA-Z0-9-]+", current["metadata"]["uid"])
+        or (record["uid"] is not None and record["uid"] != current["metadata"]["uid"])
+    ):
+        raise RuntimeError("bootstrap Tenant identity is occupied or changed")
+    if current is not None and record["uid"] is None:
+        record["uid"] = current["metadata"]["uid"]
+        write_private_file(path, json.dumps(record))
+    uid = record["uid"]
+    if record["deleting"]:
+        if current is not None:
+            _delete_probe_tenant_uid(config, client, name, uid)
+            client.kubectl(
+                "wait", "--for=delete", f"tenant/{name}",
+                f"--timeout={config['DELETE_TIMEOUT']}",
+            )
+        _verify_probe_cleanup(client, name, namespace, storage_namespace)
+        ensure_catalog_cutover_lock(client)
+        verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+        remove_tenant_cutover_lock(config, client)
+        unlink_private_file(path)
+        return
+    if current is not None and not unlocked:
+        remove_tenant_cutover_lock(config, client)
+    probe = (name, uid)
+
+    def intent_ready() -> bool:
+        current = _probe_resource(client, f"tenant/{name}")
+        if (
+            current is None or current["metadata"].get("uid") != uid
+            or current["metadata"].get("annotations", {}).get(
+                "tenancy.cnpg-vcluster.io/catalog-bootstrap"
+            ) != "installer-owned"
+            or current["metadata"].get("annotations", {}).get(
+                "tenancy.cnpg-vcluster.io/catalog-bootstrap-token"
+            ) != record["token"]
+            or current["metadata"].get("deletionTimestamp")
+        ):
+            raise RuntimeError("bootstrap Tenant identity changed")
+        intent = current.get("status", {}).get("catalogCreateIntent", {})
+        return intent == {"namespace": namespace, "name": name, "tenantUID": uid}
+
+    wait_for(
+        "bootstrap catalog creation intent", parse_duration(config["CONDITION_TIMEOUT"]),
+        2, intent_ready,
+    )
+    for document in catalog_cutover_lock_documents(probe):
+        client.kubectl(
+            "apply", "--server-side", "--field-manager=cnpg-vcluster-catalog-cutover",
+            "--force-conflicts", "-f", "-", input_text=json.dumps(document),
+        )
+    identity = verify_catalog_cutover_lock(
+        client, namespace=CONTROLLER_NAMESPACE, probe=probe,
+    )
+    _verify_probe_exception(client, name, uid)
+
+    def capability_ready() -> bool:
+        intent_ready()
+        current = _probe_resource(client, f"tenant/{name}")
+        if current.get("status", {}).get("databaseCapability", {}).get("available") is not True:
+            return False
+        verify_catalog_release_capability(client, provider=provider, probe=probe)
+        _empty_database_namespace(client, namespace)
+        if provider == "azure":
+            _empty_database_namespace(client, storage_namespace)
+        return True
+
+    wait_for(
+        "bootstrap database capability", parse_duration(config["CONDITION_TIMEOUT"]),
+        2, capability_ready,
+    )
+    client.kubectl(
+        "-n", CONTROLLER_NAMESPACE, "rollout", "status",
+        "deployment/database-controller",
+        f"--timeout={config['CONDITION_TIMEOUT']}",
+    )
+    verify_catalog_release_deployment(
+        client, name="database-controller", image=database_image,
+        service_account="database-controller", probe=probe,
+    )
+    verify_catalog_cutover_lock(
+        client, namespace=CONTROLLER_NAMESPACE, expected_identity=identity, probe=probe,
+    )
+    _empty_database_namespace(client, namespace)
+    if provider == "azure":
+        _empty_database_namespace(client, storage_namespace)
+    current = _probe_resource(client, f"tenant/{name}")
+    if current is None or current["metadata"].get("uid") != uid:
+        raise RuntimeError("bootstrap Tenant identity changed before cleanup")
+    record["deleting"] = True
+    write_private_file(path, json.dumps(record))
+    _delete_probe_tenant_uid(config, client, name, uid)
+    client.kubectl(
+        "wait", "--for=delete", f"tenant/{name}",
+        f"--timeout={config['DELETE_TIMEOUT']}",
+    )
+    _verify_probe_cleanup(client, name, namespace, storage_namespace)
+    ensure_catalog_cutover_lock(client)
+    verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+    unlink_private_file(path)
+
+
+def _verify_probe_cleanup(
+        client: ManagementClient, name: str, namespace: str,
+        storage_namespace: str,
+) -> None:
+    for reference, scope in (
+        (f"tenant/{name}", None),
+        (f"tenantdatabasecatalog/{name}", namespace),
+        (f"namespace/{namespace}", None),
+        (f"namespace/{storage_namespace}", None),
+        (f"namespace/{name}", None),
+        ("role/tenant-database-credentials", name),
+        ("rolebinding/tenant-database-credentials", name),
+    ):
+        if _probe_resource(client, reference, namespace=scope) is not None:
+            raise RuntimeError("bootstrap identity persists after Tenant deletion")
+    inspect_catalog_inventory(client)
+    inventory = client.json("get", "tenants.tenancy.cnpg-vcluster.io")
+    if inventory.get("items") != [] or inventory.get("metadata", {}).get("continue", "") != "":
+        raise RuntimeError("bootstrap Tenant inventory is not empty after deletion")
 
 
 def catalog_cutover_lock_cleanup_refs() -> tuple[str, str]:
@@ -469,7 +1497,6 @@ def prepare_tenant_api_cutover(
     client: ManagementClient,
 ) -> bool:
     require_absent_legacy_database_crd(client)
-    ensure_catalog_cutover_lock(client)
     observed = client.kubectl(
         "get",
         f"crd/{TENANT_CRD}",
@@ -477,6 +1504,14 @@ def prepare_tenant_api_cutover(
         "-o",
         "json",
     ).stdout.strip()
+    if observed and tenant_api_cutover_state(json.loads(observed)) == "v1alpha4":
+        if (
+            not tenant_cutover_lock_present(client)
+            and not _catalog_lock_present(client)
+            and _catalog_activation_complete(client)
+        ):
+            return False
+    ensure_catalog_cutover_lock(client)
     if not observed:
         if not tenant_cutover_lock_present(client):
             apply_tenant_cutover_lock(config, client)
@@ -981,10 +2016,17 @@ def verify_controller_crd(client: ManagementClient) -> None:
 
 def install_database_catalog(
     root: Path, config: dict[str, str], client: ManagementClient,
-    *, azure: bool = False,
+    *, azure: bool = False, cutover_locked: bool = True,
 ) -> None:
     require_absent_legacy_database_crd(client)
-    ensure_catalog_cutover_lock(client)
+    if cutover_locked:
+        ensure_catalog_cutover_lock(client)
+    elif (
+        not _catalog_activation_complete(client)
+        or _catalog_lock_present(client)
+        or tenant_cutover_lock_present(client)
+    ):
+        raise RuntimeError("completed catalog activation is no longer open")
     for path in catalog_manifests(root, azure=azure):
         client.kubectl(
             "apply", "--server-side",
@@ -1021,7 +2063,14 @@ def install_database_catalog(
                        and item.get("kind") == "TenantDatabaseCatalog"
                        and item.get("namespaced") is True for item in resources)):
             raise RuntimeError("TenantDatabaseCatalog endpoint is not served")
-        verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+        if cutover_locked:
+            verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+        elif (
+            not _catalog_activation_complete(client)
+            or _catalog_lock_present(client)
+            or tenant_cutover_lock_present(client)
+        ):
+            raise RuntimeError("completed catalog activation changed during install")
 
 
 def verify_controller_api(
@@ -1200,6 +2249,7 @@ def reconcile_controller(
 ) -> None:
     require_tenant_api_cutover_ready()
     image = build_controller_image(root, config)
+    database_image = build_database_controller_image(root, config)
     foundation = _foundation_payload(
         root, config, network, image, verified_cache, registry,
     )
@@ -1216,6 +2266,13 @@ def reconcile_controller(
             image,
             "--name",
             config["KIND_CLUSTER_NAME"],
+        ],
+        timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
+    )
+    run(
+        [
+            str(root / ".tools" / "bin" / "kind"),
+            "load", "docker-image", database_image, "--name", config["KIND_CLUSTER_NAME"],
         ],
         timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 4,
     )
@@ -1246,7 +2303,8 @@ def reconcile_controller(
         f"--timeout={timeout}",
     )
     verify_controller_crd(client)
-    install_database_catalog(root, config, client)
+    install_database_catalog(root, config, client, cutover_locked=cutover_locked)
+    install_database_controller(root, client, database_image)
     previous = {
         name: client.kubectl(
             "-n",
@@ -1478,14 +2536,10 @@ def reconcile_controller(
         verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
         verify_tenant_cutover_lock(client, "v1alpha4")
         if CATALOG_LIFECYCLE_READY:
-            remove_tenant_cutover_lock(config, client)
-    if CATALOG_LIFECYCLE_READY:
-        try:
-            verify_controller_api(config, client, require_allocation=cutover_locked)
-        except Exception:
-            if cutover_locked:
-                apply_tenant_cutover_lock(config, client)
-            raise
+            release_catalog_and_tenant_cutover_locks(
+                config, client, provider="local", tenant_image=image,
+                database_image=database_image,
+            )
 
 
 def delete_controller(
@@ -1519,6 +2573,15 @@ def delete_controller(
             )
     stop_controller(config, client)
     require_clean_controller_state(root, client)
+    inspect_catalog_inventory(client)
+    for namespace, resource in (
+        (CONTROLLER_NAMESPACE, "deployment/database-controller"),
+        (None, "clusterrolebinding/database-controller"),
+        (None, "clusterrole/database-controller"),
+        (CONTROLLER_NAMESPACE, "serviceaccount/database-controller"),
+        (None, f"crd/{CATALOG_CRD}"),
+    ):
+        delete_named(config, client, namespace, resource)
     for namespace, resource in (
         ("tenant-system", "configmap/tenant-foundation"),
         ("tenant-system", "configmap/tenant-controller-state"),

@@ -4,8 +4,11 @@ use kube::{
 };
 use serde_json::{Value, json};
 
-use crate::api::{CatalogCreateIntent, FINALIZER, Tenant, TenantStatus};
 use crate::error::ControllerError;
+use crate::{
+    api::{CatalogCreateIntent, FINALIZER, Tenant, TenantStatus},
+    readiness::set_condition,
+};
 
 fn invalid() -> ControllerError {
     ControllerError::OwnershipInvalid("Tenant identity changed".into())
@@ -152,6 +155,16 @@ where
     mutate_status(client, tenant, tenant, mutate, 4, false).await
 }
 
+pub const CATALOG_CREATE_CONDITION: &str = "CatalogCreate";
+
+pub fn catalog_create_outcome(status: &TenantStatus) -> Option<&str> {
+    status
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == CATALOG_CREATE_CONDITION)
+        .map(|condition| condition.reason.as_str())
+}
+
 pub async fn record_catalog_create_intent(
     client: Client,
     tenant: &Tenant,
@@ -164,8 +177,8 @@ pub async fn record_catalog_create_intent(
             .iter()
             .any(|finalizer| finalizer == FINALIZER)
         || intent.tenant_uid != uid
-        || intent.namespace.is_empty()
-        || intent.name.is_empty()
+        || intent.namespace != tenant_database_runtime::database_namespace(&tenant.name_any())
+        || intent.name != tenant.name_any()
     {
         return Err(invalid());
     }
@@ -179,7 +192,98 @@ pub async fn record_catalog_create_intent(
                 "catalog creation intent identity changed".into(),
             ));
         }
-        status.catalog_create_intent = Some(intent.clone());
+        if status.catalog_create_intent.is_none() {
+            status.catalog_create_intent = Some(intent.clone());
+            set_condition(
+                status,
+                tenant,
+                CATALOG_CREATE_CONDITION,
+                false,
+                "Prepared",
+                "Catalog CREATE has not been issued",
+            );
+        }
+        Ok(())
+    })
+    .await
+}
+
+pub async fn set_catalog_create_outcome(
+    client: Client,
+    tenant: &Tenant,
+    intent: &CatalogCreateIntent,
+    from: &str,
+    to: &str,
+) -> Result<(), ControllerError> {
+    if tenant
+        .status
+        .as_ref()
+        .and_then(|status| status.catalog_create_intent.as_ref())
+        != Some(intent)
+        || !tenant
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == FINALIZER)
+        || (matches!(to, "Unknown" | "Preparing" | "Prepared")
+            && tenant.metadata.deletion_timestamp.is_some())
+    {
+        return Err(invalid());
+    }
+    update_status(client, tenant, |status| {
+        if status.catalog_create_intent.as_ref() != Some(intent)
+            || catalog_create_outcome(status) != Some(from)
+        {
+            return Err(invalid());
+        }
+        set_condition(
+            status,
+            tenant,
+            CATALOG_CREATE_CONDITION,
+            to == "Observed",
+            to,
+            "Catalog CREATE outcome",
+        );
+        Ok(())
+    })
+    .await
+}
+
+pub async fn record_catalog_namespaces(
+    client: Client,
+    tenant: &Tenant,
+    intent: &CatalogCreateIntent,
+    namespace_uid: &str,
+    storage_uid: Option<&str>,
+) -> Result<(), ControllerError> {
+    update_status(client, tenant, |status| {
+        if status.catalog_create_intent.as_ref() != Some(intent)
+            || catalog_create_outcome(status) != Some("Preparing")
+        {
+            return Err(invalid());
+        }
+        let capability = status
+            .database_capability
+            .get_or_insert_with(Default::default);
+        if !capability.catalog_uid.is_empty()
+            || (!capability.namespace_uid.is_empty() && capability.namespace_uid != namespace_uid)
+            || (capability.storage_namespace_uid.is_some()
+                && capability.storage_namespace_uid.as_deref() != storage_uid)
+        {
+            return Err(invalid());
+        }
+        capability.namespace = intent.namespace.clone();
+        capability.namespace_uid = namespace_uid.into();
+        capability.storage_namespace_uid = storage_uid.map(str::to_owned);
+        capability.available = false;
+        capability.reason = "CatalogNotReady".into();
+        set_condition(
+            status,
+            tenant,
+            CATALOG_CREATE_CONDITION,
+            false,
+            "Namespaced",
+            "Catalog namespace identities persisted before CREATE",
+        );
         Ok(())
     })
     .await

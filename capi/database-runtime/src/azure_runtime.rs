@@ -149,7 +149,7 @@ async fn workload(
 }
 
 pub async fn observe(client: Client, tenant_uid: &str) -> Result<&'static str, kube::Error> {
-    if !workload(
+    let operator = workload(
         client.clone(),
         "cnpg-system",
         "cnpg-cloudnative-pg",
@@ -157,11 +157,8 @@ pub async fn observe(client: Client, tenant_uid: &str) -> Result<&'static str, k
         "manager",
         CNPG_IMAGE,
     )
-    .await?
-    {
-        return Ok("OperatorNotReady");
-    }
-    if !workload(
+    .await;
+    let controller = workload(
         client.clone(),
         "kube-system",
         "csi-azuredisk-controller",
@@ -169,19 +166,28 @@ pub async fn observe(client: Client, tenant_uid: &str) -> Result<&'static str, k
         "azuredisk",
         AZURE_DISK_IMAGE,
     )
-    .await?
-        || !workload(
-            client.clone(),
-            "kube-system",
-            "csi-azuredisk-node",
-            "DaemonSet",
-            "azuredisk",
-            AZURE_DISK_IMAGE,
-        )
-        .await?
-    {
-        return Ok("DiskCSINotReady");
+    .await;
+    let node = workload(
+        client.clone(),
+        "kube-system",
+        "csi-azuredisk-node",
+        "DaemonSet",
+        "azuredisk",
+        AZURE_DISK_IMAGE,
+    )
+    .await;
+    let disk_reason = match (controller, node) {
+        (Ok(true), Ok(true)) => observe_disk(client, tenant_uid).await,
+        (Err(error), _) | (_, Err(error)) => Err(error),
+        _ => Ok("DiskCSINotReady"),
+    };
+    if !operator? {
+        return Ok("OperatorNotReady");
     }
+    disk_reason
+}
+
+async fn observe_disk(client: Client, tenant_uid: &str) -> Result<&'static str, kube::Error> {
     let mut resource =
         ApiResource::from_gvk(&GroupVersionKind::gvk("storage.k8s.io", "v1", "CSIDriver"));
     resource.plural = "csidrivers".into();

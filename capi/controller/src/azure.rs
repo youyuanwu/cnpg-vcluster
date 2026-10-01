@@ -302,14 +302,7 @@ pub fn desired_objects(context: &AzureContext<'_>) -> Result<Vec<DynamicObject>,
 helm repo add projectcalico https://docs.tigera.io/calico/charts\n\
 helm upgrade --install cloud-provider-azure cloud-provider-azure/cloud-provider-azure --kubeconfig /tenant/value --version {} --namespace kube-system --values /values/cloud-provider.yaml --wait --timeout 10m\n\
 helm upgrade --install calico-crds projectcalico/crd.projectcalico.org.v1 --kubeconfig /tenant/value --version {} --namespace tigera-operator --create-namespace --wait --timeout 5m\n\
-helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant/value --version {} --namespace tigera-operator --create-namespace --values /values/calico.yaml --wait --timeout 10m\n\
-mkdir -p /charts\n\
-if wget -q https://github.com/cloudnative-pg/charts/releases/download/cloudnative-pg-v0.29.0/cloudnative-pg-0.29.0.tgz -O /charts/cnpg.tgz && echo '668e065ff53508d58238788fd35b355a925060843629a951df0e6a9362e6d32f  /charts/cnpg.tgz' | sha256sum -c -; then\n\
- helm upgrade --install cnpg /charts/cnpg.tgz --kubeconfig /tenant/value --namespace cnpg-system --create-namespace --set-string image.repository=ghcr.io/cloudnative-pg/cloudnative-pg --set-string image.tag=1.30.0@sha256:a2701eb97cdd2a34b1fdb2cb51987f544b706e40bec72ae7146cd8580efefebb --wait --timeout 10m || echo 'CNPG installation unavailable'\n\
-else echo 'CNPG pinned chart unavailable'; fi\n\
-if wget -q https://raw.githubusercontent.com/kubernetes-sigs/azuredisk-csi-driver/v1.32.12/charts/v1.32.12/azuredisk-csi-driver-1.32.12.tgz -O /charts/azuredisk.tgz && echo '07b10ce708dc988d8315df1794f3fb913f8a1dd85b3fb93c64ca7de491eb095a  /charts/azuredisk.tgz' | sha256sum -c -; then\n\
- helm upgrade --install azuredisk /charts/azuredisk.tgz --kubeconfig /tenant/value --namespace kube-system --set controller.allowEmptyCloudConfig=true --set-string image.azuredisk.repository=mcr.microsoft.com/oss/v2/kubernetes-csi/azuredisk-csi --set-string image.azuredisk.tag=v1.32.12@sha256:96ed94bea5da1fc6bc1e9a75f8a666c467e95a4fe06079a7bbacf469cf6a4cbd --wait --timeout 10m || echo 'Azure Disk CSI installation unavailable'\n\
-else echo 'Azure Disk CSI pinned chart unavailable'; fi",
+helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant/value --version {} --namespace tigera-operator --create-namespace --values /values/calico.yaml --wait --timeout 10m",
         config.cloud_provider_version.trim_start_matches('v'),
         config.calico_version,
         config.calico_version
@@ -574,6 +567,43 @@ pub fn validate_binding(
     }
 }
 
+pub fn provider_resource_identity(
+    object: &DynamicObject,
+    uid: String,
+) -> AzureProviderResourceIdentity {
+    let types = object
+        .types
+        .as_ref()
+        .expect("provider resource GVK validated");
+    let mut owner_uids: Vec<_> = object
+        .metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .map(|owner| owner.uid.clone())
+        .collect();
+    owner_uids.sort();
+    owner_uids.dedup();
+    let resource_id = [
+        "/status/id",
+        "/status/resourceId",
+        "/status/providerID",
+        "/spec/providerID",
+    ]
+    .into_iter()
+    .find_map(|pointer| object.data.pointer(pointer).and_then(Value::as_str))
+    .map(Into::into);
+    AzureProviderResourceIdentity {
+        api_version: types.api_version.clone(),
+        kind: types.kind.clone(),
+        namespace: object.metadata.namespace.clone(),
+        name: object.metadata.name.clone().unwrap_or_default(),
+        uid,
+        resource_id,
+        owner_uids,
+    }
+}
+
 pub fn validate_live_object(
     desired: &DynamicObject,
     live: &DynamicObject,
@@ -662,60 +692,61 @@ fn desired_subset(desired: &Value, live: &Value, path: &str) -> Result<(), Azure
     }
 }
 
-impl AzureManagementStatus {
-    pub fn uid_for(&self, kind: &str, name: &str, tenant: &str) -> Option<&str> {
-        let names = AzureNames::new(tenant);
-        match (kind, name) {
-            ("Namespace", value) if value == names.namespace => self.namespace_uid.as_deref(),
-            ("AzureClusterIdentity", value) if value == names.identity => {
-                self.azure_cluster_identity_uid.as_deref()
+macro_rules! management_ids {
+    ($(($kind:literal, $name:ident, $field:ident)),+ $(,)?) => {
+        impl AzureManagementStatus {
+            pub fn uid_for(&self, kind: &str, name: &str, tenant: &str) -> Option<&str> {
+                let names = AzureNames::new(tenant);
+                match (kind, name) {
+                    $(($kind, value) if value == names.$name => self.$field.as_deref(),)+
+                    _ => None,
+                }
             }
-            ("Cluster", value) if value == names.cluster => self.cluster_uid.as_deref(),
-            ("AzureCluster", value) if value == names.azure_cluster => {
-                self.azure_cluster_uid.as_deref()
-            }
-            ("KamajiControlPlane", value) if value == names.control_plane => {
-                self.kamaji_control_plane_uid.as_deref()
-            }
-            ("KubeadmConfig", value) if value == names.pool => self.kubeadm_config_uid.as_deref(),
-            ("AzureMachinePool", value) if value == names.pool => {
-                self.azure_machine_pool_uid.as_deref()
-            }
-            ("MachinePool", value) if value == names.pool => self.machine_pool_uid.as_deref(),
-            ("ConfigMap", value) if value == names.cloud_values => {
-                self.cloud_values_config_map_uid.as_deref()
-            }
-            ("ConfigMap", value) if value == names.network_values => {
-                self.network_values_config_map_uid.as_deref()
-            }
-            ("Deployment", value) if value == names.status_probe => {
-                self.status_probe_deployment_uid.as_deref()
-            }
-            ("Job", value) if value == names.addon_job => self.addon_job_uid.as_deref(),
-            _ => None,
-        }
-    }
 
-    pub fn recorded_uids(&self) -> BTreeSet<&str> {
-        [
-            self.namespace_uid.as_deref(),
-            self.azure_cluster_identity_uid.as_deref(),
-            self.cluster_uid.as_deref(),
-            self.azure_cluster_uid.as_deref(),
-            self.kamaji_control_plane_uid.as_deref(),
-            self.kubeadm_config_uid.as_deref(),
-            self.azure_machine_pool_uid.as_deref(),
-            self.machine_pool_uid.as_deref(),
-            self.cloud_values_config_map_uid.as_deref(),
-            self.network_values_config_map_uid.as_deref(),
-            self.status_probe_deployment_uid.as_deref(),
-            self.addon_job_uid.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|uid| !uid.is_empty())
-        .collect()
-    }
+            pub fn record_uid(
+                &mut self, kind: &str, name: &str, tenant: &str, uid: &str,
+            ) -> Result<(), crate::error::ControllerError> {
+                use crate::error::ControllerError;
+                let names = AzureNames::new(tenant);
+                let slot = match (kind, name) {
+                    $(($kind, value) if value == names.$name => &mut self.$field,)+
+                    _ => return Err(ControllerError::InvalidInput(
+                        "uncatalogued Azure management identity".into(),
+                    )),
+                };
+                if slot.as_deref().is_some_and(|recorded| recorded != uid) {
+                    return Err(ControllerError::OwnershipInvalid(
+                        "Azure management object UID changed".into(),
+                    ));
+                }
+                *slot = Some(uid.into());
+                Ok(())
+            }
+
+            pub fn recorded_uids(&self) -> BTreeSet<&str> {
+                [$(self.$field.as_deref(),)+]
+                    .into_iter()
+                    .flatten()
+                    .filter(|uid| !uid.is_empty())
+                    .collect()
+            }
+        }
+    };
+}
+
+management_ids! {
+    ("Namespace", namespace, namespace_uid),
+    ("AzureClusterIdentity", identity, azure_cluster_identity_uid),
+    ("Cluster", cluster, cluster_uid),
+    ("AzureCluster", azure_cluster, azure_cluster_uid),
+    ("KamajiControlPlane", control_plane, kamaji_control_plane_uid),
+    ("KubeadmConfig", pool, kubeadm_config_uid),
+    ("AzureMachinePool", pool, azure_machine_pool_uid),
+    ("MachinePool", pool, machine_pool_uid),
+    ("ConfigMap", cloud_values, cloud_values_config_map_uid),
+    ("ConfigMap", network_values, network_values_config_map_uid),
+    ("Deployment", status_probe, status_probe_deployment_uid),
+    ("Job", addon_job, addon_job_uid),
 }
 
 pub fn validate_provider_identity(
@@ -1026,24 +1057,9 @@ mod tests {
             .unwrap();
         assert!(job.contains("--version 1.32.3"));
         assert!(job.contains("--version v3.32.2"));
-        for (image, repository_key, tag_key) in [
-            (
-                tenant_database_runtime::azure_runtime::CNPG_IMAGE,
-                "image.repository",
-                "image.tag",
-            ),
-            (
-                tenant_database_runtime::azure_runtime::AZURE_DISK_IMAGE,
-                "image.azuredisk.repository",
-                "image.azuredisk.tag",
-            ),
-        ] {
-            let (repository, tag) = image.split_once(':').unwrap();
-            assert!(job.contains(&format!(
-                "--set-string {repository_key}={repository} --set-string {tag_key}={tag}"
-            )));
-        }
-        assert!(job.contains("sha256sum -c -"));
+        assert!(!job.contains("cnpg"));
+        assert!(!job.contains("azuredisk"));
+        assert!(!job.contains("wget"));
         assert!(
             !serde_json::to_string(&objects)
                 .unwrap()

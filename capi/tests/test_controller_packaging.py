@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import io
 import json
 import os
 import tempfile
@@ -8,7 +9,7 @@ import unittest
 from contextlib import ExitStack
 from pathlib import Path
 from subprocess import CompletedProcess
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from scripts.lib import controller as packaging
 from scripts.lib import database_controller
@@ -81,10 +82,910 @@ class Client:
 
 
 class PackagingTests(unittest.TestCase):
-    def setUp(self):
-        legacy = patch.object(packaging, "require_absent_legacy_database_crd")
-        legacy.start()
-        self.addCleanup(legacy.stop)
+    def test_database_controller_build_uses_offline_static_binary_and_bounded_context(self):
+        binary = ROOT / "database-controller" / "Dockerfile"
+        result = response(json.dumps({
+            "reason": "compiler-artifact",
+            "target": {"name": "manager", "kind": ["bin"]},
+            "executable": str(binary),
+        }) + "\n")
+        with (
+            patch("scripts.lib.controller.rust_toolchain",
+                  return_value=("cargo", "rustc identity")),
+            patch("scripts.lib.controller.fetch_controller_dependencies") as fetch,
+            patch("scripts.lib.controller.verify_static_manager") as verify,
+            patch.object(database_controller, "run", return_value=result) as run,
+        ):
+            image = database_controller.build_database_controller_image(
+                ROOT, {**CONFIG, "TENANT_CONTROLLER_IMAGE_REPOSITORY": "local/tenant"},
+            )
+        self.assertRegex(image, r"^local/tenant-database:[0-9a-f]{16}$")
+        fetch.assert_called_once()
+        verify.assert_called_once_with(binary)
+        commands = [call.args[0] for call in run.call_args_list]
+        self.assertIn("--offline", commands[0])
+        self.assertIn("--locked", commands[0])
+        self.assertIn("tenant-database-controller", commands[0])
+        self.assertEqual(commands[1][:3], ["docker", "build", "--pull=false"])
+        self.assertEqual(commands[1][4], image)
+        self.assertFalse((ROOT / ".runtime/rendered/database-controller-build").exists())
+
+    def test_database_deployment_renders_verified_image_and_rolls_out(self):
+        image = "registry.example/db@sha256:" + "a" * 64
+        path = database_controller.render_database_controller(ROOT, image)
+        try:
+            content = path.read_text()
+            self.assertIn("image: " + image, content)
+            self.assertNotIn(database_controller.DATABASE_IMAGE_PLACEHOLDER, content)
+            client = Client()
+            database_controller.install_database_controller(ROOT, client, image)
+            self.assertTrue(any(args[:1] == ("apply",) for args, _ in client.calls))
+            self.assertFalse(any("rollout" in args for args, _ in client.calls))
+        finally:
+            path.unlink(missing_ok=True)
+        with self.assertRaisesRegex(RuntimeError, "built"):
+            database_controller.render_database_controller(ROOT, "")
+
+    def test_catalog_probe_exception_is_single_identity_and_service_account(self):
+        policy = packaging.catalog_cutover_lock_documents(
+            ("catalog-bootstrap-probe", "uid-123"),
+        )[0]
+        expression = policy["spec"]["validations"][0]["expression"]
+        for fragment in (
+            "request.userInfo.username == 'system:serviceaccount:tenant-system:tenant-controller'",
+            "object.metadata.namespace == 'tenant-db-catalog-bootstrap-probe'",
+            "object.spec.tenantUID == 'uid-123'",
+            "object.spec.entries.size() == 0",
+            "object.metadata.ownerReferences.size() == 1",
+        ):
+            self.assertIn(fragment, expression)
+        self.assertEqual(policy["spec"]["failurePolicy"], "Fail")
+        self.assertEqual(
+            packaging.catalog_cutover_lock_documents()[0]["spec"]["validations"],
+            [{"expression": "false",
+              "message": "TenantDatabaseCatalog creation is locked during API cutover"}],
+        )
+        with self.assertRaisesRegex(RuntimeError, "invalid probe"):
+            packaging.catalog_cutover_lock_documents(("other", "uid' || true"))
+
+    def test_probe_deletion_uses_api_uid_precondition_and_stops_proxy(self):
+        proxy = Mock()
+        proxy.stdout = io.StringIO("Starting to serve on 127.0.0.1:18888\n")
+        proxy.poll.return_value = None
+        client = Mock(
+            kubeconfig=Path("management.kubeconfig"), kubectl_path=Path("kubectl"),
+            context="kind-management",
+        )
+        opener = MagicMock()
+        opener.open.return_value.__enter__.return_value = (
+            io.BytesIO(b'{"kind":"Status","status":"Success"}')
+        )
+        with (
+            patch.object(packaging.subprocess, "Popen", return_value=proxy) as start_proxy,
+            patch.object(packaging.select, "select",
+                         return_value=([proxy.stdout], [], [])),
+            patch.object(packaging.urllib.request, "build_opener",
+                         return_value=opener),
+        ):
+            packaging._delete_probe_tenant_uid(CONFIG, client, "probe", "uid-123")
+        request = opener.open.call_args.args[0]
+        self.assertEqual(request.get_method(), "DELETE")
+        self.assertIn("--context", start_proxy.call_args.args[0])
+        self.assertIn("kind-management", start_proxy.call_args.args[0])
+        self.assertEqual(json.loads(request.data)["preconditions"], {"uid": "uid-123"})
+        self.assertEqual(
+            request.full_url,
+            "http://127.0.0.1:18888/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/probe",
+        )
+        proxy.terminate.assert_called_once()
+
+    def test_probe_exception_rejects_nonmatching_uid_as_controller_service_account(self):
+        def client(allow_foreign=False):
+            def handler(*args, **kwargs):
+                if "create" in args:
+                    document = json.loads(kwargs["input_text"])
+                    if document["spec"]["tenantUID"] == "uid-123" or allow_foreign:
+                        return response()
+                    return response(code=1, error=(
+                        f"{packaging.CATALOG_CUTOVER_POLICY}: "
+                        "TenantDatabaseCatalog creation is locked during API cutover"
+                    ))
+                return response()
+            return Client(handler)
+
+        accepted = client()
+        packaging._verify_probe_exception(accepted, "catalog-bootstrap-probe", "uid-123")
+        creations = [(args, kwargs) for args, kwargs in accepted.calls if "create" in args]
+        self.assertEqual(len(creations), 2)
+        self.assertTrue(all(
+            "--as=system:serviceaccount:tenant-system:tenant-controller" in args
+            and "--dry-run=server" in args
+            for args, _ in creations
+        ))
+        with self.assertRaisesRegex(RuntimeError, "foreign catalog"):
+            packaging._verify_probe_exception(
+                client(allow_foreign=True), "catalog-bootstrap-probe", "uid-123",
+            )
+
+    def test_observer_receipt_is_bound_to_live_catalog_and_pod(self):
+        observer = {
+            "catalogUID": "catalog-uid", "observedGeneration": 1,
+            "observedResourceVersion": "8", "podUID": "pod-uid",
+            "instanceId": "instance-uid",
+        }
+        catalog = {
+            "metadata": {
+                "name": "probe", "namespace": "tenant-db-probe",
+                "uid": "catalog-uid", "resourceVersion": "9", "generation": 1,
+            },
+            "spec": {"tenantUID": "tenant-uid", "entries": {}},
+            "status": {"observer": observer, "entries": {}},
+        }
+        receipt = {"observer": observer, "resourceVersion": "9"}
+
+        def client(catalog_value, receipt_value):
+            return Client(lambda *args, **kwargs: (
+                response(catalog_value) if args[:2] == ("-n", "tenant-db-probe")
+                else response(receipt_value) if args[:2] == ("get", "--raw")
+                else response()
+            ))
+
+        accepted = client(catalog, receipt)
+        packaging._verify_catalog_observation(
+            accepted, "pod-name", "pod-uid", "probe", "tenant-uid",
+        )
+        self.assertTrue(any(
+            "/pods/pod-name:8082/proxy/observation?" in " ".join(args)
+            and "catalogUID=catalog-uid" in " ".join(args)
+            and "resourceVersion=9" in " ".join(args)
+            for args, _ in accepted.calls
+        ))
+        for mutation in (
+            lambda c, r: c["status"]["observer"].update(podUID="previous-pod"),
+            lambda c, r: c["metadata"].update(resourceVersion=""),
+            lambda c, r: c["metadata"].update(generation=2),
+            lambda c, r: c["spec"].update(tenantUID="foreign"),
+            lambda c, r: r.update(resourceVersion="old"),
+        ):
+            changed_catalog, changed_receipt = copy.deepcopy((catalog, receipt))
+            mutation(changed_catalog, changed_receipt)
+            with self.assertRaisesRegex(RuntimeError, "obser|receipt"):
+                packaging._verify_catalog_observation(
+                    client(changed_catalog, changed_receipt),
+                    "pod-name", "pod-uid", "probe", "tenant-uid",
+                )
+
+    def test_probe_cleanup_requires_exact_credential_role_absence(self):
+        namespace = "tenant-db-probe"
+        for occupied in ("role/tenant-database-credentials",
+                         "rolebinding/tenant-database-credentials"):
+            client = Client(lambda *args, **kwargs: (
+                response({"metadata": {"name": occupied.split("/")[1]}})
+                if occupied in args else response()
+            ))
+            with self.assertRaisesRegex(RuntimeError, "identity persists"):
+                packaging._verify_probe_cleanup(
+                    client, "probe", namespace, "tenant-db-storage-probe",
+                )
+            self.assertTrue(any(args[:4] == ("-n", "probe", "get", occupied)
+                                for args, _ in client.calls))
+            self.assertFalse(any(args[:2] == ("delete", occupied)
+                                 for args, _ in client.calls))
+        management = Client(lambda *args, **kwargs: (
+            response({"metadata": {"name": "probe"}})
+            if args[:2] == ("get", "namespace/probe") else response()
+        ))
+        with self.assertRaisesRegex(RuntimeError, "identity persists"):
+            packaging._verify_probe_cleanup(
+                management, "probe", namespace, "tenant-db-storage-probe",
+            )
+
+    def test_probe_rejects_existing_tenant_without_unlock_or_cleanup(self):
+        client = Client(lambda *args, **kwargs: (
+            response({"metadata": {}, "items": [{"metadata": {"name": "foreign"}}]})
+            if args[:2] == ("get", "tenants.tenancy.cnpg-vcluster.io")
+            else response()
+        ))
+        with self.assertRaisesRegex(RuntimeError, "empty Tenant inventory"):
+            packaging.run_catalog_lifecycle_probe(
+                CONFIG, client, provider="local", database_image="db:image",
+            )
+        self.assertFalse(any(args[0] in ("delete", "create") for args, _ in client.calls))
+
+    def test_probe_releases_tenant_first_then_restores_catalog_fence_after_uid_cleanup(self):
+        state = {"created": False, "deleted": False}
+        name = "catalog-bootstrap-probe"
+        namespace = f"tenant-db-{name}"
+        tenant = {
+            "metadata": {
+                "name": name, "uid": "uid-123",
+                "annotations": {"tenancy.cnpg-vcluster.io/catalog-bootstrap": "installer-owned"},
+            },
+            "status": {
+                "catalogCreateIntent": {
+                    "name": name, "namespace": namespace, "tenantUID": "uid-123",
+                },
+                "databaseCapability": {"available": True},
+            },
+        }
+
+        def handler(*args, **kwargs):
+            if args[:2] == ("get", "tenants.tenancy.cnpg-vcluster.io"):
+                return response({"metadata": {}, "items": [tenant] if state["created"] and not state["deleted"] else []})
+            if args[:2] == ("get", f"tenant/{name}"):
+                return response(tenant) if state["created"] and not state["deleted"] else response()
+            if args[:2] == ("get", f"namespace/{namespace}"):
+                return response()
+            if args[:1] == ("-n",):
+                return response()
+            if args[:2] == ("create", "-f"):
+                state["created"] = True
+                tenant["metadata"]["annotations"].update(
+                    json.loads(kwargs["input_text"])["metadata"]["annotations"]
+                )
+                tenant["spec"] = json.loads(kwargs["input_text"])["spec"]
+                return response(tenant)
+            if args[:2] == ("wait", "--for=delete"):
+                self.assertTrue(state["deleted"])
+            return response()
+
+        client = Client(handler)
+
+        def delete_uid(_config, _client, deleted_name, uid):
+            self.assertEqual((deleted_name, uid), (name, "uid-123"))
+            state["deleted"] = True
+
+        with (
+            patch.object(database_controller, "inspect_catalog_inventory") as inventory,
+            patch.object(packaging, "inspect_catalog_inventory") as cleanup_inventory,
+            patch.object(packaging, "remove_tenant_cutover_lock") as unlock,
+            patch.object(packaging, "verify_catalog_cutover_lock",
+                         return_value=("p", 1, "b", 1)) as fence,
+            patch.object(packaging, "_verify_probe_exception",
+                         side_effect=[RuntimeError("interrupted"), None]) as exception,
+            patch.object(packaging, "verify_catalog_release_capability") as capability,
+            patch.object(packaging, "_empty_database_namespace") as empty,
+            patch.object(packaging, "verify_catalog_release_deployment") as observer,
+            patch.object(packaging, "_delete_probe_tenant_uid", side_effect=delete_uid),
+            patch.object(packaging, "ensure_catalog_cutover_lock") as restore,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                packaging.run_catalog_lifecycle_probe(
+                    CONFIG, client, provider="local", database_image="db:image",
+                )
+            self.assertTrue(self.probe_path.is_file())
+            self.assertTrue(state["created"])
+            packaging.run_catalog_lifecycle_probe(
+                CONFIG, client, provider="local", database_image="db:image",
+            )
+        self.assertEqual(unlock.call_count, 2)
+        self.assertEqual(exception.call_count, 2)
+        exception.assert_called_with(client, name, "uid-123")
+        self.assertEqual(len([args for args, _ in client.calls if args[:2] == ("create", "-f")]), 1)
+        observer.assert_called_once_with(
+            client, name="database-controller", image="db:image",
+            service_account="database-controller", probe=(name, "uid-123"),
+        )
+        self.assertTrue(any(args[:4] == (
+            "-n", "tenant-system", "rollout", "status",
+        ) for args, _ in client.calls))
+        capability.assert_called_once_with(
+            client, provider="local", probe=(name, "uid-123"),
+        )
+        self.assertEqual(empty.call_count, 2)
+        inventory.assert_called_once_with(client)
+        cleanup_inventory.assert_called_once_with(client)
+        restore.assert_called_once_with(client)
+        self.assertEqual(fence.call_count, 4)
+        self.assertFalse(self.probe_path.exists())
+        self.assertFalse(any(args[0] == "delete" for args, _ in client.calls))
+
+    def test_ambiguous_probe_create_restores_both_fences_without_deleting(self):
+        client = Client(lambda *args, **kwargs: (
+            response({"metadata": {}, "items": []})
+            if args[:2] == ("get", "tenants.tenancy.cnpg-vcluster.io")
+            else response()
+        ))
+        with (
+            patch.object(packaging, "CATALOG_LIFECYCLE_READY", True),
+            patch.object(packaging, "tenant_cutover_lock_present", return_value=True),
+            patch.object(packaging, "verify_release_tenant_cutover_lock"),
+            patch.object(packaging, "verify_catalog_release_gates",
+                         return_value=("p", 1, "b", 1)),
+            patch.object(packaging, "verify_catalog_cutover_lock"),
+            patch.object(database_controller, "inspect_catalog_inventory"),
+            patch.object(packaging, "remove_tenant_cutover_lock") as release_tenant,
+            patch.object(packaging, "apply_tenant_cutover_lock") as restore_tenant,
+            patch.object(packaging, "ensure_catalog_cutover_lock") as restore_catalog,
+            self.assertRaisesRegex(RuntimeError, "outcome is unknown"),
+        ):
+            packaging.release_catalog_and_tenant_cutover_locks(
+                CONFIG, client, provider="local", tenant_image="tenant:image",
+                database_image="db:image",
+            )
+        release_tenant.assert_called_once()
+        restore_tenant.assert_called_once()
+        restore_catalog.assert_called_once()
+        self.assertFalse(any(args[0] == "delete" for args, _ in client.calls))
+        self.assertTrue(self.probe_path.is_file())
+        with (
+            patch.object(database_controller, "inspect_catalog_inventory"),
+            patch.object(packaging, "remove_tenant_cutover_lock") as unlock,
+            self.assertRaisesRegex(RuntimeError, "outcome is unknown"),
+        ):
+            packaging.run_catalog_lifecycle_probe(
+                CONFIG, client, provider="local", database_image="db:image",
+            )
+        unlock.assert_not_called()
+        self.assertEqual(len([
+            args for args, _ in client.calls if args[:2] == ("create", "-f")
+        ]), 1)
+
+    def test_restart_after_probe_deletion_proves_absence_before_releasing_record(self):
+        record = {
+            "schema": 1, "name": "catalog-bootstrap-probe", "provider": "local",
+            "token": "a" * 32, "uid": "uid-123", "issued": True,
+            "deleting": True,
+        }
+        packaging.write_private_file(self.probe_path, json.dumps(record))
+        client = Client(lambda *args, **kwargs: (
+            response({"metadata": {}, "items": []})
+            if args[:2] == ("get", "tenants.tenancy.cnpg-vcluster.io")
+            else response()
+        ))
+        with (
+            patch.object(packaging, "inspect_catalog_inventory"),
+            patch.object(packaging, "ensure_catalog_cutover_lock") as restore,
+            patch.object(packaging, "verify_catalog_cutover_lock") as verify,
+            patch.object(packaging, "remove_tenant_cutover_lock") as unlock,
+        ):
+            packaging.run_catalog_lifecycle_probe(
+                CONFIG, client, provider="local", database_image="db:image",
+            )
+        self.assertFalse(self.probe_path.exists())
+        restore.assert_called_once_with(client)
+        verify.assert_called_once_with(client, namespace="tenant-system")
+        unlock.assert_called_once_with(CONFIG, client)
+        self.assertFalse(any(args[:1] in (("create",), ("delete",))
+                             for args, _ in client.calls))
+        for occupied in ("role/tenant-database-credentials",
+                         "rolebinding/tenant-database-credentials"):
+            packaging.write_private_file(self.probe_path, json.dumps(record))
+            blocked = Client(lambda *args, **kwargs: (
+                response({"metadata": {}, "items": []})
+                if args[:2] == ("get", "tenants.tenancy.cnpg-vcluster.io")
+                else response({"metadata": {"name": occupied.split("/")[1]}})
+                if occupied in args else response()
+            ))
+            with self.assertRaisesRegex(RuntimeError, "identity persists"):
+                packaging.run_catalog_lifecycle_probe(
+                    CONFIG, blocked, provider="local", database_image="db:image",
+                )
+            self.assertTrue(self.probe_path.exists())
+
+    def test_release_wrapper_unlocks_tenant_after_interrupted_probe_cleanup(self):
+        record = {
+            "schema": 1, "name": "catalog-bootstrap-probe", "provider": "local",
+            "token": "a" * 32, "uid": "uid-123", "issued": True,
+            "deleting": True,
+        }
+        packaging.write_private_file(self.probe_path, json.dumps(record))
+        client = Client(lambda *args, **kwargs: (
+            response({"metadata": {}, "items": []})
+            if args[:2] == ("get", "tenants.tenancy.cnpg-vcluster.io")
+            else response()
+        ))
+        steps = []
+        with (
+            patch.object(packaging, "CATALOG_LIFECYCLE_READY", True),
+            patch.object(packaging, "tenant_cutover_lock_present", return_value=True),
+            patch.object(packaging, "apply_tenant_cutover_lock"),
+            patch.object(packaging, "ensure_catalog_cutover_lock"),
+            patch.object(packaging, "verify_release_tenant_cutover_lock"),
+            patch.object(packaging, "verify_catalog_release_gates",
+                         return_value=("policy", 1, "binding", 1)),
+            patch.object(packaging, "verify_catalog_cutover_lock"),
+            patch.object(packaging, "inspect_catalog_inventory"),
+            patch.object(packaging, "remove_tenant_cutover_lock",
+                         side_effect=lambda *_args: steps.append("tenant")),
+            patch.object(packaging, "_record_catalog_activation",
+                         side_effect=lambda *_args: steps.append("record")),
+            patch.object(packaging, "remove_catalog_cutover_lock",
+                         side_effect=lambda *_args: steps.append("catalog")),
+        ):
+            packaging.release_catalog_and_tenant_cutover_locks(
+                CONFIG, client, provider="local", tenant_image="tenant:image",
+                database_image="db:image",
+            )
+        self.assertEqual(steps, ["tenant", "record", "catalog"])
+        self.assertFalse(self.probe_path.exists())
+
+    def test_uninstall_requires_empty_catalog_before_database_controller_cleanup(self):
+        client = Client()
+        with (
+            patch.object(packaging, "stop_controller"),
+            patch.object(packaging, "require_clean_controller_state"),
+            patch.object(packaging, "inspect_catalog_inventory",
+                         side_effect=RuntimeError("retained catalog")),
+            self.assertRaisesRegex(RuntimeError, "retained catalog"),
+        ):
+            packaging.delete_controller(ROOT, CONFIG, client)
+        self.assertFalse(any(
+            "database-controller" in " ".join(args)
+            for args, _ in client.calls
+        ))
+        client = Client()
+        with (
+            patch.object(packaging, "stop_controller"),
+            patch.object(packaging, "require_clean_controller_state"),
+            patch.object(packaging, "inspect_catalog_inventory"),
+        ):
+            packaging.delete_controller(ROOT, CONFIG, client)
+        resources = [
+            argument
+            for args, _ in client.calls if "delete" in args
+            for argument in args if "database-controller" in argument
+        ]
+        self.assertEqual(resources[:4], [
+            "deployment/database-controller",
+            "clusterrolebinding/database-controller",
+            "clusterrole/database-controller",
+            "serviceaccount/database-controller",
+        ])
+
+    def test_release_probe_is_empty_unique_dry_run_and_never_cleans_catalog(self):
+        names = set()
+        calls = []
+
+        def handler(*args, **kwargs):
+            calls.append((args, kwargs))
+            if args[:2] == ("create", "--dry-run=server"):
+                document = json.loads(kwargs["input_text"])
+                self.assertEqual(document["spec"]["entries"], {})
+                self.assertEqual(document["metadata"]["namespace"], "tenant-system")
+                self.assertNotIn(document["metadata"]["name"], names)
+                names.add(document["metadata"]["name"])
+                return response(code=1, error=(
+                    f"{packaging.CATALOG_CUTOVER_POLICY}: "
+                    "TenantDatabaseCatalog creation is locked during API cutover"
+                ))
+            return response()
+
+        client = Client(handler)
+        packaging.verify_catalog_release_probe(client, namespace="tenant-system")
+        packaging.verify_catalog_release_probe(client, namespace="tenant-system")
+        self.assertEqual(len(names), 2)
+        self.assertEqual(
+            len([args for args, _ in calls if "--ignore-not-found=true" in args]), 4,
+        )
+        self.assertFalse(any(args[0] == "delete" for args, _ in calls))
+        for failure in (
+            response(),
+            response(code=1, error="rejected by webhook"),
+        ):
+            with self.subTest(failure=failure), self.assertRaisesRegex(
+                RuntimeError, "owned policy denial",
+            ):
+                packaging.verify_catalog_release_probe(
+                    Client(lambda *args, **kwargs: (
+                        failure if args[:2] == ("create", "--dry-run=server")
+                        else response()
+                    )), namespace="tenant-system",
+                )
+        persisted = Client(lambda *args, **kwargs: (
+            response("tenantdatabasecatalog/database-release-probe")
+            if "--ignore-not-found=true" in args else handler(*args, **kwargs)
+        ))
+        with self.assertRaisesRegex(RuntimeError, "persisted"):
+            packaging.verify_catalog_release_probe(
+                persisted, namespace="tenant-system",
+            )
+        self.assertFalse(any(args[0] == "delete" for args, _ in persisted.calls))
+
+    def test_release_rollout_requires_exact_image_service_account_and_ready_pod(self):
+        def deployment(name):
+            return {
+                "metadata": {"uid": name + "-uid", "generation": 2},
+                "spec": {
+                    "replicas": 1, "strategy": {"type": "Recreate"},
+                    "selector": {"matchLabels": {"app": name}},
+                    "template": {"spec": {
+                        "serviceAccountName": name,
+                        "containers": [{
+                            "name": "manager", "image": name + ":image",
+                            "args": ["--provider=local", "--controller-image=" + name + ":image"],
+                        }],
+                    }},
+                },
+                "status": {
+                    "observedGeneration": 2, "replicas": 1,
+                    "readyReplicas": 1, "updatedReplicas": 1, "availableReplicas": 1,
+                },
+            }
+
+        def pod(name):
+            return {
+                "metadata": {
+                    "uid": name + "-pod", "name": name + "-pod",
+                    "labels": {"app": name},
+                    "ownerReferences": [{
+                        "kind": "ReplicaSet", "name": name + "-rs",
+                        "uid": name + "-rs-uid", "controller": True,
+                    }],
+                },
+                "spec": {
+                    "serviceAccountName": name,
+                    "containers": [{
+                        "name": "manager", "image": name + ":image",
+                        "args": ["--provider=local", "--controller-image=" + name + ":image"],
+                    }],
+                },
+                "status": {"conditions": [{"type": "Ready", "status": "True"}]},
+            }
+
+        def check(name, observed, running, *, image=None):
+            client = Client(lambda *args, **kwargs: (
+                response("ok") if args[:2] == ("get", "--raw") else
+                response(observed) if args[3] == f"deployment/{name}"
+                else response({
+                    "metadata": {
+                        "uid": name + "-rs-uid",
+                        "ownerReferences": [{
+                            "kind": "Deployment", "name": name,
+                            "uid": name + "-uid", "controller": True,
+                        }],
+                    },
+                    "spec": {"replicas": 1}, "status": {"readyReplicas": 1},
+                }) if args[3] == f"replicaset/{name}-rs"
+                else response({"items": running})
+            ))
+            with patch.object(packaging, "_verify_catalog_observation") as receipt:
+                packaging.verify_catalog_release_deployment(
+                    client, name=name, image=image or name + ":image",
+                    service_account=name,
+                    probe=("bootstrap", "tenant-uid") if name == "database-controller" else None,
+                )
+                if name == "database-controller":
+                    receipt.assert_called_once_with(
+                        client, name + "-pod", name + "-pod", "bootstrap", "tenant-uid",
+                    )
+
+        for name in ("tenant-controller", "database-controller"):
+            with self.subTest(name=name):
+                check(name, deployment(name), [pod(name)])
+                for mutation in (
+                    lambda d: d["status"].update(observedGeneration=1),
+                    lambda d: d["status"].update(readyReplicas=0),
+                    lambda d: d["spec"]["template"]["spec"].update(
+                        serviceAccountName="wrong",
+                    ),
+                ):
+                    changed = deployment(name)
+                    mutation(changed)
+                    with self.assertRaisesRegex(RuntimeError, "rollout"):
+                        check(name, changed, [pod(name)])
+                with self.assertRaisesRegex(RuntimeError, "rollout"):
+                    check(name, deployment(name), [pod(name)], image="stale:image")
+                with self.assertRaisesRegex(RuntimeError, "Ready Pod"):
+                    check(name, deployment(name), [])
+                if name == "tenant-controller":
+                    with self.assertRaisesRegex(RuntimeError, "rollout"):
+                        packaging.verify_catalog_release_deployment(
+                            Client(lambda *args, **kwargs: response(deployment(name))),
+                            name=name, image=name + ":image",
+                            service_account=name, provider="azure",
+                        )
+
+    def test_release_effective_rbac_fails_closed(self):
+        client = Client(lambda *args, **_kwargs: response("yes\n"))
+        packaging.verify_catalog_release_rbac(client)
+        self.assertTrue(all(args[:2] == ("auth", "can-i") for args, _ in client.calls))
+        self.assertTrue(any("database-controller" in " ".join(args)
+                            for args, _ in client.calls))
+        for result in (response("no\n"), response("", 1, "forbidden")):
+            with self.assertRaisesRegex(RuntimeError, "effective RBAC"):
+                packaging.verify_catalog_release_rbac(
+                    Client(lambda *_args, **_kwargs: result),
+                )
+
+    def test_release_capability_requires_live_exact_catalog(self):
+        tenant = {
+            "metadata": {"name": "example", "uid": "tenant-uid"},
+            "spec": {"provider": {"type": "local"}},
+            "status": {"databaseCapability": {
+                "available": True, "namespace": "tenant-db-example",
+                "namespaceUID": "ns-uid", "catalogUID": "catalog-uid",
+            }},
+        }
+        catalog = {
+            "metadata": {
+                "uid": "catalog-uid", "name": "example",
+                "namespace": "tenant-db-example",
+                "finalizers": ["tenancy.cnpg-vcluster.io/database-catalog-finalizer"],
+                "ownerReferences": [{
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
+                    "kind": "Tenant", "name": "example", "uid": "tenant-uid",
+                }],
+            },
+            "spec": {
+                "tenantUID": "tenant-uid", "tenantName": "example",
+                "closed": False, "entries": {},
+            },
+        }
+
+        def client(tenants, value=catalog):
+            return Client(lambda *args, **kwargs: (
+                response("yes") if args[:2] == ("auth", "can-i")
+                else response({
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+                    "kind": "TenantDatabaseCatalogList",
+                    "metadata": {"continue": ""},
+                    "items": [value],
+                }) if args[:2] == (
+                    "get", "--raw=/apis/tenancy.cnpg-vcluster.io/v1alpha1/tenantdatabasecatalogs"
+                )
+                else
+                response({"items": tenants}) if args[:2] == (
+                    "get", "tenants.tenancy.cnpg-vcluster.io"
+                ) else response({"metadata": {
+                    "uid": "ns-uid", "name": "tenant-db-example",
+                    "labels": {"tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid"},
+                }}) if args[:2] == (
+                    "get", "namespace/tenant-db-example"
+                ) else response({"metadata": {
+                    "uid": "storage-uid", "name": "tenant-db-storage-example",
+                    "labels": {"tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid"},
+                }}) if args[:2] == (
+                    "get", "namespace/tenant-db-storage-example"
+                ) else response(value)
+            ))
+
+        packaging.verify_catalog_release_capability(
+            client([tenant]), provider="local",
+        )
+        packaging.verify_catalog_release_capability(
+            client([tenant]), provider="local", probe=("example", "tenant-uid"),
+        )
+        with self.assertRaisesRegex(RuntimeError, "foreign Tenant"):
+            packaging.verify_catalog_release_capability(
+                client([tenant, tenant]), provider="local", probe=("example", "tenant-uid"),
+            )
+        azure_tenant = copy.deepcopy(tenant)
+        azure_tenant["spec"]["provider"]["type"] = "azure"
+        azure_tenant["status"]["databaseCapability"]["storageNamespaceUID"] = "storage-uid"
+        packaging.verify_catalog_release_capability(
+            client([azure_tenant]), provider="azure",
+        )
+        azure_tenant["status"]["databaseCapability"]["storageNamespaceUID"] = "foreign"
+        with self.assertRaisesRegex(RuntimeError, "storage namespace identity"):
+            packaging.verify_catalog_release_capability(
+                client([azure_tenant]), provider="azure",
+            )
+        for tenants in ([], [{**tenant, "status": {}}], [
+            {**tenant, "metadata": {**tenant["metadata"], "deletionTimestamp": "now"}}
+        ]):
+            with self.assertRaisesRegex(RuntimeError, "capability"):
+                packaging.verify_catalog_release_capability(
+                    client(tenants), provider="local",
+                )
+        changed = copy.deepcopy(catalog)
+        changed["spec"]["entries"] = {"unexpected": {}}
+        with self.assertRaisesRegex(RuntimeError, "identity is not exact"):
+            packaging.verify_catalog_release_capability(
+                client([tenant], changed), provider="local",
+            )
+        with self.assertRaisesRegex(RuntimeError, "azure is unavailable"):
+            packaging.verify_catalog_release_capability(
+                client([tenant]), provider="azure",
+            )
+
+    def test_release_rechecks_identity_and_refences_interruption(self):
+        with self.assertRaisesRegex(RuntimeError, "not approved"):
+            packaging.release_catalog_and_tenant_cutover_locks(
+                CONFIG, Client(), provider="local",
+                tenant_image="tenant:image", database_image="database:image",
+            )
+        calls = []
+        client = Client(lambda *args, **kwargs: (
+            calls.append(args) or response("fence")
+            if args[:1] == ("get",) else response()
+        ))
+        with (
+            patch.object(packaging, "CATALOG_LIFECYCLE_READY", True),
+            patch.object(packaging, "verify_catalog_release_gates",
+                         return_value=("policy", 1, "binding", 1)) as gates,
+            patch.object(packaging, "run_catalog_lifecycle_probe") as bootstrap,
+            patch.object(packaging, "verify_catalog_cutover_lock") as verify,
+            patch.object(packaging, "_record_catalog_activation"),
+            patch.object(packaging, "verify_release_tenant_cutover_lock") as tenant_verify,
+            patch.object(packaging, "remove_catalog_cutover_lock",
+                         side_effect=RuntimeError("interrupted")) as remove,
+            patch.object(packaging, "apply_tenant_cutover_lock") as tenant_lock,
+            patch.object(packaging, "ensure_catalog_cutover_lock") as catalog_lock,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                packaging.release_catalog_and_tenant_cutover_locks(
+                    CONFIG, client, provider="local",
+                    tenant_image="tenant:image", database_image="database:image",
+                )
+            gates.assert_called_once_with(
+                client, provider="local",
+                tenant_image="tenant:image", database_image="database:image",
+            )
+            verify.assert_any_call(
+                client, namespace="tenant-system",
+                expected_identity=("policy", 1, "binding", 1),
+            )
+            self.assertEqual(tenant_verify.call_count, 2)
+            remove.assert_called_once()
+            bootstrap.assert_called_once_with(
+                CONFIG, client, provider="local", database_image="database:image",
+            )
+            tenant_lock.assert_called_once()
+            catalog_lock.assert_called_once()
+        self.assertFalse(any(args[0] == "delete" for args in calls))
+
+    def test_approved_release_only_deletes_cutover_policies(self):
+        client = Client()
+        with (
+            patch.object(packaging, "CATALOG_LIFECYCLE_READY", True),
+            patch.object(packaging, "tenant_cutover_lock_present", return_value=True),
+            patch.object(packaging, "verify_release_tenant_cutover_lock") as tenant_fence,
+            patch.object(packaging, "verify_catalog_release_gates",
+                         return_value=("p", 1, "b", 1)),
+            patch.object(packaging, "run_catalog_lifecycle_probe") as bootstrap,
+            patch.object(packaging, "verify_catalog_cutover_lock") as catalog_fence,
+            patch.object(packaging, "_record_catalog_activation") as record,
+        ):
+            packaging.release_catalog_and_tenant_cutover_locks(
+                CONFIG, client, provider="local",
+                tenant_image="tenant:image", database_image="database:image",
+            )
+            self.assertEqual(tenant_fence.call_count, 2)
+            bootstrap.assert_called_once_with(
+                CONFIG, client, provider="local", database_image="database:image",
+            )
+            self.assertEqual(catalog_fence.call_count, 2)
+            catalog_fence.assert_any_call(
+                client, namespace="tenant-system", expected_identity=("p", 1, "b", 1),
+            )
+            record.assert_called_once_with(client)
+        self.assertEqual(
+            [args[1] for args, _ in client.calls if args[0] == "delete"],
+            [
+                *packaging.catalog_cutover_lock_cleanup_refs(),
+            ],
+        )
+        self.assertFalse(any(args[0] == "create" for args, _ in client.calls))
+
+    def test_completed_activation_reinstall_preserves_live_tenants_and_open_fences(self):
+        crd = {
+            "metadata": {"uid": "tenant-crd-uid"},
+            "spec": {"versions": [{"name": "v1alpha4", "served": True, "storage": True}]},
+            "status": {"storedVersions": ["v1alpha4"]},
+        }
+        identity = {
+            f"crd/{packaging.TENANT_CRD}": crd,
+            "crd/tenantdatabasecatalogs.tenancy.cnpg-vcluster.io":
+                {"metadata": {"uid": "catalog-crd-uid"}},
+            "namespace/kube-system": {"metadata": {"uid": "cluster-uid"}},
+        }
+
+        def handler(*args, **kwargs):
+            if args[:2] == ("get", "tenants.tenancy.cnpg-vcluster.io"):
+                return response({"items": [{"metadata": {"uid": "live-tenant"}}]})
+            if args[:1] == ("get",):
+                return response(identity.get(args[1], ""))
+            raise AssertionError(f"reinstall mutated cutover state: {args}")
+
+        client = Client(handler)
+        packaging._record_catalog_activation(client)
+        self.assertFalse(packaging.prepare_tenant_api_cutover(ROOT, CONFIG, client))
+        self.assertTrue(all(args[0] == "get" for args, _ in client.calls))
+        identity["namespace/kube-system"] = {"metadata": {"uid": "new-cluster"}}
+        with self.assertRaisesRegex(RuntimeError, "another management cluster"):
+            packaging.prepare_tenant_api_cutover(ROOT, CONFIG, client)
+        self.assertTrue(all(args[0] == "get" for args, _ in client.calls))
+
+    def test_release_gates_fail_before_unlock_on_rollout_rbac_or_capability(self):
+        for stage in ("rollout", "rbac", "probe"):
+            with self.subTest(stage=stage):
+                client = Client()
+                with (
+                    patch.object(packaging, "verify_catalog_cutover_lock",
+                                 return_value=("policy", 1, "binding", 1)) as fence,
+                    patch.object(packaging, "verify_catalog_release_deployment",
+                                 side_effect=(RuntimeError("rollout unavailable")
+                                              if stage == "rollout" else None)),
+                    patch.object(packaging, "verify_catalog_release_rbac",
+                                 side_effect=(RuntimeError("rbac unavailable")
+                                              if stage == "rbac" else None)),
+                    patch.object(packaging, "verify_catalog_release_probe",
+                                 side_effect=(RuntimeError("probe unavailable")
+                                              if stage == "probe" else None)),
+                    self.assertRaisesRegex(RuntimeError, "unavailable"),
+                ):
+                    packaging.verify_catalog_release_gates(
+                        client, provider="local",
+                        tenant_image="tenant:image", database_image="database:image",
+                    )
+                fence.assert_called_once()
+                self.assertFalse(client.calls)
+
+    def test_release_gate_revalidates_policy_identity_after_all_checks(self):
+        client = Client()
+        with (
+            patch.object(packaging, "verify_catalog_cutover_lock",
+                         side_effect=[
+                             ("policy", 1, "binding", 1),
+                             RuntimeError("identity changed"),
+                         ]) as fence,
+            patch.object(packaging, "verify_catalog_release_deployment"),
+            patch.object(packaging, "verify_catalog_release_rbac"),
+            patch.object(packaging, "verify_catalog_release_probe") as probe,
+            self.assertRaisesRegex(RuntimeError, "identity changed"),
+        ):
+            packaging.verify_catalog_release_gates(
+                client, provider="azure",
+                tenant_image="tenant:image", database_image="database:image",
+            )
+        probe.assert_called_once_with(client, namespace="tenant-system")
+        self.assertEqual(
+            fence.call_args_list[-1].kwargs["expected_identity"],
+            ("policy", 1, "binding", 1),
+        )
+
+    def test_tenant_release_fence_requires_current_exact_policy_and_denial(self):
+        policy, binding = packaging.tenant_cutover_lock_documents()
+        for doc in (policy, binding):
+            doc["metadata"].update({"uid": doc["kind"], "generation": 2})
+        policy["status"] = {
+            "observedGeneration": 2, "typeChecking": {},
+            "conditions": [{"status": "True", "observedGeneration": 2}],
+        }
+
+        def handler(*args, **kwargs):
+            if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.TENANT_CUTOVER_POLICY}"):
+                return response(policy)
+            if args[:2] == ("get", f"validatingadmissionpolicybinding/{packaging.TENANT_CUTOVER_POLICY}"):
+                return response(binding)
+            if args[:2] == ("create", "--dry-run=server"):
+                return response(code=1, error=(
+                    f"{packaging.TENANT_CUTOVER_POLICY}: "
+                    "Tenant creation is locked during API cutover"
+                ))
+            raise AssertionError(args)
+
+        client = Client(handler)
+        packaging.verify_release_tenant_cutover_lock(client)
+        self.assertEqual(
+            len([args for args, _ in client.calls if args[:1] == ("create",)]), 5,
+        )
+        for mutation in (
+            lambda p, b: p["status"].update(observedGeneration=1),
+            lambda p, b: b["spec"].update(validationActions=["Warn"]),
+            lambda p, b: b["metadata"].update(uid=""),
+        ):
+            changed_policy, changed_binding = copy.deepcopy((policy, binding))
+            mutation(changed_policy, changed_binding)
+            with self.assertRaisesRegex(RuntimeError, "contract is malformed"):
+                packaging.verify_release_tenant_cutover_lock(
+                    Client(lambda *args, **kwargs: (
+                        response(changed_policy)
+                        if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.TENANT_CUTOVER_POLICY}")
+                        else response(changed_binding)
+                        if args[:2] == ("get", f"validatingadmissionpolicybinding/{packaging.TENANT_CUTOVER_POLICY}")
+                        else handler(*args, **kwargs)
+                    )),
+                )
+        with self.assertRaisesRegex(RuntimeError, "not effective"):
+            packaging.verify_release_tenant_cutover_lock(
+                Client(lambda *args, **kwargs: (
+                    response(code=1, error="unrelated: Tenant creation is locked during API cutover")
+                    if args[:2] == ("create", "--dry-run=server")
+                    else handler(*args, **kwargs)
+                )),
+            )
 
     def test_catalog_cutover_lock_is_separate_and_effective(self):
         policy, binding = active_catalog_lock()
@@ -251,6 +1152,32 @@ class PackagingTests(unittest.TestCase):
                 f"validatingadmissionpolicy/{packaging.TENANT_CUTOVER_POLICY}",
             ),
         )
+
+    def test_partial_catalog_policy_removal_is_refenced_before_cutover_retry(self):
+        refs = (
+            f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}",
+            f"validatingadmissionpolicybinding/{packaging.CATALOG_CUTOVER_POLICY}",
+        )
+        for survivor in refs:
+            client = Client(lambda *args, **kwargs: (
+                response(args[1]) if args[:2] == ("get", survivor)
+                else response()
+            ))
+            events = []
+            with (
+                patch.object(packaging, "ensure_catalog_cutover_lock",
+                             side_effect=lambda *_: events.append("restore")),
+                patch.object(packaging, "verify_catalog_cutover_lock",
+                             side_effect=lambda *_a, **_k: events.append("deny")),
+            ):
+                self.assertTrue(packaging._catalog_lock_present(client))
+            self.assertEqual(events, ["restore", "deny"])
+            with (
+                patch.object(packaging, "ensure_catalog_cutover_lock",
+                             side_effect=RuntimeError("cannot restore")),
+                self.assertRaisesRegex(RuntimeError, "cannot restore"),
+            ):
+                packaging._catalog_lock_present(client)
 
     def test_cutover_preflight_requires_empty_tenant_and_provider_inventory(self):
         packaging.require_empty_tenant_cutover({"items": []}, [])
@@ -526,6 +1453,15 @@ class PackagingTests(unittest.TestCase):
         (ROOT / ".runtime").mkdir(exist_ok=True)
         self.directory = tempfile.TemporaryDirectory(dir=ROOT / ".runtime")
         self.addCleanup(self.directory.cleanup)
+        legacy = patch.object(packaging, "require_absent_legacy_database_crd")
+        legacy.start()
+        self.addCleanup(legacy.stop)
+        self.probe_path = Path(self.directory.name) / "probe.json"
+        record_path = patch.object(
+            packaging, "_probe_record_path", return_value=self.probe_path,
+        )
+        record_path.start()
+        self.addCleanup(record_path.stop)
         self.repository = Path(self.directory.name)
         self.root = self.repository / "capi"
         self.root.mkdir(mode=0o700)
@@ -892,6 +1828,39 @@ class CatalogInstallerTests(unittest.TestCase):
                 packaging.install_database_catalog(ROOT, CONFIG, Client(lagging))
             self.assertEqual(preflight.call_count, 4)
 
+    def test_catalog_reinstall_does_not_recreate_verified_released_fence(self):
+        def handler(*args, **kwargs):
+            if args[:2] == ("get", f"crd/{database_controller.CATALOG_CRD}"):
+                return response(self.catalog_crd())
+            if args == ("get", "--raw=/apis/tenancy.cnpg-vcluster.io/v1alpha1"):
+                return response({"resources": [{
+                    "name": "tenantdatabasecatalogs",
+                    "kind": "TenantDatabaseCatalog", "namespaced": True,
+                }]})
+            return response()
+
+        client = Client(handler)
+        with (
+            patch.object(packaging, "_catalog_activation_complete", return_value=True),
+            patch.object(packaging, "_catalog_lock_present", return_value=False),
+            patch.object(packaging, "tenant_cutover_lock_present", return_value=False),
+        ):
+            packaging.install_database_catalog(
+                ROOT, CONFIG, client, cutover_locked=False,
+            )
+            self.assertFalse(any(
+                args[:2] == ("create", "--dry-run=server")
+                or kwargs.get("input_text", "").find(packaging.CATALOG_CUTOVER_POLICY) >= 0
+                for args, kwargs in client.calls
+            ))
+            with (
+                patch.object(packaging, "_catalog_lock_present", return_value=True),
+                self.assertRaisesRegex(RuntimeError, "no longer open"),
+            ):
+                packaging.install_database_catalog(
+                    ROOT, CONFIG, Client(handler), cutover_locked=False,
+                )
+
     def test_legacy_crd_blocks_before_catalog_install_and_is_never_deleted(self):
         client = Client(lambda *args, **_kwargs: (
             response(f"crd/{database_controller.LEGACY_CRD}")
@@ -1043,6 +2012,8 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         self.addCleanup(cutover.stop)
         for target, value in (
             ("install_database_catalog", None),
+            ("build_database_controller_image", "database:image"),
+            ("install_database_controller", None),
         ):
             mocked = patch.object(packaging, target, return_value=value)
             mocked.start()
@@ -1073,6 +2044,22 @@ class CurrentControllerPackagingTests(unittest.TestCase):
                          side_effect=RuntimeError("catalog fence is not effective")),
             patch.object(packaging, "remove_tenant_cutover_lock") as unlock,
             self.assertRaisesRegex(RuntimeError, "catalog fence is not effective"),
+        ):
+            packaging.reconcile_controller(Path("."), CONFIG, client, {}, Mock(), None)
+        unlock.assert_not_called()
+
+    def test_database_controller_rollout_failure_keeps_tenant_creation_fenced(self):
+        client = Client()
+        with (
+            patch.object(packaging, "build_controller_image", return_value="rust:image"),
+            patch.object(packaging, "_foundation_payload", return_value=self.foundation()),
+            patch.object(packaging, "run"),
+            patch.object(packaging, "prepare_tenant_api_cutover", return_value=True),
+            patch.object(packaging, "verify_controller_crd"),
+            patch.object(packaging, "install_database_controller",
+                         side_effect=RuntimeError("database rollout unavailable")),
+            patch.object(packaging, "remove_tenant_cutover_lock") as unlock,
+            self.assertRaisesRegex(RuntimeError, "database rollout unavailable"),
         ):
             packaging.reconcile_controller(Path("."), CONFIG, client, {}, Mock(), None)
         unlock.assert_not_called()
@@ -1158,6 +2145,7 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "second inventory failed"),
         ):
             packaging.reconcile_controller(Path("."), CONFIG, client, {}, Mock(), None)
+        self.assertFalse(packaging.install_database_catalog.call_args.kwargs["cutover_locked"])
         self.assertIn("stop", events)
         self.assertTrue(
             any(

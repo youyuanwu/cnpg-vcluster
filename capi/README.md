@@ -11,6 +11,14 @@ The Azure profile provisions an independently managed AKS foundation with a
 shared ACR, Kamaji control planes, CAPZ-managed Azure worker machines, and the
 external Azure cloud provider. `azure-create-management` publishes the static
 Tenant manager to ACR, pins the deployed digest, and starts it in Azure mode.
+Azure database capability is installed separately from infrastructure readiness:
+supervise `just azure-database-runtime-watch` on the management host to retry
+CNPG and Azure Disk CSI installs for Ready Azure Tenants, or run
+`just azure-database-runtime-once` for a bounded attempt. Both commands require
+the verified local cache prepared by `just cache`; they install the pinned
+charts from that cache, not from live chart URLs. Database capability stays
+unavailable until the installed runtime is observed, while Tenant
+infrastructure Ready does not depend on chart installation.
 Local and Azure tenants are Kubernetes `Tenant` resources reconciled by the
 Rust/kube-rs controller. Each manager deployment installs exactly one provider:
 local mode retains Docker and the local foundation, while Azure mode runs in

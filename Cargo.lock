@@ -3372,6 +3372,8 @@ dependencies = [
 name = "tenant-database-controller"
 version = "0.1.0"
 dependencies = [
+ "axum",
+ "futures",
  "k8s-openapi",
  "kube",
  "schemars",
@@ -3379,6 +3381,9 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "thiserror 2.0.21",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]
@@ -3387,6 +3392,7 @@ version = "0.1.0"
 dependencies = [
  "k8s-openapi",
  "kube",
+ "serde",
  "serde_json",
  "thiserror 2.0.21",
 ]

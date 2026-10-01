@@ -45,5 +45,3 @@ rules:
   - get
   - list
   - watch
-  - create
-  - delete

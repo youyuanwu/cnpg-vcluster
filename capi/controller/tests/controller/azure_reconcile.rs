@@ -318,6 +318,28 @@ impl Fixture {
         );
     }
 
+    async fn verify_catalog_loss(&self) {
+        self.until_ready().await;
+        let status = self.current().status.unwrap();
+        assert_eq!(status.phase, Some(TenantPhase::Ready));
+        assert!(!status.database_capability.unwrap().available);
+        self.management.remove(
+            "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabasecatalogs/tenant-a",
+        );
+        self.step().await;
+        let status = self.current().status.unwrap();
+        assert_eq!(status.phase, Some(TenantPhase::Degraded));
+        assert!(
+            status
+                .conditions
+                .iter()
+                .any(|condition| condition.type_ == "Ready"
+                    && condition.status == "False"
+                    && condition.reason == "CatalogNotReady")
+        );
+        assert!(!status.database_capability.unwrap().available);
+    }
+
     fn mark_deleting(&self) {
         let mut tenant = self.management.get(TENANT_PATH);
         tenant["metadata"]["deletionTimestamp"] = json!("2026-09-28T00:00:00Z");
@@ -457,6 +479,11 @@ fn management_count(tenant: &Tenant) -> usize {
         .and_then(TenantStatus::azure)
         .and_then(|status| status.management.as_ref())
         .map_or(0, |status| status.recorded_uids().len())
+}
+
+#[tokio::test]
+async fn catalog_identity_loss_degrades_azure_ready_without_coupling_runtime_readiness() {
+    Fixture::new().verify_catalog_loss().await;
 }
 
 #[tokio::test]

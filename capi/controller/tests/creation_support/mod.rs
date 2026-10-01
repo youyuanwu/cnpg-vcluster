@@ -117,6 +117,7 @@ impl DockerClient for FakeDocker {
     }
 }
 
+#[derive(Clone)]
 pub struct FakeAccess(pub Client);
 impl TenantAccess for FakeAccess {
     async fn connect(
