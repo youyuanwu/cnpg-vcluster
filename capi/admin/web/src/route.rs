@@ -1,5 +1,6 @@
 use tenant_admin_shared::routes::{
-    API_TENANT_CREATE_PATH, API_TENANT_DATABASE_QUERY_PATH, API_TENANT_DELETE_PATH,
+    API_DATABASE_PATH, API_DATABASE_QUERY_PATH, API_DATABASES_PATH, API_TENANT_CREATE_PATH,
+    API_TENANT_DELETE_PATH,
 };
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -29,8 +30,35 @@ pub fn tenant_href(name: &str) -> Option<String> {
     valid_tenant_name(name).then(|| format!("/tenants/{name}"))
 }
 
-pub fn tenant_database_query_path(name: &str) -> Option<String> {
-    valid_tenant_name(name).then(|| API_TENANT_DATABASE_QUERY_PATH.replace("{name}", name))
+pub fn databases_path(name: &str) -> Option<String> {
+    valid_tenant_name(name).then(|| API_DATABASES_PATH.replace("{name}", name))
+}
+
+pub fn database_path(name: &str, uid: &str) -> Option<String> {
+    (valid_tenant_name(name) && valid_database_uid(uid)).then(|| {
+        API_DATABASE_PATH
+            .replace("{name}", name)
+            .replace("{uid}", uid)
+    })
+}
+
+pub fn database_query_path(name: &str, uid: &str) -> Option<String> {
+    (valid_tenant_name(name) && valid_database_uid(uid)).then(|| {
+        API_DATABASE_QUERY_PATH
+            .replace("{name}", name)
+            .replace("{uid}", uid)
+    })
+}
+
+fn valid_database_uid(uid: &str) -> bool {
+    uid.len() == 36
+        && uid.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
 }
 
 pub fn tenant_create_path() -> &'static str {
@@ -41,7 +69,7 @@ pub fn tenant_delete_path(name: &str) -> Option<String> {
     valid_tenant_name(name).then(|| API_TENANT_DELETE_PATH.replace("{name}", name))
 }
 
-fn valid_tenant_name(name: &str) -> bool {
+pub fn valid_tenant_name(name: &str) -> bool {
     (1..=30).contains(&name.len())
         && name
             .bytes()
@@ -59,8 +87,8 @@ fn valid_tenant_name(name: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppRoute, parse_route, tenant_create_path, tenant_database_query_path, tenant_delete_path,
-        tenant_href,
+        AppRoute, database_path, database_query_path, databases_path, parse_route,
+        tenant_create_path, tenant_delete_path, tenant_href,
     };
 
     #[test]
@@ -94,11 +122,22 @@ mod tests {
         }
         assert_eq!(tenant_href("Team-A"), None);
         assert_eq!(tenant_href("team-a"), Some("/tenants/team-a".to_owned()));
-        assert_eq!(tenant_database_query_path("Team-A"), None);
+        let uid = "12345678-1234-1234-1234-123456789abc";
+        assert_eq!(databases_path("Team-A"), None);
         assert_eq!(
-            tenant_database_query_path("team-a"),
-            Some("/api/v1/tenants/team-a/database/query".to_owned())
+            databases_path("team-a"),
+            Some("/api/v1/tenants/team-a/databases".to_owned())
         );
+        assert_eq!(
+            database_path("team-a", uid),
+            Some(format!("/api/v1/tenants/team-a/databases/{uid}"))
+        );
+        assert_eq!(
+            database_query_path("team-a", uid),
+            Some(format!("/api/v1/tenants/team-a/databases/{uid}/query"))
+        );
+        assert_eq!(database_query_path("team-a", "../other"), None);
+        assert_eq!(database_path("Team-A", uid), None);
         assert_eq!(tenant_create_path(), "/api/v1/tenants");
         assert_eq!(
             tenant_delete_path("team-a"),

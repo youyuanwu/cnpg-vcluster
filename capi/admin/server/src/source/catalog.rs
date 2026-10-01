@@ -161,6 +161,14 @@ fn ready(tenant: &Tenant) -> Result<(), SourceError> {
     Ok(())
 }
 
+pub(super) fn capability_available(tenant: &Tenant) -> bool {
+    tenant
+        .status
+        .as_ref()
+        .and_then(|status| status.database_capability.as_ref())
+        .is_some_and(|capability| capability.available)
+}
+
 async fn live_tenant(source: &KubeDataSource, expected: &Tenant) -> Result<Tenant, SourceError> {
     let name = expected.metadata.name.as_deref().ok_or_else(unavailable)?;
     let tenant = Api::<Tenant>::all(source.client.clone())
@@ -342,7 +350,11 @@ async fn recover(
                 .values()
                 .any(|entry| entry.name == name))
     {
-        return project(&current, provider_mode(tenant));
+        return project(
+            &current,
+            provider_mode(tenant),
+            capability_available(tenant),
+        );
     }
     Err(SourceError::MutationOutcomeUnknown)
 }
@@ -366,7 +378,9 @@ pub(super) async fn add(
         );
         catalog.status = None;
         match api.replace(&name, &PostParams::default(), &catalog).await {
-            Ok(updated) => return project(&updated, provider_mode(&live)),
+            Ok(updated) => {
+                return project(&updated, provider_mode(&live), capability_available(&live));
+            }
             Err(kube::Error::Api(status)) if status.code == 409 && attempt < 2 => continue,
             Err(kube::Error::Api(status)) if status.code == 409 => {
                 return Err(SourceError::Conflict);
@@ -412,7 +426,9 @@ pub(super) async fn delete(
         );
         catalog.status = None;
         match api.replace(&name, &PostParams::default(), &catalog).await {
-            Ok(updated) => return project(&updated, provider_mode(&live)),
+            Ok(updated) => {
+                return project(&updated, provider_mode(&live), capability_available(&live));
+            }
             Err(kube::Error::Api(status)) if status.code == 409 && attempt < 2 => continue,
             Err(kube::Error::Api(status)) if status.code == 409 => {
                 return Err(SourceError::Conflict);
@@ -903,6 +919,7 @@ pub(super) async fn query(
 pub(super) fn project(
     catalog: &TenantDatabaseCatalog,
     provider: ProviderMode,
+    capability_available: bool,
 ) -> Result<CatalogView, SourceError> {
     let catalog_uid = uid(catalog.metadata.uid.as_deref())?;
     let rv = uid(catalog.metadata.resource_version.as_deref())?;
@@ -1143,6 +1160,7 @@ pub(super) fn project(
         catalog_uid: catalog_uid.into(),
         resource_version: rv.into(),
         closed: catalog.spec.closed,
+        capability_available,
         databases,
     })
 }
@@ -1381,7 +1399,13 @@ mod tests {
         state.conditions[0].reason = "password=hidden".into();
         state.conditions[0].message = "token=private".into();
         state.instances[0].role = "password=hidden".into();
-        let view = project(&catalog, ProviderMode::Local).unwrap();
+        let view = project(&catalog, ProviderMode::Local, true).unwrap();
+        assert!(view.capability_available);
+        assert!(
+            !project(&catalog, ProviderMode::Local, false)
+                .unwrap()
+                .capability_available
+        );
         assert_eq!(view.databases.len(), 2);
         assert_eq!(view.databases[0].instance_topology[0].role, "unknown");
         assert_eq!(view.databases[0].phase, "progressing");
@@ -1431,7 +1455,7 @@ mod tests {
         let mut catalog = catalog();
         observed(&mut catalog, FIRST, "alpha");
         observed(&mut catalog, SECOND, "beta");
-        let view = project(&catalog, ProviderMode::Local).unwrap();
+        let view = project(&catalog, ProviderMode::Local, true).unwrap();
         let mut graph = TopologyGraph {
             tenant_name: "tenant-a".into(),
             provider: TenantProvider::Local,
@@ -1477,9 +1501,9 @@ mod tests {
     fn azure_projection_keeps_provider_and_rejects_cross_provider_status() {
         let mut catalog = catalog();
         observed(&mut catalog, FIRST, "alpha");
-        let ready = project(&catalog, ProviderMode::Local).unwrap();
+        let ready = project(&catalog, ProviderMode::Local, true).unwrap();
         assert_eq!(ready.databases[0].topology.provider, TenantProvider::Local);
-        let rejected = project(&catalog, ProviderMode::Azure).unwrap();
+        let rejected = project(&catalog, ProviderMode::Azure, true).unwrap();
         assert_eq!(
             rejected.databases[0].topology.provider,
             TenantProvider::Azure
@@ -1502,7 +1526,7 @@ mod tests {
             .as_mut()
             .unwrap()
             .kind = "azure".into();
-        let accepted = project(&catalog, ProviderMode::Azure).unwrap();
+        let accepted = project(&catalog, ProviderMode::Azure, true).unwrap();
         assert_eq!(accepted.databases[0].phase, "ready");
         assert_eq!(accepted.databases[0].instance_topology.len(), 1);
         assert!(query_state(&catalog, &query_request(FIRST), ProviderMode::Azure).is_ok());
@@ -1512,8 +1536,8 @@ mod tests {
     fn pending_projection_retains_requested_capacity_without_storage_observations() {
         let mut catalog = catalog();
         catalog.spec.entries.insert(FIRST.into(), entry("alpha"));
-        let local = project(&catalog, ProviderMode::Local).unwrap();
-        let azure = project(&catalog, ProviderMode::Azure).unwrap();
+        let local = project(&catalog, ProviderMode::Local, true).unwrap();
+        let azure = project(&catalog, ProviderMode::Azure, true).unwrap();
         for view in [&local, &azure] {
             assert_eq!(view.databases[0].phase, "progressing");
             assert!(view.databases[0].storage.is_empty());
@@ -1547,7 +1571,7 @@ mod tests {
             verified_absent: vec!["/private/one".into()],
             pending: vec!["secret=private".into(), "/private/two".into()],
         });
-        let view = project(&catalog, ProviderMode::Local).unwrap();
+        let view = project(&catalog, ProviderMode::Local, true).unwrap();
         assert_eq!(view.databases[0].phase, "deleting");
         assert_eq!(
             view.databases[0]

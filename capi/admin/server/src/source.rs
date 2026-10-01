@@ -1463,6 +1463,7 @@ impl DataSource for KubeDataSource {
                     TenantProviderSpec::Local => ProviderMode::Local,
                     TenantProviderSpec::Azure => ProviderMode::Azure,
                 },
+                catalog::capability_available(tenant),
             )
         })
     }

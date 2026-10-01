@@ -5,10 +5,11 @@
 Tenant Admin is an administrative application deployed once in each local
 Kind or Azure AKS management cluster. It gives administrators a browser view
 of the same `Tenant` resources, conditions, provider status, and management
-resources used by the lifecycle controller. Local Tenant detail pages also
-provide an explicitly unsafe PostgreSQL superuser console. The overview can
-create provider-compatible Tenants, and detail pages can delete the exact
-displayed Tenant identity.
+resources used by the lifecycle controller. Local and Azure Tenant detail
+pages each show a database catalog and a separate, explicitly unsafe
+PostgreSQL superuser console for every Ready cluster. The overview can create
+provider-compatible Tenants, and detail pages can delete the exact displayed
+Tenant identity.
 
 Kubernetes is the only durable data source. The application has no database,
 filesystem journal, watch cache, persisted Tenant kubeconfig, Azure
@@ -148,13 +149,13 @@ The overview reports provider mode, total Tenant count, Ready, Progressing,
 Degraded, Failed, and Deleting counts, plus the available management component
 summary. It also reports creation capability independently from Tenant reads.
 The create form uses the controller-supported Kubernetes version and accepts
-name/workers plus local-only database count; Azure CIDRs are controller
-allocated.
+name/workers. Database clusters are added separately to the Tenant catalog;
+Azure CIDRs are controller allocated.
 
 ### Tenant table
 
 The table shows name, provider, generation-aware classification, Kubernetes
-version, requested workers and local databases, endpoint, age, and summarized
+version, requested workers, endpoint, age, and summarized
 conditions. An empty management cluster produces a valid empty table and zero
 counts.
 
@@ -162,23 +163,40 @@ counts.
 
 The detail view shows the immutable specification, current conditions and
 blockers, provider-specific status, accepted management resources, and a
-provider-neutral topology. For local Tenants it also shows a live CNPG panel:
+provider-neutral topology. It independently reads the schema-v5 database
+catalog, showing at most three cards for either provider. Each card displays
+its logical UID, reconciliation phase, ready instances, storage, blockers,
+conditions, finalization progress, and an entry-scoped topology. Add accepts
+a lowercase DNS-label name and one to three instances when the Tenant and its
+database capability are Ready, the catalog is open and matches the Tenant
+UID, and fewer than three slots are occupied (including deleting entries).
+Delete requires typing the exact name and sends the displayed catalog and
+logical UIDs; deleting or stale entries disable unsafe controls. Each
+console offers only Ready instances of its own entry and sends the catalog,
+logical, and instance UIDs. A lost mutation response triggers an authoritative
+catalog reread; the UI locks mutations pending inspection rather than
+automatically replaying them. Missing catalog/capability observations leave
+the rest of the Tenant detail visible, with SQL and mutations disabled.
+
+The legacy local-only database observation in the Tenant snapshot remains a
+server compatibility field and is no longer rendered by the web UI. It reports
 cluster phase, desired/observed/ready counts, primary and failover target,
 promotion timestamps, image and timeline, read/write Services, topology
 placement, PVC health, conditions, and sorted primary/standby instances. The
 topology includes the exact CNPG Cluster and observed instances when available,
 or an explicit unavailable node when Tenant access is pending or fails.
-Azure reports database observation as not applicable.
+Azure reports this legacy database observation as not applicable; its catalog
+cards are rendered in the same way as local cards.
 
 The detail page also exposes destructive Tenant deletion. The administrator
 must type the exact Tenant name, and the server binds deletion to the displayed
 UID and current resourceVersion. Same-name replacements are rejected.
 Deletion is asynchronous; refresh shows Deleting conditions and blockers.
 
-When a local database observation is available, the detail page also shows an
-unsafe SQL console. The administrator selects an observed primary, standby, or
-unknown-role instance, chooses the PostgreSQL database, and submits arbitrary
-SQL. The backend executes the request on that exact instance and returns
+On a Ready catalog entry, the detail page shows an unsafe SQL console. The
+administrator selects a Ready instance in that cluster, chooses the PostgreSQL
+database, and submits arbitrary SQL. The backend executes the request on
+that exact instance and returns
 ordered result sets with column names, text values, NULL values, affected-row
 counts, timing, and explicit truncation state. PostgreSQL errors remain
 visible with SQLSTATE and sanitized server messages.
@@ -204,10 +222,10 @@ returns a typed not-found response and a non-fatal link back to the overview.
 Every successful JSON response is:
 
 ```json
-{"schemaVersion":4,"data":{}}
+{"schemaVersion":5,"data":{}}
 ```
 
-Errors use schema version 4 plus a typed error code, sanitized message,
+Errors use schema version 5 plus a typed error code, sanitized message,
 retryable flag, and optional bounded field errors. The routes are:
 
 | Route | Response |
@@ -220,7 +238,11 @@ retryable flag, and optional bounded field errors. The routes are:
 | `GET /api/v1/tenants/{name}` | One `TenantSnapshot` containing detail, live database observation, and topology from the same Tenant UID/generation/resource read. |
 | `DELETE /api/v1/tenants/{name}` | Delete the exact displayed Tenant UID with typed-name confirmation. |
 | `GET /api/v1/tenants/{name}/topology` | `TopologyGraph`. |
-| `POST /api/v1/tenants/{name}/database/query` | Execute unrestricted SQL as CNPG PostgreSQL superuser on one exact observed instance and return bounded ordered results. |
+| `GET /api/v1/tenants/{name}/databases` | Current `CatalogView` with exact Tenant/catalog UIDs, capability availability, and at most three database entries. |
+| `POST /api/v1/tenants/{name}/databases` | Add a named cluster with one to three instances against the exact catalog UID. |
+| `DELETE /api/v1/tenants/{name}/databases/{uid}` | Mark only the exact logical UID deleting with name confirmation and catalog UID. |
+| `POST /api/v1/tenants/{name}/databases/{uid}/query` | Execute unsafe SQL against the exact Ready entry and observed instance UID. |
+| `POST /api/v1/tenants/{name}/database/query` | Legacy local-only query compatibility route; the web UI does not use it. |
 | `GET /*` | Static asset or `index.html` fallback for browser routes. |
 
 `/overview` and `/tenants/{name}` are the coherent snapshot routes. The

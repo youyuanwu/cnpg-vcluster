@@ -50,6 +50,7 @@ pub struct CatalogView {
     pub catalog_uid: String,
     pub resource_version: String,
     pub closed: bool,
+    pub capability_available: bool,
     pub databases: Vec<DatabaseView>,
 }
 

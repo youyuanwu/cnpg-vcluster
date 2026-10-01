@@ -1,7 +1,7 @@
 use tenant_admin_shared::{
     ADMIN_CONTAINER_PORT, ADMIN_NAMESPACE, ADMIN_RESOURCE_NAME, ADMIN_SERVICE_PORT,
     API_SCHEMA_NAME, API_SCHEMA_VERSION, ApiEnvelope, ApiError, ApiErrorCode, ApiErrorEnvelope,
-    catalog::{CatalogQueryRequest, DatabaseAddRequest, DatabaseDeleteRequest},
+    catalog::{CatalogQueryRequest, CatalogView, DatabaseAddRequest, DatabaseDeleteRequest},
     lifecycle::{
         CreationCapability, TenantCreateRequest, TenantCreateResponse, TenantDeleteRequest,
         TenantDeleteResponse, TenantDeleteState, TenantField, TenantFieldError,
@@ -100,6 +100,27 @@ fn catalog_contracts_carry_exact_catalog_entry_and_instance_identities() {
     assert!(serde_json::from_str::<CatalogQueryRequest>(
         r#"{"catalogUid":"c","logicalUid":"u","instance":"p","database":"postgres","sql":"select 1"}"#
     ).is_err());
+    let view = CatalogView {
+        tenant: "tenant-a".into(),
+        tenant_uid: "tenant-uid".into(),
+        catalog_uid: catalog.into(),
+        resource_version: "4".into(),
+        closed: false,
+        capability_available: false,
+        databases: vec![],
+    };
+    let serialized = serde_json::to_value(&view).unwrap();
+    assert_eq!(serialized["capabilityAvailable"], false);
+    assert_eq!(
+        serde_json::from_value::<CatalogView>(serialized).unwrap(),
+        view
+    );
+    let mut missing = serde_json::to_value(view).unwrap();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("capabilityAvailable");
+    assert!(serde_json::from_value::<CatalogView>(missing).is_err());
 }
 
 #[test]

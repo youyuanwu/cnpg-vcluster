@@ -798,6 +798,7 @@ mod tests {
                 catalog_uid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
                 resource_version: "10".into(),
                 closed: false,
+                capability_available: true,
                 databases: vec![],
             })))
         }
