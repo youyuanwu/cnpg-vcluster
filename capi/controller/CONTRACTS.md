@@ -1,119 +1,129 @@
-# Rust Tenant contracts
+# Rust Tenant and database-controller contracts
 
-The current generated Tenant CRD serves `v1alpha4`. Its database capability
-stores catalog namespace/UID identity, not the retired gate/quota protocol;
-catalog CREATE must be preceded by an exact, successful Tenant status write
-of `catalogCreateIntent` while its finalizer is held. A failed or ambiguous
-status write does not authorize CREATE. The Phase 1 controller does not issue that CREATE
-or claim database capability availability. Deletion deliberately retains the
-finalizer because catalog closure and drain cannot yet be proven. The
-v1alpha3 contract below documents the preceding experimental cutover only.
-
-`tenancy.cnpg-vcluster.io/v1alpha3` is the only installed Tenant API.
-Rust `src/bin/generate.rs` produces the checked-in
-`config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml` and
-provider-specific `config/rbac/role.yaml` and
-`config/rbac/role-azure.yaml`. Local RBAC contains common plus local catalog
-permissions; Azure RBAC contains common plus Azure catalog permissions and its
-Cluster status/Machine patch extras. Both roles keep the same name because
-they are installed in separate clusters. `just controller-verify` compares those artifacts
-against generation without rewriting them. The v1alpha1 CRD, Go manager and
-admission webhook are not installation inputs. The breaking v1alpha2 cutover
-requires ordinary Tenant deletion, a temporary create-deny admission lock,
-repeated clean-state checks, old-controller shutdown, and an in-place storage
-version transition that disables `v1alpha2` before removing it; retained
-legacy state is not converted. See
-[`API_COMPATIBILITY.md`](API_COMPATIBILITY.md) for the public contract.
-The repository-root Cargo workspace owns the shared dependency versions,
-release profile, and lockfile; this crate inherits its dependencies from that
-workspace.
-
-The root `rust-toolchain.toml` selects Rust/Cargo 1.98.1 with the
-minimal profile, Clippy, and rustfmt; the crate retains an MSRV of 1.89. The
-Python wrappers leave Cargo home, target, temporary, compiler, flag, wrapper,
-profile, and configuration selection to Cargo's defaults. CI consumes the
-same toolchain file through `actions-rust-lang/setup-rust-toolchain`, including
-its integrated `Swatinem/rust-cache`. From `capi/`, fetch the locked dependency
-graph online before offline checks:
+The Tenant manager and independent database-controller are two separately
+packaged, leader-elected Rust binaries in the root Cargo workspace. Both
+are pinned to Rust 1.98.1 and independently checked against a 12,000-line
+production-Rust ceiling. Run these commands from `capi/` after the explicit
+online `just cache` and `just controller-fetch`:
 
 ```sh
-just controller-fetch
 just controller-verify
 just controller-lint
 just controller-test
 just controller-metrics
 just controller-build
+just database-controller-verify
+just database-controller-lint
+just database-controller-test
+just database-controller-metrics
+just database-controller-build
 ```
 
-For direct Cargo usage from `capi/controller/`, run `cargo fetch --locked` and
-`cargo run --locked --offline --bin generate -- --check`. Check mode
-compares the authoritative CRD/RBAC paths without writing. `cargo fmt
---all --check`, `cargo clippy --locked --offline --all-targets
---all-features -- -D warnings`, and `cargo test --locked --offline
---all-targets --all-features` are the equivalent direct validation commands.
+Both `*-verify` commands compare generated CRDs, RBAC and management
+manifests without silently rewriting them. The Tenant generator serves
+v1alpha4; the database-controller generator serves the v1alpha1
+`TenantDatabaseCatalog`. The old per-database `TenantDatabase` CRD,
+admission webhook and gate/quota deployments are not installation inputs
+([Tenant generator](src/bin/generate.rs#L1-L65);
+[catalog generator](../database-controller/src/bin/generate.rs#L1-L85)).
+See [API_COMPATIBILITY.md](API_COMPATIBILITY.md) for the breaking
+v1alpha3/implicit-cluster cutover and v5 Admin client contract.
 
-`CAPI_OFFLINE_ENFORCED=1` makes the fetch itself offline. The release wrapper
-builds with Cargo's selected target and explicit `--locked --offline`.
-Static CRT flags apply to the final manager binary, not proc-macro
-dependencies; Cargo's JSON artifact output identifies the executable, and
-packaging rejects dynamic ELF dependencies before staging it with verified
-Calico/CNPG assets in a scratch image. An empty Cargo home cannot satisfy the
-offline build.
+## Tenant controller
 
-Cargo discovers four integration targets: `controller`, `adapters`,
-`allocation`, and `finalization`. They share the Kubernetes API simulator
-under `tests/support/`. `controller-metrics` reports production Rust source
-before test-only modules and rejects growth above the 12,000-line workflow ceiling.
+One deployment starts with `--provider=local|azure`, never both. Local mode
+uses Docker, the checksum-verified schema-3 local foundation and an ordered
+allocation Lease; Azure mode uses the approved Azure provider and network
+allocation ConfigMaps and delegates cloud mutation to CAPZ/ASO. Both
+validate UID, resourceVersion, generation, literal spec and deletion
+timestamp on Tenant status/finalizer writes; general status conflicts may
+retry only after an exact reread, and finalizer conflicts requeue. Provider
+mismatches do not acquire a new finalizer
+([reconciliation](src/reconcile/mod.rs#L482-L570);
+[status writes](src/status.rs#L15-L102)).
 
-Installation uses one `Recreate` replica, a separate leader-election Lease,
-and HTTP `/healthz` and `/readyz`, without admission ports or TLS mounts.
-Local mode additionally uses Docker, the schema-3 local foundation, and staged
-assets. Azure mode uses the schema-1 Azure provider ConfigMap plus the approved
-`tenant-azure-allocation` slot ConfigMap and no Docker
-socket or Azure credentials. Before every Azure mutation, the manager re-reads
-the ConfigMap and requires its UID and canonical typed content to equal the
-startup snapshot; drift or an unreadable replacement blocks without status,
-finalizer, or resource writes. The same binary accepts
-`--provider=local|azure`; one deployment installs exactly one lifecycle
-implementation.
+The Tenant controller records exact catalog create intent and namespace
+identity before catalog CREATE, and persists observed catalog UID in
+`status.databaseCapability`. This capability is distinct from Tenant
+infrastructure Ready. A pending or ambiguous CREATE is not proof of absence.
+On Tenant deletion it closes the catalog, marks all entries deleting,
+waits for their status and workloads to disappear and removes the catalog
+before proceeding to the provider's infrastructure finalization
+([catalog creation](src/reconcile/mod.rs#L103-L209);
+[drain](../database-runtime/src/catalog_runtime.rs#L277-L409)).
+It never unilaterally removes a database-controller entry or releases a
+Tenant finalizer while a disk or create outcome is uncertain.
 
-Azure Tenant specs do not carry Pod or Service CIDRs. The controller claims an
-ordered approved network slot with a `tenant-azure-slot-*` Lease, records the
-catalog/Lease/CIDR identity in status before provider writes, and releases only
-after exact terminal cleanup. Invalid or absent current allocation
-configuration blocks new claims and repair writes but cannot prevent
-observation or finalization from recorded identity.
+Generated management-resource inventory declares exact API identity, scope,
+ownership and watch routing; both Rust and Python use it for provider
+permissions, installation checks and deletion evidence. The local and
+Azure RBAC roles have the same installed name in **different** clusters,
+with distinct provider-only verbs. Bootstrap Roles and RoleBindings validate
+administrative content; static resources otherwise use exact identity
+checks, while dynamic roots use UID/resourceVersion-bound apply
+([management catalog](../database-runtime/src/management.rs#L1-L93);
+[resource application](src/reconcile/objects.rs#L77-L191)).
 
-The generated management-resource JSON is the cross-language local operator
-contract. Entries declare exact served API identity and scope,
-Tenant/worker/kubeconfig/observed/allocation naming, whether the resource is
-watched, watch-name suffix or cluster-label routing, inventory policy and
-namespace, evidence participation, and checked narrow exemptions. Rust and
-Python reject malformed catalogs, unserved declared versions, malformed list
-envelopes/items/owner references, and ambiguous identity.
-Python inventories exact versioned raw collection paths: the list envelope
-must declare the catalog API version and `<Kind>List`, while items must have
-valid name, UID, and scope. Raw-list items may omit redundant `apiVersion` and
-`kind`; if present, these must match. Rust likewise accepts absent dynamic
-item type metadata but rejects mismatched supplied types.
-Allocation names, fixed controller infrastructure, provider-only CRDs,
-break-glass allowlists, test fixtures, and tenant-internal resources remain
-domain-owned rather than duplicating catalog semantics.
+## Database-controller
 
-Tenant status and finalizer writes share exact UID/generation/spec/deletion
-validation. Every patch includes UID and resourceVersion and validates the
-returned UID. General status mutation retries four conflicts through direct
-rereads; finalizer mutation does not retry internally and conflicts requeue
-before failure-status reporting. Allocation removal publishes explicit null
-before finalizer removal.
+The catalog spec is the resourceVersion compare-and-swap point shared by
+Admin additions and the Tenant controller's closure. Logical UUID keys
+remain immutable across replacement; a deleting entry continues to consume
+one of three slots until the database-controller proves terminal absence
+and removes it. The database-controller alone writes catalog `/status`:
+per-entry phase, identity, instance topology, bounded conditions, create
+intents (`Planned`, `Issued`, `Rejected`, `Observed`) and finalization
+receipts. Kubernetes OpenAPI/CEL validates transition invariants; exact
+Tenant/catalog/namespace UID checks reject foreign resources
+([catalog type](../database-controller/src/api.rs#L11-L107);
+[transition checks](../database-controller/src/api.rs#L231-L330);
+[identity validation](../database-controller/src/reconcile.rs#L62-L155)).
 
-PR fast checks upload the verified static manager and PR E2E consumes that
-same-revision artifact from `.tools/artifacts`. Scheduled and manually
-dispatched high-capacity validation do not use the artifact and retain a clean
-enforced-offline release build.
+Local entries each use a UID-derived CNPG namespace, at least 1 GiB static
+hostPath PV/PVC per ordinal, and fd-relative no-follow access to the exact
+subtree of the shared Tenant Docker volume. Deleting one entry does not
+remove the shared volume or sibling paths
+([local adapter](../database-controller/src/reconcile/local.rs#L19-L25);
+[path safety](../database-controller/src/local_path.rs#L1-L109)).
+Azure entries use a separate Tenant storage namespace, per-ordinal ASO
+Disk and static Azure Disk CSI PV/PVC binding (4 GiB StandardSSD_LRS
+each). The pinned database-controller workload identity reads/deletes only
+the recorded ARM IDs, and requires direct ARM NotFound before terminal receipt.
+Unresolved CREATE or ARM responses block removal
+([Azure adapter](../database-controller/src/reconcile/azure.rs#L26-L52);
+[disk finalization](../database-controller/src/finalize/azure.rs#L20-L160)).
 
-Azure lifecycle authority is Rust-only. Python may provision and inspect the
-shared foundation, submit/observe/delete the Tenant CR, externally prove Azure
-absence, and run the explicit VMSS replacement gate. Static checks require the
-old rendering/lifecycle/deletion modules and filesystem Tenant runtime to
-remain absent.
+The manager exposes `/healthz`, `/readyz` and an exact observer receipt
+used by staged cutover. It cannot acknowledge an unrelated or changed
+catalog UID/resourceVersion as ready; a controller restart resumes durable
+catalog status, not an in-memory deletion journal
+([manager](../database-controller/src/bin/manager.rs#L35-L140)).
+
+## Admin and operational boundary
+
+Admin exact-reads the current Tenant and catalog for every spec mutation.
+Add also requires Tenant readiness, database capability and a current
+database-controller rollout; delete remains possible when those are
+unavailable. Only queries validate provider-specific Tenant credential
+bindings and per-entry database credentials. Admin has no catalog `/status`
+or direct disk deletion permission. Schema v5 sends catalog UID for add,
+catalog and logical UID plus name confirmation for delete, and additionally
+a current Pod UID for unsafe SQL. The web UI never receives raw credentials
+([Admin routes](../admin/server/src/app.rs#L151-L238);
+[catalog reads](../admin/server/src/source/catalog.rs#L65-L136);
+[spec replacements](../admin/server/src/source/catalog.rs#L362-L451);
+[query credentials](../admin/server/src/source/catalog.rs#L577-L653)).
+
+The local installer fences Tenant and catalog CREATE during incompatible
+cutover and records an owner-only probe if Tenant CREATE could have been
+issued. If the outcome is unknown, leave fences and record intact; only
+the proven local kind container-restart protocol can settle that probe.
+Azure stays fenced pending independent terminal proof. Neither controller
+nor `break-glass` may be used to erase an uncertain identity or force
+release ([recovery](../scripts/lib/controller.py#L1069-L1216)).
+
+The offline local three-by-three E2E passed with exact entry replacement,
+stale UID rejection, SQL marker persistence and host cleanup. Azure
+credentialed nine-disk destructive proof and real browser/service-proxy
+agreement are **unmet release-acceptance gates**; generated contracts and
+offline tests do not replace either live proof.

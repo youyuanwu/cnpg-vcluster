@@ -49,8 +49,9 @@ observed instance identity. Tenant kubeconfig and per-cluster PostgreSQL
 credentials are validated and used only in memory; queries use an ephemeral
 Kubernetes port-forward. The SQL console limits requests to 128 KiB (64 KiB
 SQL), execution to 30 seconds, and retained results to 32 sets, 128 columns,
-1,000 rows, 16 KiB per value and 2 MiB response text. The frontend renders catalog-scoped cards, topology, and SQL controls instead
-of an implicit Tenant database. The service validates effective management permissions and has no
+1,000 rows, 16 KiB per value and 2 MiB response text. The frontend renders
+catalog-scoped cards, topology, and SQL controls instead of an implicit Tenant
+database. The service validates effective management permissions and has no
 Azure cloud credentials, application database, persistent cache, or browser
 credential exposure. See
 [`docs/admin-ui-design.md`](docs/admin-ui-design.md).
@@ -73,6 +74,17 @@ Azure lifecycle success. `just azure-foundation-status` is read-only;
 `just azure-test-tenant-lifecycle` is destructive and runs only against the
 recorded experiment foundation. The local PR gate runs
 `just test-e2e-offline` with the separately packaged database controller.
+`just controller-metrics` and `just database-controller-metrics` enforce
+independent 12,000-line production-Rust ceilings.
+As of 2026-10-01, a read-only `just azure-foundation-status` returned
+`{"blockers":["Azure foundation inventory is absent"],"foundation":"unhealthy","healthy":false,"schema":1}`
+and exited 1: the exact owner-only `.runtime/azure/resources.json` is absent,
+and `gh secret list` found zero `CAPI_AZURE_*` repository secrets. The
+credentialed three-by-three Azure destructive run and nine-disk ASO/ARM
+absence proof have **not** run. Real browser-versus-service-proxy agreement
+and leak inspection have **not** run either. Both remain release-acceptance
+gates, not passing checks; full unit/static/local/offline success does not
+substitute for them.
 
 If local catalog bootstrap is interrupted after Tenant CREATE was issued,
 `create-management` preserves the owner-only
@@ -86,6 +98,10 @@ still requires catalog and namespace cleanup proof before the record is
 removed. Do not delete the record, bypass a finalizer, or remove the retained
 cluster while recovery is uncertain. Azure's managed API cannot use this
 restart protocol and remains fenced pending independent terminal proof.
+Inspect the exact record, management identity and both policy/binding
+identities without mutation before resuming; an immediate Tenant NotFound is
+not proof that an in-flight CREATE cannot arrive. Never clear a recorded
+catalog/disk identity or force-remove a finalizer merely to unblock a rollout.
 
 Azure foundation operations use the ignored owner-only
 `config/azure.local.env` selectors. Azure Tenant creation uses a schema-1 JSON
@@ -166,11 +182,11 @@ it exits zero. Tenant specifications are immutable; delete and recreate to
 change capacity or versions. Local manifests select `provider.type: local`;
 endpoint and networks are assigned in provider status. The same CRD supports Azure provider intent. The JSON Azure example remains a
 CLI input format, not a second lifecycle authority.
-The bounded final E2E waits for one
-explicitly selected Tenant's structural Ready contract, runs `SELECT 1`
-through its PostgreSQL read/write service with the existing disposable SQL
-probe, waits for ordinary Tenant deletion/finalization, and verifies that
-management teardown restores a clean host:
+The bounded final E2E creates three explicit three-instance catalog entries,
+checks per-entry SQL markers, failover and restart, deletes and recreates an
+entry with stale-UID rejection, then waits for ordinary Tenant
+deletion/finalization and verifies that management teardown restores a clean
+host:
 
 ```bash
 just test-e2e
@@ -178,24 +194,28 @@ just test-e2e
 
 ## Tenant specifications and runtime configuration
 
-The cluster-scoped `tenancy.cnpg-vcluster.io/v1alpha3` API requires a name and
+The cluster-scoped `tenancy.cnpg-vcluster.io/v1alpha4` API requires a name and
 an immutable spec with common `kubernetesVersion` and `workers` fields plus
-one tagged `provider`. Local manifests use `type: local` and `databases`
-(counts 1-3). Azure requests use only `type: azure`; the controller claims
+one tagged `provider`. Local manifests use `type: local`; Azure requests
+use `type: azure`. Neither provider carries a database count. The controller claims
 canonical, non-overlapping Pod and Service CIDRs from the approved finite
 Azure allocation catalog. A schema-3 foundation supplies ordered local slots
 that bind one endpoint, Pod CIDR, and Service CIDR per Tenant; those values
-appear in `status.provider.allocation`. OpenAPI/CEL reject invalid names,
-counts, version syntax, provider fields, and spec updates. The Azure controller
+appear in `status.provider.allocation`. OpenAPI/CEL reject invalid names, worker counts, version syntax, provider
+fields, and spec updates. The Azure controller
 separately validates the approved allocation catalog and active claims. Each
 controller checks its configured supported Kubernetes version. The API server
 prunes unknown fields under `fieldValidation=Warn` or `Ignore`, but rejects
 them under `Strict`, as used by the repository's local clients. No validating
 webhook is installed.
 
-The v1alpha3 contract intentionally replaces experimental v1alpha2. There is
-no conversion or migration: existing Tenant objects must be deleted and
-recreated after the create-locked clean CRD cutover. Azure-mode managers
+The v1alpha4 contract intentionally replaces experimental v1alpha3. There is
+no conversion or migration: existing Tenants and their implicit database
+workloads must complete ordinary deletion and storage cleanup before the
+create-locked clean CRD cutover. A leftover draft `TenantDatabase` CRD
+blocks installer preflight **before mutation**; do not delete it until all
+served versions and in-flight CREATE outcomes are proven terminal and
+workload/storage/admission cleanup is independently approved. Azure-mode managers
 reconcile only Azure Tenants; local-mode managers reconcile
 only local Tenants. Provider mismatches remain unsupported and do not acquire a
 new finalizer. Azure lifecycle commands continue to accept schema `1` JSON
@@ -203,8 +223,11 @@ specifications and translate them to the CRD. Safe examples are in
 [`config/tenants/examples/`](config/tenants/examples/).
 
 The lifecycle does not infer a singleton tenant from environment variables.
-The current installer supports only v1alpha3 and never deletes retained
-Tenants during cutover. The manager loads one foundation snapshot at startup.
+The installer supports only v1alpha4 and never deletes retained Tenants or
+the draft database CRD during cutover. Separate temporary Tenant and catalog
+CREATE policies guard migration, then a UID-bound empty bootstrap catalog
+probe must pass before release. A loss of certainty retains/reapplies the
+fences. The manager loads one foundation snapshot at startup.
 Same-identity restarts resume active Tenants; changed configuration requires
 an empty Tenant/provider/host inventory and a candidate-bound activation
 ticket. Failed pre-activation replacement restores the prior controller.
@@ -268,7 +291,9 @@ just test-tenant-lifecycle
 | `just tenant-create azure <spec.json>` | Reconcile one explicit Azure tenant on the recorded AKS/CAPZ foundation. |
 | `just tenant-status azure <name>` | Inspect one Azure tenant without mutating state. |
 | `just tenant-delete azure <name> azure/<name>` | Delete the exact tenant through Kubernetes/CAPI/CAPZ and wait for Tenant absence. |
-| `just azure-test-tenant-lifecycle` | Destructively prove three distinct VMSS-backed workers, exact non-primary instance replacement, targeted absence, foundation preservation, and recreation for the example tenant. |
+| `just azure-database-runtime-once` / `just azure-database-runtime-watch` | Install or retry pinned CNPG and Azure Disk CSI runtime independently of Tenant infrastructure readiness. |
+| `just azure-test-tenant-lifecycle` | Destructively prove three workers, three three-instance database entries, SQL/failover/restart, nine exact disk identities and post-deletion ASO/ARM absence, targeted VMSS replacement, foundation preservation, and recreation. Requires the matching credentialed experiment foundation. |
+| `just database-controller-verify` / `just database-controller-metrics` | Verify generated catalog CRD/RBAC and enforce the separate production-Rust ceiling. |
 | `just diagnose management` | Print management status, workloads, CRDs, and events without mutation. |
 | `just destroy` | Remove recorded tenants, controllers, the management cluster, runtime state, and restore host settings. |
 
@@ -277,9 +302,12 @@ changing state. Local lifecycle state is held in the Tenant resource, schema-3 f
 ConfigMap, per-slot allocation Leases, provider resources, and exact Docker identities;
 the public local commands do not maintain a second filesystem journal or
 readiness evaluator. Azure lifecycle identity is held in the Tenant resource.
-Normal Tenant commands, retries, and gates do not persist Tenant specifications,
-resource identities, proof checkpoints, rendered manifests, or evidence below
-`.runtime/`. Local validation caches a Tenant kubeconfig on demand only when it
+Ordinary Tenant create/status/delete commands do not persist a second Tenant
+specification or deletion journal below `.runtime/`. During management
+installation, the guarded catalog cutover **does** keep owner-only
+`catalog-bootstrap-probe.json` and activation identity in `.runtime/management/`
+until exact terminal proof; the destructive Azure gate holds proof in memory.
+Local validation caches a Tenant kubeconfig on demand only when it
 must invoke `kubectl` against that Tenant API. The cache is validated against
 the live Secret, removed after Tenant deletion, and removable with the explicit
 cache-clear commands. Foundation inventory and the management kubeconfig remain
@@ -321,7 +349,8 @@ as lifecycle-complete.
 Tenant control planes, CAPI resources, kubeconfigs, CIDRs, DNS domains, API
 VIPs, workers, Docker volumes, static PVs, and PostgreSQL credentials are
 distinct. Tenant Nodes and database objects do not appear in the management
-API. Opposite Kubernetes and PostgreSQL credentials are tested against
+API, except for the owned catalog and its bounded entry status. Opposite
+Kubernetes and PostgreSQL credentials are tested against
 reachable endpoints and must be rejected.
 
 The worker boundary is not hostile-tenant isolation. Every worker is a
@@ -333,14 +362,20 @@ access.
 ## Storage and persistence
 
 Each tenant owns one Docker volume. Its host mountpoint is mounted at the same
-container path in all three tenant workers. Prebound static hostPath PVs have
-no node affinity, so a PostgreSQL Pod can move to a replacement CAPD worker
-while retaining its PVC, PV, and bytes.
+container path in all three tenant workers. Each catalog logical UID owns
+one isolated namespace and per-ordinal directory, static PV and PVC (at least
+1 GiB per instance); deletion verifies its own subtree absent without
+removing the shared Tenant volume. Prebound static hostPath PVs have no node
+affinity, so a PostgreSQL Pod can move to a replacement CAPD worker while
+retaining its PVC, PV, and bytes.
 
 This is a local persistence proof only. It does not model Azure Disk
-attach/detach, fencing, availability zones, snapshots, or failure domains. The
-future Azure profile replaces the Docker volume and hostPath implementation
-with Azure CSI volumes.
+attach/detach, fencing, availability zones, snapshots, or failure domains.
+Azure uses separate Tenant storage and per-entry workload namespaces,
+ASO-managed 4-GiB StandardSSD_LRS disks, and static CSI PV/PVC bindings.
+The database-controller records expected ARM IDs before CREATE and waits
+for direct NotFound after exact deletion; its credentialed live gate remains
+unverified.
 
 ## Networking and add-ons
 
@@ -353,13 +388,15 @@ owned static objects are validated for identity, not generically rewritten;
 missing non-root owned children are recreated. A missing or replaced root
 CAPI Cluster is refused after its UID has been recorded.
 
-Network, storage, and CNPG objects are reconciled in dependency-ordered batches:
-Namespaces and CRDs first, supporting configuration/RBAC/storage next, then
-workloads. Every object in a batch is checked and created if missing without a per-object
-requeue. CRDs must be Established and their served versions discoverable before
-dependent batches proceed; same-name create races still require exact ownership.
-Only dynamic management roots and the CNPG `Cluster` receive targeted
-identity-bound server-side apply.
+Tenant networking/runtime bootstrap objects are reconciled in
+dependency-ordered batches: Namespaces and CRDs first, supporting
+configuration/RBAC/storage next, then workloads. Every object in a batch
+is checked and created if missing without a per-object requeue. CRDs must
+be Established and their served versions discoverable before dependent
+batches proceed; same-name create races still require exact ownership.
+Dynamic management roots use targeted identity-bound server-side apply;
+the separate database-controller reconciles each catalog entry's CNPG
+Cluster and storage.
 
 Worker image delivery is bootstrap-owned rather than a second reconciliation
 loop. The `KubeadmConfigTemplate` verifies archive checksums, imports the
@@ -398,26 +435,31 @@ Reconciliation and deletion are fail-closed:
   Machine-to-MachineSet-to-MachineDeployment ownership chain;
 - inspection distinguishes present, canonical Kubernetes `NotFound`, and
   inspection failure;
-- one finalizer deletes the exact recorded CAPI Cluster, waits
+- the Tenant finalizer first closes and drains its catalog, then deletes
+  the exact recorded CAPI Cluster, waits
   for provider objects and CAPD containers, removes the exact owned volume,
   deletes the Namespace and its credentials, releases the exact allocation
   Lease, and
   removes the finalizer last;
-- tenant-internal resources and bootstrap RBAC are disposable with the
-  dedicated tenant cluster; finalization does not contact the tenant API or
-  require a cleanup checkpoint. Management/host ownership remains fail-closed.
+- after the database-controller verifies each entry's workload, local path
+  or Azure disk absent, remaining tenant-internal networking/bootstrap
+  resources are disposable with the dedicated tenant cluster. Management,
+  Tenant API and host inspection remain fail-closed.
   Unsupported live legacy Kubernetes/provider/Docker residue blocks
   installation and is never migrated. Only recognized private local
   compatibility file shapes are removed by explicit cleanup; unknown
   descendants remain fail-closed.
 
-The controller does not persist a creation program counter or child-resource
-UID ledger. Missing children are discovered from live state. Static bootstrap
+The Tenant controller records catalog creation intent/outcome and exact
+catalog namespace/UID status, but no generic infrastructure creation
+program counter or child-resource UID ledger. Missing children are
+discovered from live state. Static bootstrap
 objects are created when absent and ownership-validated while creation is
 progressing; existing objects are not continuously rewritten or generically
 content-audited. Bootstrap Roles and RoleBindings retain explicit content
 validation because they establish required administrative access. Dynamic CAPI
-roots and the CNPG `Cluster` retain targeted repair.
+roots retain targeted repair; the database-controller owns CNPG `Cluster`
+identity and reconciliation.
 Expected progress uses a fixed poll interval rather than rate-limited requeue
 backoff.
 
@@ -465,9 +507,13 @@ a stale `True` condition. A healthy local Tenant requires:
   with containers running on the foundation network;
 - available Calico, CoreDNS, and repository-owned kube-proxy workloads from
   that same observation;
-- the expected static StorageClass and exact owned Docker volume;
-- a CNPG Cluster in healthy state with the requested number of ready
-  instances.
+- the expected static StorageClass and exact owned Docker volume.
+
+`Tenant` infrastructure Ready is independent of catalog entry health. Its
+database capability is separately observed; each entry publishes its own
+Ready/Progressing/Deleting/Degraded state, storage and instance topology.
+Do not use a Ready Tenant condition as proof that SQL or all databases are
+ready.
 
 Canonical Kubernetes `Error from server (NotFound):` is the only accepted
 absence proof in fail-closed lifecycle inspections. Other API errors are
@@ -553,16 +599,19 @@ GitHub Actions runs Python unit/static checks and Rust generated-artifact
 verification, format, Clippy, tests, and release/static-link build in
 **CAPI fast checks**, independently of the destructive **CAPI end-to-end**
 job. Fast checks explicitly repeat the offline Azure foundation packaging,
-operator command, proof, ownership, and gate contracts; the destructive Azure
-gate remains manual. They also verify admin generation, lint, tests, metrics,
-offline reproducible server/Wasm packaging, and upload the static server plus
-browser assets with the controller manager. PR E2E validates and consumes
-those exact artifacts; scheduled/manual CI rebuilds independently from the
-complete cache.
-The final **CAPI tests** check requires fast checks and the online E2E on PRs
-(including fork PRs), fast checks and the targeted/offline high-capacity job
-on manual dispatch and the weekly Monday 04:23 UTC schedule, and fast checks
-alone on `main` pushes. Keep **CAPI tests** as the required branch-protection
+operator command, proof, ownership, and gate contracts. They also verify
+database-controller generation, lint, tests, metrics, static build and image,
+admin generation/lint/tests/metrics, and offline reproducible server/Wasm
+packaging. PR E2E consumes the exact uploaded controller,
+database-controller and admin artifacts and runs `just test-e2e-offline`;
+scheduled/manual high-capacity CI rebuilds from the complete cache.
+Scheduled/manual `azure-destructive` CI separately requires six Azure secrets
+and a matching healthy inventory before running nine-disk proof.
+The final **CAPI tests** check requires fast checks and offline E2E on PRs
+(including fork PRs), fast checks plus targeted/offline high-capacity and
+credentialed Azure jobs on manual dispatch and the weekly schedule, and fast
+checks alone on `main` pushes. The Azure job fails (not skips as a success)
+without configured secrets. Keep **CAPI tests** as the required branch-protection
 check: its always-running gate rejects failed, cancelled, or unexpectedly
 skipped applicable jobs.
 Pushes to `main` run fast checks only, avoiding an immediate repeat of the PR's
@@ -660,6 +709,8 @@ Exact versions, URLs, checksums, source commits, and image digests are in
   lab-wide deletion lock.
 - The Azure profile is an experiment with a shared resource group, VNet,
   subnet, and broad resource-group Contributor identity.
+- The Azure nine-disk destructive and browser/service-proxy agreement gates
+  remain unmet; no managed-Azure database rollout is claimed.
 - CAPZ `v1.21.1` requires the narrowly scoped external-control-plane webhook
   compatibility selector documented in
   [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md).

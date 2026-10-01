@@ -1,124 +1,98 @@
-# Tenant API compatibility
+# Tenant and database catalog API compatibility
 
-The current Tenant API is `tenancy.cnpg-vcluster.io/v1alpha4`: provider
-`local` and `azure` have no `databases` field. In the catalog-transition
-Phase 1 controller, `status.databaseCapability` reports a lifecycle
-`namespace`, its observed `namespaceUID`, and `catalogUID` (plus an optional
-Azure `storageNamespaceUID`), never a gate or quota. Named kubeconfig Secret
-access remains bound to the exact Tenant credential Role/RoleBinding. The optional
-`status.catalogCreateIntent` records the exact namespace, catalog name and
-Tenant UID *before* any catalog CREATE can be issued. Phase 1 neither creates
-nor drains a catalog: capability remains unavailable even when the database
-runtime is observable, and deletion retains the Tenant finalizer until an
-exact catalog drain can be verified by the subsequent lifecycle integration.
-Infrastructure Ready remains independent of database capability. The
-v1alpha3 behavior described below is historical, not an installed
-catalog-transition contract.
+The installed cluster-scoped Tenant CRD serves and stores only
+`tenancy.cnpg-vcluster.io/v1alpha4`. Its immutable spec has a DNS-label name,
+supported three-part Kubernetes version, one to three workers and one tagged
+`provider.type: local|azure`. Neither provider carries `databases`; Tenant
+creation creates no PostgreSQL workload. Structural OpenAPI/CEL enforces
+immutable spec and provider shape; `fieldValidation=Strict` rejects unknown
+fields, while Warn/Ignore may prune them. Repository clients use Strict. A
+provider-mode mismatch is unsupported, not a request to adopt the Tenant
+([Tenant API](src/api.rs#L15-L52);
+[generated CRD](config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml#L1-L75)).
 
-`tenancy.cnpg-vcluster.io/v1alpha3` is the only served and stored Tenant
-version. It intentionally replaces experimental `v1alpha2`; there is no
-conversion or migration. Existing objects must complete ordinary deletion
-before cutover. The installer denies new Tenant creation, verifies empty
-Tenant/provider inventories around old-controller shutdown, applies an
-in-place dual-version CRD with `v1alpha2` no longer served, rechecks emptiness,
-advances `status.storedVersions`, installs the single v1alpha3 generation,
-verifies the allocator-capable controller, and then removes the create lock.
-A request admitted through a lagging API server is retained and blocks
-completion rather than being deleted by CRD replacement. The installer
-verifies both `spec.versions` and `status.storedVersions`.
+Each Tenant owns exactly one namespaced
+`tenancy.cnpg-vcluster.io/v1alpha1` `TenantDatabaseCatalog`, initially empty
+in `tenant-db-<tenant>`. Its spec fixes `tenantName` and `tenantUID`; the
+catalog Kubernetes UID lives in metadata. Spec map keys are immutable logical UUIDs,
+different for a deleted-and-recreated display name. Entry names are unique
+1-30-character lowercase DNS labels, instance counts are integers from one
+through three, and all entries, including deleting entries, count against
+the maximum of three. `closed` and `deleting` only advance to true. A status
+subresource contains controller-owned per-entry phase, identities,
+observation, create intents and terminal proof. OpenAPI/CEL rejects
+reassigning an entry, reopening a catalog, or removing an entry without
+its exact terminal evidence
+([catalog API](../database-controller/src/api.rs#L11-L107);
+[catalog transitions](../database-controller/src/api.rs#L231-L330);
+[CEL rules](../database-controller/src/api.rs#L403-L459)).
 
-A Tenant is cluster-scoped. Its immutable spec has common
-`kubernetesVersion` and `workers` fields plus exactly one tagged `provider`.
-The local variant contains `type: local` and `databases`; the Azure variant
-contains only `type: azure`. OpenAPI requires numeric three-part version syntax
-(optional leading `v`), integer counts from one to three, and provider-specific
-fields. Azure networks come from the separately approved allocation catalog.
-CEL constrains the name to a
-1-30 character lowercase DNS label and compares the *whole literal spec* to
-`oldSelf.spec` on updates. Each controller checks its configured supported version separately and
-normalizes an initial `v` for the canonical spec hash. A `v` spelling change
-on an existing object is still prohibited by CEL.
-Change a spec by ordinary DELETE and recreate, not by in-place update.
+**Concurrency and readiness:** Admin and the Tenant controller conditionally
+update the catalog spec with live UID/resourceVersion; the independent
+database-controller writes `/status` and removes proven terminal entries.
+A conflict demands a fresh exact read; an ambiguous write is never
+automatically replayed. The Tenant controller records
+`status.catalogCreateIntent` and the namespace identities before catalog
+CREATE and publishes `status.databaseCapability` with namespace UID,
+catalog UID and optional Azure storage namespace UID. An unknown CREATE
+outcome retains the finalizer and cannot be converted into absence by an
+immediate NotFound. Tenant infrastructure Ready is independent of catalog
+capability and entry status
+([Tenant catalog creation](src/reconcile/mod.rs#L103-L209);
+[Tenant catalog drain](src/reconcile/mod.rs#L385-L424);
+[database-controller identity](../database-controller/src/reconcile.rs#L62-L155)).
 
-The structural CRD prunes unsupported fields under
-`fieldValidation=Warn` (warning returned) or `Ignore` (no warning); only
-`fieldValidation=Strict` rejects unknown fields. Repository local clients
-request Strict. No validating webhook is installed, so callers must not rely
-on Warn/Ignore to reject extra input. Status is controller-owned through its
-subresource and may add optional observational fields without changing spec
-semantics. Common status contains phase, conditions, and observed generation.
-Local status exposes the allocated `slotId`, endpoint, Pod CIDR and Service
-CIDR under `status.provider.allocation`, plus
-`status.provider.foundationHash` and the exact
-`status.provider.clusterUID`. Azure status contains the exact immutable
-foundation/specification binding, endpoint, management UIDs, kubeconfig
-UID/hash, VMSS and Node identities, add-on identities, provider descendants,
-deletion barriers, and `networkAllocation` with slot, CIDRs, catalog
-UID/hash, and Lease name/UID. Clients must compare `metadata.generation`,
-`status.observedGeneration`, and the Ready condition's observed generation;
-do not depend on condition order, cached True conditions, or an internal
-reconciliation stage. A provider/status discriminator mismatch is invalid
-durable identity and is reported as `OwnershipInvalid`; it is never repaired
-across providers. The supported local status command owns exit classification.
+**Deletion:** Tenant DELETE first closes the catalog and marks every entry
+deleting with a UID/resourceVersion patch. The database-controller verifies
+per-UID workload, credential, local subtree or Azure disk absence before
+terminal status and spec removal. Only an empty catalog and status can lose
+the catalog finalizer; provider infrastructure finalization follows. Foreign
+or replacement resources are never adopted or deleted. No manual finalizer
+stripping is part of normal recovery
+([catalog drain](../database-runtime/src/catalog_runtime.rs#L277-L409);
+[Azure disk cleanup](../database-controller/src/finalize/azure.rs#L20-L160)).
 
-Every status and finalizer write is an exact merge patch containing the
-observed UID and current resourceVersion. The controller revalidates UID,
-generation, literal spec, and deletion timestamp before writing and rejects a
-replacement response. General status conflicts may retry only after a fresh
-exact read; finalizer conflicts wait for another reconciliation pass.
-Unchanged status/finalizer state is a no-op, and clearing allocation emits an
-explicit JSON `null`.
+**Breaking experimental migration:** The former v1alpha3
+`provider.databases`/implicit `capi-postgres` contract is not converted.
+Normally delete old Tenants and independently verify legacy workloads and
+storage removed before a clean, create-locked in-place storage-version
+transition. The former v1alpha2-to-v1alpha3 transition is historical, not
+the installed contract. A draft `TenantDatabase` CRD from an abandoned
+experiment is never automatically retired: its mere presence blocks the
+installer before mutation. To authorize its removal separately, first prove
+all served versions empty, every in-flight CREATE outcome terminal across
+API servers, and legacy workload/storage/admission cleanup. There is no
+automatic adoption, data migration, or rollback of an incompatible old
+object into a new catalog
+([legacy CRD guard](../scripts/lib/database_controller.py#L324-L335)).
 
-Python resolves the tracked local slot catalog and publishes a
-checksum-verified schema-3 foundation. One non-expiring namespaced allocation Lease claims the
-endpoint/Pod CIDR/Service CIDR tuple. Its exact name and markers bind Tenant
-UID, canonical spec hash, foundation hash and slot identity; a restart can
-recover a claim created before status publication. A missing, malformed,
-foreign, or changed status-bound claim fails closed during creation and
-nonterminal deletion. Leader election uses a distinct renewable Lease.
+Temporary Tenant and catalog CREATE-deny policies protect the cutover. The
+installer checks exact policies/bindings and effective denials, releases only
+Tenant CREATE for one UID-bound empty bootstrap catalog probe, checks the
+database-controller's exact observation and normal probe cleanup, then
+releases general catalog CREATE. Uncertain or interrupted probes preserve
+the owner-only record and fences. This is **not** a permanent database
+admission webhook, reservation or quota
+([installer cutover](../scripts/lib/controller.py#L761-L803);
+[local unknown-outcome recovery](../scripts/lib/controller.py#L1069-L1216)).
+The managed Azure API cannot use the local kind management-container restart
+protocol; it stays fenced until an independent terminal proof is available.
 
-Azure uses the same durable claim pattern with approved
-`tenant-azure-allocation` content and `tenant-azure-slot-*` Leases. Catalog
-validation covers every slot pair, reserved management networks, active-claim
-network overlap, and exact operator-approved hash. Existing recorded
-allocations remain observable and finalizable when the current catalog is
-missing or invalid; new allocation and repair writes fail closed.
+The public Admin envelope uses `schemaVersion: 5`. Clients must switch from
+the singular local-only query route to
+`GET/POST /api/v1/tenants/{name}/databases`,
+`DELETE /api/v1/tenants/{name}/databases/{uid}` and
+`POST /api/v1/tenants/{name}/databases/{uid}/query`, supplying the displayed
+catalog UID, logical UID and exact observed instance UID as appropriate.
+The retained singular route rejects catalog-capable Tenants; do not use it
+to infer a default database. Browser mutations require the same-authority
+local/IP Origin and unsafe-request header; authenticated service-proxy
+requests without Origin remain possible
+([routes](../admin/shared/src/routes.rs#L1-L14);
+[catalog DTOs](../admin/shared/src/catalog.rs#L6-L62);
+[handlers](../admin/server/src/app.rs#L151-L238)).
 
-Static tenant resources are created when absent but are not continuously
-repaired or generically content-audited. Existing resources must retain exact
-Tenant ownership markers; bootstrap Roles and RoleBindings also retain
-explicit content validation because they establish administrative access.
-Dynamic CAPI roots and the CNPG database `Cluster` retain targeted,
-identity-bound repair. Foundation and root Cluster bindings precede external
-mutation and root replacement is refused after its UID is recorded.
-
-Deletion is ordinary Kubernetes DELETE guarded by
-`tenancy.cnpg-vcluster.io/finalizer`, even when creation-only foundation
-validation is blocked.
-No tenant API access or tenant-resource cleanup checkpoint is needed: the
-dedicated cluster's contents are disposable. The finalizer verifies
-management/host/provider/Lease ownership from live reads; deletes the exact
-recorded CAPI Cluster and residual provider roots with UID/resourceVersion
-preconditions; waits for descendants and CAPD workers/load balancer; removes
-the exactly owned volume, Namespace/credentials, then allocation Lease; and
-removes itself last. Inspection uncertainty retains the finalizer. Only after
-authoritative absence of *all* old external residue can an absent old Lease or
-a successor-owned Lease count as an already-completed release; the successor
-claim is never modified. No manual finalizer stripping is part of normal
-recovery.
-
-A second served version must not be added until conversion behavior, storage
-version migration, downgrade behavior and removal criteria are documented and
-covered by conformance tests. Existing objects must never be silently re-read
-under different semantics.
-
-The manager starts with exactly one provider implementation. A local Tenant in
-Azure mode, or an Azure Tenant in local mode, reports `ProviderUnsupported`
-without acquiring a new finalizer. Azure mode reconciles the Tenant through
-Kubernetes APIs only and delegates Azure mutation to CAPZ/ASO. Its finalizer
-uses exact UID/resourceVersion preconditions and durable status identities;
-external Python proof is observational and does not replace finalization.
-
-The Azure JSON TenantSpec remains a client input compatibility format. It is
-translated to the CRD and is not a separate Python lifecycle. Existing
-filesystem Azure identity/journal state is not migrated or adopted.
+The Azure JSON `TenantSpec` is still a schema-1 CLI input, translated to
+v1alpha4, not a second lifecycle authority. New served versions require a
+separately designed conversion, storage migration, downgrade and removal
+contract with conformance tests; never silently reinterpret retained state.

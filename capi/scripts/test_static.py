@@ -852,7 +852,7 @@ def check_documentation() -> None:
         "This is a local persistence proof only.",
         "The Tenant controller is the single networking writer.",
         "Worker image delivery is bootstrap-owned",
-        "one finalizer deletes the exact recorded CAPI Cluster",
+        "Tenant finalizer first closes and drains its catalog",
         "while retaining its PVC, PV, and bytes.",
         "`just cache` is the explicit online acquisition",
         "The retained workflow is a development optimization, not a final gate",
@@ -973,6 +973,95 @@ def check_documentation() -> None:
         and "unsafe PostgreSQL superuser console" in root_readme,
         "root README omits the Tenant Admin entry point",
     )
+    compatibility = (ROOT / "controller" / "API_COMPATIBILITY.md").read_text(encoding="utf-8")
+    contracts = (ROOT / "controller" / "CONTRACTS.md").read_text(encoding="utf-8")
+    catalog_docs = {
+        "root README": (root_readme, (
+            "v1alpha4", "explicit database", "unmet release-acceptance",
+        )),
+        "CAPI README": (readme, (
+            "schema-v5", "three-by-three", "nine-disk", "not passing checks",
+            "catalog-bootstrap-probe.json", "12,000",
+        )),
+        "high-level design": (design, (
+            "TenantDatabaseCatalog", "database-controller", "v1alpha4",
+            "catalog entry health", "direct ARM NotFound",
+        )),
+        "Admin design": (admin_design, (
+            "schema version 5", "catalogUid", "logicalUid", "instanceUid",
+            "same-authority", "browser/service-proxy",
+        )),
+        "Azure design": (azure_design, (
+            "TenantDatabaseCatalog", "4-GiB", "StandardSSD_LRS",
+            "nine-disk", "foundation inventory is absent",
+        )),
+        "API compatibility": (compatibility, (
+            "v1alpha4", "v1alpha1", "resourceVersion", "schemaVersion: 5",
+            "in-flight CREATE", "never automatically retired",
+        )),
+        "controller contracts": (contracts, (
+            "database-controller-verify", "database-controller-metrics",
+            "Planned", "Issued", "Observed", "ARM NotFound",
+            "unmet release-acceptance",
+        )),
+    }
+    for name, (text, required) in catalog_docs.items():
+        flat = " ".join(text.split())
+        for token in required:
+            check(token in flat, f"{name} lacks catalog documentation: {token}")
+    for name, text in (
+        ("root README", root_readme),
+        ("CAPI README", readme),
+        ("high-level design", design),
+        ("Admin design", admin_design),
+        ("Azure design", azure_design),
+        ("API compatibility", compatibility),
+        ("controller contracts", contracts),
+    ):
+        check(
+            not re.search(
+                r"v1alpha3` (?:is the only|API requires)|"
+                r"catalog additions remain unavailable through Admin|"
+                r"Azure Disk and CloudNativePG remain outside the Azure",
+                text,
+            ),
+            f"{name} still asserts an obsolete single-cluster contract",
+        )
+    for secret in (
+        "CAPI_AZURE_TEST_CONFIG",
+        "CAPI_AZURE_FOUNDATION_INVENTORY",
+        "CAPI_AZURE_MANAGEMENT_KUBECONFIG",
+        "CAPI_AZURE_CLIENT_ID",
+        "CAPI_AZURE_TENANT_ID",
+        "CAPI_AZURE_SUBSCRIPTION_ID",
+    ):
+        check(secret in readme, f"CAPI README omits Azure release input: {secret}")
+    for path in (
+        ROOT.parent / "README.md",
+        ROOT / "README.md",
+        ROOT / "docs/high-level-design.md",
+        ROOT / "docs/admin-ui-design.md",
+        ROOT / "docs/azure-experiment-design.md",
+        ROOT / "controller/API_COMPATIBILITY.md",
+        ROOT / "controller/CONTRACTS.md",
+    ):
+        for target in re.findall(r"\]\(([^)]+)\)", path.read_text(encoding="utf-8")):
+            relative, _, anchor = target.partition("#")
+            if relative and "://" not in relative and not relative.startswith("mailto:"):
+                linked = path.parent / relative
+                check(
+                    linked.exists(),
+                    f"{path.relative_to(ROOT.parent)} has a broken link: {target}",
+                )
+                if match := re.fullmatch(r"L(\d+)(?:-L(\d+))?", anchor):
+                    check(linked.is_file(), f"citation must target a file: {target}")
+                    first = int(match.group(1))
+                    last = int(match.group(2) or first)
+                    line_count = len(linked.read_text(encoding="utf-8").splitlines())
+                    check(
+                        1 <= first <= last <= line_count,
+                        f"{path.relative_to(ROOT.parent)} has an invalid citation: {target}",
+                    )
     check(
         (ROOT / "licenses" / "README.md").is_file(),
         "license reference directory is missing",

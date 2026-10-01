@@ -12,16 +12,14 @@ provider-compatible Tenants, and detail pages can delete the exact displayed
 Tenant identity.
 
 Kubernetes is the only durable data source. The application has no database,
-filesystem journal, watch cache, persisted Tenant kubeconfig, Azure
+filesystem journal, watch cache, persisted Tenant kubeconfig, Azure cloud
 credentials, or direct browser-to-Kubernetes connection. Overview requests
-perform bounded reads against the management Kubernetes API. A selected local
-Tenant detail request additionally validates the exact provider-owned
-kubeconfig Secret, constructs an in-memory Tenant client, and performs exact
-live reads of the managed CNPG Cluster before returning sanitized DTOs. A
-query request repeats that trust validation, reads the exact CNPG instance Pod
-and generated superuser Secret, and opens an ephemeral Kubernetes API
-port-forward to PostgreSQL. SQL and result data are transient and are not
-persisted.
+perform bounded reads against the management API. Detail reads the selected
+Tenant and exact owned database catalog and returns sanitized per-entry
+status/topology. Local and Azure query requests validate the exact Tenant
+credential binding, construct an in-memory Tenant client, read the selected
+CNPG Cluster, instance Pod and per-cluster superuser Secret, then open an
+ephemeral Kubernetes API port-forward. SQL and results are transient.
 
 Browser mutation requests must have a same-authority `Origin`/`Host` pair and the
 `X-Tenant-Admin-Unsafe-Request: 1` header emitted by the Leptos client. The
@@ -31,9 +29,10 @@ The custom header also blocks simple cross-origin form requests. No-`Origin`
 Kubernetes service-proxy requests remain available for operational validation.
 
 The management-cluster ServiceAccount can create and delete only top-level
-Tenant resources. It also reads the exact named controller Deployment to
-discover provider/version capability; it has no allocation-Lease or downstream
-infrastructure mutation authority. The SQL endpoint is a separate,
+Tenant resources and conditionally update the exact database catalog spec.
+It reads the exact controller Deployments and temporary cutover lock to
+discover capability; it has no allocation-Lease, catalog `/status`, disk or
+downstream infrastructure mutation authority. The SQL endpoint is a separate,
 deliberately unsafe data-plane capability obtained through the
 validated Tenant administrative kubeconfig. It can execute DDL, DML,
 transaction control, and multiple statements as PostgreSQL superuser.
@@ -48,10 +47,11 @@ flowchart LR
   Leptos[Leptos CSR WebAssembly application]
   DTO[tenant-admin-shared DTOs]
   Kube[Management Kubernetes API]
-  TenantAPI[Selected local Tenant API]
-  CNPG[database/capi-postgres]
+  Catalog[TenantDatabaseCatalog]
+  TenantAPI[Selected local or Azure Tenant API]
+  CNPG[UID-scoped CNPG Cluster]
   Pod[Selected CNPG instance Pod]
-  Secret[capi-postgres-superuser Secret]
+  Secret[Entry superuser Secret]
   Postgres[PostgreSQL]
   Tenant[Tenant resources and status]
   Resources[CAPI, provider, and add-on resources]
@@ -62,6 +62,7 @@ flowchart LR
   Axum --> DTO
   Axum --> Kube
   Kube --> Tenant
+  Kube --> Catalog
   Kube --> Resources
   Kube -->|validated kubeconfig Secret| Axum
   Axum -->|exact live GET| TenantAPI
@@ -100,7 +101,8 @@ fail rather than being silently truncated.
 Secrets remain excluded from management-resource inventory and responses.
 Provider-specific ClusterRoles are derived from the matching
 management-resource catalog. Tenants receive `get`, `list`, `create`, and
-`delete`; Leases are excluded from Admin inventory and authority. A separate
+`delete`; the catalog grants `get` and conditional spec `update`, not
+`/status` access. Leases are excluded from Admin inventory and authority. A separate
 Role in `tenant-system` grants named `get` for the exact `tenant-controller`
 Deployment, preventing capability discovery from reading same-named
 Deployments elsewhere. The deterministic cluster-scoped Namespace
@@ -111,18 +113,22 @@ ClusterRole to dynamically named Secrets, so this is deliberately broad
 administrative read authority; the server narrows use to the selected Tenant
 namespace and validates the exact Secret name, control-plane ownership,
 markers, endpoint, CA, context, and credential structure before use. It never
-lists or watches Secrets. Azure mode receives no Secret permission.
+lists or watches Secrets. Azure uses an exact named Tenant credential
+Role/RoleBinding for its management Secret rather than a broad cluster-scoped
+Secret grant; that binding and the status-recorded Secret UID are revalidated
+before an Azure query.
 
 The validated Tenant kubeconfig exists only in request memory. The resulting
 client has fixed connect/read/write timeouts, no proxy URL, and retries
-disabled. Detail observations perform an exact GET of
-`postgresql.cnpg.io/v1`, `Cluster`, `database/capi-postgres`. Query requests
-additionally exact-GET the selected instance Pod and
-`database/capi-postgres-superuser` Secret, then use the Pod port-forward
-subresource through the Tenant client. They never list Tenant workloads or
-Secrets. Each management role otherwise grants only exact read verbs and no
-provider-irrelevant resource, wildcard, subresource, watch, update, patch, or
-downstream delete access.
+disabled. Catalog reads exact-GET the Tenant-bound catalog in
+`tenant-db-<tenant>` and validate its UID, namespace, owner and entry spec.
+Queries additionally exact-GET the selected CNPG Cluster, instance Pod and
+`<cluster>-superuser` Secret in that entry's namespace, then use its Pod
+port-forward subresource through the Tenant client. They never list Tenant
+workloads or Secrets. Management roles grant no provider-irrelevant
+resource, wildcard, watch, `/status`, patch or downstream delete access
+([catalog reads](../admin/server/src/source/catalog.rs#L65-L136);
+[credential checks](../admin/server/src/source/catalog.rs#L461-L653)).
 
 Installation and health checks compare the owned ServiceAccount, binding, and
 selected ClusterRole with the tracked generated resources. They also submit
@@ -178,15 +184,13 @@ catalog reread; the UI locks mutations pending inspection rather than
 automatically replaying them. Missing catalog/capability observations leave
 the rest of the Tenant detail visible, with SQL and mutations disabled.
 
-The legacy local-only database observation in the Tenant snapshot remains a
-server compatibility field and is no longer rendered by the web UI. It reports
-cluster phase, desired/observed/ready counts, primary and failover target,
-promotion timestamps, image and timeline, read/write Services, topology
-placement, PVC health, conditions, and sorted primary/standby instances. The
-topology includes the exact CNPG Cluster and observed instances when available,
-or an explicit unavailable node when Tenant access is pending or fails.
-Azure reports this legacy database observation as not applicable; its catalog
-cards are rendered in the same way as local cards.
+The legacy local-only database observation remains a compatibility field in
+the Tenant snapshot but is not rendered by the web UI. On catalog-capable
+Tenants it directs callers to the separate catalog endpoint rather than
+claiming an implicit `capi-postgres` Cluster exists. A failed catalog read
+leaves Tenant detail and topology usable with database controls disabled;
+Azure and local catalog cards use the same UI
+([detail projection](../admin/server/src/app.rs#L427-L483)).
 
 The detail page also exposes destructive Tenant deletion. The administrator
 must type the exact Tenant name, and the server binds deletion to the displayed
@@ -242,7 +246,7 @@ retryable flag, and optional bounded field errors. The routes are:
 | `POST /api/v1/tenants/{name}/databases` | Add a named cluster with one to three instances against the exact catalog UID. |
 | `DELETE /api/v1/tenants/{name}/databases/{uid}` | Mark only the exact logical UID deleting with name confirmation and catalog UID. |
 | `POST /api/v1/tenants/{name}/databases/{uid}/query` | Execute unsafe SQL against the exact Ready entry and observed instance UID. |
-| `POST /api/v1/tenants/{name}/database/query` | Legacy local-only query compatibility route; the web UI does not use it. |
+| `POST /api/v1/tenants/{name}/database/query` | Retained singular compatibility route; refuses catalog-capable Tenants because it cannot bind a logical UID. |
 | `GET /*` | Static asset or `index.html` fallback for browser routes. |
 
 `/overview` and `/tenants/{name}` are the coherent snapshot routes. The
@@ -271,6 +275,15 @@ The shared DTOs include:
 - topology nodes, edges, health, display attributes, and exact resource
   identity.
 
+Catalog additions use `{"catalogUid","name","instances"}` and require a
+Ready Tenant, open catalog, available database capability and current
+controller rollout. Deletes require `{"catalogUid","logicalUid","confirmation"}`
+with URL UID and typed exact name matching. Queries additionally bind
+`instanceUid`, selected instance, database and SQL; API errors distinguish
+stale identity, capacity conflict and unavailable dependencies. A lost
+write reply triggers an authoritative read, never an automatic destructive
+retry ([route handlers](../admin/server/src/app.rs#L151-L238);
+[request DTOs](../admin/shared/src/catalog.rs#L6-L62)).
 Schema changes require a deliberate `schemaVersion` change and coordinated
 server/web deployment. The UI treats a mismatched schema as a visible
 non-retryable error.
@@ -292,11 +305,11 @@ to an accepted root through the live owner chain. Secrets and ambiguous,
 foreign, marker-only, missing-UID, or owner-inconsistent objects are excluded.
 
 Node and add-on information is rendered only when already represented by
-sanitized durable status. For local CNPG only, the admin server connects to
-the selected Tenant API after validating the provider-owned kubeconfig and
-reads the deterministic Cluster. CNPG instance topology is derived only from
-that Cluster's bounded status fields; raw objects, arbitrary labels, internal
-IPs, system IDs, managed roles, Secrets, and credentials are excluded.
+sanitized durable status. For each local or Azure catalog entry, the Admin
+server validates its catalog-recorded Cluster and observed instance UIDs;
+its topology is scoped to the logical UID. Raw objects, arbitrary labels,
+internal IPs, system IDs, managed roles, Secrets, and credentials are
+excluded.
 Partially reconciled Tenants retain available trusted nodes and show missing
 components as blockers rather than inventing topology.
 
@@ -336,8 +349,8 @@ build output, not source or checked-in generated fixtures. The authoritative
 inputs are the Rust, HTML, CSS, Trunk configuration, Cargo lockfile, pinned
 tool identities, generated Kubernetes resources, and Dockerfile.
 
-Fast CI uploads the static server and exact web inventory with the controller
-manager. PR E2E accepts those files only when they are owned, non-writable,
+Fast CI uploads the static server and exact web inventory with both
+controller managers. PR E2E accepts those files only when they are owned, non-writable,
 regular sibling artifacts below `.tools/artifacts`; it revalidates the static
 ELF and exact browser inventory before copying them into private runtime state.
 Scheduled/manual high-capacity CI rebuilds independently from the verified
@@ -402,11 +415,12 @@ the local SQL console as PostgreSQL superuser and can destroy Tenant data.
 - **Overview works but detail omits resources**: inspect Tenant status UIDs,
   controller markers, and owner references. Foreign or ambiguous objects are
   intentionally excluded.
-- **Database panel is unavailable**: inspect the deterministic Tenant
-  kubeconfig Secret ownership, Tenant endpoint reachability, CNPG CRD, and
-  `database/capi-postgres`. The response reason distinguishes pending access,
-  invalid credentials, Tenant API failure, missing Cluster, and malformed
-  status without exposing credential details.
+- **Catalog panel is unavailable**: inspect the exact Tenant/catalog UID
+  binding, closed flag, database-controller rollout, provider runtime,
+  Tenant credential Role/RoleBinding and endpoint reachability. For an
+  entry-scoped SQL error, inspect its recorded CNPG Cluster/Pod/credential
+  identity; never infer a default `database/capi-postgres`. A stale or
+  unavailable observation disables mutations instead of guessing.
 - **Nested browser route returns an error**: verify the static web inventory
   and server/web schema are from the same build; the Axum fallback should
   return `index.html`.
@@ -420,7 +434,7 @@ the local SQL console as PostgreSQL superuser and can destroy Tenant data.
 This is an experimental administrative tool, not a production control plane.
 It has no Ingress, application authentication, authorization by Tenant,
 pagination UI, watch/poll stream, historical data, metrics backend, audit
-store, or general Tenant workload topology. Local CNPG metadata is a
+store, or general Tenant workload topology. Per-entry CNPG metadata is a
 point-in-time exact read, not monitoring: there are no LSN, replication-lag,
 or historical metrics. The SQL console is intentionally unrestricted and can
 modify schemas, roles, configuration, and data. Transport and response limits
@@ -429,7 +443,9 @@ read any known Secret name because Kubernetes ClusterRole rules cannot filter
 dynamic Tenant Secret names; deployment compromise therefore has
 administrative Tenant impact despite application-level exact-name and
 ownership checks. The validated Tenant kubeconfig and CNPG superuser Secret
-raise that impact to complete local Tenant and PostgreSQL administration.
-Azure Disk and CloudNativePG remain outside the Azure
-experiment. The fixed list limits intentionally fail closed for larger
-management clusters and will require a separately designed pagination model.
+raise that impact to complete Tenant and PostgreSQL administration for
+either provider. Azure database lifecycle is staged: credentialed
+three-by-three nine-disk destructive proof and real browser/service-proxy
+agreement are still **unmet release-acceptance gates**. The fixed list limits
+intentionally fail closed for larger management clusters and will require a
+separately designed pagination model.

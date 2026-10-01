@@ -19,8 +19,10 @@ an explicit provider mode and installs exactly one `ProviderLifecycle`.
 flowchart TB
   User[just and kubectl]
   Mgmt[kind management cluster]
-  TenantCR[Tenant v1alpha3]
-  Controller[Rust kube-rs controller]
+  TenantCR[Tenant v1alpha4]
+  Controller[Rust Tenant controller]
+  Catalog[TenantDatabaseCatalog]
+  DatabaseController[Rust database-controller]
   Slots[Allocation Leases]
   Providers[CAPI, CABPK, CAPD, Kamaji provider]
   Kamaji[Kamaji and shared datastore]
@@ -28,10 +30,12 @@ flowchart TB
   Workers[1-3 CAPD worker containers]
   Network[Calico, CoreDNS, capi-kube-proxy]
   Volume[(Exact Docker volume)]
-  CNPG[1-3 CNPG instances]
+  CNPG[Up to 3 CNPG clusters, 1-3 instances each]
 
   User --> TenantCR
   TenantCR --> Controller
+  Controller --> Catalog --> DatabaseController
+  DatabaseController --> CNPG
   Controller --> Slots
   Controller --> Providers
   Providers --> Kamaji --> API
@@ -40,6 +44,7 @@ flowchart TB
   Controller --> Volume
   Volume --> Workers --> CNPG
   Mgmt --> Controller
+  Mgmt --> DatabaseController
   Mgmt --> Providers
 ```
 
@@ -55,9 +60,10 @@ an Axum/kube-rs server for overview, sorted Tenant list, detail, and
 deterministic topology data. Kubernetes is the only durable platform data
 source; the server has no application database, filesystem state, watch cache,
 or Azure credentials. Overview and management topology use only the management
-API. A selected local Tenant detail request validates the exact provider-owned
-kubeconfig Secret, creates an in-memory Tenant client, and performs an exact
-live read of `database/capi-postgres`.
+API. Tenant detail reads its exact management catalog identity and renders
+entry-scoped cards and topology on both providers. Local and Azure SQL
+queries validate exact Tenant credentials and per-entry CNPG identity through
+an in-memory Tenant client.
 
 The generated admin ClusterRole grants exact `get` and `list` permissions plus
 top-level Tenant `create`/`delete`, and excludes subresources and Leases. A
@@ -72,14 +78,14 @@ only from the exact managed Cluster. Azure topology requires durable status
 UIDs, binding markers, and recorded owner UIDs and never reads Tenant
 credentials. Ambiguous or foreign resources are omitted. Refresh is manual.
 
-Local detail pages also expose an explicitly unsafe administrator SQL console.
-Each execution repeats the Tenant and CNPG ownership checks, validates the
-selected instance Pod and deterministic CNPG superuser Secret, opens an
-ephemeral Kubernetes port-forward to that exact Pod, and executes arbitrary
-multi-statement SQL as PostgreSQL superuser. Passwords, connection strings,
-Tenant kubeconfigs, and raw Secrets remain server-side. The console has bounded
-request, execution-time, and response-memory limits, but no SQL authorization
-or read-only enforcement. It is unavailable for Azure Tenants.
+Both providers' Ready entry cards expose an explicitly unsafe administrator
+SQL console. Each execution rechecks Tenant/catalog, CNPG Cluster, selected
+Pod UID and cluster-specific superuser Secret, opens an ephemeral Kubernetes
+port-forward to that exact Pod, and executes arbitrary multi-statement SQL
+as PostgreSQL superuser. Passwords, connection strings, Tenant kubeconfigs,
+and raw Secrets remain server-side. The console has bounded request,
+execution-time and response-memory limits but no SQL authorization or
+read-only enforcement.
 
 The provider-neutral scratch image contains the static native server and the
 generated browser bundle. Local management loads it into Kind; Azure
@@ -90,14 +96,14 @@ See [`admin-ui-design.md`](admin-ui-design.md).
 ## Tenant API and controller
 
 The cluster-scoped API is
-`tenancy.cnpg-vcluster.io/v1alpha3`, kind `Tenant`. The immutable spec contains
+`tenancy.cnpg-vcluster.io/v1alpha4`, kind `Tenant`. The immutable spec contains
 common `kubernetesVersion` and `workers` fields plus one tagged `provider`:
 
-- `type: local` with `databases`, from one through three; or
+- `type: local`; or
 - `type: azure`; the controller assigns reviewed Pod and Service networks from
   the approved Azure allocation catalog.
 
-OpenAPI and CEL reject invalid names, counts, version syntax, types, and
+OpenAPI and CEL reject invalid names, worker counts, version syntax, types, and
 any spec update. A leading `v` is accepted on creation, but a spelling change
 is still an immutable-spec update. The controller checks its configured
 supported version; slot validation rejects overlapping or
@@ -116,24 +122,43 @@ specification, operation, management UIDs, kubeconfig identity, endpoint,
 VMSS/Node inventory, add-on components, provider descendants, and deletion
 barriers. `status.provider.networkAllocation` records the Azure slot,
 Pod/Service CIDRs, catalog hash/UID, and exact Lease identity.
-There is no persisted creation
-stage, tenant-API cleanup checkpoint, child-resource UID ledger,
-worker-container evidence, or Docker volume identity.
-Normal Tenant commands also persist no Tenant specification, resource
-identity, rendered manifest, deletion proof, or gate checkpoint on the local
-filesystem. Local validation may create one owner-only kubeconfig cache from
+`status.catalogCreateIntent`, creation outcome and database capability
+persist exact catalog namespace/UID identity; there is no generic
+infrastructure creation stage or child-resource UID ledger.
+Ordinary Tenant create/status/delete commands persist no separate Tenant
+specification or deletion journal. The guarded management installer does
+persist an owner-only bootstrap CREATE probe/activation record on the local
+filesystem while cutover is uncertain. Local validation may create one
+owner-only kubeconfig cache from
 the management-cluster Secret when it needs direct Tenant API access. That
 cache is non-authoritative, validated against the live Secret, removed after
 Tenant deletion, and explicitly clearable.
 
-The generic reconciler validates and dispatches through `ProviderLifecycle`.
-`LocalProvider` owns allocation, CAPI/CAPD/Kamaji, Docker, network, storage,
-CNPG, readiness, and finalization. `AzureProvider` owns the Kubernetes
-CAPI/CAPZ/Kamaji/add-on desired state and finalizer but has no Azure
-credentials; CAPZ/ASO perform cloud mutation. A provider not installed in the
-selected manager mode reports unsupported without acquiring a new finalizer.
-A provider/status discriminator mismatch is invalid durable identity and
-reports `OwnershipInvalid`.
+The generic Tenant reconciler validates and dispatches through
+`ProviderLifecycle`. `LocalProvider` owns allocation, CAPI/CAPD/Kamaji,
+Docker, network, static storage capability, infrastructure readiness and
+finalization. `AzureProvider` owns Kubernetes CAPI/CAPZ/Kamaji/add-on desired
+state and finalization but has no Azure credentials; CAPZ/ASO perform cloud
+mutation. A provider not installed in the selected manager mode reports
+unsupported without acquiring a new finalizer. A provider/status
+discriminator mismatch reports `OwnershipInvalid`.
+
+### Catalog and independent database-controller
+
+Each Tenant gets one owned v1alpha1 `TenantDatabaseCatalog` in
+`tenant-db-<tenant>`, initially open with zero entries. Its spec maps at
+most three immutable logical UUIDs to names, instance counts and monotonic
+deletion intent. Admin and the Tenant controller conditionally mutate the
+spec with exact UID/resourceVersion; the independent database-controller
+reconciles entries and owns `/status`, including create intent, CNPG/storage
+identity and terminal absence. A deleting entry still occupies its slot
+until exact finalization and controller removal. There is no per-entry CRD,
+admission webhook, quota, or permanent gate. The Tenant controller records
+catalog creation intent before CREATE and closes/drains the catalog before
+provider finalization. Unexpected or foreign identity blocks progress
+([controller reconcile](../controller/src/reconcile/mod.rs#L103-L209);
+[catalog API](../database-controller/src/api.rs#L11-L102);
+[drain](../database-runtime/src/catalog_runtime.rs#L277-L409)).
 
 The Tokio manager uses kube-rs watches, a dedicated renewable leader-election
 Lease, health probes, and one bounded reconcile worker. Allocation Leases
@@ -154,15 +179,20 @@ Reconciliation proceeds through these responsibilities:
 5. create the Namespace, CAPI Cluster, and CAPD DevCluster;
 6. create the KamajiControlPlane and validate its exact kubeconfig Secret;
 7. establish bootstrap RBAC;
-8. create or validate the exact Docker volume and worker templates, whose
-   bootstrap prepares the CNPG storage directories;
+8. create or validate the exact Docker volume and worker templates; the
+   database-controller later prepares per-entry CNPG storage directories;
 9. create missing static networking resources without rewriting existing owned
    objects;
 10. require one exact worker, container, Node, and network observation;
-11. create missing storage, CNPG operator, Namespace, and PV resources, then
-    reconcile the dynamic CNPG Cluster;
-12. reuse the worker/network observation and set Ready only after the remaining
-    component observations pass.
+11. ensure the database runtime, bind an empty catalog and its recorded
+    identity, then publish database capability separately;
+12. reuse the worker/network observation and publish infrastructure Ready
+    without waiting for any database entry to become Ready.
+
+The database-controller observes that capability and exact Tenant/catalog
+UIDs before creating entry namespaces, credentials, static storage and
+CNPG Clusters. It writes independent entry phases/conditions/topology;
+an unavailable database never silently changes infrastructure Ready.
 
 The Python-produced, checksum-verified schema-3 foundation binds the ordered
 slot catalog, networking, image archives, paths and offline inputs; the
@@ -178,8 +208,8 @@ different contracts by role:
   when present, but their existing content is not generically audited or
   rewritten. Bootstrap Roles and RoleBindings retain explicit content
   validation because they establish administrative access;
-- dynamic management roots and the CNPG Cluster use
-  UID/resource-version-bound server-side apply.
+- dynamic management roots use UID/resource-version-bound server-side
+  apply; the separate database-controller owns per-entry CNPG Clusters.
 
 Missing non-root children may be recreated. A missing or different-UID root
 Cluster after `status.provider.clusterUID` is recorded becomes Degraded or
@@ -210,13 +240,15 @@ The controller periodically requires:
 - available Calico, CoreDNS, and `capi-kube-proxy` workloads from that same
   observation;
 - the expected static StorageClass;
-- a CNPG Cluster in healthy state with the requested ready instance count;
 - current ownership markers for every direct tenant resource and the recorded
   exact UID for the root CAPI Cluster.
 
 False, Unknown, missing, or stale aggregate Cluster conditions are not Ready.
 Same-name resources with foreign UIDs or markers produce `OwnershipInvalid`.
 API inspection failures remain errors rather than success-shaped status.
+The separate catalog capability and each database entry have their own
+readiness and blocker observations; Tenant Ready does not assert SQL
+availability or catalog entry health.
 
 Comprehensive DNS, storage, SQL, filesystem, credential-isolation, and
 disruption proofs are explicit scenario gates rather than lifecycle state.
@@ -294,26 +326,28 @@ without a failure-status write. Allocation clearing explicitly publishes
 
 Finalization is ordered:
 
-1. revalidate the target Tenant, foundation binding, status-bound allocation
+1. close the exact catalog and mark all entries deleting; wait until the
+   database-controller proves each UID-specific workload, credential and
+   storage absent, removes every entry, and retires catalog/namespaces;
+2. revalidate the target Tenant, foundation binding, status-bound allocation
    Lease, and
    live ownership;
-2. delete the exact recorded CAPI Cluster with UID/resourceVersion preconditions and
+3. delete the exact recorded CAPI Cluster with UID/resourceVersion preconditions and
    Background propagation;
-3. wait for authoritative Cluster/provider descendant absence and CAPD
+4. wait for authoritative Cluster/provider descendant absence and CAPD
    container absence, deleting only exactly owned residual management roots
    with ordinary Kubernetes deletion;
-4. delete only the exact owned Docker volume;
-5. delete the Namespace and its credentials;
-6. delete/re-observe only the exact target allocation Lease with
+5. delete only the exact owned Docker volume;
+6. delete the Tenant infrastructure Namespace and its credentials;
+7. delete/re-observe only the exact target allocation Lease with
    UID/resourceVersion preconditions;
-7. remove the finalizer last.
+8. remove the finalizer last.
 
 Each local Tenant has dedicated worker containers and an exactly labelled
-storage volume. Tenant-internal CNPG, storage, networking, and bootstrap RBAC
-resources are disposable with that cluster: finalization neither contacts the
-tenant API nor persists a tenant-cleanup checkpoint. Tenant API unavailability
-does not block the Tenant finalizer from requesting Cluster deletion; provider
-controllers still complete their own ordinary finalizers.
+storage volume. Database cleanup now requires validated Tenant API access
+before Tenant infrastructure can be finalized. After the catalog drain,
+remaining tenant-internal networking and bootstrap resources are disposable
+with the cluster; provider controllers complete their own ordinary finalizers.
 Only after every old provider, Namespace, Secret, worker/load-balancer
 container, and volume identity is proved absent may a missing old Lease or a
 successor-owned Lease count as a completed release. The successor is never
@@ -322,8 +356,10 @@ Partial creation is handled from live management and host state, even when a
 Cluster, control plane, or workers were never created. An observed root Cluster
 UID is recorded before deletion. Ownership conflicts, failed management/host
 inspection, and foundation hash changes still block destructive progress.
-The current-only installer does not migrate or automatically remove
-Go-managed API or host state. The CRD serves and stores only v1alpha3.
+The clean-install-only installer does not migrate or automatically remove
+legacy `TenantDatabase` CRDs, objects or host state. The Tenant CRD serves
+and stores only v1alpha4; an existing draft CRD stops preflight before
+cutover mutation.
 The foundation identity excludes controller image identity, allowing
 same-configuration controller rebuilds while resource-affecting inputs remain
 immutable. Creation-only foundation errors block creation without preventing
@@ -338,16 +374,28 @@ UID.
 
 Each Tenant owns one Docker volume mounted at
 `/var/lib/capi-tenant-storage` in every worker. The controller creates one
-no-provisioner `capi-hostpath` StorageClass and one prebound static PV per
-requested CNPG instance. Worker bootstrap idempotently creates each ordinal
-directory with UID/GID 26 and mode `0700` before kubeadm. The PVs intentionally
-omit node affinity.
+no-provisioner `capi-hostpath` StorageClass. The database-controller binds
+one prebound static PV/PVC and at least 1 GiB per entry ordinal in a
+catalog/entry-UID-specific directory, using fd-relative no-follow traversal
+and PostgreSQL UID/GID 26. A single entry deletion removes only its exact
+subtree; the Tenant volume remains for siblings. The PVs intentionally omit
+node affinity.
 
 The persistence scenario writes a SQL marker, verifies PostgreSQL filesystem
 ownership, replaces a Machine, restarts a replica, deletes the primary, and
 requires the same PVC/PV identities and marker bytes throughout. This proves
 local rescheduling and byte persistence only; it does not model cloud disks,
 fencing, zones, snapshots, or regional recovery.
+
+Azure entries use a separate Tenant storage namespace, pinned ASO Disk
+objects and static Azure Disk CSI PV/PVC bindings with 4-GiB
+StandardSSD_LRS disks per ordinal. Expected ARM IDs are recorded before
+create, and exact direct ARM NotFound is required before catalog entry
+removal. Missing, ambiguous or foreign outcomes remain blocked. The
+credentialed destructive nine-disk proof is still a release-acceptance gate,
+not an observed live pass
+([Azure reconcile](../database-controller/src/reconcile/azure.rs#L26-L52);
+[Azure cleanup](../database-controller/src/finalize/azure.rs#L20-L160)).
 
 ## Supply chain and offline operation
 
@@ -414,6 +462,6 @@ do not appear in the management API.
 CAPD workers are privileged Docker containers sharing the host kernel, Docker
 daemon, storage hardware, network, power, and failure domain. This is not a
 hostile-tenant security boundary. The management node and Tenant controller
-also have Docker socket access. The API is experimental `v1alpha3`; this work
-intentionally replaces the earlier flat local spec. Existing Tenant objects
-must be deleted and recreated with the provider-discriminated shape.
+also have Docker socket access. The API is experimental `v1alpha4`; this work intentionally replaces the
+earlier implicit single-cluster spec. Existing Tenant objects must complete
+ordinary deletion and cleanup and be recreated with explicit catalogs.
