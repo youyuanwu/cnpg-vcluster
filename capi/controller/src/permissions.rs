@@ -16,7 +16,6 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
         ],
     ),
     ("", &["events"], &["create", "patch", "update"]),
-    ("", &["resourcequotas"], &["create", "get"]),
     (
         "rbac.authorization.k8s.io",
         &["roles", "rolebindings"],
@@ -24,8 +23,10 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
     ),
     (
         "tenancy.cnpg-vcluster.io",
-        &["tenantdatabases"],
-        &["delete", "list", "watch"],
+        &["tenantdatabasecatalogs"],
+        &[
+            "create", "delete", "get", "list", "patch", "update", "watch",
+        ],
     ),
     (
         "tenancy.cnpg-vcluster.io",
@@ -164,6 +165,21 @@ mod tests {
                 .chain(&azure_rules)
                 .all(|rule| !rule.verbs.contains(&"*".to_string()))
         );
+        for rules in [&local_rules, &azure_rules] {
+            assert!(rules.iter().any(|rule| {
+                rule.api_groups.as_deref() == Some(&["tenancy.cnpg-vcluster.io".into()])
+                    && rule.resources.as_deref() == Some(&["tenantdatabasecatalogs".into()])
+                    && rule.verbs.contains(&"get".into())
+                    && rule.verbs.contains(&"update".into())
+            }));
+            assert!(rules.iter().all(|rule| {
+                rule.resources.as_ref().is_none_or(|resources| {
+                    !resources.iter().any(|resource| {
+                        matches!(resource.as_str(), "tenantdatabases" | "resourcequotas")
+                    })
+                })
+            }));
+        }
         assert!(!azure_rules.iter().any(|rule| {
             rule.api_groups.as_deref() == Some(&["coordination.k8s.io".into()])
                 && rule.resources.as_deref() == Some(&["leases".into()])

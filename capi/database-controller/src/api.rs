@@ -1,5 +1,7 @@
+use std::collections::{BTreeMap, BTreeSet};
+
 use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::{
-    CustomResourceDefinition, ValidationRule,
+    CustomResourceDefinition, JSONSchemaProps, JSONSchemaPropsOrArray, ValidationRule,
 };
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition;
 use kube::{CustomResource, CustomResourceExt};
@@ -8,60 +10,71 @@ use serde::{Deserialize, Serialize};
 
 pub const GROUP: &str = "tenancy.cnpg-vcluster.io";
 pub const VERSION: &str = "v1alpha1";
-pub const FINALIZER: &str = "tenancy.cnpg-vcluster.io/database-finalizer";
+pub const FINALIZER: &str = "tenancy.cnpg-vcluster.io/database-catalog-finalizer";
 pub const DATABASE_LIMIT: usize = 3;
 
-#[expect(
-    clippy::duplicated_attributes,
-    reason = "each printer column declares its own type"
-)]
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[kube(
     group = "tenancy.cnpg-vcluster.io",
     version = "v1alpha1",
-    kind = "TenantDatabase",
-    plural = "tenantdatabases",
-    shortname = "tdb",
+    kind = "TenantDatabaseCatalog",
+    plural = "tenantdatabasecatalogs",
+    shortname = "tdc",
     namespaced,
-    status = "TenantDatabaseStatus",
+    status = "CatalogStatus",
     derive = "PartialEq",
-    printcolumn(name = "Phase", type_ = "string", json_path = ".status.phase"),
-    printcolumn(name = "Instances", type_ = "integer", json_path = ".spec.instances"),
-    printcolumn(
-        name = "Ready",
-        type_ = "integer",
-        json_path = ".status.readyInstances"
-    )
+    printcolumn(name = "Closed", type_ = "boolean", json_path = ".spec.closed")
 )]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TenantDatabaseSpec {
+pub struct TenantDatabaseCatalogSpec {
     pub tenant_name: String,
     #[serde(rename = "tenantUID")]
     pub tenant_uid: String,
+    pub closed: bool,
+    #[serde(default)]
+    pub entries: BTreeMap<String, CatalogEntry>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CatalogEntry {
+    pub name: String,
     pub instances: i32,
+    pub deleting: bool,
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct TenantDatabaseStatus {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub observed_generation: Option<i64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub phase: Option<DatabasePhase>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub conditions: Vec<Condition>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "namespaceUID")]
-    pub namespace_uid: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none", rename = "clusterUID")]
-    pub cluster_uid: Option<String>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub storage: Vec<StorageIdentity>,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub instances: Vec<InstanceObservation>,
+pub struct CatalogStatus {
     #[serde(default)]
-    pub ready_instances: i32,
+    pub entries: BTreeMap<String, EntryStatus>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct EntryStatus {
+    #[serde(rename = "logicalUID")]
+    pub logical_uid: String,
+    pub observed_generation: i64,
+    pub phase: DatabasePhase,
+    #[serde(default)]
+    pub conditions: Vec<Condition>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub deletion: Option<DeletionStatus>,
+    pub provider: Option<ProviderIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<ResourceIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cnpg_cluster: Option<ResourceIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub credentials: Option<ResourceIdentity>,
+    #[serde(default)]
+    pub storage: Vec<StorageIdentity>,
+    #[serde(default)]
+    pub instances: Vec<InstanceObservation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub query: Option<QueryIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finalization: Option<FinalizationStatus>,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -76,43 +89,85 @@ pub enum DatabasePhase {
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ResourceIdentity {
+    pub name: String,
+    pub uid: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ProviderIdentity {
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub storage_namespace: Option<ResourceIdentity>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct StorageIdentity {
     pub ordinal: i32,
-    #[serde(rename = "pvUID", skip_serializing_if = "Option::is_none")]
-    pub pv_uid: Option<String>,
-    #[serde(rename = "pvcUID", skip_serializing_if = "Option::is_none")]
-    pub pvc_uid: Option<String>,
-    #[serde(rename = "diskUID", skip_serializing_if = "Option::is_none")]
-    pub disk_uid: Option<String>,
+    pub requested_bytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pv: Option<ResourceIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pvc: Option<ResourceIdentity>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub disk: Option<ResourceIdentity>,
     #[serde(rename = "armID", skip_serializing_if = "Option::is_none")]
     pub arm_id: Option<String>,
+    pub healthy: bool,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct InstanceObservation {
     pub name: String,
+    pub uid: String,
     pub role: String,
     pub ready: bool,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
-pub struct DeletionStatus {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+pub struct QueryIdentity {
+    pub cluster_uid: String,
+    pub credential_uid: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct FinalizationStatus {
+    pub terminal_verified: bool,
+    #[serde(default)]
     pub verified_absent: Vec<String>,
+    #[serde(default)]
+    pub pending: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
-pub enum SpecError {
-    #[error("database cluster name must be a 1-30 character lowercase DNS label")]
-    Name,
-    #[error("Tenant name must be a 1-30 character lowercase DNS label")]
+pub enum CatalogError {
+    #[error("Tenant name must be a lowercase DNS label of 1–30 characters")]
     TenantName,
     #[error("Tenant UID must be nonempty")]
     TenantUid,
-    #[error("instances must be an integer from 1 through 3")]
+    #[error("catalog holds at most three databases")]
+    Capacity,
+    #[error("logical UID must be a canonical lowercase UUID")]
+    LogicalUid,
+    #[error("database names must be unique lowercase DNS labels of 1–30 characters")]
+    Name,
+    #[error("instance count must be from one through three")]
     Instances,
+    #[error("Tenant identity and closure are immutable or monotonic")]
+    IdentityOrClosure,
+    #[error("database identity or deletion state is immutable or monotonic")]
+    EntryMutation,
+    #[error("removal requires prior deletion and exact controller-verified terminal absence")]
+    Removal,
+    #[error("catalog UID or resourceVersion changed; re-read before mutation")]
+    Conflict,
 }
 
 pub fn valid_name(value: &str) -> bool {
@@ -129,93 +184,107 @@ pub fn valid_name(value: &str) -> bool {
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || *byte == b'-')
 }
 
-pub fn validate_spec(name: &str, spec: &TenantDatabaseSpec) -> Result<(), SpecError> {
-    if !valid_name(name) {
-        return Err(SpecError::Name);
-    }
+pub fn valid_logical_uid(value: &str) -> bool {
+    value.len() == 36
+        && value.bytes().enumerate().all(|(index, byte)| {
+            if [8, 13, 18, 23].contains(&index) {
+                byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte)
+            }
+        })
+}
+
+pub fn validate_spec(spec: &TenantDatabaseCatalogSpec) -> Result<(), CatalogError> {
     if !valid_name(&spec.tenant_name) {
-        return Err(SpecError::TenantName);
+        return Err(CatalogError::TenantName);
     }
     if spec.tenant_uid.is_empty() {
-        return Err(SpecError::TenantUid);
+        return Err(CatalogError::TenantUid);
     }
-    if !(1..=3).contains(&spec.instances) {
-        return Err(SpecError::Instances);
+    if spec.entries.len() > DATABASE_LIMIT {
+        return Err(CatalogError::Capacity);
+    }
+    let mut names = BTreeSet::new();
+    for (uid, entry) in &spec.entries {
+        if !valid_logical_uid(uid) {
+            return Err(CatalogError::LogicalUid);
+        }
+        if !valid_name(&entry.name) || !names.insert(&entry.name) {
+            return Err(CatalogError::Name);
+        }
+        if !(1..=3).contains(&entry.instances) {
+            return Err(CatalogError::Instances);
+        }
     }
     Ok(())
 }
 
-pub fn database_crd() -> CustomResourceDefinition {
-    let mut crd = TenantDatabase::crd();
-    let schema = crd.spec.versions[0]
-        .schema
-        .as_mut()
-        .expect("TenantDatabase has a derived schema")
-        .open_api_v3_schema
-        .as_mut()
-        .expect("TenantDatabase has a structural schema");
-    let fields = schema
-        .properties
-        .as_mut()
-        .expect("schema has properties")
-        .get_mut("spec")
-        .expect("schema has spec")
-        .properties
-        .as_mut()
-        .expect("spec has properties");
-    let instances = fields.get_mut("instances").expect("spec has instances");
-    instances.minimum = Some(1.0);
-    instances.maximum = Some(3.0);
-    let status = schema
-        .properties
-        .as_mut()
-        .expect("schema has properties")
-        .get_mut("status")
-        .expect("schema has status");
-    let status_fields = status.properties.as_mut().expect("status has properties");
-    for field in ["storage", "instances"] {
-        status_fields
-            .get_mut(field)
-            .expect("bounded observation")
-            .max_items = Some(3);
+pub fn validate_transition(
+    old: &TenantDatabaseCatalog,
+    new: &TenantDatabaseCatalog,
+) -> Result<(), CatalogError> {
+    validate_spec(&new.spec)?;
+    if old.spec.tenant_name != new.spec.tenant_name
+        || old.spec.tenant_uid != new.spec.tenant_uid
+        || (old.spec.closed && !new.spec.closed)
+    {
+        return Err(CatalogError::IdentityOrClosure);
     }
-    let conditions = status_fields
-        .get_mut("conditions")
-        .expect("status has conditions");
-    conditions.x_kubernetes_list_type = Some("map".into());
-    conditions.x_kubernetes_list_map_keys = Some(vec!["type".into()]);
-    let k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaPropsOrArray::Schema(
-        condition,
-    ) = conditions.items.as_mut().expect("condition items") else {
-        panic!("conditions have one item schema");
-    };
-    condition
-        .properties
-        .as_mut()
-        .expect("condition fields")
-        .get_mut("message")
-        .expect("condition message")
-        .max_length = Some(512);
-    schema.x_kubernetes_validations = Some(vec![
-        validation("self.spec == oldSelf.spec", "database spec is immutable"),
-        validation(
-            "self.metadata.name.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')",
-            "database name must be a lowercase DNS label",
-        ),
-        validation(
-            "self.spec.tenantName.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')",
-            "Tenant name must be a lowercase DNS label",
-        ),
-        validation(
-            "size(self.spec.tenantUID) > 0",
-            "Tenant UID must be nonempty",
-        ),
-        validation(
-            "self.spec.instances >= 1 && self.spec.instances <= 3",
-            "instances must be between 1 and 3",
-        ),
-    ]);
-    crd
+    for (uid, entry) in &old.spec.entries {
+        if let Some(next) = new.spec.entries.get(uid) {
+            if entry.name != next.name
+                || entry.instances != next.instances
+                || (entry.deleting && !next.deleting)
+            {
+                return Err(CatalogError::EntryMutation);
+            }
+        } else if !entry.deleting
+            || !old
+                .status
+                .as_ref()
+                .and_then(|status| status.entries.get(uid))
+                .is_some_and(|status| {
+                    status.logical_uid == *uid
+                        && status.finalization.as_ref().is_some_and(|state| {
+                            state.terminal_verified && state.pending.is_empty()
+                        })
+                })
+        {
+            return Err(CatalogError::Removal);
+        }
+    }
+    if new.spec.closed
+        && (new.spec.entries.values().any(|entry| !entry.deleting)
+            || new
+                .spec
+                .entries
+                .keys()
+                .any(|uid| !old.spec.entries.contains_key(uid)))
+    {
+        return Err(CatalogError::IdentityOrClosure);
+    }
+    Ok(())
+}
+
+pub fn validate_conditional_update(
+    current: &TenantDatabaseCatalog,
+    next: &TenantDatabaseCatalog,
+    observed_uid: &str,
+    observed_resource_version: &str,
+) -> Result<(), CatalogError> {
+    if observed_uid.is_empty()
+        || observed_resource_version.is_empty()
+        || current.metadata.uid.as_deref() != Some(observed_uid)
+        || next.metadata.uid.as_deref() != Some(observed_uid)
+        || current.metadata.resource_version.as_deref() != Some(observed_resource_version)
+        || next.metadata.resource_version.as_deref() != Some(observed_resource_version)
+        || current.metadata.name != next.metadata.name
+        || current.metadata.namespace != next.metadata.namespace
+    {
+        return Err(CatalogError::Conflict);
+    }
+    validate_transition(current, next)
 }
 
 fn validation(rule: &str, message: &str) -> ValidationRule {
@@ -226,39 +295,350 @@ fn validation(rule: &str, message: &str) -> ValidationRule {
     }
 }
 
+fn properties(
+    schema: &mut JSONSchemaProps,
+) -> &mut std::collections::BTreeMap<String, JSONSchemaProps> {
+    schema
+        .properties
+        .as_mut()
+        .expect("structural schema properties")
+}
+
+fn map_value(schema: &mut JSONSchemaProps) -> &mut JSONSchemaProps {
+    use k8s_openapi::apiextensions_apiserver::pkg::apis::apiextensions::v1::JSONSchemaPropsOrBool;
+    let JSONSchemaPropsOrBool::Schema(value) =
+        schema.additional_properties.as_mut().expect("map values")
+    else {
+        panic!("map values have a structural schema");
+    };
+    value
+}
+
+pub fn catalog_crd() -> CustomResourceDefinition {
+    let mut crd = TenantDatabaseCatalog::crd();
+    let schema = crd.spec.versions[0]
+        .schema
+        .as_mut()
+        .expect("catalog has a derived schema")
+        .open_api_v3_schema
+        .as_mut()
+        .expect("catalog has a structural schema");
+    let spec = properties(schema).get_mut("spec").expect("spec");
+    let entries = properties(spec).get_mut("entries").expect("entries");
+    entries.max_properties = Some(DATABASE_LIMIT as i64);
+    let entry = map_value(entries);
+    properties(entry)
+        .get_mut("instances")
+        .expect("count")
+        .minimum = Some(1.0);
+    properties(entry)
+        .get_mut("instances")
+        .expect("count")
+        .maximum = Some(3.0);
+    let status = properties(schema).get_mut("status").expect("status");
+    let observations = properties(status).get_mut("entries").expect("observations");
+    observations.max_properties = Some(DATABASE_LIMIT as i64);
+    observations.x_kubernetes_validations = Some(vec![validation(
+        "self.all(uid, self[uid].logicalUID == uid && (!has(self[uid].finalization) || !self[uid].finalization.terminalVerified || size(self[uid].finalization.pending) == 0))",
+        "status identity must match its logical UID and terminal proof cannot have pending work",
+    )]);
+    let observation = map_value(observations);
+    for field in ["storage", "instances"] {
+        properties(observation)
+            .get_mut(field)
+            .expect("observation list")
+            .max_items = Some(3);
+    }
+    let conditions = properties(observation)
+        .get_mut("conditions")
+        .expect("conditions");
+    conditions.x_kubernetes_list_type = Some("map".into());
+    conditions.x_kubernetes_list_map_keys = Some(vec!["type".into()]);
+    let JSONSchemaPropsOrArray::Schema(condition) =
+        conditions.items.as_mut().expect("condition items")
+    else {
+        panic!("conditions have one item schema");
+    };
+    properties(condition)
+        .get_mut("message")
+        .expect("condition message")
+        .max_length = Some(512);
+    schema.x_kubernetes_validations = Some(vec![
+        validation(
+            "self.metadata.name == self.spec.tenantName",
+            "catalog name must equal Tenant name",
+        ),
+        validation(
+            "self.spec.tenantName.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')",
+            "Tenant name must be a lowercase DNS label",
+        ),
+        validation(
+            "size(self.spec.tenantUID) > 0",
+            "Tenant UID must be nonempty",
+        ),
+        validation(
+            "self.spec.entries.all(uid, uid.matches('^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$') && self.spec.entries[uid].name.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$') && self.spec.entries[uid].instances >= 1 && self.spec.entries[uid].instances <= 3)",
+            "logical UIDs, names and instance counts must be valid",
+        ),
+        validation(
+            "self.spec.entries.all(uid, self.spec.entries.filter(otherUID, self.spec.entries[otherUID].name == self.spec.entries[uid].name).size() == 1)",
+            "database names must be unique",
+        ),
+        validation(
+            "self.spec.tenantName == oldSelf.spec.tenantName && self.spec.tenantUID == oldSelf.spec.tenantUID",
+            "Tenant identity is immutable",
+        ),
+        validation(
+            "!oldSelf.spec.closed || self.spec.closed",
+            "a closed catalog cannot reopen",
+        ),
+        validation(
+            "!self.spec.closed || self.spec.entries.all(uid, self.spec.entries[uid].deleting)",
+            "closing a catalog must mark every remaining entry deleting",
+        ),
+        validation(
+            "!self.spec.closed || self.spec.entries.all(uid, uid in oldSelf.spec.entries)",
+            "closing a catalog cannot accept new entries",
+        ),
+        validation(
+            "oldSelf.spec.entries.all(uid, !(uid in self.spec.entries) || (self.spec.entries[uid].name == oldSelf.spec.entries[uid].name && self.spec.entries[uid].instances == oldSelf.spec.entries[uid].instances && (!oldSelf.spec.entries[uid].deleting || self.spec.entries[uid].deleting)))",
+            "entry UID, name and count are immutable and deletion is monotonic",
+        ),
+        validation(
+            "oldSelf.spec.entries.all(uid, (uid in self.spec.entries) || (oldSelf.spec.entries[uid].deleting && has(oldSelf.status) && uid in oldSelf.status.entries && oldSelf.status.entries[uid].logicalUID == uid && has(oldSelf.status.entries[uid].finalization) && oldSelf.status.entries[uid].finalization.terminalVerified))",
+            "entry removal requires prior deletion and exact controller-published terminal proof",
+        ),
+    ]);
+    crd
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
 
-    #[test]
-    fn names_and_spec_are_bounded() {
-        let spec = TenantDatabaseSpec {
-            tenant_name: "tenant-a".into(),
-            tenant_uid: "uid-1".into(),
-            instances: 3,
-        };
-        assert_eq!(validate_spec("orders", &spec), Ok(()));
-        for name in ["", "Wrong", "a.b", "-bad", "bad-", &"a".repeat(31)] {
-            assert_eq!(validate_spec(name, &spec), Err(SpecError::Name));
-        }
-        for count in [-1, 0, 4] {
-            assert_eq!(
-                validate_spec(
-                    "orders",
-                    &TenantDatabaseSpec {
-                        instances: count,
-                        ..spec.clone()
-                    }
-                ),
-                Err(SpecError::Instances)
-            );
+    const UID: &str = "12345678-1234-1234-1234-123456789abc";
+    const NEXT_UID: &str = "12345678-1234-1234-1234-123456789abd";
+    fn catalog() -> TenantDatabaseCatalog {
+        TenantDatabaseCatalog::new(
+            "tenant-a",
+            TenantDatabaseCatalogSpec {
+                tenant_name: "tenant-a".into(),
+                tenant_uid: "tenant-uid".into(),
+                closed: false,
+                entries: BTreeMap::from([(
+                    UID.into(),
+                    CatalogEntry {
+                        name: "orders".into(),
+                        instances: 2,
+                        deleting: false,
+                    },
+                )]),
+            },
+        )
+    }
+    fn terminal(uid: &str) -> EntryStatus {
+        EntryStatus {
+            logical_uid: uid.into(),
+            observed_generation: 1,
+            phase: DatabasePhase::Deleting,
+            conditions: vec![],
+            provider: None,
+            namespace: None,
+            cnpg_cluster: None,
+            credentials: None,
+            storage: vec![],
+            instances: vec![],
+            query: None,
+            finalization: Some(FinalizationStatus {
+                terminal_verified: true,
+                verified_absent: vec![],
+                pending: vec![],
+            }),
         }
     }
-
     #[test]
-    fn crd_is_namespaced_and_immutable() {
-        let crd = database_crd();
+    fn bounds_and_unique_names() {
+        let mut value = catalog();
+        assert_eq!(validate_spec(&value.spec), Ok(()));
+        for name in ["", "Upper", "a.b", "-bad", "bad-", &"x".repeat(31)] {
+            value.spec.entries.get_mut(UID).unwrap().name = name.into();
+            assert_eq!(validate_spec(&value.spec), Err(CatalogError::Name));
+        }
+        value = catalog();
+        for count in [0, 4] {
+            value.spec.entries.get_mut(UID).unwrap().instances = count;
+            assert_eq!(validate_spec(&value.spec), Err(CatalogError::Instances));
+        }
+        value = catalog();
+        value.spec.entries.insert(
+            NEXT_UID.into(),
+            CatalogEntry {
+                name: "orders".into(),
+                instances: 1,
+                deleting: false,
+            },
+        );
+        assert_eq!(validate_spec(&value.spec), Err(CatalogError::Name));
+        value.spec.entries.get_mut(NEXT_UID).unwrap().name = "other".into();
+        value.spec.entries.insert(
+            "12345678-1234-1234-1234-123456789abe".into(),
+            CatalogEntry {
+                name: "third".into(),
+                instances: 1,
+                deleting: true,
+            },
+        );
+        assert!(validate_spec(&value.spec).is_ok());
+        value.spec.entries.insert(
+            "12345678-1234-1234-1234-123456789abf".into(),
+            CatalogEntry {
+                name: "fourth".into(),
+                instances: 1,
+                deleting: false,
+            },
+        );
+        assert_eq!(validate_spec(&value.spec), Err(CatalogError::Capacity));
+    }
+    #[test]
+    fn transitions_require_old_exact_status_proof() {
+        let old = catalog();
+        let mut next = old.clone();
+        next.spec.entries.get_mut(UID).unwrap().name = "renamed".into();
+        assert_eq!(
+            validate_transition(&old, &next),
+            Err(CatalogError::EntryMutation)
+        );
+        next = old.clone();
+        next.spec.entries.get_mut(UID).unwrap().instances = 3;
+        assert_eq!(
+            validate_transition(&old, &next),
+            Err(CatalogError::EntryMutation)
+        );
+        next = old.clone();
+        next.spec.entries.remove(UID);
+        next.status = Some(CatalogStatus {
+            entries: BTreeMap::from([(UID.into(), terminal(UID))]),
+        });
+        assert_eq!(validate_transition(&old, &next), Err(CatalogError::Removal));
+        let mut deleting = old.clone();
+        deleting.spec.entries.get_mut(UID).unwrap().deleting = true;
+        assert!(validate_transition(&old, &deleting).is_ok());
+        assert_eq!(
+            validate_transition(&deleting, &next),
+            Err(CatalogError::Removal)
+        );
+        deleting.status = Some(CatalogStatus {
+            entries: BTreeMap::from([(UID.into(), terminal(NEXT_UID))]),
+        });
+        assert_eq!(
+            validate_transition(&deleting, &next),
+            Err(CatalogError::Removal)
+        );
+        deleting
+            .status
+            .as_mut()
+            .unwrap()
+            .entries
+            .insert(UID.into(), terminal(UID));
+        assert!(validate_transition(&deleting, &next).is_ok());
+        let mut undo_deletion = deleting.clone();
+        undo_deletion.spec.entries.get_mut(UID).unwrap().deleting = false;
+        assert_eq!(
+            validate_transition(&deleting, &undo_deletion),
+            Err(CatalogError::EntryMutation)
+        );
+        deleting
+            .status
+            .as_mut()
+            .unwrap()
+            .entries
+            .get_mut(UID)
+            .unwrap()
+            .finalization
+            .as_mut()
+            .unwrap()
+            .pending
+            .push("disk".into());
+        assert_eq!(
+            validate_transition(&deleting, &next),
+            Err(CatalogError::Removal)
+        );
+        deleting
+            .status
+            .as_mut()
+            .unwrap()
+            .entries
+            .get_mut(UID)
+            .unwrap()
+            .finalization
+            .as_mut()
+            .unwrap()
+            .pending
+            .clear();
+        next.spec.entries.insert(
+            NEXT_UID.into(),
+            CatalogEntry {
+                name: "other".into(),
+                instances: 1,
+                deleting: false,
+            },
+        );
+        deleting.spec.closed = true;
+        assert_eq!(
+            validate_transition(&deleting, &next),
+            Err(CatalogError::IdentityOrClosure)
+        );
+        next.spec.closed = true;
+        assert_eq!(
+            validate_transition(&deleting, &next),
+            Err(CatalogError::IdentityOrClosure)
+        );
+        next.spec.entries.remove(NEXT_UID);
+        assert!(validate_transition(&deleting, &next).is_ok());
+        let mut active_closed = old.clone();
+        active_closed.spec.closed = true;
+        assert_eq!(
+            validate_transition(&old, &active_closed),
+            Err(CatalogError::IdentityOrClosure)
+        );
+    }
+    #[test]
+    fn conditional_updates_require_exact_catalog_uid_and_resource_version() {
+        let mut current = catalog();
+        current.metadata.uid = Some("catalog-uid".into());
+        current.metadata.resource_version = Some("12".into());
+        current.metadata.namespace = Some("tenant-db-tenant-a".into());
+        let mut next = current.clone();
+        next.spec.entries.insert(
+            NEXT_UID.into(),
+            CatalogEntry {
+                name: "other".into(),
+                instances: 1,
+                deleting: false,
+            },
+        );
+        assert_eq!(
+            validate_conditional_update(&current, &next, "catalog-uid", "12"),
+            Ok(())
+        );
+        assert_eq!(
+            validate_conditional_update(&current, &next, "catalog-uid", "11"),
+            Err(CatalogError::Conflict)
+        );
+        assert_eq!(
+            validate_conditional_update(&current, &next, "replacement", "12"),
+            Err(CatalogError::Conflict)
+        );
+        next.metadata.resource_version = Some("13".into());
+        assert_eq!(
+            validate_conditional_update(&current, &next, "catalog-uid", "12"),
+            Err(CatalogError::Conflict)
+        );
+    }
+    #[test]
+    fn crd_has_structural_status_and_old_status_transition() {
+        let crd = catalog_crd();
         assert_eq!(crd.spec.scope, "Namespaced");
         assert_eq!(crd.spec.versions[0].name, VERSION);
         assert!(
@@ -269,63 +649,53 @@ mod tests {
                 .status
                 .is_some()
         );
-        let rules = crd.spec.versions[0]
-            .schema
-            .as_ref()
-            .unwrap()
-            .open_api_v3_schema
-            .as_ref()
-            .unwrap()
-            .x_kubernetes_validations
-            .as_ref()
-            .unwrap();
-        assert!(
-            rules
-                .iter()
-                .any(|rule| rule.rule == "self.spec == oldSelf.spec")
-        );
-        let resource = TenantDatabase::new(
-            "orders",
-            TenantDatabaseSpec {
-                tenant_name: "tenant-a".into(),
-                tenant_uid: "uid-1".into(),
-                instances: 2,
-            },
+        let schema = &serde_json::to_value(&crd).unwrap()["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
+        assert_eq!(
+            schema["properties"]["spec"]["properties"]["entries"]["maxProperties"],
+            3
         );
         assert_eq!(
-            serde_json::to_value(resource).unwrap()["spec"],
-            json!({
-                "tenantName": "tenant-a", "tenantUID": "uid-1", "instances": 2
-            })
-        );
-        let serialized = serde_json::to_value(&crd).unwrap();
-        let schema = &serialized["spec"]["versions"][0]["schema"]["openAPIV3Schema"];
-        assert_eq!(
-            schema["properties"]["spec"]["properties"]["instances"]["minimum"],
-            1.0
+            schema["properties"]["status"]["properties"]["entries"]["maxProperties"],
+            3
         );
         assert_eq!(
-            schema["properties"]["spec"]["properties"]["instances"]["maximum"],
+            schema["properties"]["spec"]["properties"]["entries"]["additionalProperties"]["properties"]
+                ["instances"]["maximum"],
             3.0
         );
         assert_eq!(
-            schema["properties"]["status"]["properties"]["storage"]["maxItems"],
-            3
-        );
-        assert_eq!(
-            schema["properties"]["status"]["properties"]["instances"]["maxItems"],
-            3
-        );
-        assert_eq!(
-            schema["properties"]["status"]["properties"]["conditions"]["items"]["properties"]["message"]
-                ["maxLength"],
+            schema["properties"]["status"]["properties"]["entries"]["additionalProperties"]["properties"]
+                ["conditions"]["items"]["properties"]["message"]["maxLength"],
             512
         );
+        let rules = schema["x-kubernetes-validations"].as_array().unwrap();
         assert!(
-            serde_json::from_value::<TenantDatabaseSpec>(json!({
-                "tenantName": "tenant-a", "tenantUID": "uid-1",
-                "instances": 2, "storageClass": "foreign"
-            }))
+            schema["properties"]["status"]["properties"]["entries"]["x-kubernetes-validations"][0]
+                ["rule"]
+                .as_str()
+                .unwrap()
+                .contains("self[uid].logicalUID == uid")
+        );
+        assert!(rules.iter().any(|rule| {
+            rule["rule"]
+                .as_str()
+                .unwrap()
+                .contains("oldSelf.status.entries[uid].logicalUID == uid")
+        }));
+        assert!(rules.iter().any(|rule| {
+            rule["rule"]
+                .as_str()
+                .unwrap()
+                .contains("!self.spec.closed || self.spec.entries.all")
+        }));
+        assert_eq!(
+            serde_json::to_value(catalog()).unwrap()["spec"]["tenantUID"],
+            "tenant-uid"
+        );
+        assert!(
+            serde_json::from_value::<CatalogEntry>(
+                json!({"name":"orders","instances":2,"deleting":false,"storageClass":"bad"})
+            )
             .is_err()
         );
     }

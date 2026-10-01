@@ -17,9 +17,11 @@ from scripts.lib.admin import (
     validate_admin_effective_rules,
 )
 from scripts.lib.controller import (
+    CATALOG_LIFECYCLE_READY,
     build_azure_controller_image,
-    database_activation_lock_documents,
-    install_database_admission,
+    catalog_cutover_lock_documents,
+    install_database_catalog,
+    verify_catalog_cutover_lock,
     require_empty_tenant_cutover,
     require_tenant_api_cutover_ready,
     render_azure_controller_manager,
@@ -28,6 +30,9 @@ from scripts.lib.controller import (
     tenant_crd_transition_document,
     tenant_cutover_lock_cleanup_refs,
     tenant_cutover_lock_documents,
+)
+from scripts.lib.database_controller import (
+    CATALOG_CRD, require_absent_legacy_database_crd,
 )
 
 ACR_PULL_ROLE_DEFINITION_ID = (
@@ -663,23 +668,6 @@ def _push_controller_image(
     )
 
 
-def _push_database_admission_image(
-    root: Path,
-    config: Mapping[str, str],
-    inventory: Mapping[str, object],
-) -> str:
-    from scripts.lib.database_controller import build_admission_image
-
-    controller_config = load_configuration(root)
-    return _push_acr_image(
-        root, config, inventory,
-        repository=config["AZURE_CONTROLLER_REPOSITORY"] + "-database-admission",
-        tag=config["AZURE_CONTROLLER_TAG"],
-        description="database admission",
-        build=lambda image: build_admission_image(root, controller_config, image),
-    )
-
-
 def _push_admin_image(
     root: Path,
     config: Mapping[str, str],
@@ -915,6 +903,11 @@ def _validated_azure_list(
 
 
 def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
+    class InventoryClient:
+        def kubectl(self, *args, **kwargs):
+            return _kubectl(root, *args, **kwargs)
+
+    require_absent_legacy_database_crd(InventoryClient())
     tenants = json.loads(_kubectl(root, "get", "tenants", "-o", "json").stdout)
     tenant_api_version = (
         tenants.get("apiVersion") if isinstance(tenants, dict) else None
@@ -925,18 +918,18 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
     ):
         raise RuntimeError("Azure cutover Tenant inventory is malformed")
     _validated_azure_list(tenants, tenant_api_version, "Tenant")
-    database_crd = _kubectl(
-        root, "get", "crd/tenantdatabases.tenancy.cnpg-vcluster.io",
+    catalog_crd = _kubectl(
+        root, "get", f"crd/{CATALOG_CRD}",
         "--ignore-not-found=true", "-o", "name",
     ).stdout.strip()
-    databases = []
-    if database_crd:
-        databases = _validated_azure_list(
+    catalogs = []
+    if catalog_crd:
+        catalogs = _validated_azure_list(
             json.loads(_kubectl(
-                root, "get", "tenantdatabases.tenancy.cnpg-vcluster.io",
+                root, "get", CATALOG_CRD,
                 "--all-namespaces", "-o", "json",
             ).stdout),
-            "tenancy.cnpg-vcluster.io/v1alpha1", "TenantDatabase",
+            "tenancy.cnpg-vcluster.io/v1alpha1", "TenantDatabaseCatalog",
         )
     catalog = json.loads(
         (root / "controller" / "config" / "azure-management-resources.json").read_text(
@@ -1016,8 +1009,8 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
         if item.get("metadata", {}).get("uid") in owned_uids
     ]
     residue.extend(
-        f"TenantDatabase/{item['metadata']['namespace']}/{item['metadata']['name']}"
-        for item in databases
+        f"TenantDatabaseCatalog/{item['metadata']['namespace']}/{item['metadata']['name']}"
+        for item in catalogs
     )
     return tenants, residue
 
@@ -1063,20 +1056,32 @@ def _prepare_azure_tenant_api_cutover(
     root: Path,
     config: Mapping[str, str],
 ) -> bool:
-    for document in database_activation_lock_documents():
+    class CutoverClient:
+        def kubectl(self, *args, **kwargs):
+            return _kubectl(root, *args, **kwargs)
+
+        def json(self, *args):
+            return json.loads(self.kubectl(*args, "-o", "json").stdout)
+
+    require_absent_legacy_database_crd(CutoverClient())
+    for document in catalog_cutover_lock_documents():
         _kubectl(
             root, "apply", "--server-side",
-            "--field-manager=cnpg-vcluster-database-activation",
+            "--field-manager=cnpg-vcluster-catalog-cutover",
             "--force-conflicts", "-f", "-", input_text=json.dumps(document),
         )
     observed = _get_management_resource(
         root, None, "crd/tenants.tenancy.cnpg-vcluster.io"
     )
     if observed is None:
-        return _azure_cutover_lock_present(root)
+        if not _azure_cutover_lock_present(root):
+            _azure_cutover_lock(root, present=True)
+        return True
     generation = tenant_api_cutover_state(observed)
     if generation == "v1alpha4":
-        return _azure_cutover_lock_present(root)
+        if not _azure_cutover_lock_present(root):
+            _azure_cutover_lock(root, present=True)
+        return True
     rendered = _kubectl(
         root,
         "create",
@@ -1295,7 +1300,6 @@ def _install_tenant_controller(
 ) -> tuple[str, str, str]:
     require_tenant_api_cutover_ready()
     image = _push_controller_image(root, config, inventory)
-    admission_image = _push_database_admission_image(root, config, inventory)
     provider_config = _azure_provider_configuration(config, inventory, image)
     _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(root, config)
     cutover_locked = _prepare_azure_tenant_api_cutover(root, config)
@@ -1417,31 +1421,36 @@ def _install_tenant_controller(
     )
     if not isinstance(allocation_uid, str) or not allocation_uid:
         raise RuntimeError("Azure Tenant allocation ConfigMap UID is absent")
-    class AzureAdmissionClient:
+    class AzureCatalogClient:
         def kubectl(self, *args, **kwargs):
             return _kubectl(root, *args, **kwargs)
 
         def json(self, *args):
             return json.loads(self.kubectl(*args, "-o", "json").stdout)
 
-    admission_config = load_configuration(root)
-    admission_config["CONDITION_TIMEOUT"] = config["AZURE_CONTROLLER_TIMEOUT"]
-    install_database_admission(
-        root, admission_config, AzureAdmissionClient(), admission_image,
+    catalog_config = load_configuration(root)
+    catalog_config["CONDITION_TIMEOUT"] = config["AZURE_CONTROLLER_TIMEOUT"]
+    install_database_catalog(
+        root, catalog_config, AzureCatalogClient(),
         azure=True,
     )
     if cutover_locked:
+        verify_catalog_cutover_lock(
+            AzureCatalogClient(), namespace="tenant-system",
+        )
+        _verify_azure_cutover_lock(root, "v1alpha4")
         _verify_azure_controller_allocation_readiness(
             root,
             allocation_raw,
             allocation_sha256,
         )
-        _azure_cutover_lock(root, present=False)
-        try:
-            _verify_azure_cutover_probe(root, config)
-        except Exception:
-            _azure_cutover_lock(root, present=True)
-            raise
+        if CATALOG_LIFECYCLE_READY:
+            _azure_cutover_lock(root, present=False)
+            try:
+                _verify_azure_cutover_probe(root, config)
+            except Exception:
+                _azure_cutover_lock(root, present=True)
+                raise
     return image, uid, allocation_uid
 
 

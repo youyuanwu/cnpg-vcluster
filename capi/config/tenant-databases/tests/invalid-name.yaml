@@ -1,9 +1,14 @@
 apiVersion: tenancy.cnpg-vcluster.io/v1alpha1
-kind: TenantDatabase
+kind: TenantDatabaseCatalog
 metadata:
-  name: Invalid.Name
+  name: azure-example
   namespace: tenant-db-azure-example
 spec:
   tenantName: azure-example
   tenantUID: replace-with-live-tenant-uid
-  instances: 1
+  closed: false
+  entries:
+    123e4567-e89b-12d3-a456-426614174000:
+      name: Invalid.Name
+      instances: 1
+      deleting: false

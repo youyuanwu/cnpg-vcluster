@@ -14,8 +14,8 @@ use crate::{
     allocation::AllocationError,
     api::{
         AzureBindingStatus, AzureKubeconfigStatus, AzureManagementStatus, AzureNodeIdentity,
-        AzureProviderResourceIdentity, AzureProviderStatus, AzureVmssStatus, CanonicalSpec,
-        DatabaseCapability, Tenant, TenantPhase, TenantProviderSpec, spec_hash,
+        AzureProviderResourceIdentity, AzureProviderStatus, AzureVmssStatus, CanonicalSpec, Tenant,
+        TenantPhase, TenantProviderSpec, spec_hash,
     },
     azure::{
         self, ANNOTATION_FOUNDATION, ANNOTATION_OPERATION, ANNOTATION_PROFILE, ANNOTATION_SPEC,
@@ -337,50 +337,32 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             &components,
             &provider_resources,
         )?;
-        let previous = tenant
+        let mut capability = tenant
             .status
             .as_ref()
-            .and_then(|status| status.database_capability.clone());
-        let expected = previous.as_ref().and_then(DatabaseCapability::identity);
-        let mut capability = previous.unwrap_or_default();
+            .and_then(|status| status.database_capability.clone())
+            .unwrap_or_default();
         capability.available = false;
-        capability.reason = match tenant_database_runtime::azure_runtime::observe(
-            tenant_client,
-            &tenant_uid,
-        )
-        .await
-        {
-            Ok("Ready") => {
-                match tenant_database_runtime::ensure(
-                    self.client.clone(),
-                    &name,
-                    &tenant_uid,
-                    true,
-                    expected.as_ref(),
-                )
-                .await
-                {
-                    Ok(identity) => {
-                        capability.available = true;
-                        capability.namespace_uid = identity.namespace_uid;
-                        capability.quota_uid = identity.quota_uid;
-                        capability.gate_uid = identity.gate_uid;
-                        capability.storage_namespace_uid = identity.storage_namespace_uid;
-                        "Ready"
-                    }
+        capability.namespace = tenant_database_runtime::database_namespace(&name);
+        capability.reason =
+            match tenant_database_runtime::azure_runtime::observe(tenant_client, &tenant_uid).await
+            {
+                Ok("Ready") => match tenant_database_runtime::catalog_runtime::ensure_credentials(
+                    self.client.clone(), &name, &tenant_uid, true,
+                ).await {
+                    Ok(()) => "CatalogNotReady",
                     Err(error) => {
-                        tracing::warn!(tenant = %name, %error, "Azure database gate unavailable");
-                        "GateUnavailable"
+                        tracing::warn!(tenant = %name, %error, "Azure database credential access unavailable");
+                        "CredentialAccessUnavailable"
                     }
+                },
+                Ok(reason) => reason,
+                Err(error) => {
+                    tracing::warn!(tenant = %name, %error, "Azure database runtime unavailable");
+                    "RuntimeNotReady"
                 }
             }
-            Ok(reason) => reason,
-            Err(error) => {
-                tracing::warn!(tenant = %name, %error, "Azure database runtime unavailable");
-                "RuntimeNotReady"
-            }
-        }
-        .into();
+            .into();
         self.validate_mutation().await?;
         status::update_status(self.client.clone(), tenant, |status| {
             let azure = status.azure_mut()?;

@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
 use serde_json::{Value, json};
-use tenant_database_controller::{admission::GATE_NAMESPACE, api::database_crd};
+use tenant_database_controller::api::catalog_crd;
 
 type Generated = Vec<(&'static str, Vec<u8>)>;
 
@@ -13,287 +13,91 @@ fn rule(group: &str, resources: &[&str], verbs: &[&str]) -> Value {
     json!({"apiGroups": [group], "resources": resources, "verbs": verbs})
 }
 
-fn role(name: &str, namespace: &str, rules: Vec<Value>) -> Value {
-    json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "Role",
-        "metadata": {"name": name, "namespace": namespace},
-        "rules": rules,
-    })
-}
-
-fn binding(name: &str, namespace: &str, role: &str, service_account: &str) -> Value {
-    json!({
-        "apiVersion": "rbac.authorization.k8s.io/v1",
-        "kind": "RoleBinding",
-        "metadata": {"name": name, "namespace": namespace},
-        "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": role},
-        "subjects": [{"kind": "ServiceAccount", "name": service_account, "namespace": "tenant-system"}],
-    })
-}
-
-fn namespace(name: &str) -> Value {
-    json!({"apiVersion": "v1", "kind": "Namespace", "metadata": {"name": name}})
-}
-
-fn admission_webhook(name: &str, path: &str, mutating: bool) -> Value {
-    let mut webhook = json!({
-        "name": name,
-        "admissionReviewVersions": ["v1"],
-        "failurePolicy": "Fail",
-        "matchPolicy": "Exact",
-        "sideEffects": "None",
-        "timeoutSeconds": 30,
-        "clientConfig": {"service": {
-            "name": "database-admission", "namespace": "tenant-system",
-            "path": path, "port": 443
-        }},
-        "rules": [{
-            "apiGroups": ["tenancy.cnpg-vcluster.io"],
-            "apiVersions": ["v1alpha1"],
-            "operations": ["CREATE"],
-            "resources": ["tenantdatabases"],
-            "scope": "Namespaced"
-        }]
-    });
-    if mutating {
-        webhook["reinvocationPolicy"] = json!("Never");
+fn inventory(azure: bool) -> Value {
+    let mut resources = vec![
+        json!({"group": "tenancy.cnpg-vcluster.io", "version": "v1alpha1", "kind": "TenantDatabaseCatalog", "resource": "tenantdatabasecatalogs", "scope": "Namespaced"}),
+        json!({"group": "tenancy.cnpg-vcluster.io", "version": "v1alpha4", "kind": "Tenant", "resource": "tenants", "scope": "Cluster"}),
+        json!({"group": "", "version": "v1", "kind": "Namespace", "resource": "namespaces", "scope": "Cluster"}),
+    ];
+    if azure {
+        resources.push(json!({"group": "compute.azure.com", "version": "v1api20240302", "kind": "Disk", "resource": "disks", "scope": "Namespaced"}));
     }
-    webhook
+    Value::Array(resources)
 }
 
-fn update_webhook(name: &str, gate: bool) -> Value {
-    let mut webhook = admission_webhook(name, "/validate", false);
-    let rule = &mut webhook["rules"][0];
-    rule["operations"] = json!(["UPDATE"]);
-    if gate {
-        rule["apiGroups"] = json!([""]);
-        rule["apiVersions"] = json!(["v1"]);
-        rule["resources"] = json!(["configmaps"]);
-        webhook["matchConditions"] = json!([{
-            "name": "gate-namespace",
-            "expression": "request.namespace == 'tenant-database-gates'"
-        }]);
+fn controller_rules(azure: bool) -> Vec<Value> {
+    let mut rules = vec![
+        rule(
+            "tenancy.cnpg-vcluster.io",
+            &["tenantdatabasecatalogs"],
+            &["get", "list", "watch", "update"],
+        ),
+        rule(
+            "tenancy.cnpg-vcluster.io",
+            &["tenantdatabasecatalogs/status"],
+            &["get", "patch", "update"],
+        ),
+        rule(
+            "tenancy.cnpg-vcluster.io",
+            &["tenants"],
+            &["get", "list", "watch"],
+        ),
+        rule("", &["namespaces"], &["get", "list", "watch"]),
+    ];
+    if azure {
+        rules.push(rule(
+            "compute.azure.com",
+            &["disks"],
+            &["get", "list", "watch", "create", "delete"],
+        ));
     }
-    webhook
+    rules
 }
 
 fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
-    let management_resources = json!([
-        {"group": "tenancy.cnpg-vcluster.io", "version": "v1alpha1", "kind": "TenantDatabase", "resource": "tenantdatabases", "scope": "Namespaced"},
-        {"group": "tenancy.cnpg-vcluster.io", "version": "v1alpha4", "kind": "Tenant", "resource": "tenants", "scope": "Cluster"},
-        {"group": "", "version": "v1", "kind": "Namespace", "resource": "namespaces", "scope": "Cluster"},
-        {"group": "", "version": "v1", "kind": "ResourceQuota", "resource": "resourcequotas", "scope": "Namespaced"},
-        {"group": "", "version": "v1", "kind": "ConfigMap", "resource": "configmaps", "scope": "Namespaced"}
-    ]);
-    let mut azure_management_resources = management_resources.as_array().unwrap().clone();
-    azure_management_resources.push(json!({
-        "group": "compute.azure.com", "version": "v1api20240302",
-        "kind": "Disk", "resource": "disks", "scope": "Namespaced"
-    }));
     let mut resources = vec![
         (
-            "crd/bases/tenancy.cnpg-vcluster.io_tenantdatabases.yaml",
-            yaml(&database_crd())?,
+            "crd/bases/tenancy.cnpg-vcluster.io_tenantdatabasecatalogs.yaml",
+            yaml(&catalog_crd())?,
         ),
         (
             "management-resources.json",
-            format!("{}\n", serde_json::to_string_pretty(&management_resources)?).into_bytes(),
+            format!("{}\n", serde_json::to_string_pretty(&inventory(false))?).into_bytes(),
         ),
         (
             "azure-management-resources.json",
-            format!(
-                "{}\n",
-                serde_json::to_string_pretty(&azure_management_resources)?
-            )
-            .into_bytes(),
+            format!("{}\n", serde_json::to_string_pretty(&inventory(true))?).into_bytes(),
         ),
     ];
-    for (name, resource) in [
-        ("rbac/gates-namespace.yaml", namespace(GATE_NAMESPACE)),
-        (
-            "rbac/admission-service-account.yaml",
-            json!({"apiVersion": "v1", "kind": "ServiceAccount",
-                "metadata": {"name": "database-admission", "namespace": "tenant-system"}}),
-        ),
+    for (path, resource) in [
         (
             "rbac/controller-service-account.yaml",
             json!({"apiVersion": "v1", "kind": "ServiceAccount",
                 "metadata": {"name": "database-controller", "namespace": "tenant-system"}}),
         ),
         (
-            "rbac/admission-cluster-role.yaml",
-            json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
-            "metadata": {"name": "database-admission"},
-            "rules": [
-                rule("tenancy.cnpg-vcluster.io", &["tenants"], &["get"]),
-                rule("", &["namespaces"], &["get"]),
-                rule("", &["resourcequotas"], &["get"])
-            ]}),
-        ),
-        (
             "rbac/controller-cluster-role.yaml",
             json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
-            "metadata": {"name": "database-controller"},
-            "rules": [
-                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases"], &["create", "get", "list", "watch", "patch", "update"]),
-                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases/status"], &["get", "patch", "update"]),
-                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases/finalizers"], &["update"]),
-                rule("tenancy.cnpg-vcluster.io", &["tenants"], &["get", "list", "watch"])
-            ]}),
+                "metadata": {"name": "database-controller"}, "rules": controller_rules(false)}),
         ),
         (
             "rbac/controller-cluster-role-azure.yaml",
             json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
-            "metadata": {"name": "database-controller"},
-            "rules": [
-                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases"], &["create", "get", "list", "watch", "patch", "update"]),
-                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases/status"], &["get", "patch", "update"]),
-                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases/finalizers"], &["update"]),
-                rule("tenancy.cnpg-vcluster.io", &["tenants"], &["get", "list", "watch"])
-            ]}),
+                "metadata": {"name": "database-controller"}, "rules": controller_rules(true)}),
         ),
         (
-            "rbac/admission-gates-role.yaml",
-            role(
-                "database-admission",
-                GATE_NAMESPACE,
-                vec![rule("", &["configmaps"], &["get"])],
-            ),
-        ),
-        (
-            "rbac/controller-gates-role.yaml",
-            role(
-                "database-controller",
-                GATE_NAMESPACE,
-                vec![rule("", &["configmaps"], &["get", "update", "patch"])],
-            ),
-        ),
-        (
-            "rbac/tenant-gates-role.yaml",
-            role(
-                "tenant-controller-database-gates",
-                GATE_NAMESPACE,
-                vec![rule(
-                    "",
-                    &["configmaps"],
-                    &["create", "get", "update", "patch", "delete"],
-                )],
-            ),
-        ),
-        (
-            "rbac/admission-gates-binding.yaml",
-            binding(
-                "database-admission",
-                GATE_NAMESPACE,
-                "database-admission",
-                "database-admission",
-            ),
-        ),
-        (
-            "rbac/controller-gates-binding.yaml",
-            binding(
-                "database-controller",
-                GATE_NAMESPACE,
-                "database-controller",
-                "database-controller",
-            ),
-        ),
-        (
-            "rbac/tenant-gates-binding.yaml",
-            binding(
-                "tenant-controller-database-gates",
-                GATE_NAMESPACE,
-                "tenant-controller-database-gates",
-                "tenant-controller",
-            ),
-        ),
-        (
-            "admission/issuer.yaml",
-            json!({"apiVersion": "cert-manager.io/v1", "kind": "Issuer",
-                "metadata": {"name": "database-admission-selfsigned", "namespace": "tenant-system"},
-                "spec": {"selfSigned": {}}}),
-        ),
-        (
-            "admission/ca-certificate.yaml",
-            json!({"apiVersion": "cert-manager.io/v1", "kind": "Certificate",
-            "metadata": {"name": "database-admission-ca", "namespace": "tenant-system"},
-            "spec": {
-                "isCA": true, "commonName": "database-admission-ca",
-                "secretName": "database-admission-ca",
-                "issuerRef": {"name": "database-admission-selfsigned", "kind": "Issuer"}
-            }}),
-        ),
-        (
-            "admission/ca-issuer.yaml",
-            json!({"apiVersion": "cert-manager.io/v1", "kind": "Issuer",
-                "metadata": {"name": "database-admission-ca", "namespace": "tenant-system"},
-                "spec": {"ca": {"secretName": "database-admission-ca"}}}),
-        ),
-        (
-            "admission/serving-certificate.yaml",
-            json!({"apiVersion": "cert-manager.io/v1", "kind": "Certificate",
-            "metadata": {"name": "database-admission-serving", "namespace": "tenant-system"},
-            "spec": {
-                "secretName": "database-admission-serving",
-                "dnsNames": ["database-admission.tenant-system.svc",
-                    "database-admission.tenant-system.svc.cluster.local"],
-                "issuerRef": {"name": "database-admission-ca", "kind": "Issuer"}
-            }}),
-        ),
-        (
-            "admission/service.yaml",
-            json!({"apiVersion": "v1", "kind": "Service",
-            "metadata": {"name": "database-admission", "namespace": "tenant-system"},
-            "spec": {
-                "selector": {"app.kubernetes.io/name": "database-admission"},
-                "ports": [{"name": "https", "port": 443, "targetPort": 9443}]
-            }}),
-        ),
-        (
-            "admission/mutating-webhook.yaml",
-            json!({"apiVersion": "admissionregistration.k8s.io/v1",
-            "kind": "MutatingWebhookConfiguration",
-            "metadata": {"name": "database-admission",
-                "annotations": {"cert-manager.io/inject-ca-from": "tenant-system/database-admission-ca"}},
-            "webhooks": [admission_webhook(
-                "tenantdatabases.tenancy.cnpg-vcluster.io", "/mutate", true
-            )]}),
-        ),
-        (
-            "admission/validating-webhook.yaml",
-            json!({"apiVersion": "admissionregistration.k8s.io/v1",
-            "kind": "ValidatingWebhookConfiguration",
-            "metadata": {"name": "database-admission",
-                "annotations": {"cert-manager.io/inject-ca-from": "tenant-system/database-admission-ca"}},
-            "webhooks": [
-                admission_webhook("tenantdatabases.tenancy.cnpg-vcluster.io", "/validate", false),
-                update_webhook("tenantdatabases-update.tenancy.cnpg-vcluster.io", false),
-                update_webhook("tenant-database-gates.tenancy.cnpg-vcluster.io", true),
-            ]}),
-        ),
-    ] {
-        resources.push((name, yaml(&resource)?));
-    }
-    for (name, account, role) in [
-        ("admission", "database-admission", "database-admission"),
-        ("controller", "database-controller", "database-controller"),
-    ] {
-        resources.push((
-            if name == "admission" {
-                "rbac/admission-cluster-binding.yaml"
-            } else {
-                "rbac/controller-cluster-binding.yaml"
-            },
-            yaml(&json!({
+            "rbac/controller-cluster-binding.yaml",
+            json!({
                 "apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRoleBinding",
-                "metadata": {"name": role},
+                "metadata": {"name": "database-controller"},
                 "roleRef": {"apiGroup": "rbac.authorization.k8s.io",
-                    "kind": "ClusterRole", "name": role},
+                    "kind": "ClusterRole", "name": "database-controller"},
                 "subjects": [{"kind": "ServiceAccount", "namespace": "tenant-system",
-                    "name": account}]
-            }))?,
-        ));
+                    "name": "database-controller"}]
+            }),
+        ),
+    ] {
+        resources.push((path, yaml(&resource)?));
     }
     Ok(resources)
 }
@@ -309,13 +113,34 @@ fn run(args: &[String]) -> Result<(), Box<dyn std::error::Error>> {
             _ => return Err("unknown or repeated generator argument".into()),
         }
     }
-    for (relative, contents) in generated_files()? {
-        let path = output_dir.join(relative);
-        if check {
-            if std::fs::read(&path)? != contents {
+    let expected = generated_files()?;
+    if check {
+        for (relative, contents) in &expected {
+            let path = output_dir.join(relative);
+            if std::fs::read(&path)? != *contents {
                 return Err(format!("generated fixture differs: {}", path.display()).into());
             }
-        } else {
+        }
+        for dir in ["admission", "rbac", "crd/bases"] {
+            let path = output_dir.join(dir);
+            if path.exists() {
+                for artifact in std::fs::read_dir(path)? {
+                    let artifact = artifact?.path();
+                    let relative = artifact
+                        .strip_prefix(&output_dir)?
+                        .to_str()
+                        .ok_or("invalid path")?;
+                    if !expected.iter().any(|(name, _)| *name == relative) {
+                        return Err(
+                            format!("obsolete generated fixture: {}", artifact.display()).into(),
+                        );
+                    }
+                }
+            }
+        }
+    } else {
+        for (relative, contents) in &expected {
+            let path = output_dir.join(relative);
             std::fs::create_dir_all(path.parent().ok_or("invalid output path")?)?;
             std::fs::write(path, contents)?;
         }
@@ -331,131 +156,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 mod tests {
     use super::*;
 
+    fn find<'a>(artifacts: &'a Generated, name: &str) -> &'a [u8] {
+        &artifacts.iter().find(|(path, _)| *path == name).unwrap().1
+    }
+
     #[test]
     fn generated_contracts_are_current() {
         run(&["--check".into()]).unwrap();
     }
 
     #[test]
-    fn gate_roles_share_only_exact_namespace_and_no_lease_authority() {
+    fn inventories_and_roles_are_exact_and_provider_specific() {
         let artifacts = generated_files().unwrap();
-        let find = |name: &str| {
-            serde_yaml::from_slice::<Value>(
-                &artifacts.iter().find(|(path, _)| *path == name).unwrap().1,
-            )
-            .unwrap()
-        };
-        let gates = find("rbac/admission-gates-role.yaml");
-        let controller = find("rbac/controller-gates-role.yaml");
-        let tenant = find("rbac/tenant-gates-role.yaml");
-        assert_eq!(gates["rules"][0]["verbs"], json!(["get"]));
-        assert_eq!(
-            controller["rules"][0]["verbs"],
-            json!(["get", "update", "patch"])
-        );
-        assert_eq!(
-            tenant["rules"][0]["verbs"],
-            json!(["create", "get", "update", "patch", "delete"])
-        );
-        assert_eq!(gates["metadata"]["namespace"], GATE_NAMESPACE);
-        assert_eq!(controller["metadata"]["namespace"], GATE_NAMESPACE);
-        assert_eq!(tenant["metadata"]["namespace"], GATE_NAMESPACE);
-        for role in [&gates, &controller, &tenant] {
-            assert_eq!(role["rules"][0]["resources"], json!(["configmaps"]));
-            assert_eq!(role["rules"][0]["apiGroups"], json!([""]));
-        }
-        let admission = find("rbac/admission-cluster-role.yaml");
-        assert_eq!(admission["rules"].as_array().unwrap().len(), 3);
-        assert!(admission["rules"].as_array().unwrap().iter().all(|rule| {
-            rule["verbs"] == json!(["get"])
-                && !rule["resources"]
-                    .as_array()
-                    .unwrap()
-                    .contains(&json!("configmaps"))
-        }));
-        for path in [
-            "rbac/controller-cluster-role.yaml",
-            "rbac/controller-cluster-role-azure.yaml",
-        ] {
-            let controller = find(path);
-            assert_eq!(
-                controller["rules"][0]["resources"],
-                json!(["tenantdatabases"])
-            );
-            assert_eq!(
-                controller["rules"][0]["verbs"],
-                json!(["create", "get", "list", "watch", "patch", "update"])
-            );
-        }
-        for path in [
-            "admission/mutating-webhook.yaml",
-            "admission/validating-webhook.yaml",
-        ] {
-            let webhook = find(path);
-            for rule in webhook["webhooks"].as_array().unwrap() {
-                assert_eq!(rule["failurePolicy"], "Fail");
-                assert_eq!(rule["sideEffects"], "None");
-                assert_eq!(
-                    rule["clientConfig"]["service"]["namespace"],
-                    "tenant-system"
-                );
-            }
-            assert_eq!(
-                webhook["webhooks"][0]["rules"][0]["operations"],
-                json!(["CREATE"])
-            );
-            assert_eq!(
-                webhook["webhooks"][0]["rules"][0]["resources"],
-                json!(["tenantdatabases"])
-            );
-            assert_eq!(
-                webhook["metadata"]["annotations"]["cert-manager.io/inject-ca-from"],
-                "tenant-system/database-admission-ca"
-            );
-        }
-        let validating = find("admission/validating-webhook.yaml");
-        assert_eq!(validating["webhooks"].as_array().unwrap().len(), 3);
-        assert_eq!(
-            validating["webhooks"][1]["rules"][0]["operations"],
-            json!(["UPDATE"])
-        );
-        assert_eq!(
-            validating["webhooks"][2]["rules"][0]["resources"],
-            json!(["configmaps"])
-        );
-        assert_eq!(
-            validating["webhooks"][2]["matchConditions"][0]["expression"],
-            "request.namespace == 'tenant-database-gates'"
-        );
-        assert!(artifacts.iter().all(|(_, contents)| {
-            !String::from_utf8_lossy(contents).contains("tenant-database-reservations")
-        }));
-        let catalog = serde_json::from_slice::<Value>(
-            &artifacts
-                .iter()
-                .find(|(name, _)| *name == "management-resources.json")
+        let local: Value =
+            serde_json::from_slice(find(&artifacts, "management-resources.json")).unwrap();
+        let azure: Value =
+            serde_json::from_slice(find(&artifacts, "azure-management-resources.json")).unwrap();
+        assert_eq!(local.as_array().unwrap().len(), 3);
+        assert_eq!(azure.as_array().unwrap().len(), 4);
+        assert_eq!(azure[3]["resource"], "disks");
+        assert!(
+            local
+                .as_array()
                 .unwrap()
-                .1,
-        )
-        .unwrap();
-        assert_eq!(catalog.as_array().unwrap().len(), 5);
-        assert!(catalog.as_array().unwrap().iter().any(|resource| {
-            resource["resource"] == "tenantdatabases" && resource["scope"] == "Namespaced"
-        }));
-        let azure_catalog = serde_json::from_slice::<Value>(
-            &artifacts
                 .iter()
-                .find(|(name, _)| *name == "azure-management-resources.json")
+                .any(|r| r["resource"] == "tenantdatabasecatalogs" && r["scope"] == "Namespaced")
+        );
+        for artifact in [&local, &azure] {
+            assert!(artifact.as_array().unwrap().iter().all(|r| {
+                !["tenantdatabases", "configmaps", "resourcequotas"]
+                    .contains(&r["resource"].as_str().unwrap())
+            }));
+        }
+        let local_role: Value =
+            serde_yaml::from_slice(find(&artifacts, "rbac/controller-cluster-role.yaml")).unwrap();
+        let azure_role: Value =
+            serde_yaml::from_slice(find(&artifacts, "rbac/controller-cluster-role-azure.yaml"))
+                .unwrap();
+        for role in [&local_role, &azure_role] {
+            let rules = role["rules"].as_array().unwrap();
+            assert_eq!(rules[0]["resources"], json!(["tenantdatabasecatalogs"]));
+            assert_eq!(rules[0]["verbs"], json!(["get", "list", "watch", "update"]));
+            assert_eq!(
+                rules[1]["resources"],
+                json!(["tenantdatabasecatalogs/status"])
+            );
+            assert!(
+                rules.iter().all(
+                    |rule| !rule["resources"].as_array().unwrap().iter().any(|r| [
+                        "tenantdatabases",
+                        "resourcequotas",
+                        "configmaps",
+                        "tenantdatabasecatalogs/finalizers"
+                    ]
+                    .contains(&r.as_str().unwrap()))
+                )
+            );
+            assert!(rules.iter().all(|rule| rule["resources"]
+                != json!(["tenantdatabasecatalogs"])
+                || !rule["verbs"].as_array().unwrap().contains(&json!("create"))));
+        }
+        assert!(local_role["rules"].as_array().unwrap().iter().all(|r| {
+            ![
+                "persistentvolumes",
+                "persistentvolumeclaims",
+                "secrets",
+                "pods",
+                "clusters",
+            ]
+            .contains(&r["resources"][0].as_str().unwrap())
+        }));
+        assert!(
+            azure_role["rules"]
+                .as_array()
                 .unwrap()
-                .1,
-        )
-        .unwrap();
-        assert_eq!(azure_catalog.as_array().unwrap().len(), 6);
-        assert_eq!(azure_catalog[5]["resource"], "disks");
-        assert_eq!(azure_catalog[5]["version"], "v1api20240302");
-        assert_eq!(
-            find("rbac/controller-cluster-role.yaml")["rules"],
-            find("rbac/controller-cluster-role-azure.yaml")["rules"]
+                .iter()
+                .any(|r| r["resources"] == json!(["disks"]))
+        );
+        assert!(
+            artifacts
+                .iter()
+                .all(|(name, _)| !name.starts_with("admission/") && !name.contains("gates"))
         );
     }
 }

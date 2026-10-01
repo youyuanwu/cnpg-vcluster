@@ -7,27 +7,19 @@ rules:
 - apiGroups:
   - tenancy.cnpg-vcluster.io
   resources:
-  - tenantdatabases
+  - tenantdatabasecatalogs
   verbs:
-  - create
   - get
   - list
   - watch
-  - patch
   - update
 - apiGroups:
   - tenancy.cnpg-vcluster.io
   resources:
-  - tenantdatabases/status
+  - tenantdatabasecatalogs/status
   verbs:
   - get
   - patch
-  - update
-- apiGroups:
-  - tenancy.cnpg-vcluster.io
-  resources:
-  - tenantdatabases/finalizers
-  verbs:
   - update
 - apiGroups:
   - tenancy.cnpg-vcluster.io
@@ -37,3 +29,21 @@ rules:
   - get
   - list
   - watch
+- apiGroups:
+  - ''
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - compute.azure.com
+  resources:
+  - disks
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - delete

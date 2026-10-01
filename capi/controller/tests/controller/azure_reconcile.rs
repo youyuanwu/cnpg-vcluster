@@ -11,7 +11,7 @@ use tenant_controller::{
         AzureClaimIdentity, AzureNetworkSlot,
     },
     management::{self, AZURE_MANAGEMENT_RESOURCES, ResourceClass},
-    reconcile::{AzureProvider, Config, ReconcileError, Reconciler},
+    reconcile::{AzureProvider, Config, ProviderLifecycle, ReconcileError, Reconciler},
 };
 
 use crate::creation_support::{FakeAccess, Server};
@@ -109,6 +109,19 @@ impl Fixture {
             },
         );
         reconciler.reconcile_name("tenant-a").await.map(|_| ())
+    }
+
+    async fn provider_finalize_step(&self) -> Result<(), ReconcileError> {
+        let tenant = self.current();
+        AzureProvider {
+            client: self.management.client(),
+            configuration: self.configuration.clone(),
+            allocation: self.provider_allocation.clone(),
+            access: FakeAccess(self.workload.client()),
+        }
+        .finalize(&tenant, "1.32.13")
+        .await
+        .map(|_| ())
     }
 
     fn settle(&self) {
@@ -731,7 +744,7 @@ async fn deleting_tenant_recovers_claim_created_before_status() {
     .unwrap();
     fixture.mark_deleting();
     for _ in 0..6 {
-        fixture.step().await;
+        fixture.provider_finalize_step().await.unwrap();
         if !fixture
             .current()
             .metadata
@@ -843,7 +856,7 @@ async fn restart_without_catalog_can_begin_recorded_tenant_finalization() {
     fixture.provider_allocation = None;
     fixture.management.remove(ALLOCATION_CONFIG_PATH);
     fixture.mark_deleting();
-    fixture.step().await;
+    fixture.provider_finalize_step().await.unwrap();
     assert_eq!(
         fixture
             .current()
@@ -1050,7 +1063,7 @@ async fn finalization_records_then_deletes_in_exact_order() {
     fixture.mark_deleting();
     fixture.management.take_calls();
 
-    fixture.step().await;
+    fixture.provider_finalize_step().await.unwrap();
     let current = fixture.current();
     let status = current.status.as_ref().unwrap();
     let azure = status.azure().unwrap();
@@ -1072,7 +1085,7 @@ async fn finalization_records_then_deletes_in_exact_order() {
     );
 
     for _ in 0..4 {
-        fixture.step().await;
+        fixture.provider_finalize_step().await.unwrap();
     }
     let first = fixture.management.take_calls();
     let machine_patches: Vec<_> = first
@@ -1092,7 +1105,7 @@ async fn finalization_records_then_deletes_in_exact_order() {
     assert!(pool_delete.body["preconditions"]["resourceVersion"].is_string());
 
     fixture.remove_kinds(&["Machine", "AzureMachinePool", "AzureMachinePoolMachine"]);
-    fixture.step().await;
+    fixture.provider_finalize_step().await.unwrap();
     let cluster_delete = fixture
         .management
         .take_calls()
@@ -1104,7 +1117,7 @@ async fn finalization_records_then_deletes_in_exact_order() {
 
     fixture.remove_kinds(&["Cluster"]);
     fixture.start_azure_cluster_deletion_without_lb();
-    fixture.step().await;
+    fixture.provider_finalize_step().await.unwrap();
     let workaround = fixture
         .management
         .take_calls()
@@ -1139,7 +1152,7 @@ async fn finalization_records_then_deletes_in_exact_order() {
         "Secret",
     ]);
     fixture.management.take_calls();
-    fixture.step().await;
+    fixture.provider_finalize_step().await.unwrap();
     let config_map_deletes: Vec<_> = fixture
         .management
         .calls()
@@ -1148,11 +1161,11 @@ async fn finalization_records_then_deletes_in_exact_order() {
         .collect();
     assert_eq!(config_map_deletes.len(), 2);
     for _ in 0..3 {
-        fixture.step().await;
+        fixture.provider_finalize_step().await.unwrap();
     }
     fixture.remove_kinds(&["Pod", "ReplicaSet"]);
     for _ in 0..9 {
-        fixture.step().await;
+        fixture.provider_finalize_step().await.unwrap();
         if !fixture
             .current()
             .metadata
@@ -1208,18 +1221,17 @@ async fn finalization_blocks_foreign_residue_and_same_name_recreation() {
     let fixture = Fixture::new();
     fixture.until_ready().await;
     fixture.mark_deleting();
-    fixture.step().await;
+    fixture.provider_finalize_step().await.unwrap();
     fixture.management.insert(
         "/api/v1/namespaces/tenant-a/configmaps/foreign",
         json!({"apiVersion":"v1","kind":"ConfigMap","metadata":{
             "name":"foreign","namespace":"tenant-a","uid":"foreign-uid","resourceVersion":"1"
         }}),
     );
-    fixture.step().await;
-    assert_eq!(
-        fixture.current().status.unwrap().phase,
-        Some(TenantPhase::OwnershipInvalid)
-    );
+    assert!(matches!(
+        fixture.provider_finalize_step().await,
+        Err(ReconcileError::OwnershipInvalid(_))
+    ));
     fixture
         .management
         .remove("/api/v1/namespaces/tenant-a/configmaps/foreign");
@@ -1227,11 +1239,10 @@ async fn finalization_blocks_foreign_residue_and_same_name_recreation() {
     let mut pool = fixture.management.get(path);
     pool["metadata"]["uid"] = json!("recreated-pool");
     fixture.management.insert(path, pool);
-    fixture.step().await;
-    assert_eq!(
-        fixture.current().status.unwrap().phase,
-        Some(TenantPhase::OwnershipInvalid)
-    );
+    assert!(matches!(
+        fixture.provider_finalize_step().await,
+        Err(ReconcileError::OwnershipInvalid(_))
+    ));
 }
 
 #[tokio::test]
@@ -1273,14 +1284,16 @@ async fn finalization_rejects_explicit_desired_spec_drift_before_record_or_delet
         }
         fixture.mark_deleting();
         fixture.management.take_calls();
-        fixture.step().await;
-        let tenant = fixture.current();
-        let status = tenant.status.unwrap();
-        assert_eq!(
-            status.phase,
-            Some(TenantPhase::OwnershipInvalid),
+        assert!(
+            matches!(
+                fixture.provider_finalize_step().await,
+                Err(ReconcileError::OwnershipInvalid(_))
+            ),
             "{kind} {pointer}"
         );
+        let tenant = fixture.current();
+        let status = tenant.status.unwrap();
+        assert_eq!(status.phase, Some(TenantPhase::Ready), "{kind} {pointer}");
         assert!(
             status.azure().unwrap().deletion.is_none(),
             "{kind} {pointer}"
@@ -1308,7 +1321,7 @@ async fn finalization_recovers_missing_identity_in_one_barrier() {
         Some(serde_json::from_value(json!("2026-09-28T00:00:00Z")).unwrap());
     fixture.management.insert(TENANT_PATH, tenant);
     fixture.management.take_calls();
-    fixture.step().await;
+    fixture.provider_finalize_step().await.unwrap();
     let current = fixture.current();
     let azure = current.status.as_ref().unwrap().azure().unwrap();
     assert!(
@@ -1337,7 +1350,7 @@ async fn finalization_never_strips_provider_finalizers() {
     let fixture = Fixture::new();
     fixture.until_ready().await;
     fixture.mark_deleting();
-    fixture.step().await;
+    fixture.provider_finalize_step().await.unwrap();
     fixture.remove_kinds(&[
         "MachinePool",
         "Machine",
@@ -1357,7 +1370,7 @@ async fn finalization_never_strips_provider_finalizers() {
         azure_cluster["spec"]["networkSpec"]["apiServerLB"] = json!({"type":"Public"});
     }
     fixture.management.take_calls();
-    fixture.step().await;
+    fixture.provider_finalize_step().await.unwrap();
     let calls = fixture.management.take_calls();
     assert!(
         calls
@@ -1384,11 +1397,10 @@ async fn finalization_refuses_missing_recorded_provider_descendant() {
         .management
         .remove("/apis/cluster.x-k8s.io/v1beta1/namespaces/tenant-a/machines/machine-0");
     fixture.mark_deleting();
-    fixture.step().await;
-    assert_eq!(
-        fixture.current().status.unwrap().phase,
-        Some(TenantPhase::OwnershipInvalid)
-    );
+    assert!(matches!(
+        fixture.provider_finalize_step().await,
+        Err(ReconcileError::OwnershipInvalid(_))
+    ));
     assert!(
         fixture
             .management

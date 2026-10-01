@@ -1,8 +1,8 @@
 [
   {
     "group": "tenancy.cnpg-vcluster.io",
-    "kind": "TenantDatabase",
-    "resource": "tenantdatabases",
+    "kind": "TenantDatabaseCatalog",
+    "resource": "tenantdatabasecatalogs",
     "scope": "Namespaced",
     "version": "v1alpha1"
   },
@@ -18,20 +18,6 @@
     "kind": "Namespace",
     "resource": "namespaces",
     "scope": "Cluster",
-    "version": "v1"
-  },
-  {
-    "group": "",
-    "kind": "ResourceQuota",
-    "resource": "resourcequotas",
-    "scope": "Namespaced",
-    "version": "v1"
-  },
-  {
-    "group": "",
-    "kind": "ConfigMap",
-    "resource": "configmaps",
-    "scope": "Namespaced",
     "version": "v1"
   },
   {

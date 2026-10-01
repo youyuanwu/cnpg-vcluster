@@ -4,7 +4,7 @@ use kube::{Client, ResourceExt, core::DynamicObject, runtime::controller::Action
 
 use crate::{
     allocation::{self, ClaimContext},
-    api::{CanonicalSpec, DatabaseCapability, Tenant, TenantProviderSpec, spec_hash},
+    api::{CanonicalSpec, Tenant, TenantProviderSpec, spec_hash},
     docker::{BollardDockerClient, DockerClient, validate_volume},
     error::ControllerError,
     foundation::{Foundation, ImageArchive, RuntimeFoundation},
@@ -382,43 +382,30 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
             && !operator.created
             && !operator.pending
             && deployment.is_some_and(readiness::workload_available);
-        let previous = context
+        let mut capability = context
             .tenant
             .status
             .as_ref()
-            .and_then(|status| status.database_capability.clone());
-        let expected = previous.as_ref().and_then(DatabaseCapability::identity);
-        let mut capability = previous.unwrap_or_default();
+            .and_then(|status| status.database_capability.clone())
+            .unwrap_or_default();
         capability.available = false;
-        capability.reason = "RuntimeNotReady".into();
-        if runtime_ready {
-            let tenant_uid = context
-                .tenant
-                .uid()
+        capability.namespace = tenant_database_runtime::database_namespace(context.name());
+        capability.reason = if runtime_ready {
+            let tenant_uid = context.tenant.uid()
                 .ok_or_else(|| ReconcileError::OwnershipInvalid("Tenant UID is missing".into()))?;
-            match tenant_database_runtime::ensure(
-                self.client.clone(),
-                context.name(),
-                &tenant_uid,
-                false,
-                expected.as_ref(),
-            )
-            .await
-            {
-                Ok(identity) => {
-                    capability.available = true;
-                    capability.reason = "Ready".into();
-                    capability.namespace_uid = identity.namespace_uid;
-                    capability.quota_uid = identity.quota_uid;
-                    capability.gate_uid = identity.gate_uid;
-                    capability.storage_namespace_uid = identity.storage_namespace_uid;
-                }
+            match tenant_database_runtime::catalog_runtime::ensure_credentials(
+                self.client.clone(), context.name(), &tenant_uid, false,
+            ).await {
+                Ok(()) => "CatalogNotReady",
                 Err(error) => {
-                    tracing::warn!(tenant = %context.name(), reason = %error, "database capability unavailable");
-                    capability.reason = "GateUnavailable".into();
+                    tracing::warn!(tenant = %context.name(), %error, "database credential access unavailable");
+                    "CredentialAccessUnavailable"
                 }
             }
+        } else {
+            "RuntimeNotReady"
         }
+        .into();
         let components = Components {
             control_plane: readiness::management_conditions_ready(cluster, &["Available"])?,
             workers: workers.inventory_complete && workers.all_ready,

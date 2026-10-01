@@ -50,6 +50,7 @@ from scripts.lib.azure.foundation import (
 )
 from scripts.lib.config import ConfigError
 from scripts.lib.controller import tenant_cutover_lock_cleanup_refs
+from scripts.lib.database_controller import LEGACY_CRD, require_absent_legacy_database_crd
 from scripts.lib.files import write_private_file
 from scripts.lib.locking import azure_lock
 from scripts.lib.tenant_spec import TenantSpecError
@@ -64,6 +65,33 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        legacy = patch("scripts.lib.azure.foundation.require_absent_legacy_database_crd")
+        legacy.start()
+        self.addCleanup(legacy.stop)
+
+    def test_legacy_crd_blocks_azure_cutover_before_policy_mutation(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        calls = []
+
+        def kubectl(_root, *args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("get", f"crd/{LEGACY_CRD}"):
+                return completed(f"crd/{LEGACY_CRD}")
+            raise AssertionError(f"unexpected cutover mutation: {args}")
+
+        with (
+            patch("scripts.lib.azure.foundation.require_absent_legacy_database_crd",
+                  require_absent_legacy_database_crd),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            self.assertRaisesRegex(RuntimeError, "Separately prove"),
+        ):
+            _prepare_azure_tenant_api_cutover(root, config)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ("get", f"crd/{LEGACY_CRD}"))
+
     def database_azure(self, outputs, *, change=None):
         resources = {
             "identity": {
@@ -591,7 +619,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     "metadata": {"continue": ""},
                     "items": [],
                 }))
-            if arguments[:2] == ("get", "crd/tenantdatabases.tenancy.cnpg-vcluster.io"):
+            if arguments[:2] == ("get", "crd/tenantdatabasecatalogs.tenancy.cnpg-vcluster.io"):
                 return completed()
             items = []
             resource = arguments[1]

@@ -1,5 +1,20 @@
 # Tenant API compatibility
 
+The current Tenant API is `tenancy.cnpg-vcluster.io/v1alpha4`: provider
+`local` and `azure` have no `databases` field. In the catalog-transition
+Phase 1 controller, `status.databaseCapability` reports a lifecycle
+`namespace`, its observed `namespaceUID`, and `catalogUID` (plus an optional
+Azure `storageNamespaceUID`), never a gate or quota. Named kubeconfig Secret
+access remains bound to the exact Tenant credential Role/RoleBinding. The optional
+`status.catalogCreateIntent` records the exact namespace, catalog name and
+Tenant UID *before* any catalog CREATE can be issued. Phase 1 neither creates
+nor drains a catalog: capability remains unavailable even when the database
+runtime is observable, and deletion retains the Tenant finalizer until an
+exact catalog drain can be verified by the subsequent lifecycle integration.
+Infrastructure Ready remains independent of database capability. The
+v1alpha3 behavior described below is historical, not an installed
+catalog-transition contract.
+
 `tenancy.cnpg-vcluster.io/v1alpha3` is the only served and stored Tenant
 version. It intentionally replaces experimental `v1alpha2`; there is no
 conversion or migration. Existing objects must complete ordinary deletion

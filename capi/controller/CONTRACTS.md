@@ -1,5 +1,14 @@
 # Rust Tenant contracts
 
+The current generated Tenant CRD serves `v1alpha4`. Its database capability
+stores catalog namespace/UID identity, not the retired gate/quota protocol;
+catalog CREATE must be preceded by an exact, successful Tenant status write
+of `catalogCreateIntent` while its finalizer is held. A failed or ambiguous
+status write does not authorize CREATE. The Phase 1 controller does not issue that CREATE
+or claim database capability availability. Deletion deliberately retains the
+finalizer because catalog closure and drain cannot yet be proven. The
+v1alpha3 contract below documents the preceding experimental cutover only.
+
 `tenancy.cnpg-vcluster.io/v1alpha3` is the only installed Tenant API.
 Rust `src/bin/generate.rs` produces the checked-in
 `config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml` and

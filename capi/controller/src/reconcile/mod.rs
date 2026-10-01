@@ -27,8 +27,7 @@ use kube::{
 
 use crate::{
     api::{
-        DatabaseCapability, SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase, TenantProviderSpec,
-        TenantProviderStatus, canonical_spec,
+        SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase, TenantProviderStatus, canonical_spec,
     },
     error::ControllerError,
     foundation, management,
@@ -119,15 +118,9 @@ impl<P: ProviderLifecycle> Reconciler<P> {
         }
         let deleting = tenant.metadata.deletion_timestamp.is_some();
         let result = if deleting {
-            match self.drain_databases(&tenant).await {
-                Ok(tenant_database_runtime::DrainState::Done) => {
-                    self.provider
-                        .finalize(&tenant, &self.config.supported_version)
-                        .await
-                }
-                Ok(_) => Ok(Action::requeue(DEPENDENCY_INTERVAL)),
-                Err(error) => Err(error),
-            }
+            Err(ReconcileError::Pending(
+                "catalog closure and exact database drain have not been verified".into(),
+            ))
         } else {
             self.provider.reconcile(&tenant, &spec).await
         };
@@ -149,56 +142,6 @@ impl<P: ProviderLifecycle> Reconciler<P> {
                 self.failure(&tenant, error).await
             }
         }
-    }
-    async fn drain_databases(
-        &self,
-        tenant: &Tenant,
-    ) -> Result<tenant_database_runtime::DrainState, ReconcileError> {
-        let uid = tenant.uid().ok_or(ReconcileError::OwnershipInvalid(
-            "Tenant UID is missing during database cleanup".into(),
-        ))?;
-        let capability = tenant
-            .status
-            .as_ref()
-            .and_then(|status| status.database_capability.as_ref());
-        let expected = capability.and_then(DatabaseCapability::identity);
-        let retiring = capability.is_some_and(|capability| capability.reason == "Retiring");
-        let outcome = tenant_database_runtime::finalize(
-            self.client.clone(),
-            &tenant.name_any(),
-            &uid,
-            matches!(tenant.spec.provider, TenantProviderSpec::Azure),
-            expected.as_ref(),
-            capability
-                .map(|capability| capability.gate_uid.as_str())
-                .filter(|uid| !uid.is_empty()),
-            retiring,
-        )
-        .await
-        .map_err(|error| match error {
-            tenant_database_runtime::GateError::Api(error) => ReconcileError::Kube(error),
-            error => ReconcileError::OwnershipInvalid(error.to_string()),
-        })?;
-        if let tenant_database_runtime::DrainState::ReadyToRetire(gate_uid) = &outcome {
-            status::update_status(self.client.clone(), tenant, |status| {
-                let cap = status
-                    .database_capability
-                    .get_or_insert_with(|| DatabaseCapability {
-                        gate_uid: gate_uid.clone(),
-                        ..Default::default()
-                    });
-                if cap.gate_uid != *gate_uid {
-                    return Err(ControllerError::OwnershipInvalid(
-                        "database gate identity changed".into(),
-                    ));
-                }
-                cap.available = false;
-                cap.reason = "Retiring".into();
-                Ok(())
-            })
-            .await?;
-        }
-        Ok(outcome)
     }
     async fn unsupported_provider(&self, tenant: &Tenant) -> Result<Action, ReconcileError> {
         let has_finalizer = tenant.finalizers().iter().any(|value| value == FINALIZER);

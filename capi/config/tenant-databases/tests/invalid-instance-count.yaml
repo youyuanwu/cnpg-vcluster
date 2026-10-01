@@ -1,9 +1,14 @@
 apiVersion: tenancy.cnpg-vcluster.io/v1alpha1
-kind: TenantDatabase
+kind: TenantDatabaseCatalog
 metadata:
-  name: orders
+  name: tenant-example
   namespace: tenant-db-tenant-example
 spec:
   tenantName: tenant-example
   tenantUID: replace-with-live-tenant-uid
-  instances: 4
+  closed: false
+  entries:
+    123e4567-e89b-12d3-a456-426614174000:
+      name: orders
+      instances: 4
+      deleting: false

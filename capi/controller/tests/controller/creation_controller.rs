@@ -8,8 +8,8 @@ use kube::{ResourceExt, core::DynamicObject, runtime::controller::Action};
 use serde_json::{Value, json};
 use tenant_controller::{
     api::{
-        CanonicalSpec, LocalProviderStatus, Tenant, TenantPhase, TenantProviderSpec,
-        TenantProviderStatus, TenantStatus, canonical_spec, spec_hash,
+        CanonicalSpec, CatalogCreateIntent, LocalProviderStatus, Tenant, TenantPhase,
+        TenantProviderSpec, TenantProviderStatus, TenantStatus, canonical_spec, spec_hash,
     },
     docker::{DockerContainer, WORKER_CLUSTER_LABEL, WORKER_ROLE_LABEL},
     foundation::{Foundation, FoundationError, canonical_hash, parse_runtime},
@@ -19,6 +19,7 @@ use tenant_controller::{
         Assets, Config, FINALIZER, LocalProvider, PROGRESS_INTERVAL, ProviderLifecycle,
         ReconcileError, Reconciler,
     },
+    status,
 };
 
 const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a";
@@ -247,7 +248,7 @@ impl Fixture {
                     && status
                         .database_capability
                         .as_ref()
-                        .is_some_and(|cap| cap.available)
+                        .is_some_and(|cap| cap.reason == "CatalogNotReady")
             }) {
                 return;
             }
@@ -859,7 +860,7 @@ async fn creation_finalizer_conflict_requeues_without_failure_status_patch() {
 }
 
 #[tokio::test]
-async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
+async fn deletion_never_attempts_provider_finalizer_before_catalog_drain() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.management.get(TENANT);
     tenant["metadata"]["deletionTimestamp"] = json!("2026-09-27T00:00:00Z");
@@ -877,13 +878,6 @@ async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
             resource.plural
         ));
     }
-    fixture.management.respond(
-        "PATCH",
-        TENANT,
-        409,
-        crate::support::kube::status(409, "Conflict"),
-    );
-
     fixture.reconciler.reconcile_name("tenant-a").await.unwrap();
 
     assert_eq!(
@@ -893,14 +887,14 @@ async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
             .iter()
             .filter(|call| call.method == "PATCH" && call.path == TENANT)
             .count(),
-        1
+        0
     );
     assert!(
         fixture
             .management
             .calls()
             .iter()
-            .all(|call| !(call.method == "PATCH" && call.path == format!("{TENANT}/status")))
+            .any(|call| call.method == "PATCH" && call.path == format!("{TENANT}/status"))
     );
 }
 
@@ -1022,7 +1016,7 @@ async fn full_pipeline_converges_then_observes_once_and_preserves_static_content
             .database_capability
             .unwrap()
             .reason,
-        "Ready"
+        "CatalogNotReady"
     );
     let config_path = "/api/v1/namespaces/kube-system/configmaps/capi-kube-proxy";
     let mut config = fixture.workload.get(config_path);
@@ -1030,7 +1024,7 @@ async fn full_pipeline_converges_then_observes_once_and_preserves_static_content
     fixture.workload.insert(config_path, config);
     fixture.clear();
     let action = fixture.step().await;
-    assert_eq!(action, Action::requeue(std::time::Duration::from_secs(300)));
+    assert_eq!(action, Action::requeue(std::time::Duration::from_secs(5)));
     let calls = fixture.workload.calls();
     assert_eq!(
         calls
@@ -1186,7 +1180,7 @@ async fn worker_root_owners_are_optional_but_must_be_exact_when_present() {
     }
     assert_eq!(
         fixture.step().await,
-        Action::requeue(std::time::Duration::from_secs(300))
+        Action::requeue(std::time::Duration::from_secs(5))
     );
 }
 
@@ -1197,7 +1191,7 @@ async fn tenant_readiness_does_not_depend_on_database_workloads() {
     fixture.clear();
     assert_eq!(
         fixture.step().await,
-        Action::requeue(std::time::Duration::from_secs(300))
+        Action::requeue(std::time::Duration::from_secs(5))
     );
     assert_eq!(
         fixture.current().status.unwrap().phase,
@@ -1209,17 +1203,37 @@ async fn tenant_readiness_does_not_depend_on_database_workloads() {
 }
 
 #[tokio::test]
-async fn database_runtime_capability_loss_preserves_infrastructure_ready() {
+async fn catalog_pending_does_not_reintroduce_gate_or_block_infrastructure_ready() {
     let fixture = Fixture::new(true);
     fixture.until_ready().await;
-    let credential_path =
+    let status = fixture.current().status.unwrap();
+    let capability = status.database_capability.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Ready));
+    assert!(!capability.available);
+    assert_eq!(capability.reason, "CatalogNotReady");
+    assert_eq!(capability.namespace, "tenant-db-tenant-a");
+    assert!(capability.catalog_uid.is_empty());
+    assert!(capability.namespace_uid.is_empty());
+    assert!(status.catalog_create_intent.is_none());
+    assert!(fixture.management.calls().iter().all(|call| {
+        !call.path.contains("tenant-database-gates")
+            && !call.path.contains("resourcequotas")
+            && !call.path.contains("tenantdatabases")
+    }));
+}
+
+#[tokio::test]
+async fn credential_binding_remains_exact_while_catalog_is_pending() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    let role_path =
         "/apis/rbac.authorization.k8s.io/v1/namespaces/tenant-a/roles/tenant-database-credentials";
-    let mut credential = fixture.management.get(credential_path);
+    let mut role = fixture.management.get(role_path);
     assert_eq!(
-        credential["rules"][0]["resourceNames"],
+        role["rules"][0]["resourceNames"],
         json!(["tenant-a-kubeconfig"])
     );
-    assert_eq!(credential["rules"][0]["verbs"], json!(["get"]));
+    assert_eq!(role["rules"][0]["verbs"], json!(["get"]));
     let binding = fixture.management.get(
         "/apis/rbac.authorization.k8s.io/v1/namespaces/tenant-a/rolebindings/tenant-database-credentials"
     );
@@ -1230,28 +1244,8 @@ async fn database_runtime_capability_loss_preserves_infrastructure_ready() {
             {"kind":"ServiceAccount","name":"database-controller","namespace":"tenant-system"}
         ])
     );
-    credential["rules"][0]["resourceNames"] = json!(["unrelated-secret"]);
-    fixture.management.insert(credential_path, &credential);
-    fixture.step().await;
-    assert_eq!(
-        fixture.current().status.as_ref().unwrap().phase,
-        Some(TenantPhase::Ready)
-    );
-    assert!(
-        !fixture
-            .current()
-            .status
-            .unwrap()
-            .database_capability
-            .unwrap()
-            .available
-    );
-    credential["rules"][0]["resourceNames"] = json!(["tenant-a-kubeconfig"]);
-    fixture.management.insert(credential_path, credential);
-    let path = "/api/v1/namespaces/tenant-db-tenant-a/resourcequotas/tenant-database-limit";
-    let mut quota = fixture.management.get(path);
-    quota["spec"]["hard"]["count/tenantdatabases.tenancy.cnpg-vcluster.io"] = json!("4");
-    fixture.management.insert(path, &quota);
+    role["rules"][0]["resourceNames"] = json!(["unrelated-secret"]);
+    fixture.management.insert(role_path, role);
     fixture.clear();
     assert_eq!(
         fixture.step().await,
@@ -1259,291 +1253,113 @@ async fn database_runtime_capability_loss_preserves_infrastructure_ready() {
     );
     let status = fixture.current().status.unwrap();
     assert_eq!(status.phase, Some(TenantPhase::Ready));
-    assert!(!status.database_capability.unwrap().available);
-    quota["spec"]["hard"]["count/tenantdatabases.tenancy.cnpg-vcluster.io"] = json!("3");
-    fixture.management.insert(path, quota);
-    fixture.step().await;
+    assert_eq!(
+        status.database_capability.unwrap().reason,
+        "CredentialAccessUnavailable"
+    );
     assert!(
-        fixture
-            .current()
-            .status
-            .unwrap()
-            .database_capability
-            .unwrap()
-            .available
+        fixture.management.calls().iter().all(|call| {
+            call.method != "DELETE" && !call.path.contains("tenant-database-gates")
+        })
     );
 }
 
 #[tokio::test]
-async fn tenant_deletion_closes_gate_and_drains_database_namespace_before_infrastructure() {
+async fn catalog_create_intent_is_durable_and_cannot_switch_identity() {
     let fixture = Fixture::new(true);
-    fixture.until_ready().await;
-    fixture.management.allow_typed_list(
-        "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases",
-        "tenancy.cnpg-vcluster.io/v1alpha1",
-        "TenantDatabase",
+    let tenant = fixture.current();
+    let intent = CatalogCreateIntent {
+        namespace: "tenant-db-tenant-a".into(),
+        name: "tenant-databases".into(),
+        tenant_uid: tenant.uid().unwrap(),
+    };
+    assert!(
+        status::record_catalog_create_intent(fixture.management.client(), &tenant, &intent)
+            .await
+            .is_err()
     );
-    let mut tenant = fixture.management.get(TENANT);
-    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
-    fixture.management.insert(TENANT, tenant);
-    let gate_path = format!(
-        "/api/v1/namespaces/tenant-database-gates/configmaps/{}",
-        tenant_database_runtime::gate_name("tenant-uid"),
-    );
-    fixture.clear();
-    fixture.step().await;
+    assert!(fixture.management.calls().is_empty());
+    let mut protected = tenant.clone();
+    protected.metadata.finalizers = Some(vec![FINALIZER.into()]);
+    fixture.management.insert(TENANT, protected);
+    let tenant = fixture.current();
+    status::record_catalog_create_intent(fixture.management.client(), &tenant, &intent)
+        .await
+        .unwrap();
     assert_eq!(
-        fixture.management.get(&gate_path)["data"]["state"],
-        "closed"
+        fixture.current().status.unwrap().catalog_create_intent,
+        Some(intent.clone())
     );
-    assert!(
-        fixture
-            .management
-            .calls()
-            .iter()
-            .all(|call| call.method != "DELETE")
-    );
-    fixture.clear();
-    fixture.step().await;
-    assert!(fixture.management.calls().iter().any(|call| {
-        call.method == "DELETE" && call.path == "/api/v1/namespaces/tenant-db-tenant-a"
-    }));
-    assert!(
-        fixture
-            .management
-            .calls()
-            .iter()
-            .all(|call| call.path != CLUSTER)
-    );
-    fixture.clear();
-    fixture.step().await;
+    let calls = fixture.management.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].path, format!("{TENANT}/status"));
+    assert_eq!(calls[0].body["metadata"]["uid"], intent.tenant_uid);
     assert_eq!(
-        fixture
-            .current()
-            .status
-            .unwrap()
-            .database_capability
-            .unwrap()
-            .reason,
-        "Retiring"
+        calls[0].body["metadata"]["resourceVersion"],
+        tenant.resource_version().unwrap()
     );
-    assert!(
-        fixture
-            .management
-            .calls()
-            .iter()
-            .all(|call| call.method != "DELETE")
-    );
+
     fixture.clear();
-    fixture.step().await;
+    let current = fixture.current();
+    status::record_catalog_create_intent(fixture.management.client(), &current, &intent)
+        .await
+        .unwrap();
+    assert!(fixture.management.calls().is_empty());
+    let mut replacement = intent.clone();
+    replacement.namespace = "unrelated".into();
     assert!(
-        fixture
-            .management
-            .calls()
-            .iter()
-            .any(|call| { call.method == "DELETE" && call.path == gate_path })
+        status::record_catalog_create_intent(fixture.management.client(), &current, &replacement)
+            .await
+            .is_err()
     );
-    assert!(
-        fixture
-            .management
-            .calls()
-            .iter()
-            .all(|call| call.path != CLUSTER)
+    assert!(fixture.management.calls().is_empty());
+    assert_eq!(
+        fixture.current().status.unwrap().catalog_create_intent,
+        Some(intent)
     );
 }
 
 #[tokio::test]
-async fn pending_intents_cancel_on_close_but_claimed_intents_wait_for_namespace_absence() {
-    let fixture = Fixture::new(true);
-    fixture.until_ready().await;
-    fixture.management.allow_typed_list(
-        "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases",
-        "tenancy.cnpg-vcluster.io/v1alpha1",
-        "TenantDatabase",
-    );
-    let gate_path = format!(
-        "/api/v1/namespaces/tenant-database-gates/configmaps/{}",
-        tenant_database_runtime::gate_name("tenant-uid")
-    );
-    let mut gate = fixture.management.get(&gate_path);
-    gate["data"]["intents"] = json!(
-        serde_json::to_string(&std::collections::BTreeMap::from([
-            (
-                "pending",
-                tenant_database_runtime::GateEntry {
-                    instances: 1,
-                    lifecycle: tenant_database_runtime::IntentLifecycle::Pending,
-                    bound_uid: None,
-                }
-            ),
-            (
-                "claimed",
-                tenant_database_runtime::GateEntry {
-                    instances: 2,
-                    lifecycle: tenant_database_runtime::IntentLifecycle::Materializing,
-                    bound_uid: None,
-                }
-            ),
-        ]))
-        .unwrap()
-    );
-    fixture.management.insert(&gate_path, gate);
-    let mut tenant = fixture.management.get(TENANT);
-    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
-    fixture.management.insert(TENANT, tenant);
-    fixture.step().await;
-    let gate = fixture.management.get(&gate_path);
-    let entries: Value = serde_json::from_str(gate["data"]["intents"].as_str().unwrap()).unwrap();
-    assert!(entries.get("pending").is_none());
-    assert_eq!(entries["claimed"]["lifecycle"], "materializing");
-    assert!(
-        fixture
-            .management
-            .calls()
-            .iter()
-            .all(|call| call.method != "DELETE")
-    );
-    let database_path = "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases/claimed";
-    fixture.management.insert(database_path, json!({
-        "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha1","kind":"TenantDatabase",
-        "metadata":{
-            "name":"claimed","namespace":"tenant-db-tenant-a","uid":"late-uid","resourceVersion":"5",
-            "finalizers":["tenancy.cnpg-vcluster.io/database-finalizer"],
-            "annotations":{
-                "tenancy.cnpg-vcluster.io/tenant-uid":"tenant-uid",
-                "tenancy.cnpg-vcluster.io/gate-uid":gate["metadata"]["uid"],
-                "tenancy.cnpg-vcluster.io/database-spec-sha256":"a".repeat(64)
-            }
-        },
-        "spec":{"tenantName":"tenant-a","tenantUID":"tenant-uid","instances":2}
-    }));
-    fixture.clear();
-    fixture.step().await;
-    assert!(
-        fixture
-            .management
-            .calls()
-            .iter()
-            .any(|call| call.method == "DELETE"
-                && call.path == database_path
-                && call.body["preconditions"]["uid"] == "late-uid")
-    );
-    let namespace_path = "/api/v1/namespaces/tenant-db-tenant-a";
-    let mut terminating = fixture.management.get(namespace_path);
-    terminating["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
-    fixture
-        .management
-        .respond("DELETE", namespace_path, 200, terminating.clone());
-    fixture.clear();
-    fixture.step().await;
-    assert!(
-        fixture
-            .management
-            .calls()
-            .iter()
-            .any(|call| call.method == "DELETE" && call.path == namespace_path)
-    );
-    assert!(
-        fixture
-            .management
-            .calls()
-            .iter()
-            .all(|call| call.path != gate_path || call.method != "DELETE")
-    );
-    fixture.management.insert(namespace_path, terminating);
-    fixture.clear();
-    fixture.step().await;
-    assert_eq!(
-        fixture.management.get(&gate_path)["data"]["intents"],
-        gate["data"]["intents"]
-    );
-    fixture
-        .management
-        .0
-        .lock()
-        .unwrap()
-        .objects
-        .remove(namespace_path);
-    fixture.clear();
-    fixture.step().await;
-    assert_eq!(
-        fixture.management.get(&gate_path)["data"]["intents"],
-        gate["data"]["intents"]
-    );
-    assert_eq!(
-        fixture.current().status.unwrap().phase,
-        Some(TenantPhase::OwnershipInvalid)
-    );
-}
-
-#[tokio::test]
-async fn accepted_database_is_deleted_exactly_before_infrastructure_or_replacement_refused() {
-    for replacement in [false, true] {
+async fn deletion_without_catalog_drain_retains_finalizer_and_all_infrastructure() {
+    for recorded_intent in [false, true] {
         let fixture = Fixture::new(true);
         fixture.until_ready().await;
-        fixture.management.allow_typed_list(
-            "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases",
-            "tenancy.cnpg-vcluster.io/v1alpha1",
-            "TenantDatabase",
-        );
-        let gate_path = format!(
-            "/api/v1/namespaces/tenant-database-gates/configmaps/{}",
-            tenant_database_runtime::gate_name("tenant-uid"),
-        );
-        let mut gate = fixture.management.get(&gate_path);
-        let entry = tenant_database_runtime::GateEntry {
-            instances: 1,
-            lifecycle: tenant_database_runtime::IntentLifecycle::Bound,
-            bound_uid: Some("database-uid".into()),
-        };
-        gate["data"]["intents"] = json!(
-            serde_json::to_string(&std::collections::BTreeMap::from([("orders", entry)])).unwrap()
-        );
-        let gate_uid = gate["metadata"]["uid"].clone();
-        fixture.management.insert(&gate_path, gate);
-        let database_path = "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases/orders";
-        fixture.management.insert(
-            database_path,
-            json!({
-                "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha1", "kind":"TenantDatabase",
-                "metadata":{"namespace":"tenant-db-tenant-a", "name":"orders",
-                    "uid":if replacement {"replacement-uid"} else {"database-uid"},
-                    "resourceVersion":"5",
-                    "finalizers":["tenancy.cnpg-vcluster.io/database-finalizer"],
-                    "annotations":{
-                        "tenancy.cnpg-vcluster.io/tenant-uid":"tenant-uid",
-                        "tenancy.cnpg-vcluster.io/gate-uid":gate_uid,
-                        "tenancy.cnpg-vcluster.io/database-spec-sha256":"a".repeat(64)
-                    }},
-                "spec":{"tenantName":"tenant-a","tenantUID":"tenant-uid","instances":1}
-            }),
-        );
         let mut tenant = fixture.management.get(TENANT);
         tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+        if recorded_intent {
+            tenant["status"]["catalogCreateIntent"] = json!({
+                "namespace":"tenant-db-tenant-a", "name":"tenant-databases",
+                "tenantUID":"tenant-uid"
+            });
+        }
         fixture.management.insert(TENANT, tenant);
-        fixture.step().await;
         fixture.clear();
-        fixture.step().await;
-        let deleted = fixture.management.calls().iter().any(|call| {
-            call.method == "DELETE"
-                && call.path == database_path
-                && call.body["preconditions"]["uid"] == "database-uid"
-                && call.body["preconditions"]["resourceVersion"] == "5"
-        });
-        assert_eq!(deleted, !replacement);
+        assert_eq!(
+            fixture.step().await,
+            Action::requeue(std::time::Duration::from_secs(5))
+        );
+        let current = fixture.current();
+        assert!(current.finalizers().iter().any(|value| value == FINALIZER));
+        let status = current.status.unwrap();
+        assert_eq!(status.phase, Some(TenantPhase::Deleting));
+        assert_eq!(
+            status
+                .conditions
+                .iter()
+                .find(|c| c.type_ == "Ready")
+                .unwrap()
+                .reason,
+            "DeletionBlocked"
+        );
+        assert_eq!(status.catalog_create_intent.is_some(), recorded_intent);
         assert!(
             fixture
                 .management
                 .calls()
                 .iter()
-                .all(|call| { !(call.method == "DELETE" && call.path == CLUSTER) })
+                .all(|call| call.method != "DELETE")
         );
-        if replacement {
-            assert_eq!(
-                fixture.current().status.unwrap().phase,
-                Some(TenantPhase::OwnershipInvalid)
-            );
-        }
+        assert!(fixture.workload.calls().is_empty());
     }
 }
 
@@ -1774,7 +1590,7 @@ async fn final_availability_is_distinct_from_control_plane_access_and_observed_w
     fixture.clear();
     assert_eq!(
         fixture.step().await,
-        Action::requeue(std::time::Duration::from_secs(300))
+        Action::requeue(std::time::Duration::from_secs(5))
     );
     let status = fixture.current().status.unwrap();
     assert_eq!(

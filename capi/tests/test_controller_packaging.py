@@ -11,6 +11,7 @@ from subprocess import CompletedProcess
 from unittest.mock import Mock, patch
 
 from scripts.lib import controller as packaging
+from scripts.lib import database_controller
 from scripts.lib.controller_foundation import foundation_payload
 
 
@@ -55,9 +56,9 @@ class Client:
             raise RuntimeError(result.stderr)
         if args and args[0] == "apply" and result.returncode == 0:
             document = json.loads(kwargs.get("input_text", "{}"))
-            if document.get("metadata", {}).get("name") == packaging.DATABASE_ACTIVATION_POLICY:
+            if document.get("metadata", {}).get("name") == packaging.CATALOG_CUTOVER_POLICY:
                 self.applied.add(
-                    document["kind"].lower() + "/" + packaging.DATABASE_ACTIVATION_POLICY
+                    document["kind"].lower() + "/" + packaging.CATALOG_CUTOVER_POLICY
                 )
         if args and args[0] == "get" and args[1] in self.applied and not result.stdout:
             return response(args[1])
@@ -68,33 +69,42 @@ class Client:
 
 
 class PackagingTests(unittest.TestCase):
-    def test_database_activation_lock_is_separate_and_effective(self):
-        policy, binding = packaging.database_activation_lock_documents()
-        self.assertEqual(policy["metadata"]["name"], packaging.DATABASE_ACTIVATION_POLICY)
+    def setUp(self):
+        legacy = patch.object(packaging, "require_absent_legacy_database_crd")
+        legacy.start()
+        self.addCleanup(legacy.stop)
+
+    def test_catalog_cutover_lock_is_separate_and_effective(self):
+        policy, binding = packaging.catalog_cutover_lock_documents()
+        self.assertEqual(policy["metadata"]["name"], packaging.CATALOG_CUTOVER_POLICY)
         self.assertEqual(policy["spec"]["failurePolicy"], "Fail")
         self.assertEqual(policy["spec"]["matchConstraints"]["resourceRules"][0], {
             "apiGroups": ["tenancy.cnpg-vcluster.io"],
             "apiVersions": ["v1alpha1"],
             "operations": ["CREATE"],
-            "resources": ["tenantdatabases"],
+            "resources": ["tenantdatabasecatalogs"],
             "scope": "Namespaced",
         })
         self.assertEqual(binding["spec"]["validationActions"], ["Deny"])
+        self.assertNotEqual(
+            packaging.catalog_cutover_lock_cleanup_refs(),
+            packaging.tenant_cutover_lock_cleanup_refs(),
+        )
         calls = []
 
         def reject(*args, **kwargs):
             calls.append((args, kwargs))
-            if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.DATABASE_ACTIVATION_POLICY}"):
+            if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}"):
                 return response(policy)
-            if args[:2] == ("get", f"validatingadmissionpolicybinding/{packaging.DATABASE_ACTIVATION_POLICY}"):
+            if args[:2] == ("get", f"validatingadmissionpolicybinding/{packaging.CATALOG_CUTOVER_POLICY}"):
                 return response(binding)
             if args[:2] == ("create", "--dry-run=server"):
-                return response(code=1, error="TenantDatabase creation is locked until both providers are ready")
+                return response(code=1, error=f"{packaging.CATALOG_CUTOVER_POLICY}: TenantDatabaseCatalog creation is locked during API cutover")
             return response()
 
         client = Client(reject)
-        packaging.ensure_database_activation_lock(client)
-        packaging.verify_database_activation_lock(client, namespace="tenant-system")
+        packaging.ensure_catalog_cutover_lock(client)
+        packaging.verify_catalog_cutover_lock(client, namespace="tenant-system")
         self.assertEqual(len([args for args, _ in calls if args[0] == "create"]), 5)
         def webhook_first(*args, **kwargs):
             result = reject(*args, **kwargs)
@@ -102,11 +112,11 @@ class PackagingTests(unittest.TestCase):
                 return response(code=1, error="Tenant identity is unavailable or not Ready")
             return result
         with self.assertRaisesRegex(RuntimeError, "not effective"):
-            packaging.verify_database_activation_lock(
+            packaging.verify_catalog_cutover_lock(
                 Client(webhook_first), namespace="tenant-system",
             )
         with self.assertRaisesRegex(RuntimeError, "not effective"):
-            packaging.verify_database_activation_lock(
+            packaging.verify_catalog_cutover_lock(
                 Client(lambda *args, **kwargs: (
                     reject(*args, **kwargs)
                     if args[:1] == ("get",) else response()
@@ -115,10 +125,10 @@ class PackagingTests(unittest.TestCase):
         invalid_policy = copy.deepcopy(policy)
         invalid_policy["spec"]["validations"][0]["expression"] = "true"
         with self.assertRaisesRegex(RuntimeError, "contract is malformed"):
-            packaging.verify_database_activation_lock(
+            packaging.verify_catalog_cutover_lock(
                 Client(lambda *args, **kwargs: (
                     response(invalid_policy)
-                    if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.DATABASE_ACTIVATION_POLICY}")
+                    if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}")
                     else reject(*args, **kwargs)
                 )), namespace="tenant-system",
             )
@@ -127,13 +137,13 @@ class PackagingTests(unittest.TestCase):
             "apiGroups": ["tenancy.cnpg-vcluster.io"],
             "apiVersions": ["v1alpha1"],
             "operations": ["CREATE"],
-            "resources": ["tenantdatabases"],
+            "resources": ["tenantdatabasecatalogs"],
         }]
         with self.assertRaisesRegex(RuntimeError, "contract is malformed"):
-            packaging.verify_database_activation_lock(
+            packaging.verify_catalog_cutover_lock(
                 Client(lambda *args, **kwargs: (
                     response(excluded_policy)
-                    if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.DATABASE_ACTIVATION_POLICY}")
+                    if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}")
                     else webhook_first(*args, **kwargs)
                 )), namespace="tenant-system",
             )
@@ -142,10 +152,10 @@ class PackagingTests(unittest.TestCase):
             "matchLabels": {"tenant-database-gates": "excluded"}
         }
         with self.assertRaisesRegex(RuntimeError, "contract is malformed"):
-            packaging.verify_database_activation_lock(
+            packaging.verify_catalog_cutover_lock(
                 Client(lambda *args, **kwargs: (
                     response(selected_policy)
-                    if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.DATABASE_ACTIVATION_POLICY}")
+                    if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}")
                     else webhook_first(*args, **kwargs)
                 )), namespace="tenant-system",
             )
@@ -297,7 +307,7 @@ class PackagingTests(unittest.TestCase):
             for args, _ in client.calls
         ))
 
-    def test_cutover_crd_render_failure_retains_database_activation_lock(self):
+    def test_cutover_crd_render_failure_retains_catalog_cutover_lock(self):
         old = {
             "spec": {"versions": [{
                 "name": "v1alpha3", "served": True, "storage": True,
@@ -320,7 +330,7 @@ class PackagingTests(unittest.TestCase):
             packaging.prepare_tenant_api_cutover(Path("."), CONFIG, client)
         self.assertTrue(any(
             args and args[0] == "apply" and
-            packaging.DATABASE_ACTIVATION_POLICY in kwargs.get("input_text", "")
+            packaging.CATALOG_CUTOVER_POLICY in kwargs.get("input_text", "")
             for args, kwargs in client.calls
         ))
         self.assertFalse(any(
@@ -719,23 +729,249 @@ class PackagingTests(unittest.TestCase):
         )
 
 
+class CatalogInstallerTests(unittest.TestCase):
+    @staticmethod
+    def catalog_crd():
+        return {
+            "spec": {"versions": [{
+                "name": "v1alpha1", "served": True, "storage": True,
+                "subresources": {"status": {}},
+            }]},
+            "status": {"storedVersions": ["v1alpha1"]},
+        }
+
+    def test_catalog_installer_requires_discovery_and_policy_denial(self):
+        local = database_controller.catalog_manifests(ROOT)
+        azure = database_controller.catalog_manifests(ROOT, azure=True)
+        self.assertTrue(all(path.is_file() for path in (*local, *azure)))
+        self.assertIn(
+            "tenancy.cnpg-vcluster.io_tenantdatabasecatalogs.yaml",
+            [path.name for path in local],
+        )
+        self.assertNotIn("controller-cluster-role-azure.yaml", [path.name for path in local])
+        self.assertNotIn("controller-cluster-role.yaml", [path.name for path in azure])
+        self.assertFalse(any("admission" in str(path) or "gates" in str(path)
+                             for path in (*local, *azure)))
+        policy, binding = packaging.catalog_cutover_lock_documents()
+
+        def handler(*args, **_kwargs):
+            if args[:2] == ("get", f"crd/{database_controller.CATALOG_CRD}"):
+                return response(self.catalog_crd())
+            if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}"):
+                return response(policy)
+            if args[:2] == ("get", f"validatingadmissionpolicybinding/{packaging.CATALOG_CUTOVER_POLICY}"):
+                return response(binding)
+            if args == ("get", "--raw=/apis/tenancy.cnpg-vcluster.io/v1alpha1"):
+                return response({"resources": [{
+                    "name": "tenantdatabasecatalogs",
+                    "kind": "TenantDatabaseCatalog",
+                    "namespaced": True,
+                }]})
+            if args[:2] == ("create", "--dry-run=server"):
+                return response(code=1, error=(
+                    f"{packaging.CATALOG_CUTOVER_POLICY}: "
+                    "TenantDatabaseCatalog creation is locked during API cutover"
+                ))
+            return response()
+
+        with patch.object(packaging, "require_absent_legacy_database_crd") as preflight:
+            client = Client(handler)
+            packaging.install_database_catalog(ROOT, CONFIG, client)
+            preflight.assert_called_once_with(client)
+            self.assertEqual(
+                len([args for args, _ in client.calls if args[:2] == ("create", "--dry-run=server")]),
+                25,
+            )
+            self.assertFalse(any("database-admission" in str(args) for args, _ in client.calls))
+
+            with self.assertRaisesRegex(RuntimeError, "endpoint is not served"):
+                packaging.install_database_catalog(
+                    ROOT, CONFIG, Client(lambda *args, **kw: (
+                        response({"resources": []})
+                        if args == ("get", "--raw=/apis/tenancy.cnpg-vcluster.io/v1alpha1")
+                        else handler(*args, **kw)
+                    )),
+                )
+            self.assertEqual(preflight.call_count, 2)
+
+            with self.assertRaisesRegex(RuntimeError, "not effective"):
+                packaging.install_database_catalog(
+                    ROOT, CONFIG, Client(lambda *args, **kw: (
+                        response(code=1, error="schema validation rejected")
+                        if args[:2] == ("create", "--dry-run=server")
+                        else handler(*args, **kw)
+                    )),
+                )
+            self.assertEqual(preflight.call_count, 3)
+
+            probes = 0
+            def lagging(*args, **kw):
+                nonlocal probes
+                if args[:2] == ("create", "--dry-run=server"):
+                    probes += 1
+                    if probes == 8:
+                        return response()
+                return handler(*args, **kw)
+
+            with self.assertRaisesRegex(RuntimeError, "not effective"):
+                packaging.install_database_catalog(ROOT, CONFIG, Client(lagging))
+            self.assertEqual(preflight.call_count, 4)
+
+    def test_legacy_crd_blocks_before_catalog_install_and_is_never_deleted(self):
+        client = Client(lambda *args, **_kwargs: (
+            response(f"crd/{database_controller.LEGACY_CRD}")
+            if args[:2] == ("get", f"crd/{database_controller.LEGACY_CRD}")
+            else response()
+        ))
+        with (
+            patch.object(packaging, "require_absent_legacy_database_crd",
+                         database_controller.require_absent_legacy_database_crd),
+            self.assertRaisesRegex(RuntimeError, "Separately prove"),
+        ):
+            packaging.install_database_catalog(ROOT, CONFIG, client)
+        self.assertEqual(len(client.calls), 1)
+        self.assertEqual(client.calls[0][0][:2], (
+            "get", f"crd/{database_controller.LEGACY_CRD}",
+        ))
+
+    def test_legacy_crd_blocks_tenant_cutover_before_policy_mutation(self):
+        client = Client(lambda *args, **_kwargs: (
+            response(f"crd/{database_controller.LEGACY_CRD}")
+            if args[:2] == ("get", f"crd/{database_controller.LEGACY_CRD}")
+            else response()
+        ))
+        with (
+            patch.object(packaging, "require_absent_legacy_database_crd",
+                         database_controller.require_absent_legacy_database_crd),
+            self.assertRaisesRegex(RuntimeError, "clean-install-only cutover"),
+        ):
+            packaging.prepare_tenant_api_cutover(ROOT, CONFIG, client)
+        self.assertEqual(len(client.calls), 1)
+        self.assertFalse(any(args[0] in ("apply", "patch", "delete")
+                             for args, _ in client.calls))
+
+    def test_fresh_cutover_retains_tenant_create_lock_until_catalog_lifecycle(self):
+        client = Client()
+        with patch.object(packaging, "require_absent_legacy_database_crd",
+                          database_controller.require_absent_legacy_database_crd):
+            self.assertTrue(packaging.prepare_tenant_api_cutover(ROOT, CONFIG, client))
+        applied = [
+            json.loads(kwargs["input_text"])["metadata"]["name"]
+            for args, kwargs in client.calls if args[:1] == ("apply",)
+        ]
+        self.assertIn(packaging.TENANT_CUTOVER_POLICY, applied)
+        self.assertIn(packaging.CATALOG_CUTOVER_POLICY, applied)
+        self.assertFalse(any(args[:1] == ("delete",) for args, _ in client.calls))
+
+    def test_absent_legacy_crd_allows_catalog_preflight_and_lookup_errors_block(self):
+        absent = Client()
+        database_controller.require_absent_legacy_database_crd(absent)
+        self.assertEqual(len(absent.calls), 1)
+        for error in ("forbidden", "connection refused"):
+            client = Client(lambda *_args, **_kwargs: response(code=1, error=error))
+            with self.subTest(error=error), self.assertRaisesRegex(
+                RuntimeError, "failed to inspect CRD",
+            ):
+                database_controller.require_absent_legacy_database_crd(client)
+            self.assertEqual(len(client.calls), 1)
+
+    def test_absent_legacy_crd_permits_catalog_install(self):
+        policy, binding = packaging.catalog_cutover_lock_documents()
+
+        def handler(*args, **_kwargs):
+            if args[:2] == ("get", f"crd/{database_controller.CATALOG_CRD}"):
+                return response(self.catalog_crd())
+            if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}"):
+                return response(policy)
+            if args[:2] == ("get", f"validatingadmissionpolicybinding/{packaging.CATALOG_CUTOVER_POLICY}"):
+                return response(binding)
+            if args == ("get", "--raw=/apis/tenancy.cnpg-vcluster.io/v1alpha1"):
+                return response({"resources": [{
+                    "name": "tenantdatabasecatalogs", "kind": "TenantDatabaseCatalog",
+                    "namespaced": True,
+                }]})
+            if args[:2] == ("create", "--dry-run=server"):
+                return response(code=1, error=(
+                    f"{packaging.CATALOG_CUTOVER_POLICY}: "
+                    "TenantDatabaseCatalog creation is locked during API cutover"
+                ))
+            return response()
+
+        client = Client(handler)
+        with patch.object(packaging, "require_absent_legacy_database_crd",
+                          database_controller.require_absent_legacy_database_crd):
+            packaging.install_database_catalog(ROOT, CONFIG, client)
+        self.assertEqual(
+            client.calls[0][0][:2],
+            ("get", f"crd/{database_controller.LEGACY_CRD}"),
+        )
+        self.assertTrue(any(
+            args[:1] == ("apply",)
+            and "tenancy.cnpg-vcluster.io_tenantdatabasecatalogs.yaml" in str(args)
+            for args, _ in client.calls
+        ))
+        self.assertFalse(any(
+            args[:2] == ("delete", f"crd/{database_controller.LEGACY_CRD}")
+            for args, _ in client.calls
+        ))
+
+    def test_clean_install_no_legacy_mutation_in_tracked_installer_sources(self):
+        sources = [
+            ROOT / "scripts/lib/database_controller.py",
+            ROOT / "scripts/lib/controller.py",
+            ROOT / "scripts/lib/azure/foundation.py",
+        ]
+        for source in sources:
+            with self.subTest(source=source):
+                text = source.read_text()
+                self.assertNotIn("retire_legacy_database_api", text)
+                self.assertNotIn("fence_legacy_database_api", text)
+        self.assertFalse(
+            (ROOT / "database-controller/config/crd/bases/"
+             "tenancy.cnpg-vcluster.io_tenantdatabases.yaml").exists()
+        )
+
+    def test_catalog_inventory_never_treats_accepted_entries_as_empty(self):
+        def handler(*args, **_kwargs):
+            if args[:2] == ("get", f"crd/{database_controller.CATALOG_CRD}"):
+                return response("crd/" + database_controller.CATALOG_CRD)
+            if args == ("get", "--raw=/apis/tenancy.cnpg-vcluster.io/v1alpha1/tenantdatabasecatalogs"):
+                return response({
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+                    "kind": "TenantDatabaseCatalogList",
+                    "metadata": {"continue": ""},
+                    "items": [{"metadata": {"name": "accepted"}}],
+                })
+            return response()
+
+        with self.assertRaisesRegex(RuntimeError, "retained TenantDatabaseCatalogs"):
+            database_controller.inspect_catalog_inventory(Client(handler))
+        with self.assertRaisesRegex(RuntimeError, "inventory is invalid"):
+            database_controller.inspect_catalog_inventory(Client(
+                lambda *args, **kwargs: (
+                    response({
+                        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
+                        "kind": "TenantDatabaseCatalogList",
+                        "metadata": {"continue": "more"},
+                        "items": [],
+                    }) if args[:2] == (
+                        "get", "--raw=/apis/tenancy.cnpg-vcluster.io/v1alpha1/tenantdatabasecatalogs"
+                    ) else handler(*args, **kwargs)
+                )
+            ))
+
+
 class CurrentControllerPackagingTests(unittest.TestCase):
     def setUp(self):
         cutover = patch.object(packaging, "TENANT_API_CUTOVER_READY", True)
         cutover.start()
         self.addCleanup(cutover.stop)
         for target, value in (
-            ("database_admission_image", "admission:image"),
-            ("install_database_admission", None),
+            ("install_database_catalog", None),
         ):
             mocked = patch.object(packaging, target, return_value=value)
             mocked.start()
             self.addCleanup(mocked.stop)
-        from scripts.lib import database_controller
-        build = patch.object(database_controller, "build_admission_image",
-                             return_value="admission:image")
-        build.start()
-        self.addCleanup(build.stop)
 
     @staticmethod
     def foundation(image="rust:image"):
@@ -749,6 +985,22 @@ class CurrentControllerPackagingTests(unittest.TestCase):
                 "foundation.sha256": packaging._foundation_checksum(raw),
             },
         }
+
+    def test_catalog_install_failure_keeps_tenant_creation_fenced(self):
+        client = Client()
+        with (
+            patch.object(packaging, "build_controller_image", return_value="rust:image"),
+            patch.object(packaging, "_foundation_payload", return_value=self.foundation()),
+            patch.object(packaging, "run"),
+            patch.object(packaging, "prepare_tenant_api_cutover", return_value=True),
+            patch.object(packaging, "verify_controller_crd"),
+            patch.object(packaging, "install_database_catalog",
+                         side_effect=RuntimeError("catalog fence is not effective")),
+            patch.object(packaging, "remove_tenant_cutover_lock") as unlock,
+            self.assertRaisesRegex(RuntimeError, "catalog fence is not effective"),
+        ):
+            packaging.reconcile_controller(Path("."), CONFIG, client, {}, Mock(), None)
+        unlock.assert_not_called()
 
     def test_crd_requires_exact_served_and_stored_version_and_status(self):
         valid = {
@@ -813,6 +1065,7 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         client = Client(handle)
         with (
             patch.object(packaging, "build_controller_image", return_value="rust:image"),
+            patch.object(packaging, "prepare_tenant_api_cutover", return_value=False),
             patch.object(packaging, "_foundation_payload", return_value=desired),
             patch.object(packaging, "run"),
             patch.object(packaging, "verify_controller_crd"),
@@ -867,6 +1120,7 @@ class CurrentControllerPackagingTests(unittest.TestCase):
         client = Client(handle)
         with (
             patch.object(packaging, "build_controller_image", return_value="rust:image"),
+            patch.object(packaging, "prepare_tenant_api_cutover", return_value=False),
             patch.object(packaging, "_foundation_payload", return_value=desired),
             patch.object(packaging, "run"),
             patch.object(packaging, "verify_controller_crd"),
@@ -918,6 +1172,7 @@ class CurrentControllerPackagingTests(unittest.TestCase):
 
         with (
             patch.object(packaging, "build_controller_image", return_value="rust:image"),
+            patch.object(packaging, "prepare_tenant_api_cutover", return_value=False),
             patch.object(packaging, "_foundation_payload", return_value=desired),
             patch.object(packaging, "run"),
             patch.object(packaging, "verify_controller_crd"),
@@ -975,6 +1230,7 @@ class CurrentControllerPackagingTests(unittest.TestCase):
             with (
                 self.subTest(accepted_after=accepted_after),
                 patch.object(packaging, "build_controller_image", return_value="rust:image"),
+                patch.object(packaging, "prepare_tenant_api_cutover", return_value=False),
                 patch.object(packaging, "_foundation_payload", return_value=desired),
                 patch.object(packaging, "run"),
                 patch.object(packaging, "verify_controller_crd"),

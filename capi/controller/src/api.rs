@@ -60,6 +60,7 @@ pub struct TenantStatus {
     #[serde(skip_serializing_if = "Option::is_none")] pub phase: Option<TenantPhase>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
     #[serde(skip_serializing_if = "Option::is_none")] pub database_capability: Option<DatabaseCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub catalog_create_intent: Option<CatalogCreateIntent>,
     #[serde(skip_serializing_if = "Option::is_none")] #[schemars(with = "Option<TenantProviderStatusSchema>")] pub provider: Option<TenantProviderStatus>,
 }
 
@@ -68,18 +69,20 @@ pub struct TenantStatus {
 #[serde(rename_all = "camelCase")]
 pub struct DatabaseCapability {
     pub available: bool, pub reason: String,
+    pub namespace: String,
     #[serde(rename = "namespaceUID")] pub namespace_uid: String,
-    #[serde(rename = "quotaUID")] pub quota_uid: String,
-    #[serde(rename = "gateUID")] pub gate_uid: String,
+    #[serde(rename = "catalogUID")] pub catalog_uid: String,
     #[serde(skip_serializing_if = "Option::is_none", rename = "storageNamespaceUID")]
     pub storage_namespace_uid: Option<String>,
 }
 
 #[rustfmt::skip]
-impl DatabaseCapability {
-    pub fn identity(&self) -> Option<tenant_database_runtime::GateIdentity> {
-        tenant_database_runtime::GateIdentity::from_recorded(&self.namespace_uid, &self.quota_uid, &self.gate_uid, self.storage_namespace_uid.as_deref())
-    }
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCreateIntent {
+    pub namespace: String,
+    pub name: String,
+    #[serde(rename = "tenantUID")] pub tenant_uid: String,
 }
 
 #[rustfmt::skip]
@@ -317,6 +320,7 @@ pub fn tenant_crd() -> k8s_openapi::apiextensions_apiserver::pkg::apis::apiexten
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type == self.spec.provider.type", "Tenant provider status must match the requested provider"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type != 'azure' || (!has(self.status.provider.allocation) && !has(self.status.provider.foundationHash) && !has(self.status.provider.clusterUID))", "Azure provider status cannot contain local durable identity"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type != 'local' || (!has(self.status.provider.binding) && !has(self.status.provider.networkAllocation) && !has(self.status.provider.endpoint) && !has(self.status.provider.management) && !has(self.status.provider.kubeconfig) && !has(self.status.provider.vmss) && !has(self.status.provider.nodes) && !has(self.status.provider.addonComponents) && !has(self.status.provider.providerResources) && !has(self.status.provider.deletion))", "Local provider status cannot contain Azure durable identity"),
+        rule("!has(oldSelf.status) || !has(oldSelf.status.catalogCreateIntent) || (has(self.status) && has(self.status.catalogCreateIntent) && self.status.catalogCreateIntent == oldSelf.status.catalogCreateIntent)", "catalog creation intent cannot be removed or replaced"),
         rule("self.spec.kubernetesVersion.matches('^v?[0-9]+[.][0-9]+[.][0-9]+$')", "kubernetesVersion must be a three-component numeric version"),
     ]);
     crd
@@ -357,6 +361,7 @@ mod tests {
             phase: Some(TenantPhase::Progressing),
             conditions: vec![condition],
             database_capability: None,
+            catalog_create_intent: None,
             provider: Some(TenantProviderStatus::Local(LocalProviderStatus {
                 allocation: Some(AllocationStatus {
                     slot_id: "slot-a".into(),
@@ -672,6 +677,24 @@ mod tests {
         assert!(!provider_fields.contains_key("databases"));
         assert!(!provider_fields.contains_key("podCIDR"));
         assert!(!provider_fields.contains_key("serviceCIDR"));
+        let status_fields = properties["status"].properties.as_ref().unwrap();
+        let capability_fields = status_fields["databaseCapability"]
+            .properties
+            .as_ref()
+            .unwrap();
+        for field in ["namespace", "namespaceUID", "catalogUID"] {
+            assert!(capability_fields.contains_key(field));
+        }
+        assert!(!capability_fields.contains_key("gateUID"));
+        assert!(!capability_fields.contains_key("quotaUID"));
+        let intent_fields = status_fields["catalogCreateIntent"]
+            .properties
+            .as_ref()
+            .unwrap();
+        assert_eq!(intent_fields.len(), 3);
+        for field in ["namespace", "name", "tenantUID"] {
+            assert!(intent_fields.contains_key(field));
+        }
         let status_provider = properties["status"].properties.as_ref().unwrap()["provider"]
             .properties
             .as_ref()
@@ -709,6 +732,9 @@ mod tests {
                 .any(|r| r.contains("status.provider.type == self.spec.provider.type"))
         );
         assert!(rules.iter().any(|r| r.contains("spec.kubernetesVersion")));
+        assert!(rules.iter().any(|r| {
+            r.contains("self.status.catalogCreateIntent == oldSelf.status.catalogCreateIntent")
+        }));
         let conditions = &properties["status"].properties.as_ref().unwrap()["conditions"];
         assert_eq!(conditions.x_kubernetes_list_type.as_deref(), Some("map"));
         assert_eq!(

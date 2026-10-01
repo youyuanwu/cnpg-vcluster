@@ -4,7 +4,7 @@ use kube::{
 };
 use serde_json::{Value, json};
 
-use crate::api::{Tenant, TenantStatus};
+use crate::api::{CatalogCreateIntent, FINALIZER, Tenant, TenantStatus};
 use crate::error::ControllerError;
 
 fn invalid() -> ControllerError {
@@ -150,6 +150,39 @@ where
     F: Fn(&mut TenantStatus) -> Result<(), ControllerError>,
 {
     mutate_status(client, tenant, tenant, mutate, 4, false).await
+}
+
+pub async fn record_catalog_create_intent(
+    client: Client,
+    tenant: &Tenant,
+    intent: &CatalogCreateIntent,
+) -> Result<(), ControllerError> {
+    let uid = tenant.uid().ok_or_else(invalid)?;
+    if tenant.metadata.deletion_timestamp.is_some()
+        || !tenant
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == FINALIZER)
+        || intent.tenant_uid != uid
+        || intent.namespace.is_empty()
+        || intent.name.is_empty()
+    {
+        return Err(invalid());
+    }
+    update_status(client, tenant, |status| {
+        if status
+            .catalog_create_intent
+            .as_ref()
+            .is_some_and(|recorded| recorded != intent)
+        {
+            return Err(ControllerError::OwnershipInvalid(
+                "catalog creation intent identity changed".into(),
+            ));
+        }
+        status.catalog_create_intent = Some(intent.clone());
+        Ok(())
+    })
+    .await
 }
 
 pub async fn replace_status(

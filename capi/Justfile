@@ -107,11 +107,11 @@ controller-build:
 controller-image:
     @python3 scripts/build_controller.py
 
-# Verify checked-in TenantDatabase API and admission/RBAC resources.
+# Verify checked-in TenantDatabaseCatalog API and RBAC resources.
 database-controller-verify:
     @cargo run --locked --offline -p tenant-database-controller --bin generate -- --check
 
-# Run database-controller API, admission, and generated-contract tests.
+# Run database-controller API and generated-contract tests.
 database-controller-test:
     @cargo test --locked --offline -p tenant-database-controller --all-targets
 

@@ -9,6 +9,9 @@ from scripts.lib.controller_catalog import (
     ManagementResource,
     load_management_resources,
 )
+from scripts.lib.database_controller import (
+    inspect_catalog_inventory, require_absent_legacy_database_crd,
+)
 from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
 
@@ -83,45 +86,8 @@ def require_clean_controller_state(
         )
     if tenants.returncode != 0:
         raise RuntimeError(f"failed to inspect Tenant resources: {tenants.stderr}")
-    database_crd_response = client.kubectl(
-        "get",
-        "crd/tenantdatabases.tenancy.cnpg-vcluster.io",
-        "--ignore-not-found=true",
-        "-o",
-        "name",
-        check=False,
-    )
-    if database_crd_response.returncode != 0 and not _missing(
-        database_crd_response, undiscovered=True
-    ):
-        raise RuntimeError(
-            "failed to inspect TenantDatabase CRD: "
-            + database_crd_response.stderr
-        )
-    database_crd = database_crd_response.stdout.strip()
-    if database_crd:
-        databases = client.kubectl(
-            "get",
-            "tenantdatabases.tenancy.cnpg-vcluster.io",
-            "--all-namespaces",
-            "-o",
-            "json",
-        )
-        try:
-            payload = json.loads(databases.stdout)
-        except json.JSONDecodeError as error:
-            raise RuntimeError("TenantDatabase cutover inventory is invalid") from error
-        if (
-            not isinstance(payload, dict)
-            or payload.get("kind") != "TenantDatabaseList"
-            or payload.get("apiVersion") != "tenancy.cnpg-vcluster.io/v1alpha1"
-            or not isinstance(payload.get("items"), list)
-            or not isinstance(payload.get("metadata"), dict)
-            or payload["metadata"].get("continue", "") != ""
-        ):
-            raise RuntimeError("TenantDatabase cutover inventory is invalid")
-        if payload["items"]:
-            raise RuntimeError("retained TenantDatabases block Tenant API cutover")
+    require_absent_legacy_database_crd(client)
+    inspect_catalog_inventory(client)
     for resource in load_management_resources(root):
         _verify_discovery(client, resource)
         for item in _inventory(client, resource):
