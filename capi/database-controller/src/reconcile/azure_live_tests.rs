@@ -28,6 +28,7 @@ const CATALOG_PATH: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/t
 struct ClusterApi {
     catalog: TenantDatabaseCatalog,
     objects: BTreeMap<String, DynamicObject>,
+    known_paths: BTreeSet<String>,
     deleted: BTreeMap<String, (String, String)>,
     verified_absent: BTreeSet<String>,
     events: Vec<String>,
@@ -60,7 +61,9 @@ fn resource_path(resource: &DynamicObject) -> String {
 
 fn insert(api: &mut ClusterApi, mut object: DynamicObject, id: &str) {
     object.metadata.uid = Some(id.into());
-    api.objects.insert(resource_path(&object), object);
+    let path = resource_path(&object);
+    api.known_paths.insert(path.clone());
+    api.objects.insert(path, object);
 }
 
 fn initial_state() -> (ClusterApi, Access, BTreeMap<String, Value>) {
@@ -119,6 +122,7 @@ fn initial_state() -> (ClusterApi, Access, BTreeMap<String, Value>) {
     let mut api = ClusterApi {
         catalog: catalog.clone(),
         objects: BTreeMap::new(),
+        known_paths: BTreeSet::new(),
         deleted: BTreeMap::new(),
         verified_absent: BTreeSet::new(),
         events: vec![],
@@ -248,6 +252,13 @@ fn initial_state() -> (ClusterApi, Access, BTreeMap<String, Value>) {
     (api, access, cloud)
 }
 
+fn require_absence(api: &ClusterApi, path: &str) {
+    assert!(
+        api.verified_absent.contains(path),
+        "dependent delete before NotFound: {path}"
+    );
+}
+
 fn management_client(
     mock: Arc<Mutex<ClusterApi>>,
     cloud: Arc<Mutex<BTreeMap<String, Value>>>,
@@ -285,12 +296,13 @@ fn management_client(
                         }),
                     ),
                     (Method::GET, _) => {
+                        assert!(mock.known_paths.contains(&path), "unexpected GET {path}");
                         if let Some(resource) = mock.objects.get(&path) {
                             (StatusCode::OK, json!(resource))
                         } else {
-                            if mock.deleted.contains_key(&path) {
-                                mock.verified_absent.insert(path.clone());
-                            }
+                            assert!(mock.deleted.contains_key(&path), "unissued GET 404 {path}");
+                            mock.verified_absent.insert(path.clone());
+                            mock.events.push(format!("KUBE_NOT_FOUND:{path}"));
                             (
                                 StatusCode::NOT_FOUND,
                                 json!({"reason":"NotFound","code":404}),
@@ -314,14 +326,68 @@ fn management_client(
                             .and_then(|labels| labels.get(ownership::ENTRY_LABEL))
                             .expect("all workload and disk resources bind an entry");
                         let kind = live.types.as_ref().unwrap().kind.clone();
-                        if kind == "Disk" {
-                            assert!(mock.deleted.iter().all(
-                                |(deleted_path, (uid, prior_kind))| {
-                                    uid != owner
-                                        || prior_kind == "Disk"
-                                        || mock.verified_absent.contains(deleted_path)
+                        let (namespace, cluster) = ownership::names(CATALOG, owner).unwrap();
+                        let secret =
+                            format!("/api/v1/namespaces/{namespace}/secrets/{cluster}-superuser");
+                        let ordinal = live
+                            .name_any()
+                            .rsplit('-')
+                            .next()
+                            .and_then(|last| last.parse::<i32>().ok());
+                        match kind.as_str() {
+                            "Cluster" => {}
+                            "Secret" => require_absence(
+                                &mock,
+                                &format!(
+                                    "/apis/postgresql.cnpg.io/v1/namespaces/{namespace}/clusters/{cluster}"
+                                ),
+                            ),
+                            "PersistentVolumeClaim" => {
+                                require_absence(&mock, &secret);
+                                if let Some(prior) = ordinal.filter(|n| *n > 1) {
+                                    require_absence(
+                                        &mock,
+                                        &format!(
+                                            "/api/v1/persistentvolumes/pv-{cluster}-{}",
+                                            prior - 1
+                                        ),
+                                    );
                                 }
-                            ));
+                            }
+                            "PersistentVolume" => require_absence(
+                                &mock,
+                                &format!(
+                                    "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{cluster}-{}",
+                                    ordinal.unwrap()
+                                ),
+                            ),
+                            "Namespace" => {
+                                for ordinal in 1..=3 {
+                                    require_absence(
+                                        &mock,
+                                        &format!(
+                                            "/api/v1/persistentvolumes/pv-{cluster}-{ordinal}"
+                                        ),
+                                    );
+                                }
+                            }
+                            "Disk" => {
+                                require_absence(&mock, &format!("/api/v1/namespaces/{namespace}"));
+                                if let Some(prior) = ordinal.filter(|n| *n > 1) {
+                                    require_absence(
+                                        &mock,
+                                        &format!(
+                                            "/apis/compute.azure.com/v1api20240302/namespaces/tenant-db-storage-tenant-a/disks/{cluster}-{}",
+                                            prior - 1
+                                        ),
+                                    );
+                                    assert!(mock.events.contains(&format!(
+                                        "ARM_GET_NOT_FOUND:{}",
+                                        arm_id(GROUP, &format!("{cluster}-{}", prior - 1))
+                                    )));
+                                }
+                            }
+                            _ => panic!("unexpected Kubernetes deletion kind {kind}"),
                         }
                         mock.deleted.insert(path.clone(), (owner.clone(), kind));
                         mock.events.push(format!(
@@ -352,6 +418,7 @@ fn management_client(
                                 .entries
                                 .keys()
                                 .filter(|uid| !next.spec.entries.contains_key(*uid))
+                                .cloned()
                                 .collect();
                             assert_eq!(removed.len(), 1);
                             let proof = mock
@@ -360,23 +427,47 @@ fn management_client(
                                 .as_ref()
                                 .unwrap()
                                 .entries
-                                .get(removed[0])
+                                .get(&removed[0])
                                 .unwrap()
                                 .finalization
                                 .as_ref()
                                 .unwrap();
                             assert!(proof.terminal_verified && proof.pending.is_empty());
                             assert_eq!(proof.verified_absent.len(), 3);
+                            let (_, cluster) = ownership::names(CATALOG, &removed[0]).unwrap();
+                            let expected: BTreeSet<_> = (1..=3)
+                                .map(|ordinal| arm_id(GROUP, &format!("{cluster}-{ordinal}")))
+                                .collect();
+                            assert_eq!(
+                                proof
+                                    .verified_absent
+                                    .iter()
+                                    .cloned()
+                                    .collect::<BTreeSet<_>>(),
+                                expected
+                            );
                             for id in &proof.verified_absent {
                                 assert!(!cloud.lock().unwrap().contains_key(id));
+                                let deleted = mock
+                                    .events
+                                    .iter()
+                                    .position(|event| event == &format!("ARM:{id}"))
+                                    .expect("exact ARM DELETE");
+                                let absent = mock
+                                    .events
+                                    .iter()
+                                    .rposition(|event| event == &format!("ARM_GET_NOT_FOUND:{id}"))
+                                    .expect("direct post-DELETE NotFound");
+                                assert!(deleted < absent);
                             }
                             assert!(mock.deleted.iter().all(|(deleted_path, (uid, _))| {
-                                uid != removed[0] || mock.verified_absent.contains(deleted_path)
+                                uid != &removed[0] || mock.verified_absent.contains(deleted_path)
                             }));
                             for (uid, entry) in &next.spec.entries {
                                 assert_eq!(mock.catalog.spec.entries.get(uid), Some(entry));
                             }
                             mock.spec_updates += 1;
+                            mock.events.push(format!("CATALOG_REMOVE:{}", removed[0]));
                         } else {
                             assert_eq!(next.spec, mock.catalog.spec);
                             let mut observed = 0;
@@ -419,6 +510,13 @@ fn management_client(
                                                 .lock()
                                                 .unwrap()
                                                 .contains_key(&arm_id(GROUP, &intent.name))
+                                        );
+                                        assert_eq!(
+                                            mock.events.last(),
+                                            Some(&format!(
+                                                "ARM_GET_SUCCEEDED:{}",
+                                                arm_id(GROUP, &intent.name)
+                                            ))
                                         );
                                         observed += 1;
                                     }
@@ -466,6 +564,8 @@ async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_di
     access.arm.as_mut().unwrap().token_file = token.path().to_str().unwrap().into();
     let event_state = mock.clone();
     let cloud_state = cloud.clone();
+    let known_arm_ids: Arc<BTreeSet<String>> =
+        Arc::new(cloud.lock().unwrap().keys().cloned().collect());
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let address = listener.local_addr().unwrap();
     let server = tokio::spawn(async move {
@@ -474,12 +574,14 @@ async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_di
             any(move |request: Request<AxumBody>| {
                 let events = event_state.clone();
                 let cloud = cloud_state.clone();
+                let known_ids = known_arm_ids.clone();
                 async move {
                     if request.uri().path() == "/token" && request.method() == Method::POST {
                         return (StatusCode::OK, Json(json!({"access_token":"test-token"})));
                     }
                     let path = request.uri().path().to_owned();
-                    if request.uri().query() != Some("api-version=2024-03-02")
+                    if !known_ids.contains(&path)
+                        || request.uri().query() != Some("api-version=2024-03-02")
                         || request
                             .headers()
                             .get("authorization")
@@ -514,9 +616,18 @@ async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_di
                         events.lock().unwrap().events.push(format!("ARM:{path}"));
                         return (StatusCode::ACCEPTED, Json(Value::Null));
                     }
-                    match cloud.lock().unwrap().get(&path).cloned() {
-                        Some(disk) => (StatusCode::OK, Json(disk)),
-                        None => (StatusCode::NOT_FOUND, Json(json!({"error":"NotFound"}))),
+                    let disk = cloud.lock().unwrap().get(&path).cloned();
+                    match disk {
+                        Some(disk) => {
+                            events.lock().unwrap().events.push(format!("ARM_GET_SUCCEEDED:{path}"));
+                            (StatusCode::OK, Json(disk))
+                        }
+                        None => {
+                            let mut events = events.lock().unwrap();
+                            assert!(events.events.contains(&format!("ARM:{path}")));
+                            events.events.push(format!("ARM_GET_NOT_FOUND:{path}"));
+                            (StatusCode::NOT_FOUND, Json(json!({"error":"NotFound"})))
+                        }
                     }
                 }
             }),
@@ -553,17 +664,54 @@ async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_di
         let events = mock.lock().unwrap().events.clone();
         let position = |event: &str| events.iter().position(|seen| seen == event).unwrap();
         let cluster = position(&format!("Cluster:{cluster_name}"));
-        let secret = position(&format!("Secret:{cluster_name}-superuser"));
-        let pvc = position(&format!("PersistentVolumeClaim:{cluster_name}-1"));
-        let pv = position(&format!("PersistentVolume:pv-{cluster_name}-1"));
-        let namespace_event = position(&format!("Namespace:{namespace}"));
-        let aso = position(&format!("Disk:{cluster_name}-1"));
-        let arm = position(&format!(
-            "ARM:{}",
-            arm_id(GROUP, &disk_name(&cluster_name, 1))
+        let cluster_absent = position(&format!(
+            "KUBE_NOT_FOUND:/apis/postgresql.cnpg.io/v1/namespaces/{namespace}/clusters/{cluster_name}"
         ));
-        assert!(cluster < secret && secret < pvc && pvc < pv && pv < namespace_event);
-        assert!(namespace_event < aso && aso < arm);
+        let secret = position(&format!("Secret:{cluster_name}-superuser"));
+        let secret_absent = position(&format!(
+            "KUBE_NOT_FOUND:/api/v1/namespaces/{namespace}/secrets/{cluster_name}-superuser"
+        ));
+        let namespace_event = position(&format!("Namespace:{namespace}"));
+        let namespace_absent = position(&format!("KUBE_NOT_FOUND:/api/v1/namespaces/{namespace}"));
+        let removed = position(&format!("CATALOG_REMOVE:{uid}"));
+        assert!(cluster < cluster_absent && cluster_absent < secret && secret < secret_absent);
+        let mut previous_pv_absent = secret_absent;
+        let mut previous_arm_absent = namespace_absent;
+        for ordinal in 1..=3 {
+            let pvc = position(&format!("PersistentVolumeClaim:{cluster_name}-{ordinal}"));
+            let pvc_absent = position(&format!(
+                "KUBE_NOT_FOUND:/api/v1/namespaces/{namespace}/persistentvolumeclaims/{cluster_name}-{ordinal}"
+            ));
+            let pv = position(&format!("PersistentVolume:pv-{cluster_name}-{ordinal}"));
+            let pv_absent = position(&format!(
+                "KUBE_NOT_FOUND:/api/v1/persistentvolumes/pv-{cluster_name}-{ordinal}"
+            ));
+            assert!(
+                previous_pv_absent < pvc && pvc < pvc_absent && pvc_absent < pv && pv < pv_absent
+            );
+            assert!(pv_absent < namespace_event);
+            previous_pv_absent = pv_absent;
+            let name = disk_name(&cluster_name, ordinal);
+            let disk_path = format!(
+                "/apis/compute.azure.com/v1api20240302/namespaces/tenant-db-storage-tenant-a/disks/{name}"
+            );
+            let id = arm_id(GROUP, &name);
+            let terminal_create = position(&format!("ARM_GET_SUCCEEDED:{id}"));
+            let aso = position(&format!("Disk:{name}"));
+            let aso_absent = position(&format!("KUBE_NOT_FOUND:{disk_path}"));
+            let arm = position(&format!("ARM:{id}"));
+            let arm_absent = position(&format!("ARM_GET_NOT_FOUND:{id}"));
+            assert!(namespace_absent < terminal_create && terminal_create < aso);
+            assert!(
+                previous_arm_absent < aso
+                    && aso < aso_absent
+                    && aso_absent < arm
+                    && arm < arm_absent
+                    && arm_absent < removed
+            );
+            previous_arm_absent = arm_absent;
+        }
+        assert!(previous_pv_absent < namespace_event && namespace_event < namespace_absent);
     }
     assert_eq!(mock.lock().unwrap().spec_updates, 3);
     assert_eq!(mock.lock().unwrap().observed_cloud_creates, 9);
