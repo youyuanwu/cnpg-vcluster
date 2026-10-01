@@ -56,8 +56,22 @@ pub(crate) async fn cleanup(
                 item.disk.as_ref(),
                 &expected_arm,
             )?;
-            if item.disk.is_none() || previous != Some(CreateState::Observed) {
+            if item.disk.is_none() {
                 storage(state, ordinal).disk = Some(id);
+                local::save(management.clone(), catalog, uid, state).await?;
+                return Ok(true);
+            }
+            if previous == Some(CreateState::Issued) {
+                let Some(actual) = access.arm()?.request(&expected_arm, false).await? else {
+                    return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome")
+                        .await;
+                };
+                arm_disk(
+                    &actual,
+                    &expected_arm,
+                    &tags(catalog, uid)?,
+                    &access.location,
+                )?;
                 local::record(
                     management.clone(),
                     catalog,
@@ -86,10 +100,38 @@ pub(crate) async fn cleanup(
                 .await?;
             return Ok(false);
         }
-        if matches!(previous, Some(CreateState::Planned | CreateState::Issued)) {
+        if previous == Some(CreateState::Planned) {
             return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
         }
-        if let Some(actual) = access.arm()?.request(&expected_arm, false).await? {
+        let actual = access.arm()?.request(&expected_arm, false).await?;
+        if previous == Some(CreateState::Issued) {
+            let Some(actual) = actual else {
+                return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome")
+                    .await;
+            };
+            arm_disk(
+                &actual,
+                &expected_arm,
+                &tags(catalog, uid)?,
+                &access.location,
+            )?;
+            if item.disk.is_none() {
+                return Err(ObserveError::Foreign);
+            }
+            local::record(
+                management.clone(),
+                catalog,
+                uid,
+                state,
+                "Disk",
+                &name,
+                ordinal,
+                CreateState::Observed,
+            )
+            .await?;
+            return Ok(true);
+        }
+        if let Some(actual) = actual {
             arm_disk(
                 &actual,
                 &expected_arm,

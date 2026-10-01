@@ -56,9 +56,9 @@ impl Access {
 
 pub(crate) struct Arm {
     client: reqwest::Client,
-    tenant_id: String,
     client_id: String,
     token_file: String,
+    token_endpoint: String,
     endpoint: String,
 }
 
@@ -87,9 +87,11 @@ impl Arm {
             .map_err(|_| ObserveError::Azure("ARM HTTP client unavailable"))?;
         Ok(Self {
             client,
-            tenant_id: actual_tenant,
             client_id,
             token_file,
+            token_endpoint: format!(
+                "https://login.microsoftonline.com/{actual_tenant}/oauth2/v2.0/token"
+            ),
             endpoint: "https://management.azure.com".into(),
         })
     }
@@ -103,10 +105,7 @@ impl Arm {
         }
         let response = self
             .client
-            .post(format!(
-                "https://login.microsoftonline.com/{}/oauth2/v2.0/token",
-                self.tenant_id
-            ))
+            .post(&self.token_endpoint)
             .form(&[
                 ("client_id", self.client_id.as_str()),
                 ("scope", "https://management.azure.com/.default"),
@@ -578,6 +577,9 @@ pub(crate) fn arm_disk(
     {
         return Err(ObserveError::Foreign);
     }
+    if actual.pointer("/properties/provisioningState") != Some(&json!("Succeeded")) {
+        return Err(ObserveError::Azure("ARM disk creation is not terminal"));
+    }
     Ok(())
 }
 
@@ -609,19 +611,6 @@ async fn disk_ready(
             .find(|s| s.ordinal == ordinal)
             .and_then(|s| s.disk.as_ref());
         let id = disk_identity(&live, &desired, catalog, uid, expected, expected_arm)?;
-        if previous != Some(CreateState::Observed) {
-            local::record(
-                management.clone(),
-                catalog,
-                uid,
-                state,
-                "Disk",
-                name,
-                ordinal,
-                CreateState::Observed,
-            )
-            .await?;
-        }
         Some((id, live))
     } else {
         if !local::may_issue(previous) {
@@ -658,17 +647,6 @@ async fn disk_ready(
         {
             Ok(live) => {
                 let id = disk_identity(&live, &desired, catalog, uid, None, expected_arm)?;
-                local::record(
-                    management.clone(),
-                    catalog,
-                    uid,
-                    state,
-                    "Disk",
-                    name,
-                    ordinal,
-                    CreateState::Observed,
-                )
-                .await?;
                 Some((id, live))
             }
             Err(error) if local::definite_rejection(&error) => {
@@ -697,17 +675,17 @@ async fn disk_ready(
         local::save(management, catalog, uid, state).await?;
         return Ok(false);
     }
-    if live
+    let ready = live
         .data
         .pointer("/status/id")
         .and_then(Value::as_str)
-        .is_none_or(|id| !id.eq_ignore_ascii_case(expected_arm))
-        || live
+        .is_some_and(|id| id.eq_ignore_ascii_case(expected_arm))
+        && live
             .data
             .pointer("/status/conditions")
             .and_then(Value::as_array)
-            .is_none_or(|conditions| {
-                !conditions.iter().any(|condition| {
+            .is_some_and(|conditions| {
+                conditions.iter().any(|condition| {
                     condition["type"] == "Ready"
                         && condition["status"] == "True"
                         && condition["observedGeneration"]
@@ -716,22 +694,31 @@ async fn disk_ready(
                                 generation >= live.metadata.generation.unwrap_or(i64::MAX)
                             })
                 })
-            })
-    {
+            });
+    let Some(actual) = access.arm()?.request(expected_arm, false).await? else {
         return Ok(false);
-    }
-    let actual = access
-        .arm()?
-        .request(expected_arm, false)
-        .await?
-        .ok_or(ObserveError::Azure("ASO Ready disk absent from ARM"))?;
+    };
     arm_disk(
         &actual,
         expected_arm,
         &tags(catalog, uid)?,
         &access.location,
     )?;
-    Ok(true)
+    if previous != Some(CreateState::Observed) {
+        local::record(
+            management,
+            catalog,
+            uid,
+            state,
+            "Disk",
+            name,
+            ordinal,
+            CreateState::Observed,
+        )
+        .await?;
+        return Ok(false);
+    }
+    Ok(ready)
 }
 
 fn set_id(
@@ -1428,9 +1415,9 @@ mod tests {
             location: "eastus".into(),
             arm: Some(Arm {
                 client: reqwest::Client::new(),
-                tenant_id: String::new(),
                 client_id: String::new(),
                 token_file: String::new(),
+                token_endpoint: String::new(),
                 endpoint: "https://management.azure.com".into(),
             }),
         };
@@ -1588,7 +1575,7 @@ mod tests {
                     let path = request.uri().path().to_owned();
                     let body = request.into_body().collect().await.unwrap().to_bytes();
                     let mut server = server.lock().unwrap();
-                    let (code, value) = match (method, path.as_str()) {
+                    let (code, value) = match (method.clone(), path.as_str()) {
                         (Method::GET, p) if p == catalog_path => {
                             (StatusCode::OK, json!(server.catalog))
                         }
@@ -1686,9 +1673,11 @@ mod tests {
             .await
             .unwrap()
         );
-        assert_eq!(state.create_intents[0].state, CreateState::Observed);
-        assert!(
-            !disk_ready(
+        assert_eq!(state.create_intents[0].state, CreateState::Issued);
+        assert_eq!(state.storage[0].disk.as_ref().unwrap().uid, "aso-disk-uid");
+        assert!(!all_creates_resolved(&state));
+        assert!(matches!(
+            disk_ready(
                 management,
                 &mut catalog,
                 uid,
@@ -1698,12 +1687,12 @@ mod tests {
                 1,
                 &expected_arm
             )
-            .await
-            .unwrap()
-        );
-        assert_eq!(state.storage[0].disk.as_ref().unwrap().uid, "aso-disk-uid");
+            .await,
+            Err(ObserveError::Azure(_))
+        ));
+        assert_eq!(state.create_intents[0].state, CreateState::Issued);
         assert_eq!(mock.lock().unwrap().creates, 0);
-        assert_eq!(mock.lock().unwrap().writes, 2);
+        assert_eq!(mock.lock().unwrap().writes, 1);
     }
 
     #[tokio::test]
@@ -1715,10 +1704,16 @@ mod tests {
         let expected_tags = tags(&catalog, uid).unwrap();
         let mut actual = json!({
             "id":expected,"location":"eastus",
-            "properties":{"diskSizeGB":4},
+            "properties":{"diskSizeGB":4,"provisioningState":"Succeeded"},
             "sku":{"name":"StandardSSD_LRS"},"tags":expected_tags
         });
         assert!(arm_disk(&actual, &expected, &expected_tags, &access.location).is_ok());
+        actual["properties"]["provisioningState"] = json!("Creating");
+        assert!(matches!(
+            arm_disk(&actual, &expected, &expected_tags, &access.location),
+            Err(ObserveError::Azure(_))
+        ));
+        actual["properties"]["provisioningState"] = json!("Succeeded");
         actual["tags"]["cnpg-vcluster-entry-uid"] = json!(ENTRIES[1]);
         assert!(arm_disk(&actual, &expected, &expected_tags, &access.location).is_err());
         actual["tags"] = expected_tags.clone();
@@ -1824,7 +1819,7 @@ mod tests {
                     Json(json!({
                         "id":expected, "location":"eastus",
                         "sku":{"name":"StandardSSD_LRS"},
-                        "properties":{"diskSizeGB":4},
+                        "properties":{"diskSizeGB":4,"provisioningState":"Succeeded"},
                         "tags":tags(&catalog, ENTRIES[0]).unwrap(),
                     })),
                 )
@@ -1888,6 +1883,509 @@ mod tests {
             calls
                 .iter()
                 .all(|(_, path, query, _)| path == &id && query == "api-version=2024-03-02")
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn nine_cloud_disks_require_independent_direct_absence_and_preserve_siblings() {
+        use std::collections::BTreeMap;
+
+        let (catalog, mut access) = fixtures();
+        let mut expected = BTreeMap::new();
+        for uid in ENTRIES {
+            let (_, cluster) = ownership::names(CATALOG, uid).unwrap();
+            for ordinal in 1..=3 {
+                let id = arm_id(GROUP, &disk_name(&cluster, ordinal));
+                expected.insert(
+                    id.clone(),
+                    json!({
+                        "id":id,"location":"eastus","sku":{"name":"StandardSSD_LRS"},
+                        "properties":{"diskSizeGB":4,"provisioningState":"Succeeded"},
+                        "tags":tags(&catalog, uid).unwrap(),
+                    }),
+                );
+            }
+        }
+        let cloud = Arc::new(Mutex::new(expected));
+        let calls = Arc::new(Mutex::new(Vec::<(Method, String)>::new()));
+        let live = cloud.clone();
+        let recorded = calls.clone();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let endpoint = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let router = Router::new().route(
+                "/{*path}",
+                any(move |request: Request<axum::body::Body>| {
+                    let cloud = live.clone();
+                    let calls = recorded.clone();
+                    async move {
+                        let path = request.uri().path().to_owned();
+                        if request.uri().query() != Some("api-version=2024-03-02")
+                            || request
+                                .headers()
+                                .get("authorization")
+                                .and_then(|h| h.to_str().ok())
+                                != Some("Bearer test-token")
+                        {
+                            return (StatusCode::FORBIDDEN, Json(json!({"error":"denied"})));
+                        }
+                        calls
+                            .lock()
+                            .unwrap()
+                            .push((request.method().clone(), path.clone()));
+                        match request.method().as_str() {
+                            "GET" => match cloud.lock().unwrap().get(&path).cloned() {
+                                Some(disk) => (StatusCode::OK, Json(disk)),
+                                None => (StatusCode::NOT_FOUND, Json(json!({"error":"NotFound"}))),
+                            },
+                            "DELETE" => {
+                                if cloud.lock().unwrap().remove(&path).is_none() {
+                                    (StatusCode::NOT_FOUND, Json(Value::Null))
+                                } else {
+                                    (StatusCode::ACCEPTED, Json(Value::Null))
+                                }
+                            }
+                            _ => (StatusCode::METHOD_NOT_ALLOWED, Json(Value::Null)),
+                        }
+                    }
+                }),
+            );
+            axum::serve(listener, router).await.unwrap();
+        });
+        access.arm.as_mut().unwrap().endpoint = format!("http://{endpoint}");
+        for (index, uid) in ENTRIES.iter().enumerate() {
+            let (_, cluster) = ownership::names(CATALOG, uid).unwrap();
+            for ordinal in 1..=3 {
+                let id = arm_id(GROUP, &disk_name(&cluster, ordinal));
+                let arm = access.arm().unwrap();
+                let actual = arm
+                    .request_with_token(&id, false, "test-token")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                arm_disk(&actual, &id, &tags(&catalog, uid).unwrap(), "eastus").unwrap();
+                assert!(
+                    arm.request_with_token(&id, true, "test-token")
+                        .await
+                        .unwrap()
+                        .is_some()
+                );
+                assert!(
+                    arm.request_with_token(&id, false, "test-token")
+                        .await
+                        .unwrap()
+                        .is_none()
+                );
+            }
+            assert_eq!(cloud.lock().unwrap().len(), 6 - index * 3);
+            for sibling in ENTRIES.iter().skip(index + 1) {
+                let (_, cluster) = ownership::names(CATALOG, sibling).unwrap();
+                assert!(
+                    cloud
+                        .lock()
+                        .unwrap()
+                        .contains_key(&arm_id(GROUP, &disk_name(&cluster, 1)))
+                );
+            }
+        }
+        assert!(cloud.lock().unwrap().is_empty());
+        assert_eq!(calls.lock().unwrap().len(), 27);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn late_arm_create_after_aso_disappearance_blocks_then_recovers_exact_deletion() {
+        use axum::{body::Body as AxumBody, http::Response};
+        use http_body_util::BodyExt;
+        use kube::client::Body;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let (mut catalog, mut access) = fixtures();
+        let uid = ENTRIES[0];
+        let (_, cluster_name) = ownership::names(CATALOG, uid).unwrap();
+        let disk_name = disk_name(&cluster_name, 1);
+        let id = arm_id(GROUP, &disk_name);
+        let first = catalog.spec.entries.get_mut(uid).unwrap();
+        first.instances = 1;
+        first.deleting = true;
+        catalog.metadata.resource_version = Some("1".into());
+        catalog.metadata.generation = Some(1);
+        catalog.metadata.finalizers = Some(vec![crate::api::FINALIZER.into()]);
+        catalog.metadata.owner_references = Some(vec![
+            k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference {
+                api_version: "tenancy.cnpg-vcluster.io/v1alpha4".into(),
+                kind: "Tenant".into(),
+                name: "tenant-a".into(),
+                uid: "tenant-uid".into(),
+                ..Default::default()
+            },
+        ]);
+        let mut state = entry(uid, 1, &access);
+        let item = storage(&mut state, 1);
+        item.arm_id = Some(id.clone());
+        item.disk = Some(ResourceIdentity {
+            name: disk_name.clone(),
+            uid: "aso-original".into(),
+        });
+        state.create_intents.push(CreateIntent {
+            kind: "Disk".into(),
+            name: disk_name.clone(),
+            ordinal: 1,
+            state: CreateState::Issued,
+        });
+        state.finalization = Some(FinalizationStatus {
+            terminal_verified: false,
+            verified_absent: vec![],
+            pending: vec![id.clone()],
+        });
+        catalog.status = Some(crate::api::CatalogStatus {
+            entries: [(uid.into(), state.clone())].into(),
+            observer: None,
+        });
+        let current = Arc::new(Mutex::new(catalog.clone()));
+        let writes = Arc::new(Mutex::new((0usize, 0usize)));
+        let storage = access.storage_namespace.clone();
+        let disk_path = format!(
+            "/apis/compute.azure.com/v1api20240302/namespaces/{storage}/disks/{disk_name}",
+        );
+        let catalog_path = "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabasecatalogs/tenant-a";
+        let api_state = current.clone();
+        let api_writes = writes.clone();
+        let management = Client::new(
+            service_fn(move |request: Request<Body>| {
+                let state = api_state.clone();
+                let writes = api_writes.clone();
+                let disk_path = disk_path.clone();
+                async move {
+                    let method = request.method().clone();
+                    let path = request.uri().path().to_owned();
+                    let body = request.into_body().collect().await.unwrap().to_bytes();
+                    let mut current = state.lock().unwrap();
+                    let (code, value) = match (method.clone(), path.as_str()) {
+                        (Method::GET, p) if p == catalog_path => (StatusCode::OK, json!(*current)),
+                        (
+                            Method::GET,
+                            "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a",
+                        ) => (
+                            StatusCode::OK,
+                            json!({
+                                "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha4","kind":"Tenant",
+                                "metadata":{"name":"tenant-a","uid":"tenant-uid",
+                                    "finalizers":["tenancy.cnpg-vcluster.io/finalizer"]},
+                                "spec":{"provider":{"type":"azure"}},
+                                "status":{"catalogCreateIntent":{"namespace":"tenant-db-tenant-a",
+                                    "name":"tenant-a","tenantUID":"tenant-uid"},
+                                    "databaseCapability":{"namespace":"tenant-db-tenant-a",
+                                        "namespaceUID":"db-ns-uid","catalogUID":CATALOG}}
+                            }),
+                        ),
+                        (Method::GET, "/api/v1/namespaces/tenant-db-tenant-a") => (
+                            StatusCode::OK,
+                            json!({"apiVersion":"v1","kind":"Namespace",
+                            "metadata":{"name":"tenant-db-tenant-a","uid":"db-ns-uid",
+                                "labels":{"tenancy.cnpg-vcluster.io/tenant-uid":"tenant-uid"}}}),
+                        ),
+                        (Method::GET, p) if p == disk_path => (
+                            StatusCode::NOT_FOUND,
+                            json!({"reason":"NotFound","code":404}),
+                        ),
+                        (Method::PUT, p)
+                            if p == format!("{catalog_path}/status") || p == catalog_path =>
+                        {
+                            let mut next: TenantDatabaseCatalog =
+                                serde_json::from_slice(&body).unwrap();
+                            assert_eq!(
+                                next.metadata.resource_version,
+                                current.metadata.resource_version
+                            );
+                            let mut counts = writes.lock().unwrap();
+                            if p == catalog_path {
+                                counts.1 += 1
+                            } else {
+                                counts.0 += 1
+                            };
+                            next.metadata.resource_version =
+                                Some((counts.0 + counts.1 + 1).to_string());
+                            *current = next.clone();
+                            (StatusCode::OK, json!(next))
+                        }
+                        _ => panic!("unexpected Kubernetes API call: {method} {path}"),
+                    };
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(code)
+                            .header("content-type", "application/json")
+                            .body(AxumBody::from(value.to_string()))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        );
+
+        let present = Arc::new(AtomicBool::new(false));
+        let fail_delete = Arc::new(AtomicBool::new(false));
+        let arm_calls = Arc::new(Mutex::new(Vec::<Method>::new()));
+        let arm_present = present.clone();
+        let delete_failure = fail_delete.clone();
+        let calls = arm_calls.clone();
+        let expected_id = id.clone();
+        let cloud_tags = tags(&catalog, uid).unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let router = Router::new().route(
+                "/{*path}",
+                any(move |request: Request<AxumBody>| {
+                    let present = arm_present.clone();
+                    let fail_delete = delete_failure.clone();
+                    let calls = calls.clone();
+                    let expected_id = expected_id.clone();
+                    let tags = cloud_tags.clone();
+                    async move {
+                        if request.uri().path() == "/token" && request.method() == Method::POST {
+                            return (StatusCode::OK, Json(json!({"access_token":"test-token"})));
+                        }
+                        if request.uri().path() != expected_id
+                            || request.uri().query() != Some("api-version=2024-03-02")
+                            || request
+                                .headers()
+                                .get("authorization")
+                                .and_then(|v| v.to_str().ok())
+                                != Some("Bearer test-token")
+                        {
+                            return (StatusCode::FORBIDDEN, Json(json!({"error":"foreign"})));
+                        }
+                        calls.lock().unwrap().push(request.method().clone());
+                        if request.method() == Method::DELETE {
+                            if fail_delete.swap(false, Ordering::SeqCst) {
+                                return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({"error":"retry"})));
+                            }
+                            present.store(false, Ordering::SeqCst);
+                            return (StatusCode::ACCEPTED, Json(Value::Null));
+                        }
+                        if present.load(Ordering::SeqCst) {
+                            (
+                                StatusCode::OK,
+                                Json(json!({
+                                    "id":expected_id,"location":"eastus",
+                                    "sku":{"name":"StandardSSD_LRS"},
+                                    "properties":{"diskSizeGB":4,"provisioningState":"Succeeded"},"tags":tags,
+                                })),
+                            )
+                        } else {
+                            (StatusCode::NOT_FOUND, Json(json!({"error":"NotFound"})))
+                        }
+                    }
+                }),
+            );
+            axum::serve(listener, router).await.unwrap();
+        });
+        let token = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(token.path(), "test-assertion").unwrap();
+        let arm = access.arm.as_mut().unwrap();
+        arm.endpoint = format!("http://{address}");
+        arm.token_endpoint = format!("http://{address}/token");
+        arm.token_file = token.path().to_str().unwrap().into();
+
+        let workload_calls = Arc::new(Mutex::new(Vec::<String>::new()));
+        let workload_record = workload_calls.clone();
+        access.client = Client::new(
+            service_fn(move |request: Request<Body>| {
+                let calls = workload_record.clone();
+                async move {
+                    assert_eq!(request.method(), Method::GET);
+                    calls.lock().unwrap().push(request.uri().path().to_owned());
+                    Ok::<_, Infallible>(
+                        Response::builder()
+                            .status(StatusCode::NOT_FOUND)
+                            .header("content-type", "application/json")
+                            .body(AxumBody::from(r#"{"reason":"NotFound","code":404}"#))
+                            .unwrap(),
+                    )
+                }
+            }),
+            "default",
+        );
+        let (namespace, _) = ownership::names(CATALOG, uid).unwrap();
+        assert!(
+            finalize(
+                management.clone(),
+                &mut catalog,
+                uid,
+                &namespace,
+                &cluster_name,
+                &mut state,
+                1,
+                &access
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            finalize(
+                management.clone(),
+                &mut catalog,
+                uid,
+                &namespace,
+                &cluster_name,
+                &mut state,
+                1,
+                &access
+            )
+            .await
+            .unwrap()
+        );
+        let order = workload_calls.lock().unwrap().clone();
+        let paths = [
+            format!("/apis/postgresql.cnpg.io/v1/namespaces/{namespace}/clusters/{cluster_name}"),
+            format!("/api/v1/namespaces/{namespace}/secrets/{cluster_name}-superuser"),
+            format!("/api/v1/namespaces/{namespace}/persistentvolumeclaims/{cluster_name}-1"),
+            format!("/api/v1/persistentvolumes/pv-{cluster_name}-1"),
+            format!("/api/v1/namespaces/{namespace}"),
+        ];
+        let positions: Vec<_> = paths
+            .iter()
+            .map(|path| {
+                order
+                    .iter()
+                    .position(|seen| seen == path)
+                    .expect("workload stage was inspected")
+            })
+            .collect();
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert_eq!(state.create_intents[0].state, CreateState::Issued);
+        assert!(!state.finalization.as_ref().unwrap().terminal_verified);
+        assert_eq!(writes.lock().unwrap().1, 0);
+        let lost_identity = access.arm.take();
+        assert!(matches!(
+            crate::finalize::azure::cleanup(
+                management.clone(),
+                &mut catalog,
+                uid,
+                &cluster_name,
+                &mut state,
+                1,
+                &access
+            )
+            .await,
+            Err(ObserveError::Azure(_))
+        ));
+        access.arm = lost_identity;
+        present.store(true, Ordering::SeqCst);
+        assert!(
+            crate::finalize::azure::cleanup(
+                management.clone(),
+                &mut catalog,
+                uid,
+                &cluster_name,
+                &mut state,
+                1,
+                &access
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(state.create_intents[0].state, CreateState::Observed);
+        assert_eq!(writes.lock().unwrap().1, 0);
+        fail_delete.store(true, Ordering::SeqCst);
+        assert!(matches!(
+            crate::finalize::azure::cleanup(
+                management.clone(),
+                &mut catalog,
+                uid,
+                &cluster_name,
+                &mut state,
+                1,
+                &access
+            )
+            .await,
+            Err(ObserveError::Azure(_))
+        ));
+        assert_eq!(
+            state.finalization.as_ref().unwrap().pending,
+            vec![id.clone()]
+        );
+        assert_eq!(writes.lock().unwrap().1, 0);
+        assert!(
+            !crate::finalize::azure::cleanup(
+                management.clone(),
+                &mut catalog,
+                uid,
+                &cluster_name,
+                &mut state,
+                1,
+                &access
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            state.finalization.as_ref().unwrap().pending,
+            vec![id.clone()]
+        );
+        assert!(
+            crate::finalize::azure::cleanup(
+                management.clone(),
+                &mut catalog,
+                uid,
+                &cluster_name,
+                &mut state,
+                1,
+                &access
+            )
+            .await
+            .unwrap()
+        );
+        assert_eq!(
+            state.finalization.as_ref().unwrap().verified_absent,
+            vec![id.clone()]
+        );
+        assert!(
+            crate::finalize::azure::cleanup(
+                management.clone(),
+                &mut catalog,
+                uid,
+                &cluster_name,
+                &mut state,
+                1,
+                &access
+            )
+            .await
+            .unwrap()
+        );
+        assert!(state.finalization.as_ref().unwrap().terminal_verified);
+        assert!(
+            crate::finalize::azure::cleanup(
+                management,
+                &mut catalog,
+                uid,
+                &cluster_name,
+                &mut state,
+                1,
+                &access
+            )
+            .await
+            .unwrap()
+        );
+        let current = current.lock().unwrap();
+        assert!(!current.spec.entries.contains_key(uid));
+        assert_eq!(current.spec.entries.len(), 2);
+        assert_eq!(writes.lock().unwrap().1, 1);
+        assert_eq!(
+            *arm_calls.lock().unwrap(),
+            vec![
+                Method::GET,
+                Method::GET,
+                Method::GET,
+                Method::DELETE,
+                Method::GET,
+                Method::DELETE,
+                Method::GET,
+                Method::GET,
+                Method::GET
+            ]
         );
         server.abort();
     }

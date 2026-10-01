@@ -3517,6 +3517,7 @@ dependencies = [
  "serde_json",
  "serde_yaml",
  "sha2 0.10.9",
+ "tempfile",
  "tenant-controller",
  "tenant-database-runtime",
  "thiserror 2.0.21",
