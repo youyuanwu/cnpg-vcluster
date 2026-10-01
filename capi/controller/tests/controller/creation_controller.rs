@@ -1353,7 +1353,7 @@ async fn tenant_deletion_closes_gate_and_drains_database_namespace_before_infras
 }
 
 #[tokio::test]
-async fn unbound_gate_entry_waits_for_drain_deadline_and_two_absence_observations() {
+async fn pending_intents_cancel_on_close_but_claimed_intents_wait_for_namespace_absence() {
     let fixture = Fixture::new(true);
     fixture.until_ready().await;
     fixture.management.allow_typed_list(
@@ -1363,67 +1363,112 @@ async fn unbound_gate_entry_waits_for_drain_deadline_and_two_absence_observation
     );
     let gate_path = format!(
         "/api/v1/namespaces/tenant-database-gates/configmaps/{}",
-        tenant_database_runtime::gate_name("tenant-uid"),
+        tenant_database_runtime::gate_name("tenant-uid")
     );
     let mut gate = fixture.management.get(&gate_path);
-    let entry = tenant_database_runtime::GateEntry {
-        namespace: "tenant-db-tenant-a".into(),
-        name: "orders".into(),
-        spec_sha256: "a".repeat(64),
-        created_at: (chrono::Utc::now() - chrono::Duration::seconds(130)).to_rfc3339(),
-        bound_uid: None,
-        first_absent_at: None,
-        absence_checks: 0,
-    };
-    gate["data"]["reservations"] = json!(
-        serde_json::to_string(&std::collections::BTreeMap::from([("1234-5678", entry)])).unwrap()
+    gate["data"]["intents"] = json!(
+        serde_json::to_string(&std::collections::BTreeMap::from([
+            (
+                "pending",
+                tenant_database_runtime::GateEntry {
+                    instances: 1,
+                    lifecycle: tenant_database_runtime::IntentLifecycle::Pending,
+                    bound_uid: None,
+                }
+            ),
+            (
+                "claimed",
+                tenant_database_runtime::GateEntry {
+                    instances: 2,
+                    lifecycle: tenant_database_runtime::IntentLifecycle::Materializing,
+                    bound_uid: None,
+                }
+            ),
+        ]))
+        .unwrap()
     );
     fixture.management.insert(&gate_path, gate);
     let mut tenant = fixture.management.get(TENANT);
     tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
     fixture.management.insert(TENANT, tenant);
     fixture.step().await;
-    fixture.step().await;
     let gate = fixture.management.get(&gate_path);
-    let entries: serde_json::Value =
-        serde_json::from_str(gate["data"]["reservations"].as_str().unwrap()).unwrap();
-    assert_eq!(entries["1234-5678"]["absenceChecks"], 1);
+    let entries: Value = serde_json::from_str(gate["data"]["intents"].as_str().unwrap()).unwrap();
+    assert!(entries.get("pending").is_none());
+    assert_eq!(entries["claimed"]["lifecycle"], "materializing");
     assert!(
         fixture
             .management
-            .0
-            .lock()
-            .unwrap()
-            .objects
-            .contains_key("/api/v1/namespaces/tenant-db-tenant-a")
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
     );
+    let database_path = "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabases/claimed";
+    fixture.management.insert(database_path, json!({
+        "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha1","kind":"TenantDatabase",
+        "metadata":{
+            "name":"claimed","namespace":"tenant-db-tenant-a","uid":"late-uid","resourceVersion":"5",
+            "finalizers":["tenancy.cnpg-vcluster.io/database-finalizer"],
+            "annotations":{
+                "tenancy.cnpg-vcluster.io/tenant-uid":"tenant-uid",
+                "tenancy.cnpg-vcluster.io/gate-uid":gate["metadata"]["uid"],
+                "tenancy.cnpg-vcluster.io/database-spec-sha256":"a".repeat(64)
+            }
+        },
+        "spec":{"tenantName":"tenant-a","tenantUID":"tenant-uid","instances":2}
+    }));
+    fixture.clear();
     fixture.step().await;
-    let mut gate = fixture.management.get(&gate_path);
-    let mut entries: serde_json::Value =
-        serde_json::from_str(gate["data"]["reservations"].as_str().unwrap()).unwrap();
-    assert_eq!(entries["1234-5678"]["absenceChecks"], 1);
-    entries["1234-5678"]["firstAbsentAt"] =
-        json!((chrono::Utc::now() - chrono::Duration::seconds(3)).to_rfc3339());
-    gate["data"]["reservations"] = json!(entries.to_string());
-    fixture.management.insert(&gate_path, gate);
-    fixture.step().await;
-    let gate = fixture.management.get(&gate_path);
-    let entries: serde_json::Value =
-        serde_json::from_str(gate["data"]["reservations"].as_str().unwrap()).unwrap();
-    assert_eq!(entries["1234-5678"]["absenceChecks"], 2);
-    fixture.step().await;
-    let gate = fixture.management.get(&gate_path);
-    let entries: serde_json::Value =
-        serde_json::from_str(gate["data"]["reservations"].as_str().unwrap()).unwrap();
-    assert_eq!(entries["1234-5678"]["absenceChecks"], 2);
     assert!(
         fixture
             .management
-            .0
-            .lock()
-            .unwrap()
-            .objects
-            .contains_key("/api/v1/namespaces/tenant-db-tenant-a")
+            .calls()
+            .iter()
+            .any(|call| call.method == "DELETE"
+                && call.path == database_path
+                && call.body["preconditions"]["uid"] == "late-uid")
+    );
+    let namespace_path = "/api/v1/namespaces/tenant-db-tenant-a";
+    let mut terminating = fixture.management.get(namespace_path);
+    terminating["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture
+        .management
+        .respond("DELETE", namespace_path, 200, terminating.clone());
+    fixture.clear();
+    fixture.step().await;
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| call.method == "DELETE" && call.path == namespace_path)
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.path != gate_path || call.method != "DELETE")
+    );
+    fixture.management.insert(namespace_path, terminating);
+    fixture.clear();
+    fixture.step().await;
+    assert_eq!(
+        fixture.management.get(&gate_path)["data"]["intents"],
+        gate["data"]["intents"]
+    );
+    fixture
+        .management
+        .0
+        .lock()
+        .unwrap()
+        .objects
+        .remove(namespace_path);
+    fixture.clear();
+    fixture.step().await;
+    assert_eq!(
+        fixture.management.get(&gate_path)["data"]["intents"],
+        gate["data"]["intents"]
     );
     assert_eq!(
         fixture.current().status.unwrap().phase,
@@ -1447,17 +1492,12 @@ async fn accepted_database_is_deleted_exactly_before_infrastructure_or_replaceme
         );
         let mut gate = fixture.management.get(&gate_path);
         let entry = tenant_database_runtime::GateEntry {
-            namespace: "tenant-db-tenant-a".into(),
-            name: "orders".into(),
-            spec_sha256: "a".repeat(64),
-            created_at: chrono::Utc::now().to_rfc3339(),
+            instances: 1,
+            lifecycle: tenant_database_runtime::IntentLifecycle::Bound,
             bound_uid: Some("database-uid".into()),
-            first_absent_at: None,
-            absence_checks: 0,
         };
-        gate["data"]["reservations"] = json!(
-            serde_json::to_string(&std::collections::BTreeMap::from([("1234-5678", entry)]))
-                .unwrap()
+        gate["data"]["intents"] = json!(
+            serde_json::to_string(&std::collections::BTreeMap::from([("orders", entry)])).unwrap()
         );
         let gate_uid = gate["metadata"]["uid"].clone();
         fixture.management.insert(&gate_path, gate);
@@ -1472,7 +1512,6 @@ async fn accepted_database_is_deleted_exactly_before_infrastructure_or_replaceme
                     "finalizers":["tenancy.cnpg-vcluster.io/database-finalizer"],
                     "annotations":{
                         "tenancy.cnpg-vcluster.io/tenant-uid":"tenant-uid",
-                        "tenancy.cnpg-vcluster.io/admission-request-uid":"1234-5678",
                         "tenancy.cnpg-vcluster.io/gate-uid":gate_uid,
                         "tenancy.cnpg-vcluster.io/database-spec-sha256":"a".repeat(64)
                     }},

@@ -21,32 +21,27 @@ pub const CREDENTIAL_ROLE: &str = "tenant-database-credentials";
 pub const QUOTA_KEY: &str = "count/tenantdatabases.tenancy.cnpg-vcluster.io";
 pub const TENANT_UID: &str = "tenancy.cnpg-vcluster.io/tenant-uid";
 pub const GATE_UID: &str = "tenancy.cnpg-vcluster.io/gate-uid";
-pub const ADMISSION_UID: &str = "tenancy.cnpg-vcluster.io/admission-request-uid";
 pub const SPEC_SHA256: &str = "tenancy.cnpg-vcluster.io/database-spec-sha256";
-pub const GATE_ENTRIES: &str = "reservations";
+pub const GATE_ENTRIES: &str = "intents";
 pub const GATE_STATE: &str = "state";
 pub const GATE_TENANT_UID: &str = "tenantUID";
-pub const MAX_PENDING_REQUESTS: usize = 32;
-pub const API_REQUEST_DRAIN_SECONDS: i64 = 120;
-pub const ABSENCE_REPEAT_SECONDS: i64 = 2;
+pub const MAX_DATABASES: usize = 3;
 
 #[derive(Clone, Debug, Deserialize, Serialize, Eq, PartialEq)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct GateEntry {
-    pub namespace: String,
-    pub name: String,
-    pub spec_sha256: String,
-    pub created_at: String,
+    pub instances: u8,
+    pub lifecycle: IntentLifecycle,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub bound_uid: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub first_absent_at: Option<String>,
-    #[serde(default, skip_serializing_if = "is_zero")]
-    pub absence_checks: u8,
 }
 
-fn is_zero(value: &u8) -> bool {
-    *value == 0
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, Eq, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum IntentLifecycle {
+    Pending,
+    Materializing,
+    Bound,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -57,7 +52,7 @@ pub enum GateError {
     Identity,
     #[error("Tenant database gate is closed")]
     Closed,
-    #[error("TenantDatabase admission outcome remains unknown after the drain deadline")]
+    #[error("TenantDatabase CREATE may still persist; materialization outcome is unknown")]
     UnknownRequest,
     #[error(transparent)]
     Api(#[from] kube::Error),
@@ -109,13 +104,6 @@ pub fn gate_name(tenant_uid: &str) -> String {
     )
 }
 
-pub fn valid_request_uid(uid: &str) -> bool {
-    (1..=64).contains(&uid.len())
-        && uid
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit() || byte == b'-')
-}
-
 pub fn gate_entries(gate: &ConfigMap) -> Result<BTreeMap<String, GateEntry>, GateError> {
     let encoded = gate
         .data
@@ -124,42 +112,26 @@ pub fn gate_entries(gate: &ConfigMap) -> Result<BTreeMap<String, GateEntry>, Gat
         .ok_or(GateError::Invalid)?;
     let entries: BTreeMap<String, GateEntry> =
         serde_json::from_str(encoded).map_err(|_| GateError::Invalid)?;
-    if entries.len() > MAX_PENDING_REQUESTS
-        || entries.iter().any(|(uid, entry)| {
-            !valid_request_uid(uid)
-                || entry.namespace.is_empty()
-                || entry.name.is_empty()
-                || entry.spec_sha256.len() != 64
-                || chrono::DateTime::parse_from_rfc3339(&entry.created_at).is_err()
-                || entry.bound_uid.as_deref().is_some_and(str::is_empty)
-                || entry.absence_checks > 2
-                || (entry.absence_checks == 0) != entry.first_absent_at.is_none()
-                || entry
-                    .first_absent_at
-                    .as_deref()
-                    .is_some_and(|time| chrono::DateTime::parse_from_rfc3339(time).is_err())
+    if entries.len() > MAX_DATABASES
+        || entries.iter().any(|(name, entry)| {
+            name.is_empty()
+                || name.len() > 30
+                || !name
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+                || !name.as_bytes()[0].is_ascii_alphanumeric()
+                || !name.as_bytes()[name.len() - 1].is_ascii_alphanumeric()
+                || !(1..=3).contains(&entry.instances)
+                || (entry.lifecycle == IntentLifecycle::Bound)
+                    != entry
+                        .bound_uid
+                        .as_deref()
+                        .is_some_and(|uid| !uid.is_empty())
         })
     {
         return Err(GateError::Invalid);
     }
     Ok(entries)
-}
-
-pub fn unbound_entry_drained(entry: &GateEntry, now: chrono::DateTime<chrono::Utc>) -> bool {
-    let Ok(created) = chrono::DateTime::parse_from_rfc3339(&entry.created_at) else {
-        return false;
-    };
-    let Some(first_absent) = entry
-        .first_absent_at
-        .as_deref()
-        .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-    else {
-        return false;
-    };
-    entry.bound_uid.is_none()
-        && entry.absence_checks >= 2
-        && now.signed_duration_since(created).num_seconds() >= API_REQUEST_DRAIN_SECONDS
-        && now.signed_duration_since(first_absent).num_seconds() >= ABSENCE_REPEAT_SECONDS
 }
 
 pub fn validate_gate(gate: &ConfigMap, tenant_uid: &str) -> Result<(), GateError> {
@@ -536,8 +508,10 @@ pub async fn finalize(
     let namespace_api = Api::<Namespace>::all(client.clone());
     let namespace = namespace_api.get_opt(&namespace_name).await?;
     if let Some(namespace) = &namespace {
+        let mut metadata = namespace.metadata.clone();
+        metadata.deletion_timestamp = None;
         owned(
-            &namespace.metadata,
+            &metadata,
             &namespace_name,
             tenant_uid,
             expected.map(|identity| identity.namespace_uid.as_str()),
@@ -550,8 +524,10 @@ pub async fn finalize(
         None
     };
     if let Some(storage) = &storage_namespace {
+        let mut metadata = storage.metadata.clone();
+        metadata.deletion_timestamp = None;
         owned(
-            &storage.metadata,
+            &metadata,
             &storage_name,
             tenant_uid,
             expected.and_then(|identity| identity.storage_namespace_uid.as_deref()),
@@ -583,6 +559,12 @@ pub async fn finalize(
                 .as_mut()
                 .ok_or(GateError::Invalid)?
                 .insert(GATE_STATE.into(), "closed".into());
+            let mut entries = gate_entries(gate)?;
+            entries.retain(|_, entry| entry.lifecycle != IntentLifecycle::Pending);
+            closed.data.as_mut().ok_or(GateError::Invalid)?.insert(
+                GATE_ENTRIES.into(),
+                serde_json::to_string(&entries).map_err(|_| GateError::Invalid)?,
+            );
             gates
                 .replace(&name, &PostParams::default(), &closed)
                 .await?;
@@ -624,16 +606,16 @@ pub async fn finalize(
                 .annotations
                 .as_ref()
                 .ok_or(GateError::Identity)?;
-            let request_uid = annotations.get(ADMISSION_UID).ok_or(GateError::Identity)?;
-            let entry = entries.get(request_uid).ok_or(GateError::Identity)?;
+            let entry = entries.get(database_name).ok_or(GateError::Identity)?;
             if database.metadata.namespace.as_deref() != Some(namespace_name.as_str())
-                || entry.name != database_name
-                || entry.namespace != namespace_name
+                || entry.lifecycle == IntentLifecycle::Pending
                 || entry.bound_uid.as_deref().is_some_and(|bound| bound != uid)
                 || annotations.get(GATE_UID)
                     != gate.as_ref().and_then(|gate| gate.metadata.uid.as_ref())
                 || annotations.get(TENANT_UID).map(String::as_str) != Some(tenant_uid)
-                || annotations.get(SPEC_SHA256) != Some(&entry.spec_sha256)
+                || annotations.get(SPEC_SHA256).is_none_or(|hash| {
+                    hash.len() != 64 || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+                })
                 || database
                     .data
                     .pointer("/spec/tenantName")
@@ -644,6 +626,11 @@ pub async fn finalize(
                     .pointer("/spec/tenantUID")
                     .and_then(serde_json::Value::as_str)
                     != Some(tenant_uid)
+                || database
+                    .data
+                    .pointer("/spec/instances")
+                    .and_then(serde_json::Value::as_u64)
+                    != Some(u64::from(entry.instances))
                 || !database
                     .finalizers()
                     .iter()
@@ -668,62 +655,31 @@ pub async fn finalize(
             return Ok(DrainState::Pending);
         }
     }
-    if !entries.is_empty() {
-        if namespace.is_none() {
-            return Err(GateError::Identity);
-        }
-        let gate = gate.ok_or(GateError::Invalid)?;
-        let now = chrono::Utc::now();
-        let mut next = entries.clone();
-        for (request_uid, entry) in entries {
-            if entry.bound_uid.is_some() {
-                continue;
-            }
-            let item = next.get_mut(&request_uid).ok_or(GateError::Invalid)?;
-            if unbound_entry_drained(item, now) {
-                // A timed-out API handler may still persist the admitted CREATE.
-                return Err(GateError::UnknownRequest);
-            } else if now
-                .signed_duration_since(
-                    chrono::DateTime::parse_from_rfc3339(&item.created_at)
-                        .map_err(|_| GateError::Invalid)?,
-                )
-                .num_seconds()
-                >= API_REQUEST_DRAIN_SECONDS
-                && item.absence_checks < 2
-                && (item.first_absent_at.is_none()
-                    || item
-                        .first_absent_at
-                        .as_deref()
-                        .and_then(|time| chrono::DateTime::parse_from_rfc3339(time).ok())
-                        .is_some_and(|first| {
-                            now.signed_duration_since(first).num_seconds() >= ABSENCE_REPEAT_SECONDS
-                        }))
-            {
-                if item.first_absent_at.is_none() {
-                    item.first_absent_at = Some(now.to_rfc3339());
-                }
-                item.absence_checks += 1;
-            }
-        }
-        if next != gate_entries(&gate)? {
-            let mut updated = gate.clone();
-            updated.data.as_mut().ok_or(GateError::Invalid)?.insert(
-                GATE_ENTRIES.into(),
-                serde_json::to_string(&next).map_err(|_| GateError::Invalid)?,
-            );
-            gates
-                .replace(&name, &PostParams::default(), &updated)
-                .await?;
-        }
-        return Ok(DrainState::Pending);
-    }
     if let Some(namespace) = &namespace {
         if namespace.metadata.deletion_timestamp.is_none() {
             namespace_api
                 .delete(&namespace_name, &exact_delete(&namespace.metadata)?)
                 .await?;
         }
+        return Ok(DrainState::Pending);
+    }
+    if !entries.is_empty() {
+        if entries
+            .values()
+            .any(|entry| entry.lifecycle == IntentLifecycle::Materializing)
+        {
+            return Err(GateError::UnknownRequest);
+        }
+        let gate = gate.ok_or(GateError::Invalid)?;
+        let mut updated = gate.clone();
+        updated
+            .data
+            .as_mut()
+            .ok_or(GateError::Invalid)?
+            .insert(GATE_ENTRIES.into(), "{}".into());
+        gates
+            .replace(&name, &PostParams::default(), &updated)
+            .await?;
         return Ok(DrainState::Pending);
     }
     if let Some(storage) = &storage_namespace {
@@ -771,29 +727,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn unbound_recovery_requires_full_request_drain_and_separate_absence_checks() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-09-30T23:00:00Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let mut entry = GateEntry {
-            namespace: "tenant-db-demo".into(),
-            name: "orders".into(),
-            spec_sha256: "a".repeat(64),
-            created_at: "2026-09-30T22:58:01Z".into(),
-            bound_uid: None,
-            first_absent_at: Some("2026-09-30T22:59:58Z".into()),
-            absence_checks: 2,
+    fn gate_entry_requires_named_bounded_intent_and_exact_bound_uid() {
+        let gate = ConfigMap {
+            data: Some(BTreeMap::from([(
+                GATE_ENTRIES.into(),
+                serde_json::to_string(&BTreeMap::from([(
+                    "orders",
+                    GateEntry {
+                        instances: 3,
+                        lifecycle: IntentLifecycle::Materializing,
+                        bound_uid: None,
+                    },
+                )]))
+                .unwrap(),
+            )])),
+            ..Default::default()
         };
-        assert!(!unbound_entry_drained(&entry, now));
-        entry.created_at = "2026-09-30T22:58:00Z".into();
-        assert!(unbound_entry_drained(&entry, now));
-        entry.first_absent_at = Some("2026-09-30T22:59:59Z".into());
-        assert!(!unbound_entry_drained(&entry, now));
-        entry.first_absent_at = Some("2026-09-30T22:59:58Z".into());
-        entry.absence_checks = 1;
-        assert!(!unbound_entry_drained(&entry, now));
-        entry.absence_checks = 2;
-        entry.bound_uid = Some("database-uid".into());
-        assert!(!unbound_entry_drained(&entry, now));
+        assert_eq!(gate_entries(&gate).unwrap()["orders"].instances, 3);
+        let mut entries = gate_entries(&gate).unwrap();
+        entries.get_mut("orders").unwrap().lifecycle = IntentLifecycle::Bound;
+        let mut invalid = gate.clone();
+        invalid.data.as_mut().unwrap().insert(
+            GATE_ENTRIES.into(),
+            serde_json::to_string(&entries).unwrap(),
+        );
+        assert!(gate_entries(&invalid).is_err());
+        entries.get_mut("orders").unwrap().bound_uid = Some("exact-uid".into());
+        invalid.data.as_mut().unwrap().insert(
+            GATE_ENTRIES.into(),
+            serde_json::to_string(&entries).unwrap(),
+        );
+        assert_eq!(
+            gate_entries(&invalid).unwrap()["orders"]
+                .bound_uid
+                .as_deref(),
+            Some("exact-uid")
+        );
+        for name in ["second", "third"] {
+            entries.insert(
+                name.into(),
+                GateEntry {
+                    instances: 1,
+                    lifecycle: IntentLifecycle::Pending,
+                    bound_uid: None,
+                },
+            );
+        }
+        invalid.data.as_mut().unwrap().insert(
+            GATE_ENTRIES.into(),
+            serde_json::to_string(&entries).unwrap(),
+        );
+        assert_eq!(gate_entries(&invalid).unwrap().len(), MAX_DATABASES);
+        entries.insert(
+            "fourth".into(),
+            GateEntry {
+                instances: 1,
+                lifecycle: IntentLifecycle::Pending,
+                bound_uid: None,
+            },
+        );
+        invalid.data.as_mut().unwrap().insert(
+            GATE_ENTRIES.into(),
+            serde_json::to_string(&entries).unwrap(),
+        );
+        assert!(gate_entries(&invalid).is_err());
     }
 }

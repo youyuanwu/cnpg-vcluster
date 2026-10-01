@@ -42,7 +42,7 @@ fn admission_webhook(name: &str, path: &str, mutating: bool) -> Value {
         "admissionReviewVersions": ["v1"],
         "failurePolicy": "Fail",
         "matchPolicy": "Exact",
-        "sideEffects": "NoneOnDryRun",
+        "sideEffects": "None",
         "timeoutSeconds": 30,
         "clientConfig": {"service": {
             "name": "database-admission", "namespace": "tenant-system",
@@ -136,7 +136,7 @@ fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
             json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
             "metadata": {"name": "database-controller"},
             "rules": [
-                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases"], &["get", "list", "watch", "patch", "update"]),
+                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases"], &["create", "get", "list", "watch", "patch", "update"]),
                 rule("tenancy.cnpg-vcluster.io", &["tenantdatabases/status"], &["get", "patch", "update"]),
                 rule("tenancy.cnpg-vcluster.io", &["tenantdatabases/finalizers"], &["update"]),
                 rule("tenancy.cnpg-vcluster.io", &["tenants"], &["get", "list", "watch"])
@@ -147,7 +147,7 @@ fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
             json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "ClusterRole",
             "metadata": {"name": "database-controller"},
             "rules": [
-                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases"], &["get", "list", "watch", "patch", "update"]),
+                rule("tenancy.cnpg-vcluster.io", &["tenantdatabases"], &["create", "get", "list", "watch", "patch", "update"]),
                 rule("tenancy.cnpg-vcluster.io", &["tenantdatabases/status"], &["get", "patch", "update"]),
                 rule("tenancy.cnpg-vcluster.io", &["tenantdatabases/finalizers"], &["update"]),
                 rule("tenancy.cnpg-vcluster.io", &["tenants"], &["get", "list", "watch"])
@@ -158,7 +158,7 @@ fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
             role(
                 "database-admission",
                 GATE_NAMESPACE,
-                vec![rule("", &["configmaps"], &["get", "update", "patch"])],
+                vec![rule("", &["configmaps"], &["get"])],
             ),
         ),
         (
@@ -348,10 +348,7 @@ mod tests {
         let gates = find("rbac/admission-gates-role.yaml");
         let controller = find("rbac/controller-gates-role.yaml");
         let tenant = find("rbac/tenant-gates-role.yaml");
-        assert_eq!(
-            gates["rules"][0]["verbs"],
-            json!(["get", "update", "patch"])
-        );
+        assert_eq!(gates["rules"][0]["verbs"], json!(["get"]));
         assert_eq!(
             controller["rules"][0]["verbs"],
             json!(["get", "update", "patch"])
@@ -377,13 +374,27 @@ mod tests {
                     .contains(&json!("configmaps"))
         }));
         for path in [
+            "rbac/controller-cluster-role.yaml",
+            "rbac/controller-cluster-role-azure.yaml",
+        ] {
+            let controller = find(path);
+            assert_eq!(
+                controller["rules"][0]["resources"],
+                json!(["tenantdatabases"])
+            );
+            assert_eq!(
+                controller["rules"][0]["verbs"],
+                json!(["create", "get", "list", "watch", "patch", "update"])
+            );
+        }
+        for path in [
             "admission/mutating-webhook.yaml",
             "admission/validating-webhook.yaml",
         ] {
             let webhook = find(path);
             for rule in webhook["webhooks"].as_array().unwrap() {
                 assert_eq!(rule["failurePolicy"], "Fail");
-                assert_eq!(rule["sideEffects"], "NoneOnDryRun");
+                assert_eq!(rule["sideEffects"], "None");
                 assert_eq!(
                     rule["clientConfig"]["service"]["namespace"],
                     "tenant-system"

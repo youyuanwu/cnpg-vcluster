@@ -28,5 +28,5 @@ webhooks:
     resources:
     - tenantdatabases
     scope: Namespaced
-  sideEffects: NoneOnDryRun
+  sideEffects: None
   timeoutSeconds: 30

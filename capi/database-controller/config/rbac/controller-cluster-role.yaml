@@ -9,6 +9,7 @@ rules:
   resources:
   - tenantdatabases
   verbs:
+  - create
   - get
   - list
   - watch

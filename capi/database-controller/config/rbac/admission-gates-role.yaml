@@ -11,5 +11,3 @@ rules:
   - configmaps
   verbs:
   - get
-  - update
-  - patch
