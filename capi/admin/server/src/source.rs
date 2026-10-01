@@ -32,10 +32,6 @@ use tenant_controller::{
     api::{Tenant, TenantProviderSpec},
     management::{AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES, ManagementResource},
     ownership::validate_provider_owner,
-    resources::{
-        CNPG_CLUSTER_API_VERSION, CNPG_CLUSTER_KIND, CNPG_CLUSTER_PLURAL,
-        MANAGED_DATABASE_CLUSTER_NAME, MANAGED_DATABASE_NAMESPACE,
-    },
     tenant_client::{TenantApiErrorClass, TenantClientError, load_tenant_client},
 };
 
@@ -65,6 +61,11 @@ const MAX_INSTANCE_BYTES: usize = 63;
 const MAX_DATABASE_USERNAME_BYTES: usize = 1_024;
 const MAX_DATABASE_PASSWORD_BYTES: usize = 16 * 1_024;
 const DATABASE_SUPERUSER_SECRET_NAME: &str = "capi-postgres-superuser";
+const CNPG_CLUSTER_API_VERSION: &str = "postgresql.cnpg.io/v1";
+const CNPG_CLUSTER_KIND: &str = "Cluster";
+const CNPG_CLUSTER_PLURAL: &str = "clusters";
+const MANAGED_DATABASE_CLUSTER_NAME: &str = "capi-postgres";
+pub(crate) const MANAGED_DATABASE_NAMESPACE: &str = "database";
 const CONTROLLER_NAMESPACE: &str = "tenant-system";
 const CONTROLLER_DEPLOYMENT: &str = "tenant-controller";
 

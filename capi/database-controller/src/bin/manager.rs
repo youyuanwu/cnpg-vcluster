@@ -15,18 +15,24 @@ use k8s_openapi::api::core::v1::Namespace;
 use kube::{
     Api, Client, ResourceExt,
     api::{ListParams, WatchParams},
-    runtime::Controller,
     runtime::watcher,
+    runtime::{Controller, controller::Config as ControllerConfig},
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use tenant_controller::runtime::{
+    DEFAULT_LEADER_ELECTION_NAMESPACE, DEFAULT_LEASE_DURATION_SECONDS, DEFAULT_LEASE_GRACE_SECONDS,
+    HealthState, LeaderConfig, run_leader_elected,
+};
 use tenant_database_controller::{api::TenantDatabaseCatalog, reconcile};
+use tokio::sync::watch;
 
 struct Context {
     client: Client,
     pod_uid: String,
     instance_id: String,
     observations: Mutex<BTreeMap<String, Snapshot>>,
+    leadership: HealthState,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -77,21 +83,38 @@ fn matches_observation(
     pod_uid: &str,
     instance_id: &str,
 ) -> bool {
-    snapshot(catalog).as_ref() == Some(expected)
-        && catalog
-            .status
-            .as_ref()
-            .and_then(|status| status.observer.as_ref())
-            .is_some_and(|observer| {
-                observer.catalog_uid == expected.uid
-                    && observer.observed_generation == expected.generation
-                    && !observer.observed_resource_version.is_empty()
-                    && observer.pod_uid == pod_uid
-                    && observer.instance_id == instance_id
-            })
+    if snapshot(catalog).as_ref() != Some(expected) {
+        return false;
+    }
+    if !catalog.spec.entries.is_empty() {
+        return catalog.status.as_ref().is_some_and(|status| {
+            status.entries.len() == catalog.spec.entries.len()
+                && catalog.spec.entries.keys().all(|uid| {
+                    status.entries.get(uid).is_some_and(|entry| {
+                        entry.logical_uid == *uid
+                            && entry.observed_generation == expected.generation
+                    })
+                })
+        });
+    }
+    catalog
+        .status
+        .as_ref()
+        .filter(|status| status.entries.is_empty())
+        .and_then(|status| status.observer.as_ref())
+        .is_some_and(|observer| {
+            observer.catalog_uid == expected.uid
+                && observer.observed_generation == expected.generation
+                && !observer.observed_resource_version.is_empty()
+                && observer.pod_uid == pod_uid
+                && observer.instance_id == instance_id
+        })
 }
 
 async fn readyz(State(context): State<Arc<Context>>) -> Result<Json<Value>, StatusCode> {
+    if !context.leadership.is_ready() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let snapshots = context
         .observations
         .lock()
@@ -126,6 +149,9 @@ async fn observation(
     State(context): State<Arc<Context>>,
     Query(query): Query<ObservationQuery>,
 ) -> Result<Json<Value>, StatusCode> {
+    if !context.leadership.is_ready() {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     let key = key(&query.namespace, &query.name);
     let expected = context
         .observations
@@ -143,6 +169,14 @@ async fn observation(
         .get(&query.name)
         .await
         .map_err(|_| StatusCode::SERVICE_UNAVAILABLE)?;
+    if !current.spec.entries.is_empty()
+        || current
+            .status
+            .as_ref()
+            .is_some_and(|status| !status.entries.is_empty())
+    {
+        return Err(StatusCode::SERVICE_UNAVAILABLE);
+    }
     if !matches_observation(&current, &expected, &context.pod_uid, &context.instance_id) {
         return Err(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -228,6 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         pod_uid,
         instance_id,
         observations: Mutex::new(BTreeMap::new()),
+        leadership: HealthState::default(),
     });
     let health = Router::new()
         .route("/healthz", get(|| async { StatusCode::OK }))
@@ -236,78 +271,110 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .with_state(context.clone());
     let listener = tokio::net::TcpListener::bind(address).await?;
     let server = tokio::spawn(async move { axum::serve(listener, health).await });
-    Controller::new(catalogs, watcher::Config::default())
-        .graceful_shutdown_on(shutdown())
-        .run(
-            |catalog, context: Arc<Context>| async move {
-                let result = reconcile::observe(
-                    context.client.clone(),
-                    &catalog,
-                    &context.pod_uid,
-                    &context.instance_id,
+    let (stop_tx, stop_rx) = watch::channel(false);
+    tokio::spawn(async move {
+        shutdown().await;
+        let _ = stop_tx.send(true);
+    });
+    let election = LeaderConfig {
+        lease_name: "database-controller.tenancy.cnpg-vcluster.io".into(),
+        namespace: DEFAULT_LEADER_ELECTION_NAMESPACE.into(),
+        identity: format!("{}-{}", context.pod_uid, context.instance_id),
+        duration_seconds: DEFAULT_LEASE_DURATION_SECONDS,
+        grace_seconds: DEFAULT_LEASE_GRACE_SECONDS,
+    };
+    let result = run_leader_elected(
+        context.client.clone(),
+        election,
+        context.leadership.clone(),
+        stop_rx,
+        |mut leader| async {
+            let gate = leader.gate.clone();
+            Controller::new(catalogs, watcher::Config::default())
+                .with_config(ControllerConfig::default().concurrency(3))
+                .graceful_shutdown_on(async move {
+                    leader.stopped().await;
+                })
+                .run(
+                    |catalog, context: Arc<Context>| {
+                        let gate = gate.clone();
+                        async move {
+                            let permit =
+                                gate.try_enter().ok_or(reconcile::ObserveError::Identity)?;
+                            let result = reconcile::reconcile(
+                                context.client.clone(),
+                                &catalog,
+                                &context.pod_uid,
+                                &context.instance_id,
+                            )
+                            .await;
+                            drop(permit);
+                            let key = key(
+                                &catalog.namespace().unwrap_or_default(),
+                                &catalog.name_any(),
+                            );
+                            let mut observations = context
+                                .observations
+                                .lock()
+                                .expect("observer state is intact");
+                            match &result {
+                                Ok((_, verified)) => {
+                                    if let Some(value) = snapshot(verified) {
+                                        observations.insert(key, value);
+                                    } else {
+                                        observations.remove(&key);
+                                    }
+                                }
+                                Err(_) => {
+                                    observations.remove(&key);
+                                }
+                            }
+                            result.map(|(action, _)| action)
+                        }
+                    },
+                    |catalog, error, _| {
+                        tracing::warn!(
+                            catalog = %catalog.name_any(),
+                            namespace = ?catalog.namespace(),
+                            %error,
+                            "catalog observation blocked"
+                        );
+                        reconcile::error_policy()
+                    },
+                    context.clone(),
                 )
-                .await;
-                let key = key(
-                    &catalog.namespace().unwrap_or_default(),
-                    &catalog.name_any(),
-                );
-                let mut observations = context
-                    .observations
-                    .lock()
-                    .expect("observer state is intact");
-                match &result {
-                    Ok((_, verified)) => {
-                        if let Some(value) = snapshot(verified) {
-                            observations.insert(key, value);
-                        } else {
-                            observations.remove(&key);
+                .for_each_concurrent(3, |result| {
+                    let context = context.clone();
+                    async move {
+                        if let Err(error) = result {
+                            context
+                                .observations
+                                .lock()
+                                .expect("observer state is intact")
+                                .clear();
+                            tracing::warn!(%error, "catalog watch error");
                         }
                     }
-                    Err(_) => {
-                        observations.remove(&key);
-                    }
-                }
-                result.map(|(action, _)| action)
-            },
-            |catalog, error, _| {
-                tracing::warn!(
-                    catalog = %catalog.name_any(),
-                    namespace = ?catalog.namespace(),
-                    %error,
-                    "catalog observation blocked"
-                );
-                reconcile::error_policy()
-            },
-            context.clone(),
-        )
-        .for_each_concurrent(1, |result| {
-            let context = context.clone();
-            async move {
-                if let Err(error) = result {
-                    context
-                        .observations
-                        .lock()
-                        .expect("observer state is intact")
-                        .clear();
-                    tracing::warn!(%error, "catalog watch error");
-                }
-            }
-        })
-        .await;
+                })
+                .await;
+            Ok(())
+        },
+    )
+    .await;
     context
         .observations
         .lock()
         .expect("observer state is intact")
         .clear();
     server.abort();
-    Ok(())
+    result.map_err(Into::into)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use tenant_database_controller::api::{
-        CatalogObservation, CatalogStatus, TenantDatabaseCatalogSpec,
+        CatalogEntry, CatalogObservation, CatalogStatus, TenantDatabaseCatalogSpec,
     };
 
     #[test]
@@ -373,5 +440,54 @@ mod tests {
         assert!(!matches_observation(
             &catalog, &expected, "pod-uid", "boot-a"
         ));
+    }
+
+    #[test]
+    fn nonempty_readiness_requires_each_current_uid_and_generation() {
+        let uid = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        let mut catalog = TenantDatabaseCatalog::new(
+            "tenant-a",
+            TenantDatabaseCatalogSpec {
+                tenant_name: "tenant-a".into(),
+                tenant_uid: "tenant-uid".into(),
+                closed: false,
+                entries: [(
+                    uid.into(),
+                    CatalogEntry {
+                        name: "orders".into(),
+                        instances: 1,
+                        deleting: false,
+                    },
+                )]
+                .into(),
+            },
+        );
+        catalog.metadata.uid = Some("bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb".into());
+        catalog.metadata.generation = Some(2);
+        catalog.metadata.resource_version = Some("12".into());
+        let expected = snapshot(&catalog).unwrap();
+        assert!(!matches_observation(&catalog, &expected, "pod", "boot"));
+        let entry = serde_json::from_value(json!({
+            "logicalUID": uid,
+            "observedGeneration": 1,
+            "phase": "Pending",
+        }))
+        .unwrap();
+        catalog.status = Some(CatalogStatus {
+            entries: [(uid.into(), entry)].into(),
+            observer: None,
+        });
+        assert!(!matches_observation(&catalog, &expected, "pod", "boot"));
+        catalog
+            .status
+            .as_mut()
+            .unwrap()
+            .entries
+            .get_mut(uid)
+            .unwrap()
+            .observed_generation = 2;
+        assert!(matches_observation(&catalog, &expected, "pod", "boot"));
+        catalog.status.as_mut().unwrap().entries.clear();
+        assert!(!matches_observation(&catalog, &expected, "pod", "boot"));
     }
 }

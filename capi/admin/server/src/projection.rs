@@ -947,15 +947,13 @@ fn blockers(mode: ProviderMode, tenant: &Tenant) -> Vec<TenantBlocker> {
             );
         }
     }
-    if mode == ProviderMode::Local {
-        if tenant.spec.workers < 0 {
-            push_blocker(
-                &mut blockers,
-                "spec-invalid",
-                "requested worker count is invalid",
-                None,
-            );
-        }
+    if mode == ProviderMode::Local && tenant.spec.workers < 0 {
+        push_blocker(
+            &mut blockers,
+            "spec-invalid",
+            "requested worker count is invalid",
+            None,
+        );
     }
     blockers.truncate(MAX_BLOCKERS);
     blockers
@@ -1835,6 +1833,7 @@ mod tests {
             observed_generation: Some(observed),
             phase: Some(phase),
             database_capability: None,
+            catalog_create_intent: None,
             conditions: vec![
                 condition("Ready", if ready { "True" } else { "False" }, observed),
                 condition("WorkersReady", "True", observed),
@@ -1981,6 +1980,7 @@ mod tests {
             observed_generation: Some(1),
             phase: Some(TenantPhase::Ready),
             database_capability: None,
+            catalog_create_intent: None,
             conditions: vec![
                 condition("Ready", "True", 1),
                 condition("AzureWorkersReady", "True", 1),

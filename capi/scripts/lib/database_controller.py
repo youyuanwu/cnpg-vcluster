@@ -247,14 +247,17 @@ def build_database_controller_image(
     return selected
 
 
-def render_database_controller(root: Path, image: str) -> Path:
+def render_database_controller(
+    root: Path, image: str, *, azure: bool = False,
+) -> Path:
     if (
         image == DATABASE_IMAGE_PLACEHOLDER
         or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/@-]+", image) is None
     ):
         raise RuntimeError("database controller image must be built before deployment")
     template = (
-        root / "database-controller" / "config" / "deployment" / "controller.yaml"
+        root / "database-controller" / "config" / "deployment"
+        / ("controller-azure.yaml" if azure else "controller.yaml")
     ).read_text(encoding="utf-8")
     if template.count(DATABASE_IMAGE_PLACEHOLDER) != 1:
         raise RuntimeError("database controller deployment image placeholder is invalid")
@@ -264,9 +267,9 @@ def render_database_controller(root: Path, image: str) -> Path:
 
 
 def install_database_controller(
-    root: Path, client: ManagementClient, image: str,
+    root: Path, client: ManagementClient, image: str, *, azure: bool = False,
 ) -> None:
-    manifest = render_database_controller(root, image)
+    manifest = render_database_controller(root, image, azure=azure)
     client.kubectl(
         "apply", "--server-side", "--field-manager=cnpg-vcluster-database-controller",
         "--force-conflicts", "-f", str(manifest),

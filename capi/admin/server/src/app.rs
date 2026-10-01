@@ -704,6 +704,7 @@ mod tests {
             observed_generation: Some(1),
             phase: Some(TenantPhase::Ready),
             database_capability: None,
+            catalog_create_intent: None,
             conditions: vec![Condition {
                 type_: "Ready".into(),
                 status: "True".into(),

@@ -89,6 +89,25 @@ pub struct EntryStatus {
     pub query: Option<QueryIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finalization: Option<FinalizationStatus>,
+    #[serde(default)]
+    pub create_intents: Vec<CreateIntent>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateIntent {
+    pub kind: String,
+    pub name: String,
+    pub ordinal: i32,
+    pub state: CreateState,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+pub enum CreateState {
+    Planned,
+    Issued,
+    Rejected,
+    Observed,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
@@ -363,6 +382,10 @@ pub fn catalog_crd() -> CustomResourceDefinition {
             .expect("observation list")
             .max_items = Some(3);
     }
+    properties(observation)
+        .get_mut("createIntents")
+        .expect("bounded create intents")
+        .max_items = Some(12);
     let conditions = properties(observation)
         .get_mut("conditions")
         .expect("conditions");
@@ -469,6 +492,7 @@ mod tests {
                 verified_absent: vec![],
                 pending: vec![],
             }),
+            create_intents: vec![],
         }
     }
     #[test]

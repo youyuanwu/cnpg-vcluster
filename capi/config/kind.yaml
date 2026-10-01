@@ -12,3 +12,5 @@ nodes:
         readOnly: true
       - hostPath: /var/run/docker.sock
         containerPath: /var/run/docker.sock
+      - hostPath: /var/lib/docker/volumes
+        containerPath: /var/lib/docker/volumes

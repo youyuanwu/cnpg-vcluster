@@ -23,6 +23,10 @@ pub enum ObserveError {
     Identity,
     #[error("catalog has entries; provider adapters are not installed")]
     UnsupportedEntries,
+    #[error("local resource ownership cannot be proven")]
+    Foreign,
+    #[error("local data path cannot be verified")]
+    Path(#[from] crate::local_path::PathError),
     #[error("catalog spec is invalid: {0}")]
     InvalidSpec(#[from] crate::api::CatalogError),
     #[error(transparent)]
@@ -55,7 +59,7 @@ pub fn tenant_api(client: Client) -> Api<DynamicObject> {
     Api::<DynamicObject>::all_with(client, &resource)
 }
 
-pub fn verify_empty(
+pub fn verify_identity(
     catalog: &TenantDatabaseCatalog,
     tenant: &DynamicObject,
     namespace: &Namespace,
@@ -138,6 +142,15 @@ pub fn verify_empty(
     {
         return Err(ObserveError::Identity);
     }
+    Ok(())
+}
+
+pub fn verify_empty(
+    catalog: &TenantDatabaseCatalog,
+    tenant: &DynamicObject,
+    namespace: &Namespace,
+) -> Result<(), ObserveError> {
+    verify_identity(catalog, tenant, namespace)?;
     if !catalog.spec.entries.is_empty()
         || catalog
             .status
@@ -166,7 +179,7 @@ pub async fn verify_current(
     let database_namespace = Api::<Namespace>::all(client.clone())
         .get(&namespace)
         .await?;
-    verify_empty(&current, &tenant, &database_namespace)?;
+    verify_identity(&current, &tenant, &database_namespace)?;
     let latest = catalogs.get(&name).await?;
     if uid(&latest.metadata)? != uid(&current.metadata)?
         || latest.metadata.resource_version != current.metadata.resource_version
@@ -184,6 +197,14 @@ pub async fn observe(
     instance_id: &str,
 ) -> Result<(Action, TenantDatabaseCatalog), ObserveError> {
     let current = verify_current(client.clone(), observed).await?;
+    if !current.spec.entries.is_empty()
+        || current
+            .status
+            .as_ref()
+            .is_some_and(|status| !status.entries.is_empty())
+    {
+        return Err(ObserveError::UnsupportedEntries);
+    }
     let catalog_uid = uid(&current.metadata)?;
     let resource_version = current
         .metadata
@@ -195,6 +216,7 @@ pub async fn observe(
     if pod_uid.is_empty() || instance_id.is_empty() {
         return Err(ObserveError::Identity);
     }
+
     let previous = current
         .status
         .as_ref()
@@ -247,6 +269,33 @@ pub async fn observe(
 
 pub fn error_policy() -> Action {
     Action::requeue(RETRY)
+}
+
+pub mod local;
+
+pub async fn reconcile(
+    client: Client,
+    observed: &TenantDatabaseCatalog,
+    pod_uid: &str,
+    instance_id: &str,
+) -> Result<(Action, TenantDatabaseCatalog), ObserveError> {
+    let current = verify_current(client.clone(), observed).await?;
+    if current.spec.entries.is_empty()
+        && current.status.as_ref().is_none_or(|s| s.entries.is_empty())
+    {
+        return observe(client, &current, pod_uid, instance_id).await;
+    }
+    if field(
+        &tenant_api(client.clone())
+            .get(&current.spec.tenant_name)
+            .await?
+            .data,
+        "/spec/provider/type",
+    )? != "local"
+    {
+        return Err(ObserveError::UnsupportedEntries);
+    }
+    local::reconcile(client, &current).await
 }
 
 #[cfg(test)]

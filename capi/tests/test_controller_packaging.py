@@ -14,6 +14,7 @@ from unittest.mock import MagicMock, Mock, patch
 from scripts.lib import controller as packaging
 from scripts.lib import database_controller
 from scripts.lib.controller_foundation import foundation_payload
+from scripts.lib.kube import ManagementClient
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -125,6 +126,83 @@ class PackagingTests(unittest.TestCase):
             path.unlink(missing_ok=True)
         with self.assertRaisesRegex(RuntimeError, "built"):
             database_controller.render_database_controller(ROOT, "")
+
+    def test_database_deployment_selects_local_runtime_only_for_local_installer(self):
+        image = "registry.example/db@sha256:" + "a" * 64
+        rendered = []
+        try:
+            local = ManagementClient(ROOT, CONFIG)
+            with patch.object(
+                local, "kubectl",
+                side_effect=lambda *args, **_kwargs: rendered.append(
+                    Path(args[-1]).read_text()
+                ),
+            ):
+                database_controller.install_database_controller(ROOT, local, image)
+            self.assertEqual(len(rendered), 1)
+            self.assertIn("path: /var/run/docker.sock", rendered[0])
+            self.assertIn("path: /var/lib/docker/volumes", rendered[0])
+            kind_config = (ROOT / "config/kind.yaml").read_text()
+            self.assertIn(
+                "hostPath: /var/lib/docker/volumes\n"
+                "        containerPath: /var/lib/docker/volumes",
+                kind_config,
+            )
+            self.assertIn("runAsUser: 0", rendered[0])
+            self.assertIn("- CHOWN", rendered[0])
+            self.assertIn("- DAC_OVERRIDE", rendered[0])
+            self.assertIn("image: " + image, rendered[0])
+
+            azure = Client(
+                lambda *args, **_kwargs: (
+                    rendered.append(Path(args[-1]).read_text()) or response()
+                )
+            )
+            database_controller.install_database_controller(ROOT, azure, image, azure=True)
+            self.assertEqual(len(rendered), 2)
+            self.assertNotIn("docker.sock", rendered[1])
+            self.assertNotIn("docker/volumes", rendered[1])
+            self.assertIn("runAsNonRoot: true", rendered[1])
+            self.assertIn("image: " + image, rendered[1])
+        finally:
+            (ROOT / ".runtime/rendered/database-controller/controller.yaml").unlink(
+                missing_ok=True
+            )
+
+    def test_database_catalog_role_only_grants_management_side_of_tenant_access(self):
+        local = (ROOT / "database-controller/config/rbac/controller-cluster-role.yaml").read_text()
+        azure = (ROOT / "database-controller/config/rbac/controller-cluster-role-azure.yaml").read_text()
+        for role in (local, azure):
+            self.assertIn("kamajicontrolplanes", role)
+            self.assertIn("clusters", role)
+            self.assertIn("secrets", role)
+            self.assertIn("tenantdatabasecatalogs/status", role)
+            self.assertNotIn("tenantdatabases\n", role)
+            self.assertNotIn("resourcequotas", role)
+            for tenant_resource in (
+                "persistentvolumes", "persistentvolumeclaims", "clusters.postgresql.cnpg.io",
+            ):
+                self.assertNotIn(tenant_resource, role)
+        self.assertIn("tenant-foundation", local)
+        self.assertNotIn("tenant-foundation", azure)
+        self.assertIn("disks", azure)
+        self.assertNotIn("disks", local)
+        local_inventory = json.loads(
+            (ROOT / "database-controller/config/management-resources.json").read_text()
+        )
+        azure_inventory = json.loads(
+            (ROOT / "database-controller/config/azure-management-resources.json").read_text()
+        )
+        self.assertEqual(
+            {entry["resource"] for entry in local_inventory},
+            {"tenantdatabasecatalogs", "tenants", "namespaces",
+             "clusters", "kamajicontrolplanes", "secrets", "configmaps"},
+        )
+        self.assertEqual(
+            {entry["resource"] for entry in azure_inventory},
+            {"tenantdatabasecatalogs", "tenants", "namespaces",
+             "clusters", "kamajicontrolplanes", "secrets", "disks"},
+        )
 
     def test_catalog_probe_exception_is_single_identity_and_service_account(self):
         policy = packaging.catalog_cutover_lock_documents(

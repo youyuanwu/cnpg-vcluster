@@ -18,9 +18,14 @@ fn inventory(azure: bool) -> Value {
         json!({"group": "tenancy.cnpg-vcluster.io", "version": "v1alpha1", "kind": "TenantDatabaseCatalog", "resource": "tenantdatabasecatalogs", "scope": "Namespaced"}),
         json!({"group": "tenancy.cnpg-vcluster.io", "version": "v1alpha4", "kind": "Tenant", "resource": "tenants", "scope": "Cluster"}),
         json!({"group": "", "version": "v1", "kind": "Namespace", "resource": "namespaces", "scope": "Cluster"}),
+        json!({"group": "cluster.x-k8s.io", "version": "v1beta2", "kind": "Cluster", "resource": "clusters", "scope": "Namespaced"}),
+        json!({"group": "controlplane.cluster.x-k8s.io", "version": if azure { "v1alpha1" } else { "v1alpha2" }, "kind": "KamajiControlPlane", "resource": "kamajicontrolplanes", "scope": "Namespaced"}),
+        json!({"group": "", "version": "v1", "kind": "Secret", "resource": "secrets", "scope": "Namespaced"}),
     ];
     if azure {
         resources.push(json!({"group": "compute.azure.com", "version": "v1api20240302", "kind": "Disk", "resource": "disks", "scope": "Namespaced"}));
+    } else {
+        resources.push(json!({"group": "", "version": "v1", "kind": "ConfigMap", "resource": "configmaps", "scope": "Namespaced"}));
     }
     Value::Array(resources)
 }
@@ -43,6 +48,13 @@ fn controller_rules(azure: bool) -> Vec<Value> {
             &["get", "list", "watch"],
         ),
         rule("", &["namespaces"], &["get", "list", "watch"]),
+        rule("cluster.x-k8s.io", &["clusters"], &["get"]),
+        rule(
+            "controlplane.cluster.x-k8s.io",
+            &["kamajicontrolplanes"],
+            &["get"],
+        ),
+        rule("", &["secrets"], &["get"]),
     ];
     if azure {
         rules.push(rule(
@@ -50,8 +62,66 @@ fn controller_rules(azure: bool) -> Vec<Value> {
             &["disks"],
             &["get", "list", "watch"],
         ));
+    } else {
+        rules.push(json!({
+            "apiGroups": [""], "resources": ["configmaps"],
+            "resourceNames": ["tenant-foundation"], "verbs": ["get"]
+        }));
     }
     rules
+}
+
+fn deployment(local: bool) -> Value {
+    let mut container = json!({
+        "name": "manager",
+        "image": "database-controller:configure-before-install",
+        "imagePullPolicy": "IfNotPresent",
+        "env": [{
+            "name": "POD_UID",
+            "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}
+        }],
+        "ports": [{"name": "health", "containerPort": 8082}],
+        "livenessProbe": {"httpGet": {"path": "/healthz", "port": "health"}},
+        "readinessProbe": {"httpGet": {"path": "/readyz", "port": "health"}},
+        "securityContext": {
+            "allowPrivilegeEscalation": false,
+            "readOnlyRootFilesystem": true,
+            "runAsNonRoot": !local,
+            "capabilities": {"drop": ["ALL"]}
+        }
+    });
+    let mut pod = json!({
+        "serviceAccountName": "database-controller",
+        "automountServiceAccountToken": true,
+        "containers": [container]
+    });
+    if local {
+        container["securityContext"]["runAsUser"] = json!(0);
+        container["securityContext"]["capabilities"]["add"] = json!(["CHOWN", "DAC_OVERRIDE"]);
+        container["volumeMounts"] = json!([
+            {"name": "docker-socket", "mountPath": "/var/run/docker.sock"},
+            {"name": "docker-volumes", "mountPath": "/var/lib/docker/volumes"}
+        ]);
+        pod["containers"] = json!([container]);
+        pod["volumes"] = json!([
+            {"name": "docker-socket",
+                "hostPath": {"path": "/var/run/docker.sock", "type": "Socket"}},
+            {"name": "docker-volumes",
+                "hostPath": {"path": "/var/lib/docker/volumes", "type": "Directory"}}
+        ]);
+    }
+    json!({
+        "apiVersion": "apps/v1", "kind": "Deployment",
+        "metadata": {"name": "database-controller", "namespace": "tenant-system"},
+        "spec": {
+            "replicas": 1, "strategy": {"type": "Recreate"},
+            "selector": {"matchLabels": {"app": "database-controller"}},
+            "template": {
+                "metadata": {"labels": {"app": "database-controller"}},
+                "spec": pod
+            }
+        }
+    })
 }
 
 fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
@@ -68,41 +138,10 @@ fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
             "azure-management-resources.json",
             format!("{}\n", serde_json::to_string_pretty(&inventory(true))?).into_bytes(),
         ),
+        ("deployment/controller.yaml", yaml(&deployment(true))?),
         (
-            "deployment/controller.yaml",
-            yaml(&json!({
-                "apiVersion": "apps/v1", "kind": "Deployment",
-                "metadata": {"name": "database-controller", "namespace": "tenant-system"},
-                "spec": {
-                    "replicas": 1, "strategy": {"type": "Recreate"},
-                    "selector": {"matchLabels": {"app": "database-controller"}},
-                    "template": {
-                        "metadata": {"labels": {"app": "database-controller"}},
-                        "spec": {
-                            "serviceAccountName": "database-controller",
-                            "automountServiceAccountToken": true,
-                            "containers": [{
-                                "name": "manager",
-                                "image": "database-controller:configure-before-install",
-                                "imagePullPolicy": "IfNotPresent",
-                                "env": [{
-                                    "name": "POD_UID",
-                                    "valueFrom": {"fieldRef": {"fieldPath": "metadata.uid"}}
-                                }],
-                                "ports": [{"name": "health", "containerPort": 8082}],
-                                "livenessProbe": {"httpGet": {"path": "/healthz", "port": "health"}},
-                                "readinessProbe": {"httpGet": {"path": "/readyz", "port": "health"}},
-                                "securityContext": {
-                                    "allowPrivilegeEscalation": false,
-                                    "readOnlyRootFilesystem": true,
-                                    "runAsNonRoot": true,
-                                    "capabilities": {"drop": ["ALL"]}
-                                }
-                            }]
-                        }
-                    }
-                }
-            }))?,
+            "deployment/controller-azure.yaml",
+            yaml(&deployment(false))?,
         ),
     ];
     for (path, resource) in [
@@ -131,6 +170,22 @@ fn generated_files() -> Result<Generated, Box<dyn std::error::Error>> {
                 "subjects": [{"kind": "ServiceAccount", "namespace": "tenant-system",
                     "name": "database-controller"}]
             }),
+        ),
+        (
+            "rbac/controller-leader-role.yaml",
+            json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "Role",
+                "metadata": {"name": "database-controller-leader", "namespace": "default"},
+                "rules": [rule("coordination.k8s.io", &["leases"],
+                    &["create", "get", "list", "watch", "update", "patch", "delete"])]}),
+        ),
+        (
+            "rbac/controller-leader-binding.yaml",
+            json!({"apiVersion": "rbac.authorization.k8s.io/v1", "kind": "RoleBinding",
+                "metadata": {"name": "database-controller-leader", "namespace": "default"},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role",
+                    "name": "database-controller-leader"},
+                "subjects": [{"kind": "ServiceAccount", "name": "database-controller",
+                    "namespace": "tenant-system"}]}),
         ),
     ] {
         resources.push((path, yaml(&resource)?));
@@ -208,9 +263,12 @@ mod tests {
             serde_json::from_slice(find(&artifacts, "management-resources.json")).unwrap();
         let azure: Value =
             serde_json::from_slice(find(&artifacts, "azure-management-resources.json")).unwrap();
-        assert_eq!(local.as_array().unwrap().len(), 3);
-        assert_eq!(azure.as_array().unwrap().len(), 4);
-        assert_eq!(azure[3]["resource"], "disks");
+        assert_eq!(local.as_array().unwrap().len(), 7);
+        assert_eq!(azure.as_array().unwrap().len(), 7);
+        assert_eq!(azure[6]["resource"], "disks");
+        assert_eq!(local[4]["version"], "v1alpha2");
+        assert_eq!(azure[4]["version"], "v1alpha1");
+        assert_eq!(local[6]["resource"], "configmaps");
         assert!(
             local
                 .as_array()
@@ -220,8 +278,7 @@ mod tests {
         );
         for artifact in [&local, &azure] {
             assert!(artifact.as_array().unwrap().iter().all(|r| {
-                !["tenantdatabases", "configmaps", "resourcequotas"]
-                    .contains(&r["resource"].as_str().unwrap())
+                !["tenantdatabases", "resourcequotas"].contains(&r["resource"].as_str().unwrap())
             }));
         }
         let local_role: Value =
@@ -242,7 +299,6 @@ mod tests {
                     |rule| !rule["resources"].as_array().unwrap().iter().any(|r| [
                         "tenantdatabases",
                         "resourcequotas",
-                        "configmaps",
                         "tenantdatabasecatalogs/finalizers"
                     ]
                     .contains(&r.as_str().unwrap()))
@@ -252,16 +308,44 @@ mod tests {
                 != json!(["tenantdatabasecatalogs"])
                 || !rule["verbs"].as_array().unwrap().contains(&json!("create"))));
         }
-        assert!(local_role["rules"].as_array().unwrap().iter().all(|r| {
-            ![
-                "persistentvolumes",
-                "persistentvolumeclaims",
-                "secrets",
-                "pods",
-                "clusters",
-            ]
-            .contains(&r["resources"][0].as_str().unwrap())
+        for role in [&local_role, &azure_role] {
+            let rules = role["rules"].as_array().unwrap();
+            for (group, resource, verbs) in [
+                (
+                    "controlplane.cluster.x-k8s.io",
+                    "kamajicontrolplanes",
+                    json!(["get"]),
+                ),
+                ("", "secrets", json!(["get"])),
+            ] {
+                assert!(rules.iter().any(|r| r["apiGroups"] == json!([group])
+                    && r["resources"] == json!([resource])
+                    && r["verbs"] == verbs));
+            }
+            assert!(rules.iter().all(|r| {
+                ![
+                    "persistentvolumes",
+                    "persistentvolumeclaims",
+                    "pods",
+                    "clusters.postgresql.cnpg.io",
+                    "tenantdatabases",
+                    "resourcequotas",
+                ]
+                .contains(&r["resources"][0].as_str().unwrap())
+            }));
+        }
+        assert!(local_role["rules"].as_array().unwrap().iter().any(|r| {
+            r["resources"] == json!(["configmaps"])
+                && r["resourceNames"] == json!(["tenant-foundation"])
+                && r["verbs"] == json!(["get"])
         }));
+        assert!(
+            azure_role["rules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|r| { r["resources"] != json!(["configmaps"]) })
+        );
         assert!(
             azure_role["rules"]
                 .as_array()
@@ -289,6 +373,28 @@ mod tests {
             deployment["spec"]["template"]["spec"]["containers"][0]["env"][0]["valueFrom"]["fieldRef"]
                 ["fieldPath"],
             "metadata.uid"
+        );
+        let pod = &deployment["spec"]["template"]["spec"];
+        assert_eq!(
+            pod["volumes"][0]["hostPath"],
+            json!({
+                "path": "/var/run/docker.sock", "type": "Socket"
+            })
+        );
+        assert_eq!(
+            pod["containers"][0]["volumeMounts"][0]["mountPath"],
+            "/var/run/docker.sock"
+        );
+        assert_eq!(pod["containers"][0]["securityContext"]["runAsUser"], 0);
+        let azure_deployment: Value =
+            serde_yaml::from_slice(find(&artifacts, "deployment/controller-azure.yaml")).unwrap();
+        assert_eq!(
+            azure_deployment["spec"]["template"]["spec"]["volumes"],
+            Value::Null
+        );
+        assert_eq!(
+            azure_deployment["spec"]["template"]["spec"]["containers"][0]["securityContext"]["runAsNonRoot"],
+            true
         );
     }
 }

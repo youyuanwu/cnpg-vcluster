@@ -109,6 +109,32 @@ spec:
                       x-kubernetes-list-map-keys:
                       - type
                       x-kubernetes-list-type: map
+                    createIntents:
+                      default: []
+                      items:
+                        properties:
+                          kind:
+                            type: string
+                          name:
+                            type: string
+                          ordinal:
+                            format: int32
+                            type: integer
+                          state:
+                            enum:
+                            - Planned
+                            - Issued
+                            - Rejected
+                            - Observed
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        - ordinal
+                        - state
+                        type: object
+                      maxItems: 12
+                      type: array
                     credentials:
                       nullable: true
                       properties:

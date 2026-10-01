@@ -11,12 +11,13 @@ use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{Api, Client, api::Portforwarder};
 use tenant_admin_shared::query::DatabaseQueryResult;
-use tenant_controller::resources::MANAGED_DATABASE_NAMESPACE;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     time::Instant as TokioInstant,
 };
 use tokio_postgres::{CancelToken, NoTls, SimpleQueryMessage, config::SslMode};
+
+use crate::source::MANAGED_DATABASE_NAMESPACE;
 
 const QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 const CANCEL_TIMEOUT: Duration = Duration::from_secs(3);
