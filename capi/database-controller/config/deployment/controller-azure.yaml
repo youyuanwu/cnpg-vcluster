@@ -15,6 +15,7 @@ spec:
     metadata:
       labels:
         app: database-controller
+        azure.workload.identity/use: 'true'
     spec:
       automountServiceAccountToken: true
       containers:
@@ -23,6 +24,8 @@ spec:
           valueFrom:
             fieldRef:
               fieldPath: metadata.uid
+        - name: DATABASE_DISK_CLIENT_ID
+          value: database-disk-client-id:configure-before-install
         image: database-controller:configure-before-install
         imagePullPolicy: IfNotPresent
         livenessProbe:

@@ -6,8 +6,6 @@ use kube::{
 };
 use serde_json::Value;
 
-use crate::TENANT_UID;
-
 pub const CNPG_VERSION: &str = "1.30.0";
 pub const AZURE_DISK_VERSION: &str = "v1.32.12";
 pub const CNPG_IMAGE: &str = "ghcr.io/cloudnative-pg/cloudnative-pg:1.30.0@sha256:a2701eb97cdd2a34b1fdb2cb51987f544b706e40bec72ae7146cd8580efefebb";
@@ -15,17 +13,11 @@ pub const AZURE_DISK_IMAGE: &str = "mcr.microsoft.com/oss/v2/kubernetes-csi/azur
 pub const STORAGE_CLASS: &str = "cnpg-azure-disk";
 const DEFAULT_CLASS: &str = "storageclass.kubernetes.io/is-default-class";
 
-fn expected_class(tenant_uid: &str) -> StorageClass {
+fn expected_class() -> StorageClass {
     StorageClass {
         metadata: ObjectMeta {
             name: Some(STORAGE_CLASS.into()),
-            annotations: Some(
-                [
-                    (TENANT_UID.into(), tenant_uid.into()),
-                    (DEFAULT_CLASS.into(), "true".into()),
-                ]
-                .into(),
-            ),
+            annotations: Some([(DEFAULT_CLASS.into(), "false".into())].into()),
             ..Default::default()
         },
         provisioner: "disk.csi.azure.com".into(),
@@ -35,8 +27,8 @@ fn expected_class(tenant_uid: &str) -> StorageClass {
     }
 }
 
-pub fn valid_class(class: &StorageClass, tenant_uid: &str) -> bool {
-    let expected = expected_class(tenant_uid);
+pub fn valid_class(class: &StorageClass) -> bool {
+    let expected = expected_class();
     class.metadata.deletion_timestamp.is_none()
         && class
             .metadata
@@ -63,13 +55,13 @@ pub fn valid_class(class: &StorageClass, tenant_uid: &str) -> bool {
             .is_none_or(|topologies| topologies.is_empty())
 }
 
-pub async fn ensure_class(client: Client, tenant_uid: &str) -> Result<bool, kube::Error> {
+pub async fn ensure_class(client: Client) -> Result<bool, kube::Error> {
     let classes: Api<StorageClass> = Api::all(client);
     match classes.get_opt(STORAGE_CLASS).await? {
-        Some(class) => Ok(valid_class(&class, tenant_uid)),
+        Some(class) => Ok(valid_class(&class)),
         None => {
             classes
-                .create(&PostParams::default(), &expected_class(tenant_uid))
+                .create(&PostParams::default(), &expected_class())
                 .await?;
             Ok(false)
         }
@@ -148,7 +140,7 @@ async fn workload(
         .is_some_and(|object| workload_ready(object, container_name, image)))
 }
 
-pub async fn observe(client: Client, tenant_uid: &str) -> Result<&'static str, kube::Error> {
+pub async fn observe(client: Client) -> Result<&'static str, kube::Error> {
     let operator = workload(
         client.clone(),
         "cnpg-system",
@@ -177,7 +169,7 @@ pub async fn observe(client: Client, tenant_uid: &str) -> Result<&'static str, k
     )
     .await;
     let disk_reason = match (controller, node) {
-        (Ok(true), Ok(true)) => observe_disk(client, tenant_uid).await,
+        (Ok(true), Ok(true)) => observe_disk(client).await,
         (Err(error), _) | (_, Err(error)) => Err(error),
         _ => Ok("DiskCSINotReady"),
     };
@@ -187,7 +179,7 @@ pub async fn observe(client: Client, tenant_uid: &str) -> Result<&'static str, k
     disk_reason
 }
 
-async fn observe_disk(client: Client, tenant_uid: &str) -> Result<&'static str, kube::Error> {
+async fn observe_disk(client: Client) -> Result<&'static str, kube::Error> {
     let mut resource =
         ApiResource::from_gvk(&GroupVersionKind::gvk("storage.k8s.io", "v1", "CSIDriver"));
     resource.plural = "csidrivers".into();
@@ -200,7 +192,7 @@ async fn observe_disk(client: Client, tenant_uid: &str) -> Result<&'static str, 
     {
         return Ok("DiskCSINotReady");
     }
-    if !ensure_class(client, tenant_uid).await? {
+    if !ensure_class(client).await? {
         return Ok("StoragePolicyNotReady");
     }
     Ok("Ready")
@@ -212,23 +204,29 @@ mod tests {
 
     #[test]
     fn storage_policy_rejects_drift_and_recovers() {
-        let mut class = expected_class("tenant-uid");
+        let mut class = expected_class();
         let missing: Option<&StorageClass> = None;
-        assert!(!missing.is_some_and(|class| valid_class(class, "tenant-uid")));
+        assert!(!missing.is_some_and(valid_class));
         class.metadata.uid = Some("class-uid".into());
-        assert!(valid_class(&class, "tenant-uid"));
+        assert!(valid_class(&class));
         class.provisioner = "kubernetes.io/azure-disk".into();
-        assert!(!valid_class(&class, "tenant-uid"));
-        class = expected_class("tenant-uid");
+        assert!(!valid_class(&class));
+        class = expected_class();
         class.metadata.uid = Some("class-uid".into());
         class.reclaim_policy = Some("Delete".into());
-        assert!(!valid_class(&class, "tenant-uid"));
+        assert!(!valid_class(&class));
         class.reclaim_policy = Some("Retain".into());
         class.volume_binding_mode = Some("Immediate".into());
-        assert!(!valid_class(&class, "tenant-uid"));
+        assert!(!valid_class(&class));
         class.volume_binding_mode = Some("WaitForFirstConsumer".into());
-        assert!(!valid_class(&class, "other-uid"));
-        assert!(valid_class(&class, "tenant-uid"));
+        assert!(valid_class(&class));
+        class
+            .metadata
+            .annotations
+            .as_mut()
+            .unwrap()
+            .insert(DEFAULT_CLASS.into(), "true".into());
+        assert!(!valid_class(&class));
     }
 
     #[test]

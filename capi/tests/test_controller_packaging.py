@@ -156,14 +156,27 @@ class PackagingTests(unittest.TestCase):
             azure = Client(
                 lambda *args, **_kwargs: (
                     rendered.append(Path(args[-1]).read_text()) or response()
+                    if args[0] == "apply" else response()
                 )
             )
-            database_controller.install_database_controller(ROOT, azure, image, azure=True)
+            database_controller.install_database_controller(
+                ROOT, azure, image, azure=True,
+                azure_identity_client_id="11111111-1111-4111-8111-111111111111",
+            )
             self.assertEqual(len(rendered), 2)
             self.assertNotIn("docker.sock", rendered[1])
             self.assertNotIn("docker/volumes", rendered[1])
             self.assertIn("runAsNonRoot: true", rendered[1])
+            self.assertIn("azure.workload.identity/use: 'true'", rendered[1])
+            self.assertIn("11111111-1111-4111-8111-111111111111", rendered[1])
             self.assertIn("image: " + image, rendered[1])
+            self.assertTrue(any(
+                args[:3] == ("-n", "tenant-system", "annotate")
+                and "azure.workload.identity/client-id=11111111-1111-4111-8111-111111111111"
+                in args for args, _ in azure.calls
+            ))
+            with self.assertRaisesRegex(RuntimeError, "dedicated Azure disk identity"):
+                database_controller.render_database_controller(ROOT, image, azure=True)
         finally:
             (ROOT / ".runtime/rendered/database-controller/controller.yaml").unlink(
                 missing_ok=True
@@ -185,6 +198,7 @@ class PackagingTests(unittest.TestCase):
                 self.assertNotIn(tenant_resource, role)
         self.assertIn("tenant-foundation", local)
         self.assertNotIn("tenant-foundation", azure)
+        self.assertIn("tenant-azure-provider", azure)
         self.assertIn("disks", azure)
         self.assertNotIn("disks", local)
         local_inventory = json.loads(
@@ -203,6 +217,52 @@ class PackagingTests(unittest.TestCase):
             {"tenantdatabasecatalogs", "tenants", "namespaces",
              "clusters", "kamajicontrolplanes", "secrets", "disks"},
         )
+
+    def test_azure_identity_failure_does_not_roll_out_and_retry_recovers(self):
+        image = "registry.example/db@sha256:" + "a" * 64
+        client_id = "11111111-1111-4111-8111-111111111111"
+        blocked = Client(
+            lambda *args, **_kwargs: response(
+                code=1, error="dedicated identity unavailable",
+            ) if args[:3] == ("-n", "tenant-system", "annotate") else response()
+        )
+        try:
+            with self.assertRaisesRegex(RuntimeError, "dedicated identity unavailable"):
+                database_controller.install_database_controller(
+                    ROOT, blocked, image, azure=True,
+                    azure_identity_client_id=client_id,
+                )
+            self.assertFalse(any(args[0] == "apply" for args, _ in blocked.calls))
+            recovered = Client()
+            database_controller.install_database_controller(
+                ROOT, recovered, image, azure=True,
+                azure_identity_client_id=client_id,
+            )
+            self.assertEqual(
+                [args[0] for args, _ in recovered.calls],
+                ["-n", "apply"],
+            )
+            for invalid in ("", "not-a-client-id", "11111111111141118111111111111111"):
+                with self.subTest(invalid=invalid), self.assertRaisesRegex(
+                    RuntimeError, "dedicated Azure disk identity"
+                ):
+                    database_controller.render_database_controller(
+                        ROOT, image, azure=True, azure_identity_client_id=invalid,
+                    )
+        finally:
+            (ROOT / ".runtime/rendered/database-controller/controller.yaml").unlink(
+                missing_ok=True
+            )
+
+    def test_azure_adapter_is_staged_without_catalog_addition_privileges(self):
+        self.assertFalse(packaging.CATALOG_LIFECYCLE_READY)
+        for role in ("cluster-role-local.json", "cluster-role-azure.json"):
+            payload = json.loads((ROOT / "admin/config/rbac" / role).read_text())
+            self.assertFalse(any(
+                "tenantdatabasecatalogs" in rule.get("resources", [])
+                and any(verb in rule.get("verbs", []) for verb in ("create", "patch", "update"))
+                for rule in payload["rules"]
+            ))
 
     def test_catalog_probe_exception_is_single_identity_and_service_account(self):
         policy = packaging.catalog_cutover_lock_documents(

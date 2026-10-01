@@ -57,10 +57,14 @@ fn controller_rules(azure: bool) -> Vec<Value> {
         rule("", &["secrets"], &["get"]),
     ];
     if azure {
+        rules.push(json!({
+            "apiGroups": [""], "resources": ["configmaps"],
+            "resourceNames": ["tenant-azure-provider"], "verbs": ["get"]
+        }));
         rules.push(rule(
             "compute.azure.com",
             &["disks"],
-            &["get", "list", "watch"],
+            &["get", "list", "watch", "create", "delete"],
         ));
     } else {
         rules.push(json!({
@@ -109,6 +113,15 @@ fn deployment(local: bool) -> Value {
             {"name": "docker-volumes",
                 "hostPath": {"path": "/var/lib/docker/volumes", "type": "Directory"}}
         ]);
+    } else {
+        container["env"]
+            .as_array_mut()
+            .expect("env is a list")
+            .push(json!({
+                "name": "DATABASE_DISK_CLIENT_ID",
+                "value": "database-disk-client-id:configure-before-install"
+            }));
+        pod["containers"] = json!([container]);
     }
     json!({
         "apiVersion": "apps/v1", "kind": "Deployment",
@@ -117,7 +130,11 @@ fn deployment(local: bool) -> Value {
             "replicas": 1, "strategy": {"type": "Recreate"},
             "selector": {"matchLabels": {"app": "database-controller"}},
             "template": {
-                "metadata": {"labels": {"app": "database-controller"}},
+                "metadata": {"labels": if local {
+                    json!({"app": "database-controller"})
+                } else {
+                    json!({"app": "database-controller", "azure.workload.identity/use": "true"})
+                }},
                 "spec": pod
             }
         }
@@ -328,8 +345,6 @@ mod tests {
                     "persistentvolumeclaims",
                     "pods",
                     "clusters.postgresql.cnpg.io",
-                    "tenantdatabases",
-                    "resourcequotas",
                 ]
                 .contains(&r["resources"][0].as_str().unwrap())
             }));
@@ -339,20 +354,18 @@ mod tests {
                 && r["resourceNames"] == json!(["tenant-foundation"])
                 && r["verbs"] == json!(["get"])
         }));
-        assert!(
-            azure_role["rules"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .all(|r| { r["resources"] != json!(["configmaps"]) })
-        );
+        assert!(azure_role["rules"].as_array().unwrap().iter().any(|r| {
+            r["resources"] == json!(["configmaps"])
+                && r["resourceNames"] == json!(["tenant-azure-provider"])
+                && r["verbs"] == json!(["get"])
+        }));
         assert!(
             azure_role["rules"]
                 .as_array()
                 .unwrap()
                 .iter()
                 .any(|r| r["resources"] == json!(["disks"])
-                    && r["verbs"] == json!(["get", "list", "watch"]))
+                    && r["verbs"] == json!(["get", "list", "watch", "create", "delete"]))
         );
         assert!(
             artifacts
@@ -395,6 +408,14 @@ mod tests {
         assert_eq!(
             azure_deployment["spec"]["template"]["spec"]["containers"][0]["securityContext"]["runAsNonRoot"],
             true
+        );
+        assert_eq!(
+            azure_deployment["spec"]["template"]["metadata"]["labels"]["azure.workload.identity/use"],
+            "true"
+        );
+        assert_eq!(
+            azure_deployment["spec"]["template"]["spec"]["containers"][0]["env"][1]["value"],
+            "database-disk-client-id:configure-before-install"
         );
     }
 }

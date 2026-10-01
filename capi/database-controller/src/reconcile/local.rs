@@ -27,7 +27,10 @@ const SIZE: i64 = 1024 * 1024 * 1024;
 const RETRY: Duration = Duration::from_secs(10);
 const CNPG_CLUSTER_VERSION: &str = "postgresql.cnpg.io/v1";
 
-fn owned_by_cluster(owners: Option<&[OwnerReference]>, cluster: &ResourceIdentity) -> bool {
+pub(super) fn owned_by_cluster(
+    owners: Option<&[OwnerReference]>,
+    cluster: &ResourceIdentity,
+) -> bool {
     owners.is_some_and(|owners| {
         owners.len() == 1
             && owners[0].api_version == CNPG_CLUSTER_VERSION
@@ -37,7 +40,7 @@ fn owned_by_cluster(owners: Option<&[OwnerReference]>, cluster: &ResourceIdentit
     })
 }
 
-fn api(
+pub(super) fn api(
     client: Client,
     namespace: Option<&str>,
     group: &str,
@@ -53,11 +56,16 @@ fn api(
     }
 }
 
-fn core(client: Client, namespace: Option<&str>, kind: &str, plural: &str) -> Api<DynamicObject> {
+pub(super) fn core(
+    client: Client,
+    namespace: Option<&str>,
+    kind: &str,
+    plural: &str,
+) -> Api<DynamicObject> {
     api(client, namespace, "", "v1", kind, plural)
 }
 
-fn object(
+pub(super) fn object(
     kind: &str,
     name: &str,
     namespace: Option<&str>,
@@ -74,13 +82,13 @@ fn object(
     serde_json::from_value(value).map_err(|_| ObserveError::Identity)
 }
 
-fn identity(catalog: &TenantDatabaseCatalog, uid: &str) -> Result<Value, ObserveError> {
+pub(super) fn identity(catalog: &TenantDatabaseCatalog, uid: &str) -> Result<Value, ObserveError> {
     Ok(json!(
         ownership::labels(catalog, uid).map_err(|_| ObserveError::Foreign)?
     ))
 }
 
-fn check(
+pub(super) fn check(
     object: &DynamicObject,
     catalog: &TenantDatabaseCatalog,
     uid: &str,
@@ -124,7 +132,7 @@ fn contains(actual: &Value, desired: &Value) -> bool {
     }
 }
 
-fn matches_desired(live: &DynamicObject, desired: &DynamicObject) -> bool {
+pub(super) fn matches_desired(live: &DynamicObject, desired: &DynamicObject) -> bool {
     let mut desired_data = desired.data.clone();
     if desired
         .types
@@ -200,7 +208,12 @@ fn entry(uid: &str, generation: i64) -> EntryStatus {
     }
 }
 
-fn set_health(state: &mut EntryStatus, ready: bool, generation: i64, blocked: Option<&str>) {
+pub(super) fn set_health(
+    state: &mut EntryStatus,
+    ready: bool,
+    generation: i64,
+    blocked: Option<&str>,
+) {
     let reason = if let Some(reason) = blocked {
         reason
     } else if ready {
@@ -244,7 +257,7 @@ fn set_health(state: &mut EntryStatus, ready: bool, generation: i64, blocked: Op
     };
 }
 
-async fn blocked(
+pub(crate) async fn blocked(
     management: Client,
     catalog: &mut TenantDatabaseCatalog,
     uid: &str,
@@ -266,7 +279,7 @@ async fn blocked(
     Ok(false)
 }
 
-async fn save(
+pub(crate) async fn save(
     client: Client,
     catalog: &mut TenantDatabaseCatalog,
     uid: &str,
@@ -276,7 +289,7 @@ async fn save(
     Ok(())
 }
 
-fn intent(
+pub(crate) fn intent(
     state: &EntryStatus,
     kind: &str,
     name: &str,
@@ -300,7 +313,7 @@ fn intent(
     clippy::too_many_arguments,
     reason = "each durable intent is scoped to an exact catalog, entry, kind, name and ordinal"
 )]
-async fn record(
+pub(crate) async fn record(
     client: Client,
     catalog: &mut TenantDatabaseCatalog,
     uid: &str,
@@ -330,11 +343,11 @@ async fn record(
     save(client, catalog, uid, state).await
 }
 
-fn definite_rejection(error: &kube::Error) -> bool {
+pub(super) fn definite_rejection(error: &kube::Error) -> bool {
     matches!(error, kube::Error::Api(status) if (400..500).contains(&status.code) && !matches!(status.code, 408 | 409 | 429))
 }
 
-fn may_issue(previous: Option<CreateState>) -> bool {
+pub(super) fn may_issue(previous: Option<CreateState>) -> bool {
     !matches!(previous, Some(CreateState::Issued | CreateState::Observed))
 }
 
@@ -342,7 +355,7 @@ fn may_issue(previous: Option<CreateState>) -> bool {
     clippy::too_many_arguments,
     reason = "creation binds the exact catalog entry and named resource"
 )]
-async fn create(
+pub(super) async fn create(
     management: Client,
     catalog: &mut TenantDatabaseCatalog,
     uid: &str,
@@ -1264,7 +1277,7 @@ async fn ensure(
     Ok(false)
 }
 
-async fn delete_exact(
+pub(super) async fn delete_exact(
     management: Client,
     catalog: &TenantDatabaseCatalog,
     uid: &str,
@@ -1299,7 +1312,7 @@ async fn delete_exact(
     clippy::too_many_arguments,
     reason = "adoption binds the observed resource to a persisted exact intent"
 )]
-async fn adopt(
+pub(super) async fn adopt(
     management: Client,
     catalog: &mut TenantDatabaseCatalog,
     uid: &str,

@@ -27,6 +27,8 @@ pub enum ObserveError {
     Foreign,
     #[error("local data path cannot be verified")]
     Path(#[from] crate::local_path::PathError),
+    #[error("Azure disk identity, credential, or ARM response cannot be proven: {0}")]
+    Azure(&'static str),
     #[error("catalog spec is invalid: {0}")]
     InvalidSpec(#[from] crate::api::CatalogError),
     #[error(transparent)]
@@ -271,6 +273,7 @@ pub fn error_policy() -> Action {
     Action::requeue(RETRY)
 }
 
+pub mod azure;
 pub mod local;
 
 pub async fn reconcile(
@@ -285,17 +288,17 @@ pub async fn reconcile(
     {
         return observe(client, &current, pod_uid, instance_id).await;
     }
-    if field(
+    match field(
         &tenant_api(client.clone())
             .get(&current.spec.tenant_name)
             .await?
             .data,
         "/spec/provider/type",
-    )? != "local"
-    {
-        return Err(ObserveError::UnsupportedEntries);
+    )? {
+        "local" => local::reconcile(client, &current).await,
+        "azure" => azure::reconcile(client, &current).await,
+        _ => Err(ObserveError::UnsupportedEntries),
     }
-    local::reconcile(client, &current).await
 }
 
 #[cfg(test)]

@@ -357,7 +357,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             };
         capability.available = false;
         capability.reason =
-            match tenant_database_runtime::azure_runtime::observe(tenant_client, &tenant_uid).await
+            match tenant_database_runtime::azure_runtime::observe(tenant_client).await
             {
                 Ok("Ready") => match tenant_database_runtime::catalog_runtime::ensure_credentials(
                     self.client.clone(), &name, &tenant_uid, true,

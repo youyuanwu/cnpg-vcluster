@@ -56,6 +56,14 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - ''
+  resourceNames:
+  - tenant-azure-provider
+  resources:
+  - configmaps
+  verbs:
+  - get
+- apiGroups:
   - compute.azure.com
   resources:
   - disks
@@ -63,3 +71,5 @@ rules:
   - get
   - list
   - watch
+  - create
+  - delete

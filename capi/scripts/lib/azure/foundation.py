@@ -1576,6 +1576,7 @@ def _install_tenant_controller(
     )
     install_database_controller(
         root, AzureCatalogClient(), database_image, azure=True,
+        azure_identity_client_id=inventory["outputs"]["databaseIdentityClientId"],
     )
     if cutover_locked:
         verify_catalog_cutover_lock(

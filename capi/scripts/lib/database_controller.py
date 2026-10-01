@@ -21,6 +21,7 @@ CATALOG_CRD = "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io"
 LEGACY_CRD = "tenantdatabases.tenancy.cnpg-vcluster.io"
 DATABASE_DEPLOYMENT = "database-controller"
 DATABASE_IMAGE_PLACEHOLDER = "database-controller:configure-before-install"
+DATABASE_DISK_CLIENT_ID_PLACEHOLDER = "database-disk-client-id:configure-before-install"
 
 
 def _release_workloads_ready(
@@ -249,6 +250,7 @@ def build_database_controller_image(
 
 def render_database_controller(
     root: Path, image: str, *, azure: bool = False,
+    azure_identity_client_id: str | None = None,
 ) -> Path:
     if (
         image == DATABASE_IMAGE_PLACEHOLDER
@@ -261,6 +263,17 @@ def render_database_controller(
     ).read_text(encoding="utf-8")
     if template.count(DATABASE_IMAGE_PLACEHOLDER) != 1:
         raise RuntimeError("database controller deployment image placeholder is invalid")
+    if azure:
+        if (
+            azure_identity_client_id is None
+            or re.fullmatch(
+                r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}",
+                azure_identity_client_id,
+            ) is None
+            or template.count(DATABASE_DISK_CLIENT_ID_PLACEHOLDER) != 1
+        ):
+            raise RuntimeError("dedicated Azure disk identity must be bound before deployment")
+        template = template.replace(DATABASE_DISK_CLIENT_ID_PLACEHOLDER, azure_identity_client_id)
     destination = root / ".runtime" / "rendered" / "database-controller" / "controller.yaml"
     write_private_file(destination, template.replace(DATABASE_IMAGE_PLACEHOLDER, image))
     return destination
@@ -268,8 +281,17 @@ def render_database_controller(
 
 def install_database_controller(
     root: Path, client: ManagementClient, image: str, *, azure: bool = False,
+    azure_identity_client_id: str | None = None,
 ) -> None:
-    manifest = render_database_controller(root, image, azure=azure)
+    manifest = render_database_controller(
+        root, image, azure=azure, azure_identity_client_id=azure_identity_client_id,
+    )
+    if azure:
+        client.kubectl(
+            "-n", "tenant-system", "annotate", "serviceaccount/database-controller",
+            f"azure.workload.identity/client-id={azure_identity_client_id}",
+            "--overwrite",
+        )
     client.kubectl(
         "apply", "--server-side", "--field-manager=cnpg-vcluster-database-controller",
         "--force-conflicts", "-f", str(manifest),

@@ -30,6 +30,11 @@ pub fn all_creates_resolved(state: &EntryStatus) -> bool {
                     s.ordinal == intent.ordinal
                         && s.pvc.as_ref().is_some_and(|id| id.name == intent.name)
                 }),
+                "Disk" => state.storage.iter().any(|s| {
+                    s.ordinal == intent.ordinal
+                        && s.disk.as_ref().is_some_and(|id| id.name == intent.name)
+                        && s.arm_id.is_some()
+                }),
                 _ => false,
             },
         })

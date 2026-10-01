@@ -5,7 +5,8 @@ Kubernetes tenants with Cluster API. One kind management cluster runs Cluster
 API core, kubeadm bootstrap, the Docker development infrastructure provider,
 Kamaji, and the Kamaji control-plane provider. Explicit tenant specifications
 select the hosted control plane, one to three exclusive Docker worker
-containers, and one to three CloudNativePG instances.
+containers. Database workloads are explicit catalog entries, not implicit
+Tenant resources.
 
 The Azure profile provisions an independently managed AKS foundation with a
 shared ACR, Kamaji control planes, CAPZ-managed Azure worker machines, and the
@@ -22,8 +23,15 @@ infrastructure Ready does not depend on chart installation.
 Local and Azure tenants are Kubernetes `Tenant` resources reconciled by the
 Rust/kube-rs controller. Each manager deployment installs exactly one provider:
 local mode retains Docker and the local foundation, while Azure mode runs in
-AKS without Docker or Azure credentials and delegates cloud mutation to
-CAPZ/ASO.
+AKS without Docker or Azure credentials and delegates infrastructure mutation
+to CAPZ/ASO. A separate database-controller uses the dedicated Azure workload
+identity to read and delete only managed disks in the foundation resource group.
+It reconciles catalog entries against the pinned CNPG/CSI runtime and a
+non-default `cnpg-azure-disk` class. Each entry has its own workload namespace;
+its ASO disks live in the Tenant's separate storage namespace. Static CSI
+volumes retain each 4-GiB disk until workload removal and direct ARM-ID
+NotFound proof. Admin catalog additions are not exposed in this phase; the
+provider adapter and packaging are staged, not a live Azure release claim.
 
 Both management profiles install the provider-neutral `tenant-admin`
 application: a Leptos WebAssembly frontend served by an Axum/kube-rs backend.
@@ -39,11 +47,12 @@ rules and has no Azure credentials, application database, persistent cache, or
 browser credential exposure. See
 [`docs/admin-ui-design.md`](docs/admin-ui-design.md).
 
-The proposed minimal Azure experiment is documented in
+The Azure experiment is documented in
 [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md). It
-deliberately prioritizes tenant control-plane, VMSS worker, cloud-provider,
-targeted deletion, and recreation behavior over production infrastructure,
-Azure Disk/CNPG workload validation, and operational hardening.
+prioritizes tenant control-plane, VMSS worker, cloud-provider, targeted
+deletion, and recreation behavior. Azure database workloads and destructive
+disk cleanup still require the separate credentialed validation gates before
+the catalog API can be released.
 
 Azure foundation operations use the ignored owner-only
 `config/azure.local.env` selectors. Azure Tenant creation uses a schema-1 JSON

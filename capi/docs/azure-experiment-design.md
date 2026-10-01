@@ -52,8 +52,9 @@ The experiment includes:
 - CAPZ-owned whole-VMSS deletion, foundation preservation, and
   recreation checks.
 
-Azure Disk and CloudNativePG remain later experiment extensions after the
-three-worker tenant lifecycle is repeatable.
+Azure Disk and CloudNativePG are staged separately from the three-worker
+tenant lifecycle; their credentialed destructive validation remains a later
+release gate.
 
 ## Non-goals
 
@@ -489,23 +490,23 @@ exchange VXLAN traffic on UDP 4789.
 The experiment does not require tenant `LoadBalancer` Services; the important
 Azure load balancer is the Kamaji API endpoint managed by AKS.
 
-## Future storage and CloudNativePG extension
+## Staged Azure database runtime
 
-The current lifecycle gate proves three-worker VMSS replacement before
-targeted tenant deletion. A later storage extension can add:
-
-- Azure Disk CSI controller and node components;
-- one simple StorageClass using `disk.csi.azure.com`;
-- `WaitForFirstConsumer`;
-- dynamically provisioned managed disks;
-- one three-instance CloudNativePG cluster.
-
-In that extension, each PostgreSQL instance receives its own PVC and Azure
-managed disk.
-CloudNativePG pod anti-affinity spreads the instances across the three
-workers. The experiment does not initially require zone-aware storage,
-snapshots, backups, disk encryption customization, or a particular premium
-disk SKU.
+The management installer stages a pinned CNPG operator and Azure Disk CSI
+controller/node runtime independently of Tenant infrastructure readiness.
+Tenant capability observes their current rollout and a non-default,
+`Retain`/`WaitForFirstConsumer` `cnpg-azure-disk` StorageClass. Catalog entries
+use UID-derived workload namespaces, with ASO Disk
+`compute.azure.com/v1api20240302` objects in a separate Tenant-owned storage
+namespace. Each of up to three clusters has one static 4-GiB StandardSSD_LRS
+disk, PV and PVC per instance. ARM IDs are recorded before disk creation.
+Deletion removes the CNPG workload, claims, volumes and workload namespace
+before ASO disks; the dedicated database-controller workload identity must
+GET/DELETE each exact ARM ID and observe NotFound before terminal catalog
+proof. An uncertain create outcome retains the entry rather than inferring
+absence. This is staged implementation, not evidence of a live destructive
+Azure run: catalog additions remain unavailable through Admin until the API
+and remaining release gates pass.
 
 ## Operator workflow
 
@@ -668,11 +669,11 @@ authentication are outside this experiment.
 
 ## Exclusions and future work
 
-Azure Disk, Azure CSI, CloudNativePG, public tenant endpoints, DNS automation,
-certificate automation, autoscaling, multiple provider implementations in one
-manager deployment, and production hostile-tenant isolation remain excluded.
-Any future storage/database work is a separate lifecycle design and must not
-be inferred from this provider.
+Public tenant endpoints, DNS automation, certificate automation, autoscaling,
+multiple provider implementations in one manager deployment, and production
+hostile-tenant isolation remain excluded. Azure database runtime installation
+and catalog reconciliation are staged, but no production storage guarantees
+or successful credentialed destructive gate should be inferred from them.
 
 ## References
 

@@ -196,7 +196,7 @@ resource databaseDiskRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' =
   name: guid(resourceGroup().id, 'database-disk-read-delete')
   properties: {
     roleName: '${prefix}-database-disk-read-delete'
-    description: 'Read and remove exact managed disks during TenantDatabase finalization'
+    description: 'Read and remove exact managed disks during catalog entry finalization'
     type: 'CustomRole'
     permissions: [
       {
