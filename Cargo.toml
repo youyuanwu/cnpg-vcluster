@@ -49,6 +49,7 @@ tenant-database-controller = { path = "capi/database-controller" }
 tenant-database-runtime = { path = "capi/database-runtime" }
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 url = "2"
+uuid = { version = "1", features = ["v4"] }
 wasm-bindgen = "=0.2.129"
 wasm-bindgen-futures = "0.4"
 web-sys = { version = "=0.3.106", features = ["Location", "Window"] }

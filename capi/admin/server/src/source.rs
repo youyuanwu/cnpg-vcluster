@@ -44,6 +44,8 @@ use crate::{
     projection::is_accepted_local_management_resource,
 };
 
+mod catalog;
+
 const MAX_TENANTS: u32 = 500;
 const MAX_RESOURCES_PER_KIND: u32 = 500;
 const MAX_RESOURCES_TOTAL: usize = 2_000;
@@ -170,6 +172,42 @@ pub trait DataSource: Send + Sync {
         })
     }
     fn check_ready(&self) -> SourceFuture<'_, ()>;
+    fn read_catalog<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        let _ = tenant;
+        Box::pin(async { Err(SourceError::KubernetesUnavailable) })
+    }
+    fn add_database<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::DatabaseAddRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        let _ = (tenant, request);
+        Box::pin(async { Err(SourceError::CreationUnavailable) })
+    }
+    fn delete_database<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::DatabaseDeleteRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        let _ = (tenant, request);
+        Box::pin(async { Err(SourceError::KubernetesUnavailable) })
+    }
+    fn query_catalog<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::CatalogQueryRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogQueryResponse> {
+        let _ = (tenant, request);
+        Box::pin(async {
+            Err(database_unavailable(
+                "Catalog query source is unavailable",
+                true,
+            ))
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -899,6 +937,7 @@ fn validated_query_cluster(
         kind: CNPG_CLUSTER_KIND.into(),
         name: MANAGED_DATABASE_CLUSTER_NAME.into(),
         uid,
+        namespace: MANAGED_DATABASE_NAMESPACE.into(),
     })
 }
 
@@ -1413,6 +1452,44 @@ fn mutation_error(error: kube::Error) -> SourceError {
 }
 
 impl DataSource for KubeDataSource {
+    fn read_catalog<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        Box::pin(async move {
+            catalog::project(
+                &catalog::read(&self.client, tenant).await?,
+                match tenant.spec.provider {
+                    TenantProviderSpec::Local => ProviderMode::Local,
+                    TenantProviderSpec::Azure => ProviderMode::Azure,
+                },
+            )
+        })
+    }
+
+    fn add_database<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::DatabaseAddRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        Box::pin(async move { catalog::add(self, tenant, request).await })
+    }
+
+    fn delete_database<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::DatabaseDeleteRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        Box::pin(async move { catalog::delete(self, tenant, request).await })
+    }
+
+    fn query_catalog<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::CatalogQueryRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogQueryResponse> {
+        Box::pin(async move { catalog::query(self, tenant, request).await })
+    }
     fn list_tenants(&self) -> SourceFuture<'_, Vec<Tenant>> {
         Box::pin(async move {
             let list = self.tenant_list(MAX_TENANTS + 1).await?;

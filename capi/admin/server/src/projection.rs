@@ -384,6 +384,40 @@ fn accepted_azure<'a>(
     accepted
 }
 
+pub(crate) fn is_accepted_azure_management_resource(
+    tenant: &Tenant,
+    inventory: &[DynamicObject],
+    object: &DynamicObject,
+) -> bool {
+    accepted_azure(tenant, inventory)
+        .iter()
+        .any(|accepted| std::ptr::eq(accepted.object, object))
+}
+
+pub(crate) fn merge_catalog_topology(
+    graph: &mut TopologyGraph,
+    catalog: &tenant_admin_shared::catalog::CatalogView,
+) {
+    graph.nodes.retain(|node| !node.id.starts_with("database:"));
+    graph.edges.retain(|edge| {
+        !edge.source.starts_with("database:") && !edge.target.starts_with("database:")
+    });
+    for database in &catalog.databases {
+        let root = format!("database:{}", database.logical_uid);
+        graph.nodes.extend(database.topology.nodes.iter().cloned());
+        graph.edges.extend(database.topology.edges.iter().cloned());
+        graph.edges.push(TopologyEdge {
+            id: format!("edge:tenant:{root}"),
+            source: "tenant".into(),
+            target: root,
+            kind: TopologyEdgeKind::Contains,
+            label: Some("Database cluster".into()),
+        });
+    }
+    graph.nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    graph.edges.sort_by(|left, right| left.id.cmp(&right.id));
+}
+
 fn local_markers_match(
     object: &DynamicObject,
     definition: ManagementResource,

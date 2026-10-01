@@ -2037,6 +2037,24 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     "verbs": ["get"],
                 }),
             ),
+            (
+                "catalog-status-write",
+                "tenant-a",
+                add_effective_rule({
+                    "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                    "resources": ["tenantdatabasecatalogs/status"],
+                    "verbs": ["update"],
+                }),
+            ),
+            (
+                "direct-disk-authority",
+                "tenant-a",
+                add_effective_rule({
+                    "apiGroups": ["resources.azure.com"],
+                    "resources": ["disks"],
+                    "verbs": ["delete"],
+                }),
+            ),
         ):
             with self.subTest(name=name):
                 (_, blockers), _ = inspect(

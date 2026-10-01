@@ -30,21 +30,30 @@ It reconciles catalog entries against the pinned CNPG/CSI runtime and a
 non-default `cnpg-azure-disk` class. Each entry has its own workload namespace;
 its ASO disks live in the Tenant's separate storage namespace. Static CSI
 volumes retain each 4-GiB disk until workload removal and direct ARM-ID
-NotFound proof. Admin catalog additions are not exposed in this phase; the
-provider adapter and packaging are staged, not a live Azure release claim.
+NotFound proof. Catalog additions are gated on absence of both temporary
+catalog cutover locks, current Tenant/database-controller rollouts,
+exact Tenant readiness, and effective catalog permissions; provider
+adapters and packaging are staged, not a live Azure release claim.
 
 Both management profiles install the provider-neutral `tenant-admin`
 application: a Leptos WebAssembly frontend served by an Axum/kube-rs backend.
-It reads management topology and creates/deletes only top-level Tenants through
-exact provider-specific lifecycle RBAC.
-For a selected local Tenant detail page, it also reads the exact
-provider-owned kubeconfig Secret, validates its ownership and endpoint, and
-uses it only in memory for exact live CNPG reads. An explicitly unsafe SQL
-console can connect to a selected CNPG instance through an ephemeral
-Kubernetes port-forward and execute unrestricted SQL as the generated
-PostgreSQL superuser. The service validates its complete effective management
-rules and has no Azure credentials, application database, persistent cache, or
-browser credential exposure. See
+It reads management topology and creates/deletes top-level Tenants through
+exact provider-specific lifecycle RBAC. The schema-v5 backend exposes
+`GET/POST /api/v1/tenants/{name}/databases`,
+`DELETE /api/v1/tenants/{name}/databases/{uid}`, and
+`POST /api/v1/tenants/{name}/databases/{uid}/query`. Mutations require the
+displayed catalog UID; deletion additionally requires the logical UID and exact
+database name, and ambiguous writes only reread authoritative catalog state.
+Local and Azure queries require an exact Ready, non-deleting catalog entry and
+observed instance identity. Tenant kubeconfig and per-cluster PostgreSQL
+credentials are validated and used only in memory; queries use an ephemeral
+Kubernetes port-forward. The SQL console limits requests to 128 KiB (64 KiB
+SQL), execution to 30 seconds, and retained results to 32 sets, 128 columns,
+1,000 rows, 16 KiB per value and 2 MiB response text. The current frontend
+still shows the previous single-cluster experience pending the Phase 6 UI
+update. The service validates effective management permissions and has no
+Azure cloud credentials, application database, persistent cache, or browser
+credential exposure. See
 [`docs/admin-ui-design.md`](docs/admin-ui-design.md).
 
 The Azure experiment is documented in
@@ -52,7 +61,7 @@ The Azure experiment is documented in
 prioritizes tenant control-plane, VMSS worker, cloud-provider, targeted
 deletion, and recreation behavior. Azure database workloads and destructive
 disk cleanup still require the separate credentialed validation gates before
-the catalog API can be released.
+a live Azure rollout can be claimed.
 
 Azure foundation operations use the ignored owner-only
 `config/azure.local.env` selectors. Azure Tenant creation uses a schema-1 JSON

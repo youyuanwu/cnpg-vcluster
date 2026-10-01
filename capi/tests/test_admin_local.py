@@ -705,22 +705,20 @@ class AdminLocalTests(unittest.TestCase):
         role["rules"][0]["resources"].append("secrets")
         with self.assertRaisesRegex(RuntimeError, "read-only RBAC"):
             admin_local._verify_role(ROOT, role)
-        secret_rule_index = next(
+        catalog_rule_index = next(
             index
             for index, rule in enumerate(client.role["rules"])
-            if rule["resources"] == ["secrets"]
+            if rule["resources"] == ["tenantdatabasecatalogs"]
         )
         for verbs in (
-            ["list"],
             ["watch"],
             ["create"],
-            ["update"],
             ["patch"],
             ["delete"],
         ):
             role = copy.deepcopy(client.role)
-            role["rules"][secret_rule_index]["verbs"] = verbs
-            with self.subTest(secret_verbs=verbs), self.assertRaisesRegex(
+            role["rules"][catalog_rule_index]["verbs"] = verbs
+            with self.subTest(catalog_verbs=verbs), self.assertRaisesRegex(
                 RuntimeError,
                 "read-only RBAC",
             ):
@@ -787,6 +785,38 @@ class AdminLocalTests(unittest.TestCase):
                     "apiGroups": [""],
                     "resources": ["secrets"],
                     "verbs": ["create", "update", "patch", "delete"],
+                },
+            ),
+            (
+                "catalog-patch",
+                {
+                    "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                    "resources": ["tenantdatabasecatalogs"],
+                    "verbs": ["patch"],
+                },
+            ),
+            (
+                "catalog-status-write",
+                {
+                    "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                    "resources": ["tenantdatabasecatalogs/status"],
+                    "verbs": ["update"],
+                },
+            ),
+            (
+                "direct-disk-delete",
+                {
+                    "apiGroups": ["resources.azure.com"],
+                    "resources": ["disks"],
+                    "verbs": ["delete"],
+                },
+            ),
+            (
+                "cutover-policy-write",
+                {
+                    "apiGroups": ["admissionregistration.k8s.io"],
+                    "resources": ["validatingadmissionpolicybindings"],
+                    "verbs": ["update"],
                 },
             ),
             (

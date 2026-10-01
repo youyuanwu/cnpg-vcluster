@@ -215,7 +215,28 @@ def _normalized_rules(value: object) -> list[tuple[tuple[str, ...], ...]]:
             groups == ("apps",)
             and resources == ("deployments",)
             and verbs == ("get",)
-            and names == ("tenant-controller",)
+            and names in (("tenant-controller",), ("database-controller",))
+        )
+        catalog_intent = (
+            groups == ("tenancy.cnpg-vcluster.io",)
+            and resources == ("tenantdatabasecatalogs",)
+            and verbs == ("get", "update")
+            and not names
+        )
+        credential_policy_read = (
+            groups == ("rbac.authorization.k8s.io",)
+            and resources == ("rolebindings", "roles")
+            and verbs == ("get",)
+            and names == ("tenant-database-credentials",)
+        )
+        cutover_read = (
+            groups == ("admissionregistration.k8s.io",)
+            and resources == (
+                "validatingadmissionpolicies",
+                "validatingadmissionpolicybindings",
+            )
+            and verbs == ("get",)
+            and names == ("tenant-database-catalog-cutover-create-lock",)
         )
         ordinary_read = (
             set(verbs).issubset({"get", "list"}) and not names
@@ -234,7 +255,7 @@ def _normalized_rules(value: object) -> list[tuple[tuple[str, ...], ...]]:
             )
             or any("/" in resource for resource in resources)
             or not verbs
-            or not (tenant_mutation or controller_read or ordinary_read)
+            or not (tenant_mutation or controller_read or catalog_intent or credential_policy_read or cutover_read or ordinary_read)
         ):
             raise RuntimeError("Tenant Admin ClusterRole is not exact read-only RBAC")
         normalized.append((groups, resources, verbs, names))
@@ -415,7 +436,12 @@ def _verify_effective_rbac(root: Path, client: ManagementClient) -> None:
             raise RuntimeError(
                 f"Tenant Admin effective RBAC review is invalid in {namespace}"
             ) from exc
-        validate_admin_effective_rules(root, "local", review, namespace)
+        validate_admin_effective_rules(
+            root, "local", review, namespace,
+            lambda scope, resource: client.json(
+                "get", "-n", scope, resource
+            ) if not resource.startswith("namespace/") else client.json("get", resource),
+        )
 
 
 def _service_proxy_response(client: ManagementClient, path: str):

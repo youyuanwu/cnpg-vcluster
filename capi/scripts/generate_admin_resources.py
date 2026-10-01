@@ -23,8 +23,12 @@ PROVIDER_CATALOGS = {
     "local": Path("controller/config/management-resources.json"),
 }
 PROVIDER_EXPLICIT_RULES = {
-    "azure": (),
-    "local": (("", ("secrets",), ("get",), ()),),
+    "azure": (
+        ("rbac.authorization.k8s.io", ("roles", "rolebindings"), ("get",), ("tenant-database-credentials",)),
+    ),
+    "local": (
+        ("rbac.authorization.k8s.io", ("roles", "rolebindings"), ("get",), ("tenant-database-credentials",)),
+    ),
 }
 
 OUTPUT_PATHS = (
@@ -126,6 +130,11 @@ def provider_rules(
             ("create", "delete", "get", "list"),
             (),
         ),
+        ("tenancy.cnpg-vcluster.io", ("tenantdatabasecatalogs",), ("get", "update"), ()),
+        ("apps", ("deployments",), ("get",), ("database-controller",)),
+        ("admissionregistration.k8s.io",
+         ("validatingadmissionpolicies", "validatingadmissionpolicybindings"),
+         ("get",), ("tenant-database-catalog-cutover-create-lock",)),
         *PROVIDER_EXPLICIT_RULES[provider],
         *(
             (group, tuple(sorted(resources)), ("get",), ())

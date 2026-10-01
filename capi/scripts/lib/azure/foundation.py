@@ -1877,7 +1877,20 @@ def _admin_authorization_blockers(root: Path) -> list[str]:
             ]
         try:
             review = json.loads(response.stdout)
-            validate_admin_effective_rules(root, "azure", review, namespace)
+            def credential_resource(scope: str, resource: str) -> object:
+                args = ("get", resource, "-o", "json")
+                if not resource.startswith("namespace/"):
+                    args = ("get", "-n", scope, resource, "-o", "json")
+                result = _kubectl(root, *args, check=False)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        "Azure admin effective RBAC credential identity is unavailable"
+                    )
+                return json.loads(result.stdout)
+
+            validate_admin_effective_rules(
+                root, "azure", review, namespace, credential_resource
+            )
         except (json.JSONDecodeError, RuntimeError) as exc:
             return [str(exc).replace("Tenant Admin", "Azure admin", 1)]
     return []

@@ -254,13 +254,18 @@ class PackagingTests(unittest.TestCase):
                 missing_ok=True
             )
 
-    def test_azure_adapter_is_staged_without_catalog_addition_privileges(self):
+    def test_azure_adapter_stays_fenced_while_admin_only_updates_catalog_intents(self):
         self.assertFalse(packaging.CATALOG_LIFECYCLE_READY)
         for role in ("cluster-role-local.json", "cluster-role-azure.json"):
             payload = json.loads((ROOT / "admin/config/rbac" / role).read_text())
             self.assertFalse(any(
                 "tenantdatabasecatalogs" in rule.get("resources", [])
-                and any(verb in rule.get("verbs", []) for verb in ("create", "patch", "update"))
+                and any(verb in rule.get("verbs", []) for verb in ("create", "patch", "delete"))
+                for rule in payload["rules"]
+            ))
+            self.assertTrue(any(
+                rule.get("resources") == ["tenantdatabasecatalogs"]
+                and rule.get("verbs") == ["get", "update"]
                 for rule in payload["rules"]
             ))
 

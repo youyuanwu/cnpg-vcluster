@@ -3437,14 +3437,18 @@ dependencies = [
  "kube",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tenant-admin-shared",
  "tenant-controller",
+ "tenant-database-controller",
+ "tenant-database-runtime",
  "tokio",
  "tokio-postgres",
  "tower",
  "tower-http 0.7.1",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
