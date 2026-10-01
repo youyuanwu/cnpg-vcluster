@@ -435,26 +435,47 @@ async fn projected_tenant(
         .and_then(|status| status.database_capability.as_ref())
         .is_some()
     {
-        Some(state.source.read_catalog(&tenant).await?)
+        match state.source.read_catalog(&tenant).await {
+            Ok(catalog) => Ok(Some(catalog)),
+            Err(error) => {
+                tracing::warn!("catalog read unavailable while projecting Tenant detail");
+                Err(error)
+            }
+        }
     } else {
-        None
+        Ok(None)
     };
-    let database = if catalog.is_some() {
-        DatabaseObservation::Unavailable {
+    let database = match &catalog {
+        Ok(Some(_)) => DatabaseObservation::Unavailable {
             observed_at: chrono::Utc::now().to_rfc3339(),
             freshness: DatabaseObservationFreshness::Live,
             reason: DatabaseUnavailableReason::Pending,
             message: "Use the catalog database endpoint for per-cluster observations".into(),
             retryable: false,
+        },
+        Err(error) => DatabaseObservation::Unavailable {
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            freshness: DatabaseObservationFreshness::Live,
+            reason: DatabaseUnavailableReason::TenantApiUnavailable,
+            message: "Database catalog is unavailable; refresh its separate catalog panel".into(),
+            retryable: matches!(
+                error,
+                SourceError::KubernetesUnavailable
+                    | SourceError::DatabaseUnavailable {
+                        retryable: true,
+                        ..
+                    }
+            ),
+        },
+        Ok(None) => {
+            state
+                .source
+                .database_observation(state.provider, &tenant, &resources)
+                .await?
         }
-    } else {
-        state
-            .source
-            .database_observation(state.provider, &tenant, &resources)
-            .await?
     };
     let mut projection = TenantProjection::new(state.provider, tenant, resources, database);
-    if let Some(catalog) = catalog {
+    if let Ok(Some(catalog)) = catalog {
         merge_catalog_topology(&mut projection.topology, &catalog);
     }
     Ok(projection)
@@ -783,6 +804,7 @@ mod tests {
         tenant_deletes: AtomicUsize,
         created_tenants: Mutex<Vec<Tenant>>,
         catalog_reads: AtomicUsize,
+        catalog_failure: Mutex<Option<SourceError>>,
         catalog_adds: AtomicUsize,
         catalog_deletes: AtomicUsize,
         catalog_queries: AtomicUsize,
@@ -791,6 +813,9 @@ mod tests {
     impl DataSource for MockSource {
         fn read_catalog<'a>(&'a self, tenant: &'a Tenant) -> SourceFuture<'a, CatalogView> {
             self.calls.catalog_reads.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = self.calls.catalog_failure.lock().unwrap().clone() {
+                return Box::pin(ready(Err(error)));
+            }
             let name = tenant.metadata.name.clone().unwrap();
             Box::pin(ready(Ok(CatalogView {
                 tenant: name,
@@ -1352,6 +1377,99 @@ mod tests {
         assert_eq!(calls.tenant_gets.load(Ordering::Relaxed), 2);
         assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 2);
         assert_eq!(calls.database_observations.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn catalog_failures_keep_tenant_detail_and_topology_available_for_both_providers() {
+        for (provider, failure, status, retryable) in [
+            (
+                ProviderMode::Local,
+                SourceError::KubernetesUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+            ),
+            (
+                ProviderMode::Azure,
+                SourceError::StaleIdentity,
+                StatusCode::CONFLICT,
+                false,
+            ),
+        ] {
+            let mut tenant = ready_tenant();
+            if provider == ProviderMode::Azure {
+                tenant.spec.provider = TenantProviderSpec::Azure;
+                tenant.status.as_mut().unwrap().provider =
+                    Some(TenantProviderStatus::Azure(Box::default()));
+            }
+            tenant.status.as_mut().unwrap().database_capability =
+                Some(tenant_controller::api::DatabaseCapability {
+                    available: true,
+                    reason: "Ready".into(),
+                    namespace: "tenant-db-tenant-a".into(),
+                    namespace_uid: "namespace-uid".into(),
+                    catalog_uid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                    storage_namespace_uid: None,
+                });
+            let calls = Arc::new(SourceCalls::default());
+            *calls.catalog_failure.lock().unwrap() = Some(failure);
+            let app = test_router_with_provider(
+                MockSource {
+                    tenants: Ok(vec![tenant.clone()]),
+                    tenant: Ok(Some(tenant)),
+                    resources: Ok(Vec::new()),
+                    database: Ok(database_observation()),
+                    query: Ok(query_response()),
+                    ready: Ok(()),
+                    calls: calls.clone(),
+                },
+                provider,
+            );
+            let detail = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/tenants/tenant-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(detail.status(), StatusCode::OK);
+            let detail: ApiEnvelope<TenantSnapshot> = response_json(detail).await;
+            assert_eq!(detail.data.identity.uid, "tenant-uid");
+            assert_eq!(detail.data.detail.summary.name, "tenant-a");
+            match detail.data.database {
+                DatabaseObservation::Unavailable {
+                    reason,
+                    retryable: observed_retryable,
+                    ..
+                } => {
+                    assert_eq!(reason, DatabaseUnavailableReason::TenantApiUnavailable);
+                    assert_eq!(observed_retryable, retryable);
+                }
+                other => panic!("expected explicit unavailable observation: {other:?}"),
+            }
+            let topology = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/tenants/tenant-a/topology")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(topology.status(), StatusCode::OK);
+            let catalog = app
+                .oneshot(
+                    Request::get("/api/v1/tenants/tenant-a/databases")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(catalog.status(), status);
+            assert_eq!(calls.catalog_reads.load(Ordering::Relaxed), 3);
+            assert_eq!(calls.database_observations.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]
