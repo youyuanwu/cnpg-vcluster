@@ -460,11 +460,11 @@ pub fn validate_gate_update(
                 || new_entries
                     .iter()
                     .any(|(name, entry)| old_entries.get(name) != Some(entry))
-                || (old_state == "open"
-                    && old_entries.iter().any(|(name, entry)| {
-                        !new_entries.contains_key(name)
-                            && entry.lifecycle != IntentLifecycle::Pending
-                    }))
+                || old_entries.iter().any(|(name, entry)| {
+                    !new_entries.contains_key(name)
+                        && (entry.lifecycle == IntentLifecycle::Materializing
+                            || (old_state == "open" && entry.lifecycle != IntentLifecycle::Pending))
+                })
             {
                 return Err(AdmissionError::Gate);
             }
@@ -957,6 +957,16 @@ mod tests {
             .insert(GATE_ENTRIES.into(), "{}".into());
         assert_eq!(
             validate_gate_update(&claimed, &invalid, tenant),
+            Err(AdmissionError::Gate)
+        );
+        let mut dropped_after_close = closed.clone();
+        dropped_after_close
+            .data
+            .as_mut()
+            .unwrap()
+            .insert(GATE_ENTRIES.into(), "{}".into());
+        assert_eq!(
+            validate_gate_update(&closed, &dropped_after_close, tenant),
             Err(AdmissionError::Gate)
         );
         let mut close_pending = pending.clone();
