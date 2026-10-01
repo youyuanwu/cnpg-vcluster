@@ -1351,6 +1351,10 @@ async fn finalize(
 }
 
 #[cfg(test)]
+#[path = "azure_live_tests.rs"]
+mod live_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::api::{CatalogEntry, CreateIntent, TenantDatabaseCatalogSpec};
