@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -214,31 +215,41 @@ def build_database_controller_image(
         f"{config['TENANT_CONTROLLER_IMAGE_REPOSITORY']}-database:"
         f"{digest.hexdigest()[:16]}"
     )
-    fetch_controller_dependencies(root, config)
-    result = run(
-        [cargo, "rustc", "--locked", "--offline", "--release", "-p",
-         "tenant-database-controller", "--bin", "manager",
-         "--message-format=json-render-diagnostics", "--", *STATIC_MANAGER_FLAGS],
-        cwd=source, timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,
-    )
-    executables = [
-        Path(message["executable"])
-        for line in result.stdout.splitlines()
-        for message in [json.loads(line)]
-        if message.get("reason") == "compiler-artifact"
-        and message.get("target", {}).get("name") == "manager"
-        and message.get("target", {}).get("kind") == ["bin"]
-        and isinstance(message.get("executable"), str)
-    ]
-    if len(executables) != 1 or not executables[0].is_file():
-        raise RuntimeError("Cargo did not report exactly one database manager executable")
-    verify_static_manager(executables[0])
+    prebuilt = os.environ.get("CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY")
+    if prebuilt:
+        executable = Path(prebuilt).resolve()
+        if (
+            not executable.is_file()
+            or not executable.is_relative_to((root / ".tools" / "artifacts").resolve())
+        ):
+            raise RuntimeError("prebuilt database manager must be inside .tools/artifacts")
+    else:
+        fetch_controller_dependencies(root, config)
+        result = run(
+            [cargo, "rustc", "--locked", "--offline", "--release", "-p",
+             "tenant-database-controller", "--bin", "manager",
+             "--message-format=json-render-diagnostics", "--", *STATIC_MANAGER_FLAGS],
+            cwd=source, timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,
+        )
+        executables = [
+            Path(message["executable"])
+            for line in result.stdout.splitlines()
+            for message in [json.loads(line)]
+            if message.get("reason") == "compiler-artifact"
+            and message.get("target", {}).get("name") == "manager"
+            and message.get("target", {}).get("kind") == ["bin"]
+            and isinstance(message.get("executable"), str)
+        ]
+        if len(executables) != 1 or not executables[0].is_file():
+            raise RuntimeError("Cargo did not report exactly one database manager executable")
+        executable = executables[0]
+    verify_static_manager(executable)
     build_root = root / ".runtime" / "rendered" / "database-controller-build"
     shutil.rmtree(build_root, ignore_errors=True)
     ensure_private_dir(build_root)
     try:
         shutil.copy2(source / "Dockerfile", build_root / "Dockerfile")
-        shutil.copy2(executables[0], build_root / "manager")
+        shutil.copy2(executable, build_root / "manager")
         run(
             ["docker", "build", "--pull=false", "-t", selected, str(build_root)],
             timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,

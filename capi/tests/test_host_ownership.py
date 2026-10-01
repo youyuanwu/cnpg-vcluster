@@ -75,6 +75,23 @@ class HostOwnershipTests(unittest.TestCase):
             with self.assertRaises(RuntimeError):
                 _validate_runtime_inventory(root)
 
+    def test_runtime_inventory_allows_activation_but_blocks_ambiguous_probe(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            management = root / ".runtime/management"
+            management.mkdir(parents=True, mode=0o700)
+            (root / ".runtime").chmod(0o700)
+            activation = management / "catalog-activation.json"
+            activation.write_text("{}\n", encoding="utf-8")
+            activation.chmod(0o600)
+            _validate_runtime_inventory(root)
+            probe = management / "catalog-bootstrap-probe.json"
+            probe.write_text("{}\n", encoding="utf-8")
+            probe.chmod(0o600)
+            with self.assertRaisesRegex(RuntimeError, "unexpected runtime file"):
+                _validate_runtime_inventory(root)
+            self.assertTrue(probe.exists())
+
     def test_runtime_inventory_removes_private_obsolete_local_state(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

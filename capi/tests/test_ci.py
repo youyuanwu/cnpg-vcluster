@@ -25,8 +25,10 @@ def job(name: str) -> str:
 
 class CIWorkflowTests(unittest.TestCase):
     def test_tiered_checks_and_stable_aggregate(self) -> None:
-        fast, e2e, high, gate = (
-            job(name) for name in ("fast-checks", "e2e", "high-capacity", "capi-tests")
+        fast, e2e, high, azure, gate = (
+            job(name) for name in (
+                "fast-checks", "e2e", "high-capacity", "azure-destructive", "capi-tests",
+            )
         )
         self.assertNotIn("    needs:", fast + high)
         self.assertRegex(e2e, r"(?m)^    needs: fast-checks$")
@@ -35,12 +37,15 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'", high)
         self.assertIn("name: CAPI tests\n", gate)
         self.assertIn("if: always()", gate)
-        self.assertIn("needs: [fast-checks, e2e, high-capacity]", gate)
+        self.assertIn("needs: [fast-checks, e2e, high-capacity, azure-destructive]", gate)
         for command in (
             "just test-unit", "just test-static",
             "just test-azure-operator-contracts", "just controller-fetch",
             "just controller-verify", "just controller-lint", "just controller-test",
             "just controller-metrics", "just controller-build",
+            "just database-controller-verify", "just database-controller-lint",
+            "just database-controller-test", "just database-controller-metrics",
+            "just database-controller-build",
             "just admin-fetch", "just admin-generate-check", "just admin-lint",
             "just admin-test", "just admin-metrics", "just admin-package-check",
         ):
@@ -48,8 +53,9 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("just cache admin-build", fast)
         self.assertNotIn("run: just cache\n", fast)
         self.assertLess(e2e.index("just cache"), e2e.index("just test-e2e"))
-        self.assertIn("just test-e2e", e2e)
-        self.assertNotIn("just test-e2e-offline", e2e)
+        self.assertIn("just test-e2e-offline", e2e)
+        self.assertIn("CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY", e2e)
+        self.assertIn("database-manager", fast)
         self.assertIn("actions/upload-artifact@v6", fast)
         self.assertIn("controller-manager-${{ github.sha }}", fast)
         self.assertIn("actions/download-artifact@v7", e2e)
@@ -86,6 +92,12 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertTrue(all(setup_end < high.index(command) for command in targeted))
         self.assertLess(setup_end, high.index("just test-e2e-offline"))
         self.assertIn("just test-e2e-offline", high)
+        self.assertIn("just azure-test-tenant-lifecycle", azure)
+        self.assertIn("just azure-foundation-status", azure)
+        self.assertIn("CAPI_AZURE_FOUNDATION_INVENTORY", azure)
+        self.assertIn("CAPI_AZURE_MANAGEMENT_KUBECONFIG", azure)
+        self.assertIn("id-token: write", azure)
+        self.assertIn("azure/login@v2", azure)
         self.assertLess(high.index("just test-e2e-offline"), high.index("just destroy"))
         cleanup = high[high.index("- name: Clean up high-capacity environment"):]
         self.assertIn("if: always()", cleanup)
@@ -142,20 +154,24 @@ class CIWorkflowTests(unittest.TestCase):
             for fast in ("success", "failure", "skipped", "cancelled"):
                 for e2e in ("success", "failure", "skipped", "cancelled"):
                     for high in ("success", "failure", "skipped", "cancelled"):
-                        with self.subTest(event=event, fast=fast, e2e=e2e, high=high):
-                            result = subprocess.run(
-                                ["bash", "--noprofile", "--norc", "-e", "-c", script],
-                                env={
-                                    **os.environ, "FAST_RESULT": fast,
-                                    "E2E_RESULT": e2e, "HIGH_CAPACITY_RESULT": high,
-                                    "EVENT_NAME": event,
-                                },
-                                capture_output=True,
-                                check=False,
-                            )
-                            expected = (
-                                fast == "success"
-                                and e2e == ("success" if event == "pull_request" else "skipped")
-                                and high == ("success" if event in {"workflow_dispatch", "schedule"} else "skipped")
-                            )
-                            self.assertEqual(expected, result.returncode == 0)
+                        for azure in ("success", "failure", "skipped", "cancelled"):
+                            with self.subTest(event=event, fast=fast, e2e=e2e,
+                                              high=high, azure=azure):
+                                result = subprocess.run(
+                                    ["bash", "--noprofile", "--norc", "-e", "-c", script],
+                                    env={
+                                        **os.environ, "FAST_RESULT": fast,
+                                        "E2E_RESULT": e2e, "HIGH_CAPACITY_RESULT": high,
+                                        "AZURE_RESULT": azure,
+                                        "EVENT_NAME": event,
+                                    },
+                                    capture_output=True,
+                                    check=False,
+                                )
+                                expected = (
+                                    fast == "success"
+                                    and e2e == ("success" if event == "pull_request" else "skipped")
+                                    and high == ("success" if event in {"workflow_dispatch", "schedule"} else "skipped")
+                                    and azure == ("success" if event in {"workflow_dispatch", "schedule"} else "skipped")
+                                )
+                                self.assertEqual(expected, result.returncode == 0)

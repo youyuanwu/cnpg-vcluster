@@ -123,6 +123,12 @@ database-controller-lint:
 # Build the standalone database-controller observer manager.
 database-controller-build:
     @cargo rustc --locked --offline --release -p tenant-database-controller --bin manager -- -C target-feature=+crt-static
+    @! readelf -lW ../target/release/manager | grep -q ' INTERP '
+    @! readelf -dW ../target/release/manager | grep -q ' NEEDED '
+
+# Build the pinned standalone database-controller image used by both providers.
+database-controller-image:
+    @python3 scripts/build_database_controller.py
 
 # Reconcile pinned database charts separately from Azure infrastructure readiness.
 # Supervise this command for continuous retry; --once performs one bounded attempt.
@@ -131,8 +137,6 @@ azure-database-runtime-watch:
 
 azure-database-runtime-once:
     @python3 -m scripts.azure_database_runtime --once
-    @! readelf -lW ../target/release/manager | grep -q ' INTERP '
-    @! readelf -dW ../target/release/manager | grep -q ' NEEDED '
 
 # Enforce the independent 12,000-line database-controller production Rust ceiling.
 database-controller-metrics:

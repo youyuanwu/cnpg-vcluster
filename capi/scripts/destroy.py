@@ -61,6 +61,7 @@ def _validate_runtime_inventory(
         "management/identity.json",
         "management/network.json",
         "management/kubeconfig",
+        "management/catalog-activation.json",
         "management/offline-registry.json",
         "retained-management.json",
         "rendered/cert-manager.yaml",
@@ -74,7 +75,9 @@ def _validate_runtime_inventory(
         "rendered/providers/kamaji-capi-components.yaml",
         "rendered/controller/manager",
         "rendered/controller/manager.yaml",
+        "rendered/database-controller/controller.yaml",
         "rendered/azure-controller/manager.yaml",
+        "rendered/azure-admin/deployment.json",
         "rendered/admin/tenant-admin",
         "rendered/admin/deployment-local.json",
         "azure/resources.json",
@@ -188,7 +191,7 @@ def _validate_runtime_inventory(
     }
     allowed_directories = (
         re.compile(r"^(host|management|rendered|azure|tenants|lifecycle)$"),
-        re.compile(r"^rendered/(providers|controller|azure-controller|admin)$"),
+        re.compile(r"^rendered/(providers|controller|database-controller|azure-controller|azure-admin|admin)$"),
         re.compile(r"^rendered/admin/web$"),
         re.compile(rf"^tenants/{local_tenant_pattern}$"),
         re.compile(r"^lifecycle/\.locks$"),
@@ -459,7 +462,10 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         if not status.get("apiReady"):
             raise RuntimeError("owned management API is not reachable; refusing partial cleanup")
         client = ManagementClient(root, config)
-        from scripts.lib.controller import delete_controller_tenants
+        from scripts.lib.controller import _catalog_activation_complete, delete_controller_tenants
+
+        if (root / ".runtime/management/catalog-activation.json").exists():
+            _catalog_activation_complete(client)
 
         tenant_response = client.kubectl(
             "get",
@@ -483,6 +489,8 @@ def destroy(root: Path, config: dict[str, str]) -> None:
         _delete_kubernetes_stack(root, config, client)
         delete_management(root, config)
     else:
+        if (root / ".runtime/management/catalog-activation.json").exists():
+            raise RuntimeError("catalog activation remains without its management cluster")
         delete_offline_registry(root, config)
         residue = inspect_host_residue(config, tuple(sorted(tenant_names)))
         if any(residue.values()):

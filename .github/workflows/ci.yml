@@ -72,6 +72,16 @@ jobs:
       - name: Build static Tenant controller
         run: just controller-build
 
+      - name: Verify, lint, test and measure database controller
+        run: |
+          just database-controller-verify
+          just database-controller-lint
+          just database-controller-test
+          just database-controller-metrics
+
+      - name: Build static database controller
+        run: just database-controller-build
+
       - name: Fetch locked admin dependencies
         run: just admin-fetch
 
@@ -95,10 +105,11 @@ jobs:
           CAPI_OFFLINE_ENFORCED: "1"
         run: just admin-package-check
 
-      - name: Stage prebuilt controller and admin artifacts
+      - name: Stage prebuilt controller, database controller and admin artifacts
         run: |
           install -d -m 700 .runtime/rendered/ci-artifact/admin/web
           install -m 700 .runtime/rendered/controller/manager .runtime/rendered/ci-artifact/manager
+          install -m 700 ../target/release/manager .runtime/rendered/ci-artifact/database-manager
           install -m 700 .runtime/rendered/admin/tenant-admin .runtime/rendered/ci-artifact/admin/tenant-admin
           install -m 600 .runtime/rendered/admin/web/* .runtime/rendered/ci-artifact/admin/web/
 
@@ -115,13 +126,14 @@ jobs:
     needs: fast-checks
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
-      MIN_DOCKER_CPUS: "2"
-      MIN_DOCKER_MEMORY_GIB: "6"
-      MIN_DOCKER_STORAGE_GIB: "10"
+      MIN_DOCKER_CPUS: "4"
+      MIN_DOCKER_MEMORY_GIB: "10"
+      MIN_DOCKER_STORAGE_GIB: "12"
       PYTHONUNBUFFERED: "1"
       CAPI_PREBUILT_CONTROLLER_BINARY: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/manager
+      CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/database-manager
       CAPI_PREBUILT_ADMIN_SERVER: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/admin/tenant-admin
       CAPI_PREBUILT_ADMIN_WEB: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/admin/web
     defaults:
@@ -161,7 +173,7 @@ jobs:
         run: just cache
 
       - name: Run end-to-end test
-        run: just test-e2e
+        run: just test-e2e-offline
 
   high-capacity:
     name: CAPI high-capacity offline and targeted
@@ -221,10 +233,68 @@ jobs:
         if: always()
         run: just destroy
 
+  azure-destructive:
+    name: Azure nine-disk lifecycle
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      AZURE_GATE_CONFIG: ${{ secrets.CAPI_AZURE_TEST_CONFIG }}
+      AZURE_GATE_INVENTORY: ${{ secrets.CAPI_AZURE_FOUNDATION_INVENTORY }}
+      AZURE_GATE_KUBECONFIG: ${{ secrets.CAPI_AZURE_MANAGEMENT_KUBECONFIG }}
+      AZURE_CLIENT_ID: ${{ secrets.CAPI_AZURE_CLIENT_ID }}
+      AZURE_TENANT_ID: ${{ secrets.CAPI_AZURE_TENANT_ID }}
+      AZURE_SUBSCRIPTION_ID: ${{ secrets.CAPI_AZURE_SUBSCRIPTION_ID }}
+    defaults:
+      run:
+        working-directory: capi
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+      - name: Require credentialed clean-foundation inputs
+        run: |
+          test -n "$AZURE_GATE_CONFIG"
+          test -n "$AZURE_GATE_INVENTORY"
+          test -n "$AZURE_GATE_KUBECONFIG"
+          test -n "$AZURE_CLIENT_ID"
+          test -n "$AZURE_TENANT_ID"
+          test -n "$AZURE_SUBSCRIPTION_ID"
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - name: Set up just
+        uses: extractions/setup-just@v4
+        with:
+          just-version: "1.58.0"
+      - name: Authenticate to the experiment subscription
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.CAPI_AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.CAPI_AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.CAPI_AZURE_SUBSCRIPTION_ID }}
+      - name: Restore exact private foundation inventory
+        run: |
+          install -d -m 700 .tools .runtime .runtime/azure
+          umask 077
+          printf '%s' "$AZURE_GATE_CONFIG" > config/azure.local.env
+          printf '%s' "$AZURE_GATE_INVENTORY" > .runtime/azure/resources.json
+          printf '%s' "$AZURE_GATE_KUBECONFIG" > .runtime/azure/management.kubeconfig
+      - name: Acquire pinned tools and verify the tagged foundation
+        run: |
+          just cache
+          just tools
+          just azure-foundation-status
+      - name: Prove three-entry Azure destructive lifecycle
+        run: just azure-test-tenant-lifecycle
+
   capi-tests:
     name: CAPI tests
     if: always()
-    needs: [fast-checks, e2e, high-capacity]
+    needs: [fast-checks, e2e, high-capacity, azure-destructive]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -233,16 +303,20 @@ jobs:
           FAST_RESULT: ${{ needs.fast-checks.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
           HIGH_CAPACITY_RESULT: ${{ needs.high-capacity.result }}
+          AZURE_RESULT: ${{ needs.azure-destructive.result }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           test "$FAST_RESULT" = success
           if [ "$EVENT_NAME" = pull_request ]; then
             test "$E2E_RESULT" = success
             test "$HIGH_CAPACITY_RESULT" = skipped
+            test "$AZURE_RESULT" = skipped
           elif [ "$EVENT_NAME" = push ]; then
             test "$E2E_RESULT" = skipped
             test "$HIGH_CAPACITY_RESULT" = skipped
+            test "$AZURE_RESULT" = skipped
           else
             test "$E2E_RESULT" = skipped
             test "$HIGH_CAPACITY_RESULT" = success
+            test "$AZURE_RESULT" = success
           fi

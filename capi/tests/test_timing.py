@@ -180,10 +180,10 @@ class TimingTests(unittest.TestCase):
             with timings.phase("tenant_convergence"):
                 pass
 
-    def test_sql_and_explicit_finalization_precede_management_teardown(self) -> None:
+    def test_catalog_query_and_explicit_finalization_precede_management_teardown(self) -> None:
         self._exercise_e2e()
 
-    def test_sql_failure_fails_gate_and_still_tears_down(self) -> None:
+    def test_catalog_query_failure_fails_gate_and_still_tears_down(self) -> None:
         self._exercise_e2e(sql_result="unexpected")
 
     def test_finalization_failure_fails_gate_and_still_tears_down(self) -> None:
@@ -200,8 +200,8 @@ class TimingTests(unittest.TestCase):
     ) -> None:
         output = io.StringIO()
         calls: list[str] = []
-        document = {"metadata": {"name": "tenant-example"}}
-        tenant = object()
+        document = {"metadata": {"name": "tenant-example", "uid": "tenant-uid"}}
+        tenant = Mock(name="tenant-example")
         delete = Mock()
         identity = {
             "name": "tenant-example",
@@ -283,7 +283,7 @@ class TimingTests(unittest.TestCase):
         client.kubectl.side_effect = inspect
 
         def capture(*args):
-            self.assertEqual(({}, client, document), args)
+            self.assertEqual(({"CNPG_TIMEOUT": "60s"}, client, document), args)
             calls.append("identity")
             return identity
 
@@ -295,10 +295,41 @@ class TimingTests(unittest.TestCase):
         def run_just(_root, _config, command, *_args):
             calls.append(command)
 
-        def sql(*args):
-            self.assertEqual((root, {}, tenant, "SELECT 1;"), args)
-            calls.append("sql")
-            return sql_result
+        def query(*args, **_kwargs):
+            calls.append("query")
+            if sql_result != "1":
+                raise RuntimeError("injected catalog query failure")
+
+        def entry(name):
+            return {
+                "name": name, "logicalUid": f"{name}-uid", "instances": 3,
+                "phase": "ready", "readyInstances": 3,
+            }
+        complete = {"catalogUid": "catalog-uid", "databases": [
+            entry(name) for name in ("alpha", "beta", "gamma")
+        ]}
+        recreated = {"catalogUid": "catalog-uid", "databases": [
+            entry("alpha"), {**entry("beta"), "logicalUid": "new-beta-uid"},
+            entry("gamma"),
+        ]}
+        catalog = Mock()
+        catalog.read.return_value = {"catalogUid": "catalog-uid", "databases": []}
+        catalog.add.side_effect = ["alpha-uid", "beta-uid", "gamma-uid", "new-beta-uid"]
+        catalog.wait.side_effect = [
+            complete, complete, {"databases": [entry("alpha"), entry("gamma")]},
+            recreated,
+        ]
+        catalog.query.side_effect = query
+        catalog.assert_fresh = Mock()
+        catalog.path = "api/v1/tenants/tenant-example/databases"
+        client.request_json.return_value = CompletedProcess(
+            [], 1,
+            json.dumps({
+                "schemaVersion": 5,
+                "error": {"code": "stale-identity", "retryable": False},
+            }), "HTTP 409: Conflict",
+        )
+        client.json.return_value = {"metadata": {"uid": "catalog-uid"}}
 
         def delete_tenant(*args):
             delete(*args)
@@ -310,11 +341,9 @@ class TimingTests(unittest.TestCase):
             root = self._root(temporary)
             with (
                 patch("scripts.test_e2e.ROOT", root),
-                patch("scripts.test_e2e.load_configuration", return_value={}),
+                patch("scripts.test_e2e.load_configuration", return_value={"CNPG_TIMEOUT": "60s"}),
                 patch("scripts.test_e2e.read_inotify", return_value=1),
                 patch("scripts.test_e2e.run_just", side_effect=run_just),
-                patch("scripts.test_e2e.verify_all_inputs"),
-                patch("scripts.test_e2e.verify_no_lab_residue"),
                 patch("scripts.test_e2e.wait_tenant_ready", return_value=document),
                 patch("scripts.test_e2e.tenant_from_document", return_value=tenant),
                 patch("scripts.test_e2e.ManagementClient", return_value=client),
@@ -325,10 +354,18 @@ class TimingTests(unittest.TestCase):
                     ),
                     delete_tenant_via_admin=Mock(side_effect=delete_tenant),
                     wait_tenant_absent=Mock(),
+                    verify_all_inputs=Mock(),
+                    verify_no_lab_residue=Mock(),
+                    _failover=Mock(),
+                    _restart_database_controller=Mock(),
+                    _verify_entry_gone=Mock(),
+                    _catalog_record=Mock(return_value={}),
+                    wait_for=Mock(return_value=document),
                 ),
                 patch("scripts.test_e2e.export_tenant_kubeconfig") as export,
-                patch("scripts.test_e2e._sql", side_effect=sql),
-                patch("scripts.test_e2e.verify_restart_persistence", side_effect=lambda *_: calls.append("persistence")),
+                patch("scripts.test_e2e.catalog_client", return_value=catalog),
+                patch("scripts.test_e2e.ready_entries", side_effect=lambda result, *_:
+                      {item["name"]: item for item in result["databases"]}),
                 patch("scripts.test_e2e.capture_tenant_deletion_identity", side_effect=capture),
                 patch("scripts.test_e2e.verify_tenant_deletion", side_effect=verify),
                 patch("scripts.test_e2e.run", return_value=CompletedProcess([], 0, stdout="", stderr="")),
@@ -357,7 +394,7 @@ class TimingTests(unittest.TestCase):
         self.assertEqual("passed", timings["management_teardown_host_restoration"])
         if sql_result == "1":
             delete.assert_called_once_with(client, "tenant-example", "tenant-uid")
-            expected = ["sql", "persistence", "identity", "finalization"]
+            expected = ["query", "identity", "finalization"]
             if not deletion_failure:
                 expected.append("verify-absence")
                 if not residue:
@@ -384,7 +421,7 @@ class TimingTests(unittest.TestCase):
         else:
             delete.assert_not_called()
             self.assertEqual("failed", timings["tenant_sql_probe"])
-            self.assertNotIn("PostgreSQL SELECT 1 succeeded", output.getvalue())
+            self.assertNotIn("three independent three-instance", output.getvalue())
 
 
 if __name__ == "__main__":

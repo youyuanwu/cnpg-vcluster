@@ -14,9 +14,9 @@ from scripts.lib.controller_catalog import (
     load_management_resources,
     resource_by_kind,
 )
-from scripts.cnpg import _sql, verify_restart_persistence
+from scripts.lib.catalog_lifecycle import CatalogClient, ready_entries, require_stale_identity
 from scripts.lib.host import read_inotify, resolve_host_just
-from scripts.lib.kube import ManagementClient
+from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.locking import e2e_lock
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
@@ -24,6 +24,8 @@ from scripts.tools import verify_all_inputs
 from scripts.lib.timing import PhaseTimings
 from scripts.lib.registry import registry_name
 from scripts.lib.admin_local import (
+    ADMIN_SERVICE_PROXY,
+    _service_proxy,
     create_tenant_via_admin,
     delete_tenant_via_admin,
     verify_admin_api,
@@ -36,6 +38,7 @@ from scripts.lib.controller_scenarios import (
     wait_tenant_ready,
 )
 from scripts.lib.tenants import export_tenant_kubeconfig
+from scripts.lib.tenants import _tenant_kubectl
 
 MANAGEMENT_CATALOG = load_management_resources(ROOT)
 
@@ -269,6 +272,97 @@ def verify_tenant_deletion(
         raise RuntimeError(f"Tenant storage volume remained after deletion: {name}")
 
 
+def catalog_client(client: ManagementClient, name: str, uid: str) -> CatalogClient:
+    return CatalogClient(
+        lambda path: _service_proxy(client, path),
+        lambda method, path, payload: client.request_json(
+            method, f"{ADMIN_SERVICE_PROXY}/{path}", payload,
+        ),
+        name, uid,
+    )
+
+
+def _catalog_record(client: ManagementClient, name: str) -> dict[str, object]:
+    document = client.json(
+        "-n", f"tenant-db-{name}", "get", f"tenantdatabasecatalog/{name}",
+    )
+    if not isinstance(document, dict) or not isinstance(document.get("status"), dict):
+        raise RuntimeError("catalog status is absent")
+    return document
+
+
+def _verify_entry_gone(root, config, client, tenant, catalog_uid, logical_uid, recorded):
+    current = _catalog_record(client, tenant.name)
+    if current["metadata"]["uid"] != catalog_uid or logical_uid in current["spec"]["entries"]:
+        raise RuntimeError("deleted catalog entry remains")
+    if logical_uid in current["status"]["entries"]:
+        raise RuntimeError("deleted catalog observation remains")
+    status = recorded["status"]["entries"][logical_uid]
+    namespace = status["namespace"]["name"]
+    cluster = status["cnpgCluster"]["name"]
+    for namespace_arg, resource in (
+        ((), f"namespace/{namespace}"),
+        (("-n", namespace), f"clusters.postgresql.cnpg.io/{cluster}"),
+        (("-n", namespace), f"secret/{cluster}-superuser"),
+        *(((), f"pv/{item['pv']['name']}") for item in status["storage"]),
+        *(
+            (("-n", namespace), f"pvc/{item['pvc']['name']}")
+            for item in status["storage"]
+        ),
+    ):
+        response = _tenant_kubectl(
+            root, config, tenant, *namespace_arg, "get", resource,
+            "--ignore-not-found=true", "-o", "name",
+        )
+        if response.stdout.strip():
+            raise RuntimeError(f"deleted entry resource remained: {resource}")
+    volume = f"{config['LAB_PREFIX']}-{tenant.name}-storage"
+    result = run(
+        ["docker", "run", "--rm", "--network", "none", "--pull", "never",
+         "--mount", f"type=volume,src={volume},dst=/data,readonly",
+         "--entrypoint", "/bin/sh", config["POSTGRES_IMAGE"],
+         "-c", 'test ! -e "/data/volumes/cnpg/$1/$2"', "sh",
+         catalog_uid, logical_uid],
+        timeout=60,
+    )
+    if result.returncode:
+        raise RuntimeError("deleted entry local storage path remained")
+
+
+def _failover(root, config, tenant, entry):
+    namespace, cluster = entry["namespace"], entry["cluster"]
+    before = _tenant_kubectl(
+        root, config, tenant, "-n", namespace, "get", f"clusters.postgresql.cnpg.io/{cluster}",
+        "-o", "jsonpath={.status.currentPrimary}",
+    ).stdout.strip()
+    if before not in {item["name"] for item in entry["instanceTopology"]}:
+        raise RuntimeError("CNPG primary identity is missing")
+    _tenant_kubectl(
+        root, config, tenant, "-n", namespace, "delete", f"pod/{before}", "--wait=false",
+    )
+    wait_for(
+        f"{cluster} primary failover", parse_duration(config["CNPG_TIMEOUT"]), 5,
+        lambda: (
+            current
+            if (current := _tenant_kubectl(
+                root, config, tenant, "-n", namespace, "get", f"clusters.postgresql.cnpg.io/{cluster}",
+                "-o", "jsonpath={.status.currentPrimary}", check=False,
+            ).stdout.strip()) and current != before else None
+        ),
+    )
+
+
+def _restart_database_controller(client: ManagementClient) -> None:
+    client.kubectl(
+        "-n", "tenant-system", "rollout", "restart",
+        "deployment/database-controller",
+    )
+    client.kubectl(
+        "-n", "tenant-system", "rollout", "status",
+        "deployment/database-controller", "--timeout=300s",
+    )
+
+
 def run_e2e() -> int:
     os.umask(0o077)
     config = load_configuration(ROOT)
@@ -279,11 +373,16 @@ def run_e2e() -> int:
     failure = None
     timings = PhaseTimings()
     tenant_name = "tenant-example"
+    entries = {"alpha", "beta", "gamma"}
     try:
         with timings.phase("tools_cache"):
             run_just(ROOT, config, "tools")
         with timings.phase("initial_cleanup"):
             run_just(ROOT, config, "destroy")
+            original_inotify = {
+                "max_user_instances": read_inotify("max_user_instances"),
+                "max_user_watches": read_inotify("max_user_watches"),
+            }
         with timings.phase("host_preparation"):
             run_just(ROOT, config, "prepare-host")
         with timings.phase("management_bootstrap"):
@@ -299,15 +398,24 @@ def run_e2e() -> int:
             create_tenant_via_admin(
                 client,
                 tenant_name,
-                workers=1,
-                databases=1,
+                workers=3,
             )
             document = wait_tenant_ready(ROOT, config, tenant_name)
+            wait_for(
+                "Tenant database catalog capability",
+                parse_duration(config["CNPG_TIMEOUT"]) * 4, 5,
+                lambda: (
+                    current if (
+                        (current := _inspect_management_object(client, f"tenant/{tenant_name}"))
+                        and current.get("status", {}).get("databaseCapability", {}).get("available")
+                        and current.get("metadata", {}).get("uid") == document["metadata"]["uid"]
+                    ) else None
+                ),
+            )
             verify_admin_api(
                 ManagementClient(ROOT, config),
                 expected_tenant_names=(tenant_name,),
                 require_available_databases=True,
-                verify_database_queries=True,
             )
         run_just(ROOT, config, "local-tenant-status", tenant_name)
         with timings.phase("tenant_sql_probe"):
@@ -315,16 +423,85 @@ def run_e2e() -> int:
             export_tenant_kubeconfig(
                 ROOT, config, ManagementClient(ROOT, config), tenant,
             )
-            if _sql(ROOT, config, tenant, "SELECT 1;") != "1":
-                raise RuntimeError("representative tenant PostgreSQL SELECT 1 failed")
-            verify_restart_persistence(ROOT, config, tenant)
-        print("representative tenant PostgreSQL SELECT 1 succeeded")
+            catalog = catalog_client(client, tenant_name, document["metadata"]["uid"])
+            initial = catalog.read()
+            if initial["databases"]:
+                raise RuntimeError("Tenant implicitly created a database")
+            catalog_uid = initial["catalogUid"]
+            logical_uids = {name: catalog.add(catalog_uid, name) for name in sorted(entries)}
+            ready = catalog.wait(
+                lambda item: all(
+                    entry["phase"] == "ready" for entry in item["databases"]
+                ) and len(item["databases"]) == 3,
+                parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+            )
+            observed = ready_entries(ready, entries, "local")
+            for name, entry in observed.items():
+                catalog.query(catalog_uid, entry, f"marker-{name}", write=True)
+                catalog.query(catalog_uid, entry, f"marker-{name}")
+            _failover(ROOT, config, tenant, observed["alpha"])
+            _restart_database_controller(client)
+            ready = catalog.wait(
+                lambda item: len(item["databases"]) == 3
+                and all(entry["phase"] == "ready" and entry["readyInstances"] == 3
+                        for entry in item["databases"]),
+                parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+            )
+            observed = ready_entries(ready, entries, "local")
+            for name, entry in observed.items():
+                catalog.query(catalog_uid, entry, f"marker-{name}")
+            recorded = _catalog_record(client, tenant_name)
+            old_uid = logical_uids["beta"]
+            old_entry = observed["beta"]
+            catalog.delete(catalog_uid, old_uid, "beta")
+            catalog.wait(
+                lambda item: not any(entry["logicalUid"] == old_uid
+                                     for entry in item["databases"]),
+                parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+            )
+            _verify_entry_gone(ROOT, config, client, tenant, catalog_uid, old_uid, recorded)
+            replacement_uid = catalog.add(catalog_uid, "beta")
+            if replacement_uid == old_uid:
+                raise RuntimeError("recreated entry reused the deleted logical UID")
+            catalog.require_stale_query(catalog_uid, old_entry)
+            ready = catalog.wait(
+                lambda item: len(item["databases"]) == 3
+                and all(entry["phase"] == "ready" for entry in item["databases"]),
+                parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+            )
+            recreated = ready_entries(ready, entries, "local")
+            if recreated["beta"]["logicalUid"] != replacement_uid:
+                raise RuntimeError("recreated local entry identity changed")
+            stale = client.request_json(
+                "DELETE", f"{ADMIN_SERVICE_PROXY}/{catalog.path}/{old_uid}",
+                {"catalogUid": catalog_uid, "logicalUid": old_uid, "confirmation": "beta"},
+            )
+            require_stale_identity(stale)
+            for name, entry in recreated.items():
+                if name == "beta":
+                    catalog.assert_fresh(catalog_uid, entry)
+                    catalog.query(catalog_uid, entry, f"marker-{name}", write=True)
+                catalog.query(catalog_uid, entry, f"marker-{name}")
+            print("three independent three-instance databases and entry recreation verified")
         with timings.phase("tenant_deletion_finalization"):
             client = ManagementClient(ROOT, config)
             identity = capture_tenant_deletion_identity(config, client, document)
             delete_tenant_via_admin(client, identity["name"], identity["uid"])
             wait_tenant_absent(ROOT, config, identity["name"])
             verify_tenant_deletion(client, identity)
+            catalog_response = client.kubectl(
+                "-n", f"tenant-db-{tenant_name}", "get",
+                f"tenantdatabasecatalog/{tenant_name}",
+                "--ignore-not-found=true", "-o", "name",
+            )
+            if catalog_response.stdout.strip():
+                raise RuntimeError("Tenant catalog remained after cascade")
+            namespace_response = client.kubectl(
+                "get", f"namespace/tenant-db-{tenant_name}",
+                "--ignore-not-found=true", "-o", "name",
+            )
+            if namespace_response.stdout.strip():
+                raise RuntimeError("Tenant database catalog namespace remained")
             verify_admin_api(client, expected_tenant_names=())
             print("exact Tenant/root/Lease/container/volume absence verified before management teardown")
     except BaseException as exc:

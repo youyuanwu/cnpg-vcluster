@@ -19,7 +19,7 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
     (
         "rbac.authorization.k8s.io",
         &["roles", "rolebindings"],
-        &["create", "get"],
+        &["create", "delete", "get"],
     ),
     (
         "tenancy.cnpg-vcluster.io",
@@ -166,6 +166,11 @@ mod tests {
                 .all(|rule| !rule.verbs.contains(&"*".to_string()))
         );
         for rules in [&local_rules, &azure_rules] {
+            assert!(rules.iter().any(|rule| {
+                rule.api_groups.as_deref() == Some(&["rbac.authorization.k8s.io".into()])
+                    && rule.resources.as_deref() == Some(&["roles".into(), "rolebindings".into()])
+                    && rule.verbs.contains(&"delete".into())
+            }));
             assert!(rules.iter().any(|rule| {
                 rule.api_groups.as_deref() == Some(&["tenancy.cnpg-vcluster.io".into()])
                     && rule.resources.as_deref() == Some(&["tenantdatabasecatalogs".into()])

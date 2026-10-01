@@ -10,6 +10,7 @@ import subprocess
 import urllib.error
 import urllib.request
 import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -33,6 +34,7 @@ from scripts.lib.files import (
 )
 from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.process import run
+from scripts.lib.redaction import redact
 from scripts.tools import verify_all_inputs
 
 if TYPE_CHECKING:
@@ -45,7 +47,7 @@ TENANT_CRD = "tenants.tenancy.cnpg-vcluster.io"
 TENANT_CUTOVER_POLICY = "tenant-api-cutover-create-lock"
 CATALOG_CUTOVER_POLICY = "tenant-database-catalog-cutover-create-lock"
 TENANT_API_CUTOVER_READY = True
-CATALOG_LIFECYCLE_READY = False
+CATALOG_LIFECYCLE_READY = True
 STATIC_MANAGER_FLAGS = ("-C", "target-feature=+crt-static")
 
 
@@ -386,7 +388,19 @@ def verify_catalog_release_deployment(
                 raise RuntimeError("database-controller Ready Pod name is absent")
             if probe is None:
                 raise RuntimeError("database-controller readiness requires an exact catalog probe")
-            _verify_catalog_observation(client, pod_name, pod_meta["uid"], *probe)
+
+            def receipt_ready() -> bool:
+                try:
+                    _verify_catalog_observation(client, pod_name, pod_meta["uid"], *probe)
+                except RuntimeError as exc:
+                    if str(exc).startswith(
+                        "database-controller exact probe observation is unavailable:"
+                    ):
+                        return False
+                    raise
+                return True
+
+            wait_for("database-controller exact probe receipt", 90, 2, receipt_ready)
 
 
 def _verify_catalog_observation(
@@ -422,12 +436,15 @@ def _verify_catalog_observation(
             "catalogUID": catalog_uid, "resourceVersion": resource_version,
         })
         result = client.kubectl(
-            "get", "--raw",
+            "get", "--request-timeout=0", "--raw",
             f"/api/v1/namespaces/{CONTROLLER_NAMESPACE}/pods/{pod_name}:8082/proxy/observation?{query}",
             check=False,
         )
         if result.returncode:
-            raise RuntimeError("database-controller exact probe observation is unavailable")
+            raise RuntimeError(
+                "database-controller exact probe observation is unavailable: "
+                + redact(result.stderr)[:512]
+            )
         try:
             receipt = json.loads(result.stdout)
         except ValueError as exc:
@@ -448,6 +465,8 @@ def verify_catalog_release_rbac(
             ("tenant-controller", "get", "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io", True),
             ("tenant-controller", "update", "tenants/status.tenancy.cnpg-vcluster.io", False),
             ("tenant-controller", "create", "namespaces", False),
+            ("tenant-controller", "delete", "roles.rbac.authorization.k8s.io", True),
+            ("tenant-controller", "delete", "rolebindings.rbac.authorization.k8s.io", True),
             ("database-controller", "get", "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io", True),
             ("database-controller", "list", "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io", False),
             ("database-controller", "watch", "tenantdatabasecatalogs.tenancy.cnpg-vcluster.io", False),
@@ -592,7 +611,7 @@ def verify_catalog_release_capability(
 def verify_catalog_release_probe(
         client: ManagementClient, *, namespace: str,
 ) -> None:
-        name = f"database-release-probe-{uuid.uuid4().hex}"
+        name = f"db-release-probe-{uuid.uuid4().hex[:10]}"
         reference = f"tenantdatabasecatalog/{name}"
 
         def require_absent() -> None:
@@ -623,7 +642,10 @@ def verify_catalog_release_probe(
             or "TenantDatabaseCatalog creation is locked during API cutover"
             not in result.stderr
         ):
-            raise RuntimeError("catalog release probe did not receive the owned policy denial")
+            raise RuntimeError(
+                "catalog release probe did not receive the owned policy denial: "
+                + redact(result.stderr)[:512]
+            )
 
 
 def verify_catalog_release_gates(
@@ -713,7 +735,7 @@ def verify_release_tenant_cutover_lock(client: ManagementClient) -> None:
     document = {
         "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
         "kind": "Tenant",
-        "metadata": {"name": f"release-lock-probe-{uuid.uuid4().hex[:12]}"},
+        "metadata": {"name": f"release-lock-probe-{uuid.uuid4().hex[:10]}"},
         "spec": {
             "kubernetesVersion": "1.36.4", "workers": 1,
             "provider": {"type": "local"},
@@ -1044,6 +1066,157 @@ def _verify_probe_exception(
             raise RuntimeError("UID-bound bootstrap policy permits a foreign catalog")
 
 
+def _recover_unknown_local_probe(
+    config: dict[str, str], client: ManagementClient,
+    record: dict[str, object],
+) -> None:
+    from scripts.lib.management import (
+        require_management_ownership, validate_management_kubeconfig,
+    )
+
+    if record["provider"] != "local" or record["uid"] is not None or not record["issued"]:
+        raise RuntimeError("unknown bootstrap CREATE recovery is local-only")
+    name = "catalog-bootstrap-probe"
+    namespace = f"tenant-db-{name}"
+    storage_namespace = f"tenant-db-storage-{name}"
+    apply_tenant_cutover_lock(config, client)
+    ensure_catalog_cutover_lock(client)
+    verify_release_tenant_cutover_lock(client)
+    verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+
+    root = getattr(client, "root", None)
+    if not isinstance(root, Path) or _probe_record_path(client) != (
+        root / ".runtime" / "management" / "catalog-bootstrap-probe.json"
+    ):
+        raise RuntimeError("bootstrap recovery requires the recorded management checkout")
+    identity = require_management_ownership(root, config)
+    validate_management_kubeconfig(root, config)
+    restarted_at = datetime.now(timezone.utc)
+    run(
+        ["docker", "restart", identity.identifier],
+        timeout=parse_duration(config["COMMAND_TIMEOUT"]) + 60,
+    )
+    require_management_ownership(root, config).require_exact(identity)
+    wait_for(
+        "restarted management API", parse_duration(config["CONDITION_TIMEOUT"]),
+        2,
+        lambda: client.kubectl("get", "--raw=/readyz", check=False).returncode == 0,
+    )
+    client.kubectl(
+        "-n", CONTROLLER_NAMESPACE, "rollout", "status",
+        f"deployment/{CONTROLLER_DEPLOYMENT}",
+        f"--timeout={config['CONDITION_TIMEOUT']}",
+    )
+    wait_for(
+        "restarted database-controller leader and health",
+        parse_duration(config["CONDITION_TIMEOUT"]), 2,
+        lambda: _database_controller_restarted(client, since=restarted_at),
+    )
+    verify_release_tenant_cutover_lock(client)
+    verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+
+    current = _probe_resource(client, f"tenant/{name}")
+    if current is not None:
+        metadata = current["metadata"]
+        uid = metadata.get("uid")
+        if (
+            metadata.get("name") != name
+            or not isinstance(uid, str) or not re.fullmatch(r"[a-zA-Z0-9-]+", uid)
+            or metadata.get("annotations", {}).get(
+                "tenancy.cnpg-vcluster.io/catalog-bootstrap"
+            ) != "installer-owned"
+            or metadata.get("annotations", {}).get(
+                "tenancy.cnpg-vcluster.io/catalog-bootstrap-token"
+            ) != record["token"]
+            or current.get("spec") != {
+                "kubernetesVersion": config["KUBERNETES_VERSION"].removeprefix("v"),
+                "workers": 1, "provider": {"type": "local"},
+            }
+        ):
+            raise RuntimeError("unknown bootstrap CREATE belongs to another Tenant")
+        record["uid"] = uid
+        record["deleting"] = True
+        write_private_file(_probe_record_path(client), json.dumps(record))
+        _delete_probe_tenant_uid(config, client, name, uid)
+        client.kubectl(
+            "wait", "--for=delete", f"tenant/{name}",
+            f"--timeout={config['DELETE_TIMEOUT']}",
+        )
+    _verify_probe_cleanup(client, name, namespace, storage_namespace)
+    verify_release_tenant_cutover_lock(client)
+    verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
+    unlink_private_file(_probe_record_path(client))
+
+
+def _database_controller_restarted(
+    client: ManagementClient, *, since: datetime,
+) -> bool:
+    deployment = client.json(
+        "-n", CONTROLLER_NAMESPACE, "get", "deployment/database-controller",
+    )
+    metadata = deployment.get("metadata", {})
+    spec = deployment.get("spec", {})
+    status = deployment.get("status", {})
+    if (
+        not isinstance(metadata, dict) or not isinstance(spec, dict)
+        or not isinstance(status, dict)
+        or spec.get("replicas") != 1
+        or status.get("observedGeneration") != metadata.get("generation")
+        or status.get("updatedReplicas") != 1
+    ):
+        return False
+    pods = client.json(
+        "-n", CONTROLLER_NAMESPACE, "get", "pods", "-l", "app=database-controller",
+    )
+    items = pods.get("items")
+    if not isinstance(items, list) or len(items) != 1:
+        return False
+    pod = items[0]
+    pod_meta = pod.get("metadata", {})
+    pod_status = pod.get("status", {})
+    containers = pod_status.get("containerStatuses") if isinstance(pod_status, dict) else None
+    if (
+        not isinstance(pod_meta, dict) or not isinstance(pod_status, dict)
+        or not isinstance(pod_meta.get("uid"), str)
+        or not isinstance(pod_meta.get("name"), str)
+        or pod_meta.get("deletionTimestamp")
+        or pod_status.get("phase") != "Running"
+        or not isinstance(containers, list) or len(containers) != 1
+        or not isinstance(containers[0], dict)
+        or not isinstance(containers[0].get("state", {}).get("running"), dict)
+    ):
+        return False
+    lease = client.json(
+        "-n", "default", "get",
+        "lease/database-controller.tenancy.cnpg-vcluster.io",
+    ).get("spec", {})
+    if not isinstance(lease, dict):
+        return False
+    holder = lease.get("holderIdentity")
+    renewed = lease.get("renewTime")
+    duration = lease.get("leaseDurationSeconds")
+    if (
+        not isinstance(holder, str)
+        or not holder.startswith(f"{pod_meta['uid']}-")
+        or not isinstance(renewed, str)
+        or type(duration) is not int or duration <= 0
+    ):
+        return False
+    try:
+        observed = datetime.fromisoformat(renewed.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    if observed.tzinfo is None:
+        return False
+    age = (datetime.now(timezone.utc) - observed).total_seconds()
+    if not 0 <= age < duration or observed < since:
+        return False
+    return client.kubectl(
+        "get", f"--raw=/api/v1/namespaces/{CONTROLLER_NAMESPACE}/pods/"
+        f"{pod_meta['name']}:8082/proxy/healthz", check=False,
+    ).returncode == 0
+
+
 def run_catalog_lifecycle_probe(
     config: dict[str, str], client: ManagementClient, *,
     provider: str, database_image: str,
@@ -1059,6 +1232,11 @@ def run_catalog_lifecycle_probe(
     record = _probe_record(client)
     if record is not None and record["provider"] != provider:
         raise RuntimeError("bootstrap provider differs from recovery record")
+    if record is not None and record["issued"] and record["uid"] is None:
+        if provider != "local":
+            raise RuntimeError("bootstrap Tenant CREATE outcome is unknown on managed API")
+        _recover_unknown_local_probe(config, client, record)
+        record = None
     inventory = client.json("get", "tenants.tenancy.cnpg-vcluster.io")
     current = _probe_resource(client, f"tenant/{name}") if record else None
     if (
@@ -1110,17 +1288,37 @@ def run_catalog_lifecycle_probe(
     if current is None and not record["issued"]:
         remove_tenant_cutover_lock(config, client)
         unlocked = True
+
+        def create_admitted() -> bool:
+            result = client.kubectl(
+                "create", "--dry-run=server", "-f", "-",
+                input_text=json.dumps(document), check=False,
+            )
+            if result.returncode == 0:
+                return True
+            if (
+                TENANT_CUTOVER_POLICY in result.stderr
+                and "Tenant creation is locked during API cutover" in result.stderr
+            ):
+                return False
+            raise RuntimeError("bootstrap Tenant CREATE dry-run failed: "
+                               + redact(result.stderr)[:512])
+
+        wait_for(
+            "bootstrap Tenant CREATE admission propagation",
+            parse_duration(config["CONDITION_TIMEOUT"]), 2, create_admitted,
+        )
         record["issued"] = True
         write_private_file(path, json.dumps(record))
         try:
             created = client.kubectl("create", "-f", "-", input_text=json.dumps(document))
             current = json.loads(created.stdout)
-        except (RuntimeError, ValueError, KeyError, TypeError):
+        except (RuntimeError, ValueError, KeyError, TypeError) as exc:
             current = _probe_resource(client, f"tenant/{name}")
             if current is None:
                 raise RuntimeError(
                     "bootstrap Tenant creation outcome is unknown; do not delete it"
-                )
+                ) from exc
     if current is not None and (
         current.get("metadata", {}).get("name") != name
         or current.get("metadata", {}).get("annotations", {}).get(
@@ -1427,7 +1625,7 @@ def verify_tenant_cutover_lock(client: ManagementClient, generation: str) -> Non
     document = {
         "apiVersion": f"tenancy.cnpg-vcluster.io/{generation}",
         "kind": "Tenant",
-        "metadata": {"name": f"cutover-lock-probe-{uuid.uuid4().hex[:12]}"},
+        "metadata": {"name": f"cutover-lock-probe-{uuid.uuid4().hex[:10]}"},
         "spec": {
             "kubernetesVersion": "1.36.4",
             "workers": 1,
@@ -1447,7 +1645,10 @@ def verify_tenant_cutover_lock(client: ManagementClient, generation: str) -> Non
             or "Tenant creation is locked during API cutover"
             not in response.stderr
         ):
-            raise RuntimeError("Tenant cutover create lock is not effective")
+            raise RuntimeError(
+                "Tenant cutover create lock is not effective"
+                f" for {generation}: {redact(response.stderr)[:512]}"
+            )
 
 
 def remove_tenant_cutover_lock(config: dict[str, str], client: ManagementClient) -> None:

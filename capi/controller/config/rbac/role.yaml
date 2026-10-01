@@ -31,6 +31,7 @@ rules:
   - rolebindings
   verbs:
   - create
+  - delete
   - get
 - apiGroups:
   - tenancy.cnpg-vcluster.io

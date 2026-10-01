@@ -49,9 +49,8 @@ observed instance identity. Tenant kubeconfig and per-cluster PostgreSQL
 credentials are validated and used only in memory; queries use an ephemeral
 Kubernetes port-forward. The SQL console limits requests to 128 KiB (64 KiB
 SQL), execution to 30 seconds, and retained results to 32 sets, 128 columns,
-1,000 rows, 16 KiB per value and 2 MiB response text. The current frontend
-still shows the previous single-cluster experience pending the Phase 6 UI
-update. The service validates effective management permissions and has no
+1,000 rows, 16 KiB per value and 2 MiB response text. The frontend renders catalog-scoped cards, topology, and SQL controls instead
+of an implicit Tenant database. The service validates effective management permissions and has no
 Azure cloud credentials, application database, persistent cache, or browser
 credential exposure. See
 [`docs/admin-ui-design.md`](docs/admin-ui-design.md).
@@ -62,6 +61,31 @@ prioritizes tenant control-plane, VMSS worker, cloud-provider, targeted
 deletion, and recreation behavior. Azure database workloads and destructive
 disk cleanup still require the separate credentialed validation gates before
 a live Azure rollout can be claimed.
+
+The scheduled/manual `azure-destructive` CI job requires repository secrets
+`CAPI_AZURE_TEST_CONFIG`, `CAPI_AZURE_FOUNDATION_INVENTORY`,
+`CAPI_AZURE_MANAGEMENT_KUBECONFIG`, `CAPI_AZURE_CLIENT_ID`,
+`CAPI_AZURE_TENANT_ID`, and `CAPI_AZURE_SUBSCRIPTION_ID`. These must identify
+the same healthy, tagged experiment resource group; the gate refuses an
+existing Tenant and checks source cleanliness before failure injection.
+Missing credentials or foundation inventory fail the job rather than claiming
+Azure lifecycle success. `just azure-foundation-status` is read-only;
+`just azure-test-tenant-lifecycle` is destructive and runs only against the
+recorded experiment foundation. The local PR gate runs
+`just test-e2e-offline` with the separately packaged database controller.
+
+If local catalog bootstrap is interrupted after Tenant CREATE was issued,
+`create-management` preserves the owner-only
+`.runtime/management/catalog-bootstrap-probe.json` record and re-fences Tenant
+and catalog CREATE. Only the local kind profile can settle an unknown result:
+it verifies the recorded management container and kubeconfig, restarts that
+exact container to terminate in-flight API requests, waits for the management
+API and controller leadership, then reads the exact Tenant identity. A matching
+probe is deleted through ordinary UID-preconditioned deletion; an absent probe
+still requires catalog and namespace cleanup proof before the record is
+removed. Do not delete the record, bypass a finalizer, or remove the retained
+cluster while recovery is uncertain. Azure's managed API cannot use this
+restart protocol and remains fenced pending independent terminal proof.
 
 Azure foundation operations use the ignored owner-only
 `config/azure.local.env` selectors. Azure Tenant creation uses a schema-1 JSON

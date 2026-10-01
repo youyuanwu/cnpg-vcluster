@@ -10,16 +10,16 @@ FIELD_MANAGER = "cnpg-vcluster-tenant-client"
 
 
 def tenant_manifest_document(
-    config: dict[str, str], name: str, *, workers: int = 1, databases: int = 1,
+    config: dict[str, str], name: str, *, workers: int = 1,
 ) -> dict[str, object]:
     return {
-        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
         "kind": "Tenant",
         "metadata": {"name": name},
         "spec": {
             "kubernetesVersion": config["KUBERNETES_VERSION"].removeprefix("v"),
             "workers": workers,
-            "provider": {"type": "local", "databases": databases},
+            "provider": {"type": "local"},
         },
     }
 

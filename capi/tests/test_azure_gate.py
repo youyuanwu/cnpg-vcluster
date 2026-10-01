@@ -18,6 +18,8 @@ from scripts.test_azure_tenant_lifecycle import (
     _admin_mutation,
     _ensure_tenant_ready,
     _require_allocation_lease_absent,
+    _require_disks_absent,
+    _disk_records,
     _require_recreated_identity,
 )
 
@@ -52,12 +54,51 @@ def readiness(identifiers=(0, 1, 2)):
 
 
 class AzureGateTests(unittest.TestCase):
+    def test_disk_proof_requires_three_distinct_disks_per_entry_and_arm_404(self):
+        uids = ("aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+                "cccccccc-cccc-4ccc-8ccc-cccccccccccc")
+        entries = {
+            uid: {"storage": [
+                {
+                    "ordinal": ordinal,
+                    "disk": {"name": f"disk-{index}-{ordinal}",
+                             "uid": f"disk-uid-{index}-{ordinal}"},
+                    "armID": f"/subscriptions/sub/resourceGroups/rg/providers/"
+                             f"Microsoft.Compute/disks/disk-{index}-{ordinal}",
+                } for ordinal in (1, 2, 3)
+            ]} for index, uid in enumerate(uids)
+        }
+        with patch("scripts.test_azure_tenant_lifecycle._catalog_record",
+                   return_value={"status": {"entries": entries}}):
+            disks = _disk_records(
+                "tenant-a", set(uids), "/subscriptions/sub/resourceGroups/rg",
+            )
+        self.assertEqual(9, len(disks))
+        with (
+            patch("scripts.test_azure_tenant_lifecycle._kubectl",
+                  return_value=CompletedProcess([], 0, "", "")) as kubectl,
+            patch("scripts.test_azure_tenant_lifecycle._az",
+                  return_value=CompletedProcess([], 1, "", "(404) ResourceNotFound")) as arm,
+        ):
+            _require_disks_absent({}, "tenant-a", disks)
+            self.assertEqual(9, kubectl.call_count)
+            self.assertEqual(9, arm.call_count)
+        with (
+            patch("scripts.test_azure_tenant_lifecycle._kubectl",
+                  return_value=CompletedProcess([], 0, "", "")),
+            patch("scripts.test_azure_tenant_lifecycle._az",
+                  return_value=CompletedProcess([], 1, "", "Forbidden")),
+            self.assertRaisesRegex(RuntimeError, "absence is unproven"),
+        ):
+            _require_disks_absent({}, "tenant-a", disks)
+
     def test_admin_mutation_uses_authenticated_json_transport(self) -> None:
         config = CompletedProcess([], 0, "{}", "")
         response = CompletedProcess(
             [],
             0,
-            json.dumps({"schemaVersion": 4, "data": {"state": "accepted"}}),
+            json.dumps({"schemaVersion": 5, "data": {"state": "accepted"}}),
             "",
         )
         with (
@@ -168,7 +209,7 @@ class AzureGateTests(unittest.TestCase):
         ):
             _require_allocation_lease_absent("tenant-azure-slot-old")
 
-    def test_ready_gate_reuses_parsed_spec_after_terminating_tenant(self) -> None:
+    def test_ready_gate_requires_a_clean_tenant_identity(self) -> None:
         spec = type("Spec", (), {"name": "tenant-c"})()
         events = []
         with (
@@ -180,10 +221,6 @@ class AzureGateTests(unittest.TestCase):
                         "deletionTimestamp": "2026-09-29T00:00:00Z",
                     }
                 },
-            ),
-            patch(
-                "scripts.test_azure_tenant_lifecycle.wait_tenant_absent",
-                side_effect=lambda *_args: events.append("absent"),
             ),
             patch(
                 "scripts.test_azure_tenant_lifecycle._admin_create_tenant",
@@ -198,11 +235,20 @@ class AzureGateTests(unittest.TestCase):
                 return_value={"classification": "ready"},
             ),
         ):
-            self.assertEqual(
-                {"classification": "ready"},
-                _ensure_tenant_ready({}, spec),
-            )
-        self.assertEqual(["absent", spec, "ready"], events)
+            with self.assertRaisesRegex(RuntimeError, "absent Tenant"):
+                _ensure_tenant_ready({}, spec)
+        self.assertEqual([], events)
+        with (
+            patch("scripts.test_azure_tenant_lifecycle.read_tenant", return_value=None),
+            patch("scripts.test_azure_tenant_lifecycle._admin_create_tenant",
+                  side_effect=lambda observed: events.append(observed)),
+            patch("scripts.test_azure_tenant_lifecycle.wait_tenant_ready",
+                  side_effect=lambda *_args: events.append("ready")),
+            patch("scripts.test_azure_tenant_lifecycle._require_status",
+                  return_value={"classification": "ready"}),
+        ):
+            self.assertEqual({"classification": "ready"}, _ensure_tenant_ready({}, spec))
+        self.assertEqual([spec, "ready"], events)
 
     def test_exact_mapping_checkpoint_and_non_primary_selection(self) -> None:
         snapshot = build_worker_snapshot(

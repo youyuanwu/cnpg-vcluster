@@ -17,7 +17,7 @@ pub fn names(catalog_uid: &str, entry_uid: &str) -> Result<(String, String), For
     }
     let digest = Sha256::digest(format!("{catalog_uid}/{entry_uid}"));
     let hex = format!("{digest:x}");
-    Ok((format!("db-{}", &hex[..48]), format!("pg-{}", &hex[..48])))
+    Ok((format!("db-{}", &hex[..48]), format!("pg-{}", &hex[..47])))
 }
 
 pub fn labels(
@@ -63,4 +63,26 @@ pub fn check(
         name: name.into(),
         uid: uid.into(),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::names;
+
+    #[test]
+    fn generated_cluster_name_respects_cnpg_fifty_character_limit() {
+        let first = names(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb",
+        )
+        .unwrap();
+        let second = names(
+            "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+            "cccccccc-cccc-4ccc-8ccc-cccccccccccc",
+        )
+        .unwrap();
+        assert_eq!(first.0.len(), 51);
+        assert_eq!(first.1.len(), 50);
+        assert_ne!(first, second);
+    }
 }

@@ -4,9 +4,12 @@ import copy
 import io
 import json
 import os
+import subprocess
+import sys
 import tempfile
 import unittest
 from contextlib import ExitStack
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import MagicMock, Mock, patch
@@ -83,6 +86,16 @@ class Client:
 
 
 class PackagingTests(unittest.TestCase):
+    def test_database_image_entrypoint_imports_outside_repository(self):
+        entrypoint = ROOT / "scripts/build_database_controller.py"
+        result = subprocess.run(
+            [sys.executable, "-I", "-c",
+             f"import runpy; runpy.run_path({str(entrypoint)!r}, run_name='import-check')"],
+            cwd=ROOT.parent, capture_output=True, text=True, timeout=30,
+            check=False,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
     def test_database_controller_build_uses_offline_static_binary_and_bounded_context(self):
         binary = ROOT / "database-controller" / "Dockerfile"
         result = response(json.dumps({
@@ -110,6 +123,24 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(commands[1][:3], ["docker", "build", "--pull=false"])
         self.assertEqual(commands[1][4], image)
         self.assertFalse((ROOT / ".runtime/rendered/database-controller-build").exists())
+
+    def test_prebuilt_database_controller_requires_verified_artifact_boundary(self):
+        binary = ROOT / "database-controller" / "Dockerfile"
+        with (
+            patch.dict("os.environ", {
+                "CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY": str(binary),
+            }),
+            patch("scripts.lib.controller.rust_toolchain",
+                  return_value=("cargo", "rustc identity")),
+            patch("scripts.lib.controller.fetch_controller_dependencies") as fetch,
+            patch.object(database_controller, "run") as build,
+            self.assertRaisesRegex(RuntimeError, "inside .tools/artifacts"),
+        ):
+            database_controller.build_database_controller_image(
+                ROOT, {**CONFIG, "TENANT_CONTROLLER_IMAGE_REPOSITORY": "local/tenant"},
+            )
+        fetch.assert_not_called()
+        build.assert_not_called()
 
     def test_database_deployment_renders_verified_image_and_rolls_out(self):
         image = "registry.example/db@sha256:" + "a" * 64
@@ -254,8 +285,8 @@ class PackagingTests(unittest.TestCase):
                 missing_ok=True
             )
 
-    def test_azure_adapter_stays_fenced_while_admin_only_updates_catalog_intents(self):
-        self.assertFalse(packaging.CATALOG_LIFECYCLE_READY)
+    def test_catalog_release_retains_admin_intent_only_permissions(self):
+        self.assertTrue(packaging.CATALOG_LIFECYCLE_READY)
         for role in ("cluster-role-local.json", "cluster-role-azure.json"):
             payload = json.loads((ROOT / "admin/config/rbac" / role).read_text())
             self.assertFalse(any(
@@ -369,7 +400,9 @@ class PackagingTests(unittest.TestCase):
         def client(catalog_value, receipt_value):
             return Client(lambda *args, **kwargs: (
                 response(catalog_value) if args[:2] == ("-n", "tenant-db-probe")
-                else response(receipt_value) if args[:2] == ("get", "--raw")
+                else response(receipt_value) if args[:3] == (
+                    "get", "--request-timeout=0", "--raw",
+                )
                 else response()
             ))
 
@@ -379,6 +412,7 @@ class PackagingTests(unittest.TestCase):
         )
         self.assertTrue(any(
             "/pods/pod-name:8082/proxy/observation?" in " ".join(args)
+            and args[:3] == ("get", "--request-timeout=0", "--raw")
             and "catalogUID=catalog-uid" in " ".join(args)
             and "resourceVersion=9" in " ".join(args)
             for args, _ in accepted.calls
@@ -554,7 +588,9 @@ class PackagingTests(unittest.TestCase):
         with (
             patch.object(database_controller, "inspect_catalog_inventory"),
             patch.object(packaging, "remove_tenant_cutover_lock") as unlock,
-            self.assertRaisesRegex(RuntimeError, "outcome is unknown"),
+            patch.object(packaging, "verify_release_tenant_cutover_lock"),
+            patch.object(packaging, "verify_catalog_cutover_lock"),
+            self.assertRaisesRegex(RuntimeError, "recorded management checkout"),
         ):
             packaging.run_catalog_lifecycle_probe(
                 CONFIG, client, provider="local", database_image="db:image",
@@ -563,6 +599,288 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(len([
             args for args, _ in client.calls if args[:2] == ("create", "-f")
         ]), 1)
+
+    def test_unknown_local_create_recovery_restarts_only_recorded_container(self):
+        from scripts.lib import management
+
+        name = "catalog-bootstrap-probe"
+        path = self.root / ".runtime/management/catalog-bootstrap-probe.json"
+        record = {
+            "schema": 1, "name": name, "provider": "local",
+            "token": "a" * 32, "uid": None, "issued": True, "deleting": False,
+        }
+        packaging.write_private_file(path, json.dumps(record))
+        identity = Mock(identifier="recorded-container-id")
+        client = Client(lambda *args, **kwargs: (
+            response("ok") if args[:2] == ("get", "--raw=/readyz") else response()
+        ))
+        client.root = self.root
+        client.kubeconfig = path.with_name("kubeconfig")
+        events = []
+        with (
+            patch.object(packaging, "_probe_record_path", return_value=path),
+            patch.object(packaging, "apply_tenant_cutover_lock",
+                         side_effect=lambda *_: events.append("fence")),
+            patch.object(packaging, "ensure_catalog_cutover_lock",
+                         side_effect=lambda *_: events.append("catalog-fence")),
+            patch.object(packaging, "verify_release_tenant_cutover_lock",
+                         side_effect=lambda *_: events.append("tenant-denied")),
+            patch.object(packaging, "verify_catalog_cutover_lock",
+                         side_effect=lambda *_a, **_k: events.append("catalog-denied")),
+            patch.object(management, "require_management_ownership",
+                         return_value=identity) as ownership,
+            patch.object(management, "validate_management_kubeconfig") as kubeconfig,
+            patch.object(packaging, "run",
+                         side_effect=lambda *_a, **_k: events.append("restart") or response()
+                         ) as restart,
+            patch.object(packaging, "wait_for",
+                         side_effect=lambda _desc, _timeout, _interval, predicate:
+                         predicate() or (_ for _ in ()).throw(RuntimeError("API not ready"))),
+            patch.object(packaging, "_database_controller_restarted", return_value=True),
+            patch.object(packaging, "_verify_probe_cleanup",
+                         side_effect=lambda *_: events.append("cleanup")),
+        ):
+            packaging._recover_unknown_local_probe(CONFIG, client, record)
+        self.assertFalse(path.exists())
+        self.assertEqual(
+            events,
+            ["fence", "catalog-fence", "tenant-denied", "catalog-denied",
+             "restart", "tenant-denied", "catalog-denied", "cleanup",
+             "tenant-denied", "catalog-denied"],
+        )
+        restart.assert_called_once_with(
+            ["docker", "restart", "recorded-container-id"], timeout=61,
+        )
+        self.assertEqual(ownership.call_count, 2)
+        identity.require_exact.assert_called_once_with(identity)
+        kubeconfig.assert_called_once_with(self.root, CONFIG)
+        self.assertTrue(any(
+            args[:4] == ("-n", "tenant-system", "rollout", "status")
+            for args, _ in client.calls
+        ))
+
+    def test_unknown_local_create_faults_keep_record_and_never_delete_foreign_tenant(self):
+        from scripts.lib import management
+
+        name = "catalog-bootstrap-probe"
+        path = self.root / ".runtime/management/catalog-bootstrap-probe.json"
+        client = Client(lambda *args, **kwargs: response())
+        client.root = self.root
+        client.kubeconfig = path.with_name("kubeconfig")
+        record = {
+            "schema": 1, "name": name, "provider": "local",
+            "token": "a" * 32, "uid": None, "issued": True, "deleting": False,
+        }
+        identity = Mock(identifier="exact-container")
+        for failed_step in ("fence", "ownership", "kubeconfig", "restart",
+                            "readiness", "inspection", "cleanup"):
+            with self.subTest(failed_step=failed_step):
+                packaging.write_private_file(path, json.dumps(record))
+
+                def fail(step):
+                    if step == failed_step:
+                        raise RuntimeError(f"{step} failure")
+
+                def inspect(*args, **kwargs):
+                    fail("inspection")
+                    return None
+
+                with (
+                    patch.object(packaging, "_probe_record_path", return_value=path),
+                    patch.object(packaging, "apply_tenant_cutover_lock",
+                                 side_effect=lambda *_: fail("fence")),
+                    patch.object(packaging, "ensure_catalog_cutover_lock"),
+                    patch.object(packaging, "verify_release_tenant_cutover_lock"),
+                    patch.object(packaging, "verify_catalog_cutover_lock"),
+                    patch.object(management, "require_management_ownership",
+                                 side_effect=lambda *_: fail("ownership") or identity),
+                    patch.object(management, "validate_management_kubeconfig",
+                                 side_effect=lambda *_: fail("kubeconfig")),
+                    patch.object(packaging, "run",
+                                 side_effect=lambda *_a, **_k: fail("restart") or response()),
+                    patch.object(packaging, "wait_for",
+                                 side_effect=lambda *_a: fail("readiness") or True),
+                    patch.object(packaging, "_database_controller_restarted", return_value=True),
+                    patch.object(packaging, "_probe_resource", side_effect=inspect),
+                    patch.object(packaging, "_verify_probe_cleanup",
+                                 side_effect=lambda *_: fail("cleanup")),
+                    patch.object(packaging, "_delete_probe_tenant_uid") as delete,
+                    self.assertRaisesRegex(RuntimeError, f"{failed_step} failure"),
+                ):
+                    packaging._recover_unknown_local_probe(CONFIG, client, record.copy())
+                self.assertTrue(path.exists())
+                delete.assert_not_called()
+
+        tenant = {
+            "metadata": {"name": name, "uid": "tenant-uid", "annotations": {
+                "tenancy.cnpg-vcluster.io/catalog-bootstrap": "installer-owned",
+                "tenancy.cnpg-vcluster.io/catalog-bootstrap-token": record["token"],
+            }},
+            "spec": {"kubernetesVersion": "1.36.4", "workers": 1,
+                     "provider": {"type": "local"}},
+        }
+        for foreign in ({**tenant, "spec": {**tenant["spec"], "workers": 2}},
+                        {**tenant, "metadata": {**tenant["metadata"],
+                         "annotations": {"tenancy.cnpg-vcluster.io/catalog-bootstrap-token": "bad"}}}):
+            packaging.write_private_file(path, json.dumps(record))
+            with (
+                patch.object(packaging, "_probe_record_path", return_value=path),
+                patch.object(packaging, "apply_tenant_cutover_lock"),
+                patch.object(packaging, "ensure_catalog_cutover_lock"),
+                patch.object(packaging, "verify_release_tenant_cutover_lock"),
+                patch.object(packaging, "verify_catalog_cutover_lock"),
+                patch.object(management, "require_management_ownership",
+                             return_value=identity),
+                patch.object(management, "validate_management_kubeconfig"),
+                patch.object(packaging, "run"),
+                patch.object(packaging, "wait_for", return_value=True),
+                patch.object(packaging, "_database_controller_restarted", return_value=True),
+                patch.object(packaging, "_probe_resource", return_value=foreign),
+                patch.object(packaging, "_delete_probe_tenant_uid") as delete,
+                self.assertRaisesRegex(RuntimeError, "another Tenant"),
+            ):
+                packaging._recover_unknown_local_probe(CONFIG, client, record.copy())
+            self.assertTrue(path.exists())
+            delete.assert_not_called()
+
+    def test_unknown_managed_create_does_not_restart_or_clear_record(self):
+        record = {
+            "schema": 1, "name": "catalog-bootstrap-probe", "provider": "azure",
+            "token": "a" * 32, "uid": None, "issued": True, "deleting": False,
+        }
+        packaging.write_private_file(self.probe_path, json.dumps(record))
+        client = Client()
+        with (
+            patch.object(packaging, "run") as restart,
+            self.assertRaisesRegex(RuntimeError, "unknown on managed API"),
+        ):
+            packaging.run_catalog_lifecycle_probe(
+                CONFIG, client, provider="azure", database_image="db:image",
+            )
+        restart.assert_not_called()
+        self.assertTrue(self.probe_path.exists())
+        self.assertEqual(client.calls, [])
+
+    def test_delayed_unknown_create_is_uid_deleted_only_after_restart(self):
+        from scripts.lib import management
+
+        name = "catalog-bootstrap-probe"
+        path = self.root / ".runtime/management/catalog-bootstrap-probe.json"
+        record = {
+            "schema": 1, "name": name, "provider": "local",
+            "token": "a" * 32, "uid": None, "issued": True, "deleting": False,
+        }
+        packaging.write_private_file(path, json.dumps(record))
+        identity = Mock(identifier="recorded-container-id")
+        tenant = {
+            "metadata": {"name": name, "uid": "recorded-tenant-uid", "annotations": {
+                "tenancy.cnpg-vcluster.io/catalog-bootstrap": "installer-owned",
+                "tenancy.cnpg-vcluster.io/catalog-bootstrap-token": record["token"],
+            }},
+            "spec": {"kubernetesVersion": "1.36.4", "workers": 1,
+                     "provider": {"type": "local"}},
+        }
+        state = {"restarted": False, "deleted": False, "checked": False}
+        client = Client(lambda *args, **_kwargs: response())
+        client.root = self.root
+        client.kubeconfig = path.with_name("kubeconfig")
+
+        def restart(*_args, **_kwargs):
+            state["restarted"] = True
+            return response()
+
+        def exact_get(*_args, **_kwargs):
+            self.assertTrue(state["restarted"])
+            return tenant
+
+        def delete(_config, _client, deleted_name, uid):
+            self.assertTrue(state["restarted"])
+            self.assertEqual((deleted_name, uid), (name, "recorded-tenant-uid"))
+            self.assertEqual(json.loads(packaging.read_private_file(path))["uid"], uid)
+            self.assertTrue(json.loads(packaging.read_private_file(path))["deleting"])
+            state["deleted"] = True
+
+        def cleanup(*_args):
+            self.assertTrue(state["deleted"])
+            state["checked"] = True
+
+        with (
+            patch.object(packaging, "_probe_record_path", return_value=path),
+            patch.object(packaging, "apply_tenant_cutover_lock"),
+            patch.object(packaging, "ensure_catalog_cutover_lock"),
+            patch.object(packaging, "verify_release_tenant_cutover_lock"),
+            patch.object(packaging, "verify_catalog_cutover_lock"),
+            patch.object(management, "require_management_ownership",
+                         return_value=identity),
+            patch.object(management, "validate_management_kubeconfig"),
+            patch.object(packaging, "run", side_effect=restart),
+            patch.object(packaging, "wait_for", return_value=True),
+            patch.object(packaging, "_database_controller_restarted", return_value=True),
+            patch.object(packaging, "_probe_resource", side_effect=exact_get),
+            patch.object(packaging, "_delete_probe_tenant_uid", side_effect=delete),
+            patch.object(packaging, "_verify_probe_cleanup", side_effect=cleanup),
+        ):
+            packaging._recover_unknown_local_probe(CONFIG, client, record)
+        self.assertTrue(state["checked"])
+        self.assertFalse(path.exists())
+
+    def test_database_recovery_readiness_requires_current_healthy_leader(self):
+        pod_uid = "recorded-pod-uid"
+        deployment = {
+            "metadata": {"generation": 1},
+            "spec": {"replicas": 1},
+            "status": {"observedGeneration": 1, "updatedReplicas": 1},
+        }
+        pod = {
+            "metadata": {"uid": pod_uid, "name": "db-pod"},
+            "status": {"phase": "Running", "containerStatuses": [
+                {"state": {"running": {"startedAt": "now"}}},
+            ]},
+        }
+        lease = {"spec": {
+            "holderIdentity": f"{pod_uid}-instance",
+            "renewTime": datetime.now(timezone.utc).isoformat(),
+            "leaseDurationSeconds": 30,
+        }}
+        objects = {
+            "deployment/database-controller": deployment,
+            "pods": {"items": [pod]},
+            "lease/database-controller.tenancy.cnpg-vcluster.io": lease,
+        }
+
+        class RecoveryClient:
+            def json(self, *args):
+                return objects[next(value for value in args if value in objects)]
+
+            def kubectl(self, *args, **kwargs):
+                return response("ok")
+
+        client = RecoveryClient()
+        restarted_at = datetime.now(timezone.utc) - timedelta(seconds=2)
+        with patch.object(client, "kubectl", return_value=response("ok")) as health:
+            self.assertTrue(packaging._database_controller_restarted(client, since=restarted_at))
+            self.assertIn("/pods/db-pod:8082/proxy/healthz", health.call_args.args[1])
+            for change in (
+                lambda: lease["spec"].update(holderIdentity="other-pod-instance"),
+                lambda: lease["spec"].update(renewTime=(
+                    datetime.now(timezone.utc) - timedelta(seconds=40)).isoformat()),
+                lambda: lease["spec"].update(renewTime=(
+                    restarted_at - timedelta(seconds=1)).isoformat()),
+                lambda: pod["metadata"].update(deletionTimestamp="now"),
+            ):
+                original = copy.deepcopy((lease, pod))
+                change()
+                self.assertFalse(packaging._database_controller_restarted(
+                    client, since=restarted_at,
+                ))
+                lease.clear()
+                lease.update(original[0])
+                pod.clear()
+                pod.update(original[1])
+            health.return_value = response(code=1, error="unhealthy")
+            self.assertFalse(packaging._database_controller_restarted(
+                client, since=restarted_at,
+            ))
 
     def test_restart_after_probe_deletion_proves_absence_before_releasing_record(self):
         record = {
@@ -686,6 +1004,8 @@ class PackagingTests(unittest.TestCase):
                 document = json.loads(kwargs["input_text"])
                 self.assertEqual(document["spec"]["entries"], {})
                 self.assertEqual(document["metadata"]["namespace"], "tenant-system")
+                self.assertLessEqual(len(document["metadata"]["name"]), 30)
+                self.assertEqual(document["spec"]["tenantName"], document["metadata"]["name"])
                 self.assertNotIn(document["metadata"]["name"], names)
                 names.add(document["metadata"]["name"])
                 return response(code=1, error=(
@@ -923,7 +1243,10 @@ class PackagingTests(unittest.TestCase):
             )
 
     def test_release_rechecks_identity_and_refences_interruption(self):
-        with self.assertRaisesRegex(RuntimeError, "not approved"):
+        with (
+            patch.object(packaging, "CATALOG_LIFECYCLE_READY", False),
+            self.assertRaisesRegex(RuntimeError, "not approved"),
+        ):
             packaging.release_catalog_and_tenant_cutover_locks(
                 CONFIG, Client(), provider="local",
                 tenant_image="tenant:image", database_image="database:image",
@@ -1104,6 +1427,11 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(
             len([args for args, _ in client.calls if args[:1] == ("create",)]), 5,
         )
+        for args, kwargs in client.calls:
+            if args[:1] == ("create",):
+                self.assertLessEqual(
+                    len(json.loads(kwargs["input_text"])["metadata"]["name"]), 30,
+                )
         for mutation in (
             lambda p, b: p["status"].update(observedGeneration=1),
             lambda p, b: b["spec"].update(validationActions=["Warn"]),
@@ -1591,6 +1919,10 @@ class PackagingTests(unittest.TestCase):
         )
         packaging.verify_tenant_cutover_lock(client, "v1alpha3")
         self.assertEqual(5, len(client.calls))
+        for args, kwargs in client.calls:
+            probe = json.loads(kwargs["input_text"])
+            self.assertLessEqual(len(probe["metadata"]["name"]), 30)
+            self.assertEqual("Tenant", probe["kind"])
 
     def setUp(self):
         (ROOT / ".runtime").mkdir(exist_ok=True)

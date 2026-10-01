@@ -47,6 +47,7 @@ EXPECTED_RECIPES = {
     "database-controller-test",
     "database-controller-lint",
     "database-controller-build",
+    "database-controller-image",
     "database-controller-metrics",
     "azure-database-runtime-once",
     "azure-database-runtime-watch",
@@ -449,6 +450,12 @@ def check_repository_boundaries() -> None:
         "just admin-test",
         "just admin-metrics",
         "just admin-package-check",
+        "just database-controller-verify",
+        "just database-controller-lint",
+        "just database-controller-test",
+        "just database-controller-metrics",
+        "just database-controller-build",
+        "database-manager",
     ):
         check(token in fast_checks, f"fast-check artifact wiring is missing {token}")
     for token in (
@@ -457,12 +464,23 @@ def check_repository_boundaries() -> None:
         "CAPI_PREBUILT_CONTROLLER_BINARY",
         "CAPI_PREBUILT_ADMIN_SERVER",
         "CAPI_PREBUILT_ADMIN_WEB",
+        "CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY",
         "capi/.tools/artifacts/${{ github.sha }}",
     ):
         check(token in e2e, f"PR E2E artifact wiring is missing {token}")
     high_capacity = workflow.split("  high-capacity:", 1)[1].split(
+        "  azure-destructive:", 1
+    )[0]
+    azure_gate = workflow.split("  azure-destructive:", 1)[1].split(
         "  capi-tests:", 1
     )[0]
+    for token in (
+        "just azure-foundation-status",
+        "just azure-test-tenant-lifecycle",
+        "CAPI_AZURE_FOUNDATION_INVENTORY",
+        "CAPI_AZURE_MANAGEMENT_KUBECONFIG",
+    ):
+        check(token in azure_gate, f"Azure destructive gate is missing {token}")
     check(
         "CAPI_PREBUILT_CONTROLLER_BINARY" not in high_capacity,
         "high-capacity validation must retain an independent controller build",

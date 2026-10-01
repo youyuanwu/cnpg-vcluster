@@ -17,9 +17,9 @@ from scripts.lib.controller_scenarios import (
     wait_tenant_ready,
 )
 from scripts.lib.controller_client import apply_tenant_document, tenant_manifest_document
-from scripts.cnpg import _sql
-from scripts.test_e2e import capture_tenant_deletion_identity, verify_tenant_deletion
-from scripts.lib.kube import ManagementClient
+from scripts.test_e2e import capture_tenant_deletion_identity, verify_tenant_deletion, catalog_client
+from scripts.lib.config import parse_duration
+from scripts.lib.kube import ManagementClient, wait_for
 from scripts.lib.locking import tools_lock
 from scripts.lib.redaction import redact
 from scripts.lib.tenants import _tenant_kubectl, export_tenant_kubeconfig
@@ -34,6 +34,34 @@ def _apply(
     apply_tenant_document(client, tenant_manifest_document(config, name))
     document = wait_tenant_ready(root, config, name)
     export_tenant_kubeconfig(root, config, client, tenant_from_document(root, config, document))
+    wait_for(
+        f"{name} database capability", parse_duration(config["CNPG_TIMEOUT"]) * 4, 5,
+        lambda: (
+            current if (
+                (current := tenant_document(client, name))
+                and current.get("metadata", {}).get("uid") == document["metadata"]["uid"]
+                and current.get("status", {}).get("databaseCapability", {}).get("available")
+            ) else None
+        ),
+    )
+    catalog = catalog_client(client, name, document["metadata"]["uid"])
+    initial = catalog.read()
+    uid = initial["catalogUid"]
+    if not initial["databases"]:
+        catalog.add(uid, "isolation")
+    elif len(initial["databases"]) != 1 or initial["databases"][0]["name"] != "isolation":
+        raise RuntimeError("unexpected Tenant database entries")
+    ready = catalog.wait(
+        lambda item: len(item["databases"]) == 1
+        and item["databases"][0]["phase"] == "ready",
+        parse_duration(config["CNPG_TIMEOUT"]) * 4, uid,
+    )
+    entry = ready["databases"][0]
+    if entry["readyInstances"] != 3 or entry["storageHealthy"] != 3:
+        raise RuntimeError("isolation database not Ready")
+    if not initial["databases"]:
+        catalog.query(uid, entry, f"marker-{name}", write=True)
+    catalog.query(uid, entry, f"marker-{name}")
     return document
 
 
@@ -82,17 +110,14 @@ def _verify_isolation(root: Path, config: dict[str, str], client, names) -> None
         raise RuntimeError("Tenant allocated networks overlap")
     tenants = [tenant_from_document(root, config, document) for document in documents]
     for tenant in tenants:
-        result = _sql(
-            root, config, tenant,
-            "CREATE TABLE isolation_marker(value text PRIMARY KEY);"
-            f"INSERT INTO isolation_marker VALUES ('{tenant.name}');"
-            "SELECT value FROM isolation_marker;",
-        )
-        if result != tenant.name:
-            raise RuntimeError(f"Tenant SQL isolation write failed: {tenant.name}")
+        catalog = catalog_client(client, tenant.name, next(
+            item["metadata"]["uid"] for item in documents
+            if item["metadata"]["name"] == tenant.name
+        ))
+        current = catalog.read()
+        entry = current["databases"][0]
+        catalog.query(current["catalogUid"], entry, f"marker-{tenant.name}")
     for tenant, peer in zip(tenants, tenants[1:] + tenants[:1]):
-        if _sql(root, config, tenant, "SELECT value FROM isolation_marker;") != tenant.name:
-            raise RuntimeError(f"Tenant SQL data crossed an isolation boundary: {tenant.name}")
         response = _tenant_kubectl(
             root, config, tenant, f"--server=https://{peer.vip}:{config['SPIKE_API_PORT']}",
             "get", "--raw=/api", check=False,
@@ -132,8 +157,9 @@ def run_tenant_lifecycle(root: Path, config: dict[str, str]) -> None:
             if _snapshot(config, client, name) != before:
                 raise RuntimeError(f"targeted deletion changed survivor: {name}")
             tenant = tenant_from_document(root, config, wait_tenant_ready(root, config, name))
-            if _sql(root, config, tenant, "SELECT value FROM isolation_marker;") != name:
-                raise RuntimeError(f"targeted deletion changed survivor SQL data: {name}")
+            catalog = catalog_client(client, name, before["uid"])
+            current = catalog.read()
+            catalog.query(current["catalogUid"], current["databases"][0], f"marker-{name}")
 
         recreated = _apply(root, config, "tenant-c")
         if recreated["metadata"]["uid"] == first_tenant_c_uid:
