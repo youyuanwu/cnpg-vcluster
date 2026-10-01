@@ -131,39 +131,74 @@ def verify_catalog_cutover_lock(
     client: ManagementClient, *, namespace: str,
 ) -> None:
     expected_policy, expected_binding = catalog_cutover_lock_documents()
-    policy = client.json(
-        "get", f"validatingadmissionpolicy/{CATALOG_CUTOVER_POLICY}",
-    )
-    binding = client.json(
-        "get", f"validatingadmissionpolicybinding/{CATALOG_CUTOVER_POLICY}",
-    )
     expected_spec = expected_policy["spec"]
-    policy_spec = policy.get("spec", {})
-    constraints = policy_spec.get("matchConstraints", {})
-    if (
-        policy.get("metadata", {}).get("name") != CATALOG_CUTOVER_POLICY
-        or policy_spec.get("failurePolicy") != "Fail"
-        or not isinstance(constraints, dict)
-        or constraints.get("resourceRules") != expected_spec["matchConstraints"]["resourceRules"]
-        or set(constraints) - {
-            "resourceRules", "excludeResourceRules", "namespaceSelector",
-            "objectSelector", "matchPolicy",
-        }
-        or constraints.get("excludeResourceRules")
-        or constraints.get("namespaceSelector")
-        or constraints.get("objectSelector")
-        or constraints.get("matchPolicy", "Equivalent") not in ("Equivalent", "Exact")
-        or policy_spec.get("validations") != expected_spec["validations"]
-        or policy_spec.get("matchConditions")
-        or policy_spec.get("paramKind")
-        or binding.get("metadata", {}).get("name") != CATALOG_CUTOVER_POLICY
-        or binding.get("spec", {}).get("policyName")
-        != expected_binding["spec"]["policyName"]
-        or binding.get("spec", {}).get("validationActions") != ["Deny"]
-        or binding.get("spec", {}).get("matchResources")
-        or binding.get("spec", {}).get("paramRef")
-    ):
-        raise RuntimeError("catalog cutover CREATE fence contract is malformed")
+
+    def current_identity() -> tuple[str, int, str, int]:
+        policy = client.json(
+            "get", f"validatingadmissionpolicy/{CATALOG_CUTOVER_POLICY}",
+        )
+        binding = client.json(
+            "get", f"validatingadmissionpolicybinding/{CATALOG_CUTOVER_POLICY}",
+        )
+        if not isinstance(policy, dict) or not isinstance(binding, dict):
+            raise RuntimeError("catalog cutover CREATE fence contract is malformed")
+        policy_spec = policy.get("spec")
+        if not isinstance(policy_spec, dict):
+            raise RuntimeError("catalog cutover CREATE fence contract is malformed")
+        constraints = policy_spec.get("matchConstraints", {})
+        policy_meta = policy.get("metadata", {})
+        binding_meta = binding.get("metadata", {})
+        policy_status = policy.get("status", {})
+        conditions = policy_status.get("conditions", []) if isinstance(policy_status, dict) else None
+        if (
+            not isinstance(policy_meta, dict)
+            or not isinstance(binding_meta, dict)
+            or not isinstance(constraints, dict)
+            or not isinstance(policy_status, dict)
+            or not isinstance(conditions, list)
+            or policy_meta.get("name") != CATALOG_CUTOVER_POLICY
+            or not isinstance(policy_meta.get("uid"), str)
+            or not policy_meta["uid"]
+            or not isinstance(policy_meta.get("generation"), int)
+            or isinstance(policy_meta["generation"], bool)
+            or policy_meta["generation"] < 1
+            or policy_status.get("observedGeneration") != policy_meta["generation"]
+            or not isinstance(policy_status.get("typeChecking"), dict)
+            or policy_status["typeChecking"].get("expressionWarnings", []) != []
+            or any(
+                not isinstance(condition, dict)
+                or condition.get("observedGeneration") != policy_meta["generation"]
+                or condition.get("status") != "True"
+                for condition in conditions
+            )
+            or binding_meta.get("name") != CATALOG_CUTOVER_POLICY
+            or not isinstance(binding_meta.get("uid"), str)
+            or not binding_meta["uid"]
+            or not isinstance(binding_meta.get("generation"), int)
+            or isinstance(binding_meta["generation"], bool)
+            or binding_meta["generation"] < 1
+            or policy_spec.get("failurePolicy") != "Fail"
+            or constraints.get("resourceRules") != expected_spec["matchConstraints"]["resourceRules"]
+            or set(constraints) - {
+                "resourceRules", "excludeResourceRules", "namespaceSelector",
+                "objectSelector", "matchPolicy",
+            }
+            or constraints.get("excludeResourceRules")
+            or constraints.get("namespaceSelector")
+            or constraints.get("objectSelector")
+            or constraints.get("matchPolicy", "Equivalent") != "Equivalent"
+            or policy_spec.get("validations") != expected_spec["validations"]
+            or policy_spec.get("matchConditions")
+            or policy_spec.get("paramKind")
+            or binding.get("spec") != expected_binding["spec"]
+        ):
+            raise RuntimeError("catalog cutover CREATE fence contract is malformed")
+        return (
+            policy_meta["uid"], policy_meta["generation"],
+            binding_meta["uid"], binding_meta["generation"],
+        )
+
+    identity = current_identity()
     name = f"database-lock-probe-{uuid.uuid4().hex[:8]}"
     document = {
         "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha1",
@@ -175,6 +210,8 @@ def verify_catalog_cutover_lock(
         "spec": {"tenantName": name, "tenantUID": "probe", "closed": False},
     }
     for _ in range(5):
+        if current_identity() != identity:
+            raise RuntimeError("catalog cutover CREATE fence identity changed during probing")
         result = client.kubectl(
             "create", "--dry-run=server", "-f", "-",
             input_text=json.dumps(document), check=False,
@@ -184,6 +221,8 @@ def verify_catalog_cutover_lock(
             or "TenantDatabaseCatalog creation is locked during API cutover"
             not in result.stderr):
             raise RuntimeError("catalog cutover CREATE fence is not effective")
+    if current_identity() != identity:
+        raise RuntimeError("catalog cutover CREATE fence identity changed during probing")
 
 
 def catalog_cutover_lock_cleanup_refs() -> tuple[str, str]:

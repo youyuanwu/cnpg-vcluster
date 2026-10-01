@@ -43,6 +43,18 @@ def desired_crd():
     }
 
 
+def active_catalog_lock():
+    policy, binding = packaging.catalog_cutover_lock_documents()
+    policy["metadata"].update({"uid": "policy-uid", "generation": 1})
+    policy["status"] = {
+        "observedGeneration": 1,
+        "typeChecking": {"expressionWarnings": []},
+        "conditions": [],
+    }
+    binding["metadata"].update({"uid": "binding-uid", "generation": 1})
+    return policy, binding
+
+
 class Client:
     def __init__(self, handler=None):
         self.calls = []
@@ -75,7 +87,7 @@ class PackagingTests(unittest.TestCase):
         self.addCleanup(legacy.stop)
 
     def test_catalog_cutover_lock_is_separate_and_effective(self):
-        policy, binding = packaging.catalog_cutover_lock_documents()
+        policy, binding = active_catalog_lock()
         self.assertEqual(policy["metadata"]["name"], packaging.CATALOG_CUTOVER_POLICY)
         self.assertEqual(policy["spec"]["failurePolicy"], "Fail")
         self.assertEqual(policy["spec"]["matchConstraints"]["resourceRules"][0], {
@@ -132,6 +144,69 @@ class PackagingTests(unittest.TestCase):
                     else reject(*args, **kwargs)
                 )), namespace="tenant-system",
             )
+        for mutation in (
+            lambda p, b: p.pop("status"),
+            lambda p, b: p.update(spec=[]),
+            lambda p, b: p["status"].update(observedGeneration=0),
+            lambda p, b: p["status"]["typeChecking"].update(
+                expressionWarnings="invalid",
+            ),
+            lambda p, b: p["status"]["typeChecking"].update(
+                expressionWarnings=[{"warning": "invalid expression"}],
+            ),
+            lambda p, b: b["metadata"].update(name="replacement"),
+            lambda p, b: b["metadata"].update(generation=0),
+            lambda p, b: b["metadata"].pop("uid"),
+            lambda p, b: b["spec"].update(validationActions=["Warn"]),
+            lambda p, b: b["spec"].update(policyName="different-policy"),
+            lambda p, b: b["spec"].update(matchResources={"namespaceSelector": {}}),
+            lambda p, b: p["status"].update(conditions=[{
+                "type": "Ready", "status": "True", "observedGeneration": 0,
+            }]),
+            lambda p, b: p["spec"]["matchConstraints"].update(matchPolicy="Exact"),
+        ):
+            changed_policy, changed_binding = active_catalog_lock()
+            mutation(changed_policy, changed_binding)
+            with self.assertRaisesRegex(RuntimeError, "contract is malformed"):
+                packaging.verify_catalog_cutover_lock(
+                    Client(lambda *args, **kwargs: (
+                        response(changed_policy) if args[:2] == (
+                            "get", f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}"
+                        ) else response(changed_binding) if args[:2] == (
+                            "get", f"validatingadmissionpolicybinding/{packaging.CATALOG_CUTOVER_POLICY}"
+                        ) else reject(*args, **kwargs)
+                    )), namespace="tenant-system",
+                )
+        changed_policy, changed_binding = active_catalog_lock()
+        changed_binding["metadata"]["uid"] = "replaced"
+        policy_reads = 0
+
+        def replaced(*args, **kwargs):
+            nonlocal policy_reads
+            if args[:2] == ("get", f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}"):
+                policy_reads += 1
+            if args[:2] == ("get", f"validatingadmissionpolicybinding/{packaging.CATALOG_CUTOVER_POLICY}") and policy_reads > 1:
+                return response(changed_binding)
+            return reject(*args, **kwargs)
+
+        with self.assertRaisesRegex(RuntimeError, "identity changed"):
+            packaging.verify_catalog_cutover_lock(Client(replaced), namespace="tenant-system")
+        probe_count = 0
+
+        def denial_lost(*args, **kwargs):
+            nonlocal probe_count
+            result = reject(*args, **kwargs)
+            if args[:2] == ("create", "--dry-run=server"):
+                probe_count += 1
+                if probe_count == 3:
+                    return response(code=1, error="denied by unrelated admission policy")
+            return result
+
+        with self.assertRaisesRegex(RuntimeError, "not effective"):
+            packaging.verify_catalog_cutover_lock(
+                Client(denial_lost), namespace="tenant-system",
+            )
+        self.assertEqual(probe_count, 3)
         excluded_policy = copy.deepcopy(policy)
         excluded_policy["spec"]["matchConstraints"]["excludeResourceRules"] = [{
             "apiGroups": ["tenancy.cnpg-vcluster.io"],
@@ -752,7 +827,7 @@ class CatalogInstallerTests(unittest.TestCase):
         self.assertNotIn("controller-cluster-role.yaml", [path.name for path in azure])
         self.assertFalse(any("admission" in str(path) or "gates" in str(path)
                              for path in (*local, *azure)))
-        policy, binding = packaging.catalog_cutover_lock_documents()
+        policy, binding = active_catalog_lock()
 
         def handler(*args, **_kwargs):
             if args[:2] == ("get", f"crd/{database_controller.CATALOG_CRD}"):
@@ -876,7 +951,7 @@ class CatalogInstallerTests(unittest.TestCase):
             self.assertEqual(len(client.calls), 1)
 
     def test_absent_legacy_crd_permits_catalog_install(self):
-        policy, binding = packaging.catalog_cutover_lock_documents()
+        policy, binding = active_catalog_lock()
 
         def handler(*args, **_kwargs):
             if args[:2] == ("get", f"crd/{database_controller.CATALOG_CRD}"):
