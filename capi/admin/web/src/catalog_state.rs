@@ -43,7 +43,7 @@ pub fn add_disabled_reason(
     } else if !catalog.capability_available {
         Some("Database capability is disabled. Refresh after it recovers.")
     } else if classification != TenantClassification::Ready {
-        Some("Tenant database capability is not Ready. Refresh after it recovers.")
+        Some("Tenant infrastructure is not Ready. Refresh after it recovers.")
     } else if catalog.databases.len() >= MAX_DATABASES {
         Some("All three database cluster slots are occupied, including deleting entries.")
     } else {
@@ -81,10 +81,19 @@ pub fn entry_actions_enabled(
     classification: TenantClassification,
     entry: &DatabaseView,
 ) -> bool {
-    catalog_current(catalog, tenant, tenant_uid)
-        && !catalog.closed
+    entry_deletable(catalog, tenant, tenant_uid, entry)
         && catalog.capability_available
         && classification == TenantClassification::Ready
+}
+
+pub fn entry_deletable(
+    catalog: &CatalogView,
+    tenant: &str,
+    tenant_uid: &str,
+    entry: &DatabaseView,
+) -> bool {
+    catalog_current(catalog, tenant, tenant_uid)
+        && !catalog.closed
         && !entry.deleting
         && catalog
             .databases
@@ -98,7 +107,6 @@ pub fn delete_request(
     confirmation: &str,
 ) -> Option<DatabaseDeleteRequest> {
     if catalog.closed
-        || !catalog.capability_available
         || entry.deleting
         || confirmation != entry.name
         || !catalog
@@ -378,6 +386,50 @@ mod tests {
             TenantClassification::Ready,
             &first
         ));
+    }
+
+    #[test]
+    fn degraded_capability_and_infrastructure_still_allow_exact_deletion() {
+        for provider in [TenantProvider::Local, TenantProvider::Azure] {
+            let mut state = catalog(provider);
+            state.databases.truncate(1);
+            let first = state.databases[0].clone();
+            state.capability_available = false;
+            for classification in [
+                TenantClassification::Ready,
+                TenantClassification::Degraded,
+                TenantClassification::Progressing,
+            ] {
+                assert!(
+                    add_disabled_reason(&state, "tenant-a", "tenant-uid", classification).is_some()
+                );
+                assert!(!entry_actions_enabled(
+                    &state,
+                    "tenant-a",
+                    "tenant-uid",
+                    classification,
+                    &first
+                ));
+                assert!(entry_deletable(&state, "tenant-a", "tenant-uid", &first));
+                assert_eq!(
+                    delete_request(&state, &first, "alpha").unwrap().logical_uid,
+                    first.logical_uid
+                );
+            }
+            assert!(!entry_deletable(&state, "tenant-a", "replacement", &first));
+            state.closed = true;
+            assert!(!entry_deletable(&state, "tenant-a", "tenant-uid", &first));
+            assert!(delete_request(&state, &first, "alpha").is_none());
+            state.closed = false;
+            state.databases[0].deleting = true;
+            assert!(!entry_deletable(
+                &state,
+                "tenant-a",
+                "tenant-uid",
+                &state.databases[0]
+            ));
+            assert!(delete_request(&state, &state.databases[0], "alpha").is_none());
+        }
     }
 
     #[test]

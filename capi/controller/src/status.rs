@@ -165,6 +165,34 @@ pub fn catalog_create_outcome(status: &TenantStatus) -> Option<&str> {
         .map(|condition| condition.reason.as_str())
 }
 
+pub async fn close_catalog_creation_without_intent(
+    client: Client,
+    tenant: &Tenant,
+) -> Result<(), ControllerError> {
+    if tenant.metadata.deletion_timestamp.is_none()
+        || !tenant.finalizers().iter().any(|value| value == FINALIZER)
+    {
+        return Err(invalid());
+    }
+    update_status(client, tenant, |status| {
+        if status.catalog_create_intent.is_some()
+            || !matches!(catalog_create_outcome(status), None | Some("Closed"))
+        {
+            return Err(invalid());
+        }
+        set_condition(
+            status,
+            tenant,
+            CATALOG_CREATE_CONDITION,
+            false,
+            "Closed",
+            "Tenant deletion forbids catalog CREATE",
+        );
+        Ok(())
+    })
+    .await
+}
+
 pub async fn record_catalog_create_intent(
     client: Client,
     tenant: &Tenant,

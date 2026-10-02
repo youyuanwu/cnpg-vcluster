@@ -1903,6 +1903,36 @@ async fn deletion_racing_intent_write_prevents_catalog_issuance() {
 }
 
 #[tokio::test]
+async fn deleting_without_catalog_intent_persists_closed_eligibility_before_drain() {
+    let fixture = Fixture::new(true);
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["finalizers"] = json!([FINALIZER]);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+
+    fixture.step().await;
+    let current = fixture.current();
+    assert!(current.finalizers().iter().any(|value| value == FINALIZER));
+    let status = current.status.unwrap();
+    assert!(status.catalog_create_intent.is_none());
+    assert_eq!(status::catalog_create_outcome(&status), Some("Closed"));
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| call.method == "PATCH" && call.path == format!("{TENANT}/status"))
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| !call.path.contains("tenantdatabasecatalogs") && call.method != "DELETE")
+    );
+}
+
+#[tokio::test]
 async fn deletion_without_catalog_drain_retains_finalizer_and_all_infrastructure() {
     for recorded_intent in [false, true] {
         let fixture = Fixture::new(true);

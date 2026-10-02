@@ -12,8 +12,8 @@ use crate::{
     api::{delete_envelope, get_envelope, post_envelope},
     catalog_state::{
         CatalogRecovery, add_disabled_reason, add_recovery, catalog_current, create_request,
-        delete_recovery, delete_request, entry_actions_enabled, query_instances, query_request,
-        query_response_matches, visible_databases,
+        delete_recovery, delete_request, entry_actions_enabled, entry_deletable, query_instances,
+        query_request, query_response_matches, visible_databases,
     },
     database_console::{
         DEFAULT_DATABASE, DEFAULT_SQL, QueryResultPresentation, format_query_duration,
@@ -197,9 +197,11 @@ fn CatalogContent(
                     {entries.into_iter().map(|entry| {
                         let can_act = entry_actions_enabled(&catalog, &name, &tenant_uid, classification, &entry)
                             && count <= 3;
+                        let can_delete = entry_deletable(&catalog, &name, &tenant_uid, &entry)
+                            && count <= 3;
                         view! {
                             <DatabaseCard name=name.clone() catalog=catalog.clone() entry
-                                can_act state notice busy locked/>
+                                can_act can_delete state notice busy locked/>
                         }
                     }).collect_view()}
                 </div>
@@ -349,6 +351,7 @@ fn DatabaseCard(
     catalog: CatalogView,
     entry: DatabaseView,
     can_act: bool,
+    can_delete: bool,
     state: RwSignal<CatalogLoad>,
     notice: RwSignal<Option<String>>,
     busy: RwSignal<bool>,
@@ -432,7 +435,7 @@ fn DatabaseCard(
                 {topology_view(&uid, &entry.name, topology)}
             </section>
             <DatabaseDeletePanel name=name.clone() catalog=catalog.clone() entry=entry.clone()
-                can_act state notice busy locked/>
+                can_act=can_delete state notice busy locked/>
             <DatabaseConsole name catalog entry can_act busy locked/>
         </article>
     }

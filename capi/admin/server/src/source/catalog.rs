@@ -21,14 +21,16 @@ use tenant_admin_shared::{
     },
 };
 use tenant_controller::{
-    api::{AzureProviderStatus, Tenant, TenantPhase, TenantProviderSpec},
+    api::{
+        AzureProviderStatus, FINALIZER as TENANT_FINALIZER, Tenant, TenantPhase, TenantProviderSpec,
+    },
     management::{AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES},
     tenant_client::load_tenant_client_with_owner,
 };
 use tenant_database_controller::{
     api::{
-        CatalogEntry, DATABASE_LIMIT, DatabasePhase, EntryStatus, TenantDatabaseCatalog,
-        valid_logical_uid, valid_name,
+        CatalogEntry, DATABASE_LIMIT, DatabasePhase, EntryStatus, FINALIZER as CATALOG_FINALIZER,
+        TenantDatabaseCatalog, valid_logical_uid, valid_name,
     },
     ownership::{self, CATALOG_LABEL, ENTRY_LABEL, TENANT_LABEL},
 };
@@ -91,6 +93,15 @@ pub(super) async fn read(
         || ns.metadata.deletion_timestamp.is_some()
         || ns
             .metadata
+            .owner_references
+            .as_ref()
+            .is_some_and(|owners| !owners.is_empty())
+        || !tenant
+            .finalizers()
+            .iter()
+            .any(|value| value == TENANT_FINALIZER)
+        || ns
+            .metadata
             .labels
             .as_ref()
             .and_then(|labels| labels.get(TENANT_LABEL))
@@ -109,6 +120,11 @@ pub(super) async fn read(
     if catalog.metadata.uid.as_deref() != Some(&capability.catalog_uid)
         || catalog.metadata.namespace.as_deref() != Some(namespace.as_str())
         || catalog.metadata.deletion_timestamp.is_some()
+        || catalog
+            .metadata
+            .finalizers
+            .as_ref()
+            .is_none_or(|finalizers| !finalizers.iter().any(|value| value == CATALOG_FINALIZER))
         || catalog.spec.tenant_name != name
         || catalog.spec.tenant_uid != tenant_uid
         || catalog.metadata.owner_references.as_deref()
@@ -144,6 +160,10 @@ fn read_error(error: kube::Error) -> SourceError {
 fn ready(tenant: &Tenant) -> Result<(), SourceError> {
     let status = tenant.status.as_ref().ok_or_else(not_ready)?;
     if tenant.metadata.deletion_timestamp.is_some()
+        || !tenant
+            .finalizers()
+            .iter()
+            .any(|value| value == TENANT_FINALIZER)
         || status.observed_generation != tenant.metadata.generation
         || status.phase != Some(TenantPhase::Ready)
         || !status
@@ -1195,6 +1215,7 @@ mod tests {
     fn tenant() -> Tenant {
         let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1));
         tenant.metadata.uid = Some("tenant-uid".into());
+        tenant.metadata.finalizers = Some(vec![TENANT_FINALIZER.into()]);
         tenant.metadata.generation = Some(2);
         tenant.status = Some(TenantStatus {
             observed_generation: Some(2),
@@ -1233,6 +1254,7 @@ mod tests {
         );
         catalog.metadata.namespace = Some("tenant-db-tenant-a".into());
         catalog.metadata.uid = Some(CATALOG.into());
+        catalog.metadata.finalizers = Some(vec![CATALOG_FINALIZER.into()]);
         catalog.metadata.resource_version = Some("10".into());
         catalog.metadata.generation = Some(2);
         catalog.metadata.owner_references = Some(vec![OwnerReference {
@@ -1826,6 +1848,59 @@ mod tests {
             (201, allowed()),
             (201, allowed()),
         ]
+    }
+
+    #[tokio::test]
+    async fn add_rejects_unprotected_live_catalog_and_namespace() {
+        for failure in ["tenant-finalizer", "catalog-finalizer", "namespace-owner"] {
+            let mut live = tenant();
+            let mut current_namespace = namespace();
+            let mut current_catalog = catalog();
+            match failure {
+                "tenant-finalizer" => live.metadata.finalizers = None,
+                "catalog-finalizer" => current_catalog.metadata.finalizers = None,
+                "namespace-owner" => {
+                    current_namespace["metadata"]["ownerReferences"] = json!([{
+                        "apiVersion":"v1", "kind":"Namespace", "name":"foreign", "uid":"foreign"
+                    }]);
+                }
+                _ => unreachable!(),
+            }
+            let mut responses = vec![(200, serde_json::to_value(&live).unwrap())];
+            if failure != "tenant-finalizer" {
+                responses.extend(approved_rollout());
+                responses.push((200, current_namespace));
+                if failure == "catalog-finalizer" {
+                    responses.push((200, serde_json::to_value(current_catalog).unwrap()));
+                }
+            }
+            let (client, calls) = scripted_client(responses);
+            let error = add(
+                &KubeDataSource::new(client),
+                &tenant(),
+                &DatabaseAddRequest {
+                    catalog_uid: CATALOG.into(),
+                    name: "alpha".into(),
+                    instances: 2,
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(
+                    error,
+                    SourceError::StaleIdentity | SourceError::DatabaseUnavailable { .. }
+                ),
+                "{failure}: {error:?}"
+            );
+            assert!(
+                calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(path, _)| !path.starts_with("PUT "))
+            );
+        }
     }
 
     #[tokio::test]

@@ -54,7 +54,6 @@ fn controller_rules(azure: bool) -> Vec<Value> {
             &["kamajicontrolplanes"],
             &["get"],
         ),
-        rule("", &["secrets"], &["get"]),
     ];
     if azure {
         rules.push(json!({
@@ -327,18 +326,12 @@ mod tests {
         }
         for role in [&local_role, &azure_role] {
             let rules = role["rules"].as_array().unwrap();
-            for (group, resource, verbs) in [
-                (
-                    "controlplane.cluster.x-k8s.io",
-                    "kamajicontrolplanes",
-                    json!(["get"]),
-                ),
-                ("", "secrets", json!(["get"])),
-            ] {
-                assert!(rules.iter().any(|r| r["apiGroups"] == json!([group])
-                    && r["resources"] == json!([resource])
-                    && r["verbs"] == verbs));
-            }
+            assert!(rules.iter().any(|r| {
+                r["apiGroups"] == json!(["controlplane.cluster.x-k8s.io"])
+                    && r["resources"] == json!(["kamajicontrolplanes"])
+                    && r["verbs"] == json!(["get"])
+            }));
+            assert!(rules.iter().all(|r| r["resources"] != json!(["secrets"])));
             assert!(rules.iter().all(|r| {
                 ![
                     "persistentvolumes",

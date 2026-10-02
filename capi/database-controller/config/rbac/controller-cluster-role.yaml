@@ -51,12 +51,6 @@ rules:
   - get
 - apiGroups:
   - ''
-  resources:
-  - secrets
-  verbs:
-  - get
-- apiGroups:
-  - ''
   resourceNames:
   - tenant-foundation
   resources:

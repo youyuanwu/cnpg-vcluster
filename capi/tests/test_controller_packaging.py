@@ -219,7 +219,7 @@ class PackagingTests(unittest.TestCase):
         for role in (local, azure):
             self.assertIn("kamajicontrolplanes", role)
             self.assertIn("clusters", role)
-            self.assertIn("secrets", role)
+            self.assertNotIn("  - secrets\n", role)
             self.assertIn("tenantdatabasecatalogs/status", role)
             self.assertNotIn("tenantdatabases\n", role)
             self.assertNotIn("resourcequotas", role)

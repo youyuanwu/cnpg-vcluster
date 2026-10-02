@@ -401,6 +401,10 @@ async fn drain_databases(client: Client, tenant: &Tenant) -> Result<bool, Reconc
         .status
         .as_ref()
         .and_then(status::catalog_create_outcome);
+    if prior.is_none() && recorded.is_none() && outcome != Some("Closed") {
+        status::close_catalog_creation_without_intent(client, tenant).await?;
+        return Ok(false);
+    }
     if prior.is_some() && (recorded.is_none() || outcome != Some("Observed")) {
         let observed = catalog_runtime::observe_catalog(
             client.clone(),

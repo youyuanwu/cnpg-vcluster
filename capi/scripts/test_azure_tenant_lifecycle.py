@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import base64
 import json
+import math
 import os
 import sys
 import tempfile
@@ -46,6 +47,7 @@ from scripts.lib.azure.proof import (
     prove_operator_deletion,
 )
 from scripts.lib.config import parse_duration
+from scripts.lib.files import ensure_private_dir
 from scripts.lib.kube import kubeconfig_json_request
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
@@ -197,7 +199,9 @@ def _tenant_kubectl(tenant: Mapping[str, object], *arguments: str):
         or hashlib.sha256(data).hexdigest() != bound["contentSha256"]
     ):
         raise RuntimeError("Azure Tenant kubeconfig identity changed")
-    with tempfile.TemporaryDirectory() as directory:
+    scratch = ROOT / ".runtime" / "azure-tenant-lifecycle"
+    ensure_private_dir(scratch)
+    with tempfile.TemporaryDirectory(dir=scratch) as directory:
         path = Path(directory) / "tenant.kubeconfig"
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "wb") as output:
@@ -427,6 +431,96 @@ def _ready_snapshot(
     return tenant, snapshot, owned
 
 
+def _require_runtime_identity(
+    spec, expected: Mapping[str, object], current: Mapping[str, object] | None,
+) -> Mapping[str, object]:
+    if not isinstance(current, dict):
+        raise RuntimeError("Azure database runtime Tenant disappeared or is invalid")
+    metadata = current.get("metadata")
+    previous = expected.get("metadata")
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(previous, dict)
+        or metadata.get("name") != spec.name
+        or not isinstance(previous.get("uid"), str)
+        or not previous["uid"]
+        or metadata.get("uid") != previous["uid"]
+        or metadata.get("deletionTimestamp")
+        or current.get("spec") != tenant_document(spec)["spec"]
+        or tenant_status(spec.name, current).classification != "ready"
+    ):
+        raise RuntimeError("Azure database runtime Tenant identity or readiness changed")
+    provider = _provider(current)
+    original = _provider(expected)
+    if any(
+        not isinstance(original.get(key), dict)
+        or not original[key]
+        or provider.get(key) != original[key]
+        for key in ("binding", "management", "kubeconfig")
+    ):
+        raise RuntimeError("Azure database runtime Tenant binding changed")
+    return current
+
+
+def _require_only_runtime_tenant(spec, expected: Mapping[str, object]) -> None:
+    inventory = json.loads(_kubectl(ROOT, "get", "tenants", "-o", "json").stdout)
+    if (
+        not isinstance(inventory, dict)
+        or inventory.get("kind") != "TenantList"
+        or not isinstance(inventory.get("metadata"), dict)
+        or inventory["metadata"].get("continue", "") != ""
+        or not isinstance(inventory.get("items"), list)
+        or len(inventory["items"]) != 1
+    ):
+        raise RuntimeError("Azure database runtime requires one complete Tenant inventory")
+    _require_runtime_identity(spec, expected, inventory["items"][0])
+
+
+def _remaining_runtime_seconds(deadline: float) -> int:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("Azure database runtime and capability timed out")
+    return math.ceil(remaining)
+
+
+def _install_database_runtime(
+    spec, tenant: Mapping[str, object], deadline: float,
+) -> None:
+    _remaining_runtime_seconds(deadline)
+    _require_only_runtime_tenant(spec, tenant)
+    attempt_seconds = min(420, _remaining_runtime_seconds(deadline))
+    run(
+        [
+            "timeout", "--kill-after=5s", f"{attempt_seconds}s",
+            "just", "azure-database-runtime-once",
+        ],
+        cwd=ROOT,
+        timeout=attempt_seconds + 15,
+    )
+    _require_only_runtime_tenant(spec, tenant)
+
+
+def _wait_database_capability(
+    spec, tenant: Mapping[str, object], deadline: float,
+) -> None:
+    def available() -> Mapping[str, object] | None:
+        current = _require_runtime_identity(
+            spec, tenant, read_tenant(ROOT, spec.name),
+        )
+        return (
+            current
+            if current.get("status", {}).get("databaseCapability", {}).get("available")
+            else None
+        )
+
+    wait_for(
+        "Azure catalog capability",
+        _remaining_runtime_seconds(deadline),
+        10,
+        available,
+    )
+
+
 def _wait_ready_snapshot(
     config: Mapping[str, str],
     spec,
@@ -551,15 +645,14 @@ def main(arguments: list[str]) -> int:
         "worker-identity-verification",
         lambda: _ready_snapshot(config, spec),
     )
-    wait_for(
-        "Azure catalog capability", parse_duration(config["AZURE_TENANT_TIMEOUT"]), 10,
-        lambda: (
-            current if (
-                (current := read_tenant(ROOT, spec.name))
-                and current.get("metadata", {}).get("uid") == tenant["metadata"]["uid"]
-                and current.get("status", {}).get("databaseCapability", {}).get("available")
-            ) else None
-        ),
+    runtime_deadline = time.monotonic() + parse_duration(config["AZURE_TENANT_TIMEOUT"])
+    phase(
+        "database-runtime-install",
+        lambda: _install_database_runtime(spec, tenant, runtime_deadline),
+    )
+    phase(
+        "database-capability-readiness",
+        lambda: _wait_database_capability(spec, tenant, runtime_deadline),
     )
     catalog = _catalog_client(spec.name, tenant["metadata"]["uid"])
     initial = phase("empty-catalog", catalog.read)

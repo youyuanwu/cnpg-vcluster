@@ -785,7 +785,9 @@ def check_repository_boundaries() -> None:
         "Azure public deletion must not persist or perform external proof",
     )
     check(
-        ".runtime" not in gate_source
+        gate_source.count('ROOT / ".runtime" / "azure-tenant-lifecycle"') == 1
+        and "tempfile.TemporaryDirectory(dir=scratch)" in gate_source
+        and ".runtime/azure-gate" not in gate_source
         and "write_private_file" not in gate_source
         and "_incomplete_gate" not in gate_source
         and "_load_checkpoint" not in gate_source,
