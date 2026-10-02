@@ -2,9 +2,13 @@ from __future__ import annotations
 
 import base64
 import hashlib
+import select
+import subprocess
 import tempfile
+import urllib.parse
 import uuid
 from collections.abc import Callable
+from contextlib import contextmanager
 
 from .common import *
 from scripts.lib.admin import (
@@ -87,6 +91,90 @@ DATABASE_DISK_ACTIONS = {
 DATABASE_SERVICE_ACCOUNT = "system:serviceaccount:tenant-system:database-controller"
 
 
+@contextmanager
+def _azure_tenant_api_tunnel(
+    root: Path,
+    namespace: str,
+    service: str,
+    kubeconfig: Path,
+    expected_endpoint: str,
+):
+    rendered = json.loads(run(
+        [
+            str(root / ".tools" / "bin" / "kubectl"),
+            "--kubeconfig", str(kubeconfig),
+            "config", "view", "--raw", "--flatten", "--minify", "-o", "json",
+        ],
+        timeout=30,
+    ).stdout)
+    contexts = rendered.get("contexts")
+    clusters = rendered.get("clusters")
+    if (
+        not isinstance(contexts, list) or len(contexts) != 1
+        or not isinstance(clusters, list) or len(clusters) != 1
+        or not isinstance(contexts[0], dict)
+        or not isinstance(contexts[0].get("context"), dict)
+        or not isinstance(clusters[0], dict)
+        or not isinstance(clusters[0].get("cluster"), dict)
+        or not isinstance(contexts[0]["context"].get("cluster"), str)
+        or not isinstance(clusters[0].get("name"), str)
+        or contexts[0]["context"].get("cluster") != clusters[0].get("name")
+    ):
+        raise RuntimeError("Azure Tenant kubeconfig cluster identity is invalid")
+    cluster_name = clusters[0]["name"]
+    server = clusters[0]["cluster"].get("server")
+    parsed = urllib.parse.urlparse(server if isinstance(server, str) else "")
+    if (
+        parsed.scheme != "https"
+        or not parsed.hostname
+        or parsed.port is None
+        or f"{parsed.hostname}:{parsed.port}" != expected_endpoint
+    ):
+        raise RuntimeError("Azure Tenant kubeconfig endpoint changed")
+    process = subprocess.Popen(
+        [
+            str(root / ".tools" / "bin" / "kubectl"),
+            "--kubeconfig", str(_management_kubeconfig(root)),
+            "-n", namespace,
+            "port-forward", "--address=127.0.0.1",
+            f"service/{service}", ":6443",
+        ],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        if process.stdout is None or not select.select(
+            [process.stdout], [], [], 30,
+        )[0]:
+            raise RuntimeError("Azure Tenant API tunnel did not become ready")
+        started = process.stdout.readline().strip()
+        match = re.fullmatch(
+            r"Forwarding from 127[.]0[.]0[.]1:(\d+) -> 6443",
+            started,
+        )
+        if not match or process.poll() is not None:
+            raise RuntimeError("Azure Tenant API tunnel did not become ready")
+        run(
+            [
+                str(root / ".tools" / "bin" / "kubectl"),
+                "--kubeconfig", str(kubeconfig),
+                "config", "set-cluster", cluster_name,
+                f"--server=https://127.0.0.1:{match[1]}",
+                f"--tls-server-name={parsed.hostname}",
+            ],
+            timeout=30,
+        )
+        yield
+    finally:
+        process.terminate()
+        try:
+            process.communicate(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.communicate()
+
+
 def install_tenant_database_runtime(
     root: Path, config: Mapping[str, str], tenant_name: str,
 ) -> bool:
@@ -101,6 +189,8 @@ def install_tenant_database_runtime(
         provider = status.get("provider", {})
         management = provider.get("management", {})
         bound = provider.get("kubeconfig", {})
+        endpoint = provider.get("endpoint")
+        resources = provider.get("providerResources")
         if (
             metadata.get("name") != tenant_name
             or not metadata.get("uid")
@@ -112,6 +202,9 @@ def install_tenant_database_runtime(
             or not (management.get("clusterUID") or management.get("kamajiControlPlaneUID"))
             or not bound.get("secretUID")
             or not bound.get("contentSha256")
+            or not isinstance(endpoint, str)
+            or not endpoint
+            or not isinstance(resources, list)
         ):
             raise RuntimeError(f"Azure Tenant {tenant_name} is not ready for database install")
         namespace = json.loads(
@@ -152,10 +245,28 @@ def install_tenant_database_runtime(
             raise RuntimeError("Azure database installer kubeconfig is invalid") from exc
         if not content or hashlib.sha256(content).hexdigest() != bound["contentSha256"]:
             raise RuntimeError("Azure database installer kubeconfig digest changed")
-        return metadata, content
+        service_identities = [
+            item for item in resources
+            if isinstance(item, dict)
+            and item.get("apiVersion") == "v1"
+            and item.get("kind") == "Service"
+            and item.get("namespace") == tenant_name
+            and item.get("name") == tenant_name
+        ]
+        service = json.loads(_kubectl(
+            root, "-n", tenant_name, "get", f"service/{tenant_name}", "-o", "json",
+        ).stdout)
+        if (
+            len(service_identities) != 1
+            or not isinstance(service_identities[0].get("uid"), str)
+            or service.get("metadata", {}).get("uid") != service_identities[0]["uid"]
+            or service.get("metadata", {}).get("deletionTimestamp")
+        ):
+            raise RuntimeError("Azure database installer API Service identity changed")
+        return metadata, content, endpoint, service_identities[0]["uid"]
 
     try:
-        identity, content = current()
+        identity, content, endpoint, service_uid = current()
     except RuntimeError as exc:
         if str(exc) == f"Azure Tenant {tenant_name} is not ready for database install":
             return False
@@ -168,13 +279,25 @@ def install_tenant_database_runtime(
         write_private_file(kubeconfig, content)
 
         def require_current() -> None:
-            latest, latest_content = current()
-            if latest["uid"] != identity["uid"] or latest_content != content:
+            latest, latest_content, latest_endpoint, latest_service_uid = current()
+            if (
+                latest["uid"] != identity["uid"]
+                or latest_content != content
+                or latest_endpoint != endpoint
+                or latest_service_uid != service_uid
+            ):
                 raise RuntimeError("Azure database installer Tenant identity changed")
 
-        install_azure_database_runtime(
-            root, dict(config), kubeconfig, require_current=require_current,
-        )
+        with _azure_tenant_api_tunnel(
+            root,
+            tenant_name,
+            tenant_name,
+            kubeconfig,
+            endpoint,
+        ):
+            install_azure_database_runtime(
+                root, dict(config), kubeconfig, require_current=require_current,
+            )
     return True
 
 

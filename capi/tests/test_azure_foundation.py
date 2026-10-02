@@ -10,7 +10,7 @@ import subprocess
 import sys
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
@@ -113,10 +113,18 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     "type": "azure",
                     "binding": {"tenantUID": "tenant-uid"},
                     "management": {"namespaceUID": "ns-uid", "clusterUID": "cluster-uid"},
+                    "endpoint": "10.220.0.6:6443",
                     "kubeconfig": {
                         "secretUID": "secret-uid",
                         "contentSha256": hashlib.sha256(content).hexdigest(),
                     },
+                    "providerResources": [{
+                        "apiVersion": "v1",
+                        "kind": "Service",
+                        "namespace": tenant_name,
+                        "name": tenant_name,
+                        "uid": "service-uid",
+                    }],
                 },
             },
         }
@@ -140,6 +148,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return completed(json.dumps({"metadata": {"uid": "ns-uid"}}))
             if f"secret/{tenant_name}-kubeconfig" in args:
                 return completed(json.dumps(secret))
+            if f"service/{tenant_name}" in args:
+                return completed(json.dumps({
+                    "metadata": {"uid": "service-uid"},
+                }))
             raise AssertionError(args)
 
         failures = [RuntimeError("cnpg unavailable"), None]
@@ -153,6 +165,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
 
         with (
             patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            patch(
+                "scripts.lib.azure.foundation._azure_tenant_api_tunnel",
+                side_effect=lambda *_args: nullcontext(),
+            ),
             patch("scripts.lib.azure.foundation.install_azure_database_runtime",
                   side_effect=install) as installer,
         ):
