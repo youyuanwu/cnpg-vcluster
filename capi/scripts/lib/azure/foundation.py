@@ -1579,14 +1579,99 @@ def _verify_azure_controller_allocation_readiness(
         raise RuntimeError("Azure Tenant controller leader Lease is not active")
 
 
+def _azure_bootstrap_resume_images(
+    root: Path,
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> tuple[str, str] | None:
+    path = _azure_runtime_path(root) / "catalog-bootstrap-probe.json"
+    if not path.exists():
+        return None
+    try:
+        record = json.loads(read_private_file(path))
+    except ValueError as exc:
+        raise RuntimeError("Azure bootstrap recovery record is invalid") from exc
+    tenant = _get_management_resource(
+        root,
+        None,
+        "tenant/catalog-bootstrap-probe",
+    )
+    metadata = tenant.get("metadata") if isinstance(tenant, dict) else None
+    provider = tenant.get("status", {}).get("provider") if isinstance(tenant, dict) else None
+    binding = provider.get("binding") if isinstance(provider, dict) else None
+    if (
+        not isinstance(record, dict)
+        or record.get("schema") != 1
+        or record.get("provider") != "azure"
+        or not isinstance(record.get("uid"), str)
+        or not isinstance(record.get("token"), str)
+        or not isinstance(metadata, dict)
+        or metadata.get("uid") != record["uid"]
+        or metadata.get("annotations", {}).get(
+            "tenancy.cnpg-vcluster.io/catalog-bootstrap-token"
+        ) != record["token"]
+        or not isinstance(binding, dict)
+    ):
+        raise RuntimeError("Azure bootstrap recovery identity changed")
+    controller_image = binding.get("controllerImage")
+    provider_sha256 = binding.get("providerConfigSha256")
+    if (
+        not isinstance(controller_image, str)
+        or re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", controller_image) is None
+        or not isinstance(provider_sha256, str)
+        or len(provider_sha256) != 64
+    ):
+        raise RuntimeError("Azure bootstrap controller binding is invalid")
+    expected = _azure_provider_configuration(
+        config,
+        inventory,
+        controller_image,
+    )
+    canonical = hashlib.sha256(json.dumps(
+        expected,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()).hexdigest()
+    if canonical != provider_sha256:
+        raise RuntimeError(
+            "Azure provider configuration changed during bootstrap recovery"
+        )
+    deployment = _get_management_resource(
+        root,
+        "tenant-system",
+        "deployment/database-controller",
+    )
+    containers = (
+        deployment.get("spec", {}).get("template", {}).get("spec", {}).get("containers")
+        if isinstance(deployment, dict)
+        else None
+    )
+    managers = [
+        container for container in containers or []
+        if isinstance(container, dict) and container.get("name") == "manager"
+    ]
+    database_image = managers[0].get("image") if len(managers) == 1 else None
+    if (
+        not isinstance(database_image, str)
+        or re.fullmatch(r"[^@\s]+@sha256:[0-9a-f]{64}", database_image) is None
+        or deployment.get("metadata", {}).get("deletionTimestamp")
+    ):
+        raise RuntimeError("Azure bootstrap database-controller image is invalid")
+    return controller_image, database_image
+
+
 def _install_tenant_controller(
     root: Path,
     config: Mapping[str, str],
     inventory: Mapping[str, object],
 ) -> tuple[str, str, str]:
     require_tenant_api_cutover_ready()
-    image = _push_controller_image(root, config, inventory)
-    database_image = _push_database_controller_image(root, config, inventory)
+    resume_images = _azure_bootstrap_resume_images(root, config, inventory)
+    if resume_images is None:
+        image = _push_controller_image(root, config, inventory)
+        database_image = _push_database_controller_image(root, config, inventory)
+    else:
+        image, database_image = resume_images
     provider_config = _azure_provider_configuration(config, inventory, image)
     _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(root, config)
     cutover_locked = _prepare_azure_tenant_api_cutover(root, config)

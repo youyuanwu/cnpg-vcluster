@@ -30,6 +30,7 @@ from scripts.lib.azure.foundation import (
     TENANT_CONTROLLER_CONFIG,
     TENANT_CONTROLLER_CONFIG_KEY,
     _azure_provider_configuration,
+    _azure_bootstrap_resume_images,
     _azure_allocation_configuration,
     _azure_cutover_lock,
     _azure_cutover_inventory,
@@ -1093,6 +1094,67 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "controller inventory"):
             _foundation_identity(broken)
+
+    def test_bootstrap_resume_reuses_recorded_controller_images(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        controller_image = inventory["controllerImage"]
+        database_image = (
+            "yycvacr.azurecr.io/database-controller@sha256:" + "2" * 64
+        )
+        provider = _azure_provider_configuration(
+            config,
+            inventory,
+            controller_image,
+        )
+        provider_sha256 = hashlib.sha256(json.dumps(
+            provider,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()).hexdigest()
+        runtime = root / ".runtime" / "azure"
+        runtime.parent.mkdir()
+        runtime.parent.chmod(0o700)
+        runtime.mkdir()
+        runtime.chmod(0o700)
+        write_private_file(
+            runtime / "catalog-bootstrap-probe.json",
+            json.dumps({
+                "schema": 1,
+                "provider": "azure",
+                "uid": "tenant-uid",
+                "token": "a" * 32,
+            }),
+        )
+        tenant = {
+            "metadata": {
+                "uid": "tenant-uid",
+                "annotations": {
+                    "tenancy.cnpg-vcluster.io/catalog-bootstrap-token": "a" * 32,
+                },
+            },
+            "status": {"provider": {"binding": {
+                "controllerImage": controller_image,
+                "providerConfigSha256": provider_sha256,
+            }}},
+        }
+        deployment = {
+            "metadata": {},
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "manager",
+                "image": database_image,
+            }]}}},
+        }
+        with patch(
+            "scripts.lib.azure.foundation._get_management_resource",
+            side_effect=[tenant, deployment],
+        ):
+            self.assertEqual(
+                (controller_image, database_image),
+                _azure_bootstrap_resume_images(root, config, inventory),
+            )
+
     def test_foundation_health_fails_closed_on_acr_or_pull_role_drift(self):
         root = self.make_root()
         config = load_azure_configuration(root)
