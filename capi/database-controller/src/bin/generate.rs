@@ -126,7 +126,9 @@ fn deployment(local: bool) -> Value {
         "apiVersion": "apps/v1", "kind": "Deployment",
         "metadata": {"name": "database-controller", "namespace": "tenant-system"},
         "spec": {
-            "replicas": 1, "strategy": {"type": "Recreate"},
+            "replicas": 1,
+            "progressDeadlineSeconds": 1800,
+            "strategy": {"type": "Recreate"},
             "selector": {"matchLabels": {"app": "database-controller"}},
             "template": {
                 "metadata": {"labels": if local {
@@ -371,6 +373,7 @@ mod tests {
             deployment["spec"]["template"]["spec"]["serviceAccountName"],
             "database-controller"
         );
+        assert_eq!(deployment["spec"]["progressDeadlineSeconds"], 1800);
         assert_eq!(
             deployment["spec"]["template"]["spec"]["containers"][0]["readinessProbe"]["httpGet"]["path"],
             "/readyz"

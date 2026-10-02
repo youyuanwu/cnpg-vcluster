@@ -5,6 +5,7 @@ metadata:
   name: database-controller
   namespace: tenant-system
 spec:
+  progressDeadlineSeconds: 1800
   replicas: 1
   selector:
     matchLabels:
