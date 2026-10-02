@@ -9,6 +9,7 @@ use kube::{
 };
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
+use tenant_database_runtime::catalog_runtime::{CREDENTIAL_ROLE, TENANT_UID};
 
 use crate::{
     allocation::AllocationError,
@@ -1169,6 +1170,56 @@ fn azure_workload_ready(object: &DynamicObject) -> bool {
         == Some(desired)
 }
 
+fn catalog_credential_rbac(
+    object: &DynamicObject,
+    tenant: &str,
+    tenant_uid: &str,
+) -> Result<bool, ReconcileError> {
+    let Some(types) = object.types.as_ref() else {
+        return Ok(false);
+    };
+    if !matches!(types.kind.as_str(), "Role" | "RoleBinding")
+        || object.name_any() != CREDENTIAL_ROLE
+    {
+        return Ok(false);
+    }
+    if object.namespace().as_deref() != Some(tenant)
+        || object.labels().get(TENANT_UID).map(String::as_str) != Some(tenant_uid)
+        || object.metadata.deletion_timestamp.is_some()
+        || object.uid().is_none_or(|uid| uid.is_empty())
+        || !object.owner_references().is_empty()
+    {
+        return Err(ownership("Azure catalog credential RBAC identity changed"));
+    }
+    let valid = if types.kind == "Role" {
+        object.data.get("rules")
+            == Some(&json!([{
+                "apiGroups":[""],
+                "resourceNames":[format!("{tenant}-admin-kubeconfig")],
+                "resources":["secrets"],
+                "verbs":["get"],
+            }]))
+    } else {
+        object.data.get("roleRef")
+            == Some(&json!({
+                "apiGroup":"rbac.authorization.k8s.io",
+                "kind":"Role",
+                "name":CREDENTIAL_ROLE,
+            }))
+            && object.data.get("subjects")
+                == Some(&json!([
+                    {"kind":"ServiceAccount","name":"tenant-admin","namespace":"tenant-system"},
+                    {"kind":"ServiceAccount","name":"database-controller","namespace":"tenant-system"},
+                ]))
+    };
+    if !valid {
+        return Err(ownership(
+            "Azure catalog credential RBAC permissions changed",
+        ));
+    }
+    Ok(true)
+}
+
 async fn observe_provider_resources(
     client: Client,
     binding: &AzureBindingStatus,
@@ -1184,13 +1235,21 @@ async fn observe_provider_resources(
         }
         inventory.extend(super::azure_finalize::list(client.clone(), tenant, definition).await?);
     }
+    let mut catalog_rbac_uids = BTreeSet::new();
+    for object in &inventory {
+        if catalog_credential_rbac(object, tenant, &binding.tenant_uid)? {
+            catalog_rbac_uids.insert(object.uid().expect("validated catalog RBAC UID"));
+        }
+    }
     let explicit_uids: BTreeSet<_> = management_status
         .recorded_uids()
         .into_iter()
         .map(str::to_owned)
         .collect();
     inventory.retain(|object| {
-        !object.uid().is_some_and(|uid| explicit_uids.contains(&uid))
+        !object
+            .uid()
+            .is_some_and(|uid| explicit_uids.contains(&uid) || catalog_rbac_uids.contains(&uid))
             && !(object
                 .types
                 .as_ref()
@@ -1409,6 +1468,52 @@ fn bounded_set<T: Ord>(before: BTreeSet<T>, after: BTreeSet<T>, limit: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn catalog_credential_rbac_is_excluded_only_with_exact_permissions() {
+        let role: DynamicObject = serde_json::from_value(json!({
+            "apiVersion":"rbac.authorization.k8s.io/v1",
+            "kind":"Role",
+            "metadata":{
+                "name":CREDENTIAL_ROLE,
+                "namespace":"tenant-a",
+                "uid":"role-uid",
+                "labels":{TENANT_UID:"tenant-uid"},
+            },
+            "rules":[{
+                "apiGroups":[""],
+                "resourceNames":["tenant-a-admin-kubeconfig"],
+                "resources":["secrets"],
+                "verbs":["get"],
+            }],
+        }))
+        .unwrap();
+        let binding: DynamicObject = serde_json::from_value(json!({
+            "apiVersion":"rbac.authorization.k8s.io/v1",
+            "kind":"RoleBinding",
+            "metadata":{
+                "name":CREDENTIAL_ROLE,
+                "namespace":"tenant-a",
+                "uid":"binding-uid",
+                "labels":{TENANT_UID:"tenant-uid"},
+            },
+            "roleRef":{
+                "apiGroup":"rbac.authorization.k8s.io",
+                "kind":"Role",
+                "name":CREDENTIAL_ROLE,
+            },
+            "subjects":[
+                {"kind":"ServiceAccount","name":"tenant-admin","namespace":"tenant-system"},
+                {"kind":"ServiceAccount","name":"database-controller","namespace":"tenant-system"},
+            ],
+        }))
+        .unwrap();
+        assert!(catalog_credential_rbac(&role, "tenant-a", "tenant-uid").unwrap());
+        assert!(catalog_credential_rbac(&binding, "tenant-a", "tenant-uid").unwrap());
+        let mut broadened = role;
+        broadened.data["rules"][0]["verbs"] = json!(["get", "list"]);
+        assert!(catalog_credential_rbac(&broadened, "tenant-a", "tenant-uid",).is_err());
+    }
 
     #[test]
     fn operation_identity_is_stable_and_uid_bound() {
