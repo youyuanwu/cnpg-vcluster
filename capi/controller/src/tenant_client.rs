@@ -173,7 +173,7 @@ fn parse_owned_kubeconfig_with_owner(
     let control_plane_matches = MANAGEMENT_RESOURCES
         .iter()
         .chain(AZURE_MANAGEMENT_RESOURCES)
-        .filter(|resource| matches!(resource.kind, "KamajiControlPlane" | "TenantControlPlane"))
+        .filter(|resource| resource.kind == "KamajiControlPlane")
         .any(|resource| {
             control_plane.types.as_ref().is_some_and(|types| {
                 types.kind == resource.kind && types.api_version == resource.api_version
@@ -399,7 +399,7 @@ pub async fn load_tenant_client_with_owner(
     .await
 }
 
-pub async fn load_tenant_client_with_owner_named(
+async fn load_tenant_client_with_owner_named(
     management: Client,
     control_plane: &DynamicObject,
     alternate_owner: Option<&DynamicObject>,

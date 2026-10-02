@@ -25,7 +25,7 @@ use tenant_controller::{
         AzureProviderStatus, FINALIZER as TENANT_FINALIZER, Tenant, TenantPhase, TenantProviderSpec,
     },
     management::{AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES},
-    tenant_client::load_tenant_client_with_owner_named,
+    tenant_client::load_tenant_client_with_owner,
 };
 use tenant_database_controller::{
     api::{
@@ -604,15 +604,9 @@ async fn tenant_client(source: &KubeDataSource, tenant: &Tenant) -> Result<Clien
     let resources = source.list_management_resources(mode, name).await?;
     let cluster = management_object(&resources, name, "Cluster", azure)?;
     let plane = management_object(&resources, name, "KamajiControlPlane", azure)?;
-    let credential_plane = if azure {
-        management_object(&resources, name, "TenantControlPlane", true)?
-    } else {
-        plane
-    };
     if azure {
         if !is_accepted_azure_management_resource(tenant, &resources, cluster)
             || !is_accepted_azure_management_resource(tenant, &resources, plane)
-            || !is_accepted_azure_management_resource(tenant, &resources, credential_plane)
         {
             return Err(SourceError::StaleIdentity);
         }
@@ -659,19 +653,13 @@ async fn tenant_client(source: &KubeDataSource, tenant: &Tenant) -> Result<Clien
         .map_err(read_error)?
         .ok_or_else(unavailable)?;
     validated_credential_rbac(&role, &binding, tenant)?;
-    let secret_name = if azure {
-        format!("{name}-admin-kubeconfig")
-    } else {
-        format!("{name}-kubeconfig")
-    };
-    let (client, secret) = load_tenant_client_with_owner_named(
+    let (client, secret) = load_tenant_client_with_owner(
         source.client.clone(),
-        credential_plane,
+        plane,
         if azure { Some(cluster) } else { None },
         name,
         name,
         &endpoint,
-        &secret_name,
     )
     .await
     .map_err(|error| {

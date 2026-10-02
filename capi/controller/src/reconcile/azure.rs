@@ -361,7 +361,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             match tenant_database_runtime::azure_runtime::observe(tenant_client).await
             {
                 Ok("Ready") => match tenant_database_runtime::catalog_runtime::ensure_credentials(
-                    self.client.clone(), &name, &tenant_uid, true,
+                    self.client.clone(), &name, &tenant_uid,
                 ).await {
                     Ok(()) if catalog_valid => "Ready",
                     Ok(()) => "CatalogNotReady",
@@ -1195,7 +1195,7 @@ fn catalog_credential_rbac(
         object.data.get("rules")
             == Some(&json!([{
                 "apiGroups":[""],
-                "resourceNames":[format!("{tenant}-admin-kubeconfig")],
+                "resourceNames":[format!("{tenant}-kubeconfig")],
                 "resources":["secrets"],
                 "verbs":["get"],
             }]))
@@ -1482,7 +1482,7 @@ mod tests {
             },
             "rules":[{
                 "apiGroups":[""],
-                "resourceNames":["tenant-a-admin-kubeconfig"],
+                "resourceNames":["tenant-a-kubeconfig"],
                 "resources":["secrets"],
                 "verbs":["get"],
             }],
