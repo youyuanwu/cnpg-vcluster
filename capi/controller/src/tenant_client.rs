@@ -145,6 +145,11 @@ pub fn parse_owned_kubeconfig(
     tenant_name: &str,
     endpoint: &str,
 ) -> Result<Kubeconfig, TenantClientError> {
+    let secret_name = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == "Secret")
+        .and_then(|resource| resource.expected_name(tenant_name))
+        .expect("Secret has a declared name");
     parse_owned_kubeconfig_with_owner(
         secret,
         control_plane,
@@ -152,6 +157,7 @@ pub fn parse_owned_kubeconfig(
         namespace,
         tenant_name,
         endpoint,
+        &secret_name,
     )
 }
 
@@ -162,11 +168,8 @@ fn parse_owned_kubeconfig_with_owner(
     namespace: &str,
     tenant_name: &str,
     endpoint: &str,
+    secret_name: &str,
 ) -> Result<Kubeconfig, TenantClientError> {
-    let secret_definition = MANAGEMENT_RESOURCES
-        .iter()
-        .find(|resource| resource.kind == "Secret")
-        .expect("Secret is catalogued");
     let control_plane_matches = MANAGEMENT_RESOURCES
         .iter()
         .chain(AZURE_MANAGEMENT_RESOURCES)
@@ -178,7 +181,8 @@ fn parse_owned_kubeconfig_with_owner(
         });
     if namespace.is_empty()
         || tenant_name.is_empty()
-        || secret.metadata.name != secret_definition.expected_name(tenant_name)
+        || secret_name.is_empty()
+        || secret.metadata.name.as_deref() != Some(secret_name)
         || secret.metadata.namespace.as_deref() != Some(namespace)
         || secret.metadata.uid.as_deref().is_none_or(str::is_empty)
     {
@@ -419,6 +423,7 @@ pub async fn load_tenant_client_with_owner_named(
         namespace,
         tenant_name,
         endpoint,
+        secret_name,
     )?;
     let mut config = Config::from_custom_kubeconfig(configuration, &KubeConfigOptions::default())
         .await
