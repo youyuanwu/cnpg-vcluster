@@ -23,6 +23,7 @@ fn inventory(azure: bool) -> Value {
         json!({"group": "", "version": "v1", "kind": "Secret", "resource": "secrets", "scope": "Namespaced"}),
     ];
     if azure {
+        resources.push(json!({"group": "kamaji.clastix.io", "version": "v1alpha1", "kind": "TenantControlPlane", "resource": "tenantcontrolplanes", "scope": "Namespaced"}));
         resources.push(json!({"group": "compute.azure.com", "version": "v1api20240302", "kind": "Disk", "resource": "disks", "scope": "Namespaced"}));
     } else {
         resources.push(json!({"group": "", "version": "v1", "kind": "ConfigMap", "resource": "configmaps", "scope": "Namespaced"}));
@@ -56,6 +57,11 @@ fn controller_rules(azure: bool) -> Vec<Value> {
         ),
     ];
     if azure {
+        rules.push(rule(
+            "kamaji.clastix.io",
+            &["tenantcontrolplanes"],
+            &["get"],
+        ));
         rules.push(json!({
             "apiGroups": [""], "resources": ["configmaps"],
             "resourceNames": ["tenant-azure-provider"], "verbs": ["get"]
@@ -282,8 +288,9 @@ mod tests {
         let azure: Value =
             serde_json::from_slice(find(&artifacts, "azure-management-resources.json")).unwrap();
         assert_eq!(local.as_array().unwrap().len(), 7);
-        assert_eq!(azure.as_array().unwrap().len(), 7);
-        assert_eq!(azure[6]["resource"], "disks");
+        assert_eq!(azure.as_array().unwrap().len(), 8);
+        assert_eq!(azure[6]["resource"], "tenantcontrolplanes");
+        assert_eq!(azure[7]["resource"], "disks");
         assert_eq!(local[4]["version"], "v1alpha2");
         assert_eq!(azure[4]["version"], "v1alpha1");
         assert_eq!(local[6]["resource"], "configmaps");
@@ -352,6 +359,11 @@ mod tests {
         assert!(azure_role["rules"].as_array().unwrap().iter().any(|r| {
             r["resources"] == json!(["configmaps"])
                 && r["resourceNames"] == json!(["tenant-azure-provider"])
+                && r["verbs"] == json!(["get"])
+        }));
+        assert!(azure_role["rules"].as_array().unwrap().iter().any(|r| {
+            r["apiGroups"] == json!(["kamaji.clastix.io"])
+                && r["resources"] == json!(["tenantcontrolplanes"])
                 && r["verbs"] == json!(["get"])
         }));
         assert!(
