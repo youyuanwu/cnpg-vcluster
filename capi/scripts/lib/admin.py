@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import stat
+from collections.abc import Callable
 from pathlib import Path
 
 from scripts import generate_admin_resources as admin_resource_generator
@@ -256,6 +257,7 @@ def validate_admin_effective_rules(
     provider: str,
     review: object,
     namespace: str,
+    fetch_credential_resource: Callable[[str, str], object] | None = None,
 ) -> None:
     if not isinstance(review, dict):
         raise RuntimeError("Tenant Admin effective RBAC review is invalid")
@@ -321,10 +323,31 @@ def validate_admin_effective_rules(
             group == "apps"
             and resource == "deployments"
             and verb == "get"
-            and resource_name == "tenant-controller"
+            and resource_name in {"tenant-controller", "database-controller"}
+        )
+        catalog_intent = (
+            group == "tenancy.cnpg-vcluster.io"
+            and resource == "tenantdatabasecatalogs"
+            and verb in {"get", "update"}
+            and resource_name is None
+        )
+        credential_read = (
+            group == "rbac.authorization.k8s.io"
+            and resource in {"roles", "rolebindings"}
+            and verb == "get"
+            and resource_name == "tenant-database-credentials"
+        )
+        cutover_read = (
+            group == "admissionregistration.k8s.io"
+            and resource in {
+                "validatingadmissionpolicies",
+                "validatingadmissionpolicybindings",
+            }
+            and verb == "get"
+            and resource_name == "tenant-database-catalog-cutover-create-lock"
         )
         ordinary_read = verb in {"get", "list"} and resource_name is None
-        if not (tenant_mutation or controller_read or ordinary_read):
+        if not (tenant_mutation or controller_read or catalog_intent or credential_read or cutover_read or ordinary_read):
             raise RuntimeError(
                 "Tenant Admin generated ClusterRole exceeds lifecycle authority"
             )
@@ -332,6 +355,36 @@ def validate_admin_effective_rules(
         status.get("resourceRules"),
         "effective RBAC",
     )
+    secret_rules = {atom for atom in actual if atom[1] == "secrets"}
+    if secret_rules:
+        secret_name = (
+            f"{namespace}-admin-kubeconfig"
+            if provider == "azure"
+            else f"{namespace}-kubeconfig"
+        )
+        expected_secret = {("", "secrets", "get", secret_name)}
+        if (
+            namespace == ADMIN_NAMESPACE
+            or secret_rules != expected_secret
+            or fetch_credential_resource is None
+        ):
+            raise RuntimeError("Tenant Admin effective RBAC includes unbound Secret access")
+        try:
+            namespace_object = fetch_credential_resource(namespace, f"namespace/{namespace}")
+            role = fetch_credential_resource(
+                namespace, "role/tenant-database-credentials"
+            )
+            binding = fetch_credential_resource(
+                namespace, "rolebinding/tenant-database-credentials"
+            )
+            validate_admin_credential_scope(
+                provider, namespace, namespace_object, role, binding
+            )
+        except (ValueError, KeyError, TypeError) as exc:
+            raise RuntimeError(
+                "Tenant Admin effective RBAC credential identity is invalid"
+            ) from exc
+        expected.update(expected_secret)
     missing = expected - actual
     extra = actual - expected - _DEFAULT_EFFECTIVE_RESOURCE_PERMISSIONS
     if missing or extra:
@@ -357,6 +410,79 @@ def validate_admin_effective_rules(
             raise RuntimeError(
                 "Tenant Admin effective non-resource RBAC is broader than discovery"
             )
+
+
+def validate_admin_credential_scope(
+    provider: str,
+    namespace: str,
+    namespace_object: object,
+    role: object,
+    binding: object,
+) -> None:
+    if not all(isinstance(value, dict) for value in (namespace_object, role, binding)):
+        raise RuntimeError("Tenant Admin effective RBAC credential identity is invalid")
+    namespace_meta = namespace_object.get("metadata")
+    if not isinstance(namespace_meta, dict):
+        raise RuntimeError("Tenant Admin effective RBAC credential identity is invalid")
+    annotations = namespace_meta.get("annotations")
+    tenant_uid = (
+        annotations.get("tenancy.cnpg-vcluster.io/tenant-uid")
+        if isinstance(annotations, dict)
+        else None
+    )
+    if (
+        namespace_object.get("kind") != "Namespace"
+        or namespace_meta.get("name") != namespace
+        or not isinstance(namespace_meta.get("uid"), str)
+        or not namespace_meta["uid"]
+        or not isinstance(tenant_uid, str)
+        or not tenant_uid
+        or annotations.get("tenancy.cnpg-vcluster.io/tenant") != namespace
+        or namespace_meta.get("deletionTimestamp")
+        or namespace_meta.get("ownerReferences")
+    ):
+        raise RuntimeError("Tenant Admin effective RBAC credential identity is invalid")
+    for resource, kind in ((role, "Role"), (binding, "RoleBinding")):
+        meta = resource.get("metadata")
+        if (
+            resource.get("kind") != kind
+            or not isinstance(meta, dict)
+            or meta.get("name") != "tenant-database-credentials"
+            or meta.get("namespace") != namespace
+            or not isinstance(meta.get("uid"), str)
+            or not meta["uid"]
+            or meta.get("deletionTimestamp")
+            or meta.get("ownerReferences")
+            or not isinstance(meta.get("labels"), dict)
+            or meta["labels"].get("tenancy.cnpg-vcluster.io/tenant-uid")
+            != tenant_uid
+        ):
+            raise RuntimeError("Tenant Admin effective RBAC credential identity is invalid")
+    if (
+        role.get("rules")
+        != [{
+            "apiGroups": [""],
+            "resources": ["secrets"],
+            "resourceNames": [
+                f"{namespace}-admin-kubeconfig"
+                if provider == "azure"
+                else f"{namespace}-kubeconfig"
+            ],
+            "verbs": ["get"],
+        }]
+        or binding.get("roleRef")
+        != {
+            "apiGroup": "rbac.authorization.k8s.io",
+            "kind": "Role",
+            "name": "tenant-database-credentials",
+        }
+        or binding.get("subjects")
+        != [
+            {"kind": "ServiceAccount", "name": name, "namespace": ADMIN_NAMESPACE}
+            for name in ("tenant-admin", "database-controller")
+        ]
+    ):
+        raise RuntimeError("Tenant Admin effective RBAC credential identity is invalid")
 
 
 def test_admin(root: Path, config: dict[str, str]) -> None:
@@ -757,10 +883,14 @@ def admin_source_digest(root: Path, config: dict[str, str]) -> str:
     ):
         raise RuntimeError(f"controller source directory is invalid: {controller}")
     controller_inputs = _source_tree_inputs(controller / "src", "controller")
+    runtime = root / "database-runtime"
+    runtime_inputs = _source_tree_inputs(runtime / "src", "database runtime")
     inputs = [
         *admin_inputs,
         *controller_inputs,
+        *runtime_inputs,
         controller / "Cargo.toml",
+        runtime / "Cargo.toml",
         root / "scripts" / "generate_admin_resources.py",
         repository / "Cargo.toml",
         repository / "Cargo.lock",

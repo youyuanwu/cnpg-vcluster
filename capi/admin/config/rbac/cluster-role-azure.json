@@ -31,6 +31,35 @@
     },
     {
       "apiGroups": [
+        "admissionregistration.k8s.io"
+      ],
+      "resourceNames": [
+        "tenant-database-catalog-cutover-create-lock"
+      ],
+      "resources": [
+        "validatingadmissionpolicies",
+        "validatingadmissionpolicybindings"
+      ],
+      "verbs": [
+        "get"
+      ]
+    },
+    {
+      "apiGroups": [
+        "apps"
+      ],
+      "resourceNames": [
+        "database-controller"
+      ],
+      "resources": [
+        "deployments"
+      ],
+      "verbs": [
+        "get"
+      ]
+    },
+    {
+      "apiGroups": [
         "apps"
       ],
       "resources": [
@@ -164,6 +193,21 @@
     },
     {
       "apiGroups": [
+        "rbac.authorization.k8s.io"
+      ],
+      "resourceNames": [
+        "tenant-database-credentials"
+      ],
+      "resources": [
+        "roles",
+        "rolebindings"
+      ],
+      "verbs": [
+        "get"
+      ]
+    },
+    {
+      "apiGroups": [
         "resources.azure.com"
       ],
       "resources": [
@@ -171,6 +215,18 @@
       ],
       "verbs": [
         "list"
+      ]
+    },
+    {
+      "apiGroups": [
+        "tenancy.cnpg-vcluster.io"
+      ],
+      "resources": [
+        "tenantdatabasecatalogs"
+      ],
+      "verbs": [
+        "get",
+        "update"
       ]
     },
     {

@@ -186,6 +186,56 @@ resource asoFederation 'Microsoft.ManagedIdentity/userAssignedIdentities/federat
   }
 }
 
+resource databaseIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-01-31' = {
+  name: '${prefix}-database-controller'
+  location: location
+  tags: commonTags
+}
+
+resource databaseDiskRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
+  name: guid(resourceGroup().id, 'database-disk-read-delete')
+  properties: {
+    roleName: '${prefix}-database-disk-read-delete'
+    description: 'Read and remove exact managed disks during catalog entry finalization'
+    type: 'CustomRole'
+    permissions: [
+      {
+        actions: [
+          'Microsoft.Compute/disks/read'
+          'Microsoft.Compute/disks/delete'
+        ]
+        notActions: []
+        dataActions: []
+        notDataActions: []
+      }
+    ]
+    assignableScopes: [
+      resourceGroup().id
+    ]
+  }
+}
+
+resource databaseDiskAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
+  name: guid(resourceGroup().id, databaseIdentity.id, databaseDiskRole.id)
+  properties: {
+    roleDefinitionId: databaseDiskRole.id
+    principalId: databaseIdentity.properties.principalId
+    principalType: 'ServicePrincipal'
+  }
+}
+
+resource databaseFederation 'Microsoft.ManagedIdentity/userAssignedIdentities/federatedIdentityCredentials@2023-01-31' = {
+  parent: databaseIdentity
+  name: 'database-controller'
+  properties: {
+    audiences: [
+      'api://AzureADTokenExchange'
+    ]
+    issuer: aks.properties.oidcIssuerProfile.issuerURL
+    subject: 'system:serviceaccount:tenant-system:database-controller'
+  }
+}
+
 output aksName string = aks.name
 output aksId string = aks.id
 output aksNodeResourceGroup string = aks.properties.nodeResourceGroup
@@ -210,3 +260,9 @@ output roleAssignmentId string = contributor.id
 output aksRoleAssignmentId string = aksContributor.id
 output capzFederationId string = capzFederation.id
 output asoFederationId string = asoFederation.id
+output databaseIdentityId string = databaseIdentity.id
+output databaseIdentityClientId string = databaseIdentity.properties.clientId
+output databaseIdentityPrincipalId string = databaseIdentity.properties.principalId
+output databaseDiskRoleId string = databaseDiskRole.id
+output databaseDiskAssignmentId string = databaseDiskAssignment.id
+output databaseFederationId string = databaseFederation.id

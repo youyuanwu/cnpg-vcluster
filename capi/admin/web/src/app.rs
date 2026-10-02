@@ -6,11 +6,8 @@ use tenant_admin_shared::{
         TenantDeleteState, TenantField, TenantFieldError,
     },
     query::{
-        AzureProviderView, ConditionStatus, DatabaseClusterObservation, DatabaseCondition,
-        DatabaseInstanceObservation, DatabaseObservation, DatabaseObservationFreshness,
-        DatabaseQueryRequest, DatabaseQueryResponse, DatabaseQueryResult, OverviewSnapshot,
-        ProviderMode, ProviderSpecificationView, ProviderStatusView, TenantCondition,
-        TenantSnapshot, TenantSummary, TopologyGraph,
+        AzureProviderView, ConditionStatus, OverviewSnapshot, ProviderSpecificationView,
+        ProviderStatusView, TenantCondition, TenantSnapshot, TenantSummary, TopologyGraph,
     },
     routes::{API_OVERVIEW_PATH, API_PREFIX},
 };
@@ -18,27 +15,18 @@ use wasm_bindgen_futures::spawn_local;
 
 use crate::{
     api::{delete_envelope, get_envelope, post_envelope},
-    database_console::{
-        DEFAULT_DATABASE, DEFAULT_SQL, QueryResultPresentation, format_query_duration,
-        project_query_result, selectable_database_instances,
-    },
+    catalog_ui::CatalogPanel,
     error::{UiError, UiErrorKind},
     format::{
-        classification_class, classification_label, condition_status_label,
-        database_freshness_label, database_instance_role_class, database_instance_role_label,
-        database_instance_summary, database_not_applicable_reason_label,
-        database_unavailable_reason_label, edge_kind_label, format_age, health_class, health_label,
-        node_kind_label, optional_text, provider_label, provider_mode_label,
-        sort_database_instances,
+        classification_class, classification_label, condition_status_label, edge_kind_label,
+        format_age, health_class, health_label, node_kind_label, optional_text, provider_label,
+        provider_mode_label,
     },
     lifecycle::{
         CreateRecovery, DeleteRecovery, create_recovery, create_request, delete_enabled,
         delete_recovery, requires_authoritative_read,
     },
-    route::{
-        AppRoute, parse_route, tenant_create_path, tenant_database_query_path, tenant_delete_path,
-        tenant_href,
-    },
+    route::{AppRoute, parse_route, tenant_create_path, tenant_delete_path, tenant_href},
     topology::layout_graph,
 };
 
@@ -147,7 +135,7 @@ fn TenantPage(name: String) -> impl IntoView {
                     <p class="eyebrow">"Tenant detail"</p>
                     <h1>{name}</h1>
                     <p class="lede">
-                        "Specification, lifecycle controls, reconciliation status, live Tenant database metadata, management resources, and provider-neutral topology. Credentials are excluded from browser responses."
+                        "Specification, lifecycle controls, database catalog, management resources, and provider-neutral topology. Credentials are excluded from browser responses."
                     </p>
                 </div>
                 <RefreshButton state refresh/>
@@ -259,7 +247,7 @@ fn dashboard_view(mut data: OverviewSnapshot) -> AnyView {
             </div>
         </section>
 
-        <TenantCreatePanel provider=provider_mode capability=creation/>
+        <TenantCreatePanel capability=creation/>
 
         <section class="panel" aria-labelledby="tenants-heading">
             <div class="panel__header">
@@ -327,10 +315,9 @@ fn dashboard_view(mut data: OverviewSnapshot) -> AnyView {
 }
 
 #[component]
-fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> impl IntoView {
+fn TenantCreatePanel(capability: CreationCapability) -> impl IntoView {
     let name = RwSignal::new(String::new());
     let workers = RwSignal::new("1".to_owned());
-    let databases = RwSignal::new("1".to_owned());
     let field_errors = RwSignal::new(Vec::<TenantFieldError>::new());
     let state = RwSignal::new(MutationState::Idle);
     let capability_available = capability.available;
@@ -345,12 +332,7 @@ fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> 
         if !capability_available || matches!(state.get(), MutationState::Running) {
             return;
         }
-        let request = match create_request(
-            provider,
-            &name.get_untracked(),
-            &workers.get_untracked(),
-            &databases.get_untracked(),
-        ) {
+        let request = match create_request(&name.get_untracked(), &workers.get_untracked()) {
             Ok(request) => request,
             Err(errors) => {
                 field_errors.set(errors);
@@ -436,22 +418,6 @@ fn TenantCreatePanel(provider: ProviderMode, capability: CreationCapability) -> 
                     />
                     <FieldError id="tenant-create-workers-error" errors=field_errors field=TenantField::Workers/>
                 </div>
-                {matches!(provider, ProviderMode::Local).then(|| view! {
-                    <div class="form-field">
-                        <label for="tenant-create-databases">"Databases"</label>
-                        <input
-                            id="tenant-create-databases"
-                            type="number"
-                            min="1"
-                            max="3"
-                            value="1"
-                            disabled=move || !capability_available || matches!(state.get(), MutationState::Running)
-                            aria-describedby="tenant-create-databases-error"
-                            on:input=move |event| databases.set(event_target_value(&event))
-                        />
-                        <FieldError id="tenant-create-databases-error" errors=field_errors field=TenantField::Databases/>
-                    </div>
-                })}
                 <div class="form-field">
                     <span class="form-label">"Kubernetes version"</span>
                     <strong>{version}</strong>
@@ -545,20 +511,11 @@ fn tenant_row(tenant: TenantSummary) -> AnyView {
     let classification = tenant.classification;
     let status_class = classification_class(classification);
     let status_label = classification_label(classification);
-    let capacity = match tenant.requested_databases {
-        Some(databases) => format!(
-            "{} worker{}, {} database{}",
-            tenant.requested_workers,
-            plural(tenant.requested_workers),
-            databases,
-            plural(databases)
-        ),
-        None => format!(
-            "{} worker{}",
-            tenant.requested_workers,
-            plural(tenant.requested_workers)
-        ),
-    };
+    let capacity = format!(
+        "{} worker{}",
+        tenant.requested_workers,
+        plural(tenant.requested_workers)
+    );
     let conditions = condition_summary(&tenant.conditions);
     let endpoint = optional_text(tenant.endpoint.as_deref()).to_owned();
     let age = format_age(tenant.created_at.as_deref());
@@ -580,7 +537,6 @@ fn tenant_row(tenant: TenantSummary) -> AnyView {
 
 fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
     let detail = data.detail;
-    let database = data.database;
     let topology = data.topology;
     let summary = detail.summary.clone();
     let tenant_name = summary.name.clone();
@@ -617,12 +573,6 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
                 <strong class="metric__value">{summary.requested_workers}</strong>
             </div>
             <div class="metric">
-                <span class="metric__label">"Databases"</span>
-                <strong class="metric__value">
-                    {summary.requested_databases.map_or_else(|| "—".to_owned(), |value| value.to_string())}
-                </strong>
-            </div>
-            <div class="metric">
                 <span class="metric__label">"Kubernetes"</span>
                 <strong>{summary.kubernetes_version.clone()}</strong>
             </div>
@@ -632,7 +582,7 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
             </div>
         </section>
 
-        {database_panel(tenant_name, database)}
+        <CatalogPanel name=tenant_name tenant_uid=tenant_uid.clone() classification/>
 
         <TenantDeletePanel name=summary.name.clone() uid=tenant_uid/>
 
@@ -807,705 +757,11 @@ fn TenantDeletePanel(name: String, uid: String) -> impl IntoView {
     }
 }
 
-const MAX_DATABASE_CONDITIONS: usize = 8;
-
-fn database_panel(tenant: String, observation: DatabaseObservation) -> AnyView {
-    match observation {
-        DatabaseObservation::Available {
-            observed_at,
-            freshness,
-            cluster,
-        } => available_database_panel(tenant, observed_at, freshness, *cluster),
-        DatabaseObservation::Unavailable {
-            observed_at,
-            freshness,
-            reason,
-            message,
-            retryable,
-        } => {
-            let freshness_label = database_freshness_label(freshness);
-            let reason_label = database_unavailable_reason_label(reason);
-            let observed_age = format_age(Some(&observed_at));
-            let observed_at_datetime = observed_at.clone();
-            let retry_label = if retryable {
-                "Retryable on refresh"
-            } else {
-                "Not retryable from this page"
-            };
-            view! {
-                <section
-                    class="panel database-panel database-panel--warning"
-                    aria-labelledby="database-heading"
-                    role="alert"
-                >
-                    <div class="panel__header database-panel__header">
-                        <div>
-                            <h2 id="database-heading">"Database"</h2>
-                            <p>"Live CNPG metadata is temporarily unavailable; the rest of this Tenant remains available."</p>
-                        </div>
-                        <span class="status status--degraded">"Unavailable"</span>
-                    </div>
-                    <div class="database-warning">
-                        <h3>"Database observation warning"</h3>
-                        <p>{message}</p>
-                        <dl class="definition-list database-observation">
-                            <dt>"Reason"</dt><dd>{reason_label}</dd>
-                            <dt>"Retryability"</dt><dd>{retry_label}</dd>
-                            <dt>"Freshness"</dt><dd>{freshness_label}</dd>
-                            <dt>"Observed"</dt>
-                            <dd>
-                                <time datetime=observed_at_datetime>{observed_at}</time>
-                                <span class="secondary">{format!(" · {observed_age} ago")}</span>
-                            </dd>
-                        </dl>
-                    </div>
-                </section>
-            }
-            .into_any()
-        }
-        DatabaseObservation::NotApplicable {
-            observed_at,
-            freshness,
-            reason,
-        } => {
-            let freshness_label = database_freshness_label(freshness);
-            let reason_label = database_not_applicable_reason_label(reason);
-            let observed_age = format_age(Some(&observed_at));
-            let observed_at_datetime = observed_at.clone();
-            view! {
-                <section
-                    class="panel database-panel database-panel--neutral"
-                    aria-labelledby="database-heading"
-                    role="status"
-                >
-                    <div class="panel__header database-panel__header">
-                        <div>
-                            <h2 id="database-heading">"Database"</h2>
-                            <p>"Live CNPG metadata is not applicable to this Tenant provider."</p>
-                        </div>
-                        <span class="status status--unknown">"Not applicable"</span>
-                    </div>
-                    <dl class="definition-list database-observation">
-                        <dt>"Reason"</dt><dd>{reason_label}</dd>
-                        <dt>"Freshness"</dt><dd>{freshness_label}</dd>
-                        <dt>"Observed"</dt>
-                        <dd>
-                            <time datetime=observed_at_datetime>{observed_at}</time>
-                            <span class="secondary">{format!(" · {observed_age} ago")}</span>
-                        </dd>
-                    </dl>
-                </section>
-            }
-            .into_any()
-        }
-    }
-}
-
-fn available_database_panel(
-    tenant: String,
-    observed_at: String,
-    freshness: DatabaseObservationFreshness,
-    mut cluster: DatabaseClusterObservation,
-) -> AnyView {
-    sort_database_instances(&mut cluster.instances);
-    let console_instances = selectable_database_instances(&cluster.instances);
-    cluster.conditions.sort_by(|left, right| {
-        left.condition_type
-            .cmp(&right.condition_type)
-            .then_with(|| left.last_transition_time.cmp(&right.last_transition_time))
-    });
-
-    let instance_summary = database_instance_summary(&cluster.instances);
-    let observed_age = format_age(Some(&observed_at));
-    let observed_at_datetime = observed_at.clone();
-    let freshness_label = database_freshness_label(freshness);
-    let topology_label = if cluster.topology_available {
-        "Available"
-    } else {
-        "Unavailable"
-    };
-    let phase = optional_text(cluster.phase.as_deref()).to_owned();
-    let reason = optional_text(cluster.reason.as_deref()).to_owned();
-    let current_primary = optional_text(cluster.current_primary.as_deref()).to_owned();
-    let target_primary = optional_text(cluster.target_primary.as_deref()).to_owned();
-    let current_primary_since = optional_text(cluster.current_primary_since.as_deref()).to_owned();
-    let target_primary_requested_at =
-        optional_text(cluster.target_primary_requested_at.as_deref()).to_owned();
-    let current_primary_failing_since =
-        optional_text(cluster.current_primary_failing_since.as_deref()).to_owned();
-    let image = optional_text(cluster.image.as_deref()).to_owned();
-    let timeline = cluster
-        .timeline
-        .map_or_else(|| "—".to_owned(), |value| value.to_string());
-    let nodes_used = cluster
-        .nodes_used
-        .map_or_else(|| "—".to_owned(), |value| value.to_string());
-    let read_service = optional_text(cluster.services.read.as_deref()).to_owned();
-    let write_service = optional_text(cluster.services.write.as_deref()).to_owned();
-    let identity_name = format!("{}/{}", cluster.identity.namespace, cluster.identity.name);
-    let identity_kind = format!(
-        "{} · {}",
-        cluster.identity.api_version, cluster.identity.kind
-    );
-    let identity_uid = optional_text(cluster.identity.uid.as_deref()).to_owned();
-    let conditions = database_conditions_view(cluster.conditions);
-    let instances = database_instances_view(cluster.instances, instance_summary);
-
-    view! {
-        <section class="panel database-panel" aria-labelledby="database-heading">
-            <div class="panel__header database-panel__header">
-                <div>
-                    <h2 id="database-heading">"Database"</h2>
-                    <p>
-                        <span>{format!("{freshness_label} CNPG observation · ")}</span>
-                        <time datetime=observed_at_datetime>{observed_at}</time>
-                        <span>{format!(" · {observed_age} ago")}</span>
-                    </p>
-                </div>
-                <span class="status status--ready">{freshness_label}</span>
-            </div>
-
-            <div class="database-metrics" aria-label="Database instance health summary">
-                <Metric label="Desired" value=cluster.desired_instances/>
-                <Metric label="Current" value=cluster.observed_instances/>
-                <Metric label="Ready" value=cluster.ready_instances/>
-            </div>
-
-            <div class="database-detail-grid">
-                <section class="database-card" aria-labelledby="database-identity-heading">
-                    <h3 id="database-identity-heading">"CNPG identity"</h3>
-                    <dl class="definition-list">
-                        <dt>"Resource"</dt><dd>{identity_kind}</dd>
-                        <dt>"Cluster"</dt><dd>{identity_name}</dd>
-                        <dt>"UID"</dt><dd>{identity_uid}</dd>
-                        <dt>"Generation"</dt><dd>{cluster.identity.generation}</dd>
-                    </dl>
-                </section>
-                <section class="database-card" aria-labelledby="database-state-heading">
-                    <h3 id="database-state-heading">"Cluster state"</h3>
-                    <dl class="definition-list">
-                        <dt>"Phase"</dt><dd>{phase}</dd>
-                        <dt>"Reason"</dt><dd>{reason}</dd>
-                        <dt>"Timeline"</dt><dd>{timeline}</dd>
-                        <dt>"Image"</dt><dd>{image}</dd>
-                        <dt>"Topology extraction"</dt><dd>{topology_label}</dd>
-                        <dt>"Nodes used"</dt><dd>{nodes_used}</dd>
-                    </dl>
-                </section>
-                <section class="database-card" aria-labelledby="database-primary-heading">
-                    <h3 id="database-primary-heading">"Primary and promotion"</h3>
-                    <dl class="definition-list">
-                        <dt>"Current primary"</dt><dd>{current_primary}</dd>
-                        <dt>"Current since"</dt><dd>{current_primary_since}</dd>
-                        <dt>"Target primary"</dt><dd>{target_primary}</dd>
-                        <dt>"Promotion requested"</dt><dd>{target_primary_requested_at}</dd>
-                        <dt>"Failing since"</dt><dd>{current_primary_failing_since}</dd>
-                    </dl>
-                </section>
-            </div>
-
-            <div class="database-detail-grid database-detail-grid--secondary">
-                <section class="database-card" aria-labelledby="database-services-heading">
-                    <h3 id="database-services-heading">"Services"</h3>
-                    <dl class="definition-list">
-                        <dt>"Read service"</dt><dd>{read_service}</dd>
-                        <dt>"Write service"</dt><dd>{write_service}</dd>
-                    </dl>
-                </section>
-                <section class="database-card" aria-labelledby="database-storage-heading">
-                    <h3 id="database-storage-heading">"PVC health"</h3>
-                    <dl class="storage-counts">
-                        <div><dt>"Total"</dt><dd>{cluster.storage.total}</dd></div>
-                        <div><dt>"Healthy"</dt><dd>{cluster.storage.healthy}</dd></div>
-                        <div><dt>"Dangling"</dt><dd>{cluster.storage.dangling}</dd></div>
-                        <div><dt>"Initializing"</dt><dd>{cluster.storage.initializing}</dd></div>
-                        <div><dt>"Resizing"</dt><dd>{cluster.storage.resizing}</dd></div>
-                        <div><dt>"Unusable"</dt><dd>{cluster.storage.unusable}</dd></div>
-                    </dl>
-                </section>
-            </div>
-
-            {instances}
-            {conditions}
-            <DatabaseConsole tenant instances=console_instances/>
-            <p class="database-credential-note">
-                "Database credentials, passwords, and connection secrets are never returned to this browser."
-            </p>
-        </section>
-    }
-    .into_any()
-}
-
-#[derive(Clone)]
-enum QueryExecutionState {
-    Idle,
-    Running,
-    Success(DatabaseQueryResponse),
-    Error(UiError),
-}
-
-#[component]
-fn DatabaseConsole(tenant: String, instances: Vec<DatabaseInstanceObservation>) -> impl IntoView {
-    let selected_instance = RwSignal::new(
-        instances
-            .first()
-            .map(|instance| instance.name.clone())
-            .unwrap_or_default(),
-    );
-    let database = RwSignal::new(DEFAULT_DATABASE.to_owned());
-    let sql = RwSignal::new(DEFAULT_SQL.to_owned());
-    let state = RwSignal::new(QueryExecutionState::Idle);
-    let query_path = tenant_database_query_path(&tenant);
-    let has_instances = !instances.is_empty();
-
-    let submit_query = move |event: leptos::ev::SubmitEvent| {
-        event.prevent_default();
-        if matches!(state.get_untracked(), QueryExecutionState::Running) {
-            return;
-        }
-        let Some(path) = query_path.clone() else {
-            state.set(QueryExecutionState::Error(UiError {
-                kind: UiErrorKind::InvalidRequest,
-                message: "The Tenant name is not valid.".to_owned(),
-                retryable: false,
-                field_errors: Vec::new(),
-            }));
-            return;
-        };
-        let request = DatabaseQueryRequest {
-            instance: selected_instance.get_untracked(),
-            database: database.get_untracked(),
-            sql: sql.get_untracked(),
-        };
-        state.set(QueryExecutionState::Running);
-        spawn_local(async move {
-            state.set(
-                match post_envelope::<_, DatabaseQueryResponse>(&path, &request).await {
-                    Ok(response) => QueryExecutionState::Success(response),
-                    Err(error) => QueryExecutionState::Error(error),
-                },
-            );
-        });
-    };
-
-    view! {
-        <section class="database-console" aria-labelledby="database-console-heading">
-            <div class="database-console__warning">
-                <p class="eyebrow">"Dangerous operation"</p>
-                <h3 id="database-console-heading">"Unsafe administrator SQL console"</h3>
-                <p>
-                    "Queries run as the CNPG PostgreSQL superuser and can modify or destroy data. Database credentials stay server-side and are never rendered in this browser."
-                </p>
-            </div>
-            <form class="database-console__form" on:submit=submit_query>
-                <div class="database-console__controls">
-                    <label>
-                        <span>"CNPG instance"</span>
-                        <select
-                            disabled=!has_instances
-                            prop:value=move || selected_instance.get()
-                            on:change=move |event| {
-                                selected_instance.set(event_target_value(&event));
-                            }
-                        >
-                            {instances
-                                .into_iter()
-                                .map(|instance| {
-                                    let role = database_instance_role_label(instance.role);
-                                    let label = format!("{} ({role})", instance.name);
-                                    view! { <option value=instance.name>{label}</option> }
-                                })
-                                .collect_view()}
-                        </select>
-                    </label>
-                    <label>
-                        <span>"Database name"</span>
-                        <input
-                            type="text"
-                            autocomplete="off"
-                            required
-                            prop:value=move || database.get()
-                            on:input=move |event| database.set(event_target_value(&event))
-                        />
-                    </label>
-                </div>
-                <label class="database-console__sql">
-                    <span>"SQL statement"</span>
-                    <textarea
-                        rows="8"
-                        required
-                        spellcheck="false"
-                        prop:value=move || sql.get()
-                        on:input=move |event| sql.set(event_target_value(&event))
-                    ></textarea>
-                </label>
-                {(!has_instances).then(|| view! {
-                    <p class="database-console__notice" role="status">
-                        "No observed CNPG instance is available for query execution."
-                    </p>
-                })}
-                <div class="database-console__actions">
-                    <button
-                        type="submit"
-                        class="database-console__execute"
-                        disabled=move || {
-                            !has_instances
-                                || matches!(state.get(), QueryExecutionState::Running)
-                        }
-                    >
-                        {move || {
-                            if matches!(state.get(), QueryExecutionState::Running) {
-                                "Executing…"
-                            } else {
-                                "Execute SQL"
-                            }
-                        }}
-                    </button>
-                    <p class="secondary">
-                        "Only the selected observed instance is targeted. Connection details remain on the server."
-                    </p>
-                </div>
-            </form>
-            <div class="database-console__output" aria-live="polite" aria-atomic="false">
-                {move || query_execution_view(state.get())}
-            </div>
-        </section>
-    }
-}
-
-fn query_execution_view(state: QueryExecutionState) -> AnyView {
-    match state {
-        QueryExecutionState::Idle => view! {
-            <p class="database-console__placeholder">
-                "No query has been executed in this browser session."
-            </p>
-        }
-        .into_any(),
-        QueryExecutionState::Running => view! {
-            <p class="database-console__running" role="status">
-                <span class="loading-indicator" aria-hidden="true"></span>
-                "Executing SQL on the selected CNPG instance…"
-            </p>
-        }
-        .into_any(),
-        QueryExecutionState::Success(response) => query_response_view(response),
-        QueryExecutionState::Error(error) => view! {
-            <section class="database-console__error" role="alert">
-                <h4>{error.title()}</h4>
-                <p>{error.message}</p>
-                {error.retryable.then(|| view! {
-                    <p class="secondary">"The query can be submitted again when the database is available."</p>
-                })}
-            </section>
-        }
-        .into_any(),
-    }
-}
-
-fn query_response_view(response: DatabaseQueryResponse) -> AnyView {
-    let result_count = response.results.len();
-    let duration = format_query_duration(response.duration_ms);
-    let global_truncated = response.truncated;
-    let results = response.results;
-    let executed_at_datetime = response.executed_at.clone();
-
-    view! {
-        <section class="database-console__success" role="status">
-            <div class="database-console__result-header">
-                <div>
-                    <h4>"Query completed"</h4>
-                    <p>{format!(
-                        "{result_count} result set{} returned in {duration}.",
-                        if result_count == 1 { "" } else { "s" }
-                    )}</p>
-                </div>
-                <span class="status status--ready">"Success"</span>
-            </div>
-            <dl class="definition-list database-console__identity">
-                <dt>"Tenant"</dt><dd>{response.tenant}</dd>
-                <dt>"CNPG cluster"</dt><dd>{response.cluster}</dd>
-                <dt>"Instance"</dt><dd>{response.instance}</dd>
-                <dt>"Database"</dt><dd>{response.database}</dd>
-                <dt>"Executed"</dt><dd><time datetime=executed_at_datetime>{response.executed_at}</time></dd>
-                <dt>"Duration"</dt><dd>{duration}</dd>
-            </dl>
-            {global_truncated.then(|| view! {
-                <p class="database-console__truncation" role="alert">
-                    "The overall response was truncated by the server. Additional rows or result data were omitted."
-                </p>
-            })}
-            {if results.is_empty() {
-                view! {
-                    <p class="database-console__notice">
-                        "The server returned no result sets."
-                    </p>
-                }
-                .into_any()
-            } else {
-                view! {
-                    <div class="database-console__results">
-                        {results
-                            .into_iter()
-                            .enumerate()
-                            .map(|(index, result)| query_result_view(index + 1, result))
-                            .collect_view()}
-                    </div>
-                }
-                .into_any()
-            }}
-        </section>
-    }
-    .into_any()
-}
-
-fn query_result_view(index: usize, result: DatabaseQueryResult) -> AnyView {
-    let presentation = project_query_result(&result);
-    let truncated = result.truncated;
-    let truncation = truncated.then(|| {
-        view! {
-            <p class="database-console__truncation" role="alert">
-                "This result set was truncated. Additional rows were omitted."
-            </p>
-        }
-    });
-
-    match presentation {
-        QueryResultPresentation::Rows {
-            column_count,
-            row_count,
-        } => {
-            let columns = result.columns;
-            let rows = result.rows;
-            view! {
-                <section class="database-console__result" aria-labelledby=format!("query-result-{index}-heading")>
-                    <div class="database-console__result-header">
-                        <h5 id=format!("query-result-{index}-heading")>{format!("Result set {index}")}</h5>
-                        <span class="secondary">{format!(
-                            "{row_count} row{} · {column_count} column{}",
-                            if row_count == 1 { "" } else { "s" },
-                            if column_count == 1 { "" } else { "s" }
-                        )}</span>
-                    </div>
-                    <div class="table-scroll">
-                        <table class="database-console__table">
-                            <caption>{format!("SQL query result set {index}")}</caption>
-                            <thead>
-                                <tr>
-                                    {columns
-                                        .into_iter()
-                                        .map(|column| view! { <th scope="col">{column}</th> })
-                                        .collect_view()}
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {rows
-                                    .into_iter()
-                                    .map(|row| {
-                                        view! {
-                                            <tr>
-                                                {row
-                                                    .into_iter()
-                                                    .map(|cell| {
-                                                        view! {
-                                                            <td>
-                                                                {match cell {
-                                                                    Some(value) => view! {
-                                                                        <span class="database-console__value">{value}</span>
-                                                                    }
-                                                                    .into_any(),
-                                                                    None => view! {
-                                                                        <span
-                                                                            class="database-console__null"
-                                                                            aria-label="NULL value"
-                                                                        >
-                                                                            "NULL"
-                                                                        </span>
-                                                                    }
-                                                                    .into_any(),
-                                                                }}
-                                                            </td>
-                                                        }
-                                                    })
-                                                    .collect_view()}
-                                            </tr>
-                                        }
-                                    })
-                                    .collect_view()}
-                            </tbody>
-                        </table>
-                    </div>
-                    {truncation}
-                </section>
-            }
-            .into_any()
-        }
-        QueryResultPresentation::Command { affected_rows } => view! {
-            <section class="database-console__result" aria-labelledby=format!("query-result-{index}-heading")>
-                <div class="database-console__result-header">
-                    <h5 id=format!("query-result-{index}-heading")>{format!("Result set {index}")}</h5>
-                    <span class="secondary">"Command result"</span>
-                </div>
-                <p class="database-console__affected">
-                    <strong>{affected_rows}</strong>
-                    {format!(" row{} affected", if affected_rows == 1 { "" } else { "s" })}
-                </p>
-                {truncation}
-            </section>
-        }
-        .into_any(),
-    }
-}
-
-fn database_instances_view(
-    instances: Vec<tenant_admin_shared::query::DatabaseInstanceObservation>,
-    summary: String,
-) -> AnyView {
-    view! {
-        <section class="database-subsection" aria-labelledby="database-instances-heading">
-            <div class="database-subsection__header">
-                <div>
-                    <h3 id="database-instances-heading">"Instances"</h3>
-                    <p>{summary}</p>
-                </div>
-            </div>
-            {if instances.is_empty() {
-                view! { <p class="empty">"No database instances were observed."</p> }.into_any()
-            } else {
-                view! {
-                    <div class="table-scroll">
-                        <table class="database-instance-table">
-                            <caption>
-                                "CNPG database instances sorted with primary first, then standby, then unknown role"
-                            </caption>
-                            <thead>
-                                <tr>
-                                    <th scope="col">"Instance"</th>
-                                    <th scope="col">"Role"</th>
-                                    <th scope="col">"Status"</th>
-                                    <th scope="col">"Timeline"</th>
-                                    <th scope="col">"Worker node"</th>
-                                    <th scope="col">"Zone"</th>
-                                </tr>
-                            </thead>
-                            <tbody>
-                                {instances
-                                    .into_iter()
-                                    .map(|instance| {
-                                        let role = database_instance_role_label(instance.role);
-                                        let role_class = database_instance_role_class(instance.role);
-                                        let status = optional_text(instance.status.as_deref()).to_owned();
-                                        let timeline = instance
-                                            .timeline
-                                            .map_or_else(|| "—".to_owned(), |value| value.to_string());
-                                        let node = optional_text(instance.node.as_deref()).to_owned();
-                                        let zone = optional_text(instance.zone.as_deref()).to_owned();
-                                        view! {
-                                            <tr>
-                                                <th scope="row">{instance.name}</th>
-                                                <td>
-                                                    <span class=format!("database-role database-role--{role_class}")>
-                                                        {role}
-                                                    </span>
-                                                </td>
-                                                <td>{status}</td>
-                                                <td>{timeline}</td>
-                                                <td>{node}</td>
-                                                <td>{zone}</td>
-                                            </tr>
-                                        }
-                                    })
-                                    .collect_view()}
-                            </tbody>
-                        </table>
-                    </div>
-                }
-                .into_any()
-            }}
-        </section>
-    }
-    .into_any()
-}
-
-fn database_conditions_view(mut conditions: Vec<DatabaseCondition>) -> AnyView {
-    let omitted = conditions.len().saturating_sub(MAX_DATABASE_CONDITIONS);
-    conditions.truncate(MAX_DATABASE_CONDITIONS);
-
-    view! {
-        <section class="database-subsection" aria-labelledby="database-conditions-heading">
-            <div class="database-subsection__header">
-                <div>
-                    <h3 id="database-conditions-heading">"Database conditions"</h3>
-                    <p>{format!(
-                        "Showing up to {MAX_DATABASE_CONDITIONS} sanitized CNPG conditions."
-                    )}</p>
-                </div>
-            </div>
-            {if conditions.is_empty() {
-                view! { <p class="empty">"No database conditions were reported."</p> }.into_any()
-            } else {
-                view! {
-                    <ul class="condition-list database-condition-list">
-                        {conditions
-                            .into_iter()
-                            .map(|condition| {
-                                let (class, status) = condition_style(condition.status);
-                                let reason = condition.reason;
-                                let message = condition.message;
-                                let metadata = [
-                                    condition
-                                        .observed_generation
-                                        .map(|value| format!("Observed generation {value}")),
-                                    condition
-                                        .last_transition_time
-                                        .map(|value| format!("Transitioned {value}")),
-                                ]
-                                .into_iter()
-                                .flatten()
-                                .collect::<Vec<_>>()
-                                .join(" · ");
-                                view! {
-                                    <li>
-                                        <div class="condition-heading">
-                                            <strong>{condition.condition_type}</strong>
-                                            <span class=format!("status status--{class}")>{status}</span>
-                                        </div>
-                                        {reason.map(|value| view! {
-                                            <p><strong>"Reason: "</strong>{value}</p>
-                                        })}
-                                        {message.map(|value| view! { <p>{value}</p> })}
-                                        {(!metadata.is_empty()).then(|| view! {
-                                            <p class="secondary">{metadata}</p>
-                                        })}
-                                    </li>
-                                }
-                            })
-                            .collect_view()}
-                    </ul>
-                    {if omitted > 0 {
-                        Some(view! {
-                            <p class="secondary">
-                                {format!(
-                                    "{omitted} additional condition{} omitted to keep this live view bounded.",
-                                    if omitted == 1 { "" } else { "s" }
-                                )}
-                            </p>
-                        })
-                    } else {
-                        None
-                    }}
-                }
-                .into_any()
-            }}
-        </section>
-    }
-    .into_any()
-}
-
 fn provider_specification_rows(specification: ProviderSpecificationView) -> AnyView {
     match specification {
-        ProviderSpecificationView::Local { databases } => view! {
+        ProviderSpecificationView::Local => view! {
             <dt>"Provider configuration"</dt>
-            <dd>{format!("{databases} local database{}", plural(databases))}</dd>
+            <dd>"Local workers and storage"</dd>
         }
         .into_any(),
         ProviderSpecificationView::Azure => view! {

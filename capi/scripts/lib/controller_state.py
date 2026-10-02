@@ -9,6 +9,9 @@ from scripts.lib.controller_catalog import (
     ManagementResource,
     load_management_resources,
 )
+from scripts.lib.database_controller import (
+    inspect_catalog_inventory, require_absent_legacy_database_crd,
+)
 from scripts.lib.kube import ManagementClient
 from scripts.lib.process import run
 
@@ -83,6 +86,8 @@ def require_clean_controller_state(
         )
     if tenants.returncode != 0:
         raise RuntimeError(f"failed to inspect Tenant resources: {tenants.stderr}")
+    require_absent_legacy_database_crd(client)
+    inspect_catalog_inventory(client)
     for resource in load_management_resources(root):
         _verify_discovery(client, resource)
         for item in _inventory(client, resource):

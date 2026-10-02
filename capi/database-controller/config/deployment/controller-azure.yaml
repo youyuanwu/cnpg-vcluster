@@ -1,0 +1,51 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database-controller
+  namespace: tenant-system
+spec:
+  progressDeadlineSeconds: 1800
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database-controller
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: database-controller
+        azure.workload.identity/use: 'true'
+    spec:
+      automountServiceAccountToken: true
+      containers:
+      - env:
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        - name: DATABASE_DISK_CLIENT_ID
+          value: database-disk-client-id:configure-before-install
+        image: database-controller:configure-before-install
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+        name: manager
+        ports:
+        - containerPort: 8082
+          name: health
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: true
+      serviceAccountName: database-controller

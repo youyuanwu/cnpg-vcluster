@@ -72,6 +72,16 @@ jobs:
       - name: Build static Tenant controller
         run: just controller-build
 
+      - name: Verify, lint, test and measure database controller
+        run: |
+          just database-controller-verify
+          just database-controller-lint
+          just database-controller-test
+          just database-controller-metrics
+
+      - name: Build static database controller
+        run: just database-controller-build
+
       - name: Fetch locked admin dependencies
         run: just admin-fetch
 
@@ -95,10 +105,11 @@ jobs:
           CAPI_OFFLINE_ENFORCED: "1"
         run: just admin-package-check
 
-      - name: Stage prebuilt controller and admin artifacts
+      - name: Stage prebuilt controller, database controller and admin artifacts
         run: |
           install -d -m 700 .runtime/rendered/ci-artifact/admin/web
           install -m 700 .runtime/rendered/controller/manager .runtime/rendered/ci-artifact/manager
+          install -m 700 ../target/release/manager .runtime/rendered/ci-artifact/database-manager
           install -m 700 .runtime/rendered/admin/tenant-admin .runtime/rendered/ci-artifact/admin/tenant-admin
           install -m 600 .runtime/rendered/admin/web/* .runtime/rendered/ci-artifact/admin/web/
 
@@ -115,13 +126,14 @@ jobs:
     needs: fast-checks
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 180
     env:
-      MIN_DOCKER_CPUS: "2"
-      MIN_DOCKER_MEMORY_GIB: "6"
-      MIN_DOCKER_STORAGE_GIB: "10"
+      MIN_DOCKER_CPUS: "4"
+      MIN_DOCKER_MEMORY_GIB: "10"
+      MIN_DOCKER_STORAGE_GIB: "12"
       PYTHONUNBUFFERED: "1"
       CAPI_PREBUILT_CONTROLLER_BINARY: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/manager
+      CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/database-manager
       CAPI_PREBUILT_ADMIN_SERVER: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/admin/tenant-admin
       CAPI_PREBUILT_ADMIN_WEB: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/admin/web
     defaults:
@@ -161,7 +173,28 @@ jobs:
         run: just cache
 
       - name: Run end-to-end test
-        run: just test-e2e
+        run: just test-e2e-offline
+
+      - name: Diagnose failed end-to-end
+        if: failure()
+        continue-on-error: true
+        run: |
+          set +e
+          if test -f .runtime/management/kubeconfig; then
+            kubectl=(
+              .tools/bin/kubectl
+              --kubeconfig .runtime/management/kubeconfig
+              --context kind-capi-kamaji-management
+              --request-timeout 30s
+            )
+            "${kubectl[@]}" -n tenant-system get deployments,pods -o wide
+            "${kubectl[@]}" -n default get lease/database-controller.tenancy.cnpg-vcluster.io -o yaml
+            "${kubectl[@]}" -n tenant-system logs deployment/database-controller --all-pods=true --tail=200
+            "${kubectl[@]}" -n tenant-system logs deployment/tenant-controller --all-pods=true --tail=200
+            "${kubectl[@]}" get tenants.tenancy.cnpg-vcluster.io -o yaml
+            "${kubectl[@]}" get tenantdatabasecatalogs.tenancy.cnpg-vcluster.io -A -o yaml
+            "${kubectl[@]}" -n tenant-system get events --sort-by=.lastTimestamp
+          fi
 
   high-capacity:
     name: CAPI high-capacity offline and targeted

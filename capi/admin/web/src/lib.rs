@@ -1,5 +1,6 @@
 #![deny(unsafe_code)]
 
+pub mod catalog_state;
 pub mod database_console;
 pub mod error;
 pub mod format;
@@ -19,6 +20,8 @@ pub(crate) const fn unsafe_request_header() -> (&'static str, &'static str) {
 mod api;
 #[cfg(target_arch = "wasm32")]
 mod app;
+#[cfg(target_arch = "wasm32")]
+mod catalog_ui;
 
 #[cfg(target_arch = "wasm32")]
 pub fn mount() {

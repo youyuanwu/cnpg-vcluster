@@ -27,6 +27,7 @@ pub enum SourceError {
     QueryResponseTooLarge,
     QueryTimedOut,
     QueryOutcomeUnknown,
+    MutationOutcomeUnknown,
 }
 
 impl fmt::Display for SourceError {
@@ -34,16 +35,19 @@ impl fmt::Display for SourceError {
         formatter.write_str(match self {
             Self::KubernetesUnavailable => "Kubernetes API request failed",
             Self::CreationUnavailable => "Tenant creation is temporarily unavailable",
-            Self::Conflict => "Tenant already exists or changed concurrently",
-            Self::StaleIdentity => "Tenant identity changed",
-            Self::Forbidden => "Tenant lifecycle request is forbidden",
-            Self::Rejected => "Kubernetes rejected the Tenant lifecycle request",
+            Self::Conflict => "Resource already exists or changed concurrently",
+            Self::StaleIdentity => "Resource identity changed",
+            Self::Forbidden => "Lifecycle request is forbidden",
+            Self::Rejected => "Kubernetes rejected the lifecycle request",
             Self::ResponseTooLarge => "Kubernetes API response exceeded the service limit",
             Self::DatabaseUnavailable { message, .. } => message,
             Self::QueryFailed { .. } => "PostgreSQL query failed",
             Self::QueryResponseTooLarge => "PostgreSQL response exceeded the service limit",
             Self::QueryTimedOut => "PostgreSQL query timed out",
             Self::QueryOutcomeUnknown => "PostgreSQL query outcome is unknown",
+            Self::MutationOutcomeUnknown => {
+                "Database intent outcome is unknown; refresh the catalog"
+            }
         })
     }
 }
@@ -154,6 +158,14 @@ impl From<SourceError> for AppError {
             SourceError::QueryOutcomeUnknown => Self {
                 status: StatusCode::GATEWAY_TIMEOUT,
                 error: ApiError::new(ApiErrorCode::QueryOutcomeUnknown, error.to_string(), false),
+            },
+            SourceError::MutationOutcomeUnknown => Self {
+                status: StatusCode::GATEWAY_TIMEOUT,
+                error: ApiError::new(
+                    ApiErrorCode::MutationOutcomeUnknown,
+                    error.to_string(),
+                    false,
+                ),
             },
         }
     }

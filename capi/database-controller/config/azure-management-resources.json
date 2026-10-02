@@ -1,0 +1,51 @@
+[
+  {
+    "group": "tenancy.cnpg-vcluster.io",
+    "kind": "TenantDatabaseCatalog",
+    "resource": "tenantdatabasecatalogs",
+    "scope": "Namespaced",
+    "version": "v1alpha1"
+  },
+  {
+    "group": "tenancy.cnpg-vcluster.io",
+    "kind": "Tenant",
+    "resource": "tenants",
+    "scope": "Cluster",
+    "version": "v1alpha4"
+  },
+  {
+    "group": "",
+    "kind": "Namespace",
+    "resource": "namespaces",
+    "scope": "Cluster",
+    "version": "v1"
+  },
+  {
+    "group": "cluster.x-k8s.io",
+    "kind": "Cluster",
+    "resource": "clusters",
+    "scope": "Namespaced",
+    "version": "v1beta2"
+  },
+  {
+    "group": "controlplane.cluster.x-k8s.io",
+    "kind": "KamajiControlPlane",
+    "resource": "kamajicontrolplanes",
+    "scope": "Namespaced",
+    "version": "v1alpha1"
+  },
+  {
+    "group": "",
+    "kind": "Secret",
+    "resource": "secrets",
+    "scope": "Namespaced",
+    "version": "v1"
+  },
+  {
+    "group": "compute.azure.com",
+    "kind": "Disk",
+    "resource": "disks",
+    "scope": "Namespaced",
+    "version": "v1api20240302"
+  }
+]

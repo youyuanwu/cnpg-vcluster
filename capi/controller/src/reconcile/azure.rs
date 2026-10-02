@@ -23,7 +23,7 @@ use crate::{
     },
     azure_allocation::{self, AzureAllocationCatalog, AzureClaimIdentity},
     error::ControllerError,
-    management::{self, ResourceClass},
+    management,
     readiness::{self, set_condition},
     status,
 };
@@ -255,13 +255,13 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             return self.progress(tenant, PROGRESS_INTERVAL).await;
         }
         let job = find(&live, "Job")?;
-        if job_failed(job) {
+        if job_condition(job, "Failed") {
             return Err(ReconcileError::Degraded {
                 reason: "AzureAddonFailed",
                 message: "Azure add-on Job failed".into(),
             });
         }
-        if !job_complete(job) {
+        if !job_condition(job, "Complete") {
             return self
                 .waiting(tenant, "AzureAddonsReady", "Azure add-on Job is incomplete")
                 .await;
@@ -294,7 +294,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
                 )
                 .await;
         };
-        let components = observe_components(tenant_client).await?;
+        let components = observe_components(tenant_client.clone()).await?;
         let Some(components) = components else {
             return self
                 .waiting(
@@ -337,6 +337,46 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             &components,
             &provider_resources,
         )?;
+        let (mut capability, catalog_valid) =
+            match super::ensure_database_catalog(self.client.clone(), tenant, true).await {
+                Ok(capability) => (capability, true),
+                Err(ReconcileError::Pending(_)) => {
+                    return self.progress(tenant, PROGRESS_INTERVAL).await;
+                }
+                Err(error) => {
+                    tracing::warn!(tenant = %name, %error, "Azure database catalog unavailable");
+                    (
+                        tenant
+                            .status
+                            .as_ref()
+                            .and_then(|status| status.database_capability.clone())
+                            .unwrap_or_default(),
+                        false,
+                    )
+                }
+            };
+        capability.available = false;
+        capability.reason =
+            match tenant_database_runtime::azure_runtime::observe(tenant_client).await
+            {
+                Ok("Ready") => match tenant_database_runtime::catalog_runtime::ensure_credentials(
+                    self.client.clone(), &name, &tenant_uid, true,
+                ).await {
+                    Ok(()) if catalog_valid => "Ready",
+                    Ok(()) => "CatalogNotReady",
+                    Err(error) => {
+                        tracing::warn!(tenant = %name, %error, "Azure database credential access unavailable");
+                        "CredentialAccessUnavailable"
+                    }
+                },
+                Ok(reason) => reason,
+                Err(error) => {
+                    tracing::warn!(tenant = %name, %error, "Azure database runtime unavailable");
+                    "RuntimeNotReady"
+                }
+            }
+            .into();
+        capability.available = capability.reason == "Ready";
         self.validate_mutation().await?;
         status::update_status(self.client.clone(), tenant, |status| {
             let azure = status.azure_mut()?;
@@ -345,6 +385,7 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
             azure.nodes = workers.nodes.clone();
             azure.addon_components = components.clone();
             azure.provider_resources = provider_resources.clone();
+            status.database_capability = Some(capability.clone());
             readiness::initialize_status(status, tenant);
             for condition in [
                 "AzureControlPlaneReady",
@@ -363,19 +404,47 @@ impl<A: TenantAccess> ProviderLifecycle for AzureProvider<A> {
                     "Azure contract is Ready",
                 );
             }
-            status.phase = Some(TenantPhase::Ready);
+            set_condition(
+                status,
+                tenant,
+                "CatalogReady",
+                catalog_valid,
+                if catalog_valid {
+                    "Ready"
+                } else {
+                    "CatalogNotReady"
+                },
+                "Tenant catalog identity is verified",
+            );
+            status.phase = Some(if catalog_valid {
+                TenantPhase::Ready
+            } else {
+                TenantPhase::Degraded
+            });
             set_condition(
                 status,
                 tenant,
                 "Ready",
-                true,
-                "Ready",
-                "Complete Azure tenant contract is Ready",
+                catalog_valid,
+                if catalog_valid {
+                    "Ready"
+                } else {
+                    "CatalogNotReady"
+                },
+                if catalog_valid {
+                    "Complete Azure tenant contract is Ready"
+                } else {
+                    "Tenant catalog identity is unavailable"
+                },
             );
             Ok(())
         })
         .await?;
-        Ok(Action::requeue(READY_INTERVAL))
+        Ok(Action::requeue(if catalog_valid {
+            READY_INTERVAL
+        } else {
+            DEPENDENCY_INTERVAL
+        }))
     }
 
     async fn finalize(
@@ -499,7 +568,7 @@ impl<A: TenantAccess> AzureProvider<A> {
             self.update(tenant, |status| {
                 validate_status_binding(status, binding)?;
                 let management = status.management.get_or_insert_default();
-                record_uid(management, &kind, &object_name, &name, &uid)
+                management.record_uid(&kind, &object_name, &name, &uid)
             })
             .await?;
             return Ok(true);
@@ -670,52 +739,6 @@ fn validate_status_binding(
             "Azure Tenant provider binding changed".into(),
         ))
     }
-}
-
-pub(super) fn record_uid(
-    status: &mut AzureManagementStatus,
-    kind: &str,
-    object_name: &str,
-    tenant: &str,
-    uid: &str,
-) -> Result<(), ControllerError> {
-    let names = azure::AzureNames::new(tenant);
-    let slot = match (kind, object_name) {
-        ("Namespace", value) if value == names.namespace => &mut status.namespace_uid,
-        ("AzureClusterIdentity", value) if value == names.identity => {
-            &mut status.azure_cluster_identity_uid
-        }
-        ("Cluster", value) if value == names.cluster => &mut status.cluster_uid,
-        ("AzureCluster", value) if value == names.azure_cluster => &mut status.azure_cluster_uid,
-        ("KamajiControlPlane", value) if value == names.control_plane => {
-            &mut status.kamaji_control_plane_uid
-        }
-        ("KubeadmConfig", value) if value == names.pool => &mut status.kubeadm_config_uid,
-        ("AzureMachinePool", value) if value == names.pool => &mut status.azure_machine_pool_uid,
-        ("MachinePool", value) if value == names.pool => &mut status.machine_pool_uid,
-        ("ConfigMap", value) if value == names.cloud_values => {
-            &mut status.cloud_values_config_map_uid
-        }
-        ("ConfigMap", value) if value == names.network_values => {
-            &mut status.network_values_config_map_uid
-        }
-        ("Deployment", value) if value == names.status_probe => {
-            &mut status.status_probe_deployment_uid
-        }
-        ("Job", value) if value == names.addon_job => &mut status.addon_job_uid,
-        _ => {
-            return Err(ControllerError::InvalidInput(
-                "uncatalogued Azure management identity".into(),
-            ));
-        }
-    };
-    if slot.as_deref().is_some_and(|recorded| recorded != uid) {
-        return Err(ControllerError::OwnershipInvalid(
-            "Azure management object UID changed".into(),
-        ));
-    }
-    *slot = Some(uid.into());
-    Ok(())
 }
 
 pub(super) fn validate_parent(
@@ -902,25 +925,14 @@ async fn patch_cluster_bridge(
     Ok(false)
 }
 
-fn job_complete(job: &DynamicObject) -> bool {
+fn job_condition(job: &DynamicObject, kind: &str) -> bool {
     job.data
         .pointer("/status/conditions")
         .and_then(Value::as_array)
         .is_some_and(|conditions| {
             conditions
                 .iter()
-                .any(|condition| condition["type"] == "Complete" && condition["status"] == "True")
-        })
-}
-
-fn job_failed(job: &DynamicObject) -> bool {
-    job.data
-        .pointer("/status/conditions")
-        .and_then(Value::as_array)
-        .is_some_and(|conditions| {
-            conditions
-                .iter()
-                .any(|condition| condition["type"] == "Failed" && condition["status"] == "True")
+                .any(|condition| condition["type"] == kind && condition["status"] == "True")
         })
 }
 
@@ -1166,29 +1178,11 @@ async fn observe_provider_resources(
 ) -> Result<Vec<AzureProviderResourceIdentity>, ReconcileError> {
     let mut inventory = Vec::new();
     let mut seen = BTreeSet::new();
-    for definition in management::AZURE_MANAGEMENT_RESOURCES
-        .iter()
-        .filter(|definition| {
-            definition.class == ResourceClass::Descendant
-                || matches!(definition.kind, "ConfigMap" | "Deployment" | "Secret")
-        })
-    {
+    for definition in management::azure_inventory() {
         if !seen.insert((definition.api_version, definition.plural)) {
             continue;
         }
-        let api = Api::<DynamicObject>::namespaced_with(
-            client.clone(),
-            tenant,
-            &definition.api_resource(),
-        );
-        let mut items = api.list(&ListParams::default()).await?.items;
-        for item in &mut items {
-            item.types.get_or_insert(kube::core::TypeMeta {
-                api_version: definition.api_version.into(),
-                kind: definition.kind.into(),
-            });
-        }
-        inventory.extend(items);
+        inventory.extend(super::azure_finalize::list(client.clone(), tenant, definition).await?);
     }
     let explicit_uids: BTreeSet<_> = management_status
         .recorded_uids()
@@ -1237,22 +1231,7 @@ async fn observe_provider_resources(
         }
     }
     if selected.len() != inventory.len() {
-        let unknown = inventory
-            .iter()
-            .enumerate()
-            .filter(|(index, _)| !selected.contains(index))
-            .map(|(_, object)| {
-                format!(
-                    "{}/{}",
-                    object
-                        .types
-                        .as_ref()
-                        .map_or("unknown", |types| types.kind.as_str()),
-                    object.name_any()
-                )
-            })
-            .collect::<Vec<_>>()
-            .join(",");
+        let unknown = super::azure_finalize::unknown_inventory(&inventory, &selected);
         return Err(ownership(format!(
             "foreign or ownerless Azure provider resource is present: {unknown}"
         )));
@@ -1269,31 +1248,19 @@ async fn observe_provider_resources(
         let uid = object
             .uid()
             .ok_or_else(|| ownership("provider UID is missing"))?;
-        let mut owner_uids: Vec<_> = object
-            .owner_references()
-            .iter()
-            .map(|owner| owner.uid.clone())
-            .collect();
-        owner_uids.sort();
-        owner_uids.dedup();
-        if owner_uids.is_empty() || !owner_uids.iter().any(|uid| owned.contains(uid)) {
+        let identity = azure::provider_resource_identity(&object, uid);
+        if identity.owner_uids.is_empty()
+            || !identity.owner_uids.iter().any(|uid| owned.contains(uid))
+        {
             return Err(ownership(format!(
                 "Azure provider owner chain is incomplete for {}/{}",
                 types.kind,
                 object.name_any()
             )));
         }
-        let resource_id = [
-            "/status/id",
-            "/status/resourceId",
-            "/status/providerID",
-            "/spec/providerID",
-        ]
-        .into_iter()
-        .find_map(|pointer| object.data.pointer(pointer).and_then(Value::as_str))
-        .map(Into::into);
         if types.api_version.contains(".azure.com/")
-            && resource_id
+            && identity
+                .resource_id
                 .as_deref()
                 .is_none_or(|value: &str| !value.starts_with('/'))
         {
@@ -1303,15 +1270,7 @@ async fn observe_provider_resources(
                 object.name_any()
             )));
         }
-        result.push(AzureProviderResourceIdentity {
-            api_version: types.api_version.clone(),
-            kind: types.kind.clone(),
-            namespace: object.namespace(),
-            name: object.name_any(),
-            uid,
-            resource_id,
-            owner_uids,
-        });
+        result.push(identity);
     }
     result.sort_by(|left, right| {
         (
@@ -1392,10 +1351,7 @@ fn bounded_replacement(before: &[String], after: &[String]) -> bool {
         .iter()
         .map(|value| value.to_ascii_lowercase())
         .collect();
-    before == after
-        || (before.len() == after.len()
-            && before.difference(&after).count() == 1
-            && after.difference(&before).count() == 1)
+    before == after || bounded_set(before, after, 1)
 }
 
 fn bounded_node_replacement(before: &[AzureNodeIdentity], after: &[AzureNodeIdentity]) -> bool {
@@ -1407,10 +1363,7 @@ fn bounded_node_replacement(before: &[AzureNodeIdentity], after: &[AzureNodeIden
         .iter()
         .map(|node| (&node.name, &node.uid, &node.provider_id, &node.internal_ip))
         .collect();
-    before == after
-        || (before.len() == after.len()
-            && before.difference(&after).count() == 1
-            && after.difference(&before).count() == 1)
+    before == after || bounded_set(before, after, 1)
 }
 
 fn bounded_provider_replacement(

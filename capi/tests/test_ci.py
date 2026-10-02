@@ -26,7 +26,9 @@ def job(name: str) -> str:
 class CIWorkflowTests(unittest.TestCase):
     def test_tiered_checks_and_stable_aggregate(self) -> None:
         fast, e2e, high, gate = (
-            job(name) for name in ("fast-checks", "e2e", "high-capacity", "capi-tests")
+            job(name) for name in (
+                "fast-checks", "e2e", "high-capacity", "capi-tests",
+            )
         )
         self.assertNotIn("    needs:", fast + high)
         self.assertRegex(e2e, r"(?m)^    needs: fast-checks$")
@@ -41,6 +43,9 @@ class CIWorkflowTests(unittest.TestCase):
             "just test-azure-operator-contracts", "just controller-fetch",
             "just controller-verify", "just controller-lint", "just controller-test",
             "just controller-metrics", "just controller-build",
+            "just database-controller-verify", "just database-controller-lint",
+            "just database-controller-test", "just database-controller-metrics",
+            "just database-controller-build",
             "just admin-fetch", "just admin-generate-check", "just admin-lint",
             "just admin-test", "just admin-metrics", "just admin-package-check",
         ):
@@ -48,8 +53,12 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("just cache admin-build", fast)
         self.assertNotIn("run: just cache\n", fast)
         self.assertLess(e2e.index("just cache"), e2e.index("just test-e2e"))
-        self.assertIn("just test-e2e", e2e)
-        self.assertNotIn("just test-e2e-offline", e2e)
+        self.assertIn("just test-e2e-offline", e2e)
+        self.assertIn("name: Diagnose failed end-to-end", e2e)
+        self.assertIn("if: failure()", e2e)
+        self.assertIn("logs deployment/database-controller", e2e)
+        self.assertIn("CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY", e2e)
+        self.assertIn("database-manager", fast)
         self.assertIn("actions/upload-artifact@v6", fast)
         self.assertIn("controller-manager-${{ github.sha }}", fast)
         self.assertIn("actions/download-artifact@v7", e2e)
@@ -86,6 +95,8 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertTrue(all(setup_end < high.index(command) for command in targeted))
         self.assertLess(setup_end, high.index("just test-e2e-offline"))
         self.assertIn("just test-e2e-offline", high)
+        self.assertNotIn("azure-destructive", WORKFLOW)
+        self.assertNotIn("secrets.CAPI_AZURE", WORKFLOW)
         self.assertLess(high.index("just test-e2e-offline"), high.index("just destroy"))
         cleanup = high[high.index("- name: Clean up high-capacity environment"):]
         self.assertIn("if: always()", cleanup)

@@ -2,9 +2,12 @@
 from __future__ import annotations
 
 import hashlib
+import base64
 import json
+import math
 import os
 import sys
+import tempfile
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -36,11 +39,15 @@ from scripts.lib.azure.operator import (
     wait_tenant_ready,
 )
 from scripts.lib.azure.ownership import observe_azure_owned_resources
+from scripts.lib.azure.ownership import tenant_tagged_azure_resources
+from scripts.lib.catalog_lifecycle import CatalogClient, ready_entries, require_stale_identity
+from scripts.lib.kube import wait_for
 from scripts.lib.azure.proof import (
     capture_operator_deletion_proof,
     prove_operator_deletion,
 )
 from scripts.lib.config import parse_duration
+from scripts.lib.files import ensure_private_dir
 from scripts.lib.kube import kubeconfig_json_request
 from scripts.lib.process import run
 from scripts.lib.redaction import redact
@@ -49,7 +56,7 @@ from scripts.tenant import supported_versions
 
 
 T = TypeVar("T")
-ADMIN_API_SCHEMA_VERSION = 4
+ADMIN_API_SCHEMA_VERSION = 5
 
 
 def _tenant_command(*arguments: str) -> str:
@@ -95,11 +102,175 @@ def _admin_mutation(
     return envelope["data"]
 
 
+def _catalog_client(name: str, uid: str) -> CatalogClient:
+    def get(path: str) -> str:
+        return _kubectl(
+            ROOT, "get", f"--raw={ADMIN_SERVICE_PROXY}/{path}", check=True,
+        ).stdout
+
+    def mutate(method: str, path: str, payload: dict[str, object]):
+        config = _kubectl(
+            ROOT, "config", "view", "--raw", "--flatten", "--minify",
+            "-o", "json", check=False,
+        )
+        return kubeconfig_json_request(
+            config, method, f"{ADMIN_SERVICE_PROXY}/{path}", payload, 300,
+        )
+
+    return CatalogClient(get, mutate, name, uid)
+
+
+def _catalog_record(name: str) -> dict:
+    return json.loads(_kubectl(
+        ROOT, "-n", f"tenant-db-{name}", "get",
+        f"tenantdatabasecatalog/{name}", "-o", "json",
+    ).stdout)
+
+
+def _disk_records(name: str, logical_uids: set[str],
+                  group_id: str) -> dict[str, tuple[str, str]]:
+    catalog = _catalog_record(name)
+    entries = catalog.get("status", {}).get("entries", {})
+    if set(entries) != logical_uids:
+        raise RuntimeError("Azure catalog observations are incomplete")
+    disks = {}
+    for uid, entry in entries.items():
+        storage = entry.get("storage", [])
+        if len(storage) != 3 or {item.get("ordinal") for item in storage} != {1, 2, 3}:
+            raise RuntimeError("Azure entry does not record three disks")
+        for item in storage:
+            disk = item.get("disk")
+            arm_id = item.get("armID")
+            if not isinstance(disk, dict) or not disk.get("uid") or not disk.get("name"):
+                raise RuntimeError("Azure ASO disk identity is absent")
+            if not isinstance(arm_id, str) or arm_id.lower() != (
+                f"{group_id.rstrip('/')}/providers/Microsoft.Compute/disks/"
+                f"{disk['name']}"
+            ).lower():
+                raise RuntimeError("Azure disk ARM ID is invalid")
+            if arm_id.lower() in disks:
+                raise RuntimeError("Azure disk ARM IDs overlap")
+            disks[arm_id.lower()] = (disk["name"], disk["uid"])
+    if len(disks) != 9:
+        raise RuntimeError("Azure gate requires nine exact disk IDs")
+    return disks
+
+
+def _require_disks_absent(config: Mapping[str, str], tenant: str,
+                          disks: Mapping[str, tuple[str, str]]) -> None:
+    namespace = f"tenant-db-storage-{tenant}"
+    for arm_id, (name, _) in disks.items():
+        result = _kubectl(
+            ROOT, "-n", namespace, "get", f"disks.compute.azure.com/{name}",
+            "--ignore-not-found=true", "-o", "name",
+        )
+        if result.stdout.strip():
+            raise RuntimeError(f"recorded ASO Disk remained: {name}")
+        response = _az(
+            "rest", "--method", "get",
+            "--url", f"https://management.azure.com{arm_id}?api-version=2024-03-02",
+            "--output", "json", check=False,
+        )
+        if response.returncode == 0 or not any(
+            code in response.stderr for code in ("ResourceNotFound", "NotFound", "(404)")
+        ):
+            raise RuntimeError(f"ARM disk absence is unproven: {name}")
+
+
+def _require_catalog_absent(name: str) -> None:
+    for resource in (
+        f"namespace/tenant-db-{name}",
+        f"namespace/tenant-db-storage-{name}",
+    ):
+        response = _kubectl(ROOT, "get", resource, "--ignore-not-found=true", "-o", "name")
+        if response.stdout.strip():
+            raise RuntimeError(f"Azure database namespace remained: {resource}")
+
+
+def _tenant_kubectl(tenant: Mapping[str, object], *arguments: str):
+    name = tenant["metadata"]["name"]
+    bound = tenant["status"]["provider"]["kubeconfig"]
+    secret = json.loads(_kubectl(
+        ROOT, "-n", name, "get", f"secret/{name}-kubeconfig", "-o", "json",
+    ).stdout)
+    data = base64.b64decode(secret["data"]["value"], validate=True)
+    if (
+        secret["metadata"]["uid"] != bound["secretUID"]
+        or hashlib.sha256(data).hexdigest() != bound["contentSha256"]
+    ):
+        raise RuntimeError("Azure Tenant kubeconfig identity changed")
+    scratch = ROOT / ".runtime" / "azure-tenant-lifecycle"
+    ensure_private_dir(scratch)
+    with tempfile.TemporaryDirectory(dir=scratch) as directory:
+        path = Path(directory) / "tenant.kubeconfig"
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "wb") as output:
+            output.write(data)
+        return run(
+            [str(ROOT / ".tools/bin/kubectl"), "--kubeconfig", str(path), *arguments],
+            timeout=300,
+        )
+
+
+def _failover(tenant: Mapping[str, object], entry: Mapping[str, object]) -> None:
+    namespace, cluster = entry["namespace"], entry["cluster"]
+    reference = f"clusters.postgresql.cnpg.io/{cluster}"
+    previous = _tenant_kubectl(
+        tenant, "-n", namespace, "get", reference,
+        "-o", "jsonpath={.status.currentPrimary}",
+    ).stdout.strip()
+    if previous not in {item["name"] for item in entry["instanceTopology"]}:
+        raise RuntimeError("Azure CNPG primary is not an observed instance")
+    _tenant_kubectl(tenant, "-n", namespace, "delete", f"pod/{previous}", "--wait=false")
+    wait_for(
+        "Azure CNPG failover", 1800, 10,
+        lambda: (current if (current := _tenant_kubectl(
+            tenant, "-n", namespace, "get", reference,
+            "-o", "jsonpath={.status.currentPrimary}",
+        ).stdout.strip()) and current != previous else None),
+    )
+
+
+def _restart_database_controller() -> None:
+    _kubectl(ROOT, "-n", "tenant-system", "rollout", "restart",
+             "deployment/database-controller")
+    _kubectl(ROOT, "-n", "tenant-system", "rollout", "status",
+             "deployment/database-controller", "--timeout=600s")
+
+
+def _require_clean_tagged_foundation(config: Mapping[str, str], name: str) -> None:
+    group = names(config)["resourceGroup"]
+    tags = _json(["az", "group", "show", "--name", group, "--query", "tags", "-o", "json"])
+    if not isinstance(tags, dict) or any(tags.get(key) != value for key, value in {
+        "cnpg-vcluster-experiment": "azure-capi",
+        "cnpg-vcluster-prefix": config["AZURE_PREFIX"],
+        "cnpg-vcluster-owner": "cnpg-vcluster",
+    }.items()):
+        raise RuntimeError("Azure destructive gate requires a tagged experiment foundation")
+    tenants = json.loads(_kubectl(ROOT, "get", "tenants", "-o", "json").stdout)
+    catalogs = json.loads(_kubectl(
+        ROOT, "get", "tenantdatabasecatalogs", "--all-namespaces", "-o", "json",
+    ).stdout)
+    disks = _json([
+        "az", "disk", "list", "--resource-group", group, "--output", "json",
+    ])
+    if (
+        not isinstance(tenants, dict) or not isinstance(tenants.get("items"), list)
+        or not isinstance(catalogs, dict) or not isinstance(catalogs.get("items"), list)
+        or not isinstance(disks, list)
+        or tenants["items"] or catalogs["items"]
+        or disks
+        or read_tenant(ROOT, name) is not None
+        or tenant_tagged_azure_resources(config, name)
+    ):
+        raise RuntimeError("Azure destructive gate requires empty Tenant and catalog inventories")
+
+
 def _admin_create_tenant(spec) -> dict[str, object]:
     created = _admin_mutation(
         "POST",
         "api/v1/tenants",
-        {"name": spec.name, "workers": spec.workers, "databases": None},
+        {"name": spec.name, "workers": spec.workers},
     )
     identity = created.get("identity")
     if (
@@ -155,20 +326,10 @@ def _require_status(tenant: str, classification: str) -> dict[str, object]:
 
 
 def _ensure_tenant_ready(config: Mapping[str, str], spec) -> dict[str, object]:
-    existing = read_tenant(ROOT, spec.name)
-    metadata = existing.get("metadata") if isinstance(existing, dict) else None
-    if isinstance(metadata, dict) and metadata.get("deletionTimestamp"):
-        wait_tenant_absent(ROOT, spec.name)
-        existing = None
-    if existing is None:
-        _admin_create_tenant(spec)
-        wait_tenant_ready(ROOT, spec.name)
-    else:
-        if existing.get("spec") != tenant_document(spec)["spec"]:
-            raise RuntimeError(
-                "Azure lifecycle gate found an incompatible existing Tenant"
-            )
-        wait_tenant_ready(ROOT, spec.name)
+    if read_tenant(ROOT, spec.name) is not None:
+        raise RuntimeError("Azure lifecycle gate requires an absent Tenant")
+    _admin_create_tenant(spec)
+    wait_tenant_ready(ROOT, spec.name)
     return _require_status(spec.name, "ready")
 
 
@@ -268,6 +429,96 @@ def _ready_snapshot(
     snapshot = build_worker_snapshot(readiness, vmss["id"], live_instances)
     owned = observe_azure_owned_resources(ROOT, config, tenant)
     return tenant, snapshot, owned
+
+
+def _require_runtime_identity(
+    spec, expected: Mapping[str, object], current: Mapping[str, object] | None,
+) -> Mapping[str, object]:
+    if not isinstance(current, dict):
+        raise RuntimeError("Azure database runtime Tenant disappeared or is invalid")
+    metadata = current.get("metadata")
+    previous = expected.get("metadata")
+    if (
+        not isinstance(metadata, dict)
+        or not isinstance(previous, dict)
+        or metadata.get("name") != spec.name
+        or not isinstance(previous.get("uid"), str)
+        or not previous["uid"]
+        or metadata.get("uid") != previous["uid"]
+        or metadata.get("deletionTimestamp")
+        or current.get("spec") != tenant_document(spec)["spec"]
+        or tenant_status(spec.name, current).classification != "ready"
+    ):
+        raise RuntimeError("Azure database runtime Tenant identity or readiness changed")
+    provider = _provider(current)
+    original = _provider(expected)
+    if any(
+        not isinstance(original.get(key), dict)
+        or not original[key]
+        or provider.get(key) != original[key]
+        for key in ("binding", "management", "kubeconfig")
+    ):
+        raise RuntimeError("Azure database runtime Tenant binding changed")
+    return current
+
+
+def _require_only_runtime_tenant(spec, expected: Mapping[str, object]) -> None:
+    inventory = json.loads(_kubectl(ROOT, "get", "tenants", "-o", "json").stdout)
+    if (
+        not isinstance(inventory, dict)
+        or inventory.get("kind") != "TenantList"
+        or not isinstance(inventory.get("metadata"), dict)
+        or inventory["metadata"].get("continue", "") != ""
+        or not isinstance(inventory.get("items"), list)
+        or len(inventory["items"]) != 1
+    ):
+        raise RuntimeError("Azure database runtime requires one complete Tenant inventory")
+    _require_runtime_identity(spec, expected, inventory["items"][0])
+
+
+def _remaining_runtime_seconds(deadline: float) -> int:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("Azure database runtime and capability timed out")
+    return math.ceil(remaining)
+
+
+def _install_database_runtime(
+    spec, tenant: Mapping[str, object], deadline: float,
+) -> None:
+    _remaining_runtime_seconds(deadline)
+    _require_only_runtime_tenant(spec, tenant)
+    attempt_seconds = min(420, _remaining_runtime_seconds(deadline))
+    run(
+        [
+            "timeout", "--kill-after=5s", f"{attempt_seconds}s",
+            "just", "azure-database-runtime-once",
+        ],
+        cwd=ROOT,
+        timeout=attempt_seconds + 15,
+    )
+    _require_only_runtime_tenant(spec, tenant)
+
+
+def _wait_database_capability(
+    spec, tenant: Mapping[str, object], deadline: float,
+) -> None:
+    def available() -> Mapping[str, object] | None:
+        current = _require_runtime_identity(
+            spec, tenant, read_tenant(ROOT, spec.name),
+        )
+        return (
+            current
+            if current.get("status", {}).get("databaseCapability", {}).get("available")
+            else None
+        )
+
+    wait_for(
+        "Azure catalog capability",
+        _remaining_runtime_seconds(deadline),
+        10,
+        available,
+    )
 
 
 def _wait_ready_snapshot(
@@ -387,12 +638,106 @@ def main(arguments: list[str]) -> int:
         "foundation-readiness",
         lambda: _inspect_foundation(ROOT, config, require_healthy=True)[0],
     )
+    phase("clean-tagged-foundation", lambda: _require_clean_tagged_foundation(config, spec.name))
     phase("create-ready", lambda: _ensure_tenant_ready(config, spec))
 
     tenant, before, owned_before = phase(
         "worker-identity-verification",
         lambda: _ready_snapshot(config, spec),
     )
+    runtime_deadline = time.monotonic() + parse_duration(config["AZURE_TENANT_TIMEOUT"])
+    phase(
+        "database-runtime-install",
+        lambda: _install_database_runtime(spec, tenant, runtime_deadline),
+    )
+    phase(
+        "database-capability-readiness",
+        lambda: _wait_database_capability(spec, tenant, runtime_deadline),
+    )
+    catalog = _catalog_client(spec.name, tenant["metadata"]["uid"])
+    initial = phase("empty-catalog", catalog.read)
+    if initial["databases"]:
+        raise RuntimeError("Azure Tenant implicitly created database entries")
+    catalog_uid = initial["catalogUid"]
+    names_by_uid = {
+        name: phase(f"add-{name}", lambda name=name: catalog.add(catalog_uid, name))
+        for name in ("alpha", "beta", "gamma")
+    }
+    def wait_database_ready():
+        projected = catalog.wait(
+            lambda item: len(item["databases"]) == 3
+            and all(entry["phase"] == "ready" and entry["readyInstances"] == 3
+                    for entry in item["databases"]),
+            parse_duration(config["AZURE_TENANT_TIMEOUT"]), catalog_uid,
+        )
+        return ready_entries(projected, {"alpha", "beta", "gamma"}, "azure")
+
+    databases = phase("nine-instance-readiness", wait_database_ready)
+    for name, entry in databases.items():
+        phase(f"write-{name}", lambda name=name, entry=entry:
+              catalog.query(catalog_uid, entry, f"marker-{name}", write=True))
+        phase(f"query-{name}", lambda name=name, entry=entry:
+              catalog.query(catalog_uid, entry, f"marker-{name}"))
+    _failover(tenant, databases["alpha"])
+    phase("database-controller-restart", _restart_database_controller)
+    databases = phase("post-restart-readiness", wait_database_ready)
+    for name, entry in databases.items():
+        catalog.query(catalog_uid, entry, f"marker-{name}")
+    old_disks = phase(
+        "nine-exact-disk-identities",
+        lambda: _disk_records(
+            spec.name, set(names_by_uid.values()), foundation_before["resourceGroupId"],
+        ),
+    )
+    old_beta_names = {
+        item["disk"]["name"]
+        for item in _catalog_record(spec.name)["status"]["entries"][
+            names_by_uid["beta"]
+        ]["storage"]
+    }
+    old_beta_entry = databases["beta"]
+    catalog.delete(catalog_uid, names_by_uid["beta"], "beta")
+    catalog.wait(
+        lambda item: not any(entry["logicalUid"] == names_by_uid["beta"]
+                             for entry in item["databases"]),
+        parse_duration(config["AZURE_TENANT_TIMEOUT"]), catalog_uid,
+    )
+    old_beta_disks = {
+        arm: identity for arm, identity in old_disks.items()
+        if identity[0] in old_beta_names
+    }
+    if len(old_beta_disks) != 3:
+        raise RuntimeError("deleted Azure entry disk identities are incomplete")
+    phase("deleted-entry-disk-absence", lambda:
+          _require_disks_absent(config, spec.name, old_beta_disks))
+    replacement = catalog.add(catalog_uid, "beta")
+    if replacement == names_by_uid["beta"]:
+        raise RuntimeError("recreated Azure entry reused stale logical UID")
+    catalog.require_stale_query(catalog_uid, old_beta_entry)
+    names_by_uid["beta"] = replacement
+    databases = phase("entry-recreation", wait_database_ready)
+    if databases["beta"]["logicalUid"] != replacement:
+        raise RuntimeError("recreated Azure entry identity changed")
+    require_stale_identity(catalog.mutate(
+        "DELETE", f"{catalog.path}/{old_beta_entry['logicalUid']}", {
+            "catalogUid": catalog_uid,
+            "logicalUid": old_beta_entry["logicalUid"],
+            "confirmation": "beta",
+        },
+    ))
+    for name, entry in databases.items():
+        if name == "beta":
+            catalog.assert_fresh(catalog_uid, entry)
+            catalog.query(catalog_uid, entry, f"marker-{name}", write=True)
+        catalog.query(catalog_uid, entry, f"marker-{name}")
+    disks = phase(
+        "recreated-nine-disk-identities",
+        lambda: _disk_records(
+            spec.name, set(names_by_uid.values()), foundation_before["resourceGroupId"],
+        ),
+    )
+    if set(disks) & set(old_beta_disks):
+        raise RuntimeError("recreated Azure entry reused stale disks")
     metadata = tenant.get("metadata")
     binding = _provider(tenant).get("binding")
     if not isinstance(metadata, dict) or not isinstance(binding, dict):
@@ -466,6 +811,13 @@ def main(arguments: list[str]) -> int:
         or binding_after.get("operationId") != provider_operation_id
     ):
         raise RuntimeError("Azure Tenant identity changed during worker recovery")
+    databases = phase("database-recovery-after-worker-replacement", wait_database_ready)
+    for name, entry in databases.items():
+        catalog.query(catalog_uid, entry, f"marker-{name}")
+    if _disk_records(
+        spec.name, set(names_by_uid.values()), foundation_before["resourceGroupId"],
+    ) != disks:
+        raise RuntimeError("Azure worker replacement changed retained disk identities")
     proof = capture_operator_deletion_proof(ROOT, config, tenant_after)
 
     phase(
@@ -480,6 +832,8 @@ def main(arguments: list[str]) -> int:
         "external-absence-proof",
         lambda: prove_operator_deletion(ROOT, config, proof),
     )
+    phase("nine-exact-disk-absence", lambda: _require_disks_absent(config, spec.name, disks))
+    phase("catalog-and-storage-namespace-absence", lambda: _require_catalog_absent(spec.name))
     phase(
         "allocation-release-proof",
         lambda: _require_allocation_lease_absent(allocation_lease_name),
@@ -506,6 +860,15 @@ def main(arguments: list[str]) -> int:
         )
 
     phase("recreation", verify_recreation)
+    recreated = read_tenant(ROOT, spec.name)
+    phase(
+        "recreated-tenant-cascade-cleanup",
+        lambda: (
+            _admin_delete_tenant(spec.name, recreated["metadata"]["uid"]),
+            wait_tenant_absent(ROOT, spec.name),
+            _require_status(spec.name, "absent"),
+        ),
+    )
     return 0
 
 

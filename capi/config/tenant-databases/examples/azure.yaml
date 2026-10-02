@@ -1,0 +1,10 @@
+apiVersion: tenancy.cnpg-vcluster.io/v1alpha1
+kind: TenantDatabaseCatalog
+metadata:
+  name: azure-example
+  namespace: tenant-db-azure-example
+spec:
+  tenantName: azure-example
+  tenantUID: replace-with-live-tenant-uid
+  closed: false
+  entries: {}

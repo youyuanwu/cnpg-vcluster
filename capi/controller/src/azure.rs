@@ -567,6 +567,43 @@ pub fn validate_binding(
     }
 }
 
+pub fn provider_resource_identity(
+    object: &DynamicObject,
+    uid: String,
+) -> AzureProviderResourceIdentity {
+    let types = object
+        .types
+        .as_ref()
+        .expect("provider resource GVK validated");
+    let mut owner_uids: Vec<_> = object
+        .metadata
+        .owner_references
+        .iter()
+        .flatten()
+        .map(|owner| owner.uid.clone())
+        .collect();
+    owner_uids.sort();
+    owner_uids.dedup();
+    let resource_id = [
+        "/status/id",
+        "/status/resourceId",
+        "/status/providerID",
+        "/spec/providerID",
+    ]
+    .into_iter()
+    .find_map(|pointer| object.data.pointer(pointer).and_then(Value::as_str))
+    .map(Into::into);
+    AzureProviderResourceIdentity {
+        api_version: types.api_version.clone(),
+        kind: types.kind.clone(),
+        namespace: object.metadata.namespace.clone(),
+        name: object.metadata.name.clone().unwrap_or_default(),
+        uid,
+        resource_id,
+        owner_uids,
+    }
+}
+
 pub fn validate_live_object(
     desired: &DynamicObject,
     live: &DynamicObject,
@@ -655,60 +692,61 @@ fn desired_subset(desired: &Value, live: &Value, path: &str) -> Result<(), Azure
     }
 }
 
-impl AzureManagementStatus {
-    pub fn uid_for(&self, kind: &str, name: &str, tenant: &str) -> Option<&str> {
-        let names = AzureNames::new(tenant);
-        match (kind, name) {
-            ("Namespace", value) if value == names.namespace => self.namespace_uid.as_deref(),
-            ("AzureClusterIdentity", value) if value == names.identity => {
-                self.azure_cluster_identity_uid.as_deref()
+macro_rules! management_ids {
+    ($(($kind:literal, $name:ident, $field:ident)),+ $(,)?) => {
+        impl AzureManagementStatus {
+            pub fn uid_for(&self, kind: &str, name: &str, tenant: &str) -> Option<&str> {
+                let names = AzureNames::new(tenant);
+                match (kind, name) {
+                    $(($kind, value) if value == names.$name => self.$field.as_deref(),)+
+                    _ => None,
+                }
             }
-            ("Cluster", value) if value == names.cluster => self.cluster_uid.as_deref(),
-            ("AzureCluster", value) if value == names.azure_cluster => {
-                self.azure_cluster_uid.as_deref()
-            }
-            ("KamajiControlPlane", value) if value == names.control_plane => {
-                self.kamaji_control_plane_uid.as_deref()
-            }
-            ("KubeadmConfig", value) if value == names.pool => self.kubeadm_config_uid.as_deref(),
-            ("AzureMachinePool", value) if value == names.pool => {
-                self.azure_machine_pool_uid.as_deref()
-            }
-            ("MachinePool", value) if value == names.pool => self.machine_pool_uid.as_deref(),
-            ("ConfigMap", value) if value == names.cloud_values => {
-                self.cloud_values_config_map_uid.as_deref()
-            }
-            ("ConfigMap", value) if value == names.network_values => {
-                self.network_values_config_map_uid.as_deref()
-            }
-            ("Deployment", value) if value == names.status_probe => {
-                self.status_probe_deployment_uid.as_deref()
-            }
-            ("Job", value) if value == names.addon_job => self.addon_job_uid.as_deref(),
-            _ => None,
-        }
-    }
 
-    pub fn recorded_uids(&self) -> BTreeSet<&str> {
-        [
-            self.namespace_uid.as_deref(),
-            self.azure_cluster_identity_uid.as_deref(),
-            self.cluster_uid.as_deref(),
-            self.azure_cluster_uid.as_deref(),
-            self.kamaji_control_plane_uid.as_deref(),
-            self.kubeadm_config_uid.as_deref(),
-            self.azure_machine_pool_uid.as_deref(),
-            self.machine_pool_uid.as_deref(),
-            self.cloud_values_config_map_uid.as_deref(),
-            self.network_values_config_map_uid.as_deref(),
-            self.status_probe_deployment_uid.as_deref(),
-            self.addon_job_uid.as_deref(),
-        ]
-        .into_iter()
-        .flatten()
-        .filter(|uid| !uid.is_empty())
-        .collect()
-    }
+            pub fn record_uid(
+                &mut self, kind: &str, name: &str, tenant: &str, uid: &str,
+            ) -> Result<(), crate::error::ControllerError> {
+                use crate::error::ControllerError;
+                let names = AzureNames::new(tenant);
+                let slot = match (kind, name) {
+                    $(($kind, value) if value == names.$name => &mut self.$field,)+
+                    _ => return Err(ControllerError::InvalidInput(
+                        "uncatalogued Azure management identity".into(),
+                    )),
+                };
+                if slot.as_deref().is_some_and(|recorded| recorded != uid) {
+                    return Err(ControllerError::OwnershipInvalid(
+                        "Azure management object UID changed".into(),
+                    ));
+                }
+                *slot = Some(uid.into());
+                Ok(())
+            }
+
+            pub fn recorded_uids(&self) -> BTreeSet<&str> {
+                [$(self.$field.as_deref(),)+]
+                    .into_iter()
+                    .flatten()
+                    .filter(|uid| !uid.is_empty())
+                    .collect()
+            }
+        }
+    };
+}
+
+management_ids! {
+    ("Namespace", namespace, namespace_uid),
+    ("AzureClusterIdentity", identity, azure_cluster_identity_uid),
+    ("Cluster", cluster, cluster_uid),
+    ("AzureCluster", azure_cluster, azure_cluster_uid),
+    ("KamajiControlPlane", control_plane, kamaji_control_plane_uid),
+    ("KubeadmConfig", pool, kubeadm_config_uid),
+    ("AzureMachinePool", pool, azure_machine_pool_uid),
+    ("MachinePool", pool, machine_pool_uid),
+    ("ConfigMap", cloud_values, cloud_values_config_map_uid),
+    ("ConfigMap", network_values, network_values_config_map_uid),
+    ("Deployment", status_probe, status_probe_deployment_uid),
+    ("Job", addon_job, addon_job_uid),
 }
 
 pub fn validate_provider_identity(
@@ -1019,6 +1057,9 @@ mod tests {
             .unwrap();
         assert!(job.contains("--version 1.32.3"));
         assert!(job.contains("--version v3.32.2"));
+        assert!(!job.contains("cnpg"));
+        assert!(!job.contains("azuredisk"));
+        assert!(!job.contains("wget"));
         assert!(
             !serde_json::to_string(&objects)
                 .unwrap()

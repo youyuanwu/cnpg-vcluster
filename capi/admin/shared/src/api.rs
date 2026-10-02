@@ -77,5 +77,6 @@ pub enum ApiErrorCode {
     QueryResponseTooLarge,
     QueryTimedOut,
     QueryOutcomeUnknown,
+    MutationOutcomeUnknown,
     Internal,
 }

@@ -47,7 +47,7 @@ fn owner(object: &DynamicObject) -> OwnerReference {
 }
 
 fn tenant() -> Tenant {
-    let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+    let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1));
     tenant.metadata.uid = Some("tenant-uid".into());
     tenant.status = Some(TenantStatus {
         provider: Some(TenantProviderStatus::Local(LocalProviderStatus {
@@ -130,7 +130,7 @@ fn root_markers_require_uid_and_every_identity_field() {
 fn root_rejects_tenant_owner_but_provider_owners_are_separately_checked() {
     let mut metadata = marked_meta();
     metadata.owner_references = Some(vec![OwnerReference {
-        api_version: "tenancy.cnpg-vcluster.io/v1alpha3".into(),
+        api_version: "tenancy.cnpg-vcluster.io/v1alpha4".into(),
         kind: "Tenant".into(),
         name: "tenant-a".into(),
         uid: "tenant-uid".into(),

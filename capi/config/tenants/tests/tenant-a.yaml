@@ -1,4 +1,4 @@
-apiVersion: tenancy.cnpg-vcluster.io/v1alpha3
+apiVersion: tenancy.cnpg-vcluster.io/v1alpha4
 kind: Tenant
 metadata:
   name: tenant-a
@@ -7,4 +7,3 @@ spec:
   workers: 1
   provider:
     type: local
-    databases: 1

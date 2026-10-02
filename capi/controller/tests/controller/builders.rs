@@ -61,11 +61,11 @@ fn catalog_watch_mapping_preserves_typed_and_dynamic_fallbacks() {
 
 impl Fixture {
     fn new() -> Self {
-        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 2, 1));
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 2));
         tenant.metadata.uid = Some("uid-a".into());
         Self {
             tenant,
-            spec: CanonicalSpec::local("1.36.4", 2, 1),
+            spec: CanonicalSpec::local("1.36.4", 2),
             inputs: Inputs {
                 ownership_label: "example.io/owned".into(),
                 lab_prefix: "example".into(),
@@ -96,7 +96,6 @@ impl Fixture {
             endpoint: "172.18.255.1:6443",
             pod_cidr: "10.20.0.0/16",
             service_cidr: "10.21.0.0/16",
-            database_count: self.spec.local_databases().unwrap(),
             volume_path: "/var/lib/docker/volumes/tenant/_data",
             worker_bootstrap_commands: &[],
             inputs: &self.inputs,
@@ -588,60 +587,14 @@ fn kube_proxy_endpoint_config_rbac_and_privileged_mount_contract() {
 }
 
 #[test]
-fn storage_and_cnpg_all_count_pairs_affinity_and_exact_prebinding() {
-    let mut fixture = Fixture::new();
-    for workers in 1..=3 {
-        for databases in 1..=3 {
-            fixture.spec.workers = workers;
-            fixture.spec.provider = tenant_controller::api::TenantProviderSpec::Local { databases };
-            let context = fixture.context();
-            let storage = to_dynamic(&storage_class(&context, "capi-hostpath")).unwrap();
-            assert_markers(&storage, "storage");
-            assert_eq!(
-                storage.data,
-                json!({"provisioner":"kubernetes.io/no-provisioner","volumeBindingMode":"Immediate","reclaimPolicy":"Retain"})
-            );
-            let objects = cnpg_objects(&context, "capi-hostpath", "postgres:exact").unwrap();
-            assert_eq!(objects.len(), databases as usize + 2);
-            for object in &objects {
-                assert_markers(object, "cnpg");
-            }
-            assert_eq!(objects[0].metadata.name.as_deref(), Some("database"));
-            assert_eq!(objects[0].types.as_ref().unwrap().kind, "Namespace");
-            for ordinal in 1..=databases {
-                let name = format!("capi-postgres-pv-{ordinal}");
-                let volume = find(&objects, "PersistentVolume", &name);
-                assert!(volume.metadata.namespace.is_none());
-                assert_eq!(
-                    volume.data,
-                    json!({"spec":{
-                        "capacity":{"storage":"1Gi"},"accessModes":["ReadWriteOnce"],
-                        "persistentVolumeReclaimPolicy":"Retain","storageClassName":"capi-hostpath",
-                        "claimRef":{"namespace":"database","name":format!("capi-postgres-{ordinal}")},
-                        "hostPath":{"path":format!("/var/lib/storage/volumes/cnpg/{ordinal}"),"type":"DirectoryOrCreate"}
-                    }})
-                );
-                assert!(volume.data["spec"].get("nodeAffinity").is_none());
-            }
-            let cluster = find(&objects, "Cluster", "capi-postgres");
-            assert_eq!(
-                cluster.types.as_ref().unwrap().api_version,
-                "postgresql.cnpg.io/v1"
-            );
-            assert_eq!(cluster.metadata.namespace.as_deref(), Some("database"));
-            assert_eq!(
-                cluster.data,
-                json!({"spec":{
-                    "instances":databases,"imageName":"postgres:exact",
-                    "enableSuperuserAccess":true,
-                    "affinity":{"enablePodAntiAffinity":true,"podAntiAffinityType":if databases > workers {"preferred"} else {"required"},"topologyKey":"kubernetes.io/hostname"},
-                    "bootstrap":{"initdb":{"database":"app","owner":"app"}},
-                    "storage":{"size":"1Gi","storageClass":"capi-hostpath"},
-                    "resources":{"requests":{"cpu":"100m","memory":"256Mi"},"limits":{"cpu":"1","memory":"1Gi"}}
-                }})
-            );
-        }
-    }
+fn tenant_prepares_storage_policy_without_an_implicit_postgres_cluster() {
+    let fixture = Fixture::new();
+    let storage = to_dynamic(&storage_class(&fixture.context(), "capi-hostpath")).unwrap();
+    assert_markers(&storage, "storage");
+    assert_eq!(
+        storage.data,
+        json!({"provisioner":"kubernetes.io/no-provisioner","volumeBindingMode":"Immediate","reclaimPolicy":"Retain"})
+    );
 }
 
 #[test]

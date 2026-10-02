@@ -1,6 +1,7 @@
 use tenant_admin_shared::{
     ADMIN_CONTAINER_PORT, ADMIN_NAMESPACE, ADMIN_RESOURCE_NAME, ADMIN_SERVICE_PORT,
     API_SCHEMA_NAME, API_SCHEMA_VERSION, ApiEnvelope, ApiError, ApiErrorCode, ApiErrorEnvelope,
+    catalog::{CatalogQueryRequest, CatalogView, DatabaseAddRequest, DatabaseDeleteRequest},
     lifecycle::{
         CreationCapability, TenantCreateRequest, TenantCreateResponse, TenantDeleteRequest,
         TenantDeleteResponse, TenantDeleteState, TenantField, TenantFieldError,
@@ -17,9 +18,10 @@ use tenant_admin_shared::{
         TopologyNodeKind, UnknownProviderView,
     },
     routes::{
-        API_OVERVIEW_PATH, API_PREFIX, API_TENANT_CREATE_PATH, API_TENANT_DATABASE_QUERY_PATH,
-        API_TENANT_DELETE_PATH, API_TENANT_PATH, API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH,
-        FRONTEND_FALLBACK_PATH, HEALTH_PATH, READINESS_PATH, TENANT_ADMIN_UNSAFE_REQUEST_HEADER,
+        API_DATABASE_PATH, API_DATABASE_QUERY_PATH, API_DATABASES_PATH, API_OVERVIEW_PATH,
+        API_PREFIX, API_TENANT_CREATE_PATH, API_TENANT_DATABASE_QUERY_PATH, API_TENANT_DELETE_PATH,
+        API_TENANT_PATH, API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH, FRONTEND_FALLBACK_PATH,
+        HEALTH_PATH, READINESS_PATH, TENANT_ADMIN_UNSAFE_REQUEST_HEADER,
         TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
     },
 };
@@ -27,7 +29,7 @@ use tenant_admin_shared::{
 #[test]
 fn deployment_and_route_constants_are_exact() {
     assert_eq!(API_SCHEMA_NAME, "tenant-admin");
-    assert_eq!(API_SCHEMA_VERSION, 4);
+    assert_eq!(API_SCHEMA_VERSION, 5);
     assert_eq!(ADMIN_RESOURCE_NAME, "tenant-admin");
     assert_eq!(ADMIN_NAMESPACE, "tenant-system");
     assert_eq!(ADMIN_CONTAINER_PORT, 8080);
@@ -39,6 +41,12 @@ fn deployment_and_route_constants_are_exact() {
     assert_eq!(API_TENANT_CREATE_PATH, API_TENANTS_PATH);
     assert_eq!(API_TENANT_DELETE_PATH, API_TENANT_PATH);
     assert_eq!(API_TENANT_TOPOLOGY_PATH, "/api/v1/tenants/{name}/topology");
+    assert_eq!(API_DATABASES_PATH, "/api/v1/tenants/{name}/databases");
+    assert_eq!(API_DATABASE_PATH, "/api/v1/tenants/{name}/databases/{uid}");
+    assert_eq!(
+        API_DATABASE_QUERY_PATH,
+        "/api/v1/tenants/{name}/databases/{uid}/query"
+    );
     assert_eq!(
         API_TENANT_DATABASE_QUERY_PATH,
         "/api/v1/tenants/{name}/database/query"
@@ -54,15 +62,76 @@ fn deployment_and_route_constants_are_exact() {
 }
 
 #[test]
+fn catalog_contracts_carry_exact_catalog_entry_and_instance_identities() {
+    let catalog = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+    let logical = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+    let create = DatabaseAddRequest {
+        catalog_uid: catalog.into(),
+        name: "reporting".into(),
+        instances: 3,
+    };
+    let delete = DatabaseDeleteRequest {
+        catalog_uid: catalog.into(),
+        logical_uid: logical.into(),
+        confirmation: "reporting".into(),
+    };
+    let query = CatalogQueryRequest {
+        catalog_uid: catalog.into(),
+        logical_uid: logical.into(),
+        instance: "pg-one".into(),
+        instance_uid: "pod-uid".into(),
+        database: "postgres".into(),
+        sql: "select 1".into(),
+    };
+    let create_json = serde_json::to_value(ApiEnvelope::new(create)).unwrap();
+    assert_eq!(create_json["schemaVersion"], 5);
+    assert_eq!(create_json["data"]["catalogUid"], catalog);
+    assert_eq!(serde_json::to_value(delete).unwrap()["logicalUid"], logical);
+    assert_eq!(
+        serde_json::to_value(query).unwrap()["instanceUid"],
+        "pod-uid"
+    );
+    assert!(
+        serde_json::from_str::<DatabaseAddRequest>(
+            r#"{"catalogUid":"c","name":"n","instances":1,"unexpected":"ignore"}"#
+        )
+        .is_err()
+    );
+    assert!(serde_json::from_str::<CatalogQueryRequest>(
+        r#"{"catalogUid":"c","logicalUid":"u","instance":"p","database":"postgres","sql":"select 1"}"#
+    ).is_err());
+    let view = CatalogView {
+        tenant: "tenant-a".into(),
+        tenant_uid: "tenant-uid".into(),
+        catalog_uid: catalog.into(),
+        resource_version: "4".into(),
+        closed: false,
+        capability_available: false,
+        databases: vec![],
+    };
+    let serialized = serde_json::to_value(&view).unwrap();
+    assert_eq!(serialized["capabilityAvailable"], false);
+    assert_eq!(
+        serde_json::from_value::<CatalogView>(serialized).unwrap(),
+        view
+    );
+    let mut missing = serde_json::to_value(view).unwrap();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("capabilityAvailable");
+    assert!(serde_json::from_value::<CatalogView>(missing).is_err());
+}
+
+#[test]
 fn lifecycle_contracts_are_versioned_provider_neutral_and_uid_bound() {
     let create = TenantCreateRequest {
         name: "demo".into(),
         workers: 2,
-        databases: Some(1),
     };
     assert_eq!(
         serde_json::to_string(&create).unwrap(),
-        r#"{"name":"demo","workers":2,"databases":1}"#
+        r#"{"name":"demo","workers":2}"#
     );
     let identity = TenantMutationIdentity {
         name: "demo".into(),
@@ -82,7 +151,7 @@ fn lifecycle_contracts_are_versioned_provider_neutral_and_uid_bound() {
         uid: "tenant-uid".into(),
         confirmation: "demo".into(),
     };
-    assert_eq!(serde_json::to_value(created).unwrap()["schemaVersion"], 4);
+    assert_eq!(serde_json::to_value(created).unwrap()["schemaVersion"], 5);
     assert_eq!(
         serde_json::to_value(deleted).unwrap()["data"]["state"],
         "accepted"
@@ -108,7 +177,7 @@ fn envelopes_have_stable_versioned_json() {
     let success = ApiEnvelope::new(vec!["alpha", "beta"]);
     assert_eq!(
         serde_json::to_string(&success).expect("success envelope serializes"),
-        r#"{"schemaVersion":4,"data":["alpha","beta"]}"#
+        r#"{"schemaVersion":5,"data":["alpha","beta"]}"#
     );
 
     let error = ApiErrorEnvelope::new(ApiError::new(
@@ -118,7 +187,7 @@ fn envelopes_have_stable_versioned_json() {
     ));
     assert_eq!(
         serde_json::to_string(&error).expect("error envelope serializes"),
-        r#"{"schemaVersion":4,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
+        r#"{"schemaVersion":5,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
     );
 
     let decoded: ApiErrorEnvelope =
@@ -185,7 +254,6 @@ fn page_snapshots_keep_identity_and_page_data_together() {
         classification: tenant_admin_shared::query::TenantClassification::Progressing,
         kubernetes_version: "1.36.0".into(),
         requested_workers: 1,
-        requested_databases: Some(1),
         endpoint: None,
         created_at: None,
         conditions: Vec::new(),
@@ -214,7 +282,7 @@ fn page_snapshots_keep_identity_and_page_data_together() {
         specification: tenant_admin_shared::query::TenantSpecificationView {
             kubernetes_version: "1.36.0".into(),
             workers: 1,
-            provider: tenant_admin_shared::query::ProviderSpecificationView::Local { databases: 1 },
+            provider: tenant_admin_shared::query::ProviderSpecificationView::Local,
         },
         provider_status: ProviderStatusView::Unknown(UnknownProviderView {
             provider_type: "local".into(),
@@ -421,7 +489,7 @@ fn database_query_contract_supports_unrestricted_multi_result_sql_without_creden
         .expect("query response serializes");
     assert_eq!(
         json,
-        r#"{"schemaVersion":4,"data":{"tenant":"demo","cluster":"capi-postgres","instance":"capi-postgres-1","database":"postgres","executedAt":"2026-09-29T22:40:00Z","durationMs":17,"truncated":false,"results":[{"columns":[],"rows":[],"affectedRows":0,"truncated":false},{"columns":["value"],"rows":[[null]],"affectedRows":1,"truncated":false}]}}"#
+        r#"{"schemaVersion":5,"data":{"tenant":"demo","cluster":"capi-postgres","instance":"capi-postgres-1","database":"postgres","executedAt":"2026-09-29T22:40:00Z","durationMs":17,"truncated":false,"results":[{"columns":[],"rows":[],"affectedRows":0,"truncated":false},{"columns":["value"],"rows":[[null]],"affectedRows":1,"truncated":false}]}}"#
     );
     for forbidden in ["password", "username", "uri", "pgpass", "kubeconfig"] {
         assert!(

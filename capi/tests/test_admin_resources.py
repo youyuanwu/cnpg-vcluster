@@ -5,13 +5,13 @@ import unittest
 from pathlib import Path
 
 from scripts import generate_admin_resources as generator
+from scripts.lib.admin import validate_admin_effective_rules
 
 
 ROOT = Path(__file__).resolve().parents[1]
 EXPECTED_RBAC = {
     "local": {
         ("", ("namespaces",), ("get",)),
-        ("", ("secrets",), ("get",)),
         (
             "bootstrap.cluster.x-k8s.io",
             ("kubeadmconfigs", "kubeadmconfigtemplates"),
@@ -101,6 +101,106 @@ def load(relative_path: str) -> dict:
 
 
 class AdminResourceTests(unittest.TestCase):
+    def test_effective_scoped_credentials_require_exact_tenant_role_and_binding(self) -> None:
+        namespace = "tenant-a"
+        label = {"tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid"}
+        for provider in generator.PROVIDERS:
+            secret = (
+                f"{namespace}-admin-kubeconfig"
+                if provider == "azure"
+                else f"{namespace}-kubeconfig"
+            )
+            objects = {
+                f"namespace/{namespace}": {
+                    "kind": "Namespace",
+                    "metadata": {
+                        "name": namespace,
+                        "uid": "namespace-uid",
+                        "annotations": {
+                            "tenancy.cnpg-vcluster.io/tenant": namespace,
+                            "tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid",
+                        },
+                    },
+                },
+                "role/tenant-database-credentials": {
+                    "kind": "Role",
+                    "metadata": {
+                        "name": "tenant-database-credentials",
+                        "namespace": namespace,
+                        "uid": "role-uid",
+                        "labels": label,
+                    },
+                    "rules": [{
+                        "apiGroups": [""],
+                        "resources": ["secrets"],
+                        "resourceNames": [secret],
+                        "verbs": ["get"],
+                    }],
+                },
+                "rolebinding/tenant-database-credentials": {
+                    "kind": "RoleBinding",
+                    "metadata": {
+                        "name": "tenant-database-credentials",
+                        "namespace": namespace,
+                        "uid": "binding-uid",
+                        "labels": label,
+                    },
+                    "roleRef": {
+                        "apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "Role",
+                        "name": "tenant-database-credentials",
+                    },
+                    "subjects": [
+                        {
+                            "kind": "ServiceAccount",
+                            "name": subject,
+                            "namespace": "tenant-system",
+                        }
+                        for subject in ("tenant-admin", "database-controller")
+                    ],
+                },
+            }
+            rules = load(f"admin/config/rbac/cluster-role-{provider}.json")["rules"]
+            review = {
+                "apiVersion": "authorization.k8s.io/v1",
+                "kind": "SelfSubjectRulesReview",
+                "status": {
+                    "resourceRules": [
+                        *rules,
+                        {"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"],
+                         "resourceNames": [secret]},
+                    ],
+                    "nonResourceRules": [],
+                    "incomplete": False,
+                },
+            }
+            fetch = lambda scope, key: objects[key]
+            validate_admin_effective_rules(ROOT, provider, review, namespace, fetch)
+            for key, field, value in (
+                ("role/tenant-database-credentials", "rules", []),
+                ("rolebinding/tenant-database-credentials", "subjects", []),
+            ):
+                damaged = json.loads(json.dumps(objects))
+                damaged[key][field] = value
+                with self.subTest(provider=provider, key=key), self.assertRaisesRegex(
+                    RuntimeError, "credential identity"
+                ):
+                    validate_admin_effective_rules(
+                        ROOT, provider, review, namespace, lambda scope, item: damaged[item]
+                    )
+            broader = json.loads(json.dumps(review))
+            broader["status"]["resourceRules"][-1]["resourceNames"] = []
+            with self.assertRaisesRegex(RuntimeError, "unbound Secret"):
+                validate_admin_effective_rules(ROOT, provider, broader, namespace, fetch)
+            with self.assertRaisesRegex(RuntimeError, "unbound Secret"):
+                validate_admin_effective_rules(ROOT, provider, review, namespace)
+            objects[f"namespace/{namespace}"]["metadata"]["annotations"] = {
+                "tenancy.cnpg-vcluster.io/tenant": namespace,
+                "tenancy.cnpg-vcluster.io/tenant-uid": "replaced-tenant"
+            }
+            with self.assertRaisesRegex(RuntimeError, "credential identity"):
+                validate_admin_effective_rules(ROOT, provider, review, namespace, fetch)
+
     def test_generation_is_byte_stable_and_checked_in(self) -> None:
         first = generator.generated_documents()
         second = generator.generated_documents()
@@ -189,12 +289,8 @@ class AdminResourceTests(unittest.TestCase):
                 self.assertTrue(
                     all("/" not in resource for resource in resources)
                 )
-                if "secrets" in resources:
-                    self.assertEqual("local", provider)
-                    self.assertEqual(
-                        ("", ("secrets",), ("get",)),
-                        (group, resources, verbs),
-                    )
+                self.assertNotIn("secrets", resources)
+                self.assertNotIn("persistentvolumes", resources)
                 actual.add((group, resources, verbs, names))
             expected = {
                 (group, resources, verbs, ())
@@ -208,6 +304,12 @@ class AdminResourceTests(unittest.TestCase):
                     ("create", "delete", "get", "list"),
                     (),
                 ),
+                ("tenancy.cnpg-vcluster.io", ("tenantdatabasecatalogs",), ("get", "update"), ()),
+                ("apps", ("deployments",), ("get",), ("database-controller",)),
+                ("rbac.authorization.k8s.io", ("roles", "rolebindings"), ("get",), ("tenant-database-credentials",)),
+                ("admissionregistration.k8s.io",
+                 ("validatingadmissionpolicies", "validatingadmissionpolicybindings"),
+                 ("get",), ("tenant-database-catalog-cutover-create-lock",)),
             })
             self.assertEqual(expected, actual)
             self.assertEqual(

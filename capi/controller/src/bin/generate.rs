@@ -1,5 +1,6 @@
 use std::path::PathBuf;
 
+use serde_json::json;
 use tenant_controller::{
     api::tenant_crd,
     management::{AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES},
@@ -7,7 +8,7 @@ use tenant_controller::{
 };
 
 type GenerateResult<T> = Result<T, Box<dyn std::error::Error>>;
-type GeneratedFiles = [(&'static str, Vec<u8>); 5];
+type GeneratedFiles = [(&'static str, Vec<u8>); 7];
 
 #[rustfmt::skip]
 fn render<T: serde::Serialize>(value: &T) -> GenerateResult<Vec<u8>> { Ok(format!("---\n{}", serde_yaml::to_string(value)?).into_bytes()) }
@@ -33,6 +34,28 @@ fn generated_files() -> GenerateResult<GeneratedFiles> {
         ("rbac/role-azure.yaml", render(&azure_controller_role())?),
         ("management-resources.json", resources),
         ("azure-management-resources.json", azure_resources),
+        (
+            "rbac/allocation-role.yaml",
+            render(&json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "Role",
+                "metadata": {"name": "tenant-controller-allocation", "namespace": "tenant-system"},
+                "rules": [{"apiGroups": ["coordination.k8s.io"], "resources": ["leases"],
+                    "verbs": ["create", "delete", "get", "list", "patch", "update", "watch"]}]
+            }))?,
+        ),
+        (
+            "rbac/allocation-binding.yaml",
+            render(&json!({
+                "apiVersion": "rbac.authorization.k8s.io/v1",
+                "kind": "RoleBinding",
+                "metadata": {"name": "tenant-controller-allocation", "namespace": "tenant-system"},
+                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role",
+                    "name": "tenant-controller-allocation"},
+                "subjects": [{"kind": "ServiceAccount", "name": "tenant-controller",
+                    "namespace": "tenant-system"}]
+            }))?,
+        ),
     ])
 }
 

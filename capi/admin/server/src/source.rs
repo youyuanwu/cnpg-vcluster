@@ -32,10 +32,6 @@ use tenant_controller::{
     api::{Tenant, TenantProviderSpec},
     management::{AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES, ManagementResource},
     ownership::validate_provider_owner,
-    resources::{
-        CNPG_CLUSTER_API_VERSION, CNPG_CLUSTER_KIND, CNPG_CLUSTER_PLURAL,
-        MANAGED_DATABASE_CLUSTER_NAME, MANAGED_DATABASE_NAMESPACE,
-    },
     tenant_client::{TenantApiErrorClass, TenantClientError, load_tenant_client},
 };
 
@@ -47,6 +43,8 @@ use crate::{
     },
     projection::is_accepted_local_management_resource,
 };
+
+mod catalog;
 
 const MAX_TENANTS: u32 = 500;
 const MAX_RESOURCES_PER_KIND: u32 = 500;
@@ -65,6 +63,11 @@ const MAX_INSTANCE_BYTES: usize = 63;
 const MAX_DATABASE_USERNAME_BYTES: usize = 1_024;
 const MAX_DATABASE_PASSWORD_BYTES: usize = 16 * 1_024;
 const DATABASE_SUPERUSER_SECRET_NAME: &str = "capi-postgres-superuser";
+const CNPG_CLUSTER_API_VERSION: &str = "postgresql.cnpg.io/v1";
+const CNPG_CLUSTER_KIND: &str = "Cluster";
+const CNPG_CLUSTER_PLURAL: &str = "clusters";
+const MANAGED_DATABASE_CLUSTER_NAME: &str = "capi-postgres";
+pub(crate) const MANAGED_DATABASE_NAMESPACE: &str = "database";
 const CONTROLLER_NAMESPACE: &str = "tenant-system";
 const CONTROLLER_DEPLOYMENT: &str = "tenant-controller";
 
@@ -169,6 +172,42 @@ pub trait DataSource: Send + Sync {
         })
     }
     fn check_ready(&self) -> SourceFuture<'_, ()>;
+    fn read_catalog<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        let _ = tenant;
+        Box::pin(async { Err(SourceError::KubernetesUnavailable) })
+    }
+    fn add_database<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::DatabaseAddRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        let _ = (tenant, request);
+        Box::pin(async { Err(SourceError::CreationUnavailable) })
+    }
+    fn delete_database<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::DatabaseDeleteRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        let _ = (tenant, request);
+        Box::pin(async { Err(SourceError::KubernetesUnavailable) })
+    }
+    fn query_catalog<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::CatalogQueryRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogQueryResponse> {
+        let _ = (tenant, request);
+        Box::pin(async {
+            Err(database_unavailable(
+                "Catalog query source is unavailable",
+                true,
+            ))
+        })
+    }
 }
 
 #[derive(Clone)]
@@ -464,7 +503,7 @@ impl KubeDataSource {
     ) -> Result<DatabaseQueryResponse, SourceError> {
         validate_query_request(request)?;
         if provider != ProviderMode::Local
-            || !matches!(tenant.spec.provider, TenantProviderSpec::Local { .. })
+            || !matches!(tenant.spec.provider, TenantProviderSpec::Local)
         {
             return Err(database_unavailable(
                 "Database queries are available only for local Tenants",
@@ -898,6 +937,7 @@ fn validated_query_cluster(
         kind: CNPG_CLUSTER_KIND.into(),
         name: MANAGED_DATABASE_CLUSTER_NAME.into(),
         uid,
+        namespace: MANAGED_DATABASE_NAMESPACE.into(),
     })
 }
 
@@ -1412,6 +1452,45 @@ fn mutation_error(error: kube::Error) -> SourceError {
 }
 
 impl DataSource for KubeDataSource {
+    fn read_catalog<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        Box::pin(async move {
+            catalog::project(
+                &catalog::read(&self.client, tenant).await?,
+                match tenant.spec.provider {
+                    TenantProviderSpec::Local => ProviderMode::Local,
+                    TenantProviderSpec::Azure => ProviderMode::Azure,
+                },
+                catalog::capability_available(tenant),
+            )
+        })
+    }
+
+    fn add_database<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::DatabaseAddRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        Box::pin(async move { catalog::add(self, tenant, request).await })
+    }
+
+    fn delete_database<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::DatabaseDeleteRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogView> {
+        Box::pin(async move { catalog::delete(self, tenant, request).await })
+    }
+
+    fn query_catalog<'a>(
+        &'a self,
+        tenant: &'a Tenant,
+        request: &'a tenant_admin_shared::catalog::CatalogQueryRequest,
+    ) -> SourceFuture<'a, tenant_admin_shared::catalog::CatalogQueryResponse> {
+        Box::pin(async move { catalog::query(self, tenant, request).await })
+    }
     fn list_tenants(&self) -> SourceFuture<'_, Vec<Tenant>> {
         Box::pin(async move {
             let list = self.tenant_list(MAX_TENANTS + 1).await?;
@@ -1713,7 +1792,7 @@ mod tests {
 
     fn local_tenant() -> Tenant {
         serde_json::from_value(json!({
-            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
+            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha4",
             "kind":"Tenant",
             "metadata":{"name":"tenant-a","uid":"tenant-uid","generation":4},
             "spec":{
@@ -1742,7 +1821,7 @@ mod tests {
 
     fn azure_tenant() -> Tenant {
         serde_json::from_value(json!({
-            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha3",
+            "apiVersion":"tenancy.cnpg-vcluster.io/v1alpha4",
             "kind":"Tenant",
             "metadata":{"name":"tenant-a","uid":"tenant-uid","generation":4},
             "spec":{
@@ -2866,7 +2945,7 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_create_and_delete_classify_conflict_and_exact_identity() {
-        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1));
         tenant.metadata.uid = Some("tenant-uid".into());
         tenant.metadata.resource_version = Some("7".into());
         tenant.metadata.generation = Some(2);
@@ -2918,11 +2997,11 @@ mod tests {
             [
                 (
                     Method::GET,
-                    "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a".into()
+                    "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a".into()
                 ),
                 (
                     Method::DELETE,
-                    "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a".into()
+                    "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a".into()
                 )
             ]
         );
@@ -2977,7 +3056,7 @@ mod tests {
 
     #[tokio::test]
     async fn tenant_delete_sends_uid_and_resource_version_preconditions() {
-        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1));
         tenant.metadata.uid = Some("tenant-uid".into());
         tenant.metadata.resource_version = Some("17".into());
         tenant.metadata.generation = Some(2);

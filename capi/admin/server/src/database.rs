@@ -11,7 +11,6 @@ use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Pod;
 use kube::{Api, Client, api::Portforwarder};
 use tenant_admin_shared::query::DatabaseQueryResult;
-use tenant_controller::resources::MANAGED_DATABASE_NAMESPACE;
 use tokio::{
     io::{AsyncRead, AsyncWrite, ReadBuf},
     time::Instant as TokioInstant,
@@ -62,6 +61,7 @@ pub(crate) struct QueryClusterBinding {
     pub kind: String,
     pub name: String,
     pub uid: String,
+    pub namespace: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -82,7 +82,7 @@ pub(crate) fn validate_pod_binding(
         .filter(|uid| !uid.is_empty())
         .ok_or(PodBindingError::InvalidIdentity)?;
     if pod.metadata.name.as_deref() != Some(requested_instance)
-        || pod.metadata.namespace.as_deref() != Some(MANAGED_DATABASE_NAMESPACE)
+        || pod.metadata.namespace.as_deref() != Some(cluster.namespace.as_str())
         || !has_canonical_controlling_owner(pod, cluster)
     {
         return Err(PodBindingError::InvalidIdentity);
@@ -244,7 +244,7 @@ async fn open_validated_portforward(
     client: Client,
     binding: &QueryPodBinding,
 ) -> Result<PortForwardGuard, QueryExecutionError> {
-    let pods = Api::<Pod>::namespaced(client, MANAGED_DATABASE_NAMESPACE);
+    let pods = Api::<Pod>::namespaced(client, &binding.cluster.namespace);
     let mut forwarder = pods
         .portforward(&binding.pod_name, &[5432])
         .await
@@ -834,6 +834,7 @@ mod tests {
             &original,
             "capi-postgres-1",
             &QueryClusterBinding {
+                namespace: "database".into(),
                 api_version: "postgresql.cnpg.io/v1".into(),
                 kind: "Cluster".into(),
                 name: "capi-postgres".into(),

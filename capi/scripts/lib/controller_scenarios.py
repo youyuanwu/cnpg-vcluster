@@ -30,31 +30,26 @@ LEASE_NAMESPACE = LEASE.inventory_namespace or "tenant-system"
 def tenant_spec_hash(document: dict[str, object]) -> str:
     spec = document.get("spec")
     if not isinstance(spec, dict) or set(spec) != {"kubernetesVersion", "workers", "provider"}:
-        raise RuntimeError("Tenant spec is not the v1alpha2 contract")
+        raise RuntimeError("Tenant spec is not the v1alpha4 contract")
     provider = spec["provider"]
     if (
         not isinstance(provider, dict)
-        or set(provider) != {"type", "databases"}
+        or set(provider) != {"type"}
         or provider.get("type") != "local"
     ):
-        raise RuntimeError("Tenant spec is not the local v1alpha2 contract")
+        raise RuntimeError("Tenant spec is not the local v1alpha4 contract")
     version = spec["kubernetesVersion"]
     if not isinstance(version, str) or not re.fullmatch(r"v?[0-9]+\.[0-9]+\.[0-9]+", version):
         raise RuntimeError("Tenant Kubernetes version is invalid")
     if (
         type(spec["workers"]) is not int
         or not 1 <= spec["workers"] <= 3
-        or type(provider["databases"]) is not int
-        or not 1 <= provider["databases"] <= 3
     ):
-        raise RuntimeError("Tenant counts are invalid")
+        raise RuntimeError("Tenant worker count is invalid")
     canonical = {
         "kubernetesVersion": version.removeprefix("v"),
         "workers": spec["workers"],
-        "provider": {
-            "type": "local",
-            "databases": provider["databases"],
-        },
+        "provider": {"type": "local"},
     }
     return hashlib.sha256(json.dumps(canonical, separators=(",", ":")).encode()).hexdigest()
 
@@ -392,7 +387,7 @@ def tenant_from_document(
         storage_host_path=Path(str(volume[0]["Mountpoint"])),
         cnpg_cluster=config["SPIKE_CNPG_CLUSTER"],
         workers=int(spec["workers"]),
-        database_count=int(spec["provider"]["databases"]),
+        database_count=0,
         specification_sha256=specification_sha256,
     )
 

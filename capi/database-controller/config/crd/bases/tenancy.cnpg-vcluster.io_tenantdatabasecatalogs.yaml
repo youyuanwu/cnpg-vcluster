@@ -1,0 +1,363 @@
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: tenantdatabasecatalogs.tenancy.cnpg-vcluster.io
+spec:
+  group: tenancy.cnpg-vcluster.io
+  names:
+    kind: TenantDatabaseCatalog
+    plural: tenantdatabasecatalogs
+    shortNames:
+    - tdc
+    singular: tenantdatabasecatalog
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns:
+    - jsonPath: .spec.closed
+      name: Closed
+      type: boolean
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for TenantDatabaseCatalogSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              closed:
+                type: boolean
+              entries:
+                additionalProperties:
+                  properties:
+                    deleting:
+                      type: boolean
+                    instances:
+                      format: int32
+                      maximum: 3.0
+                      minimum: 1.0
+                      type: integer
+                    name:
+                      type: string
+                  required:
+                  - deleting
+                  - instances
+                  - name
+                  type: object
+                default: {}
+                maxProperties: 3
+                type: object
+              tenantName:
+                type: string
+              tenantUID:
+                type: string
+            required:
+            - closed
+            - tenantName
+            - tenantUID
+            type: object
+          status:
+            nullable: true
+            properties:
+              entries:
+                additionalProperties:
+                  properties:
+                    cnpgCluster:
+                      nullable: true
+                      properties:
+                        name:
+                          type: string
+                        uid:
+                          type: string
+                      required:
+                      - name
+                      - uid
+                      type: object
+                    conditions:
+                      default: []
+                      items:
+                        description: Condition contains details for one aspect of the current state of this API Resource.
+                        properties:
+                          lastTransitionTime:
+                            description: lastTransitionTime is the last time the condition transitioned from one status to another. This should be when the underlying condition changed.  If that is not known, then using the time when the API field changed is acceptable.
+                            format: date-time
+                            type: string
+                          message:
+                            description: message is a human readable message indicating details about the transition. This may be an empty string.
+                            maxLength: 512
+                            type: string
+                          observedGeneration:
+                            description: observedGeneration represents the .metadata.generation that the condition was set based upon. For instance, if .metadata.generation is currently 12, but the .status.conditions[x].observedGeneration is 9, the condition is out of date with respect to the current state of the instance.
+                            format: int64
+                            type: integer
+                          reason:
+                            description: reason contains a programmatic identifier indicating the reason for the condition's last transition. Producers of specific condition types may define expected values and meanings for this field, and whether the values are considered a guaranteed API. The value should be a CamelCase string. This field may not be empty.
+                            type: string
+                          status:
+                            description: status of the condition, one of True, False, Unknown.
+                            type: string
+                          type:
+                            description: type of condition in CamelCase or in foo.example.com/CamelCase.
+                            type: string
+                        required:
+                        - lastTransitionTime
+                        - message
+                        - reason
+                        - status
+                        - type
+                        type: object
+                      type: array
+                      x-kubernetes-list-map-keys:
+                      - type
+                      x-kubernetes-list-type: map
+                    createIntents:
+                      default: []
+                      items:
+                        properties:
+                          kind:
+                            type: string
+                          name:
+                            type: string
+                          ordinal:
+                            format: int32
+                            type: integer
+                          state:
+                            enum:
+                            - Planned
+                            - Issued
+                            - Rejected
+                            - Observed
+                            type: string
+                        required:
+                        - kind
+                        - name
+                        - ordinal
+                        - state
+                        type: object
+                      maxItems: 12
+                      type: array
+                    credentials:
+                      nullable: true
+                      properties:
+                        name:
+                          type: string
+                        uid:
+                          type: string
+                      required:
+                      - name
+                      - uid
+                      type: object
+                    finalization:
+                      nullable: true
+                      properties:
+                        pending:
+                          default: []
+                          items:
+                            type: string
+                          type: array
+                        terminalVerified:
+                          type: boolean
+                        verifiedAbsent:
+                          default: []
+                          items:
+                            type: string
+                          type: array
+                      required:
+                      - terminalVerified
+                      type: object
+                    instances:
+                      default: []
+                      items:
+                        properties:
+                          name:
+                            type: string
+                          ready:
+                            type: boolean
+                          role:
+                            type: string
+                          uid:
+                            type: string
+                        required:
+                        - name
+                        - ready
+                        - role
+                        - uid
+                        type: object
+                      maxItems: 3
+                      type: array
+                    logicalUID:
+                      type: string
+                    namespace:
+                      nullable: true
+                      properties:
+                        name:
+                          type: string
+                        uid:
+                          type: string
+                      required:
+                      - name
+                      - uid
+                      type: object
+                    observedGeneration:
+                      format: int64
+                      type: integer
+                    phase:
+                      enum:
+                      - Pending
+                      - Progressing
+                      - Ready
+                      - Deleting
+                      - Degraded
+                      - OwnershipInvalid
+                      type: string
+                    provider:
+                      nullable: true
+                      properties:
+                        kind:
+                          type: string
+                        storageNamespace:
+                          nullable: true
+                          properties:
+                            name:
+                              type: string
+                            uid:
+                              type: string
+                          required:
+                          - name
+                          - uid
+                          type: object
+                      required:
+                      - kind
+                      type: object
+                    query:
+                      nullable: true
+                      properties:
+                        clusterUid:
+                          type: string
+                        credentialUid:
+                          type: string
+                      required:
+                      - clusterUid
+                      - credentialUid
+                      type: object
+                    storage:
+                      default: []
+                      items:
+                        properties:
+                          armID:
+                            nullable: true
+                            type: string
+                          disk:
+                            nullable: true
+                            properties:
+                              name:
+                                type: string
+                              uid:
+                                type: string
+                            required:
+                            - name
+                            - uid
+                            type: object
+                          healthy:
+                            type: boolean
+                          ordinal:
+                            format: int32
+                            type: integer
+                          path:
+                            nullable: true
+                            type: string
+                          pv:
+                            nullable: true
+                            properties:
+                              name:
+                                type: string
+                              uid:
+                                type: string
+                            required:
+                            - name
+                            - uid
+                            type: object
+                          pvc:
+                            nullable: true
+                            properties:
+                              name:
+                                type: string
+                              uid:
+                                type: string
+                            required:
+                            - name
+                            - uid
+                            type: object
+                          requestedBytes:
+                            format: int64
+                            type: integer
+                        required:
+                        - healthy
+                        - ordinal
+                        - requestedBytes
+                        type: object
+                      maxItems: 3
+                      type: array
+                  required:
+                  - logicalUID
+                  - observedGeneration
+                  - phase
+                  type: object
+                default: {}
+                maxProperties: 3
+                type: object
+                x-kubernetes-validations:
+                - message: status identity must match its logical UID and terminal proof cannot have pending work
+                  rule: self.all(uid, self[uid].logicalUID == uid && (!has(self[uid].finalization) || !self[uid].finalization.terminalVerified || size(self[uid].finalization.pending) == 0))
+              observer:
+                nullable: true
+                properties:
+                  catalogUID:
+                    type: string
+                  instanceId:
+                    type: string
+                  observedGeneration:
+                    format: int64
+                    type: integer
+                  observedResourceVersion:
+                    type: string
+                  podUID:
+                    type: string
+                required:
+                - catalogUID
+                - instanceId
+                - observedGeneration
+                - observedResourceVersion
+                - podUID
+                type: object
+            type: object
+        required:
+        - spec
+        title: TenantDatabaseCatalog
+        type: object
+        x-kubernetes-validations:
+        - message: catalog name must equal Tenant name
+          rule: self.metadata.name == self.spec.tenantName
+        - message: Tenant name must be a lowercase DNS label
+          rule: self.spec.tenantName.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')
+        - message: Tenant UID must be nonempty
+          rule: size(self.spec.tenantUID) > 0
+        - message: logical UIDs, names and instance counts must be valid
+          rule: self.spec.entries.all(uid, uid.matches('^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$') && self.spec.entries[uid].name.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$') && self.spec.entries[uid].instances >= 1 && self.spec.entries[uid].instances <= 3)
+        - message: database names must be unique
+          rule: self.spec.entries.all(uid, self.spec.entries.filter(otherUID, self.spec.entries[otherUID].name == self.spec.entries[uid].name).size() == 1)
+        - message: Tenant identity is immutable
+          rule: self.spec.tenantName == oldSelf.spec.tenantName && self.spec.tenantUID == oldSelf.spec.tenantUID
+        - message: a closed catalog cannot reopen
+          rule: '!oldSelf.spec.closed || self.spec.closed'
+        - message: closing a catalog must mark every remaining entry deleting
+          rule: '!self.spec.closed || self.spec.entries.all(uid, self.spec.entries[uid].deleting)'
+        - message: closing a catalog cannot accept new entries
+          rule: '!self.spec.closed || self.spec.entries.all(uid, uid in oldSelf.spec.entries)'
+        - message: entry UID, name and count are immutable and deletion is monotonic
+          rule: oldSelf.spec.entries.all(uid, !(uid in self.spec.entries) || (self.spec.entries[uid].name == oldSelf.spec.entries[uid].name && self.spec.entries[uid].instances == oldSelf.spec.entries[uid].instances && (!oldSelf.spec.entries[uid].deleting || self.spec.entries[uid].deleting)))
+        - message: entry removal requires prior deletion and exact controller-published terminal proof
+          rule: oldSelf.spec.entries.all(uid, (uid in self.spec.entries) || (oldSelf.spec.entries[uid].deleting && has(oldSelf.status) && uid in oldSelf.status.entries && oldSelf.status.entries[uid].logicalUID == uid && has(oldSelf.status.entries[uid].finalization) && oldSelf.status.entries[uid].finalization.terminalVerified))
+    served: true
+    storage: true
+    subresources:
+      status: {}

@@ -17,8 +17,13 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
     ),
     ("", &["events"], &["create", "patch", "update"]),
     (
-        "coordination.k8s.io",
-        &["leases"],
+        "rbac.authorization.k8s.io",
+        &["roles", "rolebindings"],
+        &["create", "delete", "get"],
+    ),
+    (
+        "tenancy.cnpg-vcluster.io",
+        &["tenantdatabasecatalogs"],
         &[
             "create", "delete", "get", "list", "patch", "update", "watch",
         ],
@@ -59,7 +64,7 @@ fn management_rule(resource: &ManagementResource) -> PolicyRule {
     let mut verbs = match resource.kind {
         "Namespace" => vec!["create", "delete", "get", "list"],
         "Secret" => vec!["delete", "get", "list"],
-        "Lease" => vec!["create", "delete", "get", "list", "patch", "update"],
+        "Lease" => vec!["get", "list", "watch"],
         "KubeadmConfig" | "TenantControlPlane" if resource.class != ResourceClass::Root => {
             vec!["get", "list"]
         }
@@ -107,7 +112,12 @@ pub fn controller_role() -> ClusterRole {
     let rules = BASE_PERMISSIONS
         .iter()
         .map(|(group, resources, verbs)| rule(group, resources, verbs))
-        .chain(MANAGEMENT_RESOURCES.iter().map(management_rule))
+        .chain(
+            MANAGEMENT_RESOURCES
+                .iter()
+                .filter(|resource| resource.kind != "Lease")
+                .map(management_rule),
+        )
         .collect();
     role(rules)
 }
@@ -117,7 +127,12 @@ pub fn azure_controller_role() -> ClusterRole {
         .iter()
         .chain(AZURE_EXTRA_PERMISSIONS)
         .map(|(group, resources, verbs)| rule(group, resources, verbs))
-        .chain(AZURE_MANAGEMENT_RESOURCES.iter().map(azure_management_rule))
+        .chain(
+            AZURE_MANAGEMENT_RESOURCES
+                .iter()
+                .filter(|resource| resource.kind != "Lease")
+                .map(azure_management_rule),
+        )
         .collect();
     role(rules)
 }
@@ -136,7 +151,7 @@ mod tests {
         let azure_rules = azure.rules.unwrap();
         assert_eq!(
             local_rules.len(),
-            BASE_PERMISSIONS.len() + MANAGEMENT_RESOURCES.len()
+            BASE_PERMISSIONS.len() + MANAGEMENT_RESOURCES.len() - 1
         );
         assert_eq!(
             azure_rules.len(),
@@ -150,15 +165,40 @@ mod tests {
                 .chain(&azure_rules)
                 .all(|rule| !rule.verbs.contains(&"*".to_string()))
         );
-        assert!(azure_rules.iter().any(|rule| {
+        for rules in [&local_rules, &azure_rules] {
+            assert!(rules.iter().any(|rule| {
+                rule.api_groups.as_deref() == Some(&["rbac.authorization.k8s.io".into()])
+                    && rule.resources.as_deref() == Some(&["roles".into(), "rolebindings".into()])
+                    && rule.verbs.contains(&"delete".into())
+            }));
+            assert!(rules.iter().any(|rule| {
+                rule.api_groups.as_deref() == Some(&["tenancy.cnpg-vcluster.io".into()])
+                    && rule.resources.as_deref() == Some(&["tenantdatabasecatalogs".into()])
+                    && rule.verbs.contains(&"get".into())
+                    && rule.verbs.contains(&"update".into())
+            }));
+            assert!(rules.iter().all(|rule| {
+                rule.resources.as_ref().is_none_or(|resources| {
+                    !resources.iter().any(|resource| {
+                        matches!(resource.as_str(), "tenantdatabases" | "resourcequotas")
+                    })
+                })
+            }));
+        }
+        assert!(!azure_rules.iter().any(|rule| {
             rule.api_groups.as_deref() == Some(&["coordination.k8s.io".into()])
                 && rule.resources.as_deref() == Some(&["leases".into()])
-                && rule.verbs.contains(&"watch".into())
         }));
-        for resource in MANAGEMENT_RESOURCES {
+        for resource in MANAGEMENT_RESOURCES
+            .iter()
+            .filter(|resource| resource.kind != "Lease")
+        {
             assert!(local_rules.contains(&management_rule(resource)));
         }
-        for resource in AZURE_MANAGEMENT_RESOURCES {
+        for resource in AZURE_MANAGEMENT_RESOURCES
+            .iter()
+            .filter(|resource| resource.kind != "Lease")
+        {
             assert!(azure_rules.contains(&azure_management_rule(resource)));
             if resource.class == ResourceClass::Descendant {
                 let verbs = &azure_management_rule(resource).verbs;
@@ -193,12 +233,6 @@ mod tests {
                 &["create", "delete", "get", "list", "watch"][..],
             ),
             ("Secret", &["delete", "get", "list", "watch"][..]),
-            (
-                "Lease",
-                &[
-                    "create", "delete", "get", "list", "patch", "update", "watch",
-                ][..],
-            ),
             ("TenantControlPlane", &["get", "list"][..]),
         ] {
             let resource = MANAGEMENT_RESOURCES

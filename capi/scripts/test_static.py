@@ -43,6 +43,14 @@ EXPECTED_RECIPES = {
     "controller-lint",
     "controller-build",
     "controller-image",
+    "database-controller-verify",
+    "database-controller-test",
+    "database-controller-lint",
+    "database-controller-build",
+    "database-controller-image",
+    "database-controller-metrics",
+    "azure-database-runtime-once",
+    "azure-database-runtime-watch",
     "admin-metrics",
     "admin-fetch",
     "admin-generate-check",
@@ -378,9 +386,9 @@ def check_repository_boundaries() -> None:
     crd = (controller / "config/crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml").read_text(
         encoding="utf-8"
     )
-    check("name: v1alpha3" in crd and "name: v1alpha2" not in crd
+    check("name: v1alpha4" in crd and "name: v1alpha3" not in crd
           and "controller-gen.kubebuilder.io" not in crd,
-          "the authoritative Tenant CRD is not Rust v1alpha3")
+          "the authoritative Tenant CRD is not Rust v1alpha4")
     generator = (controller / "src/bin/generate.rs").read_text(encoding="utf-8")
     check('join("config")' in generator and
           '"crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml"' in generator,
@@ -442,6 +450,12 @@ def check_repository_boundaries() -> None:
         "just admin-test",
         "just admin-metrics",
         "just admin-package-check",
+        "just database-controller-verify",
+        "just database-controller-lint",
+        "just database-controller-test",
+        "just database-controller-metrics",
+        "just database-controller-build",
+        "database-manager",
     ):
         check(token in fast_checks, f"fast-check artifact wiring is missing {token}")
     for token in (
@@ -450,12 +464,17 @@ def check_repository_boundaries() -> None:
         "CAPI_PREBUILT_CONTROLLER_BINARY",
         "CAPI_PREBUILT_ADMIN_SERVER",
         "CAPI_PREBUILT_ADMIN_WEB",
+        "CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY",
         "capi/.tools/artifacts/${{ github.sha }}",
     ):
         check(token in e2e, f"PR E2E artifact wiring is missing {token}")
     high_capacity = workflow.split("  high-capacity:", 1)[1].split(
         "  capi-tests:", 1
     )[0]
+    check(
+        "azure-destructive" not in workflow and "secrets.CAPI_AZURE" not in workflow,
+        "CI must not require unavailable Azure credentials",
+    )
     check(
         "CAPI_PREBUILT_CONTROLLER_BINARY" not in high_capacity,
         "high-capacity validation must retain an independent controller build",
@@ -673,13 +692,13 @@ def check_repository_boundaries() -> None:
     ):
         manifest = (ROOT / relative).read_text(encoding="utf-8")
         check(
-            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha3" in manifest
+            "apiVersion: tenancy.cnpg-vcluster.io/v1alpha4" in manifest
             and "kind: Tenant" in manifest
             and f"name: {expected_name}" in manifest
             and set(re.findall(r"^  ([a-zA-Z]+):", manifest.split("spec:\n")[1], re.MULTILINE))
             == {"kubernetesVersion", "workers", "provider"}
             and re.search(
-                r"^  provider:\n    type: local\n    databases: [1-3]$",
+                r"^  provider:\n    type: local$",
                 manifest,
                 re.MULTILINE,
             )
@@ -760,7 +779,9 @@ def check_repository_boundaries() -> None:
         "Azure public deletion must not persist or perform external proof",
     )
     check(
-        ".runtime" not in gate_source
+        gate_source.count('ROOT / ".runtime" / "azure-tenant-lifecycle"') == 1
+        and "tempfile.TemporaryDirectory(dir=scratch)" in gate_source
+        and ".runtime/azure-gate" not in gate_source
         and "write_private_file" not in gate_source
         and "_incomplete_gate" not in gate_source
         and "_load_checkpoint" not in gate_source,
@@ -827,7 +848,7 @@ def check_documentation() -> None:
         "This is a local persistence proof only.",
         "The Tenant controller is the single networking writer.",
         "Worker image delivery is bootstrap-owned",
-        "one finalizer deletes the exact recorded CAPI Cluster",
+        "Tenant finalizer first closes and drains its catalog",
         "while retaining its PVC, PV, and bytes.",
         "`just cache` is the explicit online acquisition",
         "The retained workflow is a development optimization, not a final gate",
@@ -948,6 +969,86 @@ def check_documentation() -> None:
         and "unsafe PostgreSQL superuser console" in root_readme,
         "root README omits the Tenant Admin entry point",
     )
+    compatibility = (ROOT / "controller" / "API_COMPATIBILITY.md").read_text(encoding="utf-8")
+    contracts = (ROOT / "controller" / "CONTRACTS.md").read_text(encoding="utf-8")
+    catalog_docs = {
+        "root README": (root_readme, (
+            "v1alpha4", "explicit database", "unmet release-acceptance",
+        )),
+        "CAPI README": (readme, (
+            "schema-v5", "three-by-three", "nine-disk", "not passing checks",
+            "catalog-bootstrap-probe.json", "12,000",
+        )),
+        "high-level design": (design, (
+            "TenantDatabaseCatalog", "database-controller", "v1alpha4",
+            "catalog entry health", "direct ARM NotFound",
+        )),
+        "Admin design": (admin_design, (
+            "schema version 5", "catalogUid", "logicalUid", "instanceUid",
+            "same-authority", "browser/service-proxy",
+        )),
+        "Azure design": (azure_design, (
+            "TenantDatabaseCatalog", "4-GiB", "StandardSSD_LRS",
+            "nine-disk", "foundation inventory is absent",
+        )),
+        "API compatibility": (compatibility, (
+            "v1alpha4", "v1alpha1", "resourceVersion", "schemaVersion: 5",
+            "in-flight CREATE", "never automatically retired",
+        )),
+        "controller contracts": (contracts, (
+            "database-controller-verify", "database-controller-metrics",
+            "Planned", "Issued", "Observed", "ARM NotFound",
+            "unmet release-acceptance",
+        )),
+    }
+    for name, (text, required) in catalog_docs.items():
+        flat = " ".join(text.split())
+        for token in required:
+            check(token in flat, f"{name} lacks catalog documentation: {token}")
+    for name, text in (
+        ("root README", root_readme),
+        ("CAPI README", readme),
+        ("high-level design", design),
+        ("Admin design", admin_design),
+        ("Azure design", azure_design),
+        ("API compatibility", compatibility),
+        ("controller contracts", contracts),
+    ):
+        check(
+            not re.search(
+                r"v1alpha3` (?:is the only|API requires)|"
+                r"catalog additions remain unavailable through Admin|"
+                r"Azure Disk and CloudNativePG remain outside the Azure",
+                text,
+            ),
+            f"{name} still asserts an obsolete single-cluster contract",
+        )
+    for path in (
+        ROOT.parent / "README.md",
+        ROOT / "README.md",
+        ROOT / "docs/high-level-design.md",
+        ROOT / "docs/admin-ui-design.md",
+        ROOT / "docs/azure-experiment-design.md",
+        ROOT / "controller/API_COMPATIBILITY.md",
+        ROOT / "controller/CONTRACTS.md",
+    ):
+        for target in re.findall(r"\]\(([^)]+)\)", path.read_text(encoding="utf-8")):
+            relative, _, anchor = target.partition("#")
+            if relative and "://" not in relative and not relative.startswith("mailto:"):
+                linked = path.parent / relative
+                check(
+                    linked.exists(),
+                    f"{path.relative_to(ROOT.parent)} has a broken link: {target}",
+                )
+                if match := re.fullmatch(r"L(\d+)(?:-L(\d+))?", anchor):
+                    check(linked.is_file(), f"citation must target a file: {target}")
+                    first = int(match.group(1))
+                    last = int(match.group(2) or first)
+                    line_count = len(linked.read_text(encoding="utf-8").splitlines())
+                    check(
+                        1 <= first <= last <= line_count,
+                        f"{path.relative_to(ROOT.parent)} has an invalid citation: {target}",
+                    )
     check(
         (ROOT / "licenses" / "README.md").is_file(),
         "license reference directory is missing",

@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import base64
+import hashlib
+import tempfile
 import uuid
 from collections.abc import Callable
 
@@ -17,7 +19,14 @@ from scripts.lib.admin import (
     validate_admin_effective_rules,
 )
 from scripts.lib.controller import (
+    CATALOG_LIFECYCLE_READY,
+    _catalog_activation_complete,
+    _catalog_lock_present,
     build_azure_controller_image,
+    catalog_cutover_lock_documents,
+    install_database_catalog,
+    release_catalog_and_tenant_cutover_locks,
+    verify_catalog_cutover_lock,
     require_empty_tenant_cutover,
     require_tenant_api_cutover_ready,
     render_azure_controller_manager,
@@ -26,6 +35,10 @@ from scripts.lib.controller import (
     tenant_crd_transition_document,
     tenant_cutover_lock_cleanup_refs,
     tenant_cutover_lock_documents,
+)
+from scripts.lib.database_controller import (
+    CATALOG_CRD, build_database_controller_image, install_database_controller,
+    install_azure_database_runtime, require_absent_legacy_database_crd,
 )
 
 ACR_PULL_ROLE_DEFINITION_ID = (
@@ -59,6 +72,158 @@ CAPI_CAPZ_DEPLOYMENTS = (
     ("capz-system", "capz-controller-manager"),
     ("capz-system", "azureserviceoperator-controller-manager"),
 )
+DATABASE_OUTPUTS = (
+    "databaseIdentityId",
+    "databaseIdentityClientId",
+    "databaseIdentityPrincipalId",
+    "databaseDiskRoleId",
+    "databaseDiskAssignmentId",
+    "databaseFederationId",
+)
+DATABASE_DISK_ACTIONS = {
+    "Microsoft.Compute/disks/read",
+    "Microsoft.Compute/disks/delete",
+}
+DATABASE_SERVICE_ACCOUNT = "system:serviceaccount:tenant-system:database-controller"
+
+
+def install_tenant_database_runtime(
+    root: Path, config: Mapping[str, str], tenant_name: str,
+) -> bool:
+    validate_tenant_name(tenant_name)
+
+    def current() -> tuple[dict, bytes]:
+        tenant = json.loads(
+            _kubectl(root, "get", f"tenant/{tenant_name}", "-o", "json").stdout
+        )
+        metadata = tenant.get("metadata", {})
+        status = tenant.get("status", {})
+        provider = status.get("provider", {})
+        management = provider.get("management", {})
+        bound = provider.get("kubeconfig", {})
+        if (
+            metadata.get("name") != tenant_name
+            or not metadata.get("uid")
+            or metadata.get("deletionTimestamp")
+            or status.get("phase") != "Ready"
+            or provider.get("type") != "azure"
+            or provider.get("binding", {}).get("tenantUID") != metadata["uid"]
+            or not management.get("namespaceUID")
+            or not (management.get("clusterUID") or management.get("kamajiControlPlaneUID"))
+            or not bound.get("secretUID")
+            or not bound.get("contentSha256")
+        ):
+            raise RuntimeError(f"Azure Tenant {tenant_name} is not ready for database install")
+        namespace = json.loads(
+            _kubectl(root, "get", f"namespace/{tenant_name}", "-o", "json").stdout
+        )
+        if namespace.get("metadata", {}).get("uid") != management.get("namespaceUID"):
+            raise RuntimeError("Azure database installer namespace identity changed")
+        secret = json.loads(
+            _kubectl(
+                root, "-n", tenant_name, "get",
+                f"secret/{tenant_name}-kubeconfig", "-o", "json",
+            ).stdout
+        )
+        secret_meta = secret.get("metadata", {})
+        expected_owners = {
+            ("cluster.x-k8s.io/v1beta1", "Cluster", tenant_name,
+             management.get("clusterUID")),
+            ("controlplane.cluster.x-k8s.io/v1alpha1", "KamajiControlPlane",
+             tenant_name, management.get("kamajiControlPlaneUID")),
+        }
+        expected_owners = {owner for owner in expected_owners if owner[3]}
+        owners = secret_meta.get("ownerReferences", [])
+        if (
+            secret_meta.get("namespace") != tenant_name
+            or secret_meta.get("uid") != bound["secretUID"]
+            or secret.get("type") != "cluster.x-k8s.io/secret"
+            or len(owners) != 1
+            or owners[0].get("controller") is not True
+            or (
+                owners[0].get("apiVersion"), owners[0].get("kind"),
+                owners[0].get("name"), owners[0].get("uid")
+            ) not in expected_owners
+        ):
+            raise RuntimeError("Azure database installer kubeconfig ownership changed")
+        try:
+            content = base64.b64decode(secret["data"]["value"], validate=True)
+        except (KeyError, ValueError) as exc:
+            raise RuntimeError("Azure database installer kubeconfig is invalid") from exc
+        if not content or hashlib.sha256(content).hexdigest() != bound["contentSha256"]:
+            raise RuntimeError("Azure database installer kubeconfig digest changed")
+        return metadata, content
+
+    try:
+        identity, content = current()
+    except RuntimeError as exc:
+        if str(exc) == f"Azure Tenant {tenant_name} is not ready for database install":
+            return False
+        raise
+
+    scratch = root / ".runtime" / "azure-database-installer"
+    ensure_private_dir(scratch)
+    with tempfile.TemporaryDirectory(dir=scratch) as directory:
+        kubeconfig = Path(directory) / "tenant.kubeconfig"
+        write_private_file(kubeconfig, content)
+
+        def require_current() -> None:
+            latest, latest_content = current()
+            if latest["uid"] != identity["uid"] or latest_content != content:
+                raise RuntimeError("Azure database installer Tenant identity changed")
+
+        install_azure_database_runtime(
+            root, dict(config), kubeconfig, require_current=require_current,
+        )
+    return True
+
+
+def _validate_database_outputs(outputs: Mapping[str, object], prefix: str) -> None:
+    missing = [
+        key for key in DATABASE_OUTPUTS
+        if not isinstance(outputs.get(key), str) or not outputs[key]
+    ]
+    if missing:
+        raise RuntimeError(
+            "Azure database foundation inventory is incomplete; clean foundation "
+            "redeploy required: " + ", ".join(missing)
+        )
+    group = str(outputs.get("resourceGroupId", "")).rstrip("/")
+    group_name = f"{prefix}-rg"
+    identity = str(outputs["databaseIdentityId"]).rstrip("/")
+    expected_identity = (
+        f"{group}/providers/Microsoft.ManagedIdentity/userAssignedIdentities/"
+        f"{prefix}-database-controller"
+    )
+    authorization = f"{group}/providers/Microsoft.Authorization"
+    if (
+        not group
+        or outputs.get("resourceGroupName") != group_name
+        or re.fullmatch(
+            rf"/subscriptions/[^/]+/resourceGroups/{re.escape(group_name)}",
+            group,
+            flags=re.IGNORECASE,
+        ) is None
+        or not _azure_id_equal(identity, expected_identity)
+        or _azure_id_equal(identity, outputs.get("identityId"))
+        or outputs["databaseIdentityClientId"] == outputs.get("identityClientId")
+        or outputs["databaseIdentityPrincipalId"] == outputs.get("identityPrincipalId")
+        or not str(outputs["databaseDiskRoleId"]).lower().startswith(
+            (authorization + "/roleDefinitions/").lower()
+        )
+        or not str(outputs["databaseDiskAssignmentId"]).lower().startswith(
+            (authorization + "/roleAssignments/").lower()
+        )
+        or not _azure_id_equal(
+            outputs["databaseFederationId"],
+            identity + "/federatedIdentityCredentials/database-controller",
+        )
+        or _azure_id_equal(
+            outputs["databaseDiskAssignmentId"], outputs.get("roleAssignmentId")
+        )
+    ):
+        raise RuntimeError("Azure database foundation identity or scope mismatch")
+
 
 def preflight(
     root: Path,
@@ -172,6 +337,7 @@ def create_foundation(root: Path, config: Mapping[str, str]) -> dict[str, object
         key: value["value"]
         for key, value in payload["properties"]["outputs"].items()
     }
+    _validate_database_outputs(outputs, config["AZURE_PREFIX"])
     record = {
         "schema": FOUNDATION_INVENTORY_SCHEMA,
         **expected,
@@ -599,6 +765,26 @@ def _push_controller_image(
     )
 
 
+def _push_database_controller_image(
+    root: Path,
+    config: Mapping[str, str],
+    inventory: Mapping[str, object],
+) -> str:
+    database_config = load_configuration(root)
+    repository = config["AZURE_CONTROLLER_REPOSITORY"] + "-database"
+    if len(repository) > 255:
+        raise RuntimeError("Azure database controller repository exceeds OCI path limit")
+    return _push_acr_image(
+        root, config, inventory,
+        repository=repository,
+        tag=config["AZURE_CONTROLLER_TAG"],
+        description="database controller",
+        build=lambda image: build_database_controller_image(
+            root, database_config, image=image,
+        ),
+    )
+
+
 def _push_admin_image(
     root: Path,
     config: Mapping[str, str],
@@ -741,26 +927,17 @@ def _azure_allocation_configuration(
 
 def _azure_cutover_lock(root: Path, *, present: bool) -> None:
     if present:
-        try:
-            for document in tenant_cutover_lock_documents():
-                _kubectl(
-                    root,
-                    "apply",
-                    "--server-side",
-                    "--field-manager=cnpg-vcluster-tenant-api-cutover",
-                    "--force-conflicts",
-                    "-f",
-                    "-",
-                    input_text=json.dumps(document),
-                )
-        except Exception as failure:
-            try:
-                _azure_cutover_lock(root, present=False)
-            except Exception as cleanup:
-                failure.add_note(
-                    f"partial Azure Tenant cutover lock cleanup failed: {cleanup}"
-                )
-            raise
+        for document in tenant_cutover_lock_documents():
+            _kubectl(
+                root,
+                "apply",
+                "--server-side",
+                "--field-manager=cnpg-vcluster-tenant-api-cutover",
+                "--force-conflicts",
+                "-f",
+                "-",
+                input_text=json.dumps(document),
+            )
         return
     for resource in tenant_cutover_lock_cleanup_refs():
         _kubectl(
@@ -792,7 +969,10 @@ def _verify_azure_cutover_lock(root: Path, generation: str) -> None:
         "spec": {
             "kubernetesVersion": "1.36.4",
             "workers": 1,
-            "provider": {"type": "local", "databases": 1},
+            "provider": (
+                {"type": "local", "databases": 1}
+                if generation == "v1alpha3" else {"type": "local"}
+            ),
         },
     }
     for _ in range(5):
@@ -840,6 +1020,11 @@ def _validated_azure_list(
 
 
 def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
+    class InventoryClient:
+        def kubectl(self, *args, **kwargs):
+            return _kubectl(root, *args, **kwargs)
+
+    require_absent_legacy_database_crd(InventoryClient())
     tenants = json.loads(_kubectl(root, "get", "tenants", "-o", "json").stdout)
     tenant_api_version = (
         tenants.get("apiVersion") if isinstance(tenants, dict) else None
@@ -850,6 +1035,19 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
     ):
         raise RuntimeError("Azure cutover Tenant inventory is malformed")
     _validated_azure_list(tenants, tenant_api_version, "Tenant")
+    catalog_crd = _kubectl(
+        root, "get", f"crd/{CATALOG_CRD}",
+        "--ignore-not-found=true", "-o", "name",
+    ).stdout.strip()
+    catalogs = []
+    if catalog_crd:
+        catalogs = _validated_azure_list(
+            json.loads(_kubectl(
+                root, "get", CATALOG_CRD,
+                "--all-namespaces", "-o", "json",
+            ).stdout),
+            "tenancy.cnpg-vcluster.io/v1alpha1", "TenantDatabaseCatalog",
+        )
     catalog = json.loads(
         (root / "controller" / "config" / "azure-management-resources.json").read_text(
             encoding="utf-8"
@@ -927,6 +1125,10 @@ def _azure_cutover_inventory(root: Path) -> tuple[dict[str, object], list[str]]:
         for item, _, _, _ in items
         if item.get("metadata", {}).get("uid") in owned_uids
     ]
+    residue.extend(
+        f"TenantDatabaseCatalog/{item['metadata']['namespace']}/{item['metadata']['name']}"
+        for item in catalogs
+    )
     return tenants, residue
 
 
@@ -971,14 +1173,44 @@ def _prepare_azure_tenant_api_cutover(
     root: Path,
     config: Mapping[str, str],
 ) -> bool:
+    class CutoverClient:
+        @property
+        def kubeconfig(self):
+            return _management_kubeconfig(root)
+
+        def kubectl(self, *args, **kwargs):
+            return _kubectl(root, *args, **kwargs)
+
+        def json(self, *args):
+            return json.loads(self.kubectl(*args, "-o", "json").stdout)
+
+    client = CutoverClient()
+    require_absent_legacy_database_crd(client)
     observed = _get_management_resource(
         root, None, "crd/tenants.tenancy.cnpg-vcluster.io"
     )
+    if observed is not None and tenant_api_cutover_state(observed) == "v1alpha4":
+        if (
+            not _azure_cutover_lock_present(root)
+            and not _catalog_lock_present(client)
+            and _catalog_activation_complete(client)
+        ):
+            return False
+    for document in catalog_cutover_lock_documents():
+        _kubectl(
+            root, "apply", "--server-side",
+            "--field-manager=cnpg-vcluster-catalog-cutover",
+            "--force-conflicts", "-f", "-", input_text=json.dumps(document),
+        )
     if observed is None:
-        return _azure_cutover_lock_present(root)
+        if not _azure_cutover_lock_present(root):
+            _azure_cutover_lock(root, present=True)
+        return True
     generation = tenant_api_cutover_state(observed)
-    if generation == "v1alpha3":
-        return _azure_cutover_lock_present(root)
+    if generation == "v1alpha4":
+        if not _azure_cutover_lock_present(root):
+            _azure_cutover_lock(root, present=True)
+        return True
     rendered = _kubectl(
         root,
         "create",
@@ -1004,18 +1236,16 @@ def _prepare_azure_tenant_api_cutover(
         if transition
         else tenant_crd_transition_document(observed, desired)
     )
-    acquired_lock = False
     if transition:
         if not _azure_cutover_lock_present(root):
             raise RuntimeError("Azure Tenant CRD transition is missing its create lock")
     else:
         if not _azure_cutover_lock_present(root):
             _azure_cutover_lock(root, present=True)
-            acquired_lock = True
     try:
         _verify_azure_cutover_lock(
             root,
-            "v1alpha3" if transition else generation,
+            "v1alpha4" if transition else generation,
         )
         if not transition:
             tenants, residue = _azure_cutover_inventory(root)
@@ -1035,7 +1265,7 @@ def _prepare_azure_tenant_api_cutover(
                 "-",
                 input_text=json.dumps(transition_document),
             )
-        _verify_azure_cutover_lock(root, "v1alpha3")
+        _verify_azure_cutover_lock(root, "v1alpha4")
         tenants, residue = _azure_cutover_inventory(root)
         require_empty_tenant_cutover(tenants, residue)
         _kubectl(
@@ -1045,7 +1275,7 @@ def _prepare_azure_tenant_api_cutover(
             "--subresource=status",
             "--type=merge",
             "-p",
-            json.dumps({"status": {"storedVersions": ["v1alpha3"]}}),
+            json.dumps({"status": {"storedVersions": ["v1alpha4"]}}),
         )
         _kubectl(
             root,
@@ -1063,8 +1293,6 @@ def _prepare_azure_tenant_api_cutover(
     except Exception:
         if not transition:
             _scale_azure_controller(root, config, 1)
-            if acquired_lock:
-                _azure_cutover_lock(root, present=False)
         raise
 
 
@@ -1074,7 +1302,7 @@ def _verify_azure_cutover_probe(
 ) -> None:
     name = f"cutover-probe-{uuid.uuid4().hex[:12]}"
     document = {
-        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
+        "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha4",
         "kind": "Tenant",
         "metadata": {"name": name},
         "spec": {
@@ -1201,6 +1429,7 @@ def _install_tenant_controller(
 ) -> tuple[str, str, str]:
     require_tenant_api_cutover_ready()
     image = _push_controller_image(root, config, inventory)
+    database_image = _push_database_controller_image(root, config, inventory)
     provider_config = _azure_provider_configuration(config, inventory, image)
     _, allocation_raw, allocation_sha256 = _azure_allocation_configuration(root, config)
     cutover_locked = _prepare_azure_tenant_api_cutover(root, config)
@@ -1210,6 +1439,8 @@ def _install_tenant_controller(
         root / "controller" / "config" / "rbac" / "role-azure.yaml",
         root / "controller" / "config" / "rbac" / "service-account.yaml",
         root / "controller" / "config" / "rbac" / "role-binding.yaml",
+        root / "controller" / "config" / "rbac" / "allocation-role.yaml",
+        root / "controller" / "config" / "rbac" / "allocation-binding.yaml",
     ):
         _kubectl(
             root,
@@ -1320,18 +1551,49 @@ def _install_tenant_controller(
     )
     if not isinstance(allocation_uid, str) or not allocation_uid:
         raise RuntimeError("Azure Tenant allocation ConfigMap UID is absent")
+    class AzureCatalogClient:
+        kubectl_path = root / ".tools" / "bin" / "kubectl"
+
+        @property
+        def kubeconfig(self):
+            return _management_kubeconfig(root)
+
+        def kubectl(self, *args, **kwargs):
+            return _kubectl(root, *args, **kwargs)
+
+        def json(self, *args):
+            return json.loads(self.kubectl(*args, "-o", "json").stdout)
+
+    catalog_config = load_configuration(root)
+    catalog_config["CONDITION_TIMEOUT"] = config["AZURE_CONTROLLER_TIMEOUT"]
+    catalog_config["DELETE_TIMEOUT"] = config["AZURE_TENANT_TIMEOUT"]
+    catalog_config["AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"] = config[
+        "AZURE_SUPPORTED_TENANT_KUBERNETES_VERSION"
+    ]
+    install_database_catalog(
+        root, catalog_config, AzureCatalogClient(),
+        azure=True, cutover_locked=cutover_locked,
+    )
+    install_database_controller(
+        root, AzureCatalogClient(), database_image, azure=True,
+        azure_identity_client_id=inventory["outputs"]["databaseIdentityClientId"],
+    )
     if cutover_locked:
+        verify_catalog_cutover_lock(
+            AzureCatalogClient(), namespace="tenant-system",
+        )
+        _verify_azure_cutover_lock(root, "v1alpha4")
         _verify_azure_controller_allocation_readiness(
             root,
             allocation_raw,
             allocation_sha256,
         )
-        _azure_cutover_lock(root, present=False)
-        try:
-            _verify_azure_cutover_probe(root, config)
-        except Exception:
-            _azure_cutover_lock(root, present=True)
-            raise
+        if CATALOG_LIFECYCLE_READY:
+            release_catalog_and_tenant_cutover_locks(
+                catalog_config, AzureCatalogClient(), provider="azure",
+                tenant_image=image,
+                database_image=database_image,
+            )
     return image, uid, allocation_uid
 
 
@@ -1615,7 +1877,20 @@ def _admin_authorization_blockers(root: Path) -> list[str]:
             ]
         try:
             review = json.loads(response.stdout)
-            validate_admin_effective_rules(root, "azure", review, namespace)
+            def credential_resource(scope: str, resource: str) -> object:
+                args = ("get", resource, "-o", "json")
+                if not resource.startswith("namespace/"):
+                    args = ("get", "-n", scope, resource, "-o", "json")
+                result = _kubectl(root, *args, check=False)
+                if result.returncode != 0:
+                    raise RuntimeError(
+                        "Azure admin effective RBAC credential identity is unavailable"
+                    )
+                return json.loads(result.stdout)
+
+            validate_admin_effective_rules(
+                root, "azure", review, namespace, credential_resource
+            )
         except (json.JSONDecodeError, RuntimeError) as exc:
             return [str(exc).replace("Tenant Admin", "Azure admin", 1)]
     return []
@@ -2066,6 +2341,7 @@ def load_inventory(
         for key, value in outputs.items()
     ):
         raise RuntimeError("Azure foundation inventory outputs are invalid")
+    _validate_database_outputs(outputs, config["AZURE_PREFIX"])
     if not isinstance(controllers, dict) or not all(
         isinstance(key, str) and isinstance(value, str) and value
         for key, value in controllers.items()
@@ -2122,12 +2398,14 @@ def _foundation_identity(inventory: Mapping[str, object]) -> dict[str, str]:
         "aksRoleAssignmentId",
         "capzFederationId",
         "asoFederationId",
+        *DATABASE_OUTPUTS,
     )
     missing = [key for key in required_outputs if not outputs.get(key)]
     if missing:
         raise RuntimeError(
             "Azure foundation inventory is incomplete: " + ", ".join(missing)
         )
+    _validate_database_outputs(outputs, str(inventory["prefix"]))
     if set(controllers) != {
         f"{namespace}/{deployment}"
         for namespace, deployment in CONTROLLER_DEPLOYMENTS
@@ -2224,6 +2502,149 @@ def _deployment_ready(payload: Mapping[str, object]) -> bool:
         and status.get("availableReplicas", 0) >= requested
         and status.get("updatedReplicas", 0) >= requested
     )
+
+
+def _database_identity_blockers(outputs: Mapping[str, str]) -> list[str]:
+    blockers: list[str] = []
+
+    def inspect(description: str, *arguments: str) -> dict[str, object] | None:
+        response = _az(*arguments, "--output", "json", check=False)
+        if response.returncode != 0:
+            blockers.append(f"recorded Azure database {description} is absent")
+            return None
+        try:
+            resource = json.loads(response.stdout)
+        except (ValueError, TypeError):
+            resource = None
+        if not isinstance(resource, dict):
+            blockers.append(f"Azure database {description} inspection failed")
+            return None
+        return resource
+
+    identity = inspect(
+        "identity", "identity", "show",
+        "--resource-group", outputs["resourceGroupName"],
+        "--name", outputs["resourceGroupName"].removesuffix("-rg")
+        + "-database-controller",
+    )
+    if identity is not None and (
+        not _azure_id_equal(identity.get("id"), outputs["databaseIdentityId"])
+        or not _azure_id_equal(
+            identity.get("clientId"), outputs["databaseIdentityClientId"]
+        )
+        or not _azure_id_equal(
+            identity.get("principalId"), outputs["databaseIdentityPrincipalId"]
+        )
+    ):
+        blockers.append("Azure database identity binding changed")
+
+    role = inspect(
+        "disk role", "resource", "show", "--ids", outputs["databaseDiskRoleId"],
+        "--api-version", "2022-04-01",
+    )
+    if role is not None:
+        properties = role.get("properties")
+        permissions = (
+            properties.get("permissions") if isinstance(properties, dict) else None
+        )
+        permission = (
+            permissions[0]
+            if isinstance(permissions, list) and len(permissions) == 1
+            else None
+        )
+        if (
+            not _azure_id_equal(role.get("id"), outputs["databaseDiskRoleId"])
+            or not isinstance(properties, dict)
+            or properties.get("type") != "CustomRole"
+            or not isinstance(properties.get("assignableScopes"), list)
+            or len(properties["assignableScopes"]) != 1
+            or not _azure_id_equal(
+                properties["assignableScopes"][0], outputs["resourceGroupId"]
+            )
+            or not isinstance(permission, dict)
+            or not isinstance(permission.get("actions"), list)
+            or len(permission["actions"]) != len(DATABASE_DISK_ACTIONS)
+            or {str(action).lower() for action in permission["actions"]}
+            != {action.lower() for action in DATABASE_DISK_ACTIONS}
+            or any(
+                permission.get(key) != []
+                for key in ("notActions", "dataActions", "notDataActions")
+            )
+        ):
+            blockers.append("Azure database disk role permissions changed")
+
+    assignment = inspect(
+        "disk assignment", "resource", "show",
+        "--ids", outputs["databaseDiskAssignmentId"],
+        "--api-version", "2022-04-01",
+    )
+    if assignment is not None:
+        properties = assignment.get("properties")
+        if (
+            not _azure_id_equal(assignment.get("id"), outputs["databaseDiskAssignmentId"])
+            or not isinstance(properties, dict)
+            or not _azure_id_equal(
+                properties.get("principalId"), outputs["databaseIdentityPrincipalId"]
+            )
+            or not _azure_id_equal(
+                properties.get("roleDefinitionId"), outputs["databaseDiskRoleId"]
+            )
+            or properties.get("principalType") != "ServicePrincipal"
+            or (
+                properties.get("scope") is not None
+                and not _azure_id_equal(properties["scope"], outputs["resourceGroupId"])
+            )
+        ):
+            blockers.append("Azure database disk assignment changed")
+
+    federation = inspect(
+        "federated credential", "resource", "show",
+        "--ids", outputs["databaseFederationId"],
+        "--api-version", "2023-01-31",
+    )
+    if federation is not None:
+        properties = federation.get("properties")
+        if (
+            not _azure_id_equal(federation.get("id"), outputs["databaseFederationId"])
+            or not isinstance(properties, dict)
+            or properties.get("issuer") != outputs["aksOidcIssuer"]
+            or properties.get("subject") != DATABASE_SERVICE_ACCOUNT
+            or properties.get("audiences") != ["api://AzureADTokenExchange"]
+        ):
+            blockers.append("Azure database ServiceAccount federation changed")
+
+    response = _az(
+        "role", "assignment", "list",
+        "--assignee-object-id", outputs["databaseIdentityPrincipalId"],
+        "--all", "--include-inherited", "--output", "json", check=False,
+    )
+    if response.returncode != 0:
+        blockers.append("Azure database identity role assignment inspection failed")
+    else:
+        try:
+            assignments = json.loads(response.stdout)
+        except (ValueError, TypeError):
+            assignments = None
+        if (
+            not isinstance(assignments, list)
+            or len(assignments) != 1
+            or not isinstance(assignments[0], dict)
+            or not _azure_id_equal(
+                assignments[0].get("id"), outputs["databaseDiskAssignmentId"]
+            )
+            or not _azure_id_equal(
+                assignments[0].get("scope"), outputs["resourceGroupId"]
+            )
+            or not _azure_id_equal(
+                assignments[0].get("principalId"),
+                outputs["databaseIdentityPrincipalId"],
+            )
+            or not _azure_id_equal(
+                assignments[0].get("roleDefinitionId"), outputs["databaseDiskRoleId"]
+            )
+        ):
+            blockers.append("Azure database identity has missing or excess role authority")
+    return blockers
 
 
 def _inspect_foundation(
@@ -2468,6 +2889,7 @@ def _inspect_foundation(
             blockers.append(f"recorded Azure {description} is absent")
         elif response.stdout.strip().lower() != str(expected_id).lower():
             blockers.append(f"Azure {description} identity changed")
+    blockers.extend(_database_identity_blockers(outputs))
     try:
         readyz = _kubectl(root, "get", "--raw=/readyz", check=False)
     except (OSError, RuntimeError):
@@ -2620,6 +3042,11 @@ def destroy(root: Path, config: Mapping[str, str]) -> None:
     inventory = load_inventory(root, config)
     outputs = inventory["outputs"]
     assert isinstance(outputs, dict)
+    database_blockers = _database_identity_blockers(outputs)
+    if database_blockers:
+        raise RuntimeError(
+            "Azure database foundation is unhealthy: " + "; ".join(database_blockers)
+        )
     resource_group_id = outputs["resourceGroupId"]
     observed = _az(
         "group",

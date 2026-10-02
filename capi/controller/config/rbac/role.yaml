@@ -25,9 +25,18 @@ rules:
   - patch
   - update
 - apiGroups:
-  - coordination.k8s.io
+  - rbac.authorization.k8s.io
   resources:
-  - leases
+  - roles
+  - rolebindings
+  verbs:
+  - create
+  - delete
+  - get
+- apiGroups:
+  - tenancy.cnpg-vcluster.io
+  resources:
+  - tenantdatabasecatalogs
   verbs:
   - create
   - delete
@@ -188,16 +197,4 @@ rules:
   - delete
   - get
   - list
-  - watch
-- apiGroups:
-  - coordination.k8s.io
-  resources:
-  - leases
-  verbs:
-  - create
-  - delete
-  - get
-  - list
-  - patch
-  - update
   - watch

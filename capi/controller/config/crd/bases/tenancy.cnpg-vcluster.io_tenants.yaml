@@ -26,10 +26,7 @@ spec:
     - jsonPath: .spec.workers
       name: Workers
       type: integer
-    - jsonPath: .spec.provider.databases
-      name: Databases
-      type: integer
-    name: v1alpha3
+    name: v1alpha4
     schema:
       openAPIV3Schema:
         description: Auto-generated derived type for TenantSpec via `CustomResource`
@@ -41,11 +38,6 @@ spec:
                 type: string
               provider:
                 properties:
-                  databases:
-                    format: int32
-                    maximum: 3.0
-                    minimum: 1.0
-                    type: integer
                   type:
                     enum:
                     - local
@@ -67,6 +59,20 @@ spec:
           status:
             nullable: true
             properties:
+              catalogCreateIntent:
+                nullable: true
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                  tenantUID:
+                    type: string
+                required:
+                - name
+                - namespace
+                - tenantUID
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current state of this API Resource.
@@ -102,6 +108,29 @@ spec:
                 x-kubernetes-list-map-keys:
                 - type
                 x-kubernetes-list-type: map
+              databaseCapability:
+                nullable: true
+                properties:
+                  available:
+                    type: boolean
+                  catalogUID:
+                    type: string
+                  namespace:
+                    type: string
+                  namespaceUID:
+                    type: string
+                  reason:
+                    type: string
+                  storageNamespaceUID:
+                    nullable: true
+                    type: string
+                required:
+                - available
+                - catalogUID
+                - namespace
+                - namespaceUID
+                - reason
+                type: object
               observedGeneration:
                 format: int64
                 nullable: true
@@ -365,14 +394,14 @@ spec:
           rule: self.metadata.name.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')
         - message: workers must be between 1 and 3
           rule: self.spec.workers >= 1 && self.spec.workers <= 3
-        - message: databases must be present only for the local provider
-          rule: 'self.spec.provider.type == ''local'' ? has(self.spec.provider.databases) : !has(self.spec.provider.databases)'
         - message: Tenant provider status must match the requested provider
           rule: '!has(self.status) || !has(self.status.provider) || self.status.provider.type == self.spec.provider.type'
         - message: Azure provider status cannot contain local durable identity
           rule: '!has(self.status) || !has(self.status.provider) || self.status.provider.type != ''azure'' || (!has(self.status.provider.allocation) && !has(self.status.provider.foundationHash) && !has(self.status.provider.clusterUID))'
         - message: Local provider status cannot contain Azure durable identity
           rule: '!has(self.status) || !has(self.status.provider) || self.status.provider.type != ''local'' || (!has(self.status.provider.binding) && !has(self.status.provider.networkAllocation) && !has(self.status.provider.endpoint) && !has(self.status.provider.management) && !has(self.status.provider.kubeconfig) && !has(self.status.provider.vmss) && !has(self.status.provider.nodes) && !has(self.status.provider.addonComponents) && !has(self.status.provider.providerResources) && !has(self.status.provider.deletion))'
+        - message: catalog creation intent cannot be removed or replaced
+          rule: '!has(oldSelf.status) || !has(oldSelf.status.catalogCreateIntent) || (has(self.status) && has(self.status.catalogCreateIntent) && self.status.catalogCreateIntent == oldSelf.status.catalogCreateIntent)'
         - message: kubernetesVersion must be a three-component numeric version
           rule: self.spec.kubernetesVersion.matches('^v?[0-9]+[.][0-9]+[.][0-9]+$')
     served: true

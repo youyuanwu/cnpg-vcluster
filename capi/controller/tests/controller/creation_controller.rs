@@ -8,8 +8,8 @@ use kube::{ResourceExt, core::DynamicObject, runtime::controller::Action};
 use serde_json::{Value, json};
 use tenant_controller::{
     api::{
-        CanonicalSpec, LocalProviderStatus, Tenant, TenantPhase, TenantProviderSpec,
-        TenantProviderStatus, TenantStatus, canonical_spec, spec_hash,
+        CanonicalSpec, CatalogCreateIntent, LocalProviderStatus, Tenant, TenantPhase,
+        TenantProviderSpec, TenantProviderStatus, TenantStatus, canonical_spec, spec_hash,
     },
     docker::{DockerContainer, WORKER_CLUSTER_LABEL, WORKER_ROLE_LABEL},
     foundation::{Foundation, FoundationError, canonical_hash, parse_runtime},
@@ -19,14 +19,18 @@ use tenant_controller::{
         Assets, Config, FINALIZER, LocalProvider, PROGRESS_INTERVAL, ProviderLifecycle,
         ReconcileError, Reconciler,
     },
+    status,
 };
 
-const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha3/tenants/tenant-a";
+const TENANT: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha4/tenants/tenant-a";
 const FOUNDATION: &str = "/api/v1/namespaces/tenant-system/configmaps/tenant-foundation";
 const LEASES: &str = "/apis/coordination.k8s.io/v1/namespaces/tenant-system/leases";
 const CLUSTER: &str = "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/clusters/tenant-a";
 const DEPLOYMENT: &str =
     "/apis/cluster.x-k8s.io/v1beta2/namespaces/tenant-a/machinedeployments/tenant-a-worker";
+const CATALOGS: &str =
+    "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabasecatalogs";
+const CATALOG: &str = "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabasecatalogs/tenant-a";
 
 struct Fixture {
     management: Server,
@@ -242,13 +246,13 @@ impl Fixture {
     async fn until_ready(&self) {
         for _ in 0..25 {
             self.step().await;
-            if self
-                .current()
-                .status
-                .as_ref()
-                .and_then(|status| status.phase)
-                == Some(tenant_controller::api::TenantPhase::Ready)
-            {
+            if self.current().status.as_ref().is_some_and(|status| {
+                status.phase == Some(TenantPhase::Ready)
+                    && status
+                        .database_capability
+                        .as_ref()
+                        .is_some_and(|cap| cap.reason == "Ready")
+            }) {
                 return;
             }
             self.settle_provider();
@@ -859,7 +863,7 @@ async fn creation_finalizer_conflict_requeues_without_failure_status_patch() {
 }
 
 #[tokio::test]
-async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
+async fn deletion_never_attempts_provider_finalizer_before_catalog_drain() {
     let fixture = Fixture::new(true);
     let mut tenant = fixture.management.get(TENANT);
     tenant["metadata"]["deletionTimestamp"] = json!("2026-09-27T00:00:00Z");
@@ -867,6 +871,7 @@ async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
     tenant["status"] = json!({
         "phase":"Deleting",
         "foundationHash":fixture.hash,
+        "catalogCreateIntent":{"namespace":"tenant-db-tenant-a","name":"tenant-a","tenantUID":"tenant-uid"},
         "conditions":[]
     });
     fixture.management.insert(TENANT, tenant);
@@ -877,13 +882,6 @@ async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
             resource.plural
         ));
     }
-    fixture.management.respond(
-        "PATCH",
-        TENANT,
-        409,
-        crate::support::kube::status(409, "Conflict"),
-    );
-
     fixture.reconciler.reconcile_name("tenant-a").await.unwrap();
 
     assert_eq!(
@@ -893,14 +891,14 @@ async fn finalizer_patch_conflict_requeues_without_failure_status_patch() {
             .iter()
             .filter(|call| call.method == "PATCH" && call.path == TENANT)
             .count(),
-        1
+        0
     );
     assert!(
         fixture
             .management
             .calls()
             .iter()
-            .all(|call| !(call.method == "PATCH" && call.path == format!("{TENANT}/status")))
+            .any(|call| call.method == "PATCH" && call.path == format!("{TENANT}/status"))
     );
 }
 
@@ -1009,6 +1007,21 @@ async fn control_plane_aggregate_gates_credentials_volume_and_workers() {
 async fn full_pipeline_converges_then_observes_once_and_preserves_static_content_drift() {
     let fixture = Fixture::new(true);
     fixture.until_ready().await;
+    let storage = fixture
+        .workload
+        .get("/apis/storage.k8s.io/v1/storageclasses/capi-hostpath");
+    assert_eq!(storage["volumeBindingMode"], "Immediate");
+    assert_eq!(storage["reclaimPolicy"], "Retain");
+    assert_eq!(
+        fixture
+            .current()
+            .status
+            .unwrap()
+            .database_capability
+            .unwrap()
+            .reason,
+        "Ready"
+    );
     let config_path = "/api/v1/namespaces/kube-system/configmaps/capi-kube-proxy";
     let mut config = fixture.workload.get(config_path);
     config["data"]["config.conf"] = json!("owned drift is intentionally not repaired");
@@ -1024,25 +1037,15 @@ async fn full_pipeline_converges_then_observes_once_and_preserves_static_content
             .count(),
         1
     );
-    assert_eq!(
+    assert!(
         calls
             .iter()
-            .filter(|call| call.method == "GET"
-                && call.path
-                    == "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres")
-            .count(),
-        1
+            .all(|call| !call.path.contains("/postgresql.cnpg.io/"))
     );
     assert!(calls.iter().all(
         |call| !call.path.ends_with("/pods") && !call.path.ends_with("/persistentvolumeclaims")
     ));
-    let patches: Vec<_> = calls.iter().filter(|call| call.method == "PATCH").collect();
-    assert_eq!(
-        patches.len(),
-        1,
-        "only the CNPG Cluster is dynamic in the tenant API"
-    );
-    assert!(patches[0].path.ends_with("/clusters/capi-postgres"));
+    assert!(calls.iter().all(|call| call.method != "PATCH"));
     assert_eq!(
         fixture.workload.get(config_path)["data"]["config.conf"],
         "owned drift is intentionally not repaired"
@@ -1186,98 +1189,816 @@ async fn worker_root_owners_are_optional_but_must_be_exact_when_present() {
 }
 
 #[tokio::test]
-async fn database_health_trusts_aggregate_phase_and_ready_instances() {
-    for evidence in [
-        "missing-condition",
-        "false-condition",
-        "stale-condition",
-        "stale-status",
-        "missing-generation",
-    ] {
+async fn tenant_readiness_does_not_depend_on_database_workloads() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    fixture.clear();
+    assert_eq!(
+        fixture.step().await,
+        Action::requeue(std::time::Duration::from_secs(300))
+    );
+    assert_eq!(
+        fixture.current().status.unwrap().phase,
+        Some(TenantPhase::Ready)
+    );
+    assert!(fixture.workload.calls().iter().all(|call| {
+        !call.path.contains("/postgresql.cnpg.io/") && !call.path.contains("/namespaces/database")
+    }));
+}
+
+#[tokio::test]
+async fn empty_catalog_does_not_reintroduce_gate_or_block_infrastructure_ready() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    let status = fixture.current().status.unwrap();
+    let capability = status.database_capability.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Ready));
+    assert!(capability.available);
+    assert_eq!(capability.reason, "Ready");
+    assert_eq!(capability.namespace, "tenant-db-tenant-a");
+    assert!(!capability.catalog_uid.is_empty());
+    assert!(!capability.namespace_uid.is_empty());
+    assert_eq!(
+        status.catalog_create_intent.unwrap().tenant_uid,
+        "tenant-uid"
+    );
+    let catalog = fixture.management.get(
+        "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabasecatalogs/tenant-a"
+    );
+    assert_eq!(catalog["spec"]["entries"], json!({}));
+    assert_eq!(catalog["metadata"]["uid"], json!(capability.catalog_uid));
+    assert_eq!(
+        catalog["metadata"]["ownerReferences"][0]["uid"],
+        json!("tenant-uid")
+    );
+    assert!(fixture.management.calls().iter().all(|call| {
+        !call.path.contains("tenant-database-gates")
+            && !call.path.contains("resourcequotas")
+            && !call.path.contains("tenantdatabases")
+    }));
+}
+
+#[tokio::test]
+async fn credential_binding_remains_exact_with_empty_catalog() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    let role_path =
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/tenant-a/roles/tenant-database-credentials";
+    let mut role = fixture.management.get(role_path);
+    assert_eq!(
+        role["rules"][0]["resourceNames"],
+        json!(["tenant-a-kubeconfig"])
+    );
+    assert_eq!(role["rules"][0]["verbs"], json!(["get"]));
+    let binding = fixture.management.get(
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/tenant-a/rolebindings/tenant-database-credentials"
+    );
+    assert_eq!(
+        binding["subjects"],
+        json!([
+            {"kind":"ServiceAccount","name":"tenant-admin","namespace":"tenant-system"},
+            {"kind":"ServiceAccount","name":"database-controller","namespace":"tenant-system"}
+        ])
+    );
+    role["rules"][0]["resourceNames"] = json!(["unrelated-secret"]);
+    fixture.management.insert(role_path, role);
+    fixture.clear();
+    assert_eq!(
+        fixture.step().await,
+        Action::requeue(std::time::Duration::from_secs(5))
+    );
+    let status = fixture.current().status.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Ready));
+    assert_eq!(
+        status.database_capability.unwrap().reason,
+        "CredentialAccessUnavailable"
+    );
+    assert!(
+        fixture.management.calls().iter().all(|call| {
+            call.method != "DELETE" && !call.path.contains("tenant-database-gates")
+        })
+    );
+}
+
+#[tokio::test]
+async fn lost_or_replaced_catalog_never_reuses_a_ready_capability() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    let path = "/apis/tenancy.cnpg-vcluster.io/v1alpha1/namespaces/tenant-db-tenant-a/tenantdatabasecatalogs/tenant-a";
+    let saved = fixture.management.get(path);
+    fixture.management.0.lock().unwrap().objects.remove(path);
+    fixture.step().await;
+    let status = fixture.current().status.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Degraded));
+    assert!(
+        status
+            .conditions
+            .iter()
+            .any(|condition| condition.type_ == "Ready"
+                && condition.status == "False"
+                && condition.reason == "CatalogNotReady")
+    );
+    assert!(!status.database_capability.unwrap().available);
+    let mut replacement = saved;
+    replacement["metadata"]["uid"] = json!("foreign-uid");
+    fixture.management.insert(path, replacement);
+    fixture.step().await;
+    assert!(
+        !fixture
+            .current()
+            .status
+            .unwrap()
+            .database_capability
+            .unwrap()
+            .available
+    );
+    assert_eq!(
+        fixture.current().status.unwrap().phase,
+        Some(TenantPhase::Degraded)
+    );
+}
+
+#[tokio::test]
+async fn credential_deletion_never_targets_a_foreign_replacement() {
+    use tenant_database_runtime::catalog_runtime::{CatalogRuntimeError, drain_catalog};
+    const BINDING: &str = "/apis/rbac.authorization.k8s.io/v1/namespaces/tenant-a/rolebindings/tenant-database-credentials";
+    const ROLE: &str =
+        "/apis/rbac.authorization.k8s.io/v1/namespaces/tenant-a/roles/tenant-database-credentials";
+    let owned = json!({"name":"tenant-database-credentials","uid":"owned-uid",
+        "resourceVersion":"4","labels":{"tenancy.cnpg-vcluster.io/tenant-uid":"tenant-uid"}});
+    let mut foreign = owned.clone();
+    foreign["uid"] = json!("foreign-uid");
+    foreign["labels"]["tenancy.cnpg-vcluster.io/tenant-uid"] = json!("foreign");
+    let role = json!({"apiVersion":"rbac.authorization.k8s.io/v1","kind":"Role",
+        "metadata":owned,"rules":[]});
+    let binding = json!({"apiVersion":"rbac.authorization.k8s.io/v1","kind":"RoleBinding",
+        "metadata":role["metadata"],"roleRef":{"apiGroup":"rbac.authorization.k8s.io",
+            "kind":"Role","name":"tenant-database-credentials"}});
+    let server = Server::default();
+    server.insert(ROLE, &role);
+    server.insert(BINDING, &binding);
+    let mut replacement = binding.clone();
+    replacement["metadata"] = foreign.clone();
+    server.mutate_on("GET", BINDING, BINDING, Some(replacement.clone()));
+    let result = drain_catalog(server.client(), "tenant-a", "tenant-uid", None).await;
+    assert!(matches!(result, Err(CatalogRuntimeError::Identity)));
+    assert!(!server.calls().iter().any(|call| call.method == "DELETE"));
+
+    server.insert(BINDING, &binding);
+    server.take_calls();
+    server.mutate_on("DELETE", BINDING, BINDING, Some(replacement.clone()));
+    let result = drain_catalog(server.client(), "tenant-a", "tenant-uid", None).await;
+    assert!(matches!(result, Err(CatalogRuntimeError::Api(_))));
+    let calls = server.calls();
+    let delete = calls.iter().find(|call| call.method == "DELETE").unwrap();
+    assert_eq!(delete.body["preconditions"]["uid"], "owned-uid");
+    assert_eq!(server.get(BINDING)["metadata"]["uid"], "foreign-uid");
+}
+
+fn create_outcome(tenant: &Tenant) -> Option<&str> {
+    tenant
+        .status
+        .as_ref()?
+        .conditions
+        .iter()
+        .find(|condition| condition.type_ == "CatalogCreate")
+        .map(|condition| condition.reason.as_str())
+}
+
+#[tokio::test]
+async fn definitely_rejected_catalog_create_can_drain_verified_owned_namespaces() {
+    let fixture = Fixture::new(true);
+    fixture
+        .management
+        .respond("POST", CATALOGS, 403, status(403, "Forbidden"));
+    for _ in 0..30 {
+        fixture.step().await;
+        if create_outcome(&fixture.current()) == Some("Rejected") {
+            break;
+        }
+        fixture.settle_provider();
+    }
+    assert_eq!(create_outcome(&fixture.current()), Some("Rejected"));
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+    fixture.clear();
+    fixture.step().await;
+    let calls = fixture.management.calls();
+    assert!(calls.iter().any(
+        |call| call.method == "DELETE" && call.path == "/api/v1/namespaces/tenant-db-tenant-a"
+    ));
+    assert!(
+        calls
+            .iter()
+            .all(|call| call.method != "POST" || call.path != CATALOGS)
+    );
+    fixture.step().await;
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| call.method == "GET" && call.path == CLUSTER)
+    );
+}
+
+#[tokio::test]
+async fn definitely_rejected_create_retries_only_after_a_new_durable_issuance() {
+    let fixture = Fixture::new(true);
+    fixture
+        .management
+        .respond("POST", CATALOGS, 403, status(403, "Forbidden"));
+    for _ in 0..30 {
+        fixture.step().await;
+        if create_outcome(&fixture.current()) == Some("Rejected") {
+            break;
+        }
+        fixture.settle_provider();
+    }
+    assert_eq!(create_outcome(&fixture.current()), Some("Rejected"));
+    fixture.clear();
+    fixture.step().await;
+    assert_eq!(create_outcome(&fixture.current()), Some("Observed"));
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| call.method == "POST" && call.path == CATALOGS)
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| call.method == "PATCH" && call.path == format!("{TENANT}/status"))
+    );
+}
+
+#[tokio::test]
+async fn rejected_create_cannot_delete_a_replaced_namespace() {
+    let fixture = Fixture::new(true);
+    fixture
+        .management
+        .respond("POST", CATALOGS, 403, status(403, "Forbidden"));
+    for _ in 0..30 {
+        fixture.step().await;
+        if create_outcome(&fixture.current()) == Some("Rejected") {
+            break;
+        }
+        fixture.settle_provider();
+    }
+    assert_eq!(create_outcome(&fixture.current()), Some("Rejected"));
+    let path = "/api/v1/namespaces/tenant-db-tenant-a";
+    let mut namespace = fixture.management.get(path);
+    namespace["metadata"]["uid"] = json!("replacement-namespace");
+    fixture.management.insert(path, namespace);
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+    fixture.clear();
+    fixture.step().await;
+    assert!(
+        fixture
+            .current()
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == FINALIZER)
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
+}
+
+#[tokio::test]
+async fn no_catalog_attempt_can_drain_absence_but_not_foreign_namespaces() {
+    let fixture = Fixture::new(true);
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["finalizers"] = json!([FINALIZER]);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+    assert!(
+        tenant_database_runtime::catalog_runtime::drain_catalog(
+            fixture.management.client(),
+            "tenant-a",
+            "tenant-uid",
+            None,
+        )
+        .await
+        .unwrap()
+    );
+    let foreign = json!({
+        "apiVersion":"v1", "kind":"Namespace",
+        "metadata":{"name":"tenant-db-tenant-a","uid":"foreign-uid",
+            "labels":{"tenancy.cnpg-vcluster.io/tenant-uid":"foreign-tenant"}}
+    });
+    fixture
+        .management
+        .insert("/api/v1/namespaces/tenant-db-tenant-a", foreign);
+    fixture.clear();
+    fixture.step().await;
+    assert!(
+        fixture
+            .current()
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == FINALIZER)
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "POST" || call.path != CATALOGS)
+    );
+}
+
+#[tokio::test]
+async fn interrupted_namespace_preparation_keeps_catalog_unissued_and_finalizer_fenced() {
+    let fixture = Fixture::new(true);
+    for _ in 0..30 {
+        fixture.step().await;
+        if create_outcome(&fixture.current()) == Some("Prepared") {
+            break;
+        }
+        fixture.settle_provider();
+    }
+    assert_eq!(create_outcome(&fixture.current()), Some("Prepared"));
+    fixture
+        .management
+        .respond("POST", "/api/v1/namespaces", 504, status(504, "Timeout"));
+    for _ in 0..30 {
+        fixture.step().await;
+        if create_outcome(&fixture.current()) == Some("Preparing")
+            && fixture
+                .management
+                .calls()
+                .iter()
+                .any(|call| call.method == "POST" && call.path == "/api/v1/namespaces")
+        {
+            break;
+        }
+        fixture.settle_provider();
+    }
+    assert_eq!(create_outcome(&fixture.current()), Some("Preparing"));
+    fixture.clear();
+    let restarted = Reconciler::new(
+        fixture.management.client(),
+        Config::default(),
+        fixture.reconciler.provider.clone(),
+    );
+    restarted.reconcile_name("tenant-a").await.unwrap();
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "POST")
+    );
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+    fixture.clear();
+    restarted.reconcile_name("tenant-a").await.unwrap();
+    assert!(
+        fixture
+            .current()
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == FINALIZER)
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
+}
+
+#[tokio::test]
+async fn rejected_namespace_preparation_can_delete_without_a_catalog_attempt() {
+    let fixture = Fixture::new(true);
+    for _ in 0..30 {
+        fixture.step().await;
+        if create_outcome(&fixture.current()) == Some("Prepared") {
+            break;
+        }
+        fixture.settle_provider();
+    }
+    assert_eq!(create_outcome(&fixture.current()), Some("Prepared"));
+    fixture
+        .management
+        .respond("POST", "/api/v1/namespaces", 403, status(403, "Forbidden"));
+    fixture.step().await;
+    assert_eq!(
+        create_outcome(&fixture.current()),
+        Some("PreparationRejected")
+    );
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+    fixture.clear();
+    fixture.step().await;
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "POST" || call.path != CATALOGS)
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| call.method == "GET" && call.path == CLUSTER)
+    );
+}
+
+#[tokio::test]
+async fn unknown_catalog_create_survives_restart_and_late_persistence() {
+    let fixture = Fixture::new(true);
+    fixture
+        .management
+        .respond("POST", CATALOGS, 504, status(504, "Timeout"));
+    for _ in 0..30 {
+        fixture.step().await;
+        if create_outcome(&fixture.current()) == Some("Unknown")
+            && fixture
+                .management
+                .calls()
+                .iter()
+                .any(|call| call.method == "POST" && call.path == CATALOGS)
+        {
+            break;
+        }
+        fixture.settle_provider();
+    }
+    assert_eq!(create_outcome(&fixture.current()), Some("Unknown"));
+    let restarted = Reconciler::new(
+        fixture.management.client(),
+        Config::default(),
+        fixture.reconciler.provider.clone(),
+    );
+    fixture.clear();
+    restarted.reconcile_name("tenant-a").await.unwrap();
+    assert_eq!(create_outcome(&fixture.current()), Some("Unknown"));
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "POST" || call.path != CATALOGS)
+    );
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+    fixture.clear();
+    restarted.reconcile_name("tenant-a").await.unwrap();
+    assert!(
+        fixture
+            .current()
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == FINALIZER)
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
+    fixture
+        .management
+        .0
+        .lock()
+        .unwrap()
+        .objects
+        .remove("/api/v1/namespaces/tenant-db-tenant-a");
+    fixture.clear();
+    restarted.reconcile_name("tenant-a").await.unwrap();
+    assert!(
+        fixture
+            .current()
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == FINALIZER)
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
+
+    let other = Fixture::new(true);
+    other.until_ready().await;
+    let late = other.management.get(CATALOG);
+    let namespace = other
+        .management
+        .get("/api/v1/namespaces/tenant-db-tenant-a");
+    fixture
+        .management
+        .insert("/api/v1/namespaces/tenant-db-tenant-a", namespace);
+    fixture.management.insert(CATALOG, late.clone());
+    fixture.clear();
+    restarted.reconcile_name("tenant-a").await.unwrap();
+    assert_eq!(create_outcome(&fixture.current()), Some("Observed"));
+    assert_eq!(
+        fixture
+            .current()
+            .status
+            .unwrap()
+            .database_capability
+            .unwrap()
+            .catalog_uid,
+        late["metadata"]["uid"].as_str().unwrap()
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "POST" || call.path != CATALOGS)
+    );
+}
+
+#[tokio::test]
+async fn foreign_late_catalog_never_replaces_unknown_intent() {
+    let fixture = Fixture::new(true);
+    fixture
+        .management
+        .respond("POST", CATALOGS, 504, status(504, "Timeout"));
+    for _ in 0..30 {
+        fixture.step().await;
+        if create_outcome(&fixture.current()) == Some("Unknown")
+            && fixture
+                .management
+                .calls()
+                .iter()
+                .any(|call| call.method == "POST" && call.path == CATALOGS)
+        {
+            break;
+        }
+        fixture.settle_provider();
+    }
+    let other = Fixture::new(true);
+    other.until_ready().await;
+    let mut foreign = other.management.get(CATALOG);
+    foreign["metadata"]["ownerReferences"][0]["uid"] = json!("foreign-tenant");
+    fixture.management.insert(CATALOG, foreign);
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+    fixture.clear();
+    fixture.step().await;
+    assert!(
+        fixture
+            .current()
+            .finalizers()
+            .iter()
+            .any(|finalizer| finalizer == FINALIZER)
+    );
+    assert_eq!(create_outcome(&fixture.current()), Some("Unknown"));
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "DELETE")
+    );
+}
+
+#[tokio::test]
+async fn nonempty_owned_catalog_does_not_degrade_tenant_capability() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    let mut catalog = fixture.management.get(CATALOG);
+    catalog["spec"]["entries"] = json!({"db-uid":{
+        "uid":"db-uid","name":"app","instances":1,"deleting":false
+    }});
+    fixture.management.insert(CATALOG, catalog);
+    fixture.clear();
+    fixture.step().await;
+    let capability = fixture
+        .current()
+        .status
+        .unwrap()
+        .database_capability
+        .unwrap();
+    assert!(capability.available);
+    assert_eq!(capability.reason, "Ready");
+}
+
+#[tokio::test]
+async fn catalog_create_intent_is_durable_and_cannot_switch_identity() {
+    let fixture = Fixture::new(true);
+    let tenant = fixture.current();
+    let intent = CatalogCreateIntent {
+        namespace: "tenant-db-tenant-a".into(),
+        name: "tenant-a".into(),
+        tenant_uid: tenant.uid().unwrap(),
+    };
+    assert!(
+        status::record_catalog_create_intent(fixture.management.client(), &tenant, &intent)
+            .await
+            .is_err()
+    );
+    assert!(fixture.management.calls().is_empty());
+    let mut protected = tenant.clone();
+    protected.metadata.finalizers = Some(vec![FINALIZER.into()]);
+    fixture.management.insert(TENANT, protected);
+    let tenant = fixture.current();
+    status::record_catalog_create_intent(fixture.management.client(), &tenant, &intent)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture.current().status.unwrap().catalog_create_intent,
+        Some(intent.clone())
+    );
+    let calls = fixture.management.calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].path, format!("{TENANT}/status"));
+    assert_eq!(calls[0].body["metadata"]["uid"], intent.tenant_uid);
+    assert_eq!(
+        calls[0].body["metadata"]["resourceVersion"],
+        tenant.resource_version().unwrap()
+    );
+
+    fixture.clear();
+    let current = fixture.current();
+    status::record_catalog_create_intent(fixture.management.client(), &current, &intent)
+        .await
+        .unwrap();
+    assert!(fixture.management.calls().is_empty());
+    let mut replacement = intent.clone();
+    replacement.namespace = "unrelated".into();
+    assert!(
+        status::record_catalog_create_intent(fixture.management.client(), &current, &replacement)
+            .await
+            .is_err()
+    );
+    assert!(fixture.management.calls().is_empty());
+    assert_eq!(
+        fixture.current().status.unwrap().catalog_create_intent,
+        Some(intent)
+    );
+}
+
+#[tokio::test]
+async fn deletion_racing_intent_write_prevents_catalog_issuance() {
+    let fixture = Fixture::new(true);
+    let mut protected = fixture.management.get(TENANT);
+    protected["metadata"]["finalizers"] = json!([FINALIZER]);
+    fixture.management.insert(TENANT, protected.clone());
+    let tenant = fixture.current();
+    let intent = CatalogCreateIntent {
+        namespace: "tenant-db-tenant-a".into(),
+        name: "tenant-a".into(),
+        tenant_uid: tenant.uid().unwrap(),
+    };
+    protected["metadata"]["resourceVersion"] = json!("123");
+    protected["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.mutate_on(
+        "PATCH",
+        &format!("{TENANT}/status"),
+        TENANT,
+        Some(protected),
+    );
+    assert!(
+        status::record_catalog_create_intent(fixture.management.client(), &tenant, &intent,)
+            .await
+            .is_err()
+    );
+    assert!(
+        fixture
+            .current()
+            .status
+            .as_ref()
+            .and_then(|status| status.catalog_create_intent.as_ref())
+            .is_none()
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| call.method != "POST" || call.path != CATALOGS)
+    );
+}
+
+#[tokio::test]
+async fn deleting_without_catalog_intent_persists_closed_eligibility_before_drain() {
+    let fixture = Fixture::new(true);
+    let mut tenant = fixture.management.get(TENANT);
+    tenant["metadata"]["finalizers"] = json!([FINALIZER]);
+    tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+    fixture.management.insert(TENANT, tenant);
+
+    fixture.step().await;
+    let current = fixture.current();
+    assert!(current.finalizers().iter().any(|value| value == FINALIZER));
+    let status = current.status.unwrap();
+    assert!(status.catalog_create_intent.is_none());
+    assert_eq!(status::catalog_create_outcome(&status), Some("Closed"));
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| call.method == "PATCH" && call.path == format!("{TENANT}/status"))
+    );
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .all(|call| !call.path.contains("tenantdatabasecatalogs") && call.method != "DELETE")
+    );
+}
+
+#[tokio::test]
+async fn deletion_without_catalog_drain_retains_finalizer_and_all_infrastructure() {
+    for recorded_intent in [false, true] {
         let fixture = Fixture::new(true);
         fixture.until_ready().await;
-        let path = "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres";
-        let mut database = fixture.workload.get(path);
-        match evidence {
-            "missing-condition" => {
-                database["status"]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("conditions");
-            }
-            "false-condition" => database["status"]["conditions"][0]["status"] = json!("False"),
-            "stale-condition" => {
-                database["status"]["conditions"][0]["observedGeneration"] = json!(0)
-            }
-            "stale-status" => database["status"]["observedGeneration"] = json!(0),
-            "missing-generation" => {
-                database["status"]["conditions"][0]
-                    .as_object_mut()
-                    .unwrap()
-                    .remove("observedGeneration");
-            }
-            _ => unreachable!(),
+        let mut tenant = fixture.management.get(TENANT);
+        tenant["metadata"]["deletionTimestamp"] = json!("2026-01-01T00:00:00Z");
+        if !recorded_intent {
+            tenant["status"]
+                .as_object_mut()
+                .unwrap()
+                .remove("catalogCreateIntent");
+        } else {
+            tenant["status"]["catalogCreateIntent"] = json!({
+                "namespace":"tenant-db-tenant-a", "name":"tenant-a",
+                "tenantUID":"tenant-uid"
+            });
         }
-        fixture.workload.insert(path, database);
-        assert_eq!(
-            fixture.step().await,
-            Action::requeue(std::time::Duration::from_secs(300))
-        );
-        let status = fixture.current().status.unwrap();
-        assert_eq!(
-            status.phase,
-            Some(tenant_controller::api::TenantPhase::Ready),
-            "{evidence}"
-        );
+        fixture.management.insert(TENANT, tenant);
+        fixture.clear();
+        fixture.step().await;
+        let current = fixture.current();
+        assert!(current.finalizers().iter().any(|value| value == FINALIZER));
+        let status = current.status.unwrap();
+        assert_eq!(status.phase, Some(TenantPhase::Deleting));
+        assert_ne!(status.phase, Some(TenantPhase::Ready));
+        assert_eq!(status.catalog_create_intent.is_some(), recorded_intent);
+        assert!(fixture.management.calls().iter().all(|call|
+            call.method != "DELETE" || call.path.contains("tenantdatabasecatalogs")
+        ));
+        assert!(fixture.workload.calls().is_empty());
     }
 }
 
 #[tokio::test]
-async fn established_worker_and_database_recovery_remain_degraded_and_use_short_retry() {
-    for component in ["worker", "database"] {
-        let fixture = Fixture::new(true);
-        fixture.until_ready().await;
-        let path = if component == "worker" {
-            "/api/v1/nodes/worker-a"
-        } else {
-            "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres"
-        };
-        let mut value = fixture.workload.get(path);
-        if component == "worker" {
-            value["status"]["conditions"][0]["status"] = json!("False");
-        } else {
-            value["status"]["readyInstances"] = json!(0);
-        }
-        fixture.workload.insert(path, value);
-        fixture.clear();
-        assert_eq!(
-            fixture.step().await,
-            Action::requeue(std::time::Duration::from_secs(5))
-        );
-        let status = fixture.current().status.unwrap();
-        assert_eq!(
-            status.phase,
-            Some(tenant_controller::api::TenantPhase::Degraded)
-        );
-        assert_eq!(
-            status
-                .conditions
-                .iter()
-                .find(|condition| condition.type_ == "Ready")
-                .unwrap()
-                .reason,
-            "Recovering"
-        );
-        assert_eq!(
-            fixture
-                .workload
-                .calls()
-                .iter()
-                .filter(|call| call.path == "/api/v1/nodes")
-                .count(),
-            1
-        );
-    }
+async fn established_worker_recovery_remains_degraded_and_uses_short_retry() {
+    let fixture = Fixture::new(true);
+    fixture.until_ready().await;
+    let path = "/api/v1/nodes/worker-a";
+    let mut value = fixture.workload.get(path);
+    value["status"]["conditions"][0]["status"] = json!("False");
+    fixture.workload.insert(path, value);
+    fixture.clear();
+    assert_eq!(
+        fixture.step().await,
+        Action::requeue(std::time::Duration::from_secs(5))
+    );
+    let status = fixture.current().status.unwrap();
+    assert_eq!(status.phase, Some(TenantPhase::Degraded));
+    assert_eq!(
+        status
+            .conditions
+            .iter()
+            .find(|condition| condition.type_ == "Ready")
+            .unwrap()
+            .reason,
+        "Recovering"
+    );
+    assert_eq!(
+        fixture
+            .workload
+            .calls()
+            .iter()
+            .filter(|call| call.path == "/api/v1/nodes")
+            .count(),
+        1
+    );
 }
 
 #[tokio::test]
@@ -1472,7 +2193,7 @@ async fn final_availability_is_distinct_from_control_plane_access_and_observed_w
     fixture.clear();
     assert_eq!(
         fixture.step().await,
-        Action::requeue(std::time::Duration::from_secs(300))
+        Action::requeue(std::time::Duration::from_secs(5))
     );
     let status = fixture.current().status.unwrap();
     assert_eq!(
@@ -1488,14 +2209,11 @@ async fn final_availability_is_distinct_from_control_plane_access_and_observed_w
             .status,
         "False"
     );
-    assert_eq!(
+    assert!(
         status
             .conditions
             .iter()
-            .find(|condition| condition.type_ == "DatabaseReady")
-            .unwrap()
-            .status,
-        "True"
+            .all(|condition| condition.type_ != "DatabaseReady")
     );
     assert_eq!(
         fixture
@@ -1509,32 +2227,30 @@ async fn final_availability_is_distinct_from_control_plane_access_and_observed_w
 }
 
 #[tokio::test]
-async fn worker_and_database_spec_drift_is_repaired_only_on_the_live_bound_identities() {
+async fn worker_spec_drift_is_repaired_only_on_the_live_bound_identity() {
     let fixture = Fixture::new(true);
     fixture.until_ready().await;
-    let database_path = "/apis/postgresql.cnpg.io/v1/namespaces/database/clusters/capi-postgres";
     let mut deployment = fixture.management.get(DEPLOYMENT);
     deployment["spec"]["replicas"] = json!(3);
     fixture.management.insert(DEPLOYMENT, &deployment);
-    let mut database = fixture.workload.get(database_path);
-    database["spec"]["instances"] = json!(3);
-    fixture.workload.insert(database_path, &database);
     fixture.clear();
     fixture.step().await;
     assert_eq!(fixture.management.get(DEPLOYMENT)["spec"]["replicas"], 1);
-    assert_eq!(fixture.workload.get(database_path)["spec"]["instances"], 1);
-    for (calls, original, path) in [
-        (fixture.management.calls(), deployment, DEPLOYMENT),
-        (fixture.workload.calls(), database, database_path),
-    ] {
-        let apply = calls
+    let calls = fixture.management.calls();
+    let apply = calls
+        .iter()
+        .find(|call| call.method == "PATCH" && call.path == DEPLOYMENT)
+        .unwrap();
+    assert_eq!(apply.body["metadata"]["uid"], deployment["metadata"]["uid"]);
+    assert_eq!(
+        apply.body["metadata"]["resourceVersion"],
+        deployment["metadata"]["resourceVersion"]
+    );
+    assert!(
+        fixture
+            .workload
+            .calls()
             .iter()
-            .find(|call| call.method == "PATCH" && call.path == path)
-            .unwrap();
-        assert_eq!(apply.body["metadata"]["uid"], original["metadata"]["uid"]);
-        assert_eq!(
-            apply.body["metadata"]["resourceVersion"],
-            original["metadata"]["resourceVersion"]
-        );
-    }
+            .all(|call| !call.path.contains("/postgresql.cnpg.io/"))
+    );
 }

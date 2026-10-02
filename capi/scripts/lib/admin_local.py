@@ -17,6 +17,7 @@ from scripts.lib.admin import (
     validate_admin_effective_rules,
 )
 from scripts.lib.config import parse_duration
+from scripts.lib.catalog_lifecycle import CatalogClient, ready_entries
 from scripts.lib.controller_state import delete_named
 from scripts.lib.files import write_private_file
 from scripts.lib.kube import ManagementClient
@@ -34,7 +35,7 @@ ADMIN_LABEL = "app.kubernetes.io/name=tenant-admin"
 ADMIN_SERVICE_PROXY = (
     "/api/v1/namespaces/tenant-system/services/http:tenant-admin:80/proxy"
 )
-ADMIN_API_SCHEMA_VERSION = 4
+ADMIN_API_SCHEMA_VERSION = 5
 ADMIN_IMAGE_PATTERN = re.compile(
     r"[a-z0-9](?:[a-z0-9._/-]*[a-z0-9])?:"
     r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}"
@@ -215,7 +216,28 @@ def _normalized_rules(value: object) -> list[tuple[tuple[str, ...], ...]]:
             groups == ("apps",)
             and resources == ("deployments",)
             and verbs == ("get",)
-            and names == ("tenant-controller",)
+            and names in (("tenant-controller",), ("database-controller",))
+        )
+        catalog_intent = (
+            groups == ("tenancy.cnpg-vcluster.io",)
+            and resources == ("tenantdatabasecatalogs",)
+            and verbs == ("get", "update")
+            and not names
+        )
+        credential_policy_read = (
+            groups == ("rbac.authorization.k8s.io",)
+            and resources == ("rolebindings", "roles")
+            and verbs == ("get",)
+            and names == ("tenant-database-credentials",)
+        )
+        cutover_read = (
+            groups == ("admissionregistration.k8s.io",)
+            and resources == (
+                "validatingadmissionpolicies",
+                "validatingadmissionpolicybindings",
+            )
+            and verbs == ("get",)
+            and names == ("tenant-database-catalog-cutover-create-lock",)
         )
         ordinary_read = (
             set(verbs).issubset({"get", "list"}) and not names
@@ -234,7 +256,7 @@ def _normalized_rules(value: object) -> list[tuple[tuple[str, ...], ...]]:
             )
             or any("/" in resource for resource in resources)
             or not verbs
-            or not (tenant_mutation or controller_read or ordinary_read)
+            or not (tenant_mutation or controller_read or catalog_intent or credential_policy_read or cutover_read or ordinary_read)
         ):
             raise RuntimeError("Tenant Admin ClusterRole is not exact read-only RBAC")
         normalized.append((groups, resources, verbs, names))
@@ -415,7 +437,12 @@ def _verify_effective_rbac(root: Path, client: ManagementClient) -> None:
             raise RuntimeError(
                 f"Tenant Admin effective RBAC review is invalid in {namespace}"
             ) from exc
-        validate_admin_effective_rules(root, "local", review, namespace)
+        validate_admin_effective_rules(
+            root, "local", review, namespace,
+            lambda scope, resource: client.json(
+                "get", "-n", scope, resource
+            ) if not resource.startswith("namespace/") else client.json("get", resource),
+        )
 
 
 def _service_proxy_response(client: ManagementClient, path: str):
@@ -477,15 +504,16 @@ def create_tenant_via_admin(
     name: str,
     *,
     workers: int,
-    databases: int,
 ) -> dict[str, object]:
     response = _service_proxy_post(
         client,
         "api/v1/tenants",
-        {"name": name, "workers": workers, "databases": databases},
+        {"name": name, "workers": workers},
     )
     if response.returncode != 0:
-        raise RuntimeError("Tenant Admin create API is unavailable")
+        raise RuntimeError(
+            f"Tenant Admin create API is unavailable: {redact(response.stderr)}"
+        )
     created = _required_mapping(
         _envelope(response.stdout, "Tenant create"),
         "Tenant create data",
@@ -623,7 +651,6 @@ def _validate_summary(value: object) -> str:
         "classification",
         "kubernetesVersion",
         "requestedWorkers",
-        "requestedDatabases",
         "endpoint",
         "createdAt",
         "conditions",
@@ -636,10 +663,6 @@ def _validate_summary(value: object) -> str:
         or not isinstance(summary.get("kubernetesVersion"), str)
         or not summary["kubernetesVersion"]
         or not _is_integer(summary.get("requestedWorkers"))
-        or (
-            summary.get("requestedDatabases") is not None
-            and not _is_integer(summary.get("requestedDatabases"))
-        )
         or (
             summary.get("endpoint") is not None
             and not isinstance(summary.get("endpoint"), str)
@@ -1065,11 +1088,6 @@ def verify_admin_api(
         ):
             raise RuntimeError("Tenant Admin Tenant detail response is invalid")
         summary = _required_mapping(detail.get("summary"), "Tenant detail summary")
-        database_state, database_instances = _validate_database_observation(
-            snapshot.get("database"),
-            provider=_required_string(summary.get("provider"), "Tenant provider"),
-            require_available=require_available_databases,
-        )
         detail_uid = _required_string(detail.get("uid"), "Tenant detail UID")
         if (
             identity
@@ -1084,37 +1102,24 @@ def verify_admin_api(
             snapshot.get("topology"), "Tenant topology data"
         )
         _validate_topology(snapshot_topology, name)
-        topology_node_ids = {
-            node.get("id")
-            for node in snapshot_topology["nodes"]
-            if isinstance(node, dict)
-        }
-        if database_state == "available" and (
-            "database:cluster" not in topology_node_ids
-            or len(
-                [
-                    node_id
-                    for node_id in topology_node_ids
-                    if isinstance(node_id, str)
-                    and node_id.startswith("database:instance:")
-                ]
+        catalog_client = CatalogClient(
+            lambda path: _service_proxy(client, path),
+            lambda method, path, body: client.request_json(
+                method, f"{ADMIN_SERVICE_PROXY}/{path}", body,
+            ),
+            name, detail_uid,
+        )
+        catalog = catalog_client.read()
+        if require_available_databases and not catalog["capabilityAvailable"]:
+            raise RuntimeError("Tenant Admin catalog capability is unavailable")
+        if verify_database_queries:
+            entries = ready_entries(
+                catalog,
+                {entry["name"] for entry in catalog["databases"]},
+                "local",
             )
-            != database_instances
-        ):
-            raise RuntimeError("Tenant Admin database topology response is invalid")
-        if verify_database_queries and database_state == "available":
-            _validate_database_query(
-                client,
-                name,
-                _required_mapping(
-                    snapshot.get("database"), "database observation"
-                ),
-            )
-        if (
-            database_state == "unavailable"
-            and "database:unavailable" not in topology_node_ids
-        ):
-            raise RuntimeError("Tenant Admin database topology response is invalid")
+            for entry in entries.values():
+                catalog_client.probe(catalog["catalogUid"], entry)
         topology_response = _service_proxy_response(
             client,
             f"api/v1/tenants/{name}/topology",
@@ -1135,6 +1140,14 @@ def verify_admin_api(
             "Tenant topology data",
         )
         _validate_topology(topology, name)
+        catalog_nodes = {
+            f"database:{entry['logicalUid']}"
+            for entry in catalog["databases"]
+        }
+        if not catalog_nodes <= {
+            node.get("id") for node in topology["nodes"] if isinstance(node, dict)
+        }:
+            raise RuntimeError("Tenant Admin catalog topology is incomplete")
     return {
         "schemaVersion": ADMIN_API_SCHEMA_VERSION,
         "tenantCount": len(names),

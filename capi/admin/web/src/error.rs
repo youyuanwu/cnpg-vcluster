@@ -17,6 +17,7 @@ pub enum UiErrorKind {
     QueryResponseTooLarge,
     QueryTimedOut,
     QueryOutcomeUnknown,
+    MutationOutcomeUnknown,
     Network,
     Internal,
 }
@@ -65,6 +66,9 @@ impl UiError {
             UiErrorKind::QueryResponseTooLarge => "The SQL response was too large",
             UiErrorKind::QueryTimedOut => "The SQL query timed out",
             UiErrorKind::QueryOutcomeUnknown => "The SQL query outcome is unknown",
+            UiErrorKind::MutationOutcomeUnknown => {
+                "Database intent outcome is unknown; refresh the catalog"
+            }
             UiErrorKind::Network => "The server could not be reached",
             UiErrorKind::Internal => "The request could not be completed",
         }
@@ -87,6 +91,7 @@ impl From<ApiError> for UiError {
             ApiErrorCode::QueryResponseTooLarge => UiErrorKind::QueryResponseTooLarge,
             ApiErrorCode::QueryTimedOut => UiErrorKind::QueryTimedOut,
             ApiErrorCode::QueryOutcomeUnknown => UiErrorKind::QueryOutcomeUnknown,
+            ApiErrorCode::MutationOutcomeUnknown => UiErrorKind::MutationOutcomeUnknown,
             ApiErrorCode::Internal => UiErrorKind::Internal,
         };
         Self {

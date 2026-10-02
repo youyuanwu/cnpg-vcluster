@@ -1,0 +1,69 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: database-controller
+rules:
+- apiGroups:
+  - tenancy.cnpg-vcluster.io
+  resources:
+  - tenantdatabasecatalogs
+  verbs:
+  - get
+  - list
+  - watch
+  - update
+- apiGroups:
+  - tenancy.cnpg-vcluster.io
+  resources:
+  - tenantdatabasecatalogs/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - tenancy.cnpg-vcluster.io
+  resources:
+  - tenants
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - ''
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - cluster.x-k8s.io
+  resources:
+  - clusters
+  verbs:
+  - get
+- apiGroups:
+  - controlplane.cluster.x-k8s.io
+  resources:
+  - kamajicontrolplanes
+  verbs:
+  - get
+- apiGroups:
+  - ''
+  resourceNames:
+  - tenant-azure-provider
+  resources:
+  - configmaps
+  verbs:
+  - get
+- apiGroups:
+  - compute.azure.com
+  resources:
+  - disks
+  verbs:
+  - get
+  - list
+  - watch
+  - create
+  - delete

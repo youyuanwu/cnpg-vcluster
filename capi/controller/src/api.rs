@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const GROUP: &str = "tenancy.cnpg-vcluster.io";
-pub const VERSION: &str = "v1alpha3";
+pub const VERSION: &str = "v1alpha4";
 pub const SUPPORTED_KUBERNETES_VERSION: &str = "1.36.4";
 pub const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 
@@ -14,13 +14,12 @@ pub const FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 #[expect(clippy::duplicated_attributes, reason = "each printer column declares its own type")]
 #[derive(CustomResource, Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
 #[kube(
-    group = "tenancy.cnpg-vcluster.io", version = "v1alpha3", kind = "Tenant",
+    group = "tenancy.cnpg-vcluster.io", version = "v1alpha4", kind = "Tenant",
     plural = "tenants", shortname = "tn", status = "TenantStatus", derive = "PartialEq",
     printcolumn(name = "Phase", type_ = "string", json_path = ".status.phase"),
     printcolumn(name = "Ready", type_ = "string", json_path = ".status.conditions[?(@.type==\"Ready\")].status"),
     printcolumn(name = "Endpoint", type_ = "string", json_path = ".status.provider.allocation.endpoint"),
-    printcolumn(name = "Workers", type_ = "integer", json_path = ".spec.workers"),
-    printcolumn(name = "Databases", type_ = "integer", json_path = ".spec.provider.databases")
+    printcolumn(name = "Workers", type_ = "integer", json_path = ".spec.workers")
 )]
 #[serde(rename_all = "camelCase")]
 pub struct TenantSpec {
@@ -32,14 +31,14 @@ pub struct TenantSpec {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(tag = "type", rename_all = "lowercase")]
 pub enum TenantProviderSpec {
-    Local { databases: i32 },
+    Local,
     Azure,
 }
 #[rustfmt::skip]
 #[derive(JsonSchema)]
 #[allow(dead_code)]
 struct TenantProviderSpecSchema {
-    #[schemars(rename = "type")] provider_type: ProviderTypeSchema, databases: Option<i32>,
+    #[schemars(rename = "type")] provider_type: ProviderTypeSchema,
 }
 #[rustfmt::skip]
 #[derive(JsonSchema)]
@@ -48,10 +47,9 @@ struct TenantProviderSpecSchema {
 enum ProviderTypeSchema { Local, Azure }
 #[rustfmt::skip]
 impl TenantSpec {
-    pub fn local(kubernetes_version: impl Into<String>, workers: i32, databases: i32) -> Self {
-        Self { kubernetes_version: kubernetes_version.into(), workers, provider: TenantProviderSpec::Local { databases } }
+    pub fn local(kubernetes_version: impl Into<String>, workers: i32) -> Self {
+        Self { kubernetes_version: kubernetes_version.into(), workers, provider: TenantProviderSpec::Local }
     }
-    pub fn local_databases(&self) -> Option<i32> { match self.provider { TenantProviderSpec::Local { databases } => Some(databases), TenantProviderSpec::Azure => None } }
 }
 
 #[rustfmt::skip]
@@ -61,7 +59,30 @@ pub struct TenantStatus {
     #[serde(skip_serializing_if = "Option::is_none")] pub observed_generation: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")] pub phase: Option<TenantPhase>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")] pub conditions: Vec<k8s_openapi::apimachinery::pkg::apis::meta::v1::Condition>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub database_capability: Option<DatabaseCapability>,
+    #[serde(skip_serializing_if = "Option::is_none")] pub catalog_create_intent: Option<CatalogCreateIntent>,
     #[serde(skip_serializing_if = "Option::is_none")] #[schemars(with = "Option<TenantProviderStatusSchema>")] pub provider: Option<TenantProviderStatus>,
+}
+
+#[rustfmt::skip]
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct DatabaseCapability {
+    pub available: bool, pub reason: String,
+    pub namespace: String,
+    #[serde(rename = "namespaceUID")] pub namespace_uid: String,
+    #[serde(rename = "catalogUID")] pub catalog_uid: String,
+    #[serde(skip_serializing_if = "Option::is_none", rename = "storageNamespaceUID")]
+    pub storage_namespace_uid: Option<String>,
+}
+
+#[rustfmt::skip]
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct CatalogCreateIntent {
+    pub namespace: String,
+    pub name: String,
+    #[serde(rename = "tenantUID")] pub tenant_uid: String,
 }
 
 #[rustfmt::skip]
@@ -230,14 +251,13 @@ pub type CanonicalSpec = TenantSpec;
 
 #[rustfmt::skip]
 #[derive(Debug, PartialEq, Eq)]
-pub enum SpecError { Name, Version, UnsupportedVersion, Workers, Databases, ProviderStatus }
+pub enum SpecError { Name, Version, UnsupportedVersion, Workers, ProviderStatus }
 #[rustfmt::skip]
 impl std::fmt::Display for SpecError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             Self::Name => "tenant name must be a 1-30 character lowercase DNS label", Self::Version => "kubernetesVersion must be a three-component numeric version",
             Self::UnsupportedVersion => "kubernetesVersion is not supported by this controller", Self::Workers => "workers must be an integer from 1 through 3",
-            Self::Databases => "databases must be an integer from 1 through 3",
             Self::ProviderStatus => "Tenant provider status does not match the requested provider",
         })
     }
@@ -259,14 +279,7 @@ pub fn canonical_spec(
         || !version.split('.').all(|part| !part.is_empty() && part.bytes().all(|b| b.is_ascii_digit())) { return Err(SpecError::Version); }
     if version != supported_version.strip_prefix('v').unwrap_or(supported_version) { return Err(SpecError::UnsupportedVersion); }
     if !(1..=3).contains(&spec.workers) { return Err(SpecError::Workers); }
-    let provider = match &spec.provider {
-        TenantProviderSpec::Local { databases } => {
-            if !(1..=3).contains(databases) { return Err(SpecError::Databases); }
-            TenantProviderSpec::Local { databases: *databases }
-        }
-        TenantProviderSpec::Azure => TenantProviderSpec::Azure,
-    };
-    Ok(TenantSpec { kubernetes_version: version.to_owned(), workers: spec.workers, provider })
+    Ok(TenantSpec { kubernetes_version: version.to_owned(), workers: spec.workers, provider: spec.provider.clone() })
 }
 
 #[rustfmt::skip]
@@ -274,7 +287,7 @@ pub fn validate_provider_status(
     spec: &CanonicalSpec, status: Option<&TenantStatus>,
 ) -> Result<(), SpecError> {
     let Some(provider) = status.and_then(|status| status.provider.as_ref()) else { return Ok(()); };
-    matches!((&spec.provider, provider), (TenantProviderSpec::Local { .. }, TenantProviderStatus::Local(_)) | (TenantProviderSpec::Azure, TenantProviderStatus::Azure(_)))
+    matches!((&spec.provider, provider), (TenantProviderSpec::Local, TenantProviderStatus::Local(_)) | (TenantProviderSpec::Azure, TenantProviderStatus::Azure(_)))
         .then_some(()).ok_or(SpecError::ProviderStatus)
 }
 
@@ -293,9 +306,6 @@ pub fn tenant_crd() -> k8s_openapi::apiextensions_apiserver::pkg::apis::apiexten
     fields.get_mut("kubernetesVersion").expect("version field").pattern = Some(r"^v?[0-9]+\.[0-9]+\.[0-9]+$".into());
     let workers = fields.get_mut("workers").expect("workers field");
     (workers.minimum, workers.maximum) = (Some(1.0), Some(3.0));
-    let provider = fields.get_mut("provider").expect("provider field").properties.as_mut().expect("provider has fields");
-    let databases = provider.get_mut("databases").expect("local database field");
-    (databases.minimum, databases.maximum, databases.nullable) = (Some(1.0), Some(3.0), None);
     let conditions = properties.get_mut("status").and_then(|s| s.properties.as_mut())
         .and_then(|s| s.get_mut("conditions")).expect("status has conditions");
     (conditions.x_kubernetes_list_type, conditions.x_kubernetes_list_map_keys) =
@@ -307,10 +317,10 @@ pub fn tenant_crd() -> k8s_openapi::apiextensions_apiserver::pkg::apis::apiexten
         rule("self.spec == oldSelf.spec", "Tenant spec is immutable"),
         rule("self.metadata.name.matches('^[a-z0-9]([-a-z0-9]{0,28}[a-z0-9])?$')", "Tenant name must be a 1-30 character lowercase DNS label"),
         rule("self.spec.workers >= 1 && self.spec.workers <= 3", "workers must be between 1 and 3"),
-        rule("self.spec.provider.type == 'local' ? has(self.spec.provider.databases) : !has(self.spec.provider.databases)", "databases must be present only for the local provider"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type == self.spec.provider.type", "Tenant provider status must match the requested provider"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type != 'azure' || (!has(self.status.provider.allocation) && !has(self.status.provider.foundationHash) && !has(self.status.provider.clusterUID))", "Azure provider status cannot contain local durable identity"),
         rule("!has(self.status) || !has(self.status.provider) || self.status.provider.type != 'local' || (!has(self.status.provider.binding) && !has(self.status.provider.networkAllocation) && !has(self.status.provider.endpoint) && !has(self.status.provider.management) && !has(self.status.provider.kubeconfig) && !has(self.status.provider.vmss) && !has(self.status.provider.nodes) && !has(self.status.provider.addonComponents) && !has(self.status.provider.providerResources) && !has(self.status.provider.deletion))", "Local provider status cannot contain Azure durable identity"),
+        rule("!has(oldSelf.status) || !has(oldSelf.status.catalogCreateIntent) || (has(self.status) && has(self.status.catalogCreateIntent) && self.status.catalogCreateIntent == oldSelf.status.catalogCreateIntent)", "catalog creation intent cannot be removed or replaced"),
         rule("self.spec.kubernetesVersion.matches('^v?[0-9]+[.][0-9]+[.][0-9]+$')", "kubernetesVersion must be a three-component numeric version"),
     ]);
     crd
@@ -325,7 +335,7 @@ mod tests {
         TenantSpec {
             kubernetes_version: "v1.36.4".into(),
             workers: 2,
-            provider: TenantProviderSpec::Local { databases: 3 },
+            provider: TenantProviderSpec::Local,
         }
     }
 
@@ -350,6 +360,8 @@ mod tests {
             observed_generation: Some(2),
             phase: Some(TenantPhase::Progressing),
             conditions: vec![condition],
+            database_capability: None,
+            catalog_create_intent: None,
             provider: Some(TenantProviderStatus::Local(LocalProviderStatus {
                 allocation: Some(AllocationStatus {
                     slot_id: "slot-a".into(),
@@ -362,14 +374,14 @@ mod tests {
             })),
         });
         let value = serde_json::to_value(&tenant).unwrap();
-        assert_eq!(value["apiVersion"], "tenancy.cnpg-vcluster.io/v1alpha3");
+        assert_eq!(value["apiVersion"], "tenancy.cnpg-vcluster.io/v1alpha4");
         assert_eq!(value["kind"], "Tenant");
         assert_eq!(
             value["spec"],
             json!({
                 "kubernetesVersion":"v1.36.4",
                 "workers":2,
-                "provider":{"type":"local","databases":3}
+                "provider":{"type":"local"}
             })
         );
         assert_eq!(value["status"]["provider"]["type"], "local");
@@ -497,7 +509,7 @@ mod tests {
         let spec: TenantSpec = serde_json::from_value(json!({
             "kubernetesVersion":"1.36.4",
             "workers":1,
-            "provider":{"type":"local","databases":1,"unsupported":true}
+            "provider":{"type":"local","unsupported":true}
         }))
         .unwrap();
         assert_eq!(
@@ -515,12 +527,12 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             serde_json::to_string(&first).unwrap(),
-            r#"{"kubernetesVersion":"1.36.4","workers":2,"provider":{"type":"local","databases":3}}"#
+            r#"{"kubernetesVersion":"1.36.4","workers":2,"provider":{"type":"local"}}"#
         );
         assert_eq!(spec_hash(&first), spec_hash(&second));
         assert_eq!(
             spec_hash(&first),
-            "1bde3885f05188aa38dca07e80d5ce385b9520c7e51f09dbc5d71ebd9943191c"
+            "0af1c9ca88047848e53b9419039e7821ab65a052d1da16eaae3dcd33092a7868"
         );
         equivalent.workers += 1;
         assert_ne!(
@@ -555,12 +567,6 @@ mod tests {
             assert_eq!(
                 canonical_spec("valid", &invalid, "1.36.4"),
                 Err(SpecError::Workers)
-            );
-            invalid.workers = 1;
-            invalid.provider = TenantProviderSpec::Local { databases: count };
-            assert_eq!(
-                canonical_spec("valid", &invalid, "1.36.4"),
-                Err(SpecError::Databases)
             );
         }
     }
@@ -642,7 +648,6 @@ mod tests {
                 ("Ready", ".status.conditions[?(@.type==\"Ready\")].status"),
                 ("Endpoint", ".status.provider.allocation.endpoint"),
                 ("Workers", ".spec.workers"),
-                ("Databases", ".spec.provider.databases"),
             ]
         );
         let schema = v
@@ -669,10 +674,27 @@ mod tests {
             Some(r"^v?[0-9]+\.[0-9]+\.[0-9]+$")
         );
         let provider_fields = fields["provider"].properties.as_ref().unwrap();
-        assert_eq!(provider_fields["databases"].maximum, Some(3.0));
-        assert_eq!(provider_fields["databases"].nullable, None);
+        assert!(!provider_fields.contains_key("databases"));
         assert!(!provider_fields.contains_key("podCIDR"));
         assert!(!provider_fields.contains_key("serviceCIDR"));
+        let status_fields = properties["status"].properties.as_ref().unwrap();
+        let capability_fields = status_fields["databaseCapability"]
+            .properties
+            .as_ref()
+            .unwrap();
+        for field in ["namespace", "namespaceUID", "catalogUID"] {
+            assert!(capability_fields.contains_key(field));
+        }
+        assert!(!capability_fields.contains_key("gateUID"));
+        assert!(!capability_fields.contains_key("quotaUID"));
+        let intent_fields = status_fields["catalogCreateIntent"]
+            .properties
+            .as_ref()
+            .unwrap();
+        assert_eq!(intent_fields.len(), 3);
+        for field in ["namespace", "name", "tenantUID"] {
+            assert!(intent_fields.contains_key(field));
+        }
         let status_provider = properties["status"].properties.as_ref().unwrap()["provider"]
             .properties
             .as_ref()
@@ -703,13 +725,16 @@ mod tests {
         assert!(rules.contains(&"self.spec == oldSelf.spec"));
         assert!(rules.iter().any(|r| r.contains("metadata.name")));
         assert!(rules.iter().any(|r| r.contains("spec.workers")));
-        assert!(rules.iter().any(|r| r.contains("provider.databases")));
+        assert!(!rules.iter().any(|r| r.contains("provider.databases")));
         assert!(
             rules
                 .iter()
                 .any(|r| r.contains("status.provider.type == self.spec.provider.type"))
         );
         assert!(rules.iter().any(|r| r.contains("spec.kubernetesVersion")));
+        assert!(rules.iter().any(|r| {
+            r.contains("self.status.catalogCreateIntent == oldSelf.status.catalogCreateIntent")
+        }));
         let conditions = &properties["status"].properties.as_ref().unwrap()["conditions"];
         assert_eq!(conditions.x_kubernetes_list_type.as_deref(), Some("map"));
         assert_eq!(

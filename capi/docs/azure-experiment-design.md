@@ -6,6 +6,10 @@ This experiment extends the local Cluster API lab to Azure. It proves that an
 AKS management cluster can host Kamaji tenant control planes while Cluster API
 Provider Azure (CAPZ) creates VMSS-backed tenant workers with tenant
 networking and cloud-provider integration, targeted deletion, and recreation.
+Each Tenant may explicitly own up to three catalog-backed CloudNativePG
+clusters with one to three instances. Database provisioning and exact disk
+cleanup are implemented but require a separate credentialed destructive
+release gate.
 
 The design optimizes for a small, understandable experiment. It is not a
 production platform design. The lifecycle is tenant-keyed, while the live gate
@@ -32,6 +36,10 @@ The experiment succeeds when:
    tenant resources without changing the shared foundation.
 7. Recreating the same tenant specification reaches Ready again.
 8. Final whole-experiment cleanup removes the recorded resource group.
+9. Before a database rollout is accepted, a credentialed three-cluster,
+   three-instance run must prove exact CNPG/SQL isolation and direct absence
+   of all nine ASO/ARM disk identities after deletion. This gate has **not
+   run**; the earlier worker-only proof does not satisfy it.
 
 ## Scope
 
@@ -43,17 +51,20 @@ The experiment includes:
 - one AKS management cluster;
 - one Kamaji datastore;
 - one CAPZ and CAPI controller stack;
-- one tenant control plane;
+- one Tenant control plane and an explicit database catalog;
 - one VMSS-backed tenant worker pool;
 - Calico VXLAN networking;
 - the external Azure cloud provider components required by the tenant nodes;
 - operator-owned tenant-keyed create, status, delete, and recovery state;
 - exact gate-only VMSS instance failure injection and three-worker recovery;
 - CAPZ-owned whole-VMSS deletion, foundation preservation, and
-  recreation checks.
+  recreation checks;
+- a separate database-controller, pinned CNPG/Azure Disk CSI runtime and
+  per-entry ASO Disk/static PV/PVC lifecycle (staged, not live-proven).
 
-Azure Disk and CloudNativePG remain later experiment extensions after the
-three-worker tenant lifecycle is repeatable.
+Azure Disk and CloudNativePG are installed independently of infrastructure
+readiness; their credentialed destructive validation remains an unmet
+release-acceptance gate.
 
 ## Non-goals
 
@@ -72,7 +83,7 @@ The experiment does not initially provide:
 - GitOps;
 - Key Vault integration;
 - database backup or snapshot workflows;
-- Azure Disk CSI and CloudNativePG workload validation;
+- production Azure Disk/CNPG resilience or backup guarantees;
 - production monitoring, alerting, or upgrade automation;
 - hostile-tenant isolation guarantees.
 
@@ -93,6 +104,10 @@ flowchart TB
   TenantOperator[Rust Tenant operator in Azure mode]
   Admin[Tenant Admin lifecycle UI]
   TenantCR[Azure Tenant CR]
+  Catalog[TenantDatabaseCatalog]
+  DatabaseController[database-controller]
+  CNPG[Per-UID CNPG workloads]
+  Disks[ASO disks and Azure Disk CSI]
   Kamaji[Kamaji and datastore]
   TenantAPI[Kamaji tenant API internal LoadBalancer]
   Cluster[Cluster and AzureCluster]
@@ -114,6 +129,8 @@ flowchart TB
   ACR --> TenantOperator
   ACR --> Admin
   TenantCR --> TenantOperator
+  TenantOperator --> Catalog --> DatabaseController --> CNPG
+  DatabaseController --> Disks
   TenantOperator --> Cluster
   AKS --> Kamaji
   Kamaji --> TenantAPI
@@ -266,7 +283,8 @@ conflicting selector.
 | Bicep | Azure management foundation: resource group, VNet, subnets, identity, role assignment, federated credential, and AKS. |
 | `clusterctl` and Helm | Install the pinned CAPI, CAPZ, Kamaji, and supporting controller stack. |
 | CAPI, CABPK, and CAPZ resources | Reconcile the tenant control-plane contract, VMSS worker pool, bootstrap data, replacement, and deletion. |
-| Rust Tenant operator | Reconcile exact CAPI/CAPZ/Kamaji/add-on objects, publish durable status, and finalize exact Kubernetes roots. |
+| Rust Tenant operator | Reconcile exact CAPI/CAPZ/Kamaji/add-on objects, create and drain the catalog, publish durable status, and finalize infrastructure only after database cleanup. |
+| Rust database-controller | Reconcile per-logical-UID CNPG workloads and ASO/Azure Disk CSI storage; prove exact disk absence with its dedicated workload identity. |
 | Python | Provision and inspect the foundation, submit/observe the Tenant CR, externally prove Azure absence, and run the destructive gate. |
 | Azure CLI | Authenticate, submit Bicep deployments, query Azure state, perform the one gate-only VMSS instance injection, and clean up the whole foundation. |
 
@@ -274,8 +292,9 @@ Python does not imperatively create tenant management resources or patch CAPZ
 compatibility state. Bicep owns the management foundation, the Rust operator
 owns the Kubernetes desired state, and CAPZ/ASO own Azure tenant mutation.
 The explicit JSON TenantSpec is translated to
-`tenancy.cnpg-vcluster.io/v1alpha3`; there is no second Python tenant runtime.
-Local allocation, Docker, storage, and CNPG semantics remain local-only.
+`tenancy.cnpg-vcluster.io/v1alpha4`; there is no second Python tenant runtime.
+Local allocation, Docker volume and hostPath storage remain local-only.
+The database catalog and Admin schema-v5 routes span both providers.
 
 Terraform/OpenTofu, Pulumi, Ansible, Crossplane, and Azure Developer CLI are
 not required for the first experiment. Terraform/OpenTofu would introduce a
@@ -296,10 +315,12 @@ Bicep, Python, or `just` recipes. Configuration is split into:
 | Active `az` login | Tenant identity and authentication tokens. | No |
 | `.runtime/azure/resources.json` | Foundation-only names, Azure resource IDs, ACR and AcrPull identity, immutable controller/admin digests, Deployment/configuration identities, and foundation checksum. | No |
 
-Tenant specifications, resource identities, deletion checkpoints, and gate
-evidence are not persisted locally. The Tenant resource and provider objects
-remain authoritative in Kubernetes. The destructive gate holds exact external
-proof identity only in memory for its active run.
+Ordinary Tenant commands do not persist a separate Tenant specification or
+deletion checkpoint locally. The Tenant/catalog and provider objects remain
+authoritative in Kubernetes. The guarded management installer retains an
+owner-only bootstrap CREATE probe/activation identity if cutover is uncertain;
+the destructive gate holds exact external proof identity only in memory for
+its active run.
 
 The local file contains only non-secret selectors:
 
@@ -489,23 +510,31 @@ exchange VXLAN traffic on UDP 4789.
 The experiment does not require tenant `LoadBalancer` Services; the important
 Azure load balancer is the Kamaji API endpoint managed by AKS.
 
-## Future storage and CloudNativePG extension
+## Azure database catalog and storage runtime
 
-The current lifecycle gate proves three-worker VMSS replacement before
-targeted tenant deletion. A later storage extension can add:
-
-- Azure Disk CSI controller and node components;
-- one simple StorageClass using `disk.csi.azure.com`;
-- `WaitForFirstConsumer`;
-- dynamically provisioned managed disks;
-- one three-instance CloudNativePG cluster.
-
-In that extension, each PostgreSQL instance receives its own PVC and Azure
-managed disk.
-CloudNativePG pod anti-affinity spreads the instances across the three
-workers. The experiment does not initially require zone-aware storage,
-snapshots, backups, disk encryption customization, or a particular premium
-disk SKU.
+The management installer stages a pinned CNPG operator and Azure Disk CSI
+controller/node runtime independently of Tenant infrastructure readiness.
+Tenant capability observes their current rollout and a non-default,
+`Retain`/`WaitForFirstConsumer` `cnpg-azure-disk` StorageClass. Catalog entries
+are created through Admin schema-v5 `GET/POST
+/api/v1/tenants/{name}/databases`; deletion uses exact catalog and logical
+UID plus typed-name confirmation, and SQL binds an observed Pod UID. The
+database-controller owns per-entry status and UID-derived workload namespaces,
+with ASO Disk
+`compute.azure.com/v1api20240302` objects in a separate Tenant-owned storage
+namespace. Each of up to three clusters has one static 4-GiB StandardSSD_LRS
+disk, PV and PVC per instance. ARM IDs are recorded before disk creation.
+Deletion removes the CNPG workload, claims, volumes and workload namespace
+before ASO disks; the dedicated database-controller workload identity must
+GET/DELETE each exact ARM ID and observe NotFound before terminal catalog
+proof. An uncertain create outcome retains the entry rather than inferring
+absence. Tenant deletion closes the catalog before provider cleanup; a
+deleting or unknown-outcome entry retains its slot and finalizer. The Admin
+API and adapters exist; this is **not** evidence of a successful live
+destructive Azure run
+([catalog API](../database-controller/src/api.rs#L11-L102);
+[Azure storage](../database-controller/src/reconcile/azure.rs#L26-L52);
+[disk cleanup](../database-controller/src/finalize/azure.rs#L20-L160)).
 
 ## Operator workflow
 
@@ -520,7 +549,8 @@ The proposed interface remains `just`:
 | `just tenant-create azure <spec.json>` | Strictly submit the JSON-derived Azure Tenant without CIDRs and wait for operator Ready. |
 | `just tenant-status azure <tenant>` | Report generation-aware operator status through the provider-neutral envelope. |
 | `just tenant-delete azure <tenant> azure/<tenant>` | Issue ordinary Tenant deletion and wait for Kubernetes/CAPI/CAPZ finalization and Tenant absence. |
-| `just azure-test-tenant-lifecycle` | Destructively prove three-worker readiness, exact non-primary VMSS instance replacement, targeted tenant deletion, absence, foundation preservation, and recreation. |
+| `just azure-database-runtime-once` / `just azure-database-runtime-watch` | Retry pinned CNPG and Azure Disk CSI installation without changing infrastructure readiness. |
+| `just azure-test-tenant-lifecycle` | Destructively prove three-worker/three-database-by-three-instance lifecycle, exact non-primary VMSS replacement, SQL/failover, all nine disk IDs absent from ASO and ARM after deletion, foundation preservation, and recreation. |
 | `just azure-destroy` | Delete the entire recorded Azure foundation resource group. |
 
 The implementation reuses the repository's `just` interface, Python
@@ -642,6 +672,18 @@ output when they want a retained record.
 6. Python externally proves recorded Azure IDs and tenant tags are absent and
    compares the exact shared foundation with the pre-delete snapshot.
 
+For a database lifecycle, first confirm the foundation selectors, inventory
+and management kubeconfig describe the same healthy tagged resource group.
+Create three explicit catalog entries and require three independently Ready
+instances per entry. The destructive gate records nine exact disk names,
+ASO UIDs and ARM IDs before deleting one entry, proves its three disks absent
+while siblings remain, recreates it with a new logical UID/disks, then deletes
+the Tenant and proves all nine current disk identities absent. Do not delete
+a disk by broad name/tag selection, bypass an entry or Tenant finalizer,
+clear a create-intent record, or treat an unverified 404/failed request as
+terminal proof. A creation outcome that remains unknown blocks the catalog
+until independently settled.
+
 CAPZ remains responsible for VMSS deletion. The normal path does not issue
 `az vmss delete-instances`, patch CAPZ compatibility state, or remove Azure
 provider finalizers. `just azure-destroy` is a separate whole-foundation
@@ -649,7 +691,7 @@ cleanup operation.
 
 ## Verification boundaries
 
-The Azure experiment proves:
+The prior worker-only Azure experiment proves:
 
 - CAPI and CAPZ can reconcile VMSS-backed workers against a Kamaji control
   plane hosted on AKS;
@@ -668,11 +710,23 @@ authentication are outside this experiment.
 
 ## Exclusions and future work
 
-Azure Disk, Azure CSI, CloudNativePG, public tenant endpoints, DNS automation,
-certificate automation, autoscaling, multiple provider implementations in one
-manager deployment, and production hostile-tenant isolation remain excluded.
-Any future storage/database work is a separate lifecycle design and must not
-be inferred from this provider.
+Public tenant endpoints, DNS automation, certificate automation, autoscaling,
+multiple provider implementations in one manager deployment, and production
+hostile-tenant isolation remain excluded. Azure database runtime installation
+and catalog reconciliation are staged, but no production storage guarantees
+or successful credentialed destructive gate should be inferred from them.
+
+**Release acceptance still pending (2026-10-01):** read-only
+`just azure-foundation-status` exited 1 with
+`{"blockers":["Azure foundation inventory is absent"],"foundation":"unhealthy","healthy":false,"schema":1}`.
+The exact owner-only `.runtime/azure/resources.json` is missing, and
+`gh secret list` found zero configured `CAPI_AZURE_*` repository secrets.
+GitHub Actions intentionally does not receive Azure credentials or run the
+destructive lifecycle. The nine-disk absence must be proved by an operator outside
+CI against an explicitly recorded experiment foundation. Real browser and
+service-proxy agreement on the same deployment is also unverified. Both are
+unmet gates, not passing checks; no Azure cloud mutation was attempted for
+this run.
 
 ## References
 

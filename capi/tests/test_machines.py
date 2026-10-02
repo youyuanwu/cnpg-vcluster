@@ -8,6 +8,7 @@ from subprocess import CompletedProcess
 from unittest.mock import patch
 
 from scripts.machines import _bootstrap_secrets, _replace_machine, worker_snapshot
+from scripts.lib.addons import wait_network_ready
 
 
 class FakeClient:
@@ -58,6 +59,54 @@ class FakeClient:
 
 
 class MachineTests(unittest.TestCase):
+    def test_network_ready_after_worker_restart_reads_management_deployment(self) -> None:
+        tenant = type("Tenant", (), {"namespace": "tenant-a", "name": "tenant-a"})()
+        calls = []
+        machine = {
+            "metadata": {"generation": 1},
+            "status": {"conditions": [
+                {"type": "Ready", "status": "True", "observedGeneration": 1}
+            ]},
+        }
+
+        def management(*arguments):
+            calls.append(arguments)
+            payload = (
+                {"spec": {"replicas": 1}}
+                if any("machinedeployments" in item for item in arguments)
+                else {"items": [machine]}
+            )
+            return CompletedProcess([], 0, stdout=json.dumps(payload))
+
+        def workload(*arguments, **_kwargs):
+            payload = (
+                {"items": [{"status": {"conditions": [
+                    {"type": "Ready", "status": "True"}
+                ]}}]}
+                if "nodes" in arguments
+                else {"spec": {"replicas": 1}, "status": {
+                    "availableReplicas": 1, "desiredNumberScheduled": 1,
+                    "numberAvailable": 1,
+                }}
+            )
+            return CompletedProcess([], 0, stdout=json.dumps(payload))
+
+        client = type("Client", (), {"kubectl": lambda _self, *args: management(*args)})()
+        with (
+            patch("scripts.lib.addons.ManagementClient", return_value=client),
+            patch("scripts.lib.addons._tenant_kubectl", side_effect=workload),
+            patch("scripts.lib.addons.wait_for",
+                  side_effect=lambda _description, _timeout, _interval, predicate:
+                  self.assertTrue(predicate())),
+        ):
+            wait_network_ready(Path("."), {
+                "TENANT_CONTROL_PLANE_TIMEOUT": "1s",
+                "WAIT_POLL_INTERVAL": "1s",
+            }, tenant)
+        self.assertTrue(any(
+            "machinedeployments" in item for arguments in calls for item in arguments
+        ))
+
     def test_worker_snapshot_uses_requested_worker_count(self) -> None:
         machine = {
             "metadata": {

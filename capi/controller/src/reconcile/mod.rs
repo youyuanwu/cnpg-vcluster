@@ -27,7 +27,8 @@ use kube::{
 
 use crate::{
     api::{
-        SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase, TenantProviderStatus, canonical_spec,
+        CatalogCreateIntent, DatabaseCapability, SUPPORTED_KUBERNETES_VERSION, Tenant, TenantPhase,
+        TenantProviderStatus, canonical_spec,
     },
     error::ControllerError,
     foundation, management,
@@ -35,12 +36,411 @@ use crate::{
     runtime::{LeadershipGate, tenant_controller},
     sanitize, status,
 };
+use tenant_database_runtime::catalog_runtime::{self, CatalogIdentity, CatalogRuntimeError};
 
 pub const FOUNDATION_NAMESPACE: &str = "tenant-system";
 pub const PROGRESS_INTERVAL: Duration = Duration::from_secs(1);
 pub const DEPENDENCY_INTERVAL: Duration = Duration::from_secs(5);
 pub const READY_INTERVAL: Duration = Duration::from_secs(300);
 pub const STORAGE_CLASS: &str = "capi-hostpath";
+fn create_intent(tenant: &Tenant) -> Result<CatalogCreateIntent, ReconcileError> {
+    let name = tenant.name_any();
+    Ok(CatalogCreateIntent {
+        namespace: tenant_database_runtime::database_namespace(&name),
+        name,
+        tenant_uid: tenant
+            .uid()
+            .ok_or_else(|| ReconcileError::OwnershipInvalid("Tenant UID is missing".into()))?,
+    })
+}
+
+fn recorded_catalog(tenant: &Tenant) -> Option<CatalogIdentity> {
+    tenant
+        .status
+        .as_ref()?
+        .database_capability
+        .as_ref()
+        .and_then(|value| {
+            (!value.catalog_uid.is_empty() && !value.namespace_uid.is_empty()).then(|| {
+                CatalogIdentity {
+                    namespace_uid: value.namespace_uid.clone(),
+                    catalog_uid: value.catalog_uid.clone(),
+                    storage_namespace_uid: value.storage_namespace_uid.clone(),
+                }
+            })
+        })
+}
+
+fn catalog_error(error: CatalogRuntimeError) -> ReconcileError {
+    ReconcileError::OwnershipInvalid(error.to_string())
+}
+async fn record_catalog_identity(
+    client: Client,
+    tenant: &Tenant,
+    intent: &CatalogCreateIntent,
+    identity: &CatalogIdentity,
+) -> Result<(), ReconcileError> {
+    status::update_status(client, tenant, |status| {
+        if status.catalog_create_intent.as_ref() != Some(intent) {
+            return Err(ControllerError::OwnershipInvalid(
+                "catalog intent changed".into(),
+            ));
+        }
+        let capability = status
+            .database_capability
+            .get_or_insert_with(Default::default);
+        if (!capability.namespace_uid.is_empty()
+            && capability.namespace_uid != identity.namespace_uid)
+            || (capability.storage_namespace_uid.is_some()
+                && capability.storage_namespace_uid != identity.storage_namespace_uid)
+            || (!capability.catalog_uid.is_empty()
+                && capability.catalog_uid != identity.catalog_uid)
+        {
+            return Err(ControllerError::OwnershipInvalid(
+                "catalog identity changed".into(),
+            ));
+        }
+        capability.namespace = intent.namespace.clone();
+        capability.namespace_uid = identity.namespace_uid.clone();
+        capability.catalog_uid = identity.catalog_uid.clone();
+        capability.storage_namespace_uid = identity.storage_namespace_uid.clone();
+        capability.available = false;
+        capability.reason = "CatalogObserved".into();
+        crate::readiness::set_condition(
+            status,
+            tenant,
+            status::CATALOG_CREATE_CONDITION,
+            true,
+            "Observed",
+            "Catalog identity persisted",
+        );
+        Ok(())
+    })
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn ensure_database_catalog(
+    client: Client,
+    tenant: &Tenant,
+    azure: bool,
+) -> Result<DatabaseCapability, ReconcileError> {
+    let intent = create_intent(tenant)?;
+    let prior = tenant
+        .status
+        .as_ref()
+        .and_then(|status| status.catalog_create_intent.as_ref());
+    if prior.is_none() {
+        status::record_catalog_create_intent(client, tenant, &intent).await?;
+        return Err(ReconcileError::Pending(
+            "catalog creation intent recorded".into(),
+        ));
+    }
+    if prior != Some(&intent) {
+        return Err(ReconcileError::OwnershipInvalid(
+            "catalog creation intent changed".into(),
+        ));
+    }
+    let outcome = tenant
+        .status
+        .as_ref()
+        .and_then(status::catalog_create_outcome);
+    let recorded = recorded_catalog(tenant);
+    if let Some(identity) = catalog_runtime::observe_catalog(
+        client.clone(),
+        &intent.name,
+        &intent.tenant_uid,
+        recorded.as_ref(),
+    )
+    .await
+    .map_err(catalog_error)?
+    {
+        if recorded.as_ref() != Some(&identity) || outcome != Some("Observed") {
+            record_catalog_identity(client, tenant, &intent, &identity).await?;
+            return Err(ReconcileError::Pending("catalog identity recorded".into()));
+        }
+        return Ok(DatabaseCapability {
+            available: false,
+            reason: "RuntimeNotReady".into(),
+            namespace: intent.namespace,
+            namespace_uid: identity.namespace_uid,
+            catalog_uid: identity.catalog_uid,
+            storage_namespace_uid: identity.storage_namespace_uid,
+        });
+    }
+    if recorded.is_some() {
+        return Err(ReconcileError::OwnershipInvalid(
+            "catalog identity disappeared".into(),
+        ));
+    }
+    if outcome == Some("PreparationRejected") {
+        status::set_catalog_create_outcome(
+            client,
+            tenant,
+            &intent,
+            "PreparationRejected",
+            "Prepared",
+        )
+        .await?;
+        return Err(ReconcileError::Pending(
+            "namespace CREATE retry prepared".into(),
+        ));
+    }
+    if !matches!(
+        outcome,
+        Some("Prepared" | "Preparing" | "Namespaced" | "Rejected")
+    ) {
+        return Err(ReconcileError::Pending(
+            "catalog CREATE outcome is unresolved".into(),
+        ));
+    }
+    if outcome == Some("Prepared") {
+        status::set_catalog_create_outcome(
+            client.clone(),
+            tenant,
+            &intent,
+            "Prepared",
+            "Preparing",
+        )
+        .await?;
+        let namespace_uid = catalog_runtime::ensure_namespace(
+            client.clone(),
+            &intent.namespace,
+            &intent.tenant_uid,
+            None,
+        )
+        .await;
+        let namespace_uid = match namespace_uid {
+            Ok(uid) => uid,
+            Err(CatalogRuntimeError::Rejected) => {
+                let latest = Api::<Tenant>::all(client.clone()).get(&intent.name).await?;
+                status::set_catalog_create_outcome(
+                    client,
+                    &latest,
+                    &intent,
+                    "Preparing",
+                    "PreparationRejected",
+                )
+                .await?;
+                return Err(ReconcileError::Pending("namespace CREATE rejected".into()));
+            }
+            Err(error) => return Err(catalog_error(error)),
+        };
+        let storage_uid = if azure {
+            Some(
+                match catalog_runtime::ensure_namespace(
+                    client.clone(),
+                    &catalog_runtime::storage_namespace(&intent.name),
+                    &intent.tenant_uid,
+                    None,
+                )
+                .await
+                {
+                    Ok(uid) => uid,
+                    Err(CatalogRuntimeError::Rejected) => {
+                        let latest = Api::<Tenant>::all(client.clone()).get(&intent.name).await?;
+                        status::set_catalog_create_outcome(
+                            client,
+                            &latest,
+                            &intent,
+                            "Preparing",
+                            "PreparationRejected",
+                        )
+                        .await?;
+                        return Err(ReconcileError::Pending(
+                            "storage namespace CREATE rejected".into(),
+                        ));
+                    }
+                    Err(error) => return Err(catalog_error(error)),
+                },
+            )
+        } else {
+            None
+        };
+        let latest = Api::<Tenant>::all(client.clone()).get(&intent.name).await?;
+        status::record_catalog_namespaces(
+            client,
+            &latest,
+            &intent,
+            &namespace_uid,
+            storage_uid.as_deref(),
+        )
+        .await?;
+        return Err(ReconcileError::Pending(
+            "catalog namespace identities recorded".into(),
+        ));
+    }
+    if outcome == Some("Preparing") {
+        let namespace_uid = catalog_runtime::observe_namespace(
+            client.clone(),
+            &intent.namespace,
+            &intent.tenant_uid,
+            None,
+        )
+        .await
+        .map_err(catalog_error)?;
+        let storage_uid = if azure {
+            catalog_runtime::observe_namespace(
+                client.clone(),
+                &catalog_runtime::storage_namespace(&intent.name),
+                &intent.tenant_uid,
+                None,
+            )
+            .await
+            .map_err(catalog_error)?
+        } else {
+            None
+        };
+        if let Some(namespace_uid) = namespace_uid
+            && (!azure || storage_uid.is_some())
+        {
+            status::record_catalog_namespaces(
+                client,
+                tenant,
+                &intent,
+                &namespace_uid,
+                storage_uid.as_deref(),
+            )
+            .await?;
+        }
+        return Err(ReconcileError::Pending(
+            "catalog namespace preparation is pending".into(),
+        ));
+    }
+    let capability = tenant
+        .status
+        .as_ref()
+        .and_then(|status| status.database_capability.as_ref());
+    let namespace_uid = capability
+        .map(|capability| capability.namespace_uid.as_str())
+        .filter(|uid| !uid.is_empty())
+        .ok_or_else(|| {
+            ReconcileError::OwnershipInvalid("catalog namespace UID is missing".into())
+        })?;
+    let storage_uid = capability.and_then(|capability| capability.storage_namespace_uid.as_deref());
+    if azure && storage_uid.is_none() {
+        return Err(ReconcileError::OwnershipInvalid(
+            "storage namespace UID is missing".into(),
+        ));
+    }
+    catalog_runtime::ensure_namespace(
+        client.clone(),
+        &intent.namespace,
+        &intent.tenant_uid,
+        Some(namespace_uid),
+    )
+    .await
+    .map_err(catalog_error)?;
+    if let Some(storage_uid) = storage_uid {
+        catalog_runtime::ensure_namespace(
+            client.clone(),
+            &catalog_runtime::storage_namespace(&intent.name),
+            &intent.tenant_uid,
+            Some(storage_uid),
+        )
+        .await
+        .map_err(catalog_error)?;
+    }
+    let current = Api::<Tenant>::all(client.clone()).get(&intent.name).await?;
+    if current.uid() != tenant.uid()
+        || current.resource_version() != tenant.resource_version()
+        || current.metadata.deletion_timestamp.is_some()
+    {
+        return Err(ReconcileError::Pending(
+            "Tenant changed before catalog CREATE".into(),
+        ));
+    }
+    status::set_catalog_create_outcome(
+        client.clone(),
+        &current,
+        &intent,
+        outcome.expect("checked above"),
+        "Unknown",
+    )
+    .await?;
+    match catalog_runtime::ensure_catalog(
+        client.clone(),
+        &intent.name,
+        &intent.tenant_uid,
+        Some(namespace_uid),
+        None,
+        storage_uid,
+        azure,
+    )
+    .await
+    {
+        Ok(identity) => {
+            let latest = Api::<Tenant>::all(client.clone()).get(&intent.name).await?;
+            record_catalog_identity(client, &latest, &intent, &identity).await?;
+        }
+        Err(CatalogRuntimeError::Rejected) => {
+            let latest = Api::<Tenant>::all(client.clone()).get(&intent.name).await?;
+            status::set_catalog_create_outcome(client, &latest, &intent, "Unknown", "Rejected")
+                .await?;
+        }
+        Err(error) => return Err(catalog_error(error)),
+    }
+    Err(ReconcileError::Pending(
+        "catalog CREATE outcome recorded".into(),
+    ))
+}
+
+async fn drain_databases(client: Client, tenant: &Tenant) -> Result<bool, ReconcileError> {
+    let intent = create_intent(tenant)?;
+    let prior = tenant
+        .status
+        .as_ref()
+        .and_then(|status| status.catalog_create_intent.as_ref());
+    if prior.is_some_and(|prior| prior != &intent) {
+        return Err(ReconcileError::OwnershipInvalid(
+            "catalog creation intent changed".into(),
+        ));
+    }
+    let recorded = recorded_catalog(tenant);
+    let outcome = tenant
+        .status
+        .as_ref()
+        .and_then(status::catalog_create_outcome);
+    if prior.is_none() && recorded.is_none() && outcome != Some("Closed") {
+        status::close_catalog_creation_without_intent(client, tenant).await?;
+        return Ok(false);
+    }
+    if prior.is_some() && (recorded.is_none() || outcome != Some("Observed")) {
+        let observed = catalog_runtime::observe_catalog(
+            client.clone(),
+            &intent.name,
+            &intent.tenant_uid,
+            recorded.as_ref(),
+        )
+        .await
+        .map_err(catalog_error)?;
+        if let Some(identity) = observed {
+            record_catalog_identity(client, tenant, &intent, &identity).await?;
+            return Ok(false);
+        }
+        if !matches!(
+            outcome,
+            Some("Prepared" | "Namespaced" | "Rejected" | "PreparationRejected")
+        ) {
+            return Ok(false);
+        }
+    }
+    let expected = recorded.or_else(|| {
+        tenant
+            .status
+            .as_ref()?
+            .database_capability
+            .as_ref()
+            .map(|value| CatalogIdentity {
+                namespace_uid: value.namespace_uid.clone(),
+                catalog_uid: String::new(),
+                storage_namespace_uid: value.storage_namespace_uid.clone(),
+            })
+    });
+    catalog_runtime::drain_catalog(client, &intent.name, &intent.tenant_uid, expected.as_ref())
+        .await
+        .map_err(catalog_error)
+}
 #[derive(Clone, Debug)]
 pub struct Config {
     pub supported_version: String,
@@ -72,6 +472,7 @@ impl<P> Reconciler<P> {
 }
 
 impl<P: ProviderLifecycle> Reconciler<P> {
+    #[rustfmt::skip]
     pub async fn reconcile_name(&self, name: &str) -> Result<Action, ReconcileError> {
         let Some(tenant) = Api::<Tenant>::all(self.client.clone())
             .get_opt(name)
@@ -118,9 +519,11 @@ impl<P: ProviderLifecycle> Reconciler<P> {
         }
         let deleting = tenant.metadata.deletion_timestamp.is_some();
         let result = if deleting {
-            self.provider
-                .finalize(&tenant, &self.config.supported_version)
-                .await
+            match drain_databases(self.client.clone(), &tenant).await {
+                Ok(true) => self.provider.finalize(&tenant, &self.config.supported_version).await,
+                Ok(false) => Err(ReconcileError::Pending("catalog drain is pending".into())),
+                Err(error) => Err(error),
+            }
         } else {
             self.provider.reconcile(&tenant, &spec).await
         };
@@ -146,7 +549,7 @@ impl<P: ProviderLifecycle> Reconciler<P> {
     async fn unsupported_provider(&self, tenant: &Tenant) -> Result<Action, ReconcileError> {
         let has_finalizer = tenant.finalizers().iter().any(|value| value == FINALIZER);
         let (provider_status, provider_name) = match tenant.spec.provider {
-            crate::api::TenantProviderSpec::Local { .. } => {
+            crate::api::TenantProviderSpec::Local => {
                 (TenantProviderStatus::Local(Default::default()), "Local")
             }
             crate::api::TenantProviderSpec::Azure => {

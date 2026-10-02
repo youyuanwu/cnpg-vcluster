@@ -16,19 +16,25 @@ use axum::{
 };
 use tenant_admin_shared::{
     ApiEnvelope,
+    catalog::{
+        CatalogQueryRequest, CatalogQueryResponse, CatalogView, DatabaseAddRequest,
+        DatabaseDeleteRequest,
+    },
     lifecycle::{
         TenantCreateRequest, TenantCreateResponse, TenantDeleteRequest, TenantDeleteResponse,
         TenantDeleteState, TenantField, TenantFieldError, TenantMutationIdentity,
     },
     query::{
-        DatabaseQueryRequest, DatabaseQueryResponse, ManagementComponentView, ManagementOverview,
-        OverviewSnapshot, ProviderMode, TenantClassification, TenantCounts, TenantSnapshot,
-        TenantSnapshotIdentity, TenantSummary, TopologyGraph,
+        DatabaseObservation, DatabaseObservationFreshness, DatabaseQueryRequest,
+        DatabaseQueryResponse, DatabaseUnavailableReason, ManagementComponentView,
+        ManagementOverview, OverviewSnapshot, ProviderMode, TenantClassification, TenantCounts,
+        TenantSnapshot, TenantSnapshotIdentity, TenantSummary, TopologyGraph,
     },
     routes::{
-        API_OVERVIEW_PATH, API_TENANT_DATABASE_QUERY_PATH, API_TENANT_PATH,
-        API_TENANT_TOPOLOGY_PATH, API_TENANTS_PATH, READINESS_PATH,
-        TENANT_ADMIN_UNSAFE_REQUEST_HEADER, TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
+        API_DATABASE_PATH, API_DATABASE_QUERY_PATH, API_DATABASES_PATH, API_OVERVIEW_PATH,
+        API_TENANT_DATABASE_QUERY_PATH, API_TENANT_PATH, API_TENANT_TOPOLOGY_PATH,
+        API_TENANTS_PATH, READINESS_PATH, TENANT_ADMIN_UNSAFE_REQUEST_HEADER,
+        TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
     },
 };
 use tenant_controller::api::{Tenant, TenantProviderSpec, TenantSpec, canonical_spec};
@@ -38,6 +44,7 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+use crate::projection::merge_catalog_topology;
 use crate::{AppError, DataSource, SourceError, TenantProjection, project_summary};
 
 const MAX_DATABASE_QUERY_BODY_BYTES: usize = 128 * 1_024;
@@ -95,6 +102,21 @@ pub fn router(state: AppState, web_directory: PathBuf) -> Router {
         )
         .route(API_TENANT_TOPOLOGY_PATH, get(tenant_topology))
         .route(
+            API_DATABASES_PATH,
+            get(database_list)
+                .post(database_add)
+                .layer(DefaultBodyLimit::max(MAX_TENANT_MUTATION_BODY_BYTES)),
+        )
+        .route(
+            API_DATABASE_PATH,
+            axum::routing::delete(database_delete)
+                .layer(DefaultBodyLimit::max(MAX_TENANT_MUTATION_BODY_BYTES)),
+        )
+        .route(
+            API_DATABASE_QUERY_PATH,
+            post(catalog_query).layer(DefaultBodyLimit::max(MAX_DATABASE_QUERY_BODY_BYTES)),
+        )
+        .route(
             API_TENANT_DATABASE_QUERY_PATH,
             post(database_query).layer(DefaultBodyLimit::max(MAX_DATABASE_QUERY_BODY_BYTES)),
         )
@@ -103,6 +125,116 @@ pub fn router(state: AppState, web_directory: PathBuf) -> Router {
         .layer(middleware::from_fn(no_store_html))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+async fn catalog_tenant(state: &AppState, name: &str) -> Result<Tenant, AppError> {
+    validate_tenant_name(name)?;
+    let tenant = state
+        .source
+        .get_tenant(name)
+        .await?
+        .ok_or_else(|| AppError::not_found(format!("Tenant {name} was not found")))?;
+    let matches = matches!(
+        (state.provider, &tenant.spec.provider),
+        (ProviderMode::Local, TenantProviderSpec::Local)
+            | (ProviderMode::Azure, TenantProviderSpec::Azure)
+    );
+    if !matches {
+        return Err(AppError::database_unavailable(
+            "Tenant provider does not match Admin",
+            false,
+        ));
+    }
+    Ok(tenant)
+}
+
+async fn database_list(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<ApiEnvelope<CatalogView>>, AppError> {
+    let tenant = catalog_tenant(&state, &name).await?;
+    Ok(Json(ApiEnvelope::new(
+        state.source.read_catalog(&tenant).await?,
+    )))
+}
+
+async fn database_add(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(StatusCode, Json<ApiEnvelope<CatalogView>>), AppError> {
+    validate_request_origin(&headers)?;
+    let tenant = catalog_tenant(&state, &name).await?;
+    let body = body.map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    let request: DatabaseAddRequest = serde_json::from_slice(&body)
+        .map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    if !tenant_database_controller::api::valid_logical_uid(&request.catalog_uid)
+        || !tenant_database_controller::api::valid_name(&request.name)
+        || !(1..=3).contains(&request.instances)
+    {
+        return Err(AppError::invalid_request(
+            "Catalog UID, database name or instance count is invalid",
+        ));
+    }
+    let result = state.source.add_database(&tenant, &request).await?;
+    Ok((StatusCode::CREATED, Json(ApiEnvelope::new(result))))
+}
+
+async fn database_delete(
+    State(state): State<AppState>,
+    Path((name, uid)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<(StatusCode, Json<ApiEnvelope<CatalogView>>), AppError> {
+    validate_request_origin(&headers)?;
+    let tenant = catalog_tenant(&state, &name).await?;
+    let body = body.map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    let request: DatabaseDeleteRequest = serde_json::from_slice(&body)
+        .map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    if !tenant_database_controller::api::valid_logical_uid(&uid)
+        || !tenant_database_controller::api::valid_logical_uid(&request.catalog_uid)
+        || request.logical_uid != uid
+        || !tenant_database_controller::api::valid_name(&request.confirmation)
+    {
+        return Err(AppError::invalid_request(
+            "Exact database identity and name confirmation are required",
+        ));
+    }
+    let result = state.source.delete_database(&tenant, &request).await?;
+    Ok((StatusCode::ACCEPTED, Json(ApiEnvelope::new(result))))
+}
+
+async fn catalog_query(
+    State(state): State<AppState>,
+    Path((name, uid)): Path<(String, String)>,
+    headers: HeaderMap,
+    body: Result<Bytes, BytesRejection>,
+) -> Result<Json<ApiEnvelope<CatalogQueryResponse>>, AppError> {
+    validate_request_origin(&headers)?;
+    let tenant = catalog_tenant(&state, &name).await?;
+    let body = body.map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    let request: CatalogQueryRequest = serde_json::from_slice(&body)
+        .map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
+    if !tenant_database_controller::api::valid_logical_uid(&uid)
+        || uid != request.logical_uid
+        || !tenant_database_controller::api::valid_logical_uid(&request.catalog_uid)
+        || request.instance_uid.is_empty()
+        || request.instance_uid.len() > 128
+        || request.instance_uid.chars().any(char::is_control)
+    {
+        return Err(AppError::invalid_request(
+            "Exact catalog, database and instance identities are required",
+        ));
+    }
+    validate_query_request(&DatabaseQueryRequest {
+        instance: request.instance.clone(),
+        database: request.database.clone(),
+        sql: request.sql.clone(),
+    })?;
+    Ok(Json(ApiEnvelope::new(
+        state.source.query_catalog(&tenant, &request).await?,
+    )))
 }
 
 async fn no_store_html(request: Request<Body>, next: Next) -> impl IntoResponse {
@@ -164,7 +296,7 @@ async fn tenant_create(
     let body = body.map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
     let request: TenantCreateRequest = serde_json::from_slice(&body)
         .map_err(|_| AppError::invalid_request("Request body must be valid JSON"))?;
-    let field_errors = validate_create_request(state.provider, &request);
+    let field_errors = validate_create_request(&request);
     if !field_errors.is_empty() {
         return Err(AppError::invalid_fields(
             "Tenant creation fields are invalid",
@@ -179,10 +311,7 @@ async fn tenant_create(
         .supported_kubernetes_version
         .ok_or(SourceError::CreationUnavailable)?;
     let provider = match state.provider {
-        ProviderMode::Local => TenantProviderSpec::Local {
-            databases: i32::try_from(request.databases.expect("validated"))
-                .map_err(|_| AppError::invalid_request("databases is invalid"))?,
-        },
+        ProviderMode::Local => TenantProviderSpec::Local,
         ProviderMode::Azure => TenantProviderSpec::Azure,
     };
     let spec = TenantSpec {
@@ -262,11 +391,7 @@ async fn tenant_detail(
         .source
         .list_management_resources(state.provider, &name)
         .await?;
-    let database = state
-        .source
-        .database_observation(state.provider, &tenant, &resources)
-        .await?;
-    let projection = TenantProjection::new(state.provider, tenant, resources, database);
+    let projection = projected_tenant(&state, tenant, resources).await?;
     let identity = TenantSnapshotIdentity {
         uid: projection.detail.uid.clone(),
         generation: projection.detail.generation,
@@ -294,13 +419,66 @@ async fn tenant_topology(
         .source
         .list_management_resources(state.provider, &name)
         .await?;
-    let database = state
-        .source
-        .database_observation(state.provider, &tenant, &resources)
-        .await?;
     Ok(Json(ApiEnvelope::new(
-        TenantProjection::new(state.provider, tenant, resources, database).topology,
+        projected_tenant(&state, tenant, resources).await?.topology,
     )))
+}
+
+async fn projected_tenant(
+    state: &AppState,
+    tenant: Tenant,
+    resources: Vec<kube::core::DynamicObject>,
+) -> Result<TenantProjection, AppError> {
+    let catalog = if tenant
+        .status
+        .as_ref()
+        .and_then(|status| status.database_capability.as_ref())
+        .is_some()
+    {
+        match state.source.read_catalog(&tenant).await {
+            Ok(catalog) => Ok(Some(catalog)),
+            Err(error) => {
+                tracing::warn!("catalog read unavailable while projecting Tenant detail");
+                Err(error)
+            }
+        }
+    } else {
+        Ok(None)
+    };
+    let database = match &catalog {
+        Ok(Some(_)) => DatabaseObservation::Unavailable {
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            freshness: DatabaseObservationFreshness::Live,
+            reason: DatabaseUnavailableReason::Pending,
+            message: "Use the catalog database endpoint for per-cluster observations".into(),
+            retryable: false,
+        },
+        Err(error) => DatabaseObservation::Unavailable {
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            freshness: DatabaseObservationFreshness::Live,
+            reason: DatabaseUnavailableReason::TenantApiUnavailable,
+            message: "Database catalog is unavailable; refresh its separate catalog panel".into(),
+            retryable: matches!(
+                error,
+                SourceError::KubernetesUnavailable
+                    | SourceError::DatabaseUnavailable {
+                        retryable: true,
+                        ..
+                    }
+            ),
+        },
+        Ok(None) => {
+            state
+                .source
+                .database_observation(state.provider, &tenant, &resources)
+                .await?
+        }
+    };
+    let mut projection = TenantProjection::new(state.provider, tenant, resources, database);
+    if let Ok(Some(catalog)) = catalog {
+        merge_catalog_topology(&mut projection.topology, &catalog);
+    }
+    Ok(projection)
 }
 
 async fn database_query(
@@ -326,7 +504,18 @@ async fn database_query(
         .get_tenant(&name)
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant {name} was not found")))?;
-    if !matches!(tenant.spec.provider, TenantProviderSpec::Local { .. }) {
+    if tenant
+        .status
+        .as_ref()
+        .and_then(|status| status.database_capability.as_ref())
+        .is_some()
+    {
+        return Err(AppError::database_unavailable(
+            "Select an exact catalog database and instance for queries",
+            false,
+        ));
+    }
+    if !matches!(tenant.spec.provider, TenantProviderSpec::Local) {
         return Err(AppError::database_unavailable(
             "Database queries are available only for local Tenants",
             false,
@@ -450,10 +639,7 @@ fn counts(summaries: &[TenantSummary]) -> TenantCounts {
     counts
 }
 
-fn validate_create_request(
-    provider: ProviderMode,
-    request: &TenantCreateRequest,
-) -> Vec<TenantFieldError> {
+fn validate_create_request(request: &TenantCreateRequest) -> Vec<TenantFieldError> {
     let mut errors = Vec::new();
     if !valid_tenant_name(&request.name) {
         errors.push(TenantFieldError {
@@ -468,20 +654,6 @@ fn validate_create_request(
             code: "invalid-count".into(),
             message: "Workers must be from 1 through 3.".into(),
         });
-    }
-    match (provider, request.databases) {
-        (ProviderMode::Local, Some(databases)) if (1..=3).contains(&databases) => {}
-        (ProviderMode::Local, _) => errors.push(TenantFieldError {
-            field: TenantField::Databases,
-            code: "invalid-count".into(),
-            message: "Databases must be from 1 through 3.".into(),
-        }),
-        (ProviderMode::Azure, Some(_)) => errors.push(TenantFieldError {
-            field: TenantField::Databases,
-            code: "provider-inapplicable".into(),
-            message: "Databases are not accepted for Azure Tenants.".into(),
-        }),
-        (ProviderMode::Azure, None) => {}
     }
     errors.sort_by_key(|error| error.field);
     errors
@@ -631,9 +803,78 @@ mod tests {
         tenant_creates: AtomicUsize,
         tenant_deletes: AtomicUsize,
         created_tenants: Mutex<Vec<Tenant>>,
+        catalog_reads: AtomicUsize,
+        catalog_failure: Mutex<Option<SourceError>>,
+        catalog_adds: AtomicUsize,
+        catalog_deletes: AtomicUsize,
+        catalog_queries: AtomicUsize,
     }
 
     impl DataSource for MockSource {
+        fn read_catalog<'a>(&'a self, tenant: &'a Tenant) -> SourceFuture<'a, CatalogView> {
+            self.calls.catalog_reads.fetch_add(1, Ordering::Relaxed);
+            if let Some(error) = self.calls.catalog_failure.lock().unwrap().clone() {
+                return Box::pin(ready(Err(error)));
+            }
+            let name = tenant.metadata.name.clone().unwrap();
+            Box::pin(ready(Ok(CatalogView {
+                tenant: name,
+                tenant_uid: tenant.metadata.uid.clone().unwrap(),
+                catalog_uid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                resource_version: "10".into(),
+                closed: false,
+                capability_available: true,
+                databases: vec![],
+            })))
+        }
+
+        fn add_database<'a>(
+            &'a self,
+            tenant: &'a Tenant,
+            request: &'a DatabaseAddRequest,
+        ) -> SourceFuture<'a, CatalogView> {
+            self.calls.catalog_adds.fetch_add(1, Ordering::Relaxed);
+            let mut response = self.read_catalog(tenant);
+            let request = request.clone();
+            Box::pin(async move {
+                let mut catalog = response.as_mut().await?;
+                catalog.resource_version = request.instances.to_string();
+                Ok(catalog)
+            })
+        }
+
+        fn delete_database<'a>(
+            &'a self,
+            tenant: &'a Tenant,
+            request: &'a DatabaseDeleteRequest,
+        ) -> SourceFuture<'a, CatalogView> {
+            self.calls.catalog_deletes.fetch_add(1, Ordering::Relaxed);
+            let mut response = self.read_catalog(tenant);
+            let request = request.clone();
+            Box::pin(async move {
+                let mut catalog = response.as_mut().await?;
+                catalog.resource_version = request.logical_uid;
+                Ok(catalog)
+            })
+        }
+
+        fn query_catalog<'a>(
+            &'a self,
+            _tenant: &'a Tenant,
+            request: &'a CatalogQueryRequest,
+        ) -> SourceFuture<'a, CatalogQueryResponse> {
+            self.calls.catalog_queries.fetch_add(1, Ordering::Relaxed);
+            Box::pin(ready(Ok(CatalogQueryResponse {
+                catalog_uid: request.catalog_uid.clone(),
+                logical_uid: request.logical_uid.clone(),
+                instance: request.instance.clone(),
+                instance_uid: request.instance_uid.clone(),
+                executed_at: "2026-01-01T00:00:00Z".into(),
+                duration_ms: 1,
+                truncated: false,
+                results: vec![],
+            })))
+        }
         fn list_tenants(&self) -> SourceFuture<'_, Vec<Tenant>> {
             self.calls.tenant_lists.fetch_add(1, Ordering::Relaxed);
             Box::pin(ready(self.tenants.clone()))
@@ -717,12 +958,14 @@ mod tests {
     }
 
     fn ready_tenant() -> Tenant {
-        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1, 1));
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 1));
         tenant.metadata.uid = Some("tenant-uid".into());
         tenant.metadata.generation = Some(1);
         tenant.status = Some(TenantStatus {
             observed_generation: Some(1),
             phase: Some(TenantPhase::Ready),
+            database_capability: None,
+            catalog_create_intent: None,
             conditions: vec![Condition {
                 type_: "Ready".into(),
                 status: "True".into(),
@@ -905,9 +1148,7 @@ mod tests {
         let calls = source.calls.clone();
         let app = test_router(source);
         let create = Request::post(API_TENANTS_PATH)
-            .body(Body::from(
-                r#"{"name":"tenant-b","workers":2,"databases":1}"#,
-            ))
+            .body(Body::from(r#"{"name":"tenant-b","workers":2}"#))
             .unwrap();
         let response = app.clone().oneshot(create).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
@@ -920,14 +1161,12 @@ mod tests {
             .header("origin", "http://127.0.0.1:8080")
             .header("host", "127.0.0.1:8080")
             .header(TENANT_ADMIN_UNSAFE_REQUEST_HEADER, "1")
-            .body(Body::from(
-                r#"{"name":"Invalid","workers":0,"databases":9}"#,
-            ))
+            .body(Body::from(r#"{"name":"Invalid","workers":0}"#))
             .unwrap();
         let response = app.clone().oneshot(invalid).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let envelope: ApiErrorEnvelope = response_json(response).await;
-        assert_eq!(envelope.error.field_errors.len(), 3);
+        assert_eq!(envelope.error.field_errors.len(), 2);
         assert_eq!(calls.tenant_creates.load(Ordering::Relaxed), 1);
 
         let mismatched = Request::delete("/api/v1/tenants/tenant-a")
@@ -973,7 +1212,7 @@ mod tests {
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
         let envelope: ApiErrorEnvelope = response_json(response).await;
-        assert_eq!(envelope.error.field_errors[0].field, TenantField::Databases);
+        assert_eq!(envelope.error.code, ApiErrorCode::InvalidRequest);
         assert_eq!(calls.tenant_creates.load(Ordering::Relaxed), 0);
     }
 
@@ -991,9 +1230,7 @@ mod tests {
         let calls = source.calls.clone();
         let app = test_router_with_provider(source, ProviderMode::Azure);
         let request = Request::post(API_TENANTS_PATH)
-            .body(Body::from(
-                r#"{"name":"tenant-b","workers":2,"databases":null}"#,
-            ))
+            .body(Body::from(r#"{"name":"tenant-b","workers":2}"#))
             .unwrap();
         let response = app.oneshot(request).await.unwrap();
         assert_eq!(response.status(), StatusCode::CREATED);
@@ -1140,6 +1377,99 @@ mod tests {
         assert_eq!(calls.tenant_gets.load(Ordering::Relaxed), 2);
         assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 2);
         assert_eq!(calls.database_observations.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn catalog_failures_keep_tenant_detail_and_topology_available_for_both_providers() {
+        for (provider, failure, status, retryable) in [
+            (
+                ProviderMode::Local,
+                SourceError::KubernetesUnavailable,
+                StatusCode::SERVICE_UNAVAILABLE,
+                true,
+            ),
+            (
+                ProviderMode::Azure,
+                SourceError::StaleIdentity,
+                StatusCode::CONFLICT,
+                false,
+            ),
+        ] {
+            let mut tenant = ready_tenant();
+            if provider == ProviderMode::Azure {
+                tenant.spec.provider = TenantProviderSpec::Azure;
+                tenant.status.as_mut().unwrap().provider =
+                    Some(TenantProviderStatus::Azure(Box::default()));
+            }
+            tenant.status.as_mut().unwrap().database_capability =
+                Some(tenant_controller::api::DatabaseCapability {
+                    available: true,
+                    reason: "Ready".into(),
+                    namespace: "tenant-db-tenant-a".into(),
+                    namespace_uid: "namespace-uid".into(),
+                    catalog_uid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                    storage_namespace_uid: None,
+                });
+            let calls = Arc::new(SourceCalls::default());
+            *calls.catalog_failure.lock().unwrap() = Some(failure);
+            let app = test_router_with_provider(
+                MockSource {
+                    tenants: Ok(vec![tenant.clone()]),
+                    tenant: Ok(Some(tenant)),
+                    resources: Ok(Vec::new()),
+                    database: Ok(database_observation()),
+                    query: Ok(query_response()),
+                    ready: Ok(()),
+                    calls: calls.clone(),
+                },
+                provider,
+            );
+            let detail = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/tenants/tenant-a")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(detail.status(), StatusCode::OK);
+            let detail: ApiEnvelope<TenantSnapshot> = response_json(detail).await;
+            assert_eq!(detail.data.identity.uid, "tenant-uid");
+            assert_eq!(detail.data.detail.summary.name, "tenant-a");
+            match detail.data.database {
+                DatabaseObservation::Unavailable {
+                    reason,
+                    retryable: observed_retryable,
+                    ..
+                } => {
+                    assert_eq!(reason, DatabaseUnavailableReason::TenantApiUnavailable);
+                    assert_eq!(observed_retryable, retryable);
+                }
+                other => panic!("expected explicit unavailable observation: {other:?}"),
+            }
+            let topology = app
+                .clone()
+                .oneshot(
+                    Request::get("/api/v1/tenants/tenant-a/topology")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(topology.status(), StatusCode::OK);
+            let catalog = app
+                .oneshot(
+                    Request::get("/api/v1/tenants/tenant-a/databases")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(catalog.status(), status);
+            assert_eq!(calls.catalog_reads.load(Ordering::Relaxed), 3);
+            assert_eq!(calls.database_observations.load(Ordering::Relaxed), 0);
+        }
     }
 
     #[tokio::test]
@@ -1543,6 +1873,167 @@ mod tests {
                 assert!(response.error.message.contains("syntax error"));
             }
         }
+    }
+
+    #[tokio::test]
+    async fn nested_catalog_routes_validate_exact_identities_origin_and_bounds() {
+        const CATALOG: &str = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
+        const LOGICAL: &str = "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb";
+        let calls = Arc::new(SourceCalls::default());
+        let source = MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(Some(ready_tenant())),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: calls.clone(),
+        };
+        let router = test_router_with_provider(source, ProviderMode::Azure);
+        let path = "/api/v1/tenants/tenant-a/databases";
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let router = test_router(MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(Some(ready_tenant())),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: calls.clone(),
+        });
+        let response = router
+            .clone()
+            .oneshot(Request::get(path).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: ApiEnvelope<CatalogView> = response_json(response).await;
+        assert_eq!(body.schema_version, 5);
+        assert_eq!(body.data.catalog_uid, CATALOG);
+        let add = format!(r#"{{"catalogUid":"{CATALOG}","name":"alpha","instances":2}}"#);
+        let send = |path: &str, body: String| {
+            Request::post(path)
+                .header("host", "localhost:8080")
+                .header("origin", "http://localhost:8080")
+                .header(
+                    TENANT_ADMIN_UNSAFE_REQUEST_HEADER,
+                    TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
+                )
+                .body(Body::from(body))
+                .unwrap()
+        };
+        let response = router
+            .clone()
+            .oneshot(send(path, add.clone()))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let response = router
+            .clone()
+            .oneshot(
+                Request::post(path)
+                    .header("host", "localhost:8080")
+                    .header("origin", "http://localhost:8080")
+                    .body(Body::from(add))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let delete_path = format!("{path}/{LOGICAL}");
+        let deletion = format!(
+            r#"{{"catalogUid":"{CATALOG}","logicalUid":"{LOGICAL}","confirmation":"alpha"}}"#
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::delete(&delete_path)
+                    .header("host", "localhost:8080")
+                    .header("origin", "http://localhost:8080")
+                    .header(
+                        TENANT_ADMIN_UNSAFE_REQUEST_HEADER,
+                        TENANT_ADMIN_UNSAFE_REQUEST_VALUE,
+                    )
+                    .body(Body::from(deletion))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let invalid = format!(
+            r#"{{"catalogUid":"{CATALOG}","logicalUid":"{CATALOG}","confirmation":"alpha"}}"#
+        );
+        let response = router
+            .clone()
+            .oneshot(
+                Request::delete(&delete_path)
+                    .body(Body::from(invalid))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let query_path = format!("{delete_path}/query");
+        let query = format!(
+            r#"{{"catalogUid":"{CATALOG}","logicalUid":"{LOGICAL}","instance":"pg-1","instanceUid":"pod-uid","database":"postgres","sql":"select 1"}}"#
+        );
+        let response = router
+            .clone()
+            .oneshot(send(&query_path, query))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let wrong = format!(
+            r#"{{"catalogUid":"{CATALOG}","logicalUid":"{CATALOG}","instance":"pg-1","instanceUid":"pod-uid","database":"postgres","sql":"select 1"}}"#
+        );
+        let response = router
+            .clone()
+            .oneshot(send(&query_path, wrong))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let response = router
+            .clone()
+            .oneshot(send(&query_path, "x".repeat(128 * 1024 + 1)))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(calls.catalog_adds.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.catalog_deletes.load(Ordering::Relaxed), 1);
+        assert_eq!(calls.catalog_queries.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn catalog_capable_tenant_cannot_use_legacy_unbound_query_route() {
+        let mut tenant = ready_tenant();
+        tenant.status.as_mut().unwrap().database_capability =
+            Some(tenant_controller::api::DatabaseCapability {
+                available: true,
+                reason: "Ready".into(),
+                namespace: "tenant-db-tenant-a".into(),
+                namespace_uid: "namespace-uid".into(),
+                catalog_uid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                storage_namespace_uid: None,
+            });
+        let calls = Arc::new(SourceCalls::default());
+        let app = test_router(MockSource {
+            tenants: Ok(Vec::new()),
+            tenant: Ok(Some(tenant)),
+            resources: Ok(Vec::new()),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: calls.clone(),
+        });
+        let response = app.oneshot(query_request("select 1")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.database_queries.load(Ordering::Relaxed), 0);
     }
 
     #[tokio::test]

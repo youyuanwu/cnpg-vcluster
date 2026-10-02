@@ -39,19 +39,23 @@ def verify_api_boundaries(client, config) -> None:
     # No manager is running: the admission probe cannot race an allocation.
     verify_controller_api(config, client)
     probe = tenant_manifest_document(config, "allocation-api-probe")
-    for field in ("workers", "databases"):
-        for value in (0, 4, -1, True, 1.5, "1", None):
-            document = copy.deepcopy(probe)
-            if field == "workers":
-                document["spec"]["workers"] = value
-            else:
-                document["spec"]["provider"]["databases"] = value
-            result = client.kubectl(
-                "create", "--dry-run=server", "--validate=strict", "-f", "-",
-                input_text=json.dumps(document), check=False,
-            )
-            if result.returncode == 0 or field not in result.stderr:
-                raise RuntimeError(f"Tenant API accepted invalid {field}={value!r}")
+    for value in (0, 4, -1, True, 1.5, "1", None):
+        document = copy.deepcopy(probe)
+        document["spec"]["workers"] = value
+        result = client.kubectl(
+            "create", "--dry-run=server", "--validate=strict", "-f", "-",
+            input_text=json.dumps(document), check=False,
+        )
+        if result.returncode == 0 or "workers" not in result.stderr:
+            raise RuntimeError(f"Tenant API accepted invalid workers={value!r}")
+    document = copy.deepcopy(probe)
+    document["spec"]["provider"]["databases"] = 1
+    result = client.kubectl(
+        "create", "--dry-run=server", "--validate=strict", "-f", "-",
+        input_text=json.dumps(document), check=False,
+    )
+    if result.returncode == 0 or "databases" not in result.stderr:
+        raise RuntimeError("Tenant API accepted obsolete implicit database count")
     for version in ("1.36", "1.36.4-extra", "", "vv1.36.4"):
         document = copy.deepcopy(probe)
         document["spec"]["kubernetesVersion"] = version
@@ -65,7 +69,6 @@ def verify_api_boundaries(client, config) -> None:
                     "v" + config["KUBERNETES_VERSION"].removeprefix("v"), "0.0.0"):
         document = copy.deepcopy(probe)
         document["spec"].update(kubernetesVersion=version, workers=3)
-        document["spec"]["provider"]["databases"] = 3
         client.kubectl("create", "--dry-run=server", "--validate=strict", "-f", "-",
                        input_text=json.dumps(document))
     print("live CEL/count/version and Warn/Ignore/Strict API boundaries passed", flush=True)

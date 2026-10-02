@@ -104,10 +104,6 @@ pub fn project_summary(mode: ProviderMode, tenant: &Tenant) -> TenantSummary {
         classification: classify_tenant(mode, tenant),
         kubernetes_version: bounded(&tenant.spec.kubernetes_version, MAX_IDENTITY),
         requested_workers: nonnegative(tenant.spec.workers),
-        requested_databases: match tenant.spec.provider {
-            TenantProviderSpec::Local { databases } => Some(nonnegative(databases)),
-            TenantProviderSpec::Azure => None,
-        },
         endpoint,
         created_at: tenant
             .metadata
@@ -242,7 +238,7 @@ fn accepted_local<'a>(
                 foundation_hash,
             )
             || object.owner_references().iter().any(|owner| {
-                owner.kind == "Tenant" && owner.api_version == "tenancy.cnpg-vcluster.io/v1alpha3"
+                owner.kind == "Tenant" && owner.api_version == "tenancy.cnpg-vcluster.io/v1alpha4"
             })
             || (definition.kind == "Cluster"
                 && recorded_cluster_uid.is_some()
@@ -386,6 +382,40 @@ fn accepted_azure<'a>(
         }
     }
     accepted
+}
+
+pub(crate) fn is_accepted_azure_management_resource(
+    tenant: &Tenant,
+    inventory: &[DynamicObject],
+    object: &DynamicObject,
+) -> bool {
+    accepted_azure(tenant, inventory)
+        .iter()
+        .any(|accepted| std::ptr::eq(accepted.object, object))
+}
+
+pub(crate) fn merge_catalog_topology(
+    graph: &mut TopologyGraph,
+    catalog: &tenant_admin_shared::catalog::CatalogView,
+) {
+    graph.nodes.retain(|node| !node.id.starts_with("database:"));
+    graph.edges.retain(|edge| {
+        !edge.source.starts_with("database:") && !edge.target.starts_with("database:")
+    });
+    for database in &catalog.databases {
+        let root = format!("database:{}", database.logical_uid);
+        graph.nodes.extend(database.topology.nodes.iter().cloned());
+        graph.edges.extend(database.topology.edges.iter().cloned());
+        graph.edges.push(TopologyEdge {
+            id: format!("edge:tenant:{root}"),
+            source: "tenant".into(),
+            target: root,
+            kind: TopologyEdgeKind::Contains,
+            label: Some("Database cluster".into()),
+        });
+    }
+    graph.nodes.sort_by(|left, right| left.id.cmp(&right.id));
+    graph.edges.sort_by(|left, right| left.id.cmp(&right.id));
 }
 
 fn local_markers_match(
@@ -567,7 +597,7 @@ fn provider_status_matches(tenant: &Tenant) -> bool {
             .as_ref()
             .and_then(|status| status.provider.as_ref()),
     ) {
-        (TenantProviderSpec::Local { .. }, Some(TenantProviderStatus::Local(_))) => true,
+        (TenantProviderSpec::Local, Some(TenantProviderStatus::Local(_))) => true,
         (TenantProviderSpec::Azure, Some(TenantProviderStatus::Azure(_))) => {
             trusted_azure_status(tenant).is_some()
         }
@@ -577,16 +607,14 @@ fn provider_status_matches(tenant: &Tenant) -> bool {
 
 fn provider(specification: &TenantProviderSpec) -> TenantProvider {
     match specification {
-        TenantProviderSpec::Local { .. } => TenantProvider::Local,
+        TenantProviderSpec::Local => TenantProvider::Local,
         TenantProviderSpec::Azure => TenantProvider::Azure,
     }
 }
 
 fn specification(tenant: &Tenant) -> TenantSpecificationView {
     let provider = match &tenant.spec.provider {
-        TenantProviderSpec::Local { databases } => ProviderSpecificationView::Local {
-            databases: nonnegative(*databases),
-        },
+        TenantProviderSpec::Local => ProviderSpecificationView::Local,
         TenantProviderSpec::Azure => ProviderSpecificationView::Azure,
     };
     TenantSpecificationView {
@@ -607,7 +635,7 @@ fn provider_status(tenant: &Tenant) -> ProviderStatusView {
             .as_ref()
             .and_then(|status| status.provider.as_ref()),
     ) {
-        (TenantProviderSpec::Local { .. }, Some(TenantProviderStatus::Local(status))) => {
+        (TenantProviderSpec::Local, Some(TenantProviderStatus::Local(status))) => {
             ProviderStatusView::Local(LocalProviderView {
                 allocation: status.allocation.as_ref().and_then(|allocation| {
                     allocation
@@ -633,7 +661,7 @@ fn provider_status(tenant: &Tenant) -> ProviderStatusView {
         }
         (specification, observed) => ProviderStatusView::Unknown(UnknownProviderView {
             provider_type: match specification {
-                TenantProviderSpec::Local { .. } => "local",
+                TenantProviderSpec::Local => "local",
                 TenantProviderSpec::Azure => "azure",
             }
             .into(),
@@ -953,25 +981,13 @@ fn blockers(mode: ProviderMode, tenant: &Tenant) -> Vec<TenantBlocker> {
             );
         }
     }
-    if mode == ProviderMode::Local {
-        if let TenantProviderSpec::Local { databases } = tenant.spec.provider
-            && databases < 0
-        {
-            push_blocker(
-                &mut blockers,
-                "spec-invalid",
-                "requested database count is invalid",
-                None,
-            );
-        }
-        if tenant.spec.workers < 0 {
-            push_blocker(
-                &mut blockers,
-                "spec-invalid",
-                "requested worker count is invalid",
-                None,
-            );
-        }
+    if mode == ProviderMode::Local && tenant.spec.workers < 0 {
+        push_blocker(
+            &mut blockers,
+            "spec-invalid",
+            "requested worker count is invalid",
+            None,
+        );
     }
     blockers.truncate(MAX_BLOCKERS);
     blockers
@@ -1049,7 +1065,7 @@ fn topology(
         label: summary.name.clone(),
         health: classification_health(summary.classification),
         resource: Some(ResourceIdentityView {
-            api_version: "tenancy.cnpg-vcluster.io/v1alpha3".into(),
+            api_version: "tenancy.cnpg-vcluster.io/v1alpha4".into(),
             kind: "Tenant".into(),
             namespace: None,
             name: summary.name.clone(),
@@ -1122,7 +1138,7 @@ fn topology(
         });
     }
     match &tenant.spec.provider {
-        TenantProviderSpec::Local { databases } => {
+        TenantProviderSpec::Local => {
             add_summary_node(
                 &mut nodes,
                 &mut edges,
@@ -1135,13 +1151,7 @@ fn topology(
                     health: condition_health(tenant, "WorkersReady"),
                 },
             );
-            add_database_nodes(
-                &mut nodes,
-                &mut edges,
-                &tenant_id,
-                nonnegative(*databases),
-                database,
-            );
+            add_database_nodes(&mut nodes, &mut edges, &tenant_id, 0, database);
         }
         TenantProviderSpec::Azure => {
             if let Some(status) = trusted_azure_status(tenant) {
@@ -1850,12 +1860,14 @@ mod tests {
     }
 
     fn local_tenant(phase: TenantPhase, observed: i64, ready: bool) -> Tenant {
-        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 2, 1));
+        let mut tenant = Tenant::new("tenant-a", TenantSpec::local("1.36.4", 2));
         tenant.metadata.uid = Some("tenant-uid".into());
         tenant.metadata.generation = Some(2);
         tenant.status = Some(TenantStatus {
             observed_generation: Some(observed),
             phase: Some(phase),
+            database_capability: None,
+            catalog_create_intent: None,
             conditions: vec![
                 condition("Ready", if ready { "True" } else { "False" }, observed),
                 condition("WorkersReady", "True", observed),
@@ -2001,6 +2013,8 @@ mod tests {
         tenant.status = Some(TenantStatus {
             observed_generation: Some(1),
             phase: Some(TenantPhase::Ready),
+            database_capability: None,
+            catalog_create_intent: None,
             conditions: vec![
                 condition("Ready", "True", 1),
                 condition("AzureWorkersReady", "True", 1),

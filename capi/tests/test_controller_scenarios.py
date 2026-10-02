@@ -37,7 +37,7 @@ def tenant_document() -> dict[str, object]:
         "spec": {
             "kubernetesVersion": "1.36.4",
             "workers": 2,
-            "provider": {"type": "local", "databases": 3},
+            "provider": {"type": "local"},
         },
         "status": {
             "provider": {
@@ -123,7 +123,7 @@ class ControllerScenarioTests(unittest.TestCase):
     def test_spec_hash_matches_rust_canonical_contract(self) -> None:
         document = tenant_document()
         expected = hashlib.sha256(
-            b'{"kubernetesVersion":"1.36.4","workers":2,"provider":{"type":"local","databases":3}}'
+            b'{"kubernetesVersion":"1.36.4","workers":2,"provider":{"type":"local"}}'
         ).hexdigest()
         self.assertEqual(expected, tenant_spec_hash(document))
         document["spec"]["kubernetesVersion"] = "v1.36.4"
@@ -134,7 +134,7 @@ class ControllerScenarioTests(unittest.TestCase):
     def test_spec_networks_are_never_allocation_fallbacks(self) -> None:
         document = tenant_document()
         document["spec"].update(podCIDR="10.1.0.0/16", serviceCIDR="10.2.0.0/16")
-        with self.assertRaisesRegex(RuntimeError, "v1alpha2"):
+        with self.assertRaisesRegex(RuntimeError, "v1alpha4"):
             tenant_spec_hash(document)
         del document["status"]["provider"]["allocation"]
         with self.assertRaisesRegex(RuntimeError, "allocation"):
@@ -348,7 +348,7 @@ class ControllerScenarioTests(unittest.TestCase):
         self.assertEqual("172.18.255.10", tenant.vip)
         self.assertEqual("10.143.0.10", tenant.dns_ip)
         self.assertEqual(2, tenant.workers)
-        self.assertEqual(3, tenant.database_count)
+        self.assertEqual(0, tenant.database_count)
 
     def test_snapshot_uses_live_management_and_host_identities(self) -> None:
         class Client:

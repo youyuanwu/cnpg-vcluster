@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import copy
+import base64
+import hashlib
 import io
 import json
 import os
@@ -35,19 +37,26 @@ from scripts.lib.azure.foundation import (
     _verify_azure_controller_allocation_readiness,
     _verify_azure_cutover_probe,
     _foundation_identity,
+    _database_identity_blockers,
     _inspect_admin,
     _install_capi_capz,
     _install_admin,
+    _install_tenant_controller,
     _inspect_foundation,
+    install_tenant_database_runtime,
     _push_admin_image,
     _push_controller_image,
+    _push_database_controller_image,
     create_management,
     create_foundation,
+    destroy,
     load_inventory,
     preflight,
 )
 from scripts.lib.config import ConfigError
 from scripts.lib.controller import tenant_cutover_lock_cleanup_refs
+from scripts.lib.database_controller import LEGACY_CRD, require_absent_legacy_database_crd
+from scripts.azure_database_runtime import reconcile_once
 from scripts.lib.files import write_private_file
 from scripts.lib.locking import azure_lock
 from scripts.lib.tenant_spec import TenantSpecError
@@ -62,6 +71,353 @@ def completed(stdout: str = "", returncode: int = 0):
 
 
 class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
+    def setUp(self):
+        super().setUp()
+        legacy = patch("scripts.lib.azure.foundation.require_absent_legacy_database_crd")
+        legacy.start()
+        self.addCleanup(legacy.stop)
+
+    def test_reinstall_of_activated_azure_controller_keeps_live_tenants_unlocked(self):
+        root = self.make_root()
+        crd = {
+            "spec": {"versions": [{"name": "v1alpha4", "served": True, "storage": True}]},
+            "status": {"storedVersions": ["v1alpha4"]},
+        }
+        with (
+            patch("scripts.lib.azure.foundation._get_management_resource",
+                  return_value=crd),
+            patch("scripts.lib.azure.foundation._azure_cutover_lock_present",
+                  return_value=False),
+            patch("scripts.lib.azure.foundation._catalog_lock_present",
+                  return_value=False),
+            patch("scripts.lib.azure.foundation._catalog_activation_complete",
+                  return_value=True),
+            patch("scripts.lib.azure.foundation._kubectl") as kubectl,
+        ):
+            self.assertFalse(_prepare_azure_tenant_api_cutover(root, {}))
+        kubectl.assert_not_called()
+
+    def test_database_installer_is_independent_of_tenant_ready_and_retries(self):
+        root = self.make_root()
+        config = {"DOWNLOAD_TIMEOUT": "1s"}
+        tenant_name = "tenant-c"
+        content = b"tenant kubeconfig"
+        tenant = {
+            "metadata": {"name": tenant_name, "uid": "tenant-uid"},
+            "status": {
+                "phase": "Ready",
+                "provider": {
+                    "type": "azure",
+                    "binding": {"tenantUID": "tenant-uid"},
+                    "management": {"namespaceUID": "ns-uid", "clusterUID": "cluster-uid"},
+                    "kubeconfig": {
+                        "secretUID": "secret-uid",
+                        "contentSha256": hashlib.sha256(content).hexdigest(),
+                    },
+                },
+            },
+        }
+        secret = {
+            "metadata": {
+                "namespace": tenant_name,
+                "uid": "secret-uid",
+                "ownerReferences": [{
+                    "apiVersion": "cluster.x-k8s.io/v1beta1", "kind": "Cluster",
+                    "name": tenant_name, "uid": "cluster-uid", "controller": True,
+                }],
+            },
+            "type": "cluster.x-k8s.io/secret",
+            "data": {"value": base64.b64encode(content).decode()},
+        }
+
+        def kubectl(_root, *args, **_kwargs):
+            if args[:2] == ("get", f"tenant/{tenant_name}"):
+                return completed(json.dumps(tenant))
+            if args[:2] == ("get", f"namespace/{tenant_name}"):
+                return completed(json.dumps({"metadata": {"uid": "ns-uid"}}))
+            if f"secret/{tenant_name}-kubeconfig" in args:
+                return completed(json.dumps(secret))
+            raise AssertionError(args)
+
+        failures = [RuntimeError("cnpg unavailable"), None]
+
+        def install(_root, _config, kubeconfig, *, require_current):
+            self.assertEqual(kubeconfig.read_bytes(), content)
+            require_current()
+            failure = failures.pop(0)
+            if failure:
+                raise failure
+
+        with (
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            patch("scripts.lib.azure.foundation.install_azure_database_runtime",
+                  side_effect=install) as installer,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "cnpg unavailable"):
+                install_tenant_database_runtime(root, config, tenant_name)
+            self.assertEqual(tenant["status"]["phase"], "Ready")
+            self.assertTrue(install_tenant_database_runtime(root, config, tenant_name))
+            secret["metadata"]["uid"] = "replacement"
+            with self.assertRaisesRegex(RuntimeError, "ownership changed"):
+                install_tenant_database_runtime(root, config, tenant_name)
+            tenant["status"]["phase"] = "Progressing"
+            self.assertFalse(install_tenant_database_runtime(root, config, tenant_name))
+        self.assertEqual(installer.call_count, 2)
+        self.assertFalse(any((root / ".runtime" / "azure-database-installer").iterdir()))
+
+    def test_database_install_worker_keeps_other_tenants_and_retries(self):
+        root = self.make_root()
+        listing = {"kind": "TenantList", "metadata": {}, "items": [
+            {"metadata": {"name": "tenant-a"}, "status": {
+                "phase": "Ready", "provider": {"type": "azure"}}},
+            {"metadata": {"name": "tenant-b"}, "status": {
+                "phase": "Ready", "provider": {"type": "azure"}}},
+            {"metadata": {"name": "tenant-c"}, "status": {
+                "phase": "Progressing", "provider": {"type": "azure"}}},
+        ]}
+        with (
+            patch("scripts.azure_database_runtime._kubectl",
+                  return_value=completed(json.dumps(listing))),
+            patch("scripts.azure_database_runtime.install_tenant_database_runtime",
+                  side_effect=[RuntimeError("CNPG unavailable"), True, True, True]) as install,
+            redirect_stdout(io.StringIO()),
+        ):
+            self.assertFalse(reconcile_once(root, {}))
+            self.assertTrue(reconcile_once(root, {}))
+        self.assertEqual(
+            [call.args[2] for call in install.call_args_list],
+            ["tenant-a", "tenant-b", "tenant-a", "tenant-b"],
+        )
+
+    def test_database_image_publish_uses_pinned_registry_digest(self):
+        root = ROOT
+        config = {
+            "AZURE_CONTROLLER_REPOSITORY": "tenant-controller",
+            "AZURE_CONTROLLER_TAG": "test",
+        }
+        inventory = {}
+        selected = "registry.example/database@sha256:" + "a" * 64
+        def publish(_root, _config, _inventory, **kwargs):
+            kwargs["build"]("registry.example/database:tag")
+            return selected
+
+        with (
+            patch("scripts.lib.azure.foundation.load_configuration",
+                  return_value={"COMMAND_TIMEOUT": "1s"}),
+            patch("scripts.lib.azure.foundation._push_acr_image",
+                  side_effect=publish) as published,
+            patch("scripts.lib.azure.foundation.build_database_controller_image",
+                  return_value="registry.example/database:tag") as build,
+        ):
+            self.assertEqual(
+                _push_database_controller_image(root, config, inventory), selected,
+            )
+        self.assertEqual(
+            published.call_args.kwargs["repository"],
+            config["AZURE_CONTROLLER_REPOSITORY"] + "-database",
+        )
+        self.assertEqual(
+            published.call_args.kwargs["tag"], config["AZURE_CONTROLLER_TAG"],
+        )
+        build.assert_called_once_with(
+            root, {"COMMAND_TIMEOUT": "1s"}, image="registry.example/database:tag",
+        )
+
+    def test_azure_catalog_release_failure_preserves_both_fences_without_probe_cleanup(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        image = "registry.example/tenant@sha256:" + "1" * 64
+
+        def kubectl(*args, **kwargs):
+            if "configmap/tenant-azure-provider" in args:
+                return completed(json.dumps({"metadata": {"uid": "provider-uid"}}))
+            if "configmap/tenant-azure-allocation" in args:
+                return completed(json.dumps({"metadata": {"uid": "allocation-uid"}}))
+            return completed()
+
+        with (
+            patch("scripts.lib.azure.foundation.CATALOG_LIFECYCLE_READY", True),
+            patch("scripts.lib.azure.foundation._push_controller_image", return_value=image),
+            patch("scripts.lib.azure.foundation._push_database_controller_image",
+                  return_value="registry.example/database@sha256:" + "2" * 64),
+            patch("scripts.lib.azure.foundation._azure_provider_configuration",
+                  return_value={}),
+            patch("scripts.lib.azure.foundation._azure_allocation_configuration",
+                  return_value=({}, "{}", "allocation-sha")),
+            patch("scripts.lib.azure.foundation._prepare_azure_tenant_api_cutover",
+                  return_value=True),
+            patch("scripts.lib.azure.foundation.render_azure_controller_manager",
+                  return_value=root / "manager.yaml"),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl) as command,
+            patch("scripts.lib.azure.foundation.load_configuration",
+                  return_value={"DELETE_TIMEOUT": "1s", "CONDITION_TIMEOUT": "1s"}),
+            patch("scripts.lib.azure.foundation.install_database_catalog"),
+            patch("scripts.lib.azure.foundation.install_database_controller"),
+            patch("scripts.lib.azure.foundation.verify_catalog_cutover_lock"),
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_lock"),
+            patch("scripts.lib.azure.foundation._verify_azure_controller_allocation_readiness"),
+            patch("scripts.lib.azure.foundation.release_catalog_and_tenant_cutover_locks",
+                  side_effect=RuntimeError("release gates blocked")) as release,
+            patch("scripts.lib.azure.foundation._azure_cutover_lock") as tenant_unlock,
+            patch("scripts.lib.azure.foundation._verify_azure_cutover_probe") as tenant_probe,
+            self.assertRaisesRegex(RuntimeError, "release gates blocked"),
+        ):
+            _install_tenant_controller(root, config, inventory)
+        release.assert_called_once()
+        self.assertEqual(release.call_args.kwargs["provider"], "azure")
+        self.assertEqual(release.call_args.kwargs["tenant_image"], image)
+        self.assertEqual(
+            release.call_args.kwargs["database_image"],
+            "registry.example/database@sha256:" + "2" * 64,
+        )
+        tenant_unlock.assert_not_called()
+        tenant_probe.assert_not_called()
+        self.assertFalse(any("delete" in call.args for call in command.call_args_list))
+
+    def test_legacy_crd_blocks_azure_cutover_before_policy_mutation(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        calls = []
+
+        def kubectl(_root, *args, **_kwargs):
+            calls.append(args)
+            if args[:2] == ("get", f"crd/{LEGACY_CRD}"):
+                return completed(f"crd/{LEGACY_CRD}")
+            raise AssertionError(f"unexpected cutover mutation: {args}")
+
+        with (
+            patch("scripts.lib.azure.foundation.require_absent_legacy_database_crd",
+                  require_absent_legacy_database_crd),
+            patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            self.assertRaisesRegex(RuntimeError, "Separately prove"),
+        ):
+            _prepare_azure_tenant_api_cutover(root, config)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0][:2], ("get", f"crd/{LEGACY_CRD}"))
+
+    def database_azure(self, outputs, *, change=None):
+        resources = {
+            "identity": {
+                "id": outputs["databaseIdentityId"],
+                "clientId": outputs["databaseIdentityClientId"],
+                "principalId": outputs["databaseIdentityPrincipalId"],
+            },
+            "disk role": {
+                "id": outputs["databaseDiskRoleId"],
+                "properties": {
+                    "type": "CustomRole",
+                    "assignableScopes": [outputs["resourceGroupId"]],
+                    "permissions": [{
+                        "actions": [
+                            "Microsoft.Compute/disks/read",
+                            "Microsoft.Compute/disks/delete",
+                        ],
+                        "notActions": [], "dataActions": [], "notDataActions": [],
+                    }],
+                },
+            },
+            "disk assignment": {
+                "id": outputs["databaseDiskAssignmentId"],
+                "properties": {
+                    "principalId": outputs["databaseIdentityPrincipalId"],
+                    "roleDefinitionId": outputs["databaseDiskRoleId"],
+                    "principalType": "ServicePrincipal",
+                },
+            },
+            "federated credential": {
+                "id": outputs["databaseFederationId"],
+                "properties": {
+                    "issuer": outputs["aksOidcIssuer"],
+                    "subject": "system:serviceaccount:tenant-system:database-controller",
+                    "audiences": ["api://AzureADTokenExchange"],
+                },
+            },
+        }
+        assignments = [{
+            "id": outputs["databaseDiskAssignmentId"],
+            "scope": outputs["resourceGroupId"],
+            "principalId": outputs["databaseIdentityPrincipalId"],
+            "roleDefinitionId": outputs["databaseDiskRoleId"],
+        }]
+        if change is not None:
+            change(resources, assignments)
+
+        def invoke(*arguments, **_kwargs):
+            if arguments[:2] == ("identity", "show"):
+                return completed(json.dumps(resources["identity"]))
+            if arguments[:2] == ("resource", "show"):
+                selected = arguments[arguments.index("--ids") + 1]
+                for key in ("disk role", "disk assignment", "federated credential"):
+                    if selected == outputs[{
+                        "disk role": "databaseDiskRoleId",
+                        "disk assignment": "databaseDiskAssignmentId",
+                        "federated credential": "databaseFederationId",
+                    }[key]]:
+                        return completed(json.dumps(resources[key]))
+            if arguments[:3] == ("role", "assignment", "list"):
+                return completed(json.dumps(assignments))
+            raise AssertionError(arguments)
+
+        return invoke
+
+    def test_database_addon_pins_and_foundation_version_drift(self):
+        root = self.make_root()
+        defaults = root / "config" / "azure" / "defaults.env"
+        original = defaults.read_text(encoding="utf-8")
+        original_hash = _foundation_defaults_checksum(root)
+        defaults.write_text(
+            original + "AZURE_CNPG_VERSION=1.30.0\n"
+            "AZURE_DISK_CSI_VERSION=v1.32.12\n", encoding="utf-8",
+        )
+        self.assertNotEqual(original_hash, _foundation_defaults_checksum(root))
+        self.assertEqual("1.30.0", load_azure_configuration(root)["AZURE_CNPG_VERSION"])
+        defaults.write_text(
+            defaults.read_text(encoding="utf-8").replace(
+                "AZURE_DISK_CSI_VERSION=v1.32.12",
+                "AZURE_DISK_CSI_VERSION=v1.32.11",
+            ), encoding="utf-8",
+        )
+        with self.assertRaisesRegex(ConfigError, "AZURE_DISK_CSI_VERSION"):
+            load_azure_configuration(root)
+        defaults.write_text(
+            original + "AZURE_CNPG_VERSION=1.30.0\n"
+            "AZURE_DISK_CSI_VERSION=v1.32.12\n", encoding="utf-8",
+        )
+        self.assertEqual("v1.32.12", load_azure_configuration(root)["AZURE_DISK_CSI_VERSION"])
+
+        versions = (ROOT / "config" / "versions.env").read_text(encoding="utf-8")
+        installer = (ROOT / "controller" / "src" / "azure.rs").read_text(encoding="utf-8")
+        runtime = (ROOT / "database-runtime" / "src" / "azure_runtime.rs").read_text(encoding="utf-8")
+        from scripts.tools import AZURE_CHART_INPUTS
+
+        for digest in (
+            "668e065ff53508d58238788fd35b355a925060843629a951df0e6a9362e6d32f",
+            "07b10ce708dc988d8315df1794f3fb913f8a1dd85b3fb93c64ca7de491eb095a",
+        ):
+            self.assertIn(digest, versions)
+            self.assertNotIn(digest, installer)
+        self.assertNotIn("if wget -q", installer)
+        self.assertNotIn("helm upgrade --install cnpg", installer)
+        self.assertNotIn("helm upgrade --install azuredisk", installer)
+        self.assertEqual(len(AZURE_CHART_INPUTS), 2)
+        for _, url_key, checksum_key in AZURE_CHART_INPUTS:
+            self.assertIn(url_key + "=", versions)
+            self.assertIn(checksum_key + "=", versions)
+        cnpg_image = next(
+            line.split("=", 1)[1] for line in versions.splitlines()
+            if line.startswith("CNPG_CONTROLLER_IMAGE=")
+        )
+        disk_image = next(
+            line.split("=", 1)[1] for line in versions.splitlines()
+            if line.startswith("AZURE_DISK_CSI_IMAGE=")
+        )
+        for image in (cnpg_image, disk_image):
+            self.assertIn(image, runtime)
+        self.assertIn("disk.csi.azure.com", runtime)
+        self.assertIn("WaitForFirstConsumer", runtime)
+        self.assertIn("Retain", runtime)
+
     def test_azure_cutover_probe_requires_allocation_and_always_deletes(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -143,10 +499,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         old = {
             "spec": {
                 "versions": [
-                    {"name": "v1alpha2", "served": True, "storage": True}
+                    {"name": "v1alpha3", "served": True, "storage": True}
                 ]
             },
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         calls = []
         entries = json.loads(
@@ -169,7 +525,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             "metadata": {"name": "tenants.tenancy.cnpg-vcluster.io"},
             "spec": {
                 "versions": [{
-                    "name": "v1alpha3",
+                    "name": "v1alpha4",
                     "served": True,
                     "storage": True,
                     "schema": {"openAPIV3Schema": {"type": "object"}},
@@ -183,7 +539,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return completed(json.dumps(desired))
             if arguments[:2] == ("get", "tenants"):
                 return completed(json.dumps({
-                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
                     "kind": "TenantList",
                     "metadata": {"continue": ""},
                     "items": [],
@@ -237,7 +593,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             calls,
         )
 
-    def test_partial_azure_cutover_lock_application_is_cleaned_up(self):
+    def test_partial_azure_cutover_lock_application_retains_policy_for_retry(self):
         root = self.make_root()
         calls = []
         apply_count = 0
@@ -256,29 +612,20 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             self.assertRaisesRegex(RuntimeError, "binding rejected"),
         ):
             _azure_cutover_lock(root, present=True)
-        self.assertTrue(
-            any(
-                arguments[:2]
-                == (
-                    "delete",
-                    "validatingadmissionpolicybinding/tenant-api-cutover-create-lock",
-                )
-                for arguments in calls
-            )
-        )
+        self.assertFalse(any(arguments[0] == "delete" for arguments in calls))
 
     def test_azure_cutover_second_inventory_failure_restores_controller(self):
         root = self.make_root()
         config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         desired = {
             "spec": {"versions": [{
-                "name": "v1alpha3", "served": True, "storage": True,
+                "name": "v1alpha4", "served": True, "storage": True,
             }]}
         }
         with (
@@ -312,7 +659,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             [call.args for call in scale.call_args_list],
         )
         self.assertEqual(
-            [((root,), {"present": True}), ((root,), {"present": False})],
+            [((root,), {"present": True})],
             [(call.args, call.kwargs) for call in lock.call_args_list],
         )
 
@@ -320,9 +667,9 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         root = self.make_root()
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         with (
             patch(
@@ -347,13 +694,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         desired = {
             "spec": {"versions": [{
-                "name": "v1alpha3", "served": True, "storage": True,
+                "name": "v1alpha4", "served": True, "storage": True,
             }]}
         }
         with (
@@ -397,13 +744,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         config = {"AZURE_CONTROLLER_TIMEOUT": "1s"}
         old = {
             "spec": {"versions": [{
-                "name": "v1alpha2", "served": True, "storage": True,
+                "name": "v1alpha3", "served": True, "storage": True,
             }]},
-            "status": {"storedVersions": ["v1alpha2"]},
+            "status": {"storedVersions": ["v1alpha3"]},
         }
         desired = {
             "spec": {"versions": [{
-                "name": "v1alpha3", "served": True, "storage": True,
+                "name": "v1alpha4", "served": True, "storage": True,
             }]}
         }
         with (
@@ -469,11 +816,13 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         def kubectl(_root, *arguments, **_kwargs):
             if arguments[:2] == ("get", "tenants"):
                 return completed(json.dumps({
-                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha2",
+                    "apiVersion": "tenancy.cnpg-vcluster.io/v1alpha3",
                     "kind": "TenantList",
                     "metadata": {"continue": ""},
                     "items": [],
                 }))
+            if arguments[:2] == ("get", "crd/tenantdatabasecatalogs.tenancy.cnpg-vcluster.io"):
+                return completed()
             items = []
             resource = arguments[1]
             entries = json.loads(
@@ -647,6 +996,23 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             "acrPullRoleAssignmentId",
         ):
             self.assertIn(f"output {output} string", main)
+
+    def test_database_bicep_outputs_bind_dedicated_disk_only_identity(self):
+        foundation = (ROOT / "infra" / "azure" / "foundation.bicep").read_text()
+        main = (ROOT / "infra" / "azure" / "main.bicep").read_text()
+        for output in (
+            "databaseIdentityId", "databaseIdentityClientId",
+            "databaseIdentityPrincipalId", "databaseDiskRoleId",
+            "databaseDiskAssignmentId", "databaseFederationId",
+        ):
+            self.assertIn(f"output {output} string", foundation)
+            self.assertIn(f"output {output} string = foundation.outputs.{output}", main)
+        self.assertIn("subject: 'system:serviceaccount:tenant-system:database-controller'", foundation)
+        self.assertIn("'Microsoft.Compute/disks/read'", foundation)
+        self.assertIn("'Microsoft.Compute/disks/delete'", foundation)
+        self.assertIn("roleDefinitionId: databaseDiskRole.id", foundation)
+        self.assertIn("principalId: databaseIdentity.properties.principalId", foundation)
+
     def test_foundation_identity_requires_acr_role_and_controller_digest(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -735,7 +1101,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 }
             raise AssertionError(selected)
 
-        def azure(role_present=True, acr_present=True):
+        def azure(role_present=True, acr_present=True, database_change=None):
+            database = self.database_azure(outputs, change=database_change)
             def invoke(*arguments, **_kwargs):
                 if arguments[:2] == ("aks", "show"):
                     return completed(json.dumps({
@@ -762,6 +1129,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                         "provisioningState": "Succeeded",
                     }))
                 if arguments[:3] == ("role", "assignment", "list"):
+                    if "--assignee-object-id" in arguments and (
+                        arguments[arguments.index("--assignee-object-id") + 1]
+                        == outputs["databaseIdentityPrincipalId"]
+                    ):
+                        return database(*arguments)
                     assignments = [] if not role_present else [{
                         "id": outputs["acrPullRoleAssignmentId"],
                         "principalId": outputs["aksKubeletPrincipalId"],
@@ -773,6 +1145,12 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     }]
                     return completed(json.dumps(assignments))
                 if "--ids" in arguments:
+                    if arguments[arguments.index("--ids") + 1] in (
+                        outputs["databaseDiskRoleId"],
+                        outputs["databaseDiskAssignmentId"],
+                        outputs["databaseFederationId"],
+                    ):
+                        return database(*arguments)
                     return completed(arguments[arguments.index("--ids") + 1] + "\n")
                 if arguments[:2] == ("group", "show"):
                     return completed(outputs["resourceGroupId"] + "\n")
@@ -786,6 +1164,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     )
                     return completed(selected + "\n")
                 if arguments[:2] == ("identity", "show"):
+                    if arguments[arguments.index("--name") + 1] == "yy-cv-database-controller":
+                        return database(*arguments)
                     return completed(outputs["identityId"] + "\n")
                 raise AssertionError(arguments)
             return invoke
@@ -816,6 +1196,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         for missing, expected in (
             ({"acr_present": False}, "container registry is absent"),
             ({"role_present": False}, "AcrPull role assignment is absent"),
+            ({
+                "database_change": lambda resources, _: resources[
+                    "federated credential"
+                ]["properties"].update(subject="wrong-service-account")
+            }, "ServiceAccount federation changed"),
         ):
             with (
                 patch("scripts.lib.azure.foundation._validate_foundation_networks"),
@@ -1652,6 +2037,24 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     "verbs": ["get"],
                 }),
             ),
+            (
+                "catalog-status-write",
+                "tenant-a",
+                add_effective_rule({
+                    "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                    "resources": ["tenantdatabasecatalogs/status"],
+                    "verbs": ["update"],
+                }),
+            ),
+            (
+                "direct-disk-authority",
+                "tenant-a",
+                add_effective_rule({
+                    "apiGroups": ["resources.azure.com"],
+                    "resources": ["disks"],
+                    "verbs": ["delete"],
+                }),
+            ),
         ):
             with self.subTest(name=name):
                 (_, blockers), _ = inspect(
@@ -1932,6 +2335,117 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         self.write_inventory(root, old)
         with self.assertRaisesRegex(RuntimeError, "pre-cutover.*clean foundation redeploy"):
             load_inventory(root, config)
+
+    def test_database_outputs_are_required_and_dedicated_before_use(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        outputs = inventory["outputs"]
+        for key in (
+            "databaseIdentityId", "databaseIdentityClientId",
+            "databaseIdentityPrincipalId", "databaseDiskRoleId",
+            "databaseDiskAssignmentId", "databaseFederationId",
+        ):
+            broken = copy.deepcopy(inventory)
+            broken["outputs"].pop(key)
+            self.write_inventory(root, broken)
+            with self.subTest(key=key), self.assertRaisesRegex(
+                RuntimeError, key + ".*clean foundation redeploy|clean foundation redeploy.*" + key
+            ):
+                load_inventory(root, config)
+        for key, value in (
+            ("databaseIdentityId", outputs["identityId"]),
+            ("databaseIdentityClientId", outputs["identityClientId"]),
+            ("databaseIdentityPrincipalId", outputs["identityPrincipalId"]),
+            ("databaseDiskRoleId", outputs["databaseDiskRoleId"].replace("yy-cv-rg", "other-rg")),
+            ("databaseDiskAssignmentId", outputs["roleAssignmentId"]),
+            ("databaseFederationId", outputs["capzFederationId"]),
+        ):
+            broken = copy.deepcopy(inventory)
+            broken["outputs"][key] = value
+            self.write_inventory(root, broken)
+            with self.subTest(key=key), self.assertRaisesRegex(RuntimeError, "mismatch"):
+                load_inventory(root, config)
+            with self.assertRaisesRegex(RuntimeError, "mismatch"):
+                _foundation_identity(broken)
+
+    def test_database_outputs_rejected_before_creating_inventory(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        outputs = self.inventory(root, config)["outputs"]
+        for key in ("databaseIdentityId", "databaseFederationId"):
+            deployment = {
+                "id": "deployment-id",
+                "properties": {
+                    "outputs": {
+                        name: {"value": value}
+                        for name, value in outputs.items() if name != key
+                    }
+                },
+            }
+            with (
+                self.subTest(key=key),
+                patch("scripts.lib.azure.foundation.preflight", return_value={}),
+                patch("scripts.lib.azure.foundation._json", return_value=deployment),
+                self.assertRaisesRegex(RuntimeError, "clean foundation redeploy"),
+            ):
+                create_foundation(root, config)
+            self.assertFalse((root / ".runtime" / "azure" / "resources.json").exists())
+
+    def test_database_federation_and_disk_authority_are_verified(self):
+        root = self.make_root()
+        outputs = self.inventory(root, load_azure_configuration(root))["outputs"]
+        with patch(
+            "scripts.lib.azure.foundation._az",
+            side_effect=self.database_azure(outputs),
+        ):
+            self.assertEqual([], _database_identity_blockers(outputs))
+
+        changes = (
+            (lambda resources, _: resources["identity"].update(
+                clientId="wrong-client"), "identity binding changed"),
+            (lambda resources, _: resources["disk role"]["properties"]["permissions"][0]["actions"].append(
+                "*"), "disk role permissions changed"),
+            (lambda resources, _: resources["disk role"]["properties"].update(
+                assignableScopes=["/subscriptions/redacted"]), "disk role permissions changed"),
+            (lambda resources, _: resources["disk assignment"]["properties"].update(
+                principalId="other"), "disk assignment changed"),
+            (lambda resources, _: resources["federated credential"]["properties"].update(
+                subject="system:serviceaccount:capz-system:capz-manager"),
+             "ServiceAccount federation changed"),
+            (lambda _, assignments: assignments.append({
+                "id": outputs["roleAssignmentId"],
+                "scope": outputs["resourceGroupId"],
+                "principalId": outputs["databaseIdentityPrincipalId"],
+                "roleDefinitionId": outputs["databaseDiskRoleId"],
+            }), "excess role authority"),
+        )
+        for change, expected in changes:
+            with (
+                self.subTest(expected=expected),
+                patch("scripts.lib.azure.foundation._az",
+                      side_effect=self.database_azure(outputs, change=change)),
+            ):
+                self.assertTrue(any(
+                    expected in blocker for blocker in _database_identity_blockers(outputs)
+                ))
+
+    def test_destroy_refuses_database_identity_drift(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        self.write_inventory(root, inventory)
+        outputs = inventory["outputs"]
+        def drift(resources, _):
+            resources["federated credential"]["properties"]["subject"] = "other"
+        with (
+            patch("scripts.lib.azure.foundation._active_subscription"),
+            patch("scripts.lib.azure.foundation._az",
+                  side_effect=self.database_azure(outputs, change=drift)) as azure,
+            self.assertRaisesRegex(RuntimeError, "ServiceAccount federation changed"),
+        ):
+            destroy(root, config)
+        self.assertFalse(any(call.args[:2] == ("group", "delete") for call in azure.call_args_list))
     def test_foundation_checksum_mismatch_requires_clean_redeploy(self):
         root = self.make_root()
         config = load_azure_configuration(root)

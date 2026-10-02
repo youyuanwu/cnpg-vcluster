@@ -34,11 +34,11 @@ class LiveAPIContractsTests(unittest.TestCase):
             {
                 "kubernetesVersion": "1.36.4",
                 "workers": 1,
-                "provider": {"type": "local", "databases": 1},
+                "provider": {"type": "local"},
             },
             document["spec"],
         )
-        self.assertEqual("tenancy.cnpg-vcluster.io/v1alpha3", document["apiVersion"])
+        self.assertEqual("tenancy.cnpg-vcluster.io/v1alpha4", document["apiVersion"])
         apply_tenant_document(client, document)
         self.assertIn("--validate=strict", client.kubectl.call_args.args)
         self.assertIn("--server-side", client.kubectl.call_args.args)
@@ -54,8 +54,7 @@ class LiveAPIContractsTests(unittest.TestCase):
             observed.append(spec)
             if type(spec["workers"]) is not int or not 1 <= spec["workers"] <= 3:
                 return response(error="invalid workers")
-            databases = spec["provider"]["databases"]
-            if type(databases) is not int or not 1 <= databases <= 3:
+            if "databases" in spec["provider"]:
                 return response(error="invalid databases")
             if spec["kubernetesVersion"] in ("1.36", "1.36.4-extra", "", "vv1.36.4"):
                 return response(error="invalid kubernetesVersion")
@@ -65,7 +64,7 @@ class LiveAPIContractsTests(unittest.TestCase):
         with patch("scripts.test_controller_allocation.verify_controller_api") as existing:
             verify_api_boundaries(client, CONFIG)
         existing.assert_called_once_with(CONFIG, client)
-        self.assertEqual(21, len(observed))
+        self.assertEqual(15, len(observed))
         self.assertEqual(["1.36.4", "v1.36.4", "0.0.0"], [spec["kubernetesVersion"] for spec in observed[-3:]])
 
     def test_api_acceptance_of_bad_count_or_syntax_fails_gate(self):
@@ -105,25 +104,35 @@ class LiveAPIContractsTests(unittest.TestCase):
             controller_replicas(client, CONFIG, 0)
         self.assertIn("--replicas=0", client.kubectl.call_args.args)
 
-    def test_three_tenant_gate_uses_one_worker_and_database_each(self):
+    def test_three_tenant_gate_uses_one_worker_and_explicit_database_each(self):
         client = Mock()
+        catalog = Mock()
+        catalog.read.return_value = {"catalogUid": "catalog-uid", "databases": []}
+        catalog.wait.return_value = {"databases": [{
+            "name": "isolation", "readyInstances": 3, "storageHealthy": 3,
+        }]}
         with (
             patch("scripts.test_tenant_lifecycle.ManagementClient", return_value=client),
-            patch("scripts.test_tenant_lifecycle.wait_tenant_ready", return_value={}),
+            patch("scripts.test_tenant_lifecycle.wait_tenant_ready",
+                  side_effect=lambda _root, _config, name:
+                  {"metadata": {"name": name, "uid": name + "-uid"}}),
             patch("scripts.test_tenant_lifecycle.tenant_from_document"),
             patch("scripts.test_tenant_lifecycle.export_tenant_kubeconfig"),
+            patch("scripts.test_tenant_lifecycle.wait_for"),
+            patch("scripts.test_tenant_lifecycle.catalog_client", return_value=catalog),
         ):
             for name in ("tenant-a", "tenant-b", "tenant-c"):
-                _apply(Path("."), CONFIG, name)
+                _apply(Path("."), {**CONFIG, "CNPG_TIMEOUT": "60s"}, name)
         specs = [json.loads(call.kwargs["input_text"])["spec"] for call in client.kubectl.call_args_list]
         self.assertEqual(
             [{
                 "kubernetesVersion": "1.36.4",
                 "workers": 1,
-                "provider": {"type": "local", "databases": 1},
+                "provider": {"type": "local"},
             }] * 3,
             specs,
         )
+        self.assertEqual(3, catalog.add.call_count)
 
 
 class StaticNetworkTests(unittest.TestCase):

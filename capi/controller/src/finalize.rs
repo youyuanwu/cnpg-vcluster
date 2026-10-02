@@ -146,7 +146,7 @@ impl<D: DockerClient> Finalizer<D> {
         let spec = canonical_spec(name, &tenant.spec, &self.supported_version)
             .map_err(|error| ReconcileError::InvalidInput(error.to_string()))?;
         crate::api::validate_provider_status(&spec, tenant.status.as_ref()).map_err(|error| invalid(error.to_string()))?;
-        if spec.local_databases().is_none() { return Err(invalid("controller finalizer cannot run for an unsupported Azure provider")); }
+        if !matches!(spec.provider, crate::api::TenantProviderSpec::Local) { return Err(invalid("controller finalizer cannot run for an unsupported Azure provider")); }
         let spec_hash = spec_hash(&spec);
         let recorded_hash = tenant
             .status

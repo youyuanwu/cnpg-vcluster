@@ -53,6 +53,8 @@ FOUNDATION_DEFAULT_KEYS = (
     "AZURE_CAPZ_VERSION",
     "AZURE_KAMAJI_CAPI_VERSION",
     "AZURE_KAMAJI_CHART_VERSION",
+    "AZURE_CNPG_VERSION",
+    "AZURE_DISK_CSI_VERSION",
     "AZURE_CONTROLLER_REPOSITORY",
     "AZURE_CONTROLLER_TAG",
 )
@@ -163,6 +165,12 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
         raise ConfigError(
             "AZURE_TENANT_ALLOCATION_APPROVED_SHA256 must be a lowercase SHA-256"
         )
+    for key, expected in (
+        ("AZURE_CNPG_VERSION", "1.30.0"),
+        ("AZURE_DISK_CSI_VERSION", "v1.32.12"),
+    ):
+        if key in config and config[key] != expected:
+            raise ConfigError(f"{key} must be {expected}")
     return config
 
 
@@ -320,7 +328,7 @@ def _foundation_defaults_checksum(
         if config is None
         else config
     )
-    payload = {key: selected[key] for key in FOUNDATION_DEFAULT_KEYS}
+    payload = {key: selected[key] for key in FOUNDATION_DEFAULT_KEYS if key in selected}
     return hashlib.sha256(
         json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
     ).hexdigest()

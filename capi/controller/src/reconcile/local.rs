@@ -4,7 +4,7 @@ use kube::{Client, ResourceExt, core::DynamicObject, runtime::controller::Action
 
 use crate::{
     allocation::{self, ClaimContext},
-    api::{CanonicalSpec, Tenant, TenantProviderSpec, spec_hash},
+    api::{CanonicalSpec, Tenant, TenantPhase, TenantProviderSpec, spec_hash},
     docker::{BollardDockerClient, DockerClient, validate_volume},
     error::ControllerError,
     foundation::{Foundation, ImageArchive, RuntimeFoundation},
@@ -79,11 +79,11 @@ impl LocalProvider {
 }
 impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvider<D, A> {
     fn supports(&self, provider: &TenantProviderSpec) -> bool {
-        matches!(provider, TenantProviderSpec::Local { .. })
+        matches!(provider, TenantProviderSpec::Local)
     }
     #[rustfmt::skip]
     async fn reconcile(&self, tenant: &Tenant, spec: &CanonicalSpec) -> Result<Action, ReconcileError> {
-        let database_count = spec.local_databases().ok_or_else(|| ReconcileError::InvalidInput("azure provider is not supported by this controller".into()))?;
+        if !matches!(spec.provider, TenantProviderSpec::Local) { return Err(ReconcileError::InvalidInput("azure provider is not supported by this controller".into())); }
         let current_status = tenant.status.as_ref();
         let recorded_hash = current_status.and_then(|status| status.foundation_hash());
         let foundation = self.foundation.creation(recorded_hash)?;
@@ -157,7 +157,6 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
             endpoint: &endpoint,
             pod_cidr: &claim.slot.pod_cidr,
             service_cidr: &claim.slot.service_cidr,
-            database_count,
             volume_path: "",
             worker_bootstrap_commands: &[],
             inputs: &foundation.inputs,
@@ -247,7 +246,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> ProviderLifecycle for LocalProvid
             None => self.docker.create_volume(&volume_name, &labels).await?,
         };
         validate_volume(&volume, &volume_name, &labels)?;
-        let commands = resources::worker_bootstrap_commands(foundation.into(), database_count)?;
+        let commands = resources::worker_bootstrap_commands(foundation.into())?;
         context.volume_path = &volume.mountpoint;
         context.worker_bootstrap_commands = &commands;
         for desired in [
@@ -343,9 +342,26 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
             context.identity(),
         )
         .await?;
-        if storage.created || storage.object.metadata.deletion_timestamp.is_some() {
-            return self.progress(context.tenant, PROGRESS_INTERVAL).await;
-        }
+        let storage_ready = !storage.created
+            && storage.object.metadata.deletion_timestamp.is_none()
+            && storage
+                .object
+                .data
+                .get("provisioner")
+                .and_then(serde_json::Value::as_str)
+                == Some("kubernetes.io/no-provisioner")
+            && storage
+                .object
+                .data
+                .get("volumeBindingMode")
+                .and_then(serde_json::Value::as_str)
+                == Some("Immediate")
+            && storage
+                .object
+                .data
+                .get("reclaimPolicy")
+                .and_then(serde_json::Value::as_str)
+                == Some("Retain");
         let controller_image = image(foundation, "CNPG_CONTROLLER_IMAGE")?;
         let operator = resources::cnpg_operator(
             context,
@@ -354,9 +370,6 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
             &controller_image.reference,
         )?;
         let operator = objects::ensure_batch(client.clone(), &operator, context.identity()).await?;
-        if operator.created || operator.pending {
-            return self.progress(context.tenant, PROGRESS_INTERVAL).await;
-        }
         let deployment = operator.objects.iter().find(|object| {
             object
                 .types
@@ -365,48 +378,95 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
                 && object.metadata.namespace.as_deref() == Some("cnpg-system")
                 && object.name_any() == "cnpg-controller-manager"
         });
-        if deployment.is_none_or(|deployment| !readiness::workload_available(deployment)) {
-            return self.progress(context.tenant, DEPENDENCY_INTERVAL).await;
+        let runtime_ready = storage_ready
+            && !operator.created
+            && !operator.pending
+            && deployment.is_some_and(readiness::workload_available);
+        let (mut capability, catalog_valid) = match super::ensure_database_catalog(
+            self.client.clone(),
+            context.tenant,
+            false,
+        )
+        .await
+        {
+            Ok(capability) => (capability, true),
+            Err(ReconcileError::Pending(_)) => {
+                return self.progress(context.tenant, PROGRESS_INTERVAL).await;
+            }
+            Err(error) => {
+                tracing::warn!(tenant = %context.name(), %error, "database catalog unavailable");
+                (
+                    context
+                        .tenant
+                        .status
+                        .as_ref()
+                        .and_then(|status| status.database_capability.clone())
+                        .unwrap_or_default(),
+                    false,
+                )
+            }
+        };
+        capability.available = false;
+        capability.reason = if runtime_ready {
+            let tenant_uid = context.tenant.uid()
+                .ok_or_else(|| ReconcileError::OwnershipInvalid("Tenant UID is missing".into()))?;
+            match tenant_database_runtime::catalog_runtime::ensure_credentials(
+                self.client.clone(), context.name(), &tenant_uid, false,
+            ).await {
+                Ok(()) if catalog_valid => "Ready",
+                Ok(()) => "CatalogNotReady",
+                Err(error) => {
+                    tracing::warn!(tenant = %context.name(), %error, "database credential access unavailable");
+                    "CredentialAccessUnavailable"
+                }
+            }
+        } else {
+            "RuntimeNotReady"
         }
-        let mut database = resources::cnpg_objects(
-            context,
-            STORAGE_CLASS,
-            &image(foundation, "POSTGRES_IMAGE")?.reference,
-        )?;
-        let desired = database
-            .pop()
-            .ok_or_else(|| ReconcileError::InvalidInput("CNPG Cluster is missing".into()))?;
-        let static_objects =
-            objects::ensure_batch(client.clone(), &database, context.identity()).await?;
-        if static_objects.created || static_objects.pending {
-            return self.progress(context.tenant, PROGRESS_INTERVAL).await;
-        }
-        let database = objects::ensure_dynamic(client, &desired, context.identity()).await?;
-        if database.created {
-            return self.progress(context.tenant, PROGRESS_INTERVAL).await;
-        }
-        let database_ready = readiness::database_ready(&database.object, context.database_count);
-        if !database_ready {
-            return self.progress(context.tenant, DEPENDENCY_INTERVAL).await;
-        }
+        .into();
+        capability.available = capability.reason == "Ready";
         let components = Components {
             control_plane: readiness::management_conditions_ready(cluster, &["Available"])?,
             workers: workers.inventory_complete && workers.all_ready,
             network: workers.network_ready,
-            storage: storage
-                .object
-                .data
-                .get("provisioner")
-                .and_then(serde_json::Value::as_str)
-                == Some("kubernetes.io/no-provisioner"),
-            database: database_ready,
+            storage: true,
         };
         status::update_status(self.client.clone(), context.tenant, |status| {
             components.publish(status, context.tenant);
+            readiness::set_condition(
+                status,
+                context.tenant,
+                "CatalogReady",
+                catalog_valid,
+                if catalog_valid {
+                    "Ready"
+                } else {
+                    "CatalogNotReady"
+                },
+                "Tenant catalog identity is verified",
+            );
+            if !catalog_valid {
+                status.phase = Some(TenantPhase::Degraded);
+                readiness::set_condition(
+                    status,
+                    context.tenant,
+                    "Ready",
+                    false,
+                    "CatalogNotReady",
+                    "Tenant catalog identity is unavailable",
+                );
+            }
+            status.database_capability = Some(capability.clone());
             Ok(())
         })
         .await?;
-        Ok(Action::requeue(READY_INTERVAL))
+        Ok(Action::requeue(
+            if catalog_valid && capability.available && components.ready() {
+                READY_INTERVAL
+            } else {
+                DEPENDENCY_INTERVAL
+            },
+        ))
     }
 }
 fn image<'a>(foundation: &'a Foundation, key: &str) -> Result<&'a ImageArchive, ReconcileError> {

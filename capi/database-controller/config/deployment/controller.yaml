@@ -1,0 +1,66 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: database-controller
+  namespace: tenant-system
+spec:
+  progressDeadlineSeconds: 1800
+  replicas: 1
+  selector:
+    matchLabels:
+      app: database-controller
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: database-controller
+    spec:
+      automountServiceAccountToken: true
+      containers:
+      - env:
+        - name: POD_UID
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.uid
+        image: database-controller:configure-before-install
+        imagePullPolicy: IfNotPresent
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: health
+        name: manager
+        ports:
+        - containerPort: 8082
+          name: health
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: health
+        securityContext:
+          allowPrivilegeEscalation: false
+          capabilities:
+            add:
+            - CHOWN
+            - DAC_OVERRIDE
+            drop:
+            - ALL
+          readOnlyRootFilesystem: true
+          runAsNonRoot: false
+          runAsUser: 0
+        volumeMounts:
+        - mountPath: /var/run/docker.sock
+          name: docker-socket
+        - mountPath: /var/lib/docker/volumes
+          name: docker-volumes
+      serviceAccountName: database-controller
+      volumes:
+      - hostPath:
+          path: /var/run/docker.sock
+          type: Socket
+        name: docker-socket
+      - hostPath:
+          path: /var/lib/docker/volumes
+          type: Directory
+        name: docker-volumes

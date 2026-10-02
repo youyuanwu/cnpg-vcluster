@@ -71,7 +71,7 @@ def main() -> None:
     with tools_lock(ROOT, exclusive=True):
         _require_clean_state(ROOT, config, client)
         try:
-            manifest = tenant_manifest_document(config, TENANT_NAME, databases=2)
+            manifest = tenant_manifest_document(config, TENANT_NAME)
             client.kubectl(
                 "apply",
                 "--server-side",

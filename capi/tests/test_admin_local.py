@@ -31,7 +31,6 @@ def tenant_summary(name: str) -> dict[str, object]:
         "classification": "ready",
         "kubernetesVersion": "1.36.4",
         "requestedWorkers": 1,
-        "requestedDatabases": 1,
         "endpoint": "tenant.example",
         "createdAt": "2026-01-01T00:00:00Z",
         "conditions": [],
@@ -274,7 +273,7 @@ class FakeClient:
         if path.endswith("/api/v1/overview"):
             return json.dumps(
                 {
-                    "schemaVersion": 4,
+                    "schemaVersion": 5,
                     "data": {
                         "overview": {
                             "providerMode": "local",
@@ -302,24 +301,34 @@ class FakeClient:
         if path.endswith("/api/v1/tenants"):
             return json.dumps(
                 {
-                    "schemaVersion": 4,
+                    "schemaVersion": 5,
                     "data": [
                         tenant_summary(name) for name in self.tenant_names
                     ],
                 }
             )
         for name in self.tenant_names:
+            if path.endswith(f"/api/v1/tenants/{name}/databases"):
+                return json.dumps({
+                    "schemaVersion": 5,
+                    "data": {
+                        "tenant": name, "tenantUid": f"{name}-uid",
+                        "catalogUid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "resourceVersion": "42", "closed": False,
+                        "capabilityAvailable": True, "databases": [],
+                    },
+                })
             if path.endswith(f"/api/v1/tenants/{name}/topology"):
                 return json.dumps(
                     {
-                        "schemaVersion": 4,
+                        "schemaVersion": 5,
                         "data": topology(name),
                     }
                 )
             if path.endswith(f"/api/v1/tenants/{name}"):
                 return json.dumps(
                     {
-                        "schemaVersion": 4,
+                        "schemaVersion": 5,
                         "data": {
                             "identity": {
                                 "uid": f"{name}-uid",
@@ -364,7 +373,7 @@ class FakeClient:
                 name = request["name"]
                 self.tenant_names = tuple(sorted((*self.tenant_names, name)))
                 return response(json.dumps({
-                    "schemaVersion": 4,
+                    "schemaVersion": 5,
                     "data": {
                         "identity": {
                             "name": name,
@@ -377,7 +386,7 @@ class FakeClient:
                 }))
             tenant_name = arguments[2].split("/tenants/", 1)[1].split("/", 1)[0]
             return response(json.dumps({
-                "schemaVersion": 4,
+                "schemaVersion": 5,
                 "data": {
                     "tenant": tenant_name,
                     "cluster": "capi-postgres",
@@ -401,7 +410,7 @@ class FakeClient:
                 tenant for tenant in self.tenant_names if tenant != name
             )
             return response(json.dumps({
-                "schemaVersion": 4,
+                "schemaVersion": 5,
                 "data": {
                     "identity": {
                         "name": name,
@@ -430,7 +439,7 @@ class FakeClient:
             name = payload["name"]
             self.tenant_names = tuple(sorted((*self.tenant_names, name)))
             return response(json.dumps({
-                "schemaVersion": 4,
+                "schemaVersion": 5,
                 "data": {
                     "identity": {
                         "name": name,
@@ -447,7 +456,7 @@ class FakeClient:
                 tenant for tenant in self.tenant_names if tenant != name
             )
             return response(json.dumps({
-                "schemaVersion": 4,
+                "schemaVersion": 5,
                 "data": {
                     "identity": {
                         "name": name,
@@ -459,7 +468,7 @@ class FakeClient:
             }))
         tenant_name = path.split("/tenants/", 1)[1].split("/", 1)[0]
         return response(json.dumps({
-            "schemaVersion": 4,
+            "schemaVersion": 5,
             "data": {
                 "tenant": tenant_name,
                 "cluster": "capi-postgres",
@@ -555,9 +564,13 @@ class AdminLocalTests(unittest.TestCase):
             client,
             "tenant-new",
             workers=2,
-            databases=1,
         )
         self.assertEqual(created["identity"]["uid"], "tenant-new-uid")
+        self.assertIn(
+            ("raw-json", "POST", f"{admin_local.ADMIN_SERVICE_PROXY}/api/v1/tenants",
+             '{"name": "tenant-new", "workers": 2}'),
+            client.calls,
+        )
         self.assertIn("tenant-new", client.tenant_names)
         deleted = admin_local.delete_tenant_via_admin(
             client,
@@ -705,22 +718,20 @@ class AdminLocalTests(unittest.TestCase):
         role["rules"][0]["resources"].append("secrets")
         with self.assertRaisesRegex(RuntimeError, "read-only RBAC"):
             admin_local._verify_role(ROOT, role)
-        secret_rule_index = next(
+        catalog_rule_index = next(
             index
             for index, rule in enumerate(client.role["rules"])
-            if rule["resources"] == ["secrets"]
+            if rule["resources"] == ["tenantdatabasecatalogs"]
         )
         for verbs in (
-            ["list"],
             ["watch"],
             ["create"],
-            ["update"],
             ["patch"],
             ["delete"],
         ):
             role = copy.deepcopy(client.role)
-            role["rules"][secret_rule_index]["verbs"] = verbs
-            with self.subTest(secret_verbs=verbs), self.assertRaisesRegex(
+            role["rules"][catalog_rule_index]["verbs"] = verbs
+            with self.subTest(catalog_verbs=verbs), self.assertRaisesRegex(
                 RuntimeError,
                 "read-only RBAC",
             ):
@@ -787,6 +798,38 @@ class AdminLocalTests(unittest.TestCase):
                     "apiGroups": [""],
                     "resources": ["secrets"],
                     "verbs": ["create", "update", "patch", "delete"],
+                },
+            ),
+            (
+                "catalog-patch",
+                {
+                    "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                    "resources": ["tenantdatabasecatalogs"],
+                    "verbs": ["patch"],
+                },
+            ),
+            (
+                "catalog-status-write",
+                {
+                    "apiGroups": ["tenancy.cnpg-vcluster.io"],
+                    "resources": ["tenantdatabasecatalogs/status"],
+                    "verbs": ["update"],
+                },
+            ),
+            (
+                "direct-disk-delete",
+                {
+                    "apiGroups": ["resources.azure.com"],
+                    "resources": ["disks"],
+                    "verbs": ["delete"],
+                },
+            ),
+            (
+                "cutover-policy-write",
+                {
+                    "apiGroups": ["admissionregistration.k8s.io"],
+                    "resources": ["validatingadmissionpolicybindings"],
+                    "verbs": ["update"],
                 },
             ),
             (
@@ -918,6 +961,7 @@ class AdminLocalTests(unittest.TestCase):
                 "api/v1/overview",
                 "api/v1/tenants",
                 "api/v1/tenants/tenant-a",
+                "api/v1/tenants/tenant-a/databases",
                 "api/v1/tenants/tenant-a/topology",
             ],
             [
@@ -939,11 +983,65 @@ class AdminLocalTests(unittest.TestCase):
             for arguments in queried.calls
             if arguments[:2] == ("raw-json", "POST")
         ]
-        self.assertEqual(1, len(query_calls))
-        self.assertTrue(
-            query_calls[0][2].endswith(
-                "/api/v1/tenants/tenant-a/database/query"
+        self.assertEqual([], query_calls)
+        from tests.test_catalog_lifecycle import FIRST, entry
+
+        observed = entry("alpha", FIRST)
+        with_entries = FakeClient(tenant_names=("tenant-a",))
+        original_proxy = with_entries._proxy_response
+        original_mutation = with_entries.request_json
+
+        def populated_response(path: str) -> str:
+            response = original_proxy(path)
+            if path.endswith("/api/v1/tenants/tenant-a/databases"):
+                body = json.loads(response)
+                body["data"]["databases"] = [observed]
+                return json.dumps(body)
+            if path.endswith("/api/v1/tenants/tenant-a/topology"):
+                body = json.loads(response)
+                body["data"]["nodes"].append({
+                    "id": f"database:{FIRST}", "kind": "database",
+                    "label": "alpha", "health": "ready",
+                    "resource": None, "attributes": [],
+                })
+                return json.dumps(body)
+            return response
+
+        def query_response(method, path, payload):
+            if path.endswith(f"/databases/{FIRST}/query"):
+                with_entries.calls.append(
+                    ("raw-json", method, path, json.dumps(payload, sort_keys=True))
+                )
+                return response(json.dumps({
+                    "schemaVersion": 5,
+                    "data": {
+                        "catalogUid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
+                        "logicalUid": FIRST, "instance": "pg-alpha-1",
+                        "instanceUid": "pod-alpha-1",
+                        "executedAt": "2026-10-01T00:00:00Z",
+                        "durationMs": 2, "truncated": False,
+                        "results": [{
+                            "columns": ["value"], "rows": [["1"]],
+                            "affectedRows": 1, "truncated": False,
+                        }],
+                    },
+                }))
+            return original_mutation(method, path, payload)
+
+        with (
+            patch.object(with_entries, "_proxy_response", side_effect=populated_response),
+            patch.object(with_entries, "request_json", side_effect=query_response),
+        ):
+            admin_local.verify_admin_api(
+                with_entries, expected_tenant_names=("tenant-a",),
+                verify_database_queries=True,
             )
+        self.assertEqual(
+            "SELECT 1 AS value",
+            json.loads([
+                call[3] for call in with_entries.calls
+                if call[:2] == ("raw-json", "POST")
+            ][0])["sql"],
         )
         transitioning = FakeClient(tenant_names=("tenant-a",))
         original_transition = transitioning._proxy_response
@@ -952,11 +1050,11 @@ class AdminLocalTests(unittest.TestCase):
             if path.endswith("/api/v1/tenants"):
                 summary = tenant_summary("tenant-a")
                 summary["classification"] = "progressing"
-                return json.dumps({"schemaVersion": 4, "data": [summary]})
+                return json.dumps({"schemaVersion": 5, "data": [summary]})
             if path.endswith("/api/v1/tenants/tenant-a/topology"):
                 topology = json.loads(original_transition(path))["data"]
                 topology["nodes"][0]["health"] = "progressing"
-                return json.dumps({"schemaVersion": 4, "data": topology})
+                return json.dumps({"schemaVersion": 5, "data": topology})
             return original_transition(path)
 
         with patch.object(
@@ -975,6 +1073,10 @@ class AdminLocalTests(unittest.TestCase):
 
         def unavailable_response(path: str) -> str:
             response = original_unavailable(path)
+            if path.endswith("/api/v1/tenants/tenant-a/databases"):
+                envelope = json.loads(response)
+                envelope["data"]["capabilityAvailable"] = False
+                return json.dumps(envelope)
             if path.endswith("/api/v1/tenants/tenant-a"):
                 envelope = json.loads(response)
                 envelope["data"]["database"] = {
@@ -1018,7 +1120,7 @@ class AdminLocalTests(unittest.TestCase):
                 expected_tenant_names=("tenant-a",),
             )
             self.assertEqual(["tenant-a"], partial["tenantNames"])
-            with self.assertRaisesRegex(RuntimeError, "unavailable database"):
+            with self.assertRaisesRegex(RuntimeError, "catalog capability is unavailable"):
                 admin_local.verify_admin_api(
                     unavailable,
                     expected_tenant_names=("tenant-a",),
@@ -1030,7 +1132,7 @@ class AdminLocalTests(unittest.TestCase):
 
         def malformed_response(path: str) -> str:
             if path.endswith("/api/v1/overview"):
-                return '{"schemaVersion":4,"data":[]}'
+                return '{"schemaVersion":5,"data":[]}'
             return original(path)
 
         with patch.object(
