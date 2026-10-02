@@ -7,7 +7,7 @@ use sha2::{Digest, Sha256};
 use tenant_controller::{
     api::{Tenant, TenantPhase, TenantProviderSpec},
     azure::{AzureConfiguration, CONFIG_NAME},
-    tenant_client::load_tenant_client_with_owner,
+    tenant_client::load_tenant_client_with_owner_named,
 };
 use tenant_database_runtime::{azure_runtime, catalog_runtime};
 
@@ -423,10 +423,17 @@ async fn load(management: Client, catalog: &TenantDatabaseCatalog) -> Result<Acc
     .get(name)
     .await?;
     let endpoint = azure.endpoint.as_deref().ok_or(ObserveError::Identity)?;
-    let (client, secret) =
-        load_tenant_client_with_owner(management, &plane, Some(&cluster), name, name, endpoint)
-            .await
-            .map_err(|_| ObserveError::Identity)?;
+    let (client, secret) = load_tenant_client_with_owner_named(
+        management,
+        &plane,
+        Some(&cluster),
+        name,
+        name,
+        endpoint,
+        &format!("{name}-admin-kubeconfig"),
+    )
+    .await
+    .map_err(|_| ObserveError::Identity)?;
     let kubeconfig = azure.kubeconfig.as_ref().ok_or(ObserveError::Identity)?;
     let digest = secret
         .data

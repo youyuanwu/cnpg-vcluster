@@ -25,7 +25,7 @@ use tenant_controller::{
         AzureProviderStatus, FINALIZER as TENANT_FINALIZER, Tenant, TenantPhase, TenantProviderSpec,
     },
     management::{AZURE_MANAGEMENT_RESOURCES, MANAGEMENT_RESOURCES},
-    tenant_client::load_tenant_client_with_owner,
+    tenant_client::load_tenant_client_with_owner_named,
 };
 use tenant_database_controller::{
     api::{
@@ -653,13 +653,19 @@ async fn tenant_client(source: &KubeDataSource, tenant: &Tenant) -> Result<Clien
         .map_err(read_error)?
         .ok_or_else(unavailable)?;
     validated_credential_rbac(&role, &binding, tenant)?;
-    let (client, secret) = load_tenant_client_with_owner(
+    let secret_name = if azure {
+        format!("{name}-admin-kubeconfig")
+    } else {
+        format!("{name}-kubeconfig")
+    };
+    let (client, secret) = load_tenant_client_with_owner_named(
         source.client.clone(),
         plane,
         if azure { Some(cluster) } else { None },
         name,
         name,
         &endpoint,
+        &secret_name,
     )
     .await
     .map_err(|error| {

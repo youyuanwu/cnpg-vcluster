@@ -383,8 +383,32 @@ pub async fn load_tenant_client_with_owner(
         .find(|resource| resource.kind == "Secret")
         .and_then(|resource| resource.expected_name(tenant_name))
         .expect("Secret has a declared name");
+    load_tenant_client_with_owner_named(
+        management,
+        control_plane,
+        alternate_owner,
+        namespace,
+        tenant_name,
+        endpoint,
+        &name,
+    )
+    .await
+}
+
+pub async fn load_tenant_client_with_owner_named(
+    management: Client,
+    control_plane: &DynamicObject,
+    alternate_owner: Option<&DynamicObject>,
+    namespace: &str,
+    tenant_name: &str,
+    endpoint: &str,
+    secret_name: &str,
+) -> Result<(Client, Secret), TenantClientError> {
+    if secret_name.is_empty() {
+        return Err(TenantClientError::SecretPending);
+    }
     let secret = Api::<Secret>::namespaced(management, namespace)
-        .get_opt(&name)
+        .get_opt(secret_name)
         .await
         .map_err(|error| TenantClientError::request("read kubeconfig Secret", error, false))?
         .ok_or(TenantClientError::SecretPending)?;
