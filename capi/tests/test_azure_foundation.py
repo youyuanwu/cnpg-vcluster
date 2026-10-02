@@ -23,6 +23,7 @@ from scripts.lib.azure.common import (
 )
 from scripts.lib.azure.foundation import (
     ACR_PULL_ROLE_DEFINITION_ID,
+    ASO_DISK_CRD_PATTERN,
     CAPI_CAPZ_DEPLOYMENTS,
     TENANT_ALLOCATION_APPROVAL,
     TENANT_ALLOCATION_CONFIG,
@@ -31,6 +32,7 @@ from scripts.lib.azure.foundation import (
     TENANT_CONTROLLER_CONFIG_KEY,
     _azure_provider_configuration,
     _azure_bootstrap_resume_images,
+    _aso_disk_crd_patch,
     _azure_allocation_configuration,
     _azure_cutover_lock,
     _azure_cutover_inventory,
@@ -1154,6 +1156,26 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 (controller_image, database_image),
                 _azure_bootstrap_resume_images(root, config, inventory),
             )
+
+    def test_aso_disk_crd_patch_is_exact_and_idempotent(self):
+        deployment = {
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "manager",
+                "args": ["--v=2", "--crd-pattern=", "--webhook-port=9443"],
+            }]}}},
+        }
+        patch = _aso_disk_crd_patch(deployment)
+        self.assertEqual(2, len(patch))
+        self.assertEqual("test", patch[0]["op"])
+        self.assertEqual("--crd-pattern=", patch[0]["value"])
+        self.assertEqual(
+            f"--crd-pattern={ASO_DISK_CRD_PATTERN}",
+            patch[1]["value"],
+        )
+        deployment["spec"]["template"]["spec"]["containers"][0]["args"][1] = (
+            patch[1]["value"]
+        )
+        self.assertEqual([], _aso_disk_crd_patch(deployment))
 
     def test_foundation_health_fails_closed_on_acr_or_pull_role_drift(self):
         root = self.make_root()

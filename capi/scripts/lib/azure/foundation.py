@@ -90,6 +90,7 @@ DATABASE_DISK_ACTIONS = {
     "Microsoft.Compute/disks/delete",
 }
 DATABASE_SERVICE_ACCOUNT = "system:serviceaccount:tenant-system:database-controller"
+ASO_DISK_CRD_PATTERN = "compute.azure.com/Disk"
 
 
 @contextmanager
@@ -543,6 +544,27 @@ def _patch_capz_identity(
         "-p",
         json.dumps(patch, separators=(",", ":")),
     )
+    aso = json.loads(_kubectl(
+        root,
+        "-n",
+        "capz-system",
+        "get",
+        "deployment/azureserviceoperator-controller-manager",
+        "-o",
+        "json",
+    ).stdout)
+    crd_patch = _aso_disk_crd_patch(aso)
+    if crd_patch:
+        _kubectl(
+            root,
+            "-n",
+            "capz-system",
+            "patch",
+            "deployment/azureserviceoperator-controller-manager",
+            "--type=json",
+            "-p",
+            json.dumps(crd_patch, separators=(",", ":")),
+        )
     for deployment in (
         "azureserviceoperator-controller-manager",
         "capz-controller-manager",
@@ -555,6 +577,44 @@ def _patch_capz_identity(
             "restart",
             f"deployment/{deployment}",
         )
+
+
+def _aso_disk_crd_patch(
+    deployment: Mapping[str, object],
+) -> list[dict[str, object]]:
+    containers = (
+        deployment.get("spec", {}).get("template", {}).get("spec", {}).get("containers")
+        if isinstance(deployment, dict)
+        else None
+    )
+    if not isinstance(containers, list):
+        raise RuntimeError("ASO controller Deployment containers are invalid")
+    managers = [
+        (index, container)
+        for index, container in enumerate(containers)
+        if isinstance(container, dict) and container.get("name") == "manager"
+    ]
+    if len(managers) != 1 or not isinstance(managers[0][1].get("args"), list):
+        raise RuntimeError("ASO controller manager identity is invalid")
+    container_index, manager = managers[0]
+    args = manager["args"]
+    matches = [
+        index for index, argument in enumerate(args)
+        if isinstance(argument, str) and argument.startswith("--crd-pattern=")
+    ]
+    if len(matches) != 1:
+        raise RuntimeError("ASO controller CRD pattern argument is invalid")
+    argument_index = matches[0]
+    expected = f"--crd-pattern={ASO_DISK_CRD_PATTERN}"
+    if args[argument_index] == expected:
+        return []
+    path = (
+        f"/spec/template/spec/containers/{container_index}/args/{argument_index}"
+    )
+    return [
+        {"op": "test", "path": path, "value": args[argument_index]},
+        {"op": "replace", "path": path, "value": expected},
+    ]
 
 
 def _install_capi_capz(
