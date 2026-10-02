@@ -260,6 +260,19 @@ class PackagingTests(unittest.TestCase):
              "clusters", "kamajicontrolplanes", "secrets", "disks"},
         )
 
+    def test_azure_tenant_controller_has_read_only_disk_drain_visibility(self):
+        role = (ROOT / "controller/config/rbac/role-azure.yaml").read_text()
+        self.assertIn(
+            "- apiGroups:\n"
+            "  - compute.azure.com\n"
+            "  resources:\n"
+            "  - disks\n"
+            "  verbs:\n"
+            "  - get\n"
+            "  - list\n",
+            role,
+        )
+
     def test_azure_identity_failure_does_not_roll_out_and_retry_recovers(self):
         image = "registry.example/db@sha256:" + "a" * 64
         client_id = "11111111-1111-4111-8111-111111111111"

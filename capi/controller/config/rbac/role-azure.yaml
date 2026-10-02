@@ -46,6 +46,13 @@ rules:
   - update
   - watch
 - apiGroups:
+  - compute.azure.com
+  resources:
+  - disks
+  verbs:
+  - get
+  - list
+- apiGroups:
   - tenancy.cnpg-vcluster.io
   resources:
   - tenants

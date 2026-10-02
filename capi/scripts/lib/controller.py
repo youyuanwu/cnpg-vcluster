@@ -1190,6 +1190,7 @@ def _recover_unknown_local_probe(
         client.kubectl(
             "wait", "--for=delete", f"tenant/{name}",
             f"--timeout={config['DELETE_TIMEOUT']}",
+            timeout=parse_duration(config["DELETE_TIMEOUT"]) + 60,
         )
     _verify_probe_cleanup(client, name, namespace, storage_namespace)
     verify_release_tenant_cutover_lock(client)
@@ -1393,6 +1394,7 @@ def run_catalog_lifecycle_probe(
             client.kubectl(
                 "wait", "--for=delete", f"tenant/{name}",
                 f"--timeout={config['DELETE_TIMEOUT']}",
+                timeout=parse_duration(config["DELETE_TIMEOUT"]) + 60,
             )
         _verify_probe_cleanup(client, name, namespace, storage_namespace)
         ensure_catalog_cutover_lock(client)
@@ -1480,6 +1482,7 @@ def run_catalog_lifecycle_probe(
     client.kubectl(
         "wait", "--for=delete", f"tenant/{name}",
         f"--timeout={config['DELETE_TIMEOUT']}",
+        timeout=parse_duration(config["DELETE_TIMEOUT"]) + 60,
     )
     _verify_probe_cleanup(client, name, namespace, storage_namespace)
     ensure_catalog_cutover_lock(client)
