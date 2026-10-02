@@ -175,6 +175,27 @@ jobs:
       - name: Run end-to-end test
         run: just test-e2e-offline
 
+      - name: Diagnose failed end-to-end
+        if: failure()
+        continue-on-error: true
+        run: |
+          set +e
+          if test -f .runtime/management/kubeconfig; then
+            kubectl=(
+              .tools/bin/kubectl
+              --kubeconfig .runtime/management/kubeconfig
+              --context kind-capi-kamaji-management
+              --request-timeout 30s
+            )
+            "${kubectl[@]}" -n tenant-system get deployments,pods -o wide
+            "${kubectl[@]}" -n default get lease/database-controller.tenancy.cnpg-vcluster.io -o yaml
+            "${kubectl[@]}" -n tenant-system logs deployment/database-controller --all-pods=true --tail=200
+            "${kubectl[@]}" -n tenant-system logs deployment/tenant-controller --all-pods=true --tail=200
+            "${kubectl[@]}" get tenants.tenancy.cnpg-vcluster.io -o yaml
+            "${kubectl[@]}" get tenantdatabasecatalogs.tenancy.cnpg-vcluster.io -A -o yaml
+            "${kubectl[@]}" -n tenant-system get events --sort-by=.lastTimestamp
+          fi
+
   high-capacity:
     name: CAPI high-capacity offline and targeted
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
