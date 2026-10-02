@@ -57,10 +57,14 @@ class ToolSchemaTests(unittest.TestCase):
                     self.assertEqual(timeout, 30)
                     self.assertFalse(check)
                     return CompletedProcess(arguments, 1, "", "release not found")
-                self.assertEqual(timeout, 150)
+                self.assertEqual(timeout, 330)
                 self.assertEqual(arguments[1:3], ["upgrade", "--install"])
                 self.assertIn("--atomic", arguments)
                 self.assertIn("--wait", arguments)
+                self.assertEqual(
+                    arguments[arguments.index("--timeout") + 1],
+                    "5m",
+                )
                 release = arguments[3]
                 self.assertEqual(
                     arguments[arguments.index("--kubeconfig") + 1],
@@ -127,7 +131,9 @@ class ToolSchemaTests(unittest.TestCase):
                 if args[1] == "status":
                     return CompletedProcess(args, 1, "", "release not found")
                 releases.append(args[3])
-                self.assertEqual(timeout, 150)
+                self.assertEqual(timeout, 330)
+                if args[3] == "azuredisk":
+                    self.assertIn("controller.replicas=1", args)
                 if args[3] == "azuredisk" and releases.count("azuredisk") == 1:
                     raise subprocess.TimeoutExpired(args, timeout)
                 return CompletedProcess(args, 0, "", "")
