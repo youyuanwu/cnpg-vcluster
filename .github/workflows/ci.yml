@@ -233,68 +233,10 @@ jobs:
         if: always()
         run: just destroy
 
-  azure-destructive:
-    name: Azure nine-disk lifecycle
-    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
-    timeout-minutes: 360
-    permissions:
-      contents: read
-      id-token: write
-    env:
-      AZURE_GATE_CONFIG: ${{ secrets.CAPI_AZURE_TEST_CONFIG }}
-      AZURE_GATE_INVENTORY: ${{ secrets.CAPI_AZURE_FOUNDATION_INVENTORY }}
-      AZURE_GATE_KUBECONFIG: ${{ secrets.CAPI_AZURE_MANAGEMENT_KUBECONFIG }}
-      AZURE_CLIENT_ID: ${{ secrets.CAPI_AZURE_CLIENT_ID }}
-      AZURE_TENANT_ID: ${{ secrets.CAPI_AZURE_TENANT_ID }}
-      AZURE_SUBSCRIPTION_ID: ${{ secrets.CAPI_AZURE_SUBSCRIPTION_ID }}
-    defaults:
-      run:
-        working-directory: capi
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@v6
-      - name: Require credentialed clean-foundation inputs
-        run: |
-          test -n "$AZURE_GATE_CONFIG"
-          test -n "$AZURE_GATE_INVENTORY"
-          test -n "$AZURE_GATE_KUBECONFIG"
-          test -n "$AZURE_CLIENT_ID"
-          test -n "$AZURE_TENANT_ID"
-          test -n "$AZURE_SUBSCRIPTION_ID"
-      - name: Set up Python
-        uses: actions/setup-python@v6
-        with:
-          python-version: "3.12"
-      - name: Set up just
-        uses: extractions/setup-just@v4
-        with:
-          just-version: "1.58.0"
-      - name: Authenticate to the experiment subscription
-        uses: azure/login@v2
-        with:
-          client-id: ${{ secrets.CAPI_AZURE_CLIENT_ID }}
-          tenant-id: ${{ secrets.CAPI_AZURE_TENANT_ID }}
-          subscription-id: ${{ secrets.CAPI_AZURE_SUBSCRIPTION_ID }}
-      - name: Restore exact private foundation inventory
-        run: |
-          install -d -m 700 .tools .runtime .runtime/azure
-          umask 077
-          printf '%s' "$AZURE_GATE_CONFIG" > config/azure.local.env
-          printf '%s' "$AZURE_GATE_INVENTORY" > .runtime/azure/resources.json
-          printf '%s' "$AZURE_GATE_KUBECONFIG" > .runtime/azure/management.kubeconfig
-      - name: Acquire pinned tools and verify the tagged foundation
-        run: |
-          just cache
-          just tools
-          just azure-foundation-status
-      - name: Prove three-entry Azure destructive lifecycle
-        run: just azure-test-tenant-lifecycle
-
   capi-tests:
     name: CAPI tests
     if: always()
-    needs: [fast-checks, e2e, high-capacity, azure-destructive]
+    needs: [fast-checks, e2e, high-capacity]
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
@@ -303,20 +245,16 @@ jobs:
           FAST_RESULT: ${{ needs.fast-checks.result }}
           E2E_RESULT: ${{ needs.e2e.result }}
           HIGH_CAPACITY_RESULT: ${{ needs.high-capacity.result }}
-          AZURE_RESULT: ${{ needs.azure-destructive.result }}
           EVENT_NAME: ${{ github.event_name }}
         run: |
           test "$FAST_RESULT" = success
           if [ "$EVENT_NAME" = pull_request ]; then
             test "$E2E_RESULT" = success
             test "$HIGH_CAPACITY_RESULT" = skipped
-            test "$AZURE_RESULT" = skipped
           elif [ "$EVENT_NAME" = push ]; then
             test "$E2E_RESULT" = skipped
             test "$HIGH_CAPACITY_RESULT" = skipped
-            test "$AZURE_RESULT" = skipped
           else
             test "$E2E_RESULT" = skipped
             test "$HIGH_CAPACITY_RESULT" = success
-            test "$AZURE_RESULT" = success
           fi

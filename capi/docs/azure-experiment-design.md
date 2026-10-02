@@ -721,12 +721,12 @@ or successful credentialed destructive gate should be inferred from them.
 `{"blockers":["Azure foundation inventory is absent"],"foundation":"unhealthy","healthy":false,"schema":1}`.
 The exact owner-only `.runtime/azure/resources.json` is missing, and
 `gh secret list` found zero configured `CAPI_AZURE_*` repository secrets.
-The scheduled/manual `azure-destructive` job requires matching experiment
-config, foundation inventory, management kubeconfig, client ID, tenant ID and
-subscription ID secrets before it can prove nine-disk absence. Real browser
-and service-proxy agreement on the same deployment is also unverified.
-Both are unmet gates, not passing checks; no Azure cloud mutation was
-attempted for this run.
+GitHub Actions intentionally does not receive Azure credentials or run the
+destructive lifecycle. The nine-disk absence must be proved by an operator outside
+CI against an explicitly recorded experiment foundation. Real browser and
+service-proxy agreement on the same deployment is also unverified. Both are
+unmet gates, not passing checks; no Azure cloud mutation was attempted for
+this run.
 
 ## References
 

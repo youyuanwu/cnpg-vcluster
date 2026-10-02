@@ -63,16 +63,11 @@ deletion, and recreation behavior. Azure database workloads and destructive
 disk cleanup still require the separate credentialed validation gates before
 a live Azure rollout can be claimed.
 
-The scheduled/manual `azure-destructive` CI job requires repository secrets
-`CAPI_AZURE_TEST_CONFIG`, `CAPI_AZURE_FOUNDATION_INVENTORY`,
-`CAPI_AZURE_MANAGEMENT_KUBECONFIG`, `CAPI_AZURE_CLIENT_ID`,
-`CAPI_AZURE_TENANT_ID`, and `CAPI_AZURE_SUBSCRIPTION_ID`. These must identify
-the same healthy, tagged experiment resource group; the gate refuses an
-existing Tenant and checks source cleanliness before failure injection.
-Missing credentials or foundation inventory fail the job rather than claiming
-Azure lifecycle success. `just azure-foundation-status` is read-only;
-`just azure-test-tenant-lifecycle` is destructive and runs only against the
-recorded experiment foundation. The local PR gate runs
+GitHub Actions does not receive Azure credentials and does not run destructive
+Azure lifecycle tests. An operator with a recorded experiment foundation can
+run read-only `just azure-foundation-status` and, after separately confirming
+the target subscription and resource group, destructive
+`just azure-test-tenant-lifecycle` outside CI. The local PR gate runs
 `just test-e2e-offline` with the separately packaged database controller.
 `just controller-metrics` and `just database-controller-metrics` enforce
 independent 12,000-line production-Rust ceilings.
@@ -605,15 +600,13 @@ admin generation/lint/tests/metrics, and offline reproducible server/Wasm
 packaging. PR E2E consumes the exact uploaded controller,
 database-controller and admin artifacts and runs `just test-e2e-offline`;
 scheduled/manual high-capacity CI rebuilds from the complete cache.
-Scheduled/manual `azure-destructive` CI separately requires six Azure secrets
-and a matching healthy inventory before running nine-disk proof.
 The final **CAPI tests** check requires fast checks and offline E2E on PRs
 (including fork PRs), fast checks plus targeted/offline high-capacity and
-credentialed Azure jobs on manual dispatch and the weekly schedule, and fast
-checks alone on `main` pushes. The Azure job fails (not skips as a success)
-without configured secrets. Keep **CAPI tests** as the required branch-protection
-check: its always-running gate rejects failed, cancelled, or unexpectedly
-skipped applicable jobs.
+high-capacity jobs on manual dispatch and the weekly schedule, and fast checks
+alone on `main` pushes. Azure credentials are not available to GitHub Actions;
+destructive Azure validation remains operator-run outside CI. Keep **CAPI
+tests** as the required branch-protection check: its always-running gate rejects
+failed, cancelled, or unexpectedly skipped applicable jobs.
 Pushes to `main` run fast checks only, avoiding an immediate repeat of the PR's
 destructive E2E. Concurrency cancels superseded runs of the same event/ref,
 without a `main` push cancelling a scheduled or manually dispatched full gate.

@@ -469,18 +469,12 @@ def check_repository_boundaries() -> None:
     ):
         check(token in e2e, f"PR E2E artifact wiring is missing {token}")
     high_capacity = workflow.split("  high-capacity:", 1)[1].split(
-        "  azure-destructive:", 1
-    )[0]
-    azure_gate = workflow.split("  azure-destructive:", 1)[1].split(
         "  capi-tests:", 1
     )[0]
-    for token in (
-        "just azure-foundation-status",
-        "just azure-test-tenant-lifecycle",
-        "CAPI_AZURE_FOUNDATION_INVENTORY",
-        "CAPI_AZURE_MANAGEMENT_KUBECONFIG",
-    ):
-        check(token in azure_gate, f"Azure destructive gate is missing {token}")
+    check(
+        "azure-destructive" not in workflow and "secrets.CAPI_AZURE" not in workflow,
+        "CI must not require unavailable Azure credentials",
+    )
     check(
         "CAPI_PREBUILT_CONTROLLER_BINARY" not in high_capacity,
         "high-capacity validation must retain an independent controller build",
@@ -1029,15 +1023,6 @@ def check_documentation() -> None:
             ),
             f"{name} still asserts an obsolete single-cluster contract",
         )
-    for secret in (
-        "CAPI_AZURE_TEST_CONFIG",
-        "CAPI_AZURE_FOUNDATION_INVENTORY",
-        "CAPI_AZURE_MANAGEMENT_KUBECONFIG",
-        "CAPI_AZURE_CLIENT_ID",
-        "CAPI_AZURE_TENANT_ID",
-        "CAPI_AZURE_SUBSCRIPTION_ID",
-    ):
-        check(secret in readme, f"CAPI README omits Azure release input: {secret}")
     for path in (
         ROOT.parent / "README.md",
         ROOT / "README.md",
