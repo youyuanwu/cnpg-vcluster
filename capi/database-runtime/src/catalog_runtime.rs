@@ -592,9 +592,13 @@ pub async fn ensure_credentials(
     client: Client,
     tenant_name: &str,
     tenant_uid: &str,
-    _azure: bool,
+    azure: bool,
 ) -> Result<(), CatalogRuntimeError> {
-    let secret = format!("{tenant_name}-kubeconfig");
+    let secret = if azure {
+        format!("{tenant_name}-admin-kubeconfig")
+    } else {
+        format!("{tenant_name}-kubeconfig")
+    };
     let roles = Api::<Role>::namespaced(client.clone(), tenant_name);
     let desired = Role {
         metadata: ObjectMeta {

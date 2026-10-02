@@ -104,31 +104,62 @@ class AdminResourceTests(unittest.TestCase):
     def test_effective_scoped_credentials_require_exact_tenant_role_and_binding(self) -> None:
         namespace = "tenant-a"
         label = {"tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid"}
-        objects = {
-            f"namespace/{namespace}": {
-                "kind": "Namespace",
-                "metadata": {"name": namespace, "uid": "namespace-uid", "labels": label},
-            },
-            "role/tenant-database-credentials": {
-                "kind": "Role",
-                "metadata": {"name": "tenant-database-credentials", "namespace": namespace,
-                             "uid": "role-uid", "labels": label},
-                "rules": [{"apiGroups": [""], "resources": ["secrets"],
-                           "resourceNames": [f"{namespace}-kubeconfig"], "verbs": ["get"]}],
-            },
-            "rolebinding/tenant-database-credentials": {
-                "kind": "RoleBinding",
-                "metadata": {"name": "tenant-database-credentials", "namespace": namespace,
-                             "uid": "binding-uid", "labels": label},
-                "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role",
-                            "name": "tenant-database-credentials"},
-                "subjects": [
-                    {"kind": "ServiceAccount", "name": subject, "namespace": "tenant-system"}
-                    for subject in ("tenant-admin", "database-controller")
-                ],
-            },
-        }
         for provider in generator.PROVIDERS:
+            secret = (
+                f"{namespace}-admin-kubeconfig"
+                if provider == "azure"
+                else f"{namespace}-kubeconfig"
+            )
+            objects = {
+                f"namespace/{namespace}": {
+                    "kind": "Namespace",
+                    "metadata": {
+                        "name": namespace,
+                        "uid": "namespace-uid",
+                        "annotations": {
+                            "tenancy.cnpg-vcluster.io/tenant": namespace,
+                            "tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid",
+                        },
+                    },
+                },
+                "role/tenant-database-credentials": {
+                    "kind": "Role",
+                    "metadata": {
+                        "name": "tenant-database-credentials",
+                        "namespace": namespace,
+                        "uid": "role-uid",
+                        "labels": label,
+                    },
+                    "rules": [{
+                        "apiGroups": [""],
+                        "resources": ["secrets"],
+                        "resourceNames": [secret],
+                        "verbs": ["get"],
+                    }],
+                },
+                "rolebinding/tenant-database-credentials": {
+                    "kind": "RoleBinding",
+                    "metadata": {
+                        "name": "tenant-database-credentials",
+                        "namespace": namespace,
+                        "uid": "binding-uid",
+                        "labels": label,
+                    },
+                    "roleRef": {
+                        "apiGroup": "rbac.authorization.k8s.io",
+                        "kind": "Role",
+                        "name": "tenant-database-credentials",
+                    },
+                    "subjects": [
+                        {
+                            "kind": "ServiceAccount",
+                            "name": subject,
+                            "namespace": "tenant-system",
+                        }
+                        for subject in ("tenant-admin", "database-controller")
+                    ],
+                },
+            }
             rules = load(f"admin/config/rbac/cluster-role-{provider}.json")["rules"]
             review = {
                 "apiVersion": "authorization.k8s.io/v1",
@@ -137,7 +168,7 @@ class AdminResourceTests(unittest.TestCase):
                     "resourceRules": [
                         *rules,
                         {"apiGroups": [""], "resources": ["secrets"], "verbs": ["get"],
-                         "resourceNames": [f"{namespace}-kubeconfig"]},
+                         "resourceNames": [secret]},
                     ],
                     "nonResourceRules": [],
                     "incomplete": False,
@@ -163,12 +194,12 @@ class AdminResourceTests(unittest.TestCase):
                 validate_admin_effective_rules(ROOT, provider, broader, namespace, fetch)
             with self.assertRaisesRegex(RuntimeError, "unbound Secret"):
                 validate_admin_effective_rules(ROOT, provider, review, namespace)
-            objects[f"namespace/{namespace}"]["metadata"]["labels"] = {
+            objects[f"namespace/{namespace}"]["metadata"]["annotations"] = {
+                "tenancy.cnpg-vcluster.io/tenant": namespace,
                 "tenancy.cnpg-vcluster.io/tenant-uid": "replaced-tenant"
             }
             with self.assertRaisesRegex(RuntimeError, "credential identity"):
                 validate_admin_effective_rules(ROOT, provider, review, namespace, fetch)
-            objects[f"namespace/{namespace}"]["metadata"]["labels"] = label
 
     def test_generation_is_byte_stable_and_checked_in(self) -> None:
         first = generator.generated_documents()

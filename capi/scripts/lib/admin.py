@@ -357,7 +357,12 @@ def validate_admin_effective_rules(
     )
     secret_rules = {atom for atom in actual if atom[1] == "secrets"}
     if secret_rules:
-        expected_secret = {("", "secrets", "get", f"{namespace}-kubeconfig")}
+        secret_name = (
+            f"{namespace}-admin-kubeconfig"
+            if provider == "azure"
+            else f"{namespace}-kubeconfig"
+        )
+        expected_secret = {("", "secrets", "get", secret_name)}
         if (
             namespace == ADMIN_NAMESPACE
             or secret_rules != expected_secret
@@ -373,7 +378,7 @@ def validate_admin_effective_rules(
                 namespace, "rolebinding/tenant-database-credentials"
             )
             validate_admin_credential_scope(
-                namespace, namespace_object, role, binding
+                provider, namespace, namespace_object, role, binding
             )
         except (ValueError, KeyError, TypeError) as exc:
             raise RuntimeError(
@@ -408,6 +413,7 @@ def validate_admin_effective_rules(
 
 
 def validate_admin_credential_scope(
+    provider: str,
     namespace: str,
     namespace_object: object,
     role: object,
@@ -418,10 +424,10 @@ def validate_admin_credential_scope(
     namespace_meta = namespace_object.get("metadata")
     if not isinstance(namespace_meta, dict):
         raise RuntimeError("Tenant Admin effective RBAC credential identity is invalid")
-    labels = namespace_meta.get("labels")
+    annotations = namespace_meta.get("annotations")
     tenant_uid = (
-        labels.get("tenancy.cnpg-vcluster.io/tenant-uid")
-        if isinstance(labels, dict)
+        annotations.get("tenancy.cnpg-vcluster.io/tenant-uid")
+        if isinstance(annotations, dict)
         else None
     )
     if (
@@ -431,6 +437,7 @@ def validate_admin_credential_scope(
         or not namespace_meta["uid"]
         or not isinstance(tenant_uid, str)
         or not tenant_uid
+        or annotations.get("tenancy.cnpg-vcluster.io/tenant") != namespace
         or namespace_meta.get("deletionTimestamp")
         or namespace_meta.get("ownerReferences")
     ):
@@ -456,7 +463,11 @@ def validate_admin_credential_scope(
         != [{
             "apiGroups": [""],
             "resources": ["secrets"],
-            "resourceNames": [f"{namespace}-kubeconfig"],
+            "resourceNames": [
+                f"{namespace}-admin-kubeconfig"
+                if provider == "azure"
+                else f"{namespace}-kubeconfig"
+            ],
             "verbs": ["get"],
         }]
         or binding.get("roleRef")
