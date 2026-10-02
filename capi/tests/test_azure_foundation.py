@@ -47,6 +47,7 @@ from scripts.lib.azure.foundation import (
     _inspect_admin,
     _install_capi_capz,
     _install_admin,
+    _require_empty_admin_upgrade,
     _install_tenant_controller,
     _inspect_foundation,
     install_tenant_database_runtime,
@@ -1666,14 +1667,49 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return_value=image,
             ),
             patch(
-                "scripts.lib.azure.foundation.render_azure_admin_deployment"
+                "scripts.lib.azure.foundation._require_empty_admin_upgrade",
+            ) as empty,
+            patch(
+                "scripts.lib.azure.foundation.render_azure_admin_deployment",
+                return_value=rendered,
             ) as render,
+            patch(
+                "scripts.lib.azure.foundation._inspect_admin",
+                return_value=("admin-uid", ()),
+            ),
             patch("scripts.lib.azure.foundation._kubectl") as kubectl,
-            self.assertRaisesRegex(RuntimeError, "image identity changed"),
         ):
-            _install_admin(root, config, recorded)
-        render.assert_not_called()
-        kubectl.assert_not_called()
+            self.assertEqual(
+                (image, "admin-uid"),
+                _install_admin(root, config, recorded),
+            )
+        empty.assert_called_once_with(root)
+        render.assert_called_once_with(root, image)
+
+    def test_admin_upgrade_rejects_live_tenant_or_catalog(self):
+        root = self.make_root()
+        for description, responses in (
+            ("Tenant", [{"metadata": {}, "items": [{"metadata": {"name": "tenant-a"}}]}]),
+            (
+                "catalog",
+                [
+                    {"metadata": {}, "items": []},
+                    {"metadata": {}, "items": [{"metadata": {"name": "tenant-a"}}]},
+                ],
+            ),
+        ):
+            with (
+                self.subTest(description=description),
+                patch(
+                    "scripts.lib.azure.foundation._kubectl",
+                    side_effect=[
+                        completed(json.dumps(response))
+                        for response in responses
+                    ],
+                ),
+                self.assertRaisesRegex(RuntimeError, f"live {description} resources"),
+            ):
+                _require_empty_admin_upgrade(root)
 
     def test_admin_live_health_requires_identity_image_service_and_api(self):
         root = ROOT

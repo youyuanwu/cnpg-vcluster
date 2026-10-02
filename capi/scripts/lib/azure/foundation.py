@@ -2533,7 +2533,7 @@ def _install_admin(
     recorded_image = inventory.get("adminImage")
     recorded_uid = inventory.get("adminDeploymentUid")
     if recorded_image is not None and image != recorded_image:
-        raise RuntimeError("recorded Azure admin image identity changed")
+        _require_empty_admin_upgrade(root)
     for path in admin_rbac_resource_paths(root, "azure"):
         _kubectl(
             root,
@@ -2577,6 +2577,32 @@ def _install_admin(
     if uid is None:
         raise RuntimeError("Azure admin Deployment UID is absent")
     return image, uid
+
+
+def _require_empty_admin_upgrade(root: Path) -> None:
+    for description, arguments in (
+        ("Tenant", ("get", "tenants", "-o", "json")),
+        (
+            "catalog",
+            (
+                "get",
+                "tenantdatabasecatalogs",
+                "--all-namespaces",
+                "-o",
+                "json",
+            ),
+        ),
+    ):
+        payload = json.loads(_kubectl(root, *arguments).stdout)
+        if (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("items"), list)
+            or payload.get("metadata", {}).get("continue", "") != ""
+            or payload["items"]
+        ):
+            raise RuntimeError(
+                f"recorded Azure admin image identity changed with live {description} resources"
+            )
 
 
 def create_management(root: Path, config: Mapping[str, str]) -> None:
