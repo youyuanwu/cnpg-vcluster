@@ -258,6 +258,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return completed(json.dumps({"metadata": {"uid": "allocation-uid"}}))
             return completed()
 
+        def release_failure(*_args, **kwargs):
+            kwargs["prepare_capability"]("tenant-c")
+            raise RuntimeError("release gates blocked")
+
         with (
             patch("scripts.lib.azure.foundation.CATALOG_LIFECYCLE_READY", True),
             patch("scripts.lib.azure.foundation._push_controller_image", return_value=image),
@@ -273,14 +277,22 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                   return_value=root / "manager.yaml"),
             patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl) as command,
             patch("scripts.lib.azure.foundation.load_configuration",
-                  return_value={"DELETE_TIMEOUT": "1s", "CONDITION_TIMEOUT": "1s"}),
+                  return_value={
+                      "DELETE_TIMEOUT": "1s",
+                      "CONDITION_TIMEOUT": "1s",
+                      "TRUNK_SHA256": "tool-hash",
+                  }),
             patch("scripts.lib.azure.foundation.install_database_catalog"),
             patch("scripts.lib.azure.foundation.install_database_controller"),
+            patch(
+                "scripts.lib.azure.foundation.install_tenant_database_runtime",
+                return_value=True,
+            ) as runtime,
             patch("scripts.lib.azure.foundation.verify_catalog_cutover_lock"),
             patch("scripts.lib.azure.foundation._verify_azure_cutover_lock"),
             patch("scripts.lib.azure.foundation._verify_azure_controller_allocation_readiness"),
             patch("scripts.lib.azure.foundation.release_catalog_and_tenant_cutover_locks",
-                  side_effect=RuntimeError("release gates blocked")) as release,
+                  side_effect=release_failure) as release,
             patch("scripts.lib.azure.foundation._azure_cutover_lock") as tenant_unlock,
             patch("scripts.lib.azure.foundation._verify_azure_cutover_probe") as tenant_probe,
             self.assertRaisesRegex(RuntimeError, "release gates blocked"),
@@ -292,6 +304,12 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         self.assertEqual(
             release.call_args.kwargs["database_image"],
             "registry.example/database@sha256:" + "2" * 64,
+        )
+        runtime_config = runtime.call_args.args[1]
+        self.assertEqual(runtime_config["TRUNK_SHA256"], "tool-hash")
+        self.assertEqual(
+            runtime_config["AZURE_SUBSCRIPTION_ID"],
+            config["AZURE_SUBSCRIPTION_ID"],
         )
         tenant_unlock.assert_not_called()
         tenant_probe.assert_not_called()

@@ -1895,6 +1895,8 @@ def _install_tenant_controller(
             allocation_raw,
             allocation_sha256,
         )
+        runtime_config = catalog_config | dict(config)
+
         def prepare_database_capability(tenant_name: str) -> None:
             wait_for(
                 "Azure bootstrap Tenant database runtime readiness",
@@ -1904,7 +1906,7 @@ def _install_tenant_controller(
                     True
                     if install_tenant_database_runtime(
                         root,
-                        config,
+                        runtime_config,
                         tenant_name,
                     )
                     else None
