@@ -381,6 +381,46 @@ class PackagingTests(unittest.TestCase):
                 client(allow_foreign=True), "catalog-bootstrap-probe", "uid-123",
             )
 
+    def test_probe_exception_waits_for_policy_propagation(self):
+        attempts = 0
+
+        def handler(*args, **kwargs):
+            nonlocal attempts
+            if "create" not in args:
+                return response()
+            document = json.loads(kwargs["input_text"])
+            if document["spec"]["tenantUID"] == "uid-123":
+                attempts += 1
+                if attempts == 1:
+                    return response(code=1, error=(
+                        f"{packaging.CATALOG_CUTOVER_POLICY}: "
+                        "TenantDatabaseCatalog creation is locked during API cutover"
+                    ))
+                return response()
+            return response(code=1, error=(
+                f"{packaging.CATALOG_CUTOVER_POLICY}: "
+                "TenantDatabaseCatalog creation is locked during API cutover"
+            ))
+
+        client = Client(handler)
+        with patch.object(
+            packaging,
+            "wait_for",
+            side_effect=lambda _description, _timeout, _interval, predicate: (
+                predicate() or predicate()
+            ),
+        ):
+            packaging._verify_probe_exception(
+                client,
+                "catalog-bootstrap-probe",
+                "uid-123",
+                timeout=1,
+            )
+        self.assertEqual(attempts, 2)
+        self.assertEqual(len([
+            args for args, _ in client.calls if "create" in args
+        ]), 3)
+
     def test_observer_receipt_is_bound_to_live_catalog_and_pod(self):
         observer = {
             "catalogUID": "catalog-uid", "observedGeneration": 1,
@@ -537,7 +577,7 @@ class PackagingTests(unittest.TestCase):
             )
         self.assertEqual(unlock.call_count, 2)
         self.assertEqual(exception.call_count, 2)
-        exception.assert_called_with(client, name, "uid-123")
+        exception.assert_called_with(client, name, "uid-123", timeout=1)
         self.assertEqual(len([args for args, _ in client.calls if args[:2] == ("create", "-f")]), 1)
         observer.assert_called_once_with(
             client, name="database-controller", image="db:image",

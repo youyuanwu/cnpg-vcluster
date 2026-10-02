@@ -1006,7 +1006,7 @@ def _delete_probe_tenant_uid(
 
 
 def _verify_probe_exception(
-    client: ManagementClient, name: str, uid: str,
+    client: ManagementClient, name: str, uid: str, *, timeout: int = 90,
 ) -> None:
     namespace = f"tenant-db-{name}"
     existing = _probe_resource(client, f"tenantdatabasecatalog/{name}", namespace=namespace)
@@ -1047,23 +1047,44 @@ def _verify_probe_exception(
         "spec": {"tenantName": name, "tenantUID": uid, "closed": False, "entries": {}},
     }
     actor = f"--as=system:serviceaccount:{CONTROLLER_NAMESPACE}:tenant-controller"
-    for candidate, allowed in ((document, True), (
-        {**document, "spec": {**document["spec"], "tenantUID": "foreign-uid"}}, False
-    )):
-        if allowed and existing is not None:
-            continue
-        result = client.kubectl(
-            actor, "create", "--dry-run=server", "-f", "-",
-            input_text=json.dumps(candidate), check=False,
+    if existing is None:
+        def exact_exception_ready() -> bool:
+            result = client.kubectl(
+                actor, "create", "--dry-run=server", "-f", "-",
+                input_text=json.dumps(document), check=False,
+            )
+            if result.returncode == 0:
+                return True
+            if (
+                CATALOG_CUTOVER_POLICY in result.stderr
+                and "TenantDatabaseCatalog creation is locked during API cutover"
+                in result.stderr
+            ):
+                return False
+            raise RuntimeError(
+                "UID-bound bootstrap policy exception was rejected: "
+                + redact(result.stderr)[:512]
+            )
+
+        wait_for(
+            "UID-bound bootstrap policy exception propagation",
+            timeout,
+            2,
+            exact_exception_ready,
         )
-        if allowed:
-            if result.returncode:
-                raise RuntimeError("UID-bound bootstrap policy exception is ineffective")
-        elif (
-            result.returncode == 0 or CATALOG_CUTOVER_POLICY not in result.stderr
-            or "TenantDatabaseCatalog creation is locked during API cutover" not in result.stderr
-        ):
-            raise RuntimeError("UID-bound bootstrap policy permits a foreign catalog")
+    foreign = {
+        **document,
+        "spec": {**document["spec"], "tenantUID": "foreign-uid"},
+    }
+    result = client.kubectl(
+            actor, "create", "--dry-run=server", "-f", "-",
+            input_text=json.dumps(foreign), check=False,
+    )
+    if (
+        result.returncode == 0 or CATALOG_CUTOVER_POLICY not in result.stderr
+        or "TenantDatabaseCatalog creation is locked during API cutover" not in result.stderr
+    ):
+        raise RuntimeError("UID-bound bootstrap policy permits a foreign catalog")
 
 
 def _recover_unknown_local_probe(
@@ -1382,7 +1403,12 @@ def run_catalog_lifecycle_probe(
     identity = verify_catalog_cutover_lock(
         client, namespace=CONTROLLER_NAMESPACE, probe=probe,
     )
-    _verify_probe_exception(client, name, uid)
+    _verify_probe_exception(
+        client,
+        name,
+        uid,
+        timeout=parse_duration(config["CONDITION_TIMEOUT"]),
+    )
 
     def capability_ready() -> bool:
         intent_ready()
