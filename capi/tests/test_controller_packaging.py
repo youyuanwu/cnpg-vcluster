@@ -585,6 +585,7 @@ class PackagingTests(unittest.TestCase):
             return response()
 
         client = Client(handler)
+        prepared = []
 
         def delete_uid(_config, _client, deleted_name, uid):
             self.assertEqual((deleted_name, uid), (name, "uid-123"))
@@ -607,11 +608,13 @@ class PackagingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "interrupted"):
                 packaging.run_catalog_lifecycle_probe(
                     CONFIG, client, provider="local", database_image="db:image",
+                    prepare_capability=prepared.append,
                 )
             self.assertTrue(self.probe_path.is_file())
             self.assertTrue(state["created"])
             packaging.run_catalog_lifecycle_probe(
                 CONFIG, client, provider="local", database_image="db:image",
+                prepare_capability=prepared.append,
             )
         self.assertEqual(unlock.call_count, 2)
         self.assertEqual(exception.call_count, 2)
@@ -627,6 +630,7 @@ class PackagingTests(unittest.TestCase):
         capability.assert_called_once_with(
             client, provider="local", probe=(name, "uid-123"),
         )
+        self.assertEqual(prepared, [name])
         self.assertEqual(empty.call_count, 2)
         inventory.assert_called_once_with(client)
         cleanup_inventory.assert_called_once_with(client)
@@ -1364,6 +1368,7 @@ class PackagingTests(unittest.TestCase):
             remove.assert_called_once()
             bootstrap.assert_called_once_with(
                 CONFIG, client, provider="local", database_image="database:image",
+                prepare_capability=None,
             )
             tenant_lock.assert_called_once()
             catalog_lock.assert_called_once()
@@ -1371,6 +1376,7 @@ class PackagingTests(unittest.TestCase):
 
     def test_approved_release_only_deletes_cutover_policies(self):
         client = Client()
+        prepare = Mock()
         with (
             patch.object(packaging, "CATALOG_LIFECYCLE_READY", True),
             patch.object(packaging, "tenant_cutover_lock_present", return_value=True),
@@ -1384,10 +1390,12 @@ class PackagingTests(unittest.TestCase):
             packaging.release_catalog_and_tenant_cutover_locks(
                 CONFIG, client, provider="local",
                 tenant_image="tenant:image", database_image="database:image",
+                prepare_capability=prepare,
             )
             self.assertEqual(tenant_fence.call_count, 2)
             bootstrap.assert_called_once_with(
                 CONFIG, client, provider="local", database_image="database:image",
+                prepare_capability=prepare,
             )
             self.assertEqual(catalog_fence.call_count, 2)
             catalog_fence.assert_any_call(

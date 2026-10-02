@@ -1626,11 +1626,22 @@ def _install_tenant_controller(
             allocation_raw,
             allocation_sha256,
         )
+        def prepare_database_capability(tenant_name: str) -> None:
+            if not install_tenant_database_runtime(
+                root,
+                config,
+                tenant_name,
+            ):
+                raise RuntimeError(
+                    "Azure bootstrap Tenant is not ready for database runtime"
+                )
+
         if CATALOG_LIFECYCLE_READY:
             release_catalog_and_tenant_cutover_locks(
                 catalog_config, AzureCatalogClient(), provider="azure",
                 tenant_image=image,
                 database_image=database_image,
+                prepare_capability=prepare_database_capability,
             )
     return image, uid, allocation_uid
 
