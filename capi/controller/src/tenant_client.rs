@@ -173,7 +173,7 @@ fn parse_owned_kubeconfig_with_owner(
     let control_plane_matches = MANAGEMENT_RESOURCES
         .iter()
         .chain(AZURE_MANAGEMENT_RESOURCES)
-        .filter(|resource| resource.kind == "KamajiControlPlane")
+        .filter(|resource| matches!(resource.kind, "KamajiControlPlane" | "TenantControlPlane"))
         .any(|resource| {
             control_plane.types.as_ref().is_some_and(|types| {
                 types.kind == resource.kind && types.api_version == resource.api_version

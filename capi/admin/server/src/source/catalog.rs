@@ -604,9 +604,15 @@ async fn tenant_client(source: &KubeDataSource, tenant: &Tenant) -> Result<Clien
     let resources = source.list_management_resources(mode, name).await?;
     let cluster = management_object(&resources, name, "Cluster", azure)?;
     let plane = management_object(&resources, name, "KamajiControlPlane", azure)?;
+    let credential_plane = if azure {
+        management_object(&resources, name, "TenantControlPlane", true)?
+    } else {
+        plane
+    };
     if azure {
         if !is_accepted_azure_management_resource(tenant, &resources, cluster)
             || !is_accepted_azure_management_resource(tenant, &resources, plane)
+            || !is_accepted_azure_management_resource(tenant, &resources, credential_plane)
         {
             return Err(SourceError::StaleIdentity);
         }
@@ -660,7 +666,7 @@ async fn tenant_client(source: &KubeDataSource, tenant: &Tenant) -> Result<Clien
     };
     let (client, secret) = load_tenant_client_with_owner_named(
         source.client.clone(),
-        plane,
+        credential_plane,
         if azure { Some(cluster) } else { None },
         name,
         name,

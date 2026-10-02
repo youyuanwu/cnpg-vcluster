@@ -412,6 +412,16 @@ async fn load(management: Client, catalog: &TenantDatabaseCatalog) -> Result<Acc
     )
     .get(name)
     .await?;
+    let tenant_plane = local::api(
+        management.clone(),
+        Some(name),
+        "kamaji.clastix.io",
+        "v1alpha1",
+        "TenantControlPlane",
+        "tenantcontrolplanes",
+    )
+    .get(name)
+    .await?;
     let cluster = local::api(
         management.clone(),
         Some(name),
@@ -425,7 +435,7 @@ async fn load(management: Client, catalog: &TenantDatabaseCatalog) -> Result<Acc
     let endpoint = azure.endpoint.as_deref().ok_or(ObserveError::Identity)?;
     let (client, secret) = load_tenant_client_with_owner_named(
         management,
-        &plane,
+        &tenant_plane,
         Some(&cluster),
         name,
         name,
