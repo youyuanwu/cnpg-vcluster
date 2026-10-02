@@ -23,6 +23,7 @@ from scripts.lib.kube import ManagementClient
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = {
     "COMMAND_TIMEOUT": "1s", "CONDITION_TIMEOUT": "1s", "DELETE_TIMEOUT": "1s",
+    "KUBECTL_REQUEST_TIMEOUT": "1s",
     "KUBERNETES_VERSION": "v1.36.4", "KIND_CLUSTER_NAME": "management",
     "OWNERSHIP_LABEL": "example.io/owned", "LAB_PREFIX": "lab",
 }
@@ -86,6 +87,12 @@ class Client:
 
 
 class PackagingTests(unittest.TestCase):
+    def test_management_kubectl_accepts_operation_timeout(self):
+        client = ManagementClient(ROOT, CONFIG)
+        with patch("scripts.lib.kube.run", return_value=response()) as execute:
+            client.kubectl("get", "pods", timeout=61)
+        self.assertEqual(execute.call_args.kwargs["timeout"], 61)
+
     def test_database_image_entrypoint_imports_outside_repository(self):
         entrypoint = ROOT / "scripts/build_database_controller.py"
         result = subprocess.run(

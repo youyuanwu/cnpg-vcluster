@@ -130,6 +130,7 @@ class ManagementClient:
         *arguments: str,
         check: bool = True,
         input_text: str | None = None,
+        timeout: int | None = None,
     ):
         return run(
             [
@@ -142,7 +143,7 @@ class ManagementClient:
                 self.config["KUBECTL_REQUEST_TIMEOUT"],
                 *arguments,
             ],
-            timeout=self.timeout,
+            timeout=self.timeout if timeout is None else timeout,
             check=check,
             input_text=input_text,
         )
