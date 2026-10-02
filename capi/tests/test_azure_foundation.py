@@ -36,6 +36,7 @@ from scripts.lib.azure.foundation import (
     _validated_azure_list,
     _prepare_azure_tenant_api_cutover,
     _verify_azure_controller_allocation_readiness,
+    _verify_azure_cutover_lock,
     _verify_azure_cutover_probe,
     _foundation_identity,
     _database_identity_blockers,
@@ -450,6 +451,32 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             _verify_azure_cutover_probe(root, config)
         self.assertTrue(any(arguments[0] == "create" for arguments in calls))
         self.assertTrue(any(arguments[0] == "delete" for arguments in calls))
+
+    def test_azure_cutover_lock_waits_for_policy_propagation(self):
+        root = self.make_root()
+        responses = [
+            completed(),
+            subprocess.CompletedProcess(
+                [],
+                1,
+                stdout="",
+                stderr="Tenant creation is locked during API cutover",
+            ),
+        ]
+        with (
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                side_effect=responses,
+            ) as kubectl,
+            patch("scripts.lib.azure.foundation.time.sleep") as sleep,
+        ):
+            _verify_azure_cutover_lock(
+                root,
+                "v1alpha4",
+                timeout_seconds=10,
+            )
+        self.assertEqual(2, kubectl.call_count)
+        sleep.assert_called_once_with(2)
 
     def test_azure_cutover_readiness_proves_ready_pod_and_leader_lease(self):
         root = self.make_root()

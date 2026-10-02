@@ -977,7 +977,12 @@ def _azure_cutover_lock_present(root: Path) -> bool:
     return present[0]
 
 
-def _verify_azure_cutover_lock(root: Path, generation: str) -> None:
+def _verify_azure_cutover_lock(
+    root: Path,
+    generation: str,
+    *,
+    timeout_seconds: int = 60,
+) -> None:
     document = {
         "apiVersion": f"tenancy.cnpg-vcluster.io/{generation}",
         "kind": "Tenant",
@@ -991,17 +996,21 @@ def _verify_azure_cutover_lock(root: Path, generation: str) -> None:
             ),
         },
     }
-    for _ in range(5):
+    deadline = time.monotonic() + timeout_seconds
+    while True:
         response = _kubectl(
             root, "create", "--dry-run=server", "-f", "-",
             input_text=json.dumps(document), check=False,
         )
         if (
-            response.returncode == 0
-            or "Tenant creation is locked during API cutover"
-            not in response.stderr
+            response.returncode != 0
+            and "Tenant creation is locked during API cutover"
+            in response.stderr
         ):
+            return
+        if time.monotonic() >= deadline:
             raise RuntimeError("Azure Tenant cutover create lock is not effective")
+        time.sleep(2)
 
 
 def _validated_azure_list(
