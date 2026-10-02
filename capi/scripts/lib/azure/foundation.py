@@ -1271,6 +1271,7 @@ def _prepare_azure_tenant_api_cutover(
         _verify_azure_cutover_lock(
             root,
             "v1alpha4" if transition else generation,
+            timeout_seconds=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]),
         )
         if not transition:
             tenants, residue = _azure_cutover_inventory(root)
@@ -1290,7 +1291,11 @@ def _prepare_azure_tenant_api_cutover(
                 "-",
                 input_text=json.dumps(transition_document),
             )
-        _verify_azure_cutover_lock(root, "v1alpha4")
+        _verify_azure_cutover_lock(
+            root,
+            "v1alpha4",
+            timeout_seconds=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]),
+        )
         tenants, residue = _azure_cutover_inventory(root)
         require_empty_tenant_cutover(tenants, residue)
         _kubectl(
@@ -1607,7 +1612,11 @@ def _install_tenant_controller(
         verify_catalog_cutover_lock(
             AzureCatalogClient(), namespace="tenant-system",
         )
-        _verify_azure_cutover_lock(root, "v1alpha4")
+        _verify_azure_cutover_lock(
+            root,
+            "v1alpha4",
+            timeout_seconds=parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]),
+        )
         _verify_azure_controller_allocation_readiness(
             root,
             allocation_raw,
