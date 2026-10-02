@@ -463,10 +463,16 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 stderr="Tenant creation is locked during API cutover",
             ),
         ]
+        documents = []
+
+        def kubectl(_root, *_arguments, **kwargs):
+            documents.append(json.loads(kwargs["input_text"]))
+            return responses.pop(0)
+
         with (
             patch(
                 "scripts.lib.azure.foundation._kubectl",
-                side_effect=responses,
+                side_effect=kubectl,
             ) as kubectl,
             patch("scripts.lib.azure.foundation.time.sleep") as sleep,
         ):
@@ -477,6 +483,11 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             )
         self.assertEqual(2, kubectl.call_count)
         sleep.assert_called_once_with(2)
+        self.assertTrue(documents)
+        self.assertTrue(all(
+            len(document["metadata"]["name"]) <= 30
+            for document in documents
+        ))
 
     def test_azure_cutover_readiness_proves_ready_pod_and_leader_lease(self):
         root = self.make_root()

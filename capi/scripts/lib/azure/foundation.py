@@ -986,7 +986,7 @@ def _verify_azure_cutover_lock(
     document = {
         "apiVersion": f"tenancy.cnpg-vcluster.io/{generation}",
         "kind": "Tenant",
-        "metadata": {"name": f"cutover-lock-probe-{uuid.uuid4().hex[:12]}"},
+        "metadata": {"name": f"cutover-lock-{uuid.uuid4().hex[:12]}"},
         "spec": {
             "kubernetesVersion": "1.36.4",
             "workers": 1,
