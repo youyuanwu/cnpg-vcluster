@@ -44,6 +44,7 @@ from scripts.lib.database_controller import (
     CATALOG_CRD, build_database_controller_image, install_database_controller,
     install_azure_database_runtime, require_absent_legacy_database_crd,
 )
+from scripts.lib.kube import wait_for
 
 ACR_PULL_ROLE_DEFINITION_ID = (
     "/providers/Microsoft.Authorization/roleDefinitions/"
@@ -1835,14 +1836,20 @@ def _install_tenant_controller(
             allocation_sha256,
         )
         def prepare_database_capability(tenant_name: str) -> None:
-            if not install_tenant_database_runtime(
-                root,
-                config,
-                tenant_name,
-            ):
-                raise RuntimeError(
-                    "Azure bootstrap Tenant is not ready for database runtime"
-                )
+            wait_for(
+                "Azure bootstrap Tenant database runtime readiness",
+                parse_duration(config["AZURE_CONTROLLER_TIMEOUT"]),
+                2,
+                lambda: (
+                    True
+                    if install_tenant_database_runtime(
+                        root,
+                        config,
+                        tenant_name,
+                    )
+                    else None
+                ),
+            )
 
         if CATALOG_LIFECYCLE_READY:
             release_catalog_and_tenant_cutover_locks(
