@@ -853,6 +853,10 @@ def _azure_provider_configuration(
         "asoVersion": "v2.11.0",
         "cloudProviderVersion": config["AZURE_CLOUD_PROVIDER_VERSION"],
         "calicoVersion": config["AZURE_CALICO_VERSION"],
+        "calicoCrdsChartSha256": config["AZURE_CALICO_CRDS_CHART_SHA256"],
+        "calicoOperatorChartSha256": config[
+            "AZURE_CALICO_OPERATOR_CHART_SHA256"
+        ],
         "controllerImage": image,
         "foundationDefaultsSha256": inventory["foundationDefaultsSha256"],
     }

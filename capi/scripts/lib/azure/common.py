@@ -136,6 +136,8 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
         "AZURE_KAMAJI_CHART_VERSION",
         "AZURE_CLOUD_PROVIDER_VERSION",
         "AZURE_CALICO_VERSION",
+        "AZURE_CALICO_CRDS_CHART_SHA256",
+        "AZURE_CALICO_OPERATOR_CHART_SHA256",
         "AZURE_TENANT_ALLOCATION_APPROVED_SHA256",
         "AZURE_CONTROLLER_REPOSITORY",
         "AZURE_CONTROLLER_TAG",
@@ -163,12 +165,13 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
     for key in ("AZURE_CONTROLLER_TAG", "AZURE_ADMIN_TAG"):
         if not CONTROLLER_TAG_RE.fullmatch(config[key]):
             raise ConfigError(f"{key} must be a valid OCI tag")
-    if not re.fullmatch(
-        r"[0-9a-f]{64}", config["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"]
+    for key in (
+        "AZURE_TENANT_ALLOCATION_APPROVED_SHA256",
+        "AZURE_CALICO_CRDS_CHART_SHA256",
+        "AZURE_CALICO_OPERATOR_CHART_SHA256",
     ):
-        raise ConfigError(
-            "AZURE_TENANT_ALLOCATION_APPROVED_SHA256 must be a lowercase SHA-256"
-        )
+        if not re.fullmatch(r"[0-9a-f]{64}", config[key]):
+            raise ConfigError(f"{key} must be a lowercase SHA-256")
     fallback_role = config.get("AZURE_DATABASE_DISK_ROLE_DEFINITION_ID")
     if (
         fallback_role is not None

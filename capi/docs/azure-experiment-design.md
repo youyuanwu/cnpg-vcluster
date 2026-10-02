@@ -62,6 +62,11 @@ The experiment includes:
 - a separate database-controller, pinned CNPG/Azure Disk CSI runtime and
   per-entry ASO Disk/static PV/PVC lifecycle (staged, not live-proven).
 
+The Tenant add-on Job verifies pinned SHA-256 values for both Calico chart
+archives before Helm reads them. This permits the experiment to tolerate an
+invalid GitHub TLS interception certificate without accepting unverified chart
+content; any byte drift fails the Job before installation.
+
 Azure Disk and CloudNativePG are installed independently of infrastructure
 readiness; their credentialed destructive validation remains an unmet
 release-acceptance gate.

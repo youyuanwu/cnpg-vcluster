@@ -41,8 +41,9 @@ pub struct AzureProviderConfiguration {
     pub identity_id: String, pub identity_client_id: String, pub supported_kubernetes_version: String,
     pub worker_sku: String, pub capi_version: String, pub capz_version: String, pub kamaji_capi_version: String,
     pub kamaji_chart_version: String, pub aso_version: String, pub cloud_provider_version: String,
-    pub calico_version: String, pub controller_image: String, pub foundation_defaults_sha256: String,
-    pub foundation_sha256: String,
+    pub calico_version: String, pub calico_crds_chart_sha256: String,
+    pub calico_operator_chart_sha256: String, pub controller_image: String,
+    pub foundation_defaults_sha256: String, pub foundation_sha256: String,
 }
 
 #[rustfmt::skip]
@@ -112,9 +113,14 @@ impl AzureProviderConfiguration {
             ("capiVersion", self.capi_version.as_str()), ("capzVersion", self.capz_version.as_str()),
             ("kamajiCapiVersion", self.kamaji_capi_version.as_str()), ("kamajiChartVersion", self.kamaji_chart_version.as_str()),
             ("asoVersion", self.aso_version.as_str()), ("cloudProviderVersion", self.cloud_provider_version.as_str()),
-            ("calicoVersion", self.calico_version.as_str()), ("controllerImage", self.controller_image.as_str()),
+            ("calicoVersion", self.calico_version.as_str()),
+            ("calicoCrdsChartSha256", self.calico_crds_chart_sha256.as_str()),
+            ("calicoOperatorChartSha256", self.calico_operator_chart_sha256.as_str()),
+            ("controllerImage", self.controller_image.as_str()),
             ("foundationDefaultsSha256", self.foundation_defaults_sha256.as_str()),
             ("foundationSha256", self.foundation_sha256.as_str()),
+            ("calicoCrdsChartSha256", self.calico_crds_chart_sha256.as_str()),
+            ("calicoOperatorChartSha256", self.calico_operator_chart_sha256.as_str()),
         ] {
             if value.is_empty() || value.trim() != value {
                 return Err(AzureConfigurationError::Field(name));
@@ -299,13 +305,22 @@ pub fn desired_objects(context: &AzureContext<'_>) -> Result<Vec<DynamicObject>,
     });
     let install = format!(
         "helm repo add cloud-provider-azure https://raw.githubusercontent.com/kubernetes-sigs/cloud-provider-azure/master/helm/repo\n\
-helm repo add projectcalico https://docs.tigera.io/calico/charts\n\
 helm upgrade --install cloud-provider-azure cloud-provider-azure/cloud-provider-azure --kubeconfig /tenant/value --version {} --namespace kube-system --values /values/cloud-provider.yaml --wait --timeout 10m\n\
-helm upgrade --install calico-crds projectcalico/crd.projectcalico.org.v1 --kubeconfig /tenant/value --version {} --namespace tigera-operator --create-namespace --wait --timeout 5m\n\
-helm upgrade --install calico projectcalico/tigera-operator --kubeconfig /tenant/value --version {} --namespace tigera-operator --create-namespace --values /values/calico.yaml --wait --timeout 10m",
+calico_crds=/tmp/calico-crds.tgz\n\
+calico_operator=/tmp/calico-operator.tgz\n\
+wget --no-check-certificate -q -O \"$calico_crds\" https://github.com/projectcalico/calico/releases/download/{}/crd.projectcalico.org.v1-{}.tgz\n\
+echo '{}  /tmp/calico-crds.tgz' | sha256sum -c -\n\
+wget --no-check-certificate -q -O \"$calico_operator\" https://github.com/projectcalico/calico/releases/download/{}/tigera-operator-{}.tgz\n\
+echo '{}  /tmp/calico-operator.tgz' | sha256sum -c -\n\
+helm upgrade --install calico-crds \"$calico_crds\" --kubeconfig /tenant/value --namespace tigera-operator --create-namespace --wait --timeout 5m\n\
+helm upgrade --install calico \"$calico_operator\" --kubeconfig /tenant/value --namespace tigera-operator --create-namespace --values /values/calico.yaml --wait --timeout 10m",
         config.cloud_provider_version.trim_start_matches('v'),
         config.calico_version,
-        config.calico_version
+        config.calico_version,
+        config.calico_crds_chart_sha256,
+        config.calico_version,
+        config.calico_version,
+        config.calico_operator_chart_sha256,
     );
     let mut azure_cluster = context.object(
         "infrastructure.cluster.x-k8s.io/v1beta1",
@@ -802,6 +817,8 @@ mod tests {
             "asoVersion":"v2.11.0",
             "cloudProviderVersion":"v1.32.3",
             "calicoVersion":"v3.32.2",
+            "calicoCrdsChartSha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            "calicoOperatorChartSha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
             "controllerImage":"yycvacr.azurecr.io/controller@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
             "foundationDefaultsSha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         });
@@ -1056,10 +1073,14 @@ mod tests {
             .as_str()
             .unwrap();
         assert!(job.contains("--version 1.32.3"));
-        assert!(job.contains("--version v3.32.2"));
+        assert!(job.contains("/releases/download/v3.32.2/"));
+        assert!(job.contains(&configuration().values.calico_crds_chart_sha256));
+        assert!(job.contains(&configuration().values.calico_operator_chart_sha256));
         assert!(!job.contains("cnpg"));
         assert!(!job.contains("azuredisk"));
-        assert!(!job.contains("wget"));
+        assert!(job.contains("wget --no-check-certificate"));
+        assert!(job.contains("sha256sum -c -"));
+        assert!(!job.contains("helm repo add projectcalico"));
         assert!(
             !serde_json::to_string(&objects)
                 .unwrap()
