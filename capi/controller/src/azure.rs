@@ -811,7 +811,7 @@ mod tests {
             "supportedKubernetesVersion":"1.32.13",
             "workerSku":"Standard_B2s",
             "capiVersion":"v1.10.7",
-            "capzVersion":"v1.21.1",
+            "capzVersion":"v1.21.3",
             "kamajiCapiVersion":"v0.19.0",
             "kamajiChartVersion":"26.8.6-edge",
             "asoVersion":"v2.11.0",
@@ -870,7 +870,7 @@ mod tests {
     fn configuration_is_typed_canonical_and_fail_closed() {
         let parsed = configuration();
         assert_eq!(parsed.config_map_uid, "provider-config-uid");
-        assert_eq!(parsed.values.capz_version, "v1.21.1");
+        assert_eq!(parsed.values.capz_version, "v1.21.3");
         assert_eq!(parsed.values.aso_version, "v2.11.0");
         assert!(sha256(&parsed.sha256));
         let binding = parsed.binding("tenant-uid", "spec-sha", "operation");

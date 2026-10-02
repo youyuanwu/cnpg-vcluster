@@ -261,7 +261,7 @@ The first tested matrix is:
 | AKS management Kubernetes | `1.35.7` |
 | Tenant Kubernetes and CAPZ image | `1.32.13` |
 | CAPI core, CABPK, and Kubeadm control-plane provider | `v1.10.7` |
-| CAPZ | `v1.21.1` |
+| CAPZ | `v1.21.3` |
 | Kamaji CAPI provider | `v0.19.0` |
 | Kamaji | `26.8.6-edge` |
 | Azure cloud provider | `v1.32.3` |
@@ -274,7 +274,7 @@ Tigera operator chart.
 
 ### External-control-plane compatibility
 
-CAPZ `v1.21.1` correctly accepts
+CAPZ `v1.21.3` correctly accepts
 `AzureCluster.spec.controlPlaneEnabled: false` for a Kamaji control plane, but
 its mutating webhook clears `networkSpec.apiServerLB` while load-balancer
 reconciliation still dereferences that field. The result is a nil-pointer
@@ -740,6 +740,13 @@ CI against an explicitly recorded experiment foundation. Real browser and
 service-proxy agreement on the same deployment is also unverified. Both are
 unmet gates, not passing checks; no Azure cloud mutation was attempted for
 this run.
+
+During the 2026-10-02 live validation, CAPZ `v1.21.1` removed the VMSS but
+left two finalizer-free, owner-bound `AzureMachinePoolMachine` objects, which
+blocked the Kubernetes cascade until those exact children were ordinarily
+deleted. The compatible patch pin is now `v1.21.3`; its deletion behavior has
+not yet been rerun against a fresh foundation, so this remains an open
+acceptance item rather than a claimed fix.
 
 ## References
 
