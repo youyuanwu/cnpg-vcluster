@@ -16,6 +16,7 @@ from unittest.mock import patch
 
 from scripts.azure import _run_profile_mutation
 from scripts.lib.azure.common import (
+    DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID,
     _foundation_defaults_checksum,
     load_azure_configuration,
     tenant_names,
@@ -38,6 +39,7 @@ from scripts.lib.azure.foundation import (
     _verify_azure_cutover_probe,
     _foundation_identity,
     _database_identity_blockers,
+    _deployment_parameters,
     _inspect_admin,
     _install_capi_capz,
     _install_admin,
@@ -1010,7 +1012,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         self.assertIn("subject: 'system:serviceaccount:tenant-system:database-controller'", foundation)
         self.assertIn("'Microsoft.Compute/disks/read'", foundation)
         self.assertIn("'Microsoft.Compute/disks/delete'", foundation)
-        self.assertIn("roleDefinitionId: databaseDiskRole.id", foundation)
+        self.assertIn("param databaseDiskRoleDefinitionId string = ''", foundation)
+        self.assertIn("roleDefinitionId: effectiveDatabaseDiskRoleId", foundation)
         self.assertIn("principalId: databaseIdentity.properties.principalId", foundation)
 
     def test_foundation_identity_requires_acr_role_and_controller_digest(self):
@@ -2100,6 +2103,39 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         path.chmod(0o600)
         with self.assertRaisesRegex(ConfigError, "AZURE_PREFIX"):
             load_azure_configuration(root)
+    def test_database_disk_role_fallback_is_explicit_and_foundation_bound(self):
+        root = self.make_root()
+        baseline = load_azure_configuration(root)
+        baseline_checksum = _foundation_defaults_checksum(root, baseline)
+        path = root / "config" / "azure.local.env"
+        with path.open("a", encoding="utf-8") as output:
+            output.write(
+                "AZURE_DATABASE_DISK_ROLE_DEFINITION_ID="
+                f"{DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID}\n"
+            )
+        config = load_azure_configuration(root)
+        self.assertIn(
+            "databaseDiskRoleDefinitionId="
+            + DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID,
+            _deployment_parameters(config),
+        )
+        self.assertNotEqual(
+            baseline_checksum,
+            _foundation_defaults_checksum(root, config),
+        )
+    def test_rejects_unknown_database_disk_role_fallback(self):
+        root = self.make_root()
+        path = root / "config" / "azure.local.env"
+        with path.open("a", encoding="utf-8") as output:
+            output.write(
+                "AZURE_DATABASE_DISK_ROLE_DEFINITION_ID="
+                "00000000-0000-0000-0000-000000000000\n"
+            )
+        with self.assertRaisesRegex(
+            ConfigError,
+            "Azure Backup Snapshot Contributor",
+        ):
+            load_azure_configuration(root)
     def test_rejects_invalid_controller_or_admin_repository_and_tag(self):
         for key, value in (
             ("AZURE_CONTROLLER_REPOSITORY", "Upper/Repo"),
@@ -2429,6 +2465,34 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 self.assertTrue(any(
                     expected in blocker for blocker in _database_identity_blockers(outputs)
                 ))
+
+    def test_database_builtin_disk_role_fallback_is_verified(self):
+        root = self.make_root()
+        outputs = copy.deepcopy(
+            self.inventory(root, load_azure_configuration(root))["outputs"]
+        )
+        outputs["databaseDiskRoleId"] = (
+            "/subscriptions/redacted/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            + DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID
+        )
+
+        def use_builtin_role(resources, _):
+            properties = resources["disk role"]["properties"]
+            properties["type"] = "BuiltInRole"
+            properties["assignableScopes"] = ["/"]
+            properties["permissions"][0]["actions"].extend(
+                [
+                    "Microsoft.Compute/disks/write",
+                    "Microsoft.Compute/virtualMachines/write",
+                ]
+            )
+
+        with patch(
+            "scripts.lib.azure.foundation._az",
+            side_effect=self.database_azure(outputs, change=use_builtin_role),
+        ):
+            self.assertEqual([], _database_identity_blockers(outputs))
 
     def test_destroy_refuses_database_identity_drift(self):
         root = self.make_root()

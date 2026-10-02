@@ -178,7 +178,10 @@ def install_tenant_database_runtime(
     return True
 
 
-def _validate_database_outputs(outputs: Mapping[str, object], prefix: str) -> None:
+def _validate_database_outputs(
+    outputs: Mapping[str, object],
+    prefix: str,
+) -> None:
     missing = [
         key for key in DATABASE_OUTPUTS
         if not isinstance(outputs.get(key), str) or not outputs[key]
@@ -196,6 +199,12 @@ def _validate_database_outputs(outputs: Mapping[str, object], prefix: str) -> No
         f"{prefix}-database-controller"
     )
     authorization = f"{group}/providers/Microsoft.Authorization"
+    subscription = group.split("/resourceGroups/", 1)[0]
+    fallback_role = (
+        f"{subscription}/providers/"
+        "Microsoft.Authorization/roleDefinitions/"
+        f"{DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID}"
+    )
     if (
         not group
         or outputs.get("resourceGroupName") != group_name
@@ -208,8 +217,11 @@ def _validate_database_outputs(outputs: Mapping[str, object], prefix: str) -> No
         or _azure_id_equal(identity, outputs.get("identityId"))
         or outputs["databaseIdentityClientId"] == outputs.get("identityClientId")
         or outputs["databaseIdentityPrincipalId"] == outputs.get("identityPrincipalId")
-        or not str(outputs["databaseDiskRoleId"]).lower().startswith(
-            (authorization + "/roleDefinitions/").lower()
+        or not (
+            str(outputs["databaseDiskRoleId"]).lower().startswith(
+                (authorization + "/roleDefinitions/").lower()
+            )
+            or _azure_id_equal(outputs["databaseDiskRoleId"], fallback_role)
         )
         or not str(outputs["databaseDiskAssignmentId"]).lower().startswith(
             (authorization + "/roleAssignments/").lower()
@@ -286,7 +298,7 @@ def preflight(
         )
     return result
 def _deployment_parameters(config: Mapping[str, str]) -> list[str]:
-    return [
+    parameters = [
         f"prefix={config['AZURE_PREFIX']}",
         f"location={config['AZURE_LOCATION']}",
         f"aksKubernetesVersion={config['AZURE_AKS_KUBERNETES_VERSION']}",
@@ -299,6 +311,10 @@ def _deployment_parameters(config: Mapping[str, str]) -> list[str]:
         f"aksServiceCidr={config['AZURE_AKS_SERVICE_CIDR']}",
         f"aksDnsServiceIP={config['AZURE_AKS_DNS_SERVICE_IP']}",
     ]
+    fallback_role = config.get("AZURE_DATABASE_DISK_ROLE_DEFINITION_ID")
+    if fallback_role:
+        parameters.append(f"databaseDiskRoleDefinitionId={fallback_role}")
+    return parameters
 
 
 def _write_inventory(root: Path, payload: Mapping[str, object]) -> None:
@@ -2552,23 +2568,44 @@ def _database_identity_blockers(outputs: Mapping[str, str]) -> list[str]:
             if isinstance(permissions, list) and len(permissions) == 1
             else None
         )
+        fallback_role = str(outputs["databaseDiskRoleId"]).lower().endswith(
+            "/" + DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID
+        )
+        actions = (
+            {str(action).lower() for action in permission["actions"]}
+            if isinstance(permission, dict)
+            and isinstance(permission.get("actions"), list)
+            else set()
+        )
         if (
             not _azure_id_equal(role.get("id"), outputs["databaseDiskRoleId"])
             or not isinstance(properties, dict)
-            or properties.get("type") != "CustomRole"
-            or not isinstance(properties.get("assignableScopes"), list)
-            or len(properties["assignableScopes"]) != 1
-            or not _azure_id_equal(
-                properties["assignableScopes"][0], outputs["resourceGroupId"]
-            )
             or not isinstance(permission, dict)
-            or not isinstance(permission.get("actions"), list)
-            or len(permission["actions"]) != len(DATABASE_DISK_ACTIONS)
-            or {str(action).lower() for action in permission["actions"]}
-            != {action.lower() for action in DATABASE_DISK_ACTIONS}
-            or any(
-                permission.get(key) != []
-                for key in ("notActions", "dataActions", "notDataActions")
+            or (
+                (
+                    properties.get("type") != "BuiltInRole"
+                    or properties.get("assignableScopes") != ["/"]
+                    or not {
+                        action.lower() for action in DATABASE_DISK_ACTIONS
+                    }.issubset(actions)
+                )
+                if fallback_role
+                else (
+                    properties.get("type") != "CustomRole"
+                    or not isinstance(properties.get("assignableScopes"), list)
+                    or len(properties["assignableScopes"]) != 1
+                    or not _azure_id_equal(
+                        properties["assignableScopes"][0],
+                        outputs["resourceGroupId"],
+                    )
+                    or len(actions) != len(DATABASE_DISK_ACTIONS)
+                    or actions
+                    != {action.lower() for action in DATABASE_DISK_ACTIONS}
+                    or any(
+                        permission.get(key) != []
+                        for key in ("notActions", "dataActions", "notDataActions")
+                    )
+                )
             )
         ):
             blockers.append("Azure database disk role permissions changed")

@@ -11,6 +11,7 @@ param tenantSubnetCidr string
 param aksPodCidr string
 param aksServiceCidr string
 param aksDnsServiceIP string
+param databaseDiskRoleDefinitionId string = ''
 
 var commonTags = {
   'cnpg-vcluster-experiment': 'azure-capi'
@@ -24,6 +25,17 @@ var contributorRoleDefinitionId = subscriptionResourceId(
   'Microsoft.Authorization/roleDefinitions',
   'b24988ac-6180-42a0-ab88-20f7382dd24c'
 )
+var customDatabaseDiskRoleName = guid(resourceGroup().id, 'database-disk-read-delete')
+var customDatabaseDiskRoleId = subscriptionResourceId(
+  'Microsoft.Authorization/roleDefinitions',
+  customDatabaseDiskRoleName
+)
+var effectiveDatabaseDiskRoleId = empty(databaseDiskRoleDefinitionId)
+  ? customDatabaseDiskRoleId
+  : subscriptionResourceId(
+      'Microsoft.Authorization/roleDefinitions',
+      databaseDiskRoleDefinitionId
+    )
 
 resource vnet 'Microsoft.Network/virtualNetworks@2024-05-01' = {
   name: '${prefix}-vnet'
@@ -192,8 +204,8 @@ resource databaseIdentity 'Microsoft.ManagedIdentity/userAssignedIdentities@2023
   tags: commonTags
 }
 
-resource databaseDiskRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = {
-  name: guid(resourceGroup().id, 'database-disk-read-delete')
+resource databaseDiskRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' = if (empty(databaseDiskRoleDefinitionId)) {
+  name: customDatabaseDiskRoleName
   properties: {
     roleName: '${prefix}-database-disk-read-delete'
     description: 'Read and remove exact managed disks during catalog entry finalization'
@@ -216,9 +228,9 @@ resource databaseDiskRole 'Microsoft.Authorization/roleDefinitions@2022-04-01' =
 }
 
 resource databaseDiskAssignment 'Microsoft.Authorization/roleAssignments@2022-04-01' = {
-  name: guid(resourceGroup().id, databaseIdentity.id, databaseDiskRole.id)
+  name: guid(resourceGroup().id, databaseIdentity.id, effectiveDatabaseDiskRoleId)
   properties: {
-    roleDefinitionId: databaseDiskRole.id
+    roleDefinitionId: effectiveDatabaseDiskRoleId
     principalId: databaseIdentity.properties.principalId
     principalType: 'ServicePrincipal'
   }
@@ -263,6 +275,6 @@ output asoFederationId string = asoFederation.id
 output databaseIdentityId string = databaseIdentity.id
 output databaseIdentityClientId string = databaseIdentity.properties.clientId
 output databaseIdentityPrincipalId string = databaseIdentity.properties.principalId
-output databaseDiskRoleId string = databaseDiskRole.id
+output databaseDiskRoleId string = effectiveDatabaseDiskRoleId
 output databaseDiskAssignmentId string = databaseDiskAssignment.id
 output databaseFederationId string = databaseFederation.id

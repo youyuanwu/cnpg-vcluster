@@ -66,6 +66,14 @@ Azure Disk and CloudNativePG are installed independently of infrastructure
 readiness; their credentialed destructive validation remains an unmet
 release-acceptance gate.
 
+The database-controller normally receives a resource-group-scoped custom role
+with only managed-disk read and delete. Subscriptions that have exhausted the
+tenant-wide custom role-definition quota can explicitly select the built-in
+Azure Backup Snapshot Contributor role by its pinned definition ID. Its
+assignment is still limited to the experiment resource group, but it grants
+additional disk, restore-point, and VM operations and is therefore a
+documented experiment-only fallback rather than the default.
+
 ## Non-goals
 
 The experiment does not initially provide:

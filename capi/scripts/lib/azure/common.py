@@ -57,6 +57,10 @@ FOUNDATION_DEFAULT_KEYS = (
     "AZURE_DISK_CSI_VERSION",
     "AZURE_CONTROLLER_REPOSITORY",
     "AZURE_CONTROLLER_TAG",
+    "AZURE_DATABASE_DISK_ROLE_DEFINITION_ID",
+)
+DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID = (
+    "afc680e2-a938-412d-b213-9a49efa7fb83"
 )
 REQUIRED_PROVIDERS = (
     "Microsoft.Authorization",
@@ -164,6 +168,15 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
     ):
         raise ConfigError(
             "AZURE_TENANT_ALLOCATION_APPROVED_SHA256 must be a lowercase SHA-256"
+        )
+    fallback_role = config.get("AZURE_DATABASE_DISK_ROLE_DEFINITION_ID")
+    if (
+        fallback_role is not None
+        and fallback_role != DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID
+    ):
+        raise ConfigError(
+            "AZURE_DATABASE_DISK_ROLE_DEFINITION_ID must select the supported "
+            "Azure Backup Snapshot Contributor fallback role"
         )
     for key, expected in (
         ("AZURE_CNPG_VERSION", "1.30.0"),

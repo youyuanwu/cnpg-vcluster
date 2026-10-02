@@ -103,6 +103,15 @@ Azure foundation operations use the ignored owner-only
 specification as a command input; the client converts it to the Azure Tenant
 CR shape and observes operator status:
 
+The foundation normally creates a resource-group-scoped custom role containing
+only managed-disk read and delete. If the Azure tenant has exhausted its custom
+role-definition quota, the owner may explicitly set
+`AZURE_DATABASE_DISK_ROLE_DEFINITION_ID=afc680e2-a938-412d-b213-9a49efa7fb83`
+to use the built-in Azure Backup Snapshot Contributor role. The assignment
+remains scoped to the experiment resource group, but the built-in role grants
+additional disk, restore-point, and VM operations; omit the setting whenever
+custom role creation is available.
+
 ```bash
 just azure-preflight
 just azure-create-foundation
