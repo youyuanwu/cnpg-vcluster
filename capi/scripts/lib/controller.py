@@ -1009,6 +1009,31 @@ def _verify_probe_exception(
     client: ManagementClient, name: str, uid: str, *, timeout: int = 90,
 ) -> None:
     namespace = f"tenant-db-{name}"
+
+    def namespace_ready() -> bool:
+        current = _probe_resource(client, f"namespace/{namespace}")
+        if current is None:
+            return False
+        metadata = current.get("metadata", {})
+        if (
+            metadata.get("name") != namespace
+            or not isinstance(metadata.get("uid"), str)
+            or not metadata["uid"]
+            or metadata.get("labels", {}).get(
+                "tenancy.cnpg-vcluster.io/tenant-uid"
+            ) != uid
+            or metadata.get("deletionTimestamp")
+            or metadata.get("ownerReferences")
+        ):
+            raise RuntimeError("bootstrap database namespace identity is occupied")
+        return True
+
+    wait_for(
+        "UID-bound bootstrap database namespace",
+        timeout,
+        2,
+        namespace_ready,
+    )
     existing = _probe_resource(client, f"tenantdatabasecatalog/{name}", namespace=namespace)
     if existing is not None and (
         existing.get("metadata", {}).get("name") != name

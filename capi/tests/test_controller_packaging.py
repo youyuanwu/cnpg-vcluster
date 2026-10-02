@@ -356,6 +356,17 @@ class PackagingTests(unittest.TestCase):
     def test_probe_exception_rejects_nonmatching_uid_as_controller_service_account(self):
         def client(allow_foreign=False):
             def handler(*args, **kwargs):
+                if args[:2] == (
+                    "get",
+                    "namespace/tenant-db-catalog-bootstrap-probe",
+                ):
+                    return response({"metadata": {
+                        "name": "tenant-db-catalog-bootstrap-probe",
+                        "uid": "namespace-uid",
+                        "labels": {
+                            "tenancy.cnpg-vcluster.io/tenant-uid": "uid-123",
+                        },
+                    }})
                 if "create" in args:
                     document = json.loads(kwargs["input_text"])
                     if document["spec"]["tenantUID"] == "uid-123" or allow_foreign:
@@ -381,11 +392,26 @@ class PackagingTests(unittest.TestCase):
                 client(allow_foreign=True), "catalog-bootstrap-probe", "uid-123",
             )
 
-    def test_probe_exception_waits_for_policy_propagation(self):
+    def test_probe_exception_waits_for_namespace_and_policy_propagation(self):
+        namespace_attempts = 0
         attempts = 0
 
         def handler(*args, **kwargs):
-            nonlocal attempts
+            nonlocal attempts, namespace_attempts
+            if args[:2] == (
+                "get",
+                "namespace/tenant-db-catalog-bootstrap-probe",
+            ):
+                namespace_attempts += 1
+                if namespace_attempts == 1:
+                    return response()
+                return response({"metadata": {
+                    "name": "tenant-db-catalog-bootstrap-probe",
+                    "uid": "namespace-uid",
+                    "labels": {
+                        "tenancy.cnpg-vcluster.io/tenant-uid": "uid-123",
+                    },
+                }})
             if "create" not in args:
                 return response()
             document = json.loads(kwargs["input_text"])
@@ -416,6 +442,7 @@ class PackagingTests(unittest.TestCase):
                 "uid-123",
                 timeout=1,
             )
+        self.assertEqual(namespace_attempts, 2)
         self.assertEqual(attempts, 2)
         self.assertEqual(len([
             args for args, _ in client.calls if "create" in args
