@@ -44,8 +44,10 @@ const BASE_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
         &["get", "patch", "update"],
     ),
 ];
-const AZURE_EXTRA_PERMISSIONS: &[(&str, &[&str], &[&str])] =
-    &[("cluster.x-k8s.io", &["clusters/status"], &["get", "patch"])];
+const AZURE_EXTRA_PERMISSIONS: &[(&str, &[&str], &[&str])] = &[
+    ("cluster.x-k8s.io", &["clusters/status"], &["get", "patch"]),
+    ("compute.azure.com", &["disks"], &["get", "list"]),
+];
 
 fn rule(group: &str, resources: &[&str], verbs: &[&str]) -> PolicyRule {
     PolicyRule {
@@ -188,6 +190,11 @@ mod tests {
         assert!(!azure_rules.iter().any(|rule| {
             rule.api_groups.as_deref() == Some(&["coordination.k8s.io".into()])
                 && rule.resources.as_deref() == Some(&["leases".into()])
+        }));
+        assert!(azure_rules.iter().any(|rule| {
+            rule.api_groups.as_deref() == Some(&["compute.azure.com".into()])
+                && rule.resources.as_deref() == Some(&["disks".into()])
+                && rule.verbs == ["get".to_string(), "list".to_string()]
         }));
         for resource in MANAGEMENT_RESOURCES
             .iter()

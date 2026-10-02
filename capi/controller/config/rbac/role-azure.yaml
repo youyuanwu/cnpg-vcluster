@@ -77,6 +77,13 @@ rules:
   - get
   - patch
 - apiGroups:
+  - compute.azure.com
+  resources:
+  - disks
+  verbs:
+  - get
+  - list
+- apiGroups:
   - ''
   resources:
   - namespaces

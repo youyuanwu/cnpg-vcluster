@@ -413,9 +413,11 @@ fn provider_config() -> ConfigMap {
         "identityName":"identity",
         "identityId":"/subscriptions/subscription/resourceGroups/group/providers/Microsoft.ManagedIdentity/userAssignedIdentities/identity",
         "identityClientId":"client-id","supportedKubernetesVersion":"1.32.13",
-        "workerSku":"Standard_B2s","capiVersion":"v1.10.7","capzVersion":"v1.21.1",
+        "workerSku":"Standard_B2s","capiVersion":"v1.10.7","capzVersion":"v1.21.3",
         "kamajiCapiVersion":"v0.19.0","kamajiChartVersion":"26.8.6-edge",
         "asoVersion":"v2.11.0","cloudProviderVersion":"v1.32.3","calicoVersion":"v3.32.2",
+        "calicoCrdsChartSha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        "calicoOperatorChartSha256":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         "controllerImage":"example.azurecr.io/controller@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "foundationDefaultsSha256":"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     });

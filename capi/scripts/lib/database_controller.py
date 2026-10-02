@@ -122,7 +122,10 @@ def install_azure_database_runtime(
     installers = (
         ("cnpg", "cnpg-system", "CNPG_CONTROLLER_IMAGE", ()),
         ("azuredisk", "kube-system", "AZURE_DISK_CSI_IMAGE",
-         ("--set", "controller.allowEmptyCloudConfig=true")),
+         (
+             "--set", "controller.allowEmptyCloudConfig=true",
+             "--set", "controller.replicas=1",
+         )),
     )
     scratch = root / ".runtime" / "azure-database-installer"
     ensure_private_dir(scratch)
@@ -171,10 +174,10 @@ def install_azure_database_runtime(
                         "--namespace", namespace, "--create-namespace",
                         "--set-string", f"{image_options[0]}={repository}",
                         "--set-string", f"{image_options[1]}={tag}",
-                        *options, "--atomic", "--wait", "--timeout", "2m",
+                        *options, "--atomic", "--wait", "--timeout", "5m",
                         "--description", marker,
                     ],
-                    timeout=150,
+                    timeout=330,
                 )
             except (subprocess.SubprocessError, RuntimeError, ValueError) as exc:
                 failures.append(f"{release}: {exc}")

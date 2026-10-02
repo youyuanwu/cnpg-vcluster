@@ -14,6 +14,7 @@ param tenantSubnetCidr string
 param aksPodCidr string
 param aksServiceCidr string
 param aksDnsServiceIP string
+param databaseDiskRoleDefinitionId string = ''
 
 var resourceGroupName = '${prefix}-rg'
 
@@ -42,6 +43,7 @@ module foundation './foundation.bicep' = {
     aksPodCidr: aksPodCidr
     aksServiceCidr: aksServiceCidr
     aksDnsServiceIP: aksDnsServiceIP
+    databaseDiskRoleDefinitionId: databaseDiskRoleDefinitionId
   }
 }
 

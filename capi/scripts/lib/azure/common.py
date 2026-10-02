@@ -57,6 +57,10 @@ FOUNDATION_DEFAULT_KEYS = (
     "AZURE_DISK_CSI_VERSION",
     "AZURE_CONTROLLER_REPOSITORY",
     "AZURE_CONTROLLER_TAG",
+    "AZURE_DATABASE_DISK_ROLE_DEFINITION_ID",
+)
+DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID = (
+    "afc680e2-a938-412d-b213-9a49efa7fb83"
 )
 REQUIRED_PROVIDERS = (
     "Microsoft.Authorization",
@@ -132,6 +136,8 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
         "AZURE_KAMAJI_CHART_VERSION",
         "AZURE_CLOUD_PROVIDER_VERSION",
         "AZURE_CALICO_VERSION",
+        "AZURE_CALICO_CRDS_CHART_SHA256",
+        "AZURE_CALICO_OPERATOR_CHART_SHA256",
         "AZURE_TENANT_ALLOCATION_APPROVED_SHA256",
         "AZURE_CONTROLLER_REPOSITORY",
         "AZURE_CONTROLLER_TAG",
@@ -159,11 +165,21 @@ def load_azure_configuration(root: Path) -> dict[str, str]:
     for key in ("AZURE_CONTROLLER_TAG", "AZURE_ADMIN_TAG"):
         if not CONTROLLER_TAG_RE.fullmatch(config[key]):
             raise ConfigError(f"{key} must be a valid OCI tag")
-    if not re.fullmatch(
-        r"[0-9a-f]{64}", config["AZURE_TENANT_ALLOCATION_APPROVED_SHA256"]
+    for key in (
+        "AZURE_TENANT_ALLOCATION_APPROVED_SHA256",
+        "AZURE_CALICO_CRDS_CHART_SHA256",
+        "AZURE_CALICO_OPERATOR_CHART_SHA256",
+    ):
+        if not re.fullmatch(r"[0-9a-f]{64}", config[key]):
+            raise ConfigError(f"{key} must be a lowercase SHA-256")
+    fallback_role = config.get("AZURE_DATABASE_DISK_ROLE_DEFINITION_ID")
+    if (
+        fallback_role is not None
+        and fallback_role != DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID
     ):
         raise ConfigError(
-            "AZURE_TENANT_ALLOCATION_APPROVED_SHA256 must be a lowercase SHA-256"
+            "AZURE_DATABASE_DISK_ROLE_DEFINITION_ID must select the supported "
+            "Azure Backup Snapshot Contributor fallback role"
         )
     for key, expected in (
         ("AZURE_CNPG_VERSION", "1.30.0"),

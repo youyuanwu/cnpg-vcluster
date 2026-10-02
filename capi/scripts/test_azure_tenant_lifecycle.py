@@ -24,7 +24,11 @@ from scripts.lib.azure.common import (
     load_azure_configuration,
     names,
 )
-from scripts.lib.azure.foundation import ADMIN_SERVICE_PROXY, _inspect_foundation
+from scripts.lib.azure.foundation import (
+    ADMIN_SERVICE_PROXY,
+    _azure_tenant_api_tunnel,
+    _inspect_foundation,
+)
 from scripts.lib.azure.gate import (
     WorkerSnapshot,
     build_worker_snapshot,
@@ -189,7 +193,8 @@ def _require_catalog_absent(name: str) -> None:
 
 def _tenant_kubectl(tenant: Mapping[str, object], *arguments: str):
     name = tenant["metadata"]["name"]
-    bound = tenant["status"]["provider"]["kubeconfig"]
+    provider = tenant["status"]["provider"]
+    bound = provider["kubeconfig"]
     secret = json.loads(_kubectl(
         ROOT, "-n", name, "get", f"secret/{name}-kubeconfig", "-o", "json",
     ).stdout)
@@ -206,10 +211,22 @@ def _tenant_kubectl(tenant: Mapping[str, object], *arguments: str):
         descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         with os.fdopen(descriptor, "wb") as output:
             output.write(data)
-        return run(
-            [str(ROOT / ".tools/bin/kubectl"), "--kubeconfig", str(path), *arguments],
-            timeout=300,
-        )
+        with _azure_tenant_api_tunnel(
+            ROOT,
+            name,
+            name,
+            path,
+            provider["endpoint"],
+        ):
+            return run(
+                [
+                    str(ROOT / ".tools/bin/kubectl"),
+                    "--kubeconfig",
+                    str(path),
+                    *arguments,
+                ],
+                timeout=300,
+            )
 
 
 def _failover(tenant: Mapping[str, object], entry: Mapping[str, object]) -> None:
@@ -466,7 +483,7 @@ def _require_only_runtime_tenant(spec, expected: Mapping[str, object]) -> None:
     inventory = json.loads(_kubectl(ROOT, "get", "tenants", "-o", "json").stdout)
     if (
         not isinstance(inventory, dict)
-        or inventory.get("kind") != "TenantList"
+        or inventory.get("kind") not in {"List", "TenantList"}
         or not isinstance(inventory.get("metadata"), dict)
         or inventory["metadata"].get("continue", "") != ""
         or not isinstance(inventory.get("items"), list)

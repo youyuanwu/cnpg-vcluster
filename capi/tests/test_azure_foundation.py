@@ -10,18 +10,20 @@ import subprocess
 import sys
 import time
 import unittest
-from contextlib import redirect_stdout
+from contextlib import nullcontext, redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from scripts.azure import _run_profile_mutation
 from scripts.lib.azure.common import (
+    DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID,
     _foundation_defaults_checksum,
     load_azure_configuration,
     tenant_names,
 )
 from scripts.lib.azure.foundation import (
     ACR_PULL_ROLE_DEFINITION_ID,
+    ASO_DISK_CRD_PATTERN,
     CAPI_CAPZ_DEPLOYMENTS,
     TENANT_ALLOCATION_APPROVAL,
     TENANT_ALLOCATION_CONFIG,
@@ -29,18 +31,23 @@ from scripts.lib.azure.foundation import (
     TENANT_CONTROLLER_CONFIG,
     TENANT_CONTROLLER_CONFIG_KEY,
     _azure_provider_configuration,
+    _azure_bootstrap_resume_images,
+    _aso_disk_crd_patch,
     _azure_allocation_configuration,
     _azure_cutover_lock,
     _azure_cutover_inventory,
     _validated_azure_list,
     _prepare_azure_tenant_api_cutover,
     _verify_azure_controller_allocation_readiness,
+    _verify_azure_cutover_lock,
     _verify_azure_cutover_probe,
     _foundation_identity,
     _database_identity_blockers,
+    _deployment_parameters,
     _inspect_admin,
     _install_capi_capz,
     _install_admin,
+    _require_empty_admin_upgrade,
     _install_tenant_controller,
     _inspect_foundation,
     install_tenant_database_runtime,
@@ -110,10 +117,18 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     "type": "azure",
                     "binding": {"tenantUID": "tenant-uid"},
                     "management": {"namespaceUID": "ns-uid", "clusterUID": "cluster-uid"},
+                    "endpoint": "10.220.0.6:6443",
                     "kubeconfig": {
                         "secretUID": "secret-uid",
                         "contentSha256": hashlib.sha256(content).hexdigest(),
                     },
+                    "providerResources": [{
+                        "apiVersion": "v1",
+                        "kind": "Service",
+                        "namespace": tenant_name,
+                        "name": tenant_name,
+                        "uid": "service-uid",
+                    }],
                 },
             },
         }
@@ -137,6 +152,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return completed(json.dumps({"metadata": {"uid": "ns-uid"}}))
             if f"secret/{tenant_name}-kubeconfig" in args:
                 return completed(json.dumps(secret))
+            if f"service/{tenant_name}" in args:
+                return completed(json.dumps({
+                    "metadata": {"uid": "service-uid"},
+                }))
             raise AssertionError(args)
 
         failures = [RuntimeError("cnpg unavailable"), None]
@@ -150,6 +169,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
 
         with (
             patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl),
+            patch(
+                "scripts.lib.azure.foundation._azure_tenant_api_tunnel",
+                side_effect=lambda *_args: nullcontext(),
+            ),
             patch("scripts.lib.azure.foundation.install_azure_database_runtime",
                   side_effect=install) as installer,
         ):
@@ -167,7 +190,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
 
     def test_database_install_worker_keeps_other_tenants_and_retries(self):
         root = self.make_root()
-        listing = {"kind": "TenantList", "metadata": {}, "items": [
+        listing = {"kind": "List", "metadata": {}, "items": [
             {"metadata": {"name": "tenant-a"}, "status": {
                 "phase": "Ready", "provider": {"type": "azure"}}},
             {"metadata": {"name": "tenant-b"}, "status": {
@@ -236,6 +259,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return completed(json.dumps({"metadata": {"uid": "allocation-uid"}}))
             return completed()
 
+        def release_failure(*_args, **kwargs):
+            kwargs["prepare_capability"]("tenant-c")
+            raise RuntimeError("release gates blocked")
+
         with (
             patch("scripts.lib.azure.foundation.CATALOG_LIFECYCLE_READY", True),
             patch("scripts.lib.azure.foundation._push_controller_image", return_value=image),
@@ -251,14 +278,22 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                   return_value=root / "manager.yaml"),
             patch("scripts.lib.azure.foundation._kubectl", side_effect=kubectl) as command,
             patch("scripts.lib.azure.foundation.load_configuration",
-                  return_value={"DELETE_TIMEOUT": "1s", "CONDITION_TIMEOUT": "1s"}),
+                  return_value={
+                      "DELETE_TIMEOUT": "1s",
+                      "CONDITION_TIMEOUT": "1s",
+                      "TRUNK_SHA256": "tool-hash",
+                  }),
             patch("scripts.lib.azure.foundation.install_database_catalog"),
             patch("scripts.lib.azure.foundation.install_database_controller"),
+            patch(
+                "scripts.lib.azure.foundation.install_tenant_database_runtime",
+                return_value=True,
+            ) as runtime,
             patch("scripts.lib.azure.foundation.verify_catalog_cutover_lock"),
             patch("scripts.lib.azure.foundation._verify_azure_cutover_lock"),
             patch("scripts.lib.azure.foundation._verify_azure_controller_allocation_readiness"),
             patch("scripts.lib.azure.foundation.release_catalog_and_tenant_cutover_locks",
-                  side_effect=RuntimeError("release gates blocked")) as release,
+                  side_effect=release_failure) as release,
             patch("scripts.lib.azure.foundation._azure_cutover_lock") as tenant_unlock,
             patch("scripts.lib.azure.foundation._verify_azure_cutover_probe") as tenant_probe,
             self.assertRaisesRegex(RuntimeError, "release gates blocked"),
@@ -270,6 +305,12 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         self.assertEqual(
             release.call_args.kwargs["database_image"],
             "registry.example/database@sha256:" + "2" * 64,
+        )
+        runtime_config = runtime.call_args.args[1]
+        self.assertEqual(runtime_config["TRUNK_SHA256"], "tool-hash")
+        self.assertEqual(
+            runtime_config["AZURE_SUBSCRIPTION_ID"],
+            config["AZURE_SUBSCRIPTION_ID"],
         )
         tenant_unlock.assert_not_called()
         tenant_probe.assert_not_called()
@@ -448,6 +489,43 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             _verify_azure_cutover_probe(root, config)
         self.assertTrue(any(arguments[0] == "create" for arguments in calls))
         self.assertTrue(any(arguments[0] == "delete" for arguments in calls))
+
+    def test_azure_cutover_lock_waits_for_policy_propagation(self):
+        root = self.make_root()
+        responses = [
+            completed(),
+            subprocess.CompletedProcess(
+                [],
+                1,
+                stdout="",
+                stderr="Tenant creation is locked during API cutover",
+            ),
+        ]
+        documents = []
+
+        def kubectl(_root, *_arguments, **kwargs):
+            documents.append(json.loads(kwargs["input_text"]))
+            return responses.pop(0)
+
+        with (
+            patch(
+                "scripts.lib.azure.foundation._kubectl",
+                side_effect=kubectl,
+            ) as kubectl,
+            patch("scripts.lib.azure.foundation.time.sleep") as sleep,
+        ):
+            _verify_azure_cutover_lock(
+                root,
+                "v1alpha4",
+                timeout_seconds=10,
+            )
+        self.assertEqual(2, kubectl.call_count)
+        sleep.assert_called_once_with(2)
+        self.assertTrue(documents)
+        self.assertTrue(all(
+            len(document["metadata"]["name"]) <= 30
+            for document in documents
+        ))
 
     def test_azure_cutover_readiness_proves_ready_pod_and_leader_lease(self):
         root = self.make_root()
@@ -1010,7 +1088,8 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         self.assertIn("subject: 'system:serviceaccount:tenant-system:database-controller'", foundation)
         self.assertIn("'Microsoft.Compute/disks/read'", foundation)
         self.assertIn("'Microsoft.Compute/disks/delete'", foundation)
-        self.assertIn("roleDefinitionId: databaseDiskRole.id", foundation)
+        self.assertIn("param databaseDiskRoleDefinitionId string = ''", foundation)
+        self.assertIn("roleDefinitionId: effectiveDatabaseDiskRoleId", foundation)
         self.assertIn("principalId: databaseIdentity.properties.principalId", foundation)
 
     def test_foundation_identity_requires_acr_role_and_controller_digest(self):
@@ -1036,6 +1115,87 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         )
         with self.assertRaisesRegex(RuntimeError, "controller inventory"):
             _foundation_identity(broken)
+
+    def test_bootstrap_resume_reuses_recorded_controller_images(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        controller_image = inventory["controllerImage"]
+        database_image = (
+            "yycvacr.azurecr.io/database-controller@sha256:" + "2" * 64
+        )
+        provider = _azure_provider_configuration(
+            config,
+            inventory,
+            controller_image,
+        )
+        provider_sha256 = hashlib.sha256(json.dumps(
+            provider,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()).hexdigest()
+        runtime = root / ".runtime" / "azure"
+        runtime.parent.mkdir()
+        runtime.parent.chmod(0o700)
+        runtime.mkdir()
+        runtime.chmod(0o700)
+        write_private_file(
+            runtime / "catalog-bootstrap-probe.json",
+            json.dumps({
+                "schema": 1,
+                "provider": "azure",
+                "uid": "tenant-uid",
+                "token": "a" * 32,
+            }),
+        )
+        tenant = {
+            "metadata": {
+                "uid": "tenant-uid",
+                "annotations": {
+                    "tenancy.cnpg-vcluster.io/catalog-bootstrap-token": "a" * 32,
+                },
+            },
+            "status": {"provider": {"binding": {
+                "controllerImage": controller_image,
+                "providerConfigSha256": provider_sha256,
+            }}},
+        }
+        deployment = {
+            "metadata": {},
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "manager",
+                "image": database_image,
+            }]}}},
+        }
+        with patch(
+            "scripts.lib.azure.foundation._get_management_resource",
+            side_effect=[tenant, deployment],
+        ):
+            self.assertEqual(
+                (controller_image, database_image),
+                _azure_bootstrap_resume_images(root, config, inventory),
+            )
+
+    def test_aso_disk_crd_patch_is_exact_and_idempotent(self):
+        deployment = {
+            "spec": {"template": {"spec": {"containers": [{
+                "name": "manager",
+                "args": ["--v=2", "--crd-pattern=", "--webhook-port=9443"],
+            }]}}},
+        }
+        patch = _aso_disk_crd_patch(deployment)
+        self.assertEqual(2, len(patch))
+        self.assertEqual("test", patch[0]["op"])
+        self.assertEqual("--crd-pattern=", patch[0]["value"])
+        self.assertEqual(
+            f"--crd-pattern={ASO_DISK_CRD_PATTERN}",
+            patch[1]["value"],
+        )
+        deployment["spec"]["template"]["spec"]["containers"][0]["args"][1] = (
+            patch[1]["value"]
+        )
+        self.assertEqual([], _aso_disk_crd_patch(deployment))
+
     def test_foundation_health_fails_closed_on_acr_or_pull_role_drift(self):
         root = self.make_root()
         config = load_azure_configuration(root)
@@ -1507,14 +1667,49 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 return_value=image,
             ),
             patch(
-                "scripts.lib.azure.foundation.render_azure_admin_deployment"
+                "scripts.lib.azure.foundation._require_empty_admin_upgrade",
+            ) as empty,
+            patch(
+                "scripts.lib.azure.foundation.render_azure_admin_deployment",
+                return_value=rendered,
             ) as render,
+            patch(
+                "scripts.lib.azure.foundation._inspect_admin",
+                return_value=("admin-uid", ()),
+            ),
             patch("scripts.lib.azure.foundation._kubectl") as kubectl,
-            self.assertRaisesRegex(RuntimeError, "image identity changed"),
         ):
-            _install_admin(root, config, recorded)
-        render.assert_not_called()
-        kubectl.assert_not_called()
+            self.assertEqual(
+                (image, "admin-uid"),
+                _install_admin(root, config, recorded),
+            )
+        empty.assert_called_once_with(root)
+        render.assert_called_once_with(root, image)
+
+    def test_admin_upgrade_rejects_live_tenant_or_catalog(self):
+        root = self.make_root()
+        for description, responses in (
+            ("Tenant", [{"metadata": {}, "items": [{"metadata": {"name": "tenant-a"}}]}]),
+            (
+                "catalog",
+                [
+                    {"metadata": {}, "items": []},
+                    {"metadata": {}, "items": [{"metadata": {"name": "tenant-a"}}]},
+                ],
+            ),
+        ):
+            with (
+                self.subTest(description=description),
+                patch(
+                    "scripts.lib.azure.foundation._kubectl",
+                    side_effect=[
+                        completed(json.dumps(response))
+                        for response in responses
+                    ],
+                ),
+                self.assertRaisesRegex(RuntimeError, f"live {description} resources"),
+            ):
+                _require_empty_admin_upgrade(root)
 
     def test_admin_live_health_requires_identity_image_service_and_api(self):
         root = ROOT
@@ -1690,7 +1885,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                         return completed(json.dumps(payload))
                 if path.endswith("/api/v1/overview"):
                     return completed(json.dumps({
-                        "schemaVersion": 4,
+                        "schemaVersion": 5,
                         "data": {
                             "overview": {
                                 "providerMode": "azure",
@@ -1701,7 +1896,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     }))
                 if path.endswith("/api/v1/tenants"):
                     return completed(
-                        json.dumps({"schemaVersion": 4, "data": []})
+                        json.dumps({"schemaVersion": 5, "data": []})
                     )
                 return completed()
 
@@ -1765,7 +1960,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         }
         api_overrides = {
             "/api/v1/overview": {
-                "schemaVersion": 4,
+                "schemaVersion": 5,
                 "data": {
                     "overview": {
                         "providerMode": "azure",
@@ -1775,14 +1970,14 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 },
             },
             "/api/v1/tenants": {
-                "schemaVersion": 4,
+                "schemaVersion": 5,
                 "data": [{
                     "name": "tenant-a",
                     "classification": "progressing",
                 }],
             },
             "/api/v1/tenants/tenant-a": {
-                "schemaVersion": 4,
+                "schemaVersion": 5,
                 "data": {
                     "identity": {
                         "uid": "tenant-uid",
@@ -1805,7 +2000,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 },
             },
             "/api/v1/tenants/tenant-a/topology": {
-                "schemaVersion": 4,
+                "schemaVersion": 5,
                 "data": {
                     "tenantName": "tenant-a",
                     "provider": "azure",
@@ -1835,7 +2030,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
 
         populated_overview = api_overrides["/api/v1/overview"]
         empty_overview = {
-            "schemaVersion": 4,
+            "schemaVersion": 5,
             "data": {
                 "overview": {
                     "providerMode": "azure",
@@ -2099,6 +2294,39 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         )
         path.chmod(0o600)
         with self.assertRaisesRegex(ConfigError, "AZURE_PREFIX"):
+            load_azure_configuration(root)
+    def test_database_disk_role_fallback_is_explicit_and_foundation_bound(self):
+        root = self.make_root()
+        baseline = load_azure_configuration(root)
+        baseline_checksum = _foundation_defaults_checksum(root, baseline)
+        path = root / "config" / "azure.local.env"
+        with path.open("a", encoding="utf-8") as output:
+            output.write(
+                "AZURE_DATABASE_DISK_ROLE_DEFINITION_ID="
+                f"{DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID}\n"
+            )
+        config = load_azure_configuration(root)
+        self.assertIn(
+            "databaseDiskRoleDefinitionId="
+            + DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID,
+            _deployment_parameters(config),
+        )
+        self.assertNotEqual(
+            baseline_checksum,
+            _foundation_defaults_checksum(root, config),
+        )
+    def test_rejects_unknown_database_disk_role_fallback(self):
+        root = self.make_root()
+        path = root / "config" / "azure.local.env"
+        with path.open("a", encoding="utf-8") as output:
+            output.write(
+                "AZURE_DATABASE_DISK_ROLE_DEFINITION_ID="
+                "00000000-0000-0000-0000-000000000000\n"
+            )
+        with self.assertRaisesRegex(
+            ConfigError,
+            "Azure Backup Snapshot Contributor",
+        ):
             load_azure_configuration(root)
     def test_rejects_invalid_controller_or_admin_repository_and_tag(self):
         for key, value in (
@@ -2429,6 +2657,34 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 self.assertTrue(any(
                     expected in blocker for blocker in _database_identity_blockers(outputs)
                 ))
+
+    def test_database_builtin_disk_role_fallback_is_verified(self):
+        root = self.make_root()
+        outputs = copy.deepcopy(
+            self.inventory(root, load_azure_configuration(root))["outputs"]
+        )
+        outputs["databaseDiskRoleId"] = (
+            "/subscriptions/redacted/providers/"
+            "Microsoft.Authorization/roleDefinitions/"
+            + DATABASE_DISK_FALLBACK_ROLE_DEFINITION_ID
+        )
+
+        def use_builtin_role(resources, _):
+            properties = resources["disk role"]["properties"]
+            properties["type"] = "BuiltInRole"
+            properties["assignableScopes"] = ["/"]
+            properties["permissions"][0]["actions"].extend(
+                [
+                    "Microsoft.Compute/disks/write",
+                    "Microsoft.Compute/virtualMachines/write",
+                ]
+            )
+
+        with patch(
+            "scripts.lib.azure.foundation._az",
+            side_effect=self.database_azure(outputs, change=use_builtin_role),
+        ):
+            self.assertEqual([], _database_identity_blockers(outputs))
 
     def test_destroy_refuses_database_identity_drift(self):
         root = self.make_root()

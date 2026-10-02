@@ -32,7 +32,7 @@ def reconcile_once(root: Path, config: dict[str, str]) -> bool:
         result = json.loads(_kubectl(root, "get", "tenants", "-o", "json").stdout)
         if (
             not isinstance(result, dict)
-            or result.get("kind") != "TenantList"
+            or result.get("kind") not in {"List", "TenantList"}
             or not isinstance(result.get("items"), list)
             or result.get("metadata", {}).get("continue", "") != ""
         ):

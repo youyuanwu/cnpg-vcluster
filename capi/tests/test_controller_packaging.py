@@ -23,6 +23,7 @@ from scripts.lib.kube import ManagementClient
 ROOT = Path(__file__).resolve().parents[1]
 CONFIG = {
     "COMMAND_TIMEOUT": "1s", "CONDITION_TIMEOUT": "1s", "DELETE_TIMEOUT": "1s",
+    "KUBECTL_REQUEST_TIMEOUT": "1s",
     "KUBERNETES_VERSION": "v1.36.4", "KIND_CLUSTER_NAME": "management",
     "OWNERSHIP_LABEL": "example.io/owned", "LAB_PREFIX": "lab",
 }
@@ -86,6 +87,12 @@ class Client:
 
 
 class PackagingTests(unittest.TestCase):
+    def test_management_kubectl_accepts_operation_timeout(self):
+        client = ManagementClient(ROOT, CONFIG)
+        with patch("scripts.lib.kube.run", return_value=response()) as execute:
+            client.kubectl("get", "pods", timeout=61)
+        self.assertEqual(execute.call_args.kwargs["timeout"], 61)
+
     def test_database_image_entrypoint_imports_outside_repository(self):
         entrypoint = ROOT / "scripts/build_database_controller.py"
         result = subprocess.run(
@@ -258,6 +265,19 @@ class PackagingTests(unittest.TestCase):
             {entry["resource"] for entry in azure_inventory},
             {"tenantdatabasecatalogs", "tenants", "namespaces",
              "clusters", "kamajicontrolplanes", "secrets", "disks"},
+        )
+
+    def test_azure_tenant_controller_has_read_only_disk_drain_visibility(self):
+        role = (ROOT / "controller/config/rbac/role-azure.yaml").read_text()
+        self.assertIn(
+            "- apiGroups:\n"
+            "  - compute.azure.com\n"
+            "  resources:\n"
+            "  - disks\n"
+            "  verbs:\n"
+            "  - get\n"
+            "  - list\n",
+            role,
         )
 
     def test_azure_identity_failure_does_not_roll_out_and_retry_recovers(self):
@@ -585,6 +605,7 @@ class PackagingTests(unittest.TestCase):
             return response()
 
         client = Client(handler)
+        prepared = []
 
         def delete_uid(_config, _client, deleted_name, uid):
             self.assertEqual((deleted_name, uid), (name, "uid-123"))
@@ -607,11 +628,13 @@ class PackagingTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "interrupted"):
                 packaging.run_catalog_lifecycle_probe(
                     CONFIG, client, provider="local", database_image="db:image",
+                    prepare_capability=prepared.append,
                 )
             self.assertTrue(self.probe_path.is_file())
             self.assertTrue(state["created"])
             packaging.run_catalog_lifecycle_probe(
                 CONFIG, client, provider="local", database_image="db:image",
+                prepare_capability=prepared.append,
             )
         self.assertEqual(unlock.call_count, 2)
         self.assertEqual(exception.call_count, 2)
@@ -627,6 +650,7 @@ class PackagingTests(unittest.TestCase):
         capability.assert_called_once_with(
             client, provider="local", probe=(name, "uid-123"),
         )
+        self.assertEqual(prepared, [name])
         self.assertEqual(empty.call_count, 2)
         inventory.assert_called_once_with(client)
         cleanup_inventory.assert_called_once_with(client)
@@ -1364,6 +1388,7 @@ class PackagingTests(unittest.TestCase):
             remove.assert_called_once()
             bootstrap.assert_called_once_with(
                 CONFIG, client, provider="local", database_image="database:image",
+                prepare_capability=None,
             )
             tenant_lock.assert_called_once()
             catalog_lock.assert_called_once()
@@ -1371,6 +1396,7 @@ class PackagingTests(unittest.TestCase):
 
     def test_approved_release_only_deletes_cutover_policies(self):
         client = Client()
+        prepare = Mock()
         with (
             patch.object(packaging, "CATALOG_LIFECYCLE_READY", True),
             patch.object(packaging, "tenant_cutover_lock_present", return_value=True),
@@ -1384,10 +1410,12 @@ class PackagingTests(unittest.TestCase):
             packaging.release_catalog_and_tenant_cutover_locks(
                 CONFIG, client, provider="local",
                 tenant_image="tenant:image", database_image="database:image",
+                prepare_capability=prepare,
             )
             self.assertEqual(tenant_fence.call_count, 2)
             bootstrap.assert_called_once_with(
                 CONFIG, client, provider="local", database_image="database:image",
+                prepare_capability=prepare,
             )
             self.assertEqual(catalog_fence.call_count, 2)
             catalog_fence.assert_any_call(

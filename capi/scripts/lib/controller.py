@@ -10,6 +10,7 @@ import subprocess
 import urllib.error
 import urllib.request
 import uuid
+from collections.abc import Callable
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -761,6 +762,7 @@ def verify_release_tenant_cutover_lock(client: ManagementClient) -> None:
 def release_catalog_and_tenant_cutover_locks(
         config: dict[str, str], client: ManagementClient, *,
         provider: str, tenant_image: str, database_image: str,
+        prepare_capability: Callable[[str], None] | None = None,
 ) -> None:
         if not CATALOG_LIFECYCLE_READY:
             raise RuntimeError("catalog lifecycle release is not approved")
@@ -783,6 +785,7 @@ def release_catalog_and_tenant_cutover_locks(
             )
             run_catalog_lifecycle_probe(
                 config, client, provider=provider, database_image=database_image,
+                prepare_capability=prepare_capability,
             )
             verify_catalog_cutover_lock(client, namespace=CONTROLLER_NAMESPACE)
             _record_catalog_activation(client)
@@ -1187,6 +1190,7 @@ def _recover_unknown_local_probe(
         client.kubectl(
             "wait", "--for=delete", f"tenant/{name}",
             f"--timeout={config['DELETE_TIMEOUT']}",
+            timeout=parse_duration(config["DELETE_TIMEOUT"]) + 60,
         )
     _verify_probe_cleanup(client, name, namespace, storage_namespace)
     verify_release_tenant_cutover_lock(client)
@@ -1266,6 +1270,7 @@ def _database_controller_restarted(
 def run_catalog_lifecycle_probe(
     config: dict[str, str], client: ManagementClient, *,
     provider: str, database_image: str,
+    prepare_capability: Callable[[str], None] | None = None,
 ) -> None:
     from scripts.lib.database_controller import inspect_catalog_inventory
 
@@ -1389,6 +1394,7 @@ def run_catalog_lifecycle_probe(
             client.kubectl(
                 "wait", "--for=delete", f"tenant/{name}",
                 f"--timeout={config['DELETE_TIMEOUT']}",
+                timeout=parse_duration(config["DELETE_TIMEOUT"]) + 60,
             )
         _verify_probe_cleanup(client, name, namespace, storage_namespace)
         ensure_catalog_cutover_lock(client)
@@ -1434,6 +1440,8 @@ def run_catalog_lifecycle_probe(
         uid,
         timeout=parse_duration(config["CONDITION_TIMEOUT"]),
     )
+    if prepare_capability is not None:
+        prepare_capability(name)
 
     def capability_ready() -> bool:
         intent_ready()
@@ -1474,6 +1482,7 @@ def run_catalog_lifecycle_probe(
     client.kubectl(
         "wait", "--for=delete", f"tenant/{name}",
         f"--timeout={config['DELETE_TIMEOUT']}",
+        timeout=parse_duration(config["DELETE_TIMEOUT"]) + 60,
     )
     _verify_probe_cleanup(client, name, namespace, storage_namespace)
     ensure_catalog_cutover_lock(client)

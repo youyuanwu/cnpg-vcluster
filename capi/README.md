@@ -103,6 +103,15 @@ Azure foundation operations use the ignored owner-only
 specification as a command input; the client converts it to the Azure Tenant
 CR shape and observes operator status:
 
+The foundation normally creates a resource-group-scoped custom role containing
+only managed-disk read and delete. If the Azure tenant has exhausted its custom
+role-definition quota, the owner may explicitly set
+`AZURE_DATABASE_DISK_ROLE_DEFINITION_ID=afc680e2-a938-412d-b213-9a49efa7fb83`
+to use the built-in Azure Backup Snapshot Contributor role. The assignment
+remains scoped to the experiment resource group, but the built-in role grants
+additional disk, restore-point, and VM operations; omit the setting whenever
+custom role creation is available.
+
 ```bash
 just azure-preflight
 just azure-create-foundation
@@ -704,9 +713,12 @@ Exact versions, URLs, checksums, source commits, and image digests are in
   subnet, and broad resource-group Contributor identity.
 - The Azure nine-disk destructive and browser/service-proxy agreement gates
   remain unmet; no managed-Azure database rollout is claimed.
-- CAPZ `v1.21.1` requires the narrowly scoped external-control-plane webhook
+- CAPZ `v1.21.3` requires the narrowly scoped external-control-plane webhook
   compatibility selector documented in
   [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md).
+- The `v1.21.3` patch pin replaces `v1.21.1`, which left finalizer-free
+  `AzureMachinePoolMachine` children after live VMSS deletion. The patch
+  release still requires a fresh destructive deletion rerun before acceptance.
 
 See [`docs/high-level-design.md`](docs/high-level-design.md) for the shared
 as-built lifecycle architecture and

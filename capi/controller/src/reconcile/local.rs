@@ -411,7 +411,7 @@ impl<D: DockerClient + Clone, A: TenantAccess> LocalProvider<D, A> {
             let tenant_uid = context.tenant.uid()
                 .ok_or_else(|| ReconcileError::OwnershipInvalid("Tenant UID is missing".into()))?;
             match tenant_database_runtime::catalog_runtime::ensure_credentials(
-                self.client.clone(), context.name(), &tenant_uid, false,
+                self.client.clone(), context.name(), &tenant_uid,
             ).await {
                 Ok(()) if catalog_valid => "Ready",
                 Ok(()) => "CatalogNotReady",
