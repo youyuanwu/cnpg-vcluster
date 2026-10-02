@@ -42,13 +42,6 @@
     "version": "v1"
   },
   {
-    "group": "kamaji.clastix.io",
-    "kind": "TenantControlPlane",
-    "resource": "tenantcontrolplanes",
-    "scope": "Namespaced",
-    "version": "v1alpha1"
-  },
-  {
     "group": "compute.azure.com",
     "kind": "Disk",
     "resource": "disks",

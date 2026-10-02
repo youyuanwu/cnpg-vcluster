@@ -257,8 +257,7 @@ class PackagingTests(unittest.TestCase):
         self.assertEqual(
             {entry["resource"] for entry in azure_inventory},
             {"tenantdatabasecatalogs", "tenants", "namespaces",
-             "clusters", "kamajicontrolplanes", "tenantcontrolplanes",
-             "secrets", "disks"},
+             "clusters", "kamajicontrolplanes", "secrets", "disks"},
         )
 
     def test_azure_tenant_controller_has_read_only_disk_drain_visibility(self):

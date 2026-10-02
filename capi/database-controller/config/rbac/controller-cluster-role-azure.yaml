@@ -50,12 +50,6 @@ rules:
   verbs:
   - get
 - apiGroups:
-  - kamaji.clastix.io
-  resources:
-  - tenantcontrolplanes
-  verbs:
-  - get
-- apiGroups:
   - ''
   resourceNames:
   - tenant-azure-provider
