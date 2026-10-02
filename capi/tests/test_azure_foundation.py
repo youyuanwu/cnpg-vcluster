@@ -170,7 +170,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
 
     def test_database_install_worker_keeps_other_tenants_and_retries(self):
         root = self.make_root()
-        listing = {"kind": "TenantList", "metadata": {}, "items": [
+        listing = {"kind": "List", "metadata": {}, "items": [
             {"metadata": {"name": "tenant-a"}, "status": {
                 "phase": "Ready", "provider": {"type": "azure"}}},
             {"metadata": {"name": "tenant-b"}, "status": {

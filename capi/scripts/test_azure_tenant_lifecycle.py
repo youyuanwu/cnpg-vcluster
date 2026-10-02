@@ -466,7 +466,7 @@ def _require_only_runtime_tenant(spec, expected: Mapping[str, object]) -> None:
     inventory = json.loads(_kubectl(ROOT, "get", "tenants", "-o", "json").stdout)
     if (
         not isinstance(inventory, dict)
-        or inventory.get("kind") != "TenantList"
+        or inventory.get("kind") not in {"List", "TenantList"}
         or not isinstance(inventory.get("metadata"), dict)
         or inventory["metadata"].get("continue", "") != ""
         or not isinstance(inventory.get("items"), list)
