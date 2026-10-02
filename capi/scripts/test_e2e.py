@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from datetime import datetime
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,7 +39,9 @@ from scripts.lib.controller_scenarios import (
     wait_tenant_ready,
 )
 from scripts.lib.tenants import export_tenant_kubeconfig
-from scripts.lib.tenants import _tenant_kubectl
+from scripts.lib.tenants import _tenant_kubectl, verify_tenant_management_ownership
+from scripts.machines import worker_snapshot
+from scripts.lib.addons import wait_network_ready
 
 MANAGEMENT_CATALOG = load_management_resources(ROOT)
 
@@ -363,6 +366,211 @@ def _restart_database_controller(client: ManagementClient) -> None:
     )
 
 
+def _restart_worker_and_verify_markers(
+    root: Path, config: dict[str, str], client: ManagementClient,
+    tenant, tenant_uid: str, catalog: CatalogClient, catalog_uid: str,
+    observed: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    names = {"alpha", "beta", "gamma"}
+    if set(observed) != names or tenant.name != "tenant-example" or tenant.workers != 3:
+        raise RuntimeError("worker restart requires the disposable three-database Tenant")
+
+    def require_tenant() -> None:
+        current = _inspect_management_object(client, f"tenant/{tenant.name}")
+        metadata = current.get("metadata") if current is not None else None
+        spec = current.get("spec") if current is not None else None
+        if (
+            not isinstance(metadata, dict)
+            or not isinstance(spec, dict)
+            or metadata.get("name") != tenant.name
+            or metadata.get("uid") != tenant_uid
+            or metadata.get("deletionTimestamp")
+            or spec.get("workers") != 3
+            or spec.get("provider") != {"type": "local"}
+        ):
+            raise RuntimeError("disposable Tenant identity changed before worker restart")
+
+    require_tenant()
+    verify_tenant_management_ownership(config, client, tenant)
+    volume_name = f"{config['LAB_PREFIX']}-{tenant.name}-storage"
+    volume = json.loads(run(["docker", "volume", "inspect", volume_name], timeout=30).stdout)
+    details = volume[0] if isinstance(volume, list) and len(volume) == 1 else None
+    labels = details.get("Labels") if isinstance(details, dict) else None
+    if (
+        not isinstance(details, dict) or not isinstance(labels, dict)
+        or details.get("Name") != volume_name
+        or labels.get(config["OWNERSHIP_LABEL"]) != config["LAB_PREFIX"]
+        or labels.get("cnpg-vcluster.capi/role") != "tenant-storage"
+        or labels.get("cnpg-vcluster.capi/tenant") != tenant.name
+        or Path(details.get("Mountpoint", "")).resolve() != tenant.storage_host_path.resolve()
+    ):
+        raise RuntimeError("disposable Tenant storage ownership changed before worker restart")
+    before = worker_snapshot(root, config, client, tenant)
+    name = sorted(before)[0]
+    identity = before[name]
+    container_id = identity["containerID"]
+    if not all(identity.get(key) for key in ("machineUID", "devMachineUID", "nodeUID")) or not (
+        isinstance(container_id, str) and len(container_id) == 64
+        and all(character in "0123456789abcdef" for character in container_id)
+    ):
+        raise RuntimeError("recorded Tenant worker/node identity is incomplete")
+
+    def lease_renewal() -> tuple[str, datetime]:
+        resource = resource_by_kind(MANAGEMENT_CATALOG, "Lease")
+        result = _tenant_kubectl(
+            root, config, tenant, "-n", "kube-node-lease",
+            "get", f"{resource.kubectl_resource}/{name}", "-o", "json", check=False,
+        )
+        if result.returncode != 0:
+            raise RuntimeError("recorded Tenant worker kubelet Lease is unavailable")
+        lease = json.loads(result.stdout)
+        metadata = lease.get("metadata", {})
+        spec = lease.get("spec", {})
+        if (
+            metadata.get("name") != name
+            or metadata.get("namespace") != "kube-node-lease"
+            or not metadata.get("uid")
+            or spec.get("holderIdentity") != name
+        ):
+            raise RuntimeError("recorded Tenant worker kubelet Lease identity changed")
+        renew_time = spec.get("renewTime")
+        if not isinstance(renew_time, str):
+            raise RuntimeError("recorded Tenant worker kubelet Lease has no renewal")
+        return metadata["uid"], datetime.fromisoformat(renew_time.replace("Z", "+00:00"))
+
+    lease_uid, previous_renewal = lease_renewal()
+
+    def inspect_worker() -> dict[str, object]:
+        payload = json.loads(run(["docker", "inspect", container_id], timeout=30).stdout)
+        if not isinstance(payload, list) or len(payload) != 1:
+            raise RuntimeError("recorded Tenant worker container is missing")
+        worker = payload[0]
+        labels = worker.get("Config", {}).get("Labels") or {}
+        if (
+            worker.get("Id") != container_id or worker.get("Name") != f"/{name}"
+            or labels.get("io.x-k8s.kind.cluster") != tenant.name
+            or labels.get("io.x-k8s.kind.role") != "worker"
+            or worker.get("State", {}).get("Running") is not True
+            or not worker["State"].get("StartedAt")
+        ):
+            raise RuntimeError("recorded Tenant worker container identity changed")
+        return worker
+
+    started_at = inspect_worker()["State"]["StartedAt"]
+    require_tenant()
+    run(
+        ["docker", "restart", container_id],
+        timeout=parse_duration(config["COMMAND_TIMEOUT"]) + 60,
+    )
+    restarted_at = inspect_worker()["State"]["StartedAt"]
+    if restarted_at == started_at:
+        raise RuntimeError("recorded Tenant worker did not restart")
+    restart_time = datetime.fromisoformat(restarted_at.replace("Z", "+00:00"))
+
+    def node_ready() -> bool | None:
+        result = _tenant_kubectl(
+            root, config, tenant, "get", f"node/{name}", "-o", "json", check=False,
+        )
+        if result.returncode != 0:
+            return None
+        node = json.loads(result.stdout)
+        metadata = node.get("metadata", {})
+        if metadata.get("name") != name or metadata.get("uid") != identity["nodeUID"]:
+            raise RuntimeError("recorded Tenant worker Node identity changed")
+        if not any(
+            condition.get("type") == "Ready" and condition.get("status") == "True"
+            for condition in node.get("status", {}).get("conditions", [])
+        ):
+            return None
+        current_uid, current_renewal = lease_renewal()
+        if current_uid != lease_uid:
+            raise RuntimeError("recorded Tenant worker kubelet Lease identity changed")
+        return current_renewal > max(previous_renewal, restart_time) or None
+
+    wait_for(
+        f"recorded Tenant worker Node/{name} recovery",
+        parse_duration(config["WORKER_REGISTRATION_TIMEOUT"]),
+        parse_duration(config["WAIT_POLL_INTERVAL"]), node_ready,
+    )
+    wait_network_ready(root, config, tenant)
+    require_tenant()
+    if worker_snapshot(root, config, client, tenant) != before:
+        raise RuntimeError("recorded Tenant worker/node identity changed after restart")
+
+    ready = catalog.wait(
+        lambda item: len(item["databases"]) == 3
+        and all(entry["phase"] == "ready" and entry["readyInstances"] == 3
+                for entry in item["databases"]),
+        parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+    )
+    recovered = ready_entries(ready, names, "local")
+    for entry_name in sorted(names):
+        def marker_restored():
+            current = catalog.read(catalog_uid)
+            entries = current["databases"]
+            if (
+                current["catalogUid"] != catalog_uid
+                or current["closed"]
+                or {entry["name"] for entry in entries} != names
+                or len(entries) != 3
+            ):
+                raise RuntimeError("catalog identity changed after worker restart")
+            if not current["capabilityAvailable"] or any(
+                entry["phase"] != "ready" or entry["readyInstances"] != 3
+                for entry in entries
+            ):
+                return None
+            current_entries = ready_entries(current, names, "local")
+            entry = current_entries[entry_name]
+            if (
+                entry["logicalUid"] != observed[entry_name]["logicalUid"]
+                or entry["clusterUid"] != observed[entry_name]["clusterUid"]
+            ):
+                raise RuntimeError(
+                    f"catalog entry identity changed after worker restart: {entry_name}"
+                )
+            try:
+                catalog.query(catalog_uid, entry, f"marker-{entry_name}")
+            except RuntimeError as error:
+                if str(error).startswith("catalog query failed: HTTP 503:"):
+                    return None
+                raise
+            return entry
+
+        recovered[entry_name] = wait_for(
+            f"exact marker for {entry_name} after worker restart",
+            parse_duration(config["CNPG_TIMEOUT"]),
+            parse_duration(config["WAIT_POLL_INTERVAL"]),
+            marker_restored,
+        )
+    return recovered
+
+
+def _verify_restarts_and_markers(
+    root: Path, config: dict[str, str], client: ManagementClient,
+    tenant, tenant_uid: str, catalog: CatalogClient, catalog_uid: str,
+    observed: dict[str, dict[str, object]],
+) -> dict[str, dict[str, object]]:
+    names = {"alpha", "beta", "gamma"}
+    for name, entry in observed.items():
+        catalog.query(catalog_uid, entry, f"marker-{name}", write=True)
+        catalog.query(catalog_uid, entry, f"marker-{name}")
+    _failover(root, config, tenant, observed["alpha"])
+    _restart_database_controller(client)
+    ready = catalog.wait(
+        lambda item: len(item["databases"]) == 3
+        and all(entry["phase"] == "ready" and entry["readyInstances"] == 3
+                for entry in item["databases"]),
+        parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+    )
+    observed = ready_entries(ready, names, "local")
+    for name, entry in observed.items():
+        catalog.query(catalog_uid, entry, f"marker-{name}")
+    return _restart_worker_and_verify_markers(
+        root, config, client, tenant, tenant_uid, catalog, catalog_uid, observed,
+    )
+
+
 def run_e2e() -> int:
     os.umask(0o077)
     config = load_configuration(ROOT)
@@ -395,12 +603,14 @@ def run_e2e() -> int:
 
         with timings.phase("tenant_convergence"):
             client = ManagementClient(ROOT, config)
-            create_tenant_via_admin(
+            created = create_tenant_via_admin(
                 client,
                 tenant_name,
                 workers=3,
             )
             document = wait_tenant_ready(ROOT, config, tenant_name)
+            if document.get("metadata", {}).get("uid") != created["identity"]["uid"]:
+                raise RuntimeError("disposable Tenant identity changed after creation")
             wait_for(
                 "Tenant database catalog capability",
                 parse_duration(config["CNPG_TIMEOUT"]) * 4, 5,
@@ -436,20 +646,10 @@ def run_e2e() -> int:
                 parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
             )
             observed = ready_entries(ready, entries, "local")
-            for name, entry in observed.items():
-                catalog.query(catalog_uid, entry, f"marker-{name}", write=True)
-                catalog.query(catalog_uid, entry, f"marker-{name}")
-            _failover(ROOT, config, tenant, observed["alpha"])
-            _restart_database_controller(client)
-            ready = catalog.wait(
-                lambda item: len(item["databases"]) == 3
-                and all(entry["phase"] == "ready" and entry["readyInstances"] == 3
-                        for entry in item["databases"]),
-                parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+            observed = _verify_restarts_and_markers(
+                ROOT, config, client, tenant, document["metadata"]["uid"],
+                catalog, catalog_uid, observed,
             )
-            observed = ready_entries(ready, entries, "local")
-            for name, entry in observed.items():
-                catalog.query(catalog_uid, entry, f"marker-{name}")
             recorded = _catalog_record(client, tenant_name)
             old_uid = logical_uids["beta"]
             old_entry = observed["beta"]

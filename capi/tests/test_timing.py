@@ -316,7 +316,7 @@ class TimingTests(unittest.TestCase):
         catalog.read.return_value = {"catalogUid": "catalog-uid", "databases": []}
         catalog.add.side_effect = ["alpha-uid", "beta-uid", "gamma-uid", "new-beta-uid"]
         catalog.wait.side_effect = [
-            complete, complete, {"databases": [entry("alpha"), entry("gamma")]},
+            complete, {"databases": [entry("alpha"), entry("gamma")]},
             recreated,
         ]
         catalog.query.side_effect = query
@@ -350,7 +350,10 @@ class TimingTests(unittest.TestCase):
                 patch.multiple(
                     "scripts.test_e2e",
                     create_tenant_via_admin=Mock(
-                        side_effect=lambda *_args, **_kwargs: calls.append("admin-create")
+                        side_effect=lambda *_args, **_kwargs: (
+                            calls.append("admin-create"),
+                            {"identity": {"uid": "tenant-uid"}},
+                        )[1]
                     ),
                     delete_tenant_via_admin=Mock(side_effect=delete_tenant),
                     wait_tenant_absent=Mock(),
@@ -358,6 +361,11 @@ class TimingTests(unittest.TestCase):
                     verify_no_lab_residue=Mock(),
                     _failover=Mock(),
                     _restart_database_controller=Mock(),
+                    _verify_restarts_and_markers=Mock(
+                        side_effect=lambda *_args: {
+                            item["name"]: item for item in complete["databases"]
+                        }
+                    ),
                     _verify_entry_gone=Mock(),
                     _catalog_record=Mock(return_value={}),
                     wait_for=Mock(return_value=document),

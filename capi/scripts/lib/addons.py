@@ -172,7 +172,7 @@ def wait_network_ready(
         node = json.loads(
             _tenant_kubectl(root, config, tenant, "get", "nodes", "-o", "json").stdout
         )
-        deployment = json.loads(
+        deployment_status = json.loads(
             client.kubectl(
                 "-n",
                 tenant.namespace,
@@ -182,7 +182,7 @@ def wait_network_ready(
                 "json",
             ).stdout
         )
-        desired_workers = deployment["spec"]["replicas"]
+        desired_workers = deployment_status["spec"]["replicas"]
         if len(node["items"]) != desired_workers:
             return None
         node_ready = all(
