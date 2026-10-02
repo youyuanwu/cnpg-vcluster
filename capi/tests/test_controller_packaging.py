@@ -103,12 +103,22 @@ class PackagingTests(unittest.TestCase):
             "target": {"name": "manager", "kind": ["bin"]},
             "executable": str(binary),
         }) + "\n")
+        manager_modes = []
+
+        def command(args, **_kwargs):
+            if args[:2] == ["docker", "build"]:
+                manager_modes.append(
+                    (Path(args[-1]) / "manager").stat().st_mode & 0o777
+                )
+                return response()
+            return result
+
         with (
             patch("scripts.lib.controller.rust_toolchain",
                   return_value=("cargo", "rustc identity")),
             patch("scripts.lib.controller.fetch_controller_dependencies") as fetch,
             patch("scripts.lib.controller.verify_static_manager") as verify,
-            patch.object(database_controller, "run", return_value=result) as run,
+            patch.object(database_controller, "run", side_effect=command) as run,
         ):
             image = database_controller.build_database_controller_image(
                 ROOT, {**CONFIG, "TENANT_CONTROLLER_IMAGE_REPOSITORY": "local/tenant"},
@@ -122,6 +132,7 @@ class PackagingTests(unittest.TestCase):
         self.assertIn("tenant-database-controller", commands[0])
         self.assertEqual(commands[1][:3], ["docker", "build", "--pull=false"])
         self.assertEqual(commands[1][4], image)
+        self.assertEqual(manager_modes, [0o755])
         self.assertFalse((ROOT / ".runtime/rendered/database-controller-build").exists())
 
     def test_prebuilt_database_controller_requires_verified_artifact_boundary(self):

@@ -249,7 +249,9 @@ def build_database_controller_image(
     ensure_private_dir(build_root)
     try:
         shutil.copy2(source / "Dockerfile", build_root / "Dockerfile")
-        shutil.copy2(executable, build_root / "manager")
+        manager = build_root / "manager"
+        shutil.copy2(executable, manager)
+        manager.chmod(0o755)
         run(
             ["docker", "build", "--pull=false", "-t", selected, str(build_root)],
             timeout=parse_duration(config["COMMAND_TIMEOUT"]) * 8,
