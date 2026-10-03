@@ -1995,10 +1995,15 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                         "observedGeneration": 1,
                     },
                     "database": {
-                        "state": "not-applicable",
+                        "state": "unavailable",
                         "observedAt": "2026-09-29T20:00:00Z",
                         "freshness": "live",
-                        "reason": "provider-unsupported",
+                        "reason": "pending",
+                        "message": (
+                            "Use the catalog database endpoint for "
+                            "per-cluster observations"
+                        ),
+                        "retryable": False,
                     },
                     "topology": snapshot_topology,
                 },

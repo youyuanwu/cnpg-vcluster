@@ -717,12 +717,13 @@ Exact versions, URLs, checksums, source commits, and image digests are in
   subnet, and broad resource-group Contributor identity.
 - The Azure nine-disk destructive and browser/service-proxy agreement gates
   remain unmet; no managed-Azure database rollout is claimed.
-- CAPZ `v1.21.3` requires the narrowly scoped external-control-plane webhook
+- The pinned CAPZ line requires the narrowly scoped external-control-plane webhook
   compatibility selector documented in
   [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md).
-- The `v1.21.3` patch pin replaces `v1.21.1`, which left finalizer-free
-  `AzureMachinePoolMachine` children after live VMSS deletion. The patch
-  release still requires a fresh destructive deletion rerun before acceptance.
+- CAPZ `v1.21.1` and `v1.21.3` both left finalizer-free
+  `AzureMachinePoolMachine` children after live VMSS deletion. The candidate
+  CAPI `v1.11.10` and CAPZ `v1.22.4` line still requires a fresh destructive
+  deletion rerun before acceptance.
 
 See [`docs/high-level-design.md`](docs/high-level-design.md) for the shared
 as-built lifecycle architecture and

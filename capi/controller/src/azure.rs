@@ -810,11 +810,11 @@ mod tests {
             "identityClientId":"00000000-0000-0000-0000-000000000003",
             "supportedKubernetesVersion":"1.32.13",
             "workerSku":"Standard_B2s",
-            "capiVersion":"v1.10.7",
-            "capzVersion":"v1.21.3",
+            "capiVersion":"v1.11.10",
+            "capzVersion":"v1.22.4",
             "kamajiCapiVersion":"v0.19.0",
             "kamajiChartVersion":"26.8.6-edge",
-            "asoVersion":"v2.11.0",
+            "asoVersion":"v2.13.0",
             "cloudProviderVersion":"v1.32.3",
             "calicoVersion":"v3.32.2",
             "calicoCrdsChartSha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -870,8 +870,8 @@ mod tests {
     fn configuration_is_typed_canonical_and_fail_closed() {
         let parsed = configuration();
         assert_eq!(parsed.config_map_uid, "provider-config-uid");
-        assert_eq!(parsed.values.capz_version, "v1.21.3");
-        assert_eq!(parsed.values.aso_version, "v2.11.0");
+        assert_eq!(parsed.values.capz_version, "v1.22.4");
+        assert_eq!(parsed.values.aso_version, "v2.13.0");
         assert!(sha256(&parsed.sha256));
         let binding = parsed.binding("tenant-uid", "spec-sha", "operation");
         assert_eq!(validate_binding(&binding, &binding), Ok(()));

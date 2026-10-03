@@ -1035,7 +1035,7 @@ def _azure_provider_configuration(
         "capzVersion": config["AZURE_CAPZ_VERSION"],
         "kamajiCapiVersion": config["AZURE_KAMAJI_CAPI_VERSION"],
         "kamajiChartVersion": config["AZURE_KAMAJI_CHART_VERSION"],
-        "asoVersion": "v2.11.0",
+        "asoVersion": "v2.13.0",
         "cloudProviderVersion": config["AZURE_CLOUD_PROVIDER_VERSION"],
         "calicoVersion": config["AZURE_CALICO_VERSION"],
         "calicoCrdsChartSha256": config["AZURE_CALICO_CRDS_CHART_SHA256"],
@@ -2395,12 +2395,22 @@ def _admin_api_blockers(root: Path) -> list[str]:
                 or not isinstance(detail.get("summary"), dict)
                 or detail["summary"].get("name") != name
                 or set(database)
-                != {"state", "observedAt", "freshness", "reason"}
-                or database.get("state") != "not-applicable"
+                != {
+                    "state",
+                    "observedAt",
+                    "freshness",
+                    "reason",
+                    "message",
+                    "retryable",
+                }
+                or database.get("state") != "unavailable"
                 or not isinstance(database.get("observedAt"), str)
                 or not database["observedAt"]
                 or database.get("freshness") != "live"
-                or database.get("reason") != "provider-unsupported"
+                or database.get("reason") != "pending"
+                or database.get("message")
+                != "Use the catalog database endpoint for per-cluster observations"
+                or database.get("retryable") is not False
                 or topology.get("tenantName") != name
                 or not isinstance(topology.get("nodes"), list)
                 or not isinstance(topology.get("edges"), list)

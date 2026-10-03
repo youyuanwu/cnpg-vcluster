@@ -105,11 +105,7 @@ class AdminResourceTests(unittest.TestCase):
         namespace = "tenant-a"
         label = {"tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid"}
         for provider in generator.PROVIDERS:
-            secret = (
-                f"{namespace}-admin-kubeconfig"
-                if provider == "azure"
-                else f"{namespace}-kubeconfig"
-            )
+            secret = f"{namespace}-kubeconfig"
             objects = {
                 f"namespace/{namespace}": {
                     "kind": "Namespace",

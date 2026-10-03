@@ -357,11 +357,7 @@ def validate_admin_effective_rules(
     )
     secret_rules = {atom for atom in actual if atom[1] == "secrets"}
     if secret_rules:
-        secret_name = (
-            f"{namespace}-admin-kubeconfig"
-            if provider == "azure"
-            else f"{namespace}-kubeconfig"
-        )
+        secret_name = f"{namespace}-kubeconfig"
         expected_secret = {("", "secrets", "get", secret_name)}
         if (
             namespace == ADMIN_NAMESPACE
@@ -463,11 +459,7 @@ def validate_admin_credential_scope(
         != [{
             "apiGroups": [""],
             "resources": ["secrets"],
-            "resourceNames": [
-                f"{namespace}-admin-kubeconfig"
-                if provider == "azure"
-                else f"{namespace}-kubeconfig"
-            ],
+            "resourceNames": [f"{namespace}-kubeconfig"],
             "verbs": ["get"],
         }]
         or binding.get("roleRef")
