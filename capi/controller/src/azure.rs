@@ -702,9 +702,31 @@ fn desired_subset(desired: &Value, live: &Value, path: &str) -> Result<(), Azure
             }
             Ok(())
         }
+        (Value::String(expected), Value::String(actual))
+            if api_version_field_matches(path, expected, actual) =>
+        {
+            Ok(())
+        }
         (left, right) if left == right => Ok(()),
         _ => Err(AzureOwnershipError::Desired(path.into())),
     }
+}
+
+fn api_version_field_matches(path: &str, expected: &str, actual: &str) -> bool {
+    path.ends_with(".apiVersion")
+        && matches!(
+            (expected, actual),
+            ("cluster.x-k8s.io/v1beta1", "cluster.x-k8s.io/v1beta2")
+                | ("cluster.x-k8s.io/v1beta2", "cluster.x-k8s.io/v1beta1")
+                | (
+                    "bootstrap.cluster.x-k8s.io/v1beta1",
+                    "bootstrap.cluster.x-k8s.io/v1beta2"
+                )
+                | (
+                    "bootstrap.cluster.x-k8s.io/v1beta2",
+                    "bootstrap.cluster.x-k8s.io/v1beta1"
+                )
+        )
 }
 
 macro_rules! management_ids {
@@ -1124,6 +1146,44 @@ mod tests {
         assert_eq!(
             validate_live_object(&desired, &live, None),
             Err(AzureOwnershipError::Markers)
+        );
+    }
+
+    #[test]
+    fn desired_subset_accepts_only_supported_api_version_conversions() {
+        let desired = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "bootstrap": {
+                            "configRef": {
+                                "apiVersion": "bootstrap.cluster.x-k8s.io/v1beta1",
+                                "kind": "KubeadmConfig",
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let mut live = desired.clone();
+        live["spec"]["template"]["spec"]["bootstrap"]["configRef"]["apiVersion"] =
+            json!("bootstrap.cluster.x-k8s.io/v1beta2");
+        assert_eq!(desired_subset(&desired, &live, "$"), Ok(()));
+        live["spec"]["template"]["spec"]["bootstrap"]["configRef"]["apiVersion"] =
+            json!("bootstrap.cluster.x-k8s.io/v1alpha4");
+        assert_eq!(
+            desired_subset(&desired, &live, "$"),
+            Err(AzureOwnershipError::Desired(
+                "$.spec.template.spec.bootstrap.configRef.apiVersion".into()
+            ))
+        );
+        live = desired.clone();
+        live["spec"]["template"]["spec"]["bootstrap"]["configRef"]["kind"] = json!("ForeignConfig");
+        assert_eq!(
+            desired_subset(&desired, &live, "$"),
+            Err(AzureOwnershipError::Desired(
+                "$.spec.template.spec.bootstrap.configRef.kind".into()
+            ))
         );
     }
 
