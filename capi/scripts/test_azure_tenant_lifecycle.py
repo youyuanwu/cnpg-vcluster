@@ -255,6 +255,37 @@ def _restart_database_controller() -> None:
              "deployment/database-controller", "--timeout=600s")
 
 
+def _wait_databases_ready(
+    catalog: CatalogClient,
+    catalog_uid: str,
+    timeout: int,
+) -> dict[str, dict]:
+    deadline = time.monotonic() + timeout
+    restarted = False
+    while True:
+        projected = catalog.read(catalog_uid)
+        databases = projected["databases"]
+        if (
+            len(databases) == 3
+            and all(
+                entry["phase"] == "ready" and entry["readyInstances"] == 3
+                for entry in databases
+            )
+        ):
+            return ready_entries(projected, {"alpha", "beta", "gamma"}, "azure")
+        unknown = any(
+            blocker.get("code") == "UnknownCreateOutcome"
+            for entry in databases
+            for blocker in entry["blockers"]
+        )
+        if unknown and not restarted:
+            _restart_database_controller()
+            restarted = True
+        if time.monotonic() >= deadline:
+            raise RuntimeError("catalog did not converge before deadline")
+        time.sleep(5)
+
+
 def _require_clean_tagged_foundation(config: Mapping[str, str], name: str) -> None:
     group = names(config)["resourceGroup"]
     tags = _json(["az", "group", "show", "--name", group, "--query", "tags", "-o", "json"])
@@ -681,13 +712,11 @@ def main(arguments: list[str]) -> int:
         for name in ("alpha", "beta", "gamma")
     }
     def wait_database_ready():
-        projected = catalog.wait(
-            lambda item: len(item["databases"]) == 3
-            and all(entry["phase"] == "ready" and entry["readyInstances"] == 3
-                    for entry in item["databases"]),
-            parse_duration(config["AZURE_TENANT_TIMEOUT"]), catalog_uid,
+        return _wait_databases_ready(
+            catalog,
+            catalog_uid,
+            parse_duration(config["AZURE_TENANT_TIMEOUT"]),
         )
-        return ready_entries(projected, {"alpha", "beta", "gamma"}, "azure")
 
     databases = phase("nine-instance-readiness", wait_database_ready)
     for name, entry in databases.items():

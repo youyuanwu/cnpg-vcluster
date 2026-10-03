@@ -192,21 +192,62 @@ pub async fn verify_current(
     Ok(latest)
 }
 
-pub async fn observe(
+fn observer_epoch_changed(
+    catalog: &TenantDatabaseCatalog,
+    pod_uid: &str,
+    instance_id: &str,
+) -> Result<bool, ObserveError> {
+    let Some(observer) = catalog
+        .status
+        .as_ref()
+        .and_then(|status| status.observer.as_ref())
+    else {
+        return Ok(false);
+    };
+    if observer.catalog_uid != uid(&catalog.metadata)? {
+        return Err(ObserveError::Identity);
+    }
+    Ok(observer.pod_uid != pod_uid || observer.instance_id != instance_id)
+}
+
+fn observer_needs_refresh(
+    catalog: &TenantDatabaseCatalog,
+    pod_uid: &str,
+    instance_id: &str,
+) -> Result<bool, ObserveError> {
+    let catalog_uid = uid(&catalog.metadata)?;
+    let generation = catalog.metadata.generation.ok_or(ObserveError::Identity)?;
+    Ok(catalog
+        .status
+        .as_ref()
+        .and_then(|status| status.observer.as_ref())
+        .is_none_or(|observer| {
+            observer.catalog_uid != catalog_uid
+                || observer.observed_generation != generation
+                || observer.observed_resource_version.is_empty()
+                || observer.pod_uid != pod_uid
+                || observer.instance_id != instance_id
+        }))
+}
+
+fn has_issued_intents(catalog: &TenantDatabaseCatalog) -> bool {
+    catalog.status.as_ref().is_some_and(|status| {
+        status.entries.values().any(|entry| {
+            entry
+                .create_intents
+                .iter()
+                .any(|intent| intent.state == crate::api::CreateState::Issued)
+        })
+    })
+}
+
+async fn record_observer(
     client: Client,
     observed: &TenantDatabaseCatalog,
     pod_uid: &str,
     instance_id: &str,
-) -> Result<(Action, TenantDatabaseCatalog), ObserveError> {
+) -> Result<TenantDatabaseCatalog, ObserveError> {
     let current = verify_current(client.clone(), observed).await?;
-    if !current.spec.entries.is_empty()
-        || current
-            .status
-            .as_ref()
-            .is_some_and(|status| !status.entries.is_empty())
-    {
-        return Err(ObserveError::UnsupportedEntries);
-    }
     let catalog_uid = uid(&current.metadata)?;
     let resource_version = current
         .metadata
@@ -217,20 +258,6 @@ pub async fn observe(
     let generation = current.metadata.generation.ok_or(ObserveError::Identity)?;
     if pod_uid.is_empty() || instance_id.is_empty() {
         return Err(ObserveError::Identity);
-    }
-
-    let previous = current
-        .status
-        .as_ref()
-        .and_then(|status| status.observer.as_ref());
-    if previous.is_some_and(|receipt| {
-        receipt.catalog_uid == catalog_uid
-            && receipt.observed_generation == generation
-            && receipt.pod_uid == pod_uid
-            && receipt.instance_id == instance_id
-            && !receipt.observed_resource_version.is_empty()
-    }) {
-        return Ok((Action::requeue(RESYNC), current));
     }
     let receipt = CatalogObservation {
         catalog_uid: catalog_uid.into(),
@@ -266,6 +293,28 @@ pub async fn observe(
     {
         return Err(ObserveError::Identity);
     }
+    Ok(latest)
+}
+
+pub async fn observe(
+    client: Client,
+    observed: &TenantDatabaseCatalog,
+    pod_uid: &str,
+    instance_id: &str,
+) -> Result<(Action, TenantDatabaseCatalog), ObserveError> {
+    let current = verify_current(client.clone(), observed).await?;
+    if !current.spec.entries.is_empty()
+        || current
+            .status
+            .as_ref()
+            .is_some_and(|status| !status.entries.is_empty())
+    {
+        return Err(ObserveError::UnsupportedEntries);
+    }
+    if !observer_needs_refresh(&current, pod_uid, instance_id)? {
+        return Ok((Action::requeue(RESYNC), current));
+    }
+    let latest = record_observer(client, &current, pod_uid, instance_id).await?;
     Ok((Action::requeue(RESYNC), latest))
 }
 
@@ -288,23 +337,32 @@ pub async fn reconcile(
     {
         return observe(client, &current, pod_uid, instance_id).await;
     }
-    match field(
+    let replay_issued = observer_epoch_changed(&current, pod_uid, instance_id)?;
+    let (action, verified) = match field(
         &tenant_api(client.clone())
             .get(&current.spec.tenant_name)
             .await?
             .data,
         "/spec/provider/type",
     )? {
-        "local" => local::reconcile(client, &current).await,
-        "azure" => azure::reconcile(client, &current).await,
+        "local" => local::reconcile(client.clone(), &current).await,
+        "azure" => azure::reconcile(client.clone(), &current, replay_issued).await,
         _ => Err(ObserveError::UnsupportedEntries),
+    }?;
+    if !has_issued_intents(&verified) && observer_needs_refresh(&verified, pod_uid, instance_id)? {
+        let latest = record_observer(client, &verified, pod_uid, instance_id).await?;
+        return Ok((Action::requeue(RETRY), latest));
     }
+    Ok((action, verified))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::api::TenantDatabaseCatalogSpec;
+    use crate::api::{
+        CatalogObservation, CatalogStatus, CreateIntent, CreateState, DatabasePhase, EntryStatus,
+        TenantDatabaseCatalogSpec,
+    };
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
     use serde_json::json;
 
@@ -360,6 +418,57 @@ mod tests {
         }))
         .unwrap();
         (catalog, tenant, namespace)
+    }
+
+    #[test]
+    fn observer_epoch_change_enables_only_restart_bounded_replay() {
+        let (mut catalog, _, _) = fixtures();
+        catalog.status = Some(CatalogStatus {
+            entries: [(
+                "entry-uid".into(),
+                EntryStatus {
+                    logical_uid: "entry-uid".into(),
+                    observed_generation: 1,
+                    phase: DatabasePhase::Progressing,
+                    conditions: vec![],
+                    provider: None,
+                    namespace: None,
+                    cnpg_cluster: None,
+                    credentials: None,
+                    storage: vec![],
+                    instances: vec![],
+                    query: None,
+                    finalization: None,
+                    create_intents: vec![CreateIntent {
+                        kind: "Namespace".into(),
+                        name: "db-entry".into(),
+                        ordinal: 0,
+                        state: CreateState::Issued,
+                    }],
+                },
+            )]
+            .into(),
+            observer: Some(CatalogObservation {
+                catalog_uid: "catalog-uid".into(),
+                observed_generation: 1,
+                observed_resource_version: "1".into(),
+                pod_uid: "pod-a".into(),
+                instance_id: "instance-a".into(),
+            }),
+        });
+        assert!(!observer_epoch_changed(&catalog, "pod-a", "instance-a").unwrap());
+        assert!(observer_epoch_changed(&catalog, "pod-a", "instance-b").unwrap());
+        assert!(has_issued_intents(&catalog));
+        catalog
+            .status
+            .as_mut()
+            .unwrap()
+            .entries
+            .get_mut("entry-uid")
+            .unwrap()
+            .create_intents[0]
+            .state = CreateState::Observed;
+        assert!(!has_issued_intents(&catalog));
     }
 
     #[test]

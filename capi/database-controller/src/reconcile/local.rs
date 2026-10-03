@@ -365,6 +365,27 @@ pub(super) async fn create(
     kind: &str,
     ordinal: i32,
 ) -> Result<Option<ResourceIdentity>, ObserveError> {
+    create_with_replay(
+        management, catalog, uid, state, api, desired, kind, ordinal, false,
+    )
+    .await
+}
+
+#[expect(
+    clippy::too_many_arguments,
+    reason = "creation binds the exact catalog entry and named resource"
+)]
+pub(super) async fn create_with_replay(
+    management: Client,
+    catalog: &mut TenantDatabaseCatalog,
+    uid: &str,
+    state: &mut EntryStatus,
+    api: Api<DynamicObject>,
+    desired: DynamicObject,
+    kind: &str,
+    ordinal: i32,
+    replay_issued: bool,
+) -> Result<Option<ResourceIdentity>, ObserveError> {
     let name = desired.name_any();
     let previous = intent(state, kind, &name, ordinal)?;
     if let Some(existing) = api.get_opt(&name).await? {
@@ -390,10 +411,19 @@ pub(super) async fn create(
         }
         return Ok(Some(id));
     }
-    if !may_issue(previous) {
+    let replay = replay_issued && previous == Some(CreateState::Issued);
+    if !may_issue(previous) && !replay {
         return Ok(None);
     }
-    if previous != Some(CreateState::Planned) {
+    if replay {
+        tracing::warn!(
+            kind,
+            name,
+            ordinal,
+            "replaying issued create after controller restart"
+        );
+    }
+    if !replay && previous != Some(CreateState::Planned) {
         record(
             management.clone(),
             catalog,
@@ -406,17 +436,19 @@ pub(super) async fn create(
         )
         .await?;
     }
-    record(
-        management.clone(),
-        catalog,
-        uid,
-        state,
-        kind,
-        &name,
-        ordinal,
-        CreateState::Issued,
-    )
-    .await?;
+    if !replay {
+        record(
+            management.clone(),
+            catalog,
+            uid,
+            state,
+            kind,
+            &name,
+            ordinal,
+            CreateState::Issued,
+        )
+        .await?;
+    }
     verify_current(management.clone(), catalog).await?;
     match api.create(&PostParams::default(), &desired).await {
         Ok(created) => {
@@ -2555,7 +2587,7 @@ mod api_scenarios {
     }
 
     #[tokio::test]
-    async fn delayed_post_timeout_create_is_observed_once_not_reissued() {
+    async fn post_timeout_create_requires_explicit_replay_or_observation() {
         let mut catalog = TenantDatabaseCatalog::new(
             "tenant-a",
             TenantDatabaseCatalogSpec {
@@ -2641,6 +2673,23 @@ mod api_scenarios {
         .unwrap();
         assert!(missing.is_none());
         assert_eq!(mock.lock().unwrap().creates, 1);
+        assert!(
+            create_with_replay(
+                client.clone(),
+                &mut restarted,
+                ENTRY,
+                &mut state,
+                core(client.clone(), None, "Namespace", "namespaces"),
+                desired.clone(),
+                "Namespace",
+                0,
+                true,
+            )
+            .await
+            .is_err()
+        );
+        assert_eq!(state.create_intents[0].state, CreateState::Issued);
+        assert_eq!(mock.lock().unwrap().creates, 2);
         mock.lock().unwrap().persist = true;
         let present = create(
             client.clone(),
@@ -2656,7 +2705,7 @@ mod api_scenarios {
         .unwrap();
         assert_eq!(present.unwrap().uid, "created-uid");
         assert_eq!(state.create_intents[0].state, CreateState::Observed);
-        assert_eq!(mock.lock().unwrap().creates, 1);
+        assert_eq!(mock.lock().unwrap().creates, 2);
     }
 
     #[tokio::test]
