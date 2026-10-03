@@ -11,6 +11,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 
 from .common import *
+from scripts.lib.files import unlink_private_file
 from scripts.lib.admin import (
     ADMIN_IDENTITY,
     ADMIN_NAMESPACE_LIMIT,
@@ -3415,33 +3416,71 @@ def destroy(root: Path, config: Mapping[str, str]) -> None:
     inventory = load_inventory(root, config)
     outputs = inventory["outputs"]
     assert isinstance(outputs, dict)
-    database_blockers = _database_identity_blockers(outputs)
-    if database_blockers:
-        raise RuntimeError(
-            "Azure database foundation is unhealthy: " + "; ".join(database_blockers)
-        )
     resource_group_id = outputs["resourceGroupId"]
+    resource_group_name = str(outputs["resourceGroupName"])
     observed = _az(
         "group",
         "show",
         "--name",
-        str(outputs["resourceGroupName"]),
+        resource_group_name,
         "--query",
         "id",
         "-o",
         "tsv",
         check=False,
     )
-    if observed.returncode == 0 and observed.stdout.strip() != resource_group_id:
-        raise RuntimeError("Azure resource group identity changed")
-    if observed.returncode == 0:
-        _az(
+    if observed.returncode != 0:
+        absent = _az(
             "group",
-            "delete",
+            "exists",
             "--name",
-            str(outputs["resourceGroupName"]),
-            "--yes",
-            "--no-wait",
-            timeout=120,
+            resource_group_name,
+            "-o",
+            "tsv",
+            check=False,
         )
-        print("Azure foundation resource group deletion started")
+        if absent.returncode != 0 or absent.stdout.strip() != "false":
+            raise RuntimeError("Azure resource group absence is unproven")
+        files = (
+            _runtime_dir(root) / "catalog-activation.json",
+            _runtime_dir(root) / "catalog-bootstrap-probe.json",
+            _runtime_dir(root) / "kamaji-provider.yaml",
+            _runtime_dir(root) / "management.kubeconfig",
+            _runtime_dir(root) / "resources.json",
+            root / ".runtime" / "rendered" / "azure-admin" / "deployment.json",
+            root / ".runtime" / "rendered" / "azure-controller" / "manager.yaml",
+        )
+        for path in files:
+            unlink_private_file(path)
+        for directory in (
+            root / ".runtime" / "rendered" / "azure-admin",
+            root / ".runtime" / "rendered" / "azure-controller",
+            _runtime_dir(root),
+        ):
+            try:
+                directory.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise RuntimeError(
+                    f"unexpected Azure runtime residue blocks cleanup: {directory}"
+                ) from exc
+        print("Azure foundation absence verified and local inventory removed")
+        return
+    if observed.stdout.strip() != resource_group_id:
+        raise RuntimeError("Azure resource group identity changed")
+    database_blockers = _database_identity_blockers(outputs)
+    if database_blockers:
+        raise RuntimeError(
+            "Azure database foundation is unhealthy: " + "; ".join(database_blockers)
+        )
+    _az(
+        "group",
+        "delete",
+        "--name",
+        resource_group_name,
+        "--yes",
+        "--no-wait",
+        timeout=120,
+    )
+    print("Azure foundation resource group deletion started")

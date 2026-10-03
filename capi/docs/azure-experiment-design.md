@@ -695,12 +695,20 @@ the Tenant and proves all nine current disk identities absent. Do not delete
 a disk by broad name/tag selection, bypass an entry or Tenant finalizer,
 clear a create-intent record, or treat an unverified 404/failed request as
 terminal proof. A creation outcome that remains unknown blocks the catalog
-until independently settled.
+until independently settled. The same database-controller instance never
+replays an `Issued` Kubernetes or ASO create. If the destructive gate observes
+`UnknownCreateOutcome`, it restarts the controller once; the newly elected
+instance may replay only the exact same named desired object while preserving
+the original intent. A live object must still pass exact ownership and desired
+state checks before it becomes `Observed`.
 
 CAPZ remains responsible for VMSS deletion. The normal path does not issue
 `az vmss delete-instances`, patch CAPZ compatibility state, or remove Azure
 provider finalizers. `just azure-destroy` is a separate whole-foundation
-cleanup operation.
+cleanup operation. It starts asynchronous resource-group deletion, retains the
+recorded identity while Azure still reports the group, and removes only the
+exact local Azure inventory and rendered manifests after a later invocation
+independently proves the group absent.
 
 ## Verification boundaries
 

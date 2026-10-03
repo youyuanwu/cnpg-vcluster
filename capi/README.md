@@ -121,6 +121,7 @@ just tenant-create azure config/tenants/examples/azure.json
 just tenant-status azure tenant-example
 just tenant-delete azure tenant-example azure/tenant-example
 just azure-test-tenant-lifecycle
+just azure-destroy
 ```
 
 Azure durable identity lives in Tenant status: exact foundation/specification
@@ -134,7 +135,10 @@ in memory for its active run and is the only Python path allowed to inject
 requires a clean redeploy. Tenant Azure resources remain billable until
 ordinary deletion removes the VMSS and related resources. The preserved AKS,
 VNet, identity, and other shared foundation resources remain billable until
-`just azure-destroy` completes.
+`just azure-destroy` completes. The first invocation starts asynchronous
+resource-group deletion. After Azure reports the exact group absent, rerunning
+the command proves absence and removes the recorded kubeconfig, inventory, and
+Azure-only rendered manifests.
 
 Kamaji uses the public `26.8.6-edge` source release. The edge channel is
 experimental, but it requires no account, activation key, or paid artifact.
