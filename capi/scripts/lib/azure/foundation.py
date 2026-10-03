@@ -2206,7 +2206,7 @@ def _admin_authorization_blockers(root: Path) -> list[str]:
             review = json.loads(response.stdout)
             def credential_resource(scope: str, resource: str) -> object:
                 args = ("get", resource, "-o", "json")
-                if not resource.startswith("namespace/"):
+                if not resource.startswith(("namespace/", "tenant/")):
                     args = ("get", "-n", scope, resource, "-o", "json")
                 result = _kubectl(root, *args, check=False)
                 if result.returncode != 0:
