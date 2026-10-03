@@ -105,21 +105,31 @@ class AdminResourceTests(unittest.TestCase):
         namespace = "tenant-a"
         label = {"tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid"}
         for provider in generator.PROVIDERS:
-            secret = (
-                f"{namespace}-admin-kubeconfig"
-                if provider == "azure"
-                else f"{namespace}-kubeconfig"
-            )
+            secret = f"{namespace}-kubeconfig"
             objects = {
                 f"namespace/{namespace}": {
                     "kind": "Namespace",
                     "metadata": {
                         "name": namespace,
                         "uid": "namespace-uid",
-                        "annotations": {
-                            "tenancy.cnpg-vcluster.io/tenant": namespace,
-                            "tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid",
-                        },
+                        "annotations": (
+                            {
+                                "lifecycle.cnpg-vcluster.capi/profile": "azure",
+                                "lifecycle.cnpg-vcluster.capi/tenant": namespace,
+                            }
+                            if provider == "azure"
+                            else {
+                                "tenancy.cnpg-vcluster.io/tenant": namespace,
+                                "tenancy.cnpg-vcluster.io/tenant-uid": "tenant-uid",
+                            }
+                        ),
+                    },
+                },
+                f"tenant/{namespace}": {
+                    "kind": "Tenant",
+                    "metadata": {
+                        "name": namespace,
+                        "uid": "tenant-uid",
                     },
                 },
                 "role/tenant-database-credentials": {
@@ -194,10 +204,17 @@ class AdminResourceTests(unittest.TestCase):
                 validate_admin_effective_rules(ROOT, provider, broader, namespace, fetch)
             with self.assertRaisesRegex(RuntimeError, "unbound Secret"):
                 validate_admin_effective_rules(ROOT, provider, review, namespace)
-            objects[f"namespace/{namespace}"]["metadata"]["annotations"] = {
-                "tenancy.cnpg-vcluster.io/tenant": namespace,
-                "tenancy.cnpg-vcluster.io/tenant-uid": "replaced-tenant"
-            }
+            objects[f"namespace/{namespace}"]["metadata"]["annotations"] = (
+                {
+                    "lifecycle.cnpg-vcluster.capi/profile": "azure",
+                    "lifecycle.cnpg-vcluster.capi/tenant": "other",
+                }
+                if provider == "azure"
+                else {
+                    "tenancy.cnpg-vcluster.io/tenant": namespace,
+                    "tenancy.cnpg-vcluster.io/tenant-uid": "replaced-tenant",
+                }
+            )
             with self.assertRaisesRegex(RuntimeError, "credential identity"):
                 validate_admin_effective_rules(ROOT, provider, review, namespace, fetch)
 

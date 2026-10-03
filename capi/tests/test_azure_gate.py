@@ -6,7 +6,7 @@ import unittest
 from pathlib import Path
 from subprocess import CompletedProcess
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from scripts.lib.azure.gate import (
     WorkerSnapshot,
@@ -25,6 +25,7 @@ from scripts.test_azure_tenant_lifecycle import (
     _require_runtime_identity,
     _disk_records,
     _require_recreated_identity,
+    _wait_databases_ready,
     _wait_database_capability,
     main,
 )
@@ -81,6 +82,44 @@ def runtime_tenant(spec):
 
 
 class AzureGateTests(unittest.TestCase):
+    def test_unknown_create_outcome_restarts_controller_once(self):
+        blocked = {
+            "databases": [
+                {
+                    "phase": "progressing",
+                    "readyInstances": 0,
+                    "blockers": [{"code": "UnknownCreateOutcome"}],
+                },
+                {"phase": "ready", "readyInstances": 3, "blockers": []},
+                {"phase": "ready", "readyInstances": 3, "blockers": []},
+            ],
+        }
+        ready = {
+            "databases": [
+                {"phase": "ready", "readyInstances": 3, "blockers": []},
+                {"phase": "ready", "readyInstances": 3, "blockers": []},
+                {"phase": "ready", "readyInstances": 3, "blockers": []},
+            ],
+        }
+        catalog = SimpleNamespace(read=Mock(side_effect=[blocked, ready]))
+        with (
+            patch(
+                "scripts.test_azure_tenant_lifecycle._restart_database_controller"
+            ) as restart,
+            patch(
+                "scripts.test_azure_tenant_lifecycle.ready_entries",
+                return_value={"alpha": {}, "beta": {}, "gamma": {}},
+            ),
+            patch(
+                "scripts.test_azure_tenant_lifecycle.time.monotonic",
+                side_effect=[0, 1],
+            ),
+            patch("scripts.test_azure_tenant_lifecycle.time.sleep"),
+        ):
+            result = _wait_databases_ready(catalog, "catalog-uid", 30)
+        restart.assert_called_once_with()
+        self.assertEqual(set(result), {"alpha", "beta", "gamma"})
+
     def test_runtime_install_is_bounded_and_precedes_capability_and_catalog(self):
         spec = SimpleNamespace(name="tenant-c", workers=3, kubernetes_version="1.32.13")
         tenant = runtime_tenant(spec)

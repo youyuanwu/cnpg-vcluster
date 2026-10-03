@@ -803,7 +803,7 @@ pub(super) fn validate_parent(
         owner.controller == Some(true)
     };
     if !controller_matches
-        || owner.api_version != parent.api_version
+        || !owner_api_version_matches(parent.api_version, &owner.api_version)
         || owner.kind != parent.kind
         || owner.name != parent_name
         || Some(owner.uid.as_str()) != parent_uid
@@ -814,6 +814,15 @@ pub(super) fn validate_parent(
         )));
     }
     Ok(())
+}
+
+fn owner_api_version_matches(expected: &str, actual: &str) -> bool {
+    expected == actual
+        || matches!(
+            (expected, actual),
+            ("cluster.x-k8s.io/v1beta1", "cluster.x-k8s.io/v1beta2")
+                | ("cluster.x-k8s.io/v1beta2", "cluster.x-k8s.io/v1beta1")
+        )
 }
 
 fn find<'a>(objects: &'a [DynamicObject], kind: &str) -> Result<&'a DynamicObject, ReconcileError> {
@@ -1468,6 +1477,27 @@ fn bounded_set<T: Ord>(before: BTreeSet<T>, after: BTreeSet<T>, limit: usize) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capi_owner_versions_allow_only_the_supported_conversion_pair() {
+        assert!(owner_api_version_matches(
+            "cluster.x-k8s.io/v1beta1",
+            "cluster.x-k8s.io/v1beta2",
+        ));
+        assert!(owner_api_version_matches(
+            "cluster.x-k8s.io/v1beta2",
+            "cluster.x-k8s.io/v1beta1",
+        ));
+        assert!(owner_api_version_matches("apps/v1", "apps/v1"));
+        assert!(!owner_api_version_matches(
+            "infrastructure.cluster.x-k8s.io/v1beta1",
+            "infrastructure.cluster.x-k8s.io/v1beta2",
+        ));
+        assert!(!owner_api_version_matches(
+            "cluster.x-k8s.io/v1beta1",
+            "cluster.x-k8s.io/v1alpha4",
+        ));
+    }
 
     #[test]
     fn catalog_credential_rbac_is_excluded_only_with_exact_permissions() {

@@ -29,6 +29,7 @@ const ARM_VERSION: &str = "2024-03-02";
 pub(crate) struct Access {
     client: Client,
     capability_ready: bool,
+    replay_issued: bool,
     pub(crate) storage_namespace: String,
     storage_uid: String,
     pub(crate) group_id: String,
@@ -370,7 +371,11 @@ fn validate_state(
     Ok(())
 }
 
-async fn load(management: Client, catalog: &TenantDatabaseCatalog) -> Result<Access, ObserveError> {
+async fn load(
+    management: Client,
+    catalog: &TenantDatabaseCatalog,
+    replay_issued: bool,
+) -> Result<Access, ObserveError> {
     let tenant = Api::<Tenant>::all(management.clone())
         .get(&catalog.spec.tenant_name)
         .await?;
@@ -493,6 +498,7 @@ async fn load(management: Client, catalog: &TenantDatabaseCatalog) -> Result<Acc
             && status.observed_generation == tenant.metadata.generation
             && status.phase == Some(TenantPhase::Ready)
             && capability.available,
+        replay_issued,
         storage_namespace,
         storage_uid,
         group_id: config.values.resource_group_id,
@@ -613,10 +619,19 @@ async fn disk_ready(
         let id = disk_identity(&live, &desired, catalog, uid, expected, expected_arm)?;
         Some((id, live))
     } else {
-        if !local::may_issue(previous) {
+        let replay = access.replay_issued && previous == Some(CreateState::Issued);
+        if !local::may_issue(previous) && !replay {
             return Ok(false);
         }
-        if previous != Some(CreateState::Planned) {
+        if replay {
+            tracing::warn!(
+                kind = "Disk",
+                name,
+                ordinal,
+                "replaying issued create after controller restart"
+            );
+        }
+        if !replay && previous != Some(CreateState::Planned) {
             local::record(
                 management.clone(),
                 catalog,
@@ -629,17 +644,19 @@ async fn disk_ready(
             )
             .await?;
         }
-        local::record(
-            management.clone(),
-            catalog,
-            uid,
-            state,
-            "Disk",
-            name,
-            ordinal,
-            CreateState::Issued,
-        )
-        .await?;
+        if !replay {
+            local::record(
+                management.clone(),
+                catalog,
+                uid,
+                state,
+                "Disk",
+                name,
+                ordinal,
+                CreateState::Issued,
+            )
+            .await?;
+        }
         verify_current(management.clone(), catalog).await?;
         match api
             .create(&kube::api::PostParams::default(), &desired)
@@ -746,6 +763,7 @@ fn set_id(
 pub async fn reconcile(
     management: Client,
     observed: &TenantDatabaseCatalog,
+    replay_issued: bool,
 ) -> Result<(Action, TenantDatabaseCatalog), ObserveError> {
     let mut catalog = verify_current(management.clone(), observed).await?;
     if let Some(uid) = catalog
@@ -761,7 +779,7 @@ pub async fn reconcile(
         catalog = status::update(management, &catalog, &uid, None).await?;
         return Ok((Action::requeue(RETRY), catalog));
     }
-    let access = load(management.clone(), &catalog).await?;
+    let access = load(management.clone(), &catalog, replay_issued).await?;
     let generation = catalog.metadata.generation.ok_or(ObserveError::Identity)?;
     for (uid, spec) in catalog.spec.entries.clone() {
         let (namespace, cluster) = ownership::names(
@@ -852,7 +870,7 @@ async fn ensure(
         local::identity(catalog, uid)?,
         None,
     )?;
-    let id = local::create(
+    let id = local::create_with_replay(
         management.clone(),
         catalog,
         uid,
@@ -861,6 +879,7 @@ async fn ensure(
         ns,
         "Namespace",
         0,
+        access.replay_issued,
     )
     .await?;
     let Some(id) = id else {
@@ -907,7 +926,7 @@ async fn ensure(
             ordinal,
             &expected_arm,
         )?;
-        let id = local::create(
+        let id = local::create_with_replay(
             management.clone(),
             catalog,
             uid,
@@ -921,6 +940,7 @@ async fn ensure(
             pv,
             "PersistentVolume",
             ordinal,
+            access.replay_issued,
         )
         .await?;
         let Some(id) = id else {
@@ -940,7 +960,7 @@ async fn ensure(
         "Cluster",
         "clusters",
     );
-    let id = local::create(
+    let id = local::create_with_replay(
         management.clone(),
         catalog,
         uid,
@@ -949,6 +969,7 @@ async fn ensure(
         desired,
         "Cluster",
         0,
+        access.replay_issued,
     )
     .await?;
     let Some(id) = id else {
@@ -1413,6 +1434,7 @@ mod tests {
         let access = Access {
             client,
             capability_ready: true,
+            replay_issued: false,
             storage_namespace: "tenant-db-storage-tenant-a".into(),
             storage_uid: "storage-uid".into(),
             group_id: GROUP.into(),

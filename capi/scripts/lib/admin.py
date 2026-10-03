@@ -357,11 +357,7 @@ def validate_admin_effective_rules(
     )
     secret_rules = {atom for atom in actual if atom[1] == "secrets"}
     if secret_rules:
-        secret_name = (
-            f"{namespace}-admin-kubeconfig"
-            if provider == "azure"
-            else f"{namespace}-kubeconfig"
-        )
+        secret_name = f"{namespace}-kubeconfig"
         expected_secret = {("", "secrets", "get", secret_name)}
         if (
             namespace == ADMIN_NAMESPACE
@@ -371,6 +367,11 @@ def validate_admin_effective_rules(
             raise RuntimeError("Tenant Admin effective RBAC includes unbound Secret access")
         try:
             namespace_object = fetch_credential_resource(namespace, f"namespace/{namespace}")
+            tenant = (
+                fetch_credential_resource(namespace, f"tenant/{namespace}")
+                if provider == "azure"
+                else None
+            )
             role = fetch_credential_resource(
                 namespace, "role/tenant-database-credentials"
             )
@@ -378,7 +379,7 @@ def validate_admin_effective_rules(
                 namespace, "rolebinding/tenant-database-credentials"
             )
             validate_admin_credential_scope(
-                provider, namespace, namespace_object, role, binding
+                provider, namespace, namespace_object, role, binding, tenant
             )
         except (ValueError, KeyError, TypeError) as exc:
             raise RuntimeError(
@@ -418,6 +419,7 @@ def validate_admin_credential_scope(
     namespace_object: object,
     role: object,
     binding: object,
+    tenant: object | None = None,
 ) -> None:
     if not all(isinstance(value, dict) for value in (namespace_object, role, binding)):
         raise RuntimeError("Tenant Admin effective RBAC credential identity is invalid")
@@ -425,11 +427,22 @@ def validate_admin_credential_scope(
     if not isinstance(namespace_meta, dict):
         raise RuntimeError("Tenant Admin effective RBAC credential identity is invalid")
     annotations = namespace_meta.get("annotations")
-    tenant_uid = (
-        annotations.get("tenancy.cnpg-vcluster.io/tenant-uid")
-        if isinstance(annotations, dict)
-        else None
-    )
+    tenant_uid = None
+    tenant_name_matches = False
+    if provider == "azure" and isinstance(tenant, dict):
+        tenant_meta = tenant.get("metadata")
+        if isinstance(tenant_meta, dict):
+            tenant_uid = tenant_meta.get("uid")
+            tenant_name_matches = (
+                tenant.get("kind") == "Tenant"
+                and tenant_meta.get("name") == namespace
+                and tenant_meta.get("deletionTimestamp") is None
+            )
+    elif isinstance(annotations, dict):
+        tenant_uid = annotations.get("tenancy.cnpg-vcluster.io/tenant-uid")
+        tenant_name_matches = (
+            annotations.get("tenancy.cnpg-vcluster.io/tenant") == namespace
+        )
     if (
         namespace_object.get("kind") != "Namespace"
         or namespace_meta.get("name") != namespace
@@ -437,7 +450,15 @@ def validate_admin_credential_scope(
         or not namespace_meta["uid"]
         or not isinstance(tenant_uid, str)
         or not tenant_uid
-        or annotations.get("tenancy.cnpg-vcluster.io/tenant") != namespace
+        or not tenant_name_matches
+        or (
+            provider == "azure"
+            and (
+                not isinstance(annotations, dict)
+                or annotations.get("lifecycle.cnpg-vcluster.capi/profile") != "azure"
+                or annotations.get("lifecycle.cnpg-vcluster.capi/tenant") != namespace
+            )
+        )
         or namespace_meta.get("deletionTimestamp")
         or namespace_meta.get("ownerReferences")
     ):
@@ -463,11 +484,7 @@ def validate_admin_credential_scope(
         != [{
             "apiGroups": [""],
             "resources": ["secrets"],
-            "resourceNames": [
-                f"{namespace}-admin-kubeconfig"
-                if provider == "azure"
-                else f"{namespace}-kubeconfig"
-            ],
+            "resourceNames": [f"{namespace}-kubeconfig"],
             "verbs": ["get"],
         }]
         or binding.get("roleRef")

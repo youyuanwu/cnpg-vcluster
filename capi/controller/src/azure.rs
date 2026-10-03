@@ -702,9 +702,31 @@ fn desired_subset(desired: &Value, live: &Value, path: &str) -> Result<(), Azure
             }
             Ok(())
         }
+        (Value::String(expected), Value::String(actual))
+            if api_version_field_matches(path, expected, actual) =>
+        {
+            Ok(())
+        }
         (left, right) if left == right => Ok(()),
         _ => Err(AzureOwnershipError::Desired(path.into())),
     }
+}
+
+fn api_version_field_matches(path: &str, expected: &str, actual: &str) -> bool {
+    path.ends_with(".apiVersion")
+        && matches!(
+            (expected, actual),
+            ("cluster.x-k8s.io/v1beta1", "cluster.x-k8s.io/v1beta2")
+                | ("cluster.x-k8s.io/v1beta2", "cluster.x-k8s.io/v1beta1")
+                | (
+                    "bootstrap.cluster.x-k8s.io/v1beta1",
+                    "bootstrap.cluster.x-k8s.io/v1beta2"
+                )
+                | (
+                    "bootstrap.cluster.x-k8s.io/v1beta2",
+                    "bootstrap.cluster.x-k8s.io/v1beta1"
+                )
+        )
 }
 
 macro_rules! management_ids {
@@ -810,11 +832,11 @@ mod tests {
             "identityClientId":"00000000-0000-0000-0000-000000000003",
             "supportedKubernetesVersion":"1.32.13",
             "workerSku":"Standard_B2s",
-            "capiVersion":"v1.10.7",
-            "capzVersion":"v1.21.3",
+            "capiVersion":"v1.11.10",
+            "capzVersion":"v1.22.4",
             "kamajiCapiVersion":"v0.19.0",
             "kamajiChartVersion":"26.8.6-edge",
-            "asoVersion":"v2.11.0",
+            "asoVersion":"v2.13.0",
             "cloudProviderVersion":"v1.32.3",
             "calicoVersion":"v3.32.2",
             "calicoCrdsChartSha256":"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
@@ -870,8 +892,8 @@ mod tests {
     fn configuration_is_typed_canonical_and_fail_closed() {
         let parsed = configuration();
         assert_eq!(parsed.config_map_uid, "provider-config-uid");
-        assert_eq!(parsed.values.capz_version, "v1.21.3");
-        assert_eq!(parsed.values.aso_version, "v2.11.0");
+        assert_eq!(parsed.values.capz_version, "v1.22.4");
+        assert_eq!(parsed.values.aso_version, "v2.13.0");
         assert!(sha256(&parsed.sha256));
         let binding = parsed.binding("tenant-uid", "spec-sha", "operation");
         assert_eq!(validate_binding(&binding, &binding), Ok(()));
@@ -1124,6 +1146,44 @@ mod tests {
         assert_eq!(
             validate_live_object(&desired, &live, None),
             Err(AzureOwnershipError::Markers)
+        );
+    }
+
+    #[test]
+    fn desired_subset_accepts_only_supported_api_version_conversions() {
+        let desired = json!({
+            "spec": {
+                "template": {
+                    "spec": {
+                        "bootstrap": {
+                            "configRef": {
+                                "apiVersion": "bootstrap.cluster.x-k8s.io/v1beta1",
+                                "kind": "KubeadmConfig",
+                            }
+                        }
+                    }
+                }
+            }
+        });
+        let mut live = desired.clone();
+        live["spec"]["template"]["spec"]["bootstrap"]["configRef"]["apiVersion"] =
+            json!("bootstrap.cluster.x-k8s.io/v1beta2");
+        assert_eq!(desired_subset(&desired, &live, "$"), Ok(()));
+        live["spec"]["template"]["spec"]["bootstrap"]["configRef"]["apiVersion"] =
+            json!("bootstrap.cluster.x-k8s.io/v1alpha4");
+        assert_eq!(
+            desired_subset(&desired, &live, "$"),
+            Err(AzureOwnershipError::Desired(
+                "$.spec.template.spec.bootstrap.configRef.apiVersion".into()
+            ))
+        );
+        live = desired.clone();
+        live["spec"]["template"]["spec"]["bootstrap"]["configRef"]["kind"] = json!("ForeignConfig");
+        assert_eq!(
+            desired_subset(&desired, &live, "$"),
+            Err(AzureOwnershipError::Desired(
+                "$.spec.template.spec.bootstrap.configRef.kind".into()
+            ))
         );
     }
 

@@ -107,6 +107,7 @@ fn initial_state() -> (ClusterApi, Access, BTreeMap<String, Value>) {
             "default",
         ),
         capability_ready: true,
+        replay_issued: false,
         storage_namespace: "tenant-db-storage-tenant-a".into(),
         storage_uid: "storage-uid".into(),
         group_id: GROUP.into(),

@@ -973,10 +973,10 @@ def check_documentation() -> None:
     contracts = (ROOT / "controller" / "CONTRACTS.md").read_text(encoding="utf-8")
     catalog_docs = {
         "root README": (root_readme, (
-            "v1alpha4", "explicit database", "unmet release-acceptance",
+            "v1alpha4", "explicit database", "passed manually",
         )),
         "CAPI README": (readme, (
-            "schema-v5", "three-by-three", "nine-disk", "not passing checks",
+            "schema-v5", "three-by-three", "nine-disk", "passed manually",
             "catalog-bootstrap-probe.json", "12,000",
         )),
         "high-level design": (design, (
@@ -989,7 +989,7 @@ def check_documentation() -> None:
         )),
         "Azure design": (azure_design, (
             "TenantDatabaseCatalog", "4-GiB", "StandardSSD_LRS",
-            "nine-disk", "foundation inventory is absent",
+            "nine exact", "Release acceptance completed",
         )),
         "API compatibility": (compatibility, (
             "v1alpha4", "v1alpha1", "resourceVersion", "schemaVersion: 5",

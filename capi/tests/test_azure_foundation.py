@@ -385,6 +385,10 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
             change(resources, assignments)
 
         def invoke(*arguments, **_kwargs):
+            if arguments[:2] == ("group", "show"):
+                return completed(outputs["resourceGroupId"] + "\n")
+            if arguments[:2] == ("group", "delete"):
+                return completed()
             if arguments[:2] == ("identity", "show"):
                 return completed(json.dumps(resources["identity"]))
             if arguments[:2] == ("resource", "show"):
@@ -1991,10 +1995,15 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                         "observedGeneration": 1,
                     },
                     "database": {
-                        "state": "not-applicable",
+                        "state": "unavailable",
                         "observedAt": "2026-09-29T20:00:00Z",
                         "freshness": "live",
-                        "reason": "provider-unsupported",
+                        "reason": "pending",
+                        "message": (
+                            "Use the catalog database endpoint for "
+                            "per-cluster observations"
+                        ),
+                        "retryable": False,
                     },
                     "topology": snapshot_topology,
                 },
@@ -2702,6 +2711,61 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         ):
             destroy(root, config)
         self.assertFalse(any(call.args[:2] == ("group", "delete") for call in azure.call_args_list))
+
+    def test_destroy_cleans_local_state_after_resource_group_absence(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        inventory = self.inventory(root, config)
+        self.write_inventory(root, inventory)
+        for path in (
+            root / ".runtime/azure/catalog-activation.json",
+            root / ".runtime/azure/kamaji-provider.yaml",
+            root / ".runtime/azure/management.kubeconfig",
+            root / ".runtime/rendered/azure-admin/deployment.json",
+            root / ".runtime/rendered/azure-controller/manager.yaml",
+        ):
+            write_private_file(path, "{}\n")
+
+        def azure(*arguments, **_kwargs):
+            if arguments[:2] == ("group", "show"):
+                return completed(returncode=3)
+            if arguments[:2] == ("group", "exists"):
+                return completed("false\n")
+            raise AssertionError(arguments)
+
+        with (
+            patch("scripts.lib.azure.foundation._active_subscription"),
+            patch("scripts.lib.azure.foundation._az", side_effect=azure),
+            patch(
+                "scripts.lib.azure.foundation._database_identity_blockers",
+                side_effect=AssertionError("database health must not be queried"),
+            ),
+        ):
+            destroy(root, config)
+        self.assertFalse((root / ".runtime/azure").exists())
+        self.assertFalse((root / ".runtime/rendered/azure-admin").exists())
+        self.assertFalse((root / ".runtime/rendered/azure-controller").exists())
+
+    def test_destroy_requires_proven_resource_group_absence(self):
+        root = self.make_root()
+        config = load_azure_configuration(root)
+        self.write_inventory(root, self.inventory(root, config))
+
+        def azure(*arguments, **_kwargs):
+            if arguments[:2] == ("group", "show"):
+                return completed(returncode=1)
+            if arguments[:2] == ("group", "exists"):
+                return completed("true\n")
+            raise AssertionError(arguments)
+
+        with (
+            patch("scripts.lib.azure.foundation._active_subscription"),
+            patch("scripts.lib.azure.foundation._az", side_effect=azure),
+            self.assertRaisesRegex(RuntimeError, "absence is unproven"),
+        ):
+            destroy(root, config)
+        self.assertTrue((root / ".runtime/azure/resources.json").exists())
+
     def test_foundation_checksum_mismatch_requires_clean_redeploy(self):
         root = self.make_root()
         config = load_azure_configuration(root)

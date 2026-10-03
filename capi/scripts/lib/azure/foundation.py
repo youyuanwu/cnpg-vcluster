@@ -11,6 +11,7 @@ from collections.abc import Callable
 from contextlib import contextmanager
 
 from .common import *
+from scripts.lib.files import unlink_private_file
 from scripts.lib.admin import (
     ADMIN_IDENTITY,
     ADMIN_NAMESPACE_LIMIT,
@@ -1034,7 +1035,7 @@ def _azure_provider_configuration(
         "capzVersion": config["AZURE_CAPZ_VERSION"],
         "kamajiCapiVersion": config["AZURE_KAMAJI_CAPI_VERSION"],
         "kamajiChartVersion": config["AZURE_KAMAJI_CHART_VERSION"],
-        "asoVersion": "v2.11.0",
+        "asoVersion": "v2.13.0",
         "cloudProviderVersion": config["AZURE_CLOUD_PROVIDER_VERSION"],
         "calicoVersion": config["AZURE_CALICO_VERSION"],
         "calicoCrdsChartSha256": config["AZURE_CALICO_CRDS_CHART_SHA256"],
@@ -2205,7 +2206,7 @@ def _admin_authorization_blockers(root: Path) -> list[str]:
             review = json.loads(response.stdout)
             def credential_resource(scope: str, resource: str) -> object:
                 args = ("get", resource, "-o", "json")
-                if not resource.startswith("namespace/"):
+                if not resource.startswith(("namespace/", "tenant/")):
                     args = ("get", "-n", scope, resource, "-o", "json")
                 result = _kubectl(root, *args, check=False)
                 if result.returncode != 0:
@@ -2394,12 +2395,22 @@ def _admin_api_blockers(root: Path) -> list[str]:
                 or not isinstance(detail.get("summary"), dict)
                 or detail["summary"].get("name") != name
                 or set(database)
-                != {"state", "observedAt", "freshness", "reason"}
-                or database.get("state") != "not-applicable"
+                != {
+                    "state",
+                    "observedAt",
+                    "freshness",
+                    "reason",
+                    "message",
+                    "retryable",
+                }
+                or database.get("state") != "unavailable"
                 or not isinstance(database.get("observedAt"), str)
                 or not database["observedAt"]
                 or database.get("freshness") != "live"
-                or database.get("reason") != "provider-unsupported"
+                or database.get("reason") != "pending"
+                or database.get("message")
+                != "Use the catalog database endpoint for per-cluster observations"
+                or database.get("retryable") is not False
                 or topology.get("tenantName") != name
                 or not isinstance(topology.get("nodes"), list)
                 or not isinstance(topology.get("edges"), list)
@@ -3415,33 +3426,71 @@ def destroy(root: Path, config: Mapping[str, str]) -> None:
     inventory = load_inventory(root, config)
     outputs = inventory["outputs"]
     assert isinstance(outputs, dict)
-    database_blockers = _database_identity_blockers(outputs)
-    if database_blockers:
-        raise RuntimeError(
-            "Azure database foundation is unhealthy: " + "; ".join(database_blockers)
-        )
     resource_group_id = outputs["resourceGroupId"]
+    resource_group_name = str(outputs["resourceGroupName"])
     observed = _az(
         "group",
         "show",
         "--name",
-        str(outputs["resourceGroupName"]),
+        resource_group_name,
         "--query",
         "id",
         "-o",
         "tsv",
         check=False,
     )
-    if observed.returncode == 0 and observed.stdout.strip() != resource_group_id:
-        raise RuntimeError("Azure resource group identity changed")
-    if observed.returncode == 0:
-        _az(
+    if observed.returncode != 0:
+        absent = _az(
             "group",
-            "delete",
+            "exists",
             "--name",
-            str(outputs["resourceGroupName"]),
-            "--yes",
-            "--no-wait",
-            timeout=120,
+            resource_group_name,
+            "-o",
+            "tsv",
+            check=False,
         )
-        print("Azure foundation resource group deletion started")
+        if absent.returncode != 0 or absent.stdout.strip() != "false":
+            raise RuntimeError("Azure resource group absence is unproven")
+        files = (
+            _runtime_dir(root) / "catalog-activation.json",
+            _runtime_dir(root) / "catalog-bootstrap-probe.json",
+            _runtime_dir(root) / "kamaji-provider.yaml",
+            _runtime_dir(root) / "management.kubeconfig",
+            _runtime_dir(root) / "resources.json",
+            root / ".runtime" / "rendered" / "azure-admin" / "deployment.json",
+            root / ".runtime" / "rendered" / "azure-controller" / "manager.yaml",
+        )
+        for path in files:
+            unlink_private_file(path)
+        for directory in (
+            root / ".runtime" / "rendered" / "azure-admin",
+            root / ".runtime" / "rendered" / "azure-controller",
+            _runtime_dir(root),
+        ):
+            try:
+                directory.rmdir()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                raise RuntimeError(
+                    f"unexpected Azure runtime residue blocks cleanup: {directory}"
+                ) from exc
+        print("Azure foundation absence verified and local inventory removed")
+        return
+    if observed.stdout.strip() != resource_group_id:
+        raise RuntimeError("Azure resource group identity changed")
+    database_blockers = _database_identity_blockers(outputs)
+    if database_blockers:
+        raise RuntimeError(
+            "Azure database foundation is unhealthy: " + "; ".join(database_blockers)
+        )
+    _az(
+        "group",
+        "delete",
+        "--name",
+        resource_group_name,
+        "--yes",
+        "--no-wait",
+        timeout=120,
+    )
+    print("Azure foundation resource group deletion started")

@@ -59,9 +59,10 @@ credential exposure. See
 The Azure experiment is documented in
 [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md). It
 prioritizes tenant control-plane, VMSS worker, cloud-provider, targeted
-deletion, and recreation behavior. Azure database workloads and destructive
-disk cleanup still require the separate credentialed validation gates before
-a live Azure rollout can be claimed.
+deletion, recreation, and catalog-backed database behavior. The credentialed
+three-by-three, nine-disk destructive gate and real browser/API agreement passed
+manually on 2026-10-03. This is experiment acceptance, not a production Azure
+storage or security claim.
 
 GitHub Actions does not receive Azure credentials and does not run destructive
 Azure lifecycle tests. An operator with a recorded experiment foundation can
@@ -71,15 +72,15 @@ the target subscription and resource group, destructive
 `just test-e2e-offline` with the separately packaged database controller.
 `just controller-metrics` and `just database-controller-metrics` enforce
 independent 12,000-line production-Rust ceilings.
-As of 2026-10-01, a read-only `just azure-foundation-status` returned
-`{"blockers":["Azure foundation inventory is absent"],"foundation":"unhealthy","healthy":false,"schema":1}`
-and exited 1: the exact owner-only `.runtime/azure/resources.json` is absent,
-and `gh secret list` found zero `CAPI_AZURE_*` repository secrets. The
-credentialed three-by-three Azure destructive run and nine-disk ASO/ARM
-absence proof have **not** run. Real browser-versus-service-proxy agreement
-and leak inspection have **not** run either. Both remain release-acceptance
-gates, not passing checks; full unit/static/local/offline success does not
-substitute for them.
+On 2026-10-03, an operator ran the complete credentialed Azure gate outside
+CI: three workers, three three-instance CNPG clusters, nine exact disks, SQL,
+CNPG failover, database-controller restart, exact database delete/recreate,
+VMSS replacement, ordinary Tenant deletion, external absence proof,
+foundation preservation, Tenant recreation, and final cascade cleanup all
+passed. A real headless Chromium session loaded the same Admin deployment,
+matched the browser cards to the service-proxy catalog API, rendered three
+topology graphs, and returned `marker-alpha` through the browser SQL console.
+The test foundation was then destroyed and its local inventory removed.
 
 If local catalog bootstrap is interrupted after Tenant CREATE was issued,
 `create-management` preserves the owner-only
@@ -121,6 +122,7 @@ just tenant-create azure config/tenants/examples/azure.json
 just tenant-status azure tenant-example
 just tenant-delete azure tenant-example azure/tenant-example
 just azure-test-tenant-lifecycle
+just azure-destroy
 ```
 
 Azure durable identity lives in Tenant status: exact foundation/specification
@@ -134,7 +136,10 @@ in memory for its active run and is the only Python path allowed to inject
 requires a clean redeploy. Tenant Azure resources remain billable until
 ordinary deletion removes the VMSS and related resources. The preserved AKS,
 VNet, identity, and other shared foundation resources remain billable until
-`just azure-destroy` completes.
+`just azure-destroy` completes. The first invocation starts asynchronous
+resource-group deletion. After Azure reports the exact group absent, rerunning
+the command proves absence and removes the recorded kubeconfig, inventory, and
+Azure-only rendered manifests.
 
 Kamaji uses the public `26.8.6-edge` source release. The edge channel is
 experimental, but it requires no account, activation key, or paid artifact.
@@ -712,13 +717,15 @@ Exact versions, URLs, checksums, source commits, and image digests are in
 - The Azure profile is an experiment with a shared resource group, VNet,
   subnet, and broad resource-group Contributor identity.
 - The Azure nine-disk destructive and browser/service-proxy agreement gates
-  remain unmet; no managed-Azure database rollout is claimed.
-- CAPZ `v1.21.3` requires the narrowly scoped external-control-plane webhook
+  passed manually, but no production managed-Azure database rollout is
+  claimed.
+- The pinned CAPZ line requires the narrowly scoped external-control-plane webhook
   compatibility selector documented in
   [`docs/azure-experiment-design.md`](docs/azure-experiment-design.md).
-- The `v1.21.3` patch pin replaces `v1.21.1`, which left finalizer-free
-  `AzureMachinePoolMachine` children after live VMSS deletion. The patch
-  release still requires a fresh destructive deletion rerun before acceptance.
+- CAPZ `v1.21.1` and `v1.21.3` both left finalizer-free
+  `AzureMachinePoolMachine` children after live VMSS deletion. CAPI
+  `v1.11.10` with CAPZ `v1.22.4` completed both bootstrap-probe and
+  three-worker deletion without stale children.
 
 See [`docs/high-level-design.md`](docs/high-level-design.md) for the shared
 as-built lifecycle architecture and

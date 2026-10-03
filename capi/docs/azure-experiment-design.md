@@ -260,8 +260,8 @@ The first tested matrix is:
 |---|---|
 | AKS management Kubernetes | `1.35.7` |
 | Tenant Kubernetes and CAPZ image | `1.32.13` |
-| CAPI core, CABPK, and Kubeadm control-plane provider | `v1.10.7` |
-| CAPZ | `v1.21.3` |
+| CAPI core, CABPK, and Kubeadm control-plane provider | `v1.11.10` |
+| CAPZ | `v1.22.4` |
 | Kamaji CAPI provider | `v0.19.0` |
 | Kamaji | `26.8.6-edge` |
 | Azure cloud provider | `v1.32.3` |
@@ -274,7 +274,7 @@ Tigera operator chart.
 
 ### External-control-plane compatibility
 
-CAPZ `v1.21.3` correctly accepts
+The pinned CAPZ line accepts
 `AzureCluster.spec.controlPlaneEnabled: false` for a Kamaji control plane, but
 its mutating webhook clears `networkSpec.apiServerLB` while load-balancer
 reconciliation still dereferences that field. The result is a nil-pointer
@@ -695,12 +695,20 @@ the Tenant and proves all nine current disk identities absent. Do not delete
 a disk by broad name/tag selection, bypass an entry or Tenant finalizer,
 clear a create-intent record, or treat an unverified 404/failed request as
 terminal proof. A creation outcome that remains unknown blocks the catalog
-until independently settled.
+until independently settled. The same database-controller instance never
+replays an `Issued` Kubernetes or ASO create. If the destructive gate observes
+`UnknownCreateOutcome`, it restarts the controller once; the newly elected
+instance may replay only the exact same named desired object while preserving
+the original intent. A live object must still pass exact ownership and desired
+state checks before it becomes `Observed`.
 
 CAPZ remains responsible for VMSS deletion. The normal path does not issue
 `az vmss delete-instances`, patch CAPZ compatibility state, or remove Azure
 provider finalizers. `just azure-destroy` is a separate whole-foundation
-cleanup operation.
+cleanup operation. It starts asynchronous resource-group deletion, retains the
+recorded identity while Azure still reports the group, and removes only the
+exact local Azure inventory and rendered manifests after a later invocation
+independently proves the group absent.
 
 ## Verification boundaries
 
@@ -726,27 +734,37 @@ authentication are outside this experiment.
 Public tenant endpoints, DNS automation, certificate automation, autoscaling,
 multiple provider implementations in one manager deployment, and production
 hostile-tenant isolation remain excluded. Azure database runtime installation
-and catalog reconciliation are staged, but no production storage guarantees
-or successful credentialed destructive gate should be inferred from them.
+and catalog reconciliation passed the experiment gate, but no production
+storage, backup, disaster-recovery, or hostile-tenant guarantees should be
+inferred from that result.
 
-**Release acceptance still pending (2026-10-01):** read-only
-`just azure-foundation-status` exited 1 with
-`{"blockers":["Azure foundation inventory is absent"],"foundation":"unhealthy","healthy":false,"schema":1}`.
-The exact owner-only `.runtime/azure/resources.json` is missing, and
-`gh secret list` found zero configured `CAPI_AZURE_*` repository secrets.
-GitHub Actions intentionally does not receive Azure credentials or run the
-destructive lifecycle. The nine-disk absence must be proved by an operator outside
-CI against an explicitly recorded experiment foundation. Real browser and
-service-proxy agreement on the same deployment is also unverified. Both are
-unmet gates, not passing checks; no Azure cloud mutation was attempted for
-this run.
+**Release acceptance completed (2026-10-03):** an operator ran
+`just azure-test-tenant-lifecycle` against an explicitly recorded foundation.
+The uninterrupted run proved three Ready workers; three independent
+three-instance CNPG clusters; nine exact ASO and ARM disk identities; SQL
+write/read markers; CNPG failover; database-controller restart; exact
+database delete/recreate with stale-identity rejection; targeted VMSS
+replacement; retained database identity after worker recovery; ordinary
+Tenant deletion; external VMSS, disk, catalog, Namespace, and allocation
+absence; foundation preservation; same-spec Tenant recreation; and final
+cascade cleanup.
 
-During the 2026-10-02 live validation, CAPZ `v1.21.1` removed the VMSS but
-left two finalizer-free, owner-bound `AzureMachinePoolMachine` objects, which
-blocked the Kubernetes cascade until those exact children were ordinarily
-deleted. The compatible patch pin is now `v1.21.3`; its deletion behavior has
-not yet been rerun against a fresh foundation, so this remains an open
-acceptance item rather than a claimed fix.
+A headless Chromium session then loaded the Tenant detail page through the
+same Admin Service port-forward used by the API. Browser cards and the
+service-proxy catalog endpoint both returned `alpha`, `beta`, and `gamma`;
+each card reported three Ready instances and three healthy volumes; three
+topology graphs rendered; and the browser SQL console returned
+`marker-alpha`. The validation Tenant, VMSS, all disks, foundation resource
+group, kubeconfig, inventory, and Azure-only rendered manifests were removed
+afterward.
+
+CAPZ `v1.21.1` and `v1.21.3` both removed the VMSS but left two
+finalizer-free, owner-bound `AzureMachinePoolMachine` objects. CAPI
+`v1.11.10` with CAPZ `v1.22.4` required exact `v1beta1`/`v1beta2` owner and
+reference conversion handling, then completed bootstrap-probe deletion and
+the full three-worker cascade without stale children or finalizer changes.
+GitHub Actions intentionally still receives no Azure credentials and does not
+run this destructive lifecycle.
 
 ## References
 

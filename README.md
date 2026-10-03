@@ -69,8 +69,9 @@ admin architecture, management read RBAC, unsafe SQL access, APIs, packaging,
 and port-forward workflow are documented in
 [`capi/docs/admin-ui-design.md`](capi/docs/admin-ui-design.md). The credentialed
 Azure three-by-three destructive/nine-disk absence and real
-browser-versus-service-proxy agreement remain **unmet release-acceptance
-gates**, not verified results (see [`capi/README.md`](capi/README.md)).
+browser-versus-service-proxy agreement passed manually outside CI on
+2026-10-03 (see [`capi/README.md`](capi/README.md)); this is experimental
+acceptance rather than a production storage guarantee.
 The local
 operator uses the Rust 1.98.1 toolchain declared in
 [`rust-toolchain.toml`](rust-toolchain.toml); no Go tool downloads are needed.
