@@ -444,8 +444,8 @@ dynamic Tenant Secret names; deployment compromise therefore has
 administrative Tenant impact despite application-level exact-name and
 ownership checks. The validated Tenant kubeconfig and CNPG superuser Secret
 raise that impact to complete Tenant and PostgreSQL administration for
-either provider. Azure database lifecycle is staged: credentialed
-three-by-three nine-disk destructive proof and real browser/service-proxy
-agreement are still **unmet release-acceptance gates**. The fixed list limits
+either provider. The credentialed Azure three-by-three nine-disk destructive
+proof and real browser/service-proxy agreement passed manually on 2026-10-03;
+they remain outside CI and do not imply production storage guarantees. The fixed list limits
 intentionally fail closed for larger management clusters and will require a
 separately designed pagination model.
