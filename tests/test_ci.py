@@ -33,7 +33,10 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertNotIn("    needs:", fast + high)
         self.assertRegex(e2e, r"(?m)^    needs: fast-checks$")
         self.assertNotIn("    if:", fast)
-        self.assertIn("if: github.event_name == 'pull_request'", e2e)
+        self.assertIn(
+            "if: github.event_name == 'pull_request' || github.event_name == 'push'",
+            e2e,
+        )
         self.assertIn("if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'", high)
         self.assertIn("name: CAPI tests\n", gate)
         self.assertIn("if: always()", gate)
@@ -175,7 +178,11 @@ class CIWorkflowTests(unittest.TestCase):
                             )
                             expected = (
                                 fast == "success"
-                                and e2e == ("success" if event == "pull_request" else "skipped")
+                                and e2e == (
+                                    "success"
+                                    if event in {"pull_request", "push"}
+                                    else "skipped"
+                                )
                                 and high == ("success" if event in {"workflow_dispatch", "schedule"} else "skipped")
                             )
                             self.assertEqual(expected, result.returncode == 0)
