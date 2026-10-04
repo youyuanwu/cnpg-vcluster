@@ -1237,6 +1237,12 @@ class AdminLocalTests(unittest.TestCase):
         def mutate_provider_status(body):
             body["data"]["detail"]["providerStatus"] = {}
 
+        def mutate_created_at(body):
+            body["data"]["detail"]["summary"]["createdAt"] = "not-a-time"
+
+        def mutate_provider_allocation(body):
+            body["data"]["detail"]["providerStatus"]["status"]["allocation"] = 7
+
         def mutate_management_resource(body):
             body["data"]["detail"]["managementResources"] = [{"identity": {}}]
 
@@ -1262,6 +1268,8 @@ class AdminLocalTests(unittest.TestCase):
             ("nested-timestamp", mutate_nested_timestamp),
             ("specification", mutate_specification),
             ("provider-status", mutate_provider_status),
+            ("created-at", mutate_created_at),
+            ("provider-allocation", mutate_provider_allocation),
             ("management-resource", mutate_management_resource),
             ("node-resource", mutate_node_resource),
             ("attribute", mutate_attribute),

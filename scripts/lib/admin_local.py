@@ -697,10 +697,7 @@ def _validate_summary(value: object) -> str:
             summary.get("endpoint") is not None
             and not isinstance(summary.get("endpoint"), str)
         )
-        or (
-            summary.get("createdAt") is not None
-            and not isinstance(summary.get("createdAt"), str)
-        )
+        or not _is_optional_timestamp(summary.get("createdAt"))
         or not isinstance(conditions, list)
     ):
         raise RuntimeError("Tenant Admin Tenant summary response is invalid")
@@ -800,27 +797,123 @@ def _validate_provider_status(value: object, provider: str) -> None:
         raise RuntimeError("Tenant Admin Tenant provider status is invalid")
     if observed["provider"] != "unknown" and observed["provider"] != provider:
         raise RuntimeError("Tenant Admin Tenant provider status is invalid")
-    if observed["provider"] == "local" and set(status) != {
-        "allocation",
-        "foundationHash",
-        "clusterUid",
-    }:
-        raise RuntimeError("Tenant Admin local provider status is invalid")
-    if observed["provider"] == "azure" and set(status) != {
-        "binding",
-        "allocation",
-        "endpoint",
-        "management",
-        "workerPool",
-        "nodes",
-        "addOns",
-        "resources",
-    }:
-        raise RuntimeError("Tenant Admin Azure provider status is invalid")
-    if observed["provider"] == "unknown" and set(status) != {
-        "providerType",
-        "summary",
-    }:
+    if observed["provider"] == "local":
+        if (
+            set(status) != {"allocation", "foundationHash", "clusterUid"}
+            or not _is_optional_string(status.get("foundationHash"))
+            or not _is_optional_string(status.get("clusterUid"))
+        ):
+            raise RuntimeError("Tenant Admin local provider status is invalid")
+        if status.get("allocation") is not None:
+            allocation = _required_mapping(
+                status["allocation"], "local provider allocation"
+            )
+            if (
+                set(allocation)
+                != {"slotId", "endpoint", "podCidr", "serviceCidr"}
+                or not _is_integer(allocation.get("slotId"))
+                or allocation["slotId"] < 0
+                or any(
+                    not isinstance(allocation.get(key), str)
+                    or not allocation[key]
+                    for key in ("endpoint", "podCidr", "serviceCidr")
+                )
+            ):
+                raise RuntimeError("Tenant Admin local provider allocation is invalid")
+        return
+    if observed["provider"] == "azure":
+        if set(status) != {
+            "binding",
+            "allocation",
+            "endpoint",
+            "management",
+            "workerPool",
+            "nodes",
+            "addOns",
+            "resources",
+        } or not _is_optional_string(status.get("endpoint")):
+            raise RuntimeError("Tenant Admin Azure provider status is invalid")
+        optional_shapes = {
+            "binding": {"clusterName", "resourceGroup", "bindingHash"},
+            "allocation": {"slotId", "podCidr", "serviceCidr"},
+            "management": {
+                "clusterUid",
+                "infrastructureUid",
+                "controlPlaneUid",
+            },
+            "workerPool": {
+                "name",
+                "uid",
+                "scaleSetName",
+                "desiredReplicas",
+                "readyReplicas",
+            },
+        }
+        for key, expected in optional_shapes.items():
+            if status.get(key) is None:
+                continue
+            nested = _required_mapping(status[key], f"Azure {key}")
+            if set(nested) != expected:
+                raise RuntimeError(f"Tenant Admin Azure {key} is invalid")
+            if key == "management":
+                if not all(_is_optional_string(item) for item in nested.values()):
+                    raise RuntimeError("Tenant Admin Azure management is invalid")
+            elif key == "workerPool":
+                if (
+                    not isinstance(nested.get("name"), str)
+                    or not nested["name"]
+                    or not _is_optional_string(nested.get("uid"))
+                    or not _is_optional_string(nested.get("scaleSetName"))
+                    or not _is_integer(nested.get("desiredReplicas"))
+                    or not _is_integer(nested.get("readyReplicas"))
+                ):
+                    raise RuntimeError("Tenant Admin Azure worker pool is invalid")
+            elif any(
+                not isinstance(item, str) or not item
+                for item in nested.values()
+            ):
+                raise RuntimeError(f"Tenant Admin Azure {key} is invalid")
+        if not isinstance(status.get("nodes"), list):
+            raise RuntimeError("Tenant Admin Azure nodes are invalid")
+        for value in status["nodes"]:
+            node = _required_mapping(value, "Azure node")
+            if (
+                set(node) != {"name", "uid", "providerId", "internalIp", "ready"}
+                or not isinstance(node.get("name"), str)
+                or not node["name"]
+                or not isinstance(node.get("uid"), str)
+                or not node["uid"]
+                or not _is_optional_string(node.get("providerId"))
+                or not _is_optional_string(node.get("internalIp"))
+                or not isinstance(node.get("ready"), bool)
+            ):
+                raise RuntimeError("Tenant Admin Azure node is invalid")
+        if not isinstance(status.get("addOns"), list):
+            raise RuntimeError("Tenant Admin Azure add-ons are invalid")
+        for value in status["addOns"]:
+            _validate_resource_identity(value, "Azure add-on identity")
+        if not isinstance(status.get("resources"), list):
+            raise RuntimeError("Tenant Admin Azure resources are invalid")
+        for value in status["resources"]:
+            resource = _required_mapping(value, "Azure resource")
+            if (
+                set(resource) != {"identity", "resourceId", "ownerUids"}
+                or not _is_optional_string(resource.get("resourceId"))
+                or not isinstance(resource.get("ownerUids"), list)
+                or any(
+                    not isinstance(owner, str) or not owner
+                    for owner in resource["ownerUids"]
+                )
+            ):
+                raise RuntimeError("Tenant Admin Azure resource is invalid")
+            _validate_resource_identity(resource.get("identity"), "Azure resource identity")
+        return
+    if (
+        set(status) != {"providerType", "summary"}
+        or not isinstance(status.get("providerType"), str)
+        or not status["providerType"]
+        or not _is_optional_string(status.get("summary"))
+    ):
         raise RuntimeError("Tenant Admin unknown provider status is invalid")
 
 
