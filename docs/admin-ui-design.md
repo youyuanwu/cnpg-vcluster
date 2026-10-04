@@ -192,6 +192,21 @@ representations, external provider representations, recorded representations
 and synthetic summaries are labeled separately. Synthetic summaries are not
 ordinary resource counts.
 
+Tenant navigation, inventory selection, filters, textual relationship
+selection and all lifecycle/database controls use native links, buttons and
+form controls with visible focus. Health always includes text and shape in
+addition to color. The SVG graph is supplemental rather than the sole
+interaction path: the keyboard-operable inventory and inspector expose the
+same identity, health, attributes and directional relationships. Loading,
+partial-failure, mutation and error changes retain status, alert and live
+region semantics. Reduced-motion preferences minimize animation.
+
+At the existing responsive breakpoints the Tenant context and explorer
+collapse from coordinated columns to sequential content. Tables and topology
+retain bounded internal overflow; primary navigation and page content remain
+reachable without page-level horizontal scrolling at the 320 CSS-pixel
+minimum viewport.
+
 Status shows current conditions, reconciliation blockers, section
 availability, and links to an affected snapshot node when the server can bind
 one safely. Settings contains the immutable specification, endpoint, sanitized
