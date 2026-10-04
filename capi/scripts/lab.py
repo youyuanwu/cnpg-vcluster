@@ -23,7 +23,7 @@ from scripts.storage import run_storage_gate
 from scripts.cnpg import run_cnpg_gate
 from scripts.preflight import PreflightError, run_preflight
 from scripts.tools import prepare_tools
-from scripts.cache import acquire_admin_build_cache, acquire_cache
+from scripts.cache import acquire_admin_build_cache, acquire_cache, ensure_cache
 from scripts.test_tenant_lifecycle import run_tenant_lifecycle
 from scripts.retained import dev_bootstrap, dev_clean
 
@@ -44,11 +44,17 @@ def main(arguments: list[str]) -> int:
     if command == "cache":
         with tools_lock(ROOT, exclusive=True):
             if not rest or rest == [""]:
-                acquire_cache(ROOT, config)
+                ensure_cache(ROOT, config)
             elif rest == ["admin-build"]:
                 acquire_admin_build_cache(ROOT, config)
             else:
                 raise RuntimeError("cache accepts only the optional admin-build scope")
+        return 0
+    if command == "cache-refresh":
+        if rest:
+            raise RuntimeError("cache-refresh does not accept a scope")
+        with tools_lock(ROOT, exclusive=True):
+            acquire_cache(ROOT, config)
         return 0
     if command == "dev-bootstrap":
         with tools_lock(ROOT, exclusive=True):

@@ -18,6 +18,7 @@ from scripts.lib.config import load_configuration, load_env_file
 EXPECTED_RECIPES = {
     "default",
     "cache",
+    "cache-refresh",
     "tools",
     "prepare-host",
     "preflight",
@@ -850,7 +851,7 @@ def check_documentation() -> None:
         "Worker image delivery is bootstrap-owned",
         "Tenant finalizer first closes and drains its catalog",
         "while retaining its PVC, PV, and bytes.",
-        "`just cache` is the explicit online acquisition",
+        "`just cache-refresh` is the explicit forced online provenance-refresh",
         "The retained workflow is a development optimization, not a final gate",
         "`tools_cache`",
         "does not silently acquire missing content",

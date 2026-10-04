@@ -3,9 +3,13 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 default:
     @just --list
 
-# [implemented] Acquire and verify every pinned artifact and OCI image online.
+# [implemented] Reuse the verified cache, acquiring it online only when needed.
 cache scope="":
     @python3 scripts/lab.py cache {{quote(scope)}}
+
+# [implemented] Force online provenance refresh of every pinned cache entry.
+cache-refresh:
+    @python3 scripts/lab.py cache-refresh
 
 # [implemented] Install and verify tools from the complete local cache.
 tools:

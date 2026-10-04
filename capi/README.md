@@ -245,19 +245,22 @@ runtime layouts, and Python Azure tenant journals are not migrated or adopted.
 Local retries reapply the same immutable Tenant manifest; Azure retries submit
 the same JSON-derived Tenant specification.
 
-`just cache` is the explicit online acquisition and provenance-refresh step.
-After it succeeds, `just tools` and `just preflight` verify and use the local
-cache without Git or registry lookups. `just test-e2e-offline` applies the same
-policy to the clean-to-clean gate by blocking acquisition commands, forcing
-Docker consumers to `--pull=never`, and denying external HTTP/HTTPS inside the
-disposable nodes. The pinned Kamaji release renders tenant API-server and
-Konnectivity containers with `imagePullPolicy: Always` and exposes no supported
-pull-policy field. Offline management therefore starts an owner-labeled
-Distribution registry only on the private kind Docker network. Its read-only
-storage is generated from the verified active cache, maps the original
-`registry.k8s.io` tags and digests to their pinned OCI manifests, and is
-configured as the management node's only local mirror before tenant
-reconciliation. External registry egress remains denied.
+`just cache` verifies and reuses the stamped active generation when its pins,
+inventory, permissions, and file metadata remain current; it acquires a new
+generation online only when that cache is absent or stale. `just cache-refresh`
+is the explicit forced online provenance-refresh step. After either succeeds,
+`just tools` and `just preflight` verify and use the local cache without Git or
+registry lookups. `just test-e2e-offline` applies the same policy to the
+clean-to-clean gate by blocking acquisition commands, forcing Docker consumers
+to `--pull=never`, and denying external HTTP/HTTPS inside the disposable nodes.
+The pinned Kamaji release renders tenant API-server and Konnectivity containers
+with `imagePullPolicy: Always` and exposes no supported pull-policy field.
+Offline management therefore starts an owner-labeled Distribution registry
+only on the private kind Docker network. Its read-only storage is generated
+from the verified active cache, maps the original `registry.k8s.io` tags and
+digests to their pinned OCI manifests, and is configured as the management
+node's only local mirror before tenant reconciliation. External registry
+egress remains denied.
 
 Use the targeted suites during development instead of repeatedly running the
 full isolation gate:
@@ -277,7 +280,8 @@ just test-tenant-lifecycle
 
 | Command | Purpose |
 |---|---|
-| `just cache` | Online-only acquisition of every pinned input and OCI image into a verified immutable generation. |
+| `just cache` | Reuse the stamped verified generation, acquiring pinned inputs and OCI images online only when it is absent or stale. |
+| `just cache-refresh` | Force online provenance refresh of every pinned input and OCI image while preserving the prior generation until replacement verifies. |
 | `just tools` | Install and verify tools and inputs from the active local cache without provenance refresh. |
 | `just prepare-host` | Securely record and raise runtime inotify values. |
 | `just preflight` | Check tools, inputs, Docker capacity, CIDRs, image digests, ownership collisions, and privileged-container support. |
@@ -563,12 +567,15 @@ commands as part of recovery.
 
 ## Supply chain
 
-Large upstream YAML and OCI archives are not committed. `just cache` stages a
-new private generation, checks release SHA-256 values, verifies annotated tags
-against peeled source commits, verifies image tag provenance against OCI
-digests, validates the archived `linux/amd64` manifest and blobs, and switches
-the active pointer only after the whole generation passes. A failed refresh
-leaves the previous generation active.
+Large upstream YAML and OCI archives are not committed. `just cache` first
+checks the stamped active generation and returns without network acquisition
+when it remains valid. When it is absent or stale, and whenever
+`just cache-refresh` is used, the command stages a new private generation,
+checks release SHA-256 values, verifies annotated tags against peeled source
+commits, verifies image tag provenance against OCI digests, validates the
+archived `linux/amd64` manifest and blobs, and switches the active pointer only
+after the whole generation passes. A failed refresh leaves the previous
+generation active.
 
 Normal preflight compares the active generation and inventory with the current
 pins and records a private verification stamp after checking archive
@@ -579,6 +586,9 @@ input, or pin change forces full content verification again. Local tool
 versions are still checked on every preflight. Preflight does not silently
 acquire missing content. Missing, changed, symlinked, broad-permission,
 platform-mismatched, or stale entries require a new online `just cache`.
+After a generation is active and fully verified, cache acquisition removes
+all inactive generations. A failed refresh still leaves the prior active
+generation untouched.
 
 Management images are imported before controller installation. Worker
 `preKubeadmCommands` import the exact required archives before kubeadm and
@@ -586,10 +596,11 @@ networking start. The controller image contains only the static manager binary
 and checksum-verified Calico and CNPG assets.
 
 Trunk `0.21.14` and wasm-bindgen CLI `0.2.129` are checksum-pinned cache
-inputs. Only `just cache` acquires them (`just cache admin-build` is the
-CI-focused subset); admin builds consume the verified binaries with locked
-Cargo dependencies and Trunk offline. Generated HTML, JavaScript, Wasm, and
-CSS bundles under `.runtime/` are ignored build output.
+inputs. `just cache` and `just cache-refresh` acquire them when needed
+(`just cache admin-build` is the CI-focused subset); admin builds consume the
+verified binaries with locked Cargo dependencies and Trunk offline. Generated
+HTML, JavaScript, Wasm, and CSS bundles under `.runtime/` are ignored build
+output.
 
 The enforced-offline path additionally verifies and restores the pinned
 Kubernetes API-server, controller-manager, scheduler, Konnectivity server, and
@@ -614,6 +625,13 @@ admin generation/lint/tests/metrics, and offline reproducible server/Wasm
 packaging. PR E2E consumes the exact uploaded controller,
 database-controller and admin artifacts and runs `just test-e2e-offline`;
 scheduled/manual high-capacity CI rebuilds from the complete cache.
+The end-to-end and high-capacity jobs restore the complete verified generation
+through `actions/cache`, keyed by the pinned versions, toolchain, lockfile,
+authored manifests, and cache implementation. Cargo's shared cache remains
+owned by `actions-rust-lang/setup-rust-toolchain`. Restored CAPI content is
+never trusted solely because the Actions cache key matched: `just cache` still
+validates the active inventory and local verification stamp, then reacquires
+online if the restored generation is missing or stale.
 The final **CAPI tests** check requires fast checks and offline E2E on PRs
 (including fork PRs), fast checks plus targeted/offline high-capacity and
 high-capacity jobs on manual dispatch and the weekly schedule, and fast checks

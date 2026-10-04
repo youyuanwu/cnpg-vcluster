@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from scripts.test_e2e import (
     _restart_worker_and_verify_markers,
+    _wait_databases_ready,
     _verify_restarts_and_markers,
     capture_tenant_deletion_identity,
     verify_tenant_deletion,
@@ -83,6 +84,101 @@ class TenantDeletionProofTests(unittest.TestCase):
         snapshot.assert_called_once_with({"LAB_PREFIX": "lab"}, self.client, current)
         self.assertEqual("tenant-uid", captured["uid"])
         self.assertEqual(self.identity["allocationLease"], captured["allocationLease"])
+
+    def test_unknown_create_outcome_restarts_database_controller_once(self) -> None:
+        blocked = {
+            "catalogUid": "catalog-uid",
+            "closed": False,
+            "capabilityAvailable": True,
+            "databases": [
+                {
+                    "name": "alpha",
+                    "phase": "progressing",
+                    "instances": 3,
+                    "readyInstances": 0,
+                    "blockers": [{"code": "UnknownCreateOutcome"}],
+                },
+                {
+                    "name": "beta",
+                    "phase": "ready",
+                    "instances": 3,
+                    "readyInstances": 3,
+                    "blockers": [],
+                },
+                {
+                    "name": "gamma",
+                    "phase": "ready",
+                    "instances": 3,
+                    "readyInstances": 3,
+                    "blockers": [],
+                },
+            ],
+        }
+        ready = {
+            "catalogUid": "catalog-uid",
+            "closed": False,
+            "capabilityAvailable": True,
+            "databases": [
+                {
+                    "name": name,
+                    "phase": "ready",
+                    "instances": 3,
+                    "readyInstances": 3,
+                    "blockers": [],
+                }
+                for name in ("alpha", "beta", "gamma")
+            ],
+        }
+        catalog = Mock()
+        catalog.read.side_effect = [blocked, ready]
+        with (
+            patch("scripts.test_e2e._restart_database_controller") as restart,
+            patch("scripts.test_e2e.time.monotonic", side_effect=[0, 1]),
+            patch("scripts.test_e2e.time.sleep"),
+        ):
+            result = _wait_databases_ready(
+                self.client,
+                catalog,
+                "catalog-uid",
+                {"alpha", "beta", "gamma"},
+                30,
+            )
+        restart.assert_called_once_with(self.client)
+        self.assertEqual(ready, result)
+
+    def test_database_wait_requires_catalog_capability_after_worker_recovery(self) -> None:
+        unavailable = {
+            "catalogUid": "catalog-uid",
+            "closed": False,
+            "capabilityAvailable": False,
+            "databases": [
+                {
+                    "name": name,
+                    "phase": "ready",
+                    "instances": 3,
+                    "readyInstances": 3,
+                    "blockers": [],
+                }
+                for name in ("alpha", "beta", "gamma")
+            ],
+        }
+        ready = {**unavailable, "capabilityAvailable": True}
+        catalog = Mock()
+        catalog.read.side_effect = [unavailable, ready]
+        with (
+            patch("scripts.test_e2e._restart_database_controller") as restart,
+            patch("scripts.test_e2e.time.monotonic", side_effect=[0, 1]),
+            patch("scripts.test_e2e.time.sleep"),
+        ):
+            result = _wait_databases_ready(
+                self.client,
+                catalog,
+                "catalog-uid",
+                {"alpha", "beta", "gamma"},
+                30,
+            )
+        restart.assert_not_called()
+        self.assertEqual(ready, result)
 
     def test_capture_rejects_same_name_replacement_or_missing_tenant(self) -> None:
         for payload in (None, {"metadata": {"name": "tenant-a", "uid": "replacement"}}):
@@ -330,9 +426,17 @@ class WorkerRestartPersistenceTests(unittest.TestCase):
         def wait(predicate, _timeout, _uid):
             self.events.append("catalog-ready")
             ready = {
+                "catalogUid": "catalog-uid",
+                "closed": False,
+                "capabilityAvailable": True,
                 "databases": [
-                    {"phase": "ready", "readyInstances": 3}
-                    for _ in self.entries
+                    {
+                        "name": name,
+                        "logicalUid": entry["logicalUid"],
+                        "phase": "ready",
+                        "readyInstances": 3,
+                    }
+                    for name, entry in self.entries.items()
                 ],
             }
             if not predicate(ready):
