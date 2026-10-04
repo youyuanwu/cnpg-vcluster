@@ -472,10 +472,12 @@ fn database_stage(
         }
         if catalog.databases.iter().any(|database| {
             matches!(database.phase.as_str(), "degraded" | "ownership-invalid")
-                || database
-                    .blockers
-                    .iter()
-                    .any(|blocker| blocker.code == "ProviderMismatch")
+                || database.blockers.iter().any(|blocker| {
+                    matches!(
+                        blocker.code.as_str(),
+                        "ProviderMismatch" | "OwnershipInvalid" | "UnknownCreateOutcome"
+                    )
+                })
         }) {
             return LifecycleStageState::Blocked;
         }
@@ -2275,27 +2277,19 @@ fn object_message(object: &DynamicObject) -> Option<String> {
 }
 
 fn condition_health(tenant: &Tenant, condition_type: &str) -> TopologyHealth {
-    let generation = tenant.metadata.generation;
-    tenant
-        .status
-        .as_ref()
-        .and_then(|status| {
-            status
-                .conditions
-                .iter()
-                .find(|condition| condition.type_ == condition_type)
-        })
-        .map_or(TopologyHealth::Unknown, |condition| {
-            if condition.observed_generation != generation {
-                TopologyHealth::Progressing
-            } else {
-                match condition.status.as_str() {
-                    "True" => TopologyHealth::Ready,
-                    "False" => TopologyHealth::Degraded,
-                    _ => TopologyHealth::Progressing,
-                }
-            }
-        })
+    let Some(condition) = current_condition(tenant, condition_type) else {
+        return TopologyHealth::Unknown;
+    };
+    match condition.status.as_str() {
+        "True" => TopologyHealth::Ready,
+        "False" => match tenant.status.as_ref().and_then(|status| status.phase) {
+            Some(TenantPhase::Failed) => TopologyHealth::Failed,
+            Some(TenantPhase::Degraded | TenantPhase::OwnershipInvalid) => TopologyHealth::Degraded,
+            Some(TenantPhase::Deleting) => TopologyHealth::Deleting,
+            _ => TopologyHealth::Progressing,
+        },
+        _ => TopologyHealth::Unknown,
+    }
 }
 
 fn classification_health(classification: TenantClassification) -> TopologyHealth {
@@ -2338,6 +2332,7 @@ mod tests {
     use k8s_openapi::apimachinery::pkg::apis::meta::v1::{Condition, Time};
     use kube::core::TypeMeta;
     use serde_json::json;
+    use tenant_admin_shared::catalog::{DatabaseBlocker, DatabaseView};
     use tenant_admin_shared::query::{
         DatabaseClusterIdentity, DatabaseCondition, DatabaseNotApplicableReason,
         DatabaseObservationFreshness, DatabasePvcHealth, DatabaseServices,
@@ -2499,6 +2494,45 @@ mod tests {
             observed_at: "2026-09-29T20:50:16Z".into(),
             freshness: DatabaseObservationFreshness::Live,
             reason: DatabaseNotApplicableReason::ProviderUnsupported,
+        }
+    }
+
+    fn catalog_database(phase: &str, blocker: Option<&str>) -> DatabaseView {
+        DatabaseView {
+            logical_uid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+            name: "alpha".into(),
+            instances: 1,
+            deleting: false,
+            phase: phase.into(),
+            observed_generation: Some(1),
+            provider: Some("local".into()),
+            namespace: Some("database".into()),
+            namespace_uid: Some("namespace-uid".into()),
+            cluster: Some("pg-alpha".into()),
+            cluster_uid: Some("cluster-uid".into()),
+            credential_uid: Some("credential-uid".into()),
+            query_identity: None,
+            ready_instances: u32::from(phase == "ready"),
+            storage_requested_bytes: 1,
+            storage_healthy: u32::from(phase == "ready"),
+            storage: Vec::new(),
+            conditions: Vec::new(),
+            finalization: None,
+            instance_topology: Vec::new(),
+            blockers: blocker
+                .map(|code| {
+                    vec![DatabaseBlocker {
+                        code: code.into(),
+                        message: "blocked".into(),
+                    }]
+                })
+                .unwrap_or_default(),
+            topology: TopologyGraph {
+                tenant_name: "tenant-a".into(),
+                provider: TenantProvider::Local,
+                nodes: Vec::new(),
+                edges: Vec::new(),
+            },
         }
     }
 
@@ -2735,6 +2769,20 @@ mod tests {
         assert_eq!(
             database_stage(&stale, Some(&empty), false),
             LifecycleStageState::Unknown
+        );
+        let mut pending = empty.clone();
+        pending.databases = vec![catalog_database("progressing", Some("ObservationPending"))];
+        assert_eq!(
+            database_stage(&tenant, Some(&pending), false),
+            LifecycleStageState::Current
+        );
+        pending.databases[0].blockers = vec![DatabaseBlocker {
+            code: "UnknownCreateOutcome".into(),
+            message: "outcome unknown".into(),
+        }];
+        assert_eq!(
+            database_stage(&tenant, Some(&pending), false),
+            LifecycleStageState::Blocked
         );
     }
 
@@ -2981,6 +3029,37 @@ mod tests {
                 .unwrap()
                 .state,
             LifecycleStageState::Blocked
+        );
+    }
+
+    #[test]
+    fn azure_recorded_health_requires_fresh_terminal_evidence() {
+        let mut tenant = azure_tenant();
+        let condition = tenant
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .iter_mut()
+            .find(|condition| condition.type_ == "AzureWorkersReady")
+            .unwrap();
+        condition.status = "False".into();
+        condition.reason = "NotReady".into();
+        tenant.status.as_mut().unwrap().phase = Some(TenantPhase::Progressing);
+        assert_eq!(
+            condition_health(&tenant, "AzureWorkersReady"),
+            TopologyHealth::Progressing
+        );
+        tenant.status.as_mut().unwrap().observed_generation = Some(0);
+        assert_eq!(
+            condition_health(&tenant, "AzureWorkersReady"),
+            TopologyHealth::Unknown
+        );
+        tenant.status.as_mut().unwrap().observed_generation = Some(1);
+        tenant.status.as_mut().unwrap().phase = Some(TenantPhase::Degraded);
+        assert_eq!(
+            condition_health(&tenant, "AzureWorkersReady"),
+            TopologyHealth::Degraded
         );
     }
 

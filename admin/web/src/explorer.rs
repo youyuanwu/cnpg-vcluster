@@ -452,12 +452,22 @@ impl ExplorerModel {
             )
         });
         for node in additions {
+            if retained.contains(&node.id) {
+                continue;
+            }
             if graph.nodes.len() >= MAX_VISIBLE_NODES {
-                break;
+                let Some(index) = graph
+                    .nodes
+                    .iter()
+                    .rposition(|candidate| candidate.id != selected)
+                else {
+                    break;
+                };
+                let removed = graph.nodes.remove(index);
+                retained.remove(&removed.id);
             }
-            if retained.insert(node.id.clone()) {
-                graph.nodes.push(node);
-            }
+            retained.insert(node.id.clone());
+            graph.nodes.push(node);
         }
         graph.edges = self
             .edges
@@ -795,6 +805,12 @@ mod tests {
                 label: None,
             });
         }
+        nodes.push(node(
+            "database:expanded",
+            TopologyNodeKind::Database,
+            TopologyHealth::Ready,
+            "expanded database",
+        ));
         edges.push(TopologyEdge {
             id: "cycle".into(),
             source: "machine:0".into(),
@@ -813,6 +829,15 @@ mod tests {
                 .any(|node| node.id == "machine:39")
         );
         assert!(relationship.edges.iter().any(|edge| edge.id == "edge:39"));
+        let expanded = model.selected_group_graph("tenant", ResourceGroup::Databases);
+        assert_eq!(expanded.nodes.len(), MAX_VISIBLE_NODES);
+        assert!(expanded.nodes.iter().any(|node| node.id == "tenant"));
+        assert!(
+            expanded
+                .nodes
+                .iter()
+                .any(|node| node.id == "database:expanded")
+        );
         let inspection = model.inspection("tenant").unwrap();
         assert!(inspection.incoming.iter().any(|edge| edge.id == "cycle"));
         assert!(
@@ -821,7 +846,7 @@ mod tests {
                 .iter()
                 .any(|edge| edge.target_id == "machine:0")
         );
-        assert_eq!(model.summary_graph().nodes.len(), 2);
+        assert_eq!(model.summary_graph().nodes.len(), 3);
     }
 
     #[test]

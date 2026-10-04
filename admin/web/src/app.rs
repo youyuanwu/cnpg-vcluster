@@ -8,7 +8,7 @@ use tenant_admin_shared::{
     query::{
         AzureProviderView, ConditionStatus, LifecycleStageState, OverviewSnapshot,
         ProviderSpecificationView, ProviderStatusView, SectionAvailability, TenantCondition,
-        TenantSnapshot, TenantSummary, TopologyGraph,
+        TenantSnapshot, TenantSummary, TopologyGraph, TopologyNodeProvenance,
     },
     routes::{API_OVERVIEW_PATH, API_PREFIX},
 };
@@ -749,14 +749,26 @@ fn tenant_overview_view(data: &TenantSnapshot) -> AnyView {
                 view! {
                     <ul class="attention-list">
                         {attention.into_iter().map(|node| {
-                            let href = tenant_resource_href(&name, &node.id)
-                                .unwrap_or_else(|| tenant_section_href(&name, TenantSection::Resources).unwrap());
                             let class = health_class(node.health);
-                            view! {
-                                <li>
-                                    <a href=href><strong>{node.label}</strong></a>
-                                    <span class=format!("status status--{class}")>{health_label(node.health)}</span>
-                                </li>
+                            if node.provenance == TopologyNodeProvenance::SyntheticSummary {
+                                view! {
+                                    <li>
+                                        <span>
+                                            <strong>{node.label}</strong>
+                                            <small class="secondary">" · Summary evidence; no exact resource target"</small>
+                                        </span>
+                                        <span class=format!("status status--{class}")>{health_label(node.health)}</span>
+                                    </li>
+                                }.into_any()
+                            } else {
+                                let href = tenant_resource_href(&name, &node.id)
+                                    .unwrap_or_else(|| tenant_section_href(&name, TenantSection::Resources).unwrap());
+                                view! {
+                                    <li>
+                                        <a href=href><strong>{node.label}</strong></a>
+                                        <span class=format!("status status--{class}")>{health_label(node.health)}</span>
+                                    </li>
+                                }.into_any()
                             }
                         }).collect_view()}
                     </ul>
