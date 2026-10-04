@@ -626,7 +626,7 @@ def _source_sha256(spec_path: Path) -> str:
     tracked = run(
         ["git", "status", "--porcelain", "--untracked-files=no"],
         timeout=30,
-        cwd=ROOT.parent,
+        cwd=ROOT,
     ).stdout
     if tracked.strip():
         raise RuntimeError(
@@ -636,7 +636,7 @@ def _source_sha256(spec_path: Path) -> str:
     revision = run(
         ["git", "rev-parse", "HEAD"],
         timeout=30,
-        cwd=ROOT.parent,
+        cwd=ROOT,
     ).stdout.strip()
     digest.update(revision.encode())
     digest.update(b"\0")

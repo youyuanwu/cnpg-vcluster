@@ -1,5 +1,0 @@
-.tools/
-.runtime/
-config/azure.local.env
-__pycache__/
-*.pyc

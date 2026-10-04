@@ -44,7 +44,7 @@ class AdminPackagingTests(unittest.TestCase):
         self.directory = tempfile.TemporaryDirectory(dir=ROOT / ".runtime")
         self.addCleanup(self.directory.cleanup)
         self.repository = Path(self.directory.name)
-        self.root = self.repository / "capi"
+        self.root = self.repository
         (self.root / "admin/server").mkdir(parents=True)
         self.root.chmod(0o700)
         (self.root / ".runtime").mkdir(mode=0o700)
@@ -371,9 +371,9 @@ class AdminPackagingTests(unittest.TestCase):
 
     def test_source_digest_covers_admin_root_inputs_tools_and_commands(self) -> None:
         files = {
-            "../Cargo.toml": "[workspace]",
-            "../Cargo.lock": "lock",
-            "../rust-toolchain.toml": "[toolchain]",
+            "Cargo.toml": "[workspace]",
+            "Cargo.lock": "lock",
+            "rust-toolchain.toml": "[toolchain]",
             "admin/Dockerfile": "FROM scratch",
             "admin/shared/src/lib.rs": "shared",
             "admin/server/src/main.rs": "server",

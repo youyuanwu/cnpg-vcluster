@@ -3,7 +3,7 @@
 The Tenant manager and independent database-controller are two separately
 packaged, leader-elected Rust binaries in the root Cargo workspace. Both
 are pinned to Rust 1.98.1 and independently checked against a 12,000-line
-production-Rust ceiling. Run these commands from `capi/` after `just cache`
+production-Rust ceiling. Run these commands from the repository root after `just cache`
 (or `just cache-refresh` when an explicit online provenance refresh is
 required) and `just controller-fetch`:
 

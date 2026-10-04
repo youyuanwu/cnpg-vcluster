@@ -1069,7 +1069,7 @@ mod tests {
     fn test_router_with_provider(source: MockSource, provider: ProviderMode) -> Router {
         router(
             AppState::new(Arc::new(source), provider),
-            PathBuf::from("capi/admin/server/tests/fixtures/web"),
+            PathBuf::from("admin/server/tests/fixtures/web"),
         )
     }
 

@@ -2044,8 +2044,8 @@ class PackagingTests(unittest.TestCase):
         record_path.start()
         self.addCleanup(record_path.stop)
         self.repository = Path(self.directory.name)
-        self.root = self.repository / "capi"
-        self.root.mkdir(mode=0o700)
+        self.root = self.repository
+        self.root.chmod(0o700)
         (self.root / "controller").mkdir(mode=0o700)
 
     def toolchain(self, *_args):
@@ -2198,8 +2198,8 @@ class PackagingTests(unittest.TestCase):
 
     def test_source_identity_tracks_rust_compiler_flags_assets_not_go_or_target(self):
         files = {
-            "../Cargo.toml": "[workspace]", "../Cargo.lock": "lock",
-            "../rust-toolchain.toml": '[toolchain]\nchannel = "stable"',
+            "Cargo.toml": "[workspace]", "Cargo.lock": "lock",
+            "rust-toolchain.toml": '[toolchain]\nchannel = "stable"',
             "controller/Cargo.toml": "[package]",
             "controller/src/lib.rs": "source", "controller/Dockerfile": "FROM scratch",
             "database-runtime/Cargo.toml": "[package]",

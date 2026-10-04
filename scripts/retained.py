@@ -39,10 +39,10 @@ def _retained_payload(root: Path, config: dict[str, str]) -> dict[str, object]:
         timeout=30,
     ).stdout.strip()
     branch = run(
-        ["git", "branch", "--show-current"], timeout=30, cwd=root.parent
+        ["git", "branch", "--show-current"], timeout=30, cwd=root
     ).stdout.strip()
     revision = run(
-        ["git", "rev-parse", "HEAD"], timeout=30, cwd=root.parent
+        ["git", "rev-parse", "HEAD"], timeout=30, cwd=root
     ).stdout.strip()
     return {
         "schema": RETAINED_SCHEMA,

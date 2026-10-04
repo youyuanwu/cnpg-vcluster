@@ -274,7 +274,7 @@ class ControllerIntegrationUnitTests(unittest.TestCase):
     def test_controller_digest_includes_assets_and_versions(self, _toolchain) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
-            root = repository / "capi"
+            root = repository
             (root / "controller").mkdir(parents=True)
             repository.joinpath("Cargo.toml").write_text(
                 "[workspace]", encoding="utf-8",

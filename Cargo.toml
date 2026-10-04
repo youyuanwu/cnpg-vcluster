@@ -1,11 +1,11 @@
 [workspace]
 members = [
-    "capi/admin/server",
-    "capi/admin/shared",
-    "capi/admin/web",
-    "capi/controller",
-    "capi/database-controller",
-    "capi/database-runtime",
+    "admin/server",
+    "admin/shared",
+    "admin/web",
+    "controller",
+    "database-controller",
+    "database-runtime",
 ]
 resolver = "2"
 
@@ -43,10 +43,10 @@ tokio-postgres = "0.7"
 tower = { version = "0.5", features = ["util"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-tenant-admin-shared = { path = "capi/admin/shared" }
-tenant-controller = { path = "capi/controller" }
-tenant-database-controller = { path = "capi/database-controller" }
-tenant-database-runtime = { path = "capi/database-runtime" }
+tenant-admin-shared = { path = "admin/shared" }
+tenant-controller = { path = "controller" }
+tenant-database-controller = { path = "database-controller" }
+tenant-database-runtime = { path = "database-runtime" }
 tower-http = { version = "0.7", features = ["fs", "trace"] }
 url = "2"
 uuid = { version = "1", features = ["v4"] }

@@ -1908,7 +1908,7 @@ def vet_controller(root: Path, config: dict[str, str]) -> None:
 def controller_source_digest(root: Path, config: dict[str, str]) -> str:
     digest = hashlib.sha256()
     controller = root / "controller"
-    repository = root.parent
+    repository = root
     inputs = [
         *controller.joinpath("src").rglob("*.rs"),
         *root.joinpath("database-runtime", "src").rglob("*.rs"),

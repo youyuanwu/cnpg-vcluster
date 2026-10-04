@@ -166,15 +166,15 @@ def _requirements(config: dict[str, str], root: Path | None = None) -> dict[str,
     }
     if (
         root is not None
-        and (root.parent / "Cargo.toml").is_file()
+        and (root / "Cargo.toml").is_file()
         and (root / "controller" / "Cargo.toml").is_file()
     ):
         from scripts.lib.controller import rust_toolchain
 
-        lock = root.parent / "Cargo.lock"
+        lock = root / "Cargo.lock"
         if not lock.is_file():
             raise IntegrityError("workspace Cargo.lock is missing")
-        toolchain = root.parent / "rust-toolchain.toml"
+        toolchain = root / "rust-toolchain.toml"
         if not toolchain.is_file():
             raise IntegrityError("workspace rust-toolchain.toml is missing")
         _, compiler = rust_toolchain(root)
@@ -824,7 +824,7 @@ def verify_cache(
     requirements_sha256 = _requirements_sha256(requirements)
     state_sha256 = _cache_state_sha256(root, generation, requirements)
     if (
-        (root.parent / "Cargo.toml").is_file()
+        (root / "Cargo.toml").is_file()
         and (root / "controller" / "Cargo.toml").is_file()
     ):
         from scripts.lib.controller import fetch_controller_dependencies
@@ -992,7 +992,7 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
     try:
         acquire_tools(root, config, tools_dir=generation)
         if (
-            (root.parent / "Cargo.toml").is_file()
+            (root / "Cargo.toml").is_file()
             and (root / "controller" / "Cargo.toml").is_file()
         ):
             from scripts.lib.controller import fetch_controller_dependencies
