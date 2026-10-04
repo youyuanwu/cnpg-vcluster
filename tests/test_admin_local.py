@@ -211,8 +211,19 @@ class FakeClient:
                 "uid": f"{name}-uid",
                 "generation": 1,
                 "observedGeneration": 1,
-                "specification": {},
-                "providerStatus": {},
+                "specification": {
+                    "kubernetesVersion": "1.36.4",
+                    "workers": 1,
+                    "provider": {"provider": "local"},
+                },
+                "providerStatus": {
+                    "provider": "local",
+                    "status": {
+                        "allocation": None,
+                        "foundationHash": "foundation",
+                        "clusterUid": f"{name}-cluster-uid",
+                    },
+                },
                 "lifecycle": [
                     {
                         "stage": stage,
@@ -1178,7 +1189,16 @@ class AdminLocalTests(unittest.TestCase):
         self,
     ) -> None:
         def mutate_timestamp(body):
-            body["data"]["observedAt"] = "not-a-timestamp"
+            body["data"]["observedAt"] = "2026-01-01"
+
+        def mutate_missing_seconds(body):
+            body["data"]["observedAt"] = "2026-01-01T00:00Z"
+
+        def mutate_comma_fraction(body):
+            body["data"]["observedAt"] = "2026-01-01T00:00:00,5Z"
+
+        def mutate_compact_offset(body):
+            body["data"]["observedAt"] = "2026-01-01T00:00:00+0000"
 
         def mutate_section(body):
             body["data"]["sections"]["resources"] = {
@@ -1211,8 +1231,28 @@ class AdminLocalTests(unittest.TestCase):
                 "2026-01-01T00:00:00"
             )
 
+        def mutate_specification(body):
+            body["data"]["detail"]["specification"] = {}
+
+        def mutate_provider_status(body):
+            body["data"]["detail"]["providerStatus"] = {}
+
+        def mutate_management_resource(body):
+            body["data"]["detail"]["managementResources"] = [{"identity": {}}]
+
+        def mutate_node_resource(body):
+            body["data"]["topology"]["nodes"][0]["resource"] = {}
+
+        def mutate_attribute(body):
+            body["data"]["topology"]["nodes"][0]["attributes"] = [
+                {"label": "", "value": "bad"}
+            ]
+
         for name, mutator in (
             ("timestamp", mutate_timestamp),
+            ("missing-seconds", mutate_missing_seconds),
+            ("comma-fraction", mutate_comma_fraction),
+            ("compact-offset", mutate_compact_offset),
             ("section", mutate_section),
             ("lifecycle", mutate_lifecycle),
             ("capacity", mutate_capacity),
@@ -1220,6 +1260,11 @@ class AdminLocalTests(unittest.TestCase):
             ("edge", mutate_edge),
             ("database-timestamp", mutate_database_timestamp),
             ("nested-timestamp", mutate_nested_timestamp),
+            ("specification", mutate_specification),
+            ("provider-status", mutate_provider_status),
+            ("management-resource", mutate_management_resource),
+            ("node-resource", mutate_node_resource),
+            ("attribute", mutate_attribute),
         ):
             with self.subTest(name=name):
                 client = FakeClient(tenant_names=("tenant-a",))

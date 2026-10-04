@@ -41,6 +41,10 @@ ADMIN_IMAGE_PATTERN = re.compile(
     r"[a-z0-9](?:[a-z0-9._/-]*[a-z0-9])?:"
     r"[A-Za-z0-9_][A-Za-z0-9._-]{0,127}"
 )
+ADMIN_RFC3339_PATTERN = re.compile(
+    r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?"
+    r"(?:Z|[+-]\d{2}:\d{2})$"
+)
 ADMIN_CLASSIFICATIONS = {
     "ready",
     "progressing",
@@ -741,6 +745,101 @@ def _is_optional_timestamp(value: object) -> bool:
     return value is None or _valid_timestamp(value)
 
 
+def _validate_resource_identity(value: object, description: str) -> None:
+    identity = _required_mapping(value, description)
+    if (
+        set(identity) != {"apiVersion", "kind", "namespace", "name", "uid"}
+        or not isinstance(identity.get("apiVersion"), str)
+        or not identity["apiVersion"]
+        or not isinstance(identity.get("kind"), str)
+        or not identity["kind"]
+        or not _is_optional_string(identity.get("namespace"))
+        or not isinstance(identity.get("name"), str)
+        or not identity["name"]
+        or not _is_optional_string(identity.get("uid"))
+    ):
+        raise RuntimeError(f"Tenant Admin {description} is invalid")
+
+
+def _validate_specification(value: object, provider: str) -> None:
+    specification = _required_mapping(value, "Tenant specification")
+    provider_view = _required_mapping(
+        specification.get("provider"), "Tenant provider specification"
+    )
+    if (
+        set(specification) != {"kubernetesVersion", "workers", "provider"}
+        or not isinstance(specification.get("kubernetesVersion"), str)
+        or not specification["kubernetesVersion"]
+        or not _is_integer(specification.get("workers"))
+        or specification["workers"] < 0
+        or set(provider_view) not in ({"provider"}, {"provider", "providerType"})
+        or provider_view.get("provider") not in {"local", "azure", "unknown"}
+        or (
+            provider_view.get("provider") != "unknown"
+            and provider_view.get("provider") != provider
+        )
+        or (
+            provider_view.get("provider") == "unknown"
+            and (
+                not isinstance(provider_view.get("providerType"), str)
+                or not provider_view["providerType"]
+            )
+        )
+    ):
+        raise RuntimeError("Tenant Admin Tenant specification is invalid")
+
+
+def _validate_provider_status(value: object, provider: str) -> None:
+    observed = _required_mapping(value, "Tenant provider status")
+    status = _required_mapping(observed.get("status"), "Tenant provider status data")
+    if set(observed) != {"provider", "status"} or observed.get("provider") not in {
+        "local",
+        "azure",
+        "unknown",
+    }:
+        raise RuntimeError("Tenant Admin Tenant provider status is invalid")
+    if observed["provider"] != "unknown" and observed["provider"] != provider:
+        raise RuntimeError("Tenant Admin Tenant provider status is invalid")
+    if observed["provider"] == "local" and set(status) != {
+        "allocation",
+        "foundationHash",
+        "clusterUid",
+    }:
+        raise RuntimeError("Tenant Admin local provider status is invalid")
+    if observed["provider"] == "azure" and set(status) != {
+        "binding",
+        "allocation",
+        "endpoint",
+        "management",
+        "workerPool",
+        "nodes",
+        "addOns",
+        "resources",
+    }:
+        raise RuntimeError("Tenant Admin Azure provider status is invalid")
+    if observed["provider"] == "unknown" and set(status) != {
+        "providerType",
+        "summary",
+    }:
+        raise RuntimeError("Tenant Admin unknown provider status is invalid")
+
+
+def _validate_management_resources(value: object) -> None:
+    if not isinstance(value, list):
+        raise RuntimeError("Tenant Admin management resources are invalid")
+    for item in value:
+        resource = _required_mapping(item, "management resource")
+        if (
+            set(resource) != {"identity", "role", "health", "message"}
+            or not isinstance(resource.get("role"), str)
+            or not resource["role"]
+            or resource.get("health") not in ADMIN_TOPOLOGY_HEALTH
+            or not _is_optional_string(resource.get("message"))
+        ):
+            raise RuntimeError("Tenant Admin management resource is invalid")
+        _validate_resource_identity(resource.get("identity"), "management identity")
+
+
 def _validate_database_observation(
     value: object,
     *,
@@ -978,6 +1077,17 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
             or not isinstance(node.get("attributes"), list)
         ):
             raise RuntimeError("Tenant Admin topology node response is invalid")
+        if node.get("resource") is not None:
+            _validate_resource_identity(node["resource"], "topology resource identity")
+        for attribute_value in node["attributes"]:
+            attribute = _required_mapping(attribute_value, "topology attribute")
+            if (
+                set(attribute) != {"label", "value"}
+                or not isinstance(attribute.get("label"), str)
+                or not attribute["label"]
+                or not isinstance(attribute.get("value"), str)
+            ):
+                raise RuntimeError("Tenant Admin topology attribute is invalid")
         if node["id"] in node_ids:
             raise RuntimeError("Tenant Admin topology node identity is duplicated")
         node_ids.add(node["id"])
@@ -1001,7 +1111,7 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
 
 
 def _valid_timestamp(value: object) -> bool:
-    if not isinstance(value, str) or not value:
+    if not isinstance(value, str) or not ADMIN_RFC3339_PATTERN.fullmatch(value):
         return False
     try:
         parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
@@ -1230,6 +1340,9 @@ def verify_admin_api(
         _validate_lifecycle(detail.get("lifecycle"))
         _validate_worker_capacity(detail.get("workerCapacity"))
         summary = _required_mapping(detail.get("summary"), "Tenant detail summary")
+        _validate_specification(detail.get("specification"), summary["provider"])
+        _validate_provider_status(detail.get("providerStatus"), summary["provider"])
+        _validate_management_resources(detail.get("managementResources"))
         _validate_database_observation(
             snapshot.get("database"),
             provider=summary["provider"],

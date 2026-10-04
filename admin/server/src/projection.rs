@@ -357,15 +357,19 @@ fn lifecycle(
                                     .addon_job_uid
                                     .as_deref()
                                     .is_some_and(|value| !value.is_empty())
-                        }) && ["cloudController", "cloudNode", "calicoNode", "cnpg"]
-                            .iter()
-                            .all(|component| {
-                                status
-                                    .addon_components
-                                    .get(*component)
-                                    .is_some_and(|uid| !uid.is_empty())
-                            })
-                            && !status.provider_resources.is_empty()
+                        }) && [
+                            "cloudController",
+                            "cloudNode",
+                            "calicoNode",
+                            "calicoControllers",
+                        ]
+                        .iter()
+                        .all(|component| {
+                            status
+                                .addon_components
+                                .get(*component)
+                                .is_some_and(|uid| !uid.is_empty())
+                        }) && !status.provider_resources.is_empty()
                             && validated_azure_resources(status).len()
                                 == status.provider_resources.len()
                     }),
@@ -2817,8 +2821,24 @@ mod tests {
         status.addon_components.extend([
             ("cloudNode".into(), "cloud-node-uid".into()),
             ("calicoNode".into(), "calico-node-uid".into()),
-            ("cnpg".into(), "cnpg-uid".into()),
+            ("calicoControllers".into(), "calico-controllers-uid".into()),
         ]);
+        let stages = lifecycle(&tenant, &[], None, true);
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.stage == LifecycleStage::AddOns)
+                .unwrap()
+                .state,
+            LifecycleStageState::Unknown
+        );
+        let Some(TenantProviderStatus::Azure(status)) = tenant
+            .status
+            .as_mut()
+            .and_then(|status| status.provider.as_mut())
+        else {
+            panic!("Azure status");
+        };
         status
             .provider_resources
             .retain(|resource| resource.uid != "foreign-machine-uid");
