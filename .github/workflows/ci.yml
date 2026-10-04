@@ -21,9 +21,6 @@ jobs:
     name: CAPI fast checks
     runs-on: ubuntu-latest
     timeout-minutes: 20
-    defaults:
-      run:
-        working-directory: capi
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -109,7 +106,7 @@ jobs:
         run: |
           install -d -m 700 .runtime/rendered/ci-artifact/admin/web
           install -m 700 .runtime/rendered/controller/manager .runtime/rendered/ci-artifact/manager
-          install -m 700 ../target/release/manager .runtime/rendered/ci-artifact/database-manager
+          install -m 700 target/release/manager .runtime/rendered/ci-artifact/database-manager
           install -m 700 .runtime/rendered/admin/tenant-admin .runtime/rendered/ci-artifact/admin/tenant-admin
           install -m 600 .runtime/rendered/admin/web/* .runtime/rendered/ci-artifact/admin/web/
 
@@ -117,7 +114,7 @@ jobs:
         uses: actions/upload-artifact@v6
         with:
           name: controller-manager-${{ github.sha }}
-          path: capi/.runtime/rendered/ci-artifact/
+          path: .runtime/rendered/ci-artifact/
           if-no-files-found: error
           retention-days: 1
 
@@ -132,13 +129,10 @@ jobs:
       MIN_DOCKER_MEMORY_GIB: "10"
       MIN_DOCKER_STORAGE_GIB: "12"
       PYTHONUNBUFFERED: "1"
-      CAPI_PREBUILT_CONTROLLER_BINARY: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/manager
-      CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/database-manager
-      CAPI_PREBUILT_ADMIN_SERVER: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/admin/tenant-admin
-      CAPI_PREBUILT_ADMIN_WEB: ${{ github.workspace }}/capi/.tools/artifacts/${{ github.sha }}/admin/web
-    defaults:
-      run:
-        working-directory: capi
+      CAPI_PREBUILT_CONTROLLER_BINARY: ${{ github.workspace }}/.tools/artifacts/${{ github.sha }}/manager
+      CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY: ${{ github.workspace }}/.tools/artifacts/${{ github.sha }}/database-manager
+      CAPI_PREBUILT_ADMIN_SERVER: ${{ github.workspace }}/.tools/artifacts/${{ github.sha }}/admin/tenant-admin
+      CAPI_PREBUILT_ADMIN_WEB: ${{ github.workspace }}/.tools/artifacts/${{ github.sha }}/admin/web
 
     steps:
       - name: Check out repository
@@ -163,14 +157,14 @@ jobs:
       - name: Restore verified CAPI cache
         uses: actions/cache@v6
         with:
-          path: capi/.tools/cache
-          key: capi-full-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'capi/config/versions.env', 'capi/config/settings.env', 'capi/config/kind.yaml', 'capi/manifests/**', 'capi/scripts/cache.py', 'capi/scripts/tools.py') }}
+          path: .tools/cache
+          key: capi-full-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'config/versions.env', 'config/settings.env', 'config/kind.yaml', 'manifests/**', 'scripts/cache.py', 'scripts/tools.py') }}
 
       - name: Download static controller and Tenant Admin
         uses: actions/download-artifact@v7
         with:
           name: controller-manager-${{ github.sha }}
-          path: capi/.tools/artifacts/${{ github.sha }}
+          path: .tools/artifacts/${{ github.sha }}
 
       - name: Show Docker capacity
         run: docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}} DockerRoot={{.DockerRootDir}}'
@@ -212,9 +206,6 @@ jobs:
       MIN_DOCKER_MEMORY_GIB: "10"
       MIN_DOCKER_STORAGE_GIB: "20"
       PYTHONUNBUFFERED: "1"
-    defaults:
-      run:
-        working-directory: capi
     steps:
       - name: Check out repository
         uses: actions/checkout@v6
@@ -233,8 +224,8 @@ jobs:
       - name: Restore verified CAPI cache
         uses: actions/cache@v6
         with:
-          path: capi/.tools/cache
-          key: capi-full-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'capi/config/versions.env', 'capi/config/settings.env', 'capi/config/kind.yaml', 'capi/manifests/**', 'capi/scripts/cache.py', 'capi/scripts/tools.py') }}
+          path: .tools/cache
+          key: capi-full-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'config/versions.env', 'config/settings.env', 'config/kind.yaml', 'manifests/**', 'scripts/cache.py', 'scripts/tools.py') }}
       - name: Show Docker capacity
         run: docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}} DockerRoot={{.DockerRootDir}}'
       - name: Acquire complete verified cache

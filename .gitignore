@@ -1,2 +1,7 @@
 .paw/
 /target/
+.tools/
+.runtime/
+config/azure.local.env
+__pycache__/
+*.pyc

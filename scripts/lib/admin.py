@@ -888,7 +888,7 @@ def _source_tree_inputs(directory: Path, description: str) -> list[Path]:
 def admin_source_digest(root: Path, config: dict[str, str]) -> str:
     admin = root / "admin"
     controller = root / "controller"
-    repository = root.parent
+    repository = root
     admin_inputs = _source_tree_inputs(admin, "admin")
     try:
         controller_details = controller.lstat()

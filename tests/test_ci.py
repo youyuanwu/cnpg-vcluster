@@ -9,7 +9,7 @@ from pathlib import Path
 
 
 WORKFLOW = (
-    Path(__file__).resolve().parents[2] / ".github" / "workflows" / "ci.yml"
+    Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
 ).read_text(encoding="utf-8")
 
 
@@ -65,16 +65,16 @@ class CIWorkflowTests(unittest.TestCase):
         self.assertIn("CAPI_PREBUILT_CONTROLLER_BINARY", e2e)
         self.assertIn("CAPI_PREBUILT_ADMIN_SERVER", e2e)
         self.assertIn("CAPI_PREBUILT_ADMIN_WEB", e2e)
-        self.assertIn("path: capi/.runtime/rendered/ci-artifact/", fast)
+        self.assertIn("path: .runtime/rendered/ci-artifact/", fast)
         self.assertLess(
             fast.index("just admin-package-check"),
             fast.index("actions/upload-artifact@v6"),
         )
         for live in (e2e, high):
             self.assertIn("uses: actions/cache@v6", live)
-            self.assertIn("capi/.tools/cache", live)
+            self.assertIn("path: .tools/cache", live)
             self.assertNotIn("~/.cargo", live)
-            self.assertIn("key: capi-full-v1-", live)
+            self.assertIn("key: capi-full-v2-", live)
             self.assertLess(
                 live.index("uses: actions/cache@v6"),
                 live.index("run: just cache"),

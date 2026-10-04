@@ -202,14 +202,22 @@ def check_configuration() -> None:
 def check_repository_boundaries() -> None:
     tracked_paw = output("git", "ls-files", ".paw").stdout.strip()
     check(not tracked_paw, "PAW artifacts must not be tracked")
-    tracked_generated = output("git", "ls-files", "capi/.tools", "capi/.runtime").stdout.strip()
+    tracked_generated = output("git", "ls-files", ".tools", ".runtime").stdout.strip()
     check(not tracked_generated, "generated CAPI tool/runtime state must not be tracked")
     for candidate in (".tools/probe", ".runtime/probe"):
         result = output("git", "check-ignore", candidate, check_result=False)
         check(result.returncode == 0, f"{candidate} is not ignored")
-    check(not any(path.is_symlink() for path in ROOT.rglob("*")), "symlinks below capi are forbidden")
+    tracked_files = [
+        ROOT / relative
+        for relative in output("git", "ls-files").stdout.splitlines()
+        if (ROOT / relative).exists()
+    ]
+    check(
+        not any(path.is_symlink() for path in tracked_files),
+        "tracked repository symlinks are forbidden",
+    )
     yaml_imports = []
-    for path in ROOT.rglob("*.py"):
+    for path in (candidate for candidate in tracked_files if candidate.suffix == ".py"):
         for line_number, line in enumerate(
             path.read_text(encoding="utf-8").splitlines(),
             start=1,
@@ -218,21 +226,23 @@ def check_repository_boundaries() -> None:
                 yaml_imports.append(f"{path.relative_to(ROOT)}:{line_number}")
     check(
         not yaml_imports,
-        f"Python below capi must remain stdlib-only; yaml imports: {yaml_imports}",
+        f"Repository Python must remain stdlib-only; yaml imports: {yaml_imports}",
     )
     dependency_manifests = [
         path.relative_to(ROOT).as_posix()
-        for pattern in ("requirements*.txt", "Pipfile*", "poetry.lock")
-        for path in ROOT.rglob(pattern)
+        for path in tracked_files
+        if path.name == "poetry.lock"
+        or path.name.startswith("Pipfile")
+        or (path.name.startswith("requirements") and path.suffix == ".txt")
     ]
     check(
         not dependency_manifests,
-        "Python dependency manifests are forbidden below capi: "
+        "Python dependency manifests are forbidden in the repository: "
         f"{sorted(dependency_manifests)}",
     )
     automation = (
         (ROOT / "Justfile").read_text(encoding="utf-8")
-        + (ROOT.parent / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+        + (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     )
     check(
         re.search(
@@ -243,7 +253,7 @@ def check_repository_boundaries() -> None:
         "CAPI automation must not install Python dependencies",
     )
     check((ROOT / "scripts" / "post_renderer.py").stat().st_mode & 0o111 != 0, "post-renderer is not executable")
-    repository = ROOT.parent
+    repository = ROOT
     check(not (repository / "Makefile").exists(), "obsolete root Makefile remains")
     check(not (repository / "vcluster").exists(), "obsolete vcluster lab remains")
     check(not (repository / "kamaji").exists(), "obsolete standalone Kamaji lab remains")
@@ -271,7 +281,7 @@ def check_repository_boundaries() -> None:
         (ROOT / "controller" / "Cargo.toml").read_text(encoding="utf-8")
     )
     check(
-        "capi/controller" in workspace_manifest.get("workspace", {}).get("members", []),
+        "controller" in workspace_manifest.get("workspace", {}).get("members", []),
         "controller is not a root Cargo workspace member",
     )
     workspace_dependencies = workspace_manifest.get("workspace", {}).get(
@@ -394,8 +404,8 @@ def check_repository_boundaries() -> None:
     check('join("config")' in generator and
           '"crd/bases/tenancy.cnpg-vcluster.io_tenants.yaml"' in generator,
           "generator does not target the authoritative CRD")
-    tracked = output("git", "ls-files", "--cached", "capi/controller").stdout.splitlines()
-    present = output("git", "ls-files", "--deleted", "capi/controller").stdout.splitlines()
+    tracked = output("git", "ls-files", "--cached", "controller").stdout.splitlines()
+    present = output("git", "ls-files", "--deleted", "controller").stdout.splitlines()
     live_tracked = set(tracked) - set(present)
     check(not any(name.endswith((".go", "/go.mod", "/go.sum")) or
                   "/config/webhook/" in name for name in live_tracked),
@@ -429,7 +439,7 @@ def check_repository_boundaries() -> None:
                             r'validating-webhook\.yaml|tenant-controller-serving-cert|'
                             r'--webhook-port|9443', text),
               f"local admission lifecycle remains in {relative}")
-    workflow = (ROOT.parent / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
     check(not re.search(r"go\.mod|go\.sum|envtest|controller-gen\b|"
                         r"controller-tools|controller-vet|go-mod-cache|"
                         r"go-linux-amd64|GO_VERSION|GOCACHE|GOMODCACHE", workflow),
@@ -444,7 +454,7 @@ def check_repository_boundaries() -> None:
     for token in (
         "actions/upload-artifact@v6",
         "controller-manager-${{ github.sha }}",
-        "path: capi/.runtime/rendered/ci-artifact/",
+        "path: .runtime/rendered/ci-artifact/",
         "just admin-fetch",
         "just admin-generate-check",
         "just admin-lint",
@@ -466,7 +476,7 @@ def check_repository_boundaries() -> None:
         "CAPI_PREBUILT_ADMIN_SERVER",
         "CAPI_PREBUILT_ADMIN_WEB",
         "CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY",
-        "capi/.tools/artifacts/${{ github.sha }}",
+        ".tools/artifacts/${{ github.sha }}",
     ):
         check(token in e2e, f"PR E2E artifact wiring is missing {token}")
     high_capacity = workflow.split("  high-capacity:", 1)[1].split(
@@ -827,7 +837,7 @@ def check_documentation() -> None:
         encoding="utf-8"
     )
     notices = (ROOT / "THIRD_PARTY_NOTICES.md").read_text(encoding="utf-8")
-    root_readme = (ROOT.parent / "README.md").read_text(encoding="utf-8")
+    root_readme = (ROOT / "README.md").read_text(encoding="utf-8")
     readme_flat = " ".join(readme.split())
     design_flat = " ".join(design.split())
     azure_design_flat = " ".join(azure_design.split())
@@ -879,7 +889,7 @@ def check_documentation() -> None:
     for token in required_readme:
         check(
             token in readme_flat,
-            f"CAPI README lacks documentation assertion: {token}",
+            f"README lacks documentation assertion: {token}",
         )
     for token in required_design:
         check(
@@ -965,7 +975,7 @@ def check_documentation() -> None:
         "root README does not identify the CAPI tenant lifecycle lab",
     )
     check(
-        "capi/docs/admin-ui-design.md" in root_readme
+        "docs/admin-ui-design.md" in root_readme
         and "Leptos/Axum Tenant Admin UI" in root_readme
         and "unsafe PostgreSQL superuser console" in root_readme,
         "root README omits the Tenant Admin entry point",
@@ -973,11 +983,9 @@ def check_documentation() -> None:
     compatibility = (ROOT / "controller" / "API_COMPATIBILITY.md").read_text(encoding="utf-8")
     contracts = (ROOT / "controller" / "CONTRACTS.md").read_text(encoding="utf-8")
     catalog_docs = {
-        "root README": (root_readme, (
-            "v1alpha4", "explicit database", "passed manually",
-        )),
-        "CAPI README": (readme, (
-            "schema-v5", "three-by-three", "nine-disk", "passed manually",
+        "README": (readme, (
+            "v1alpha4", "explicit catalog entries", "schema-v5",
+            "three-by-three", "nine-disk", "passed manually",
             "catalog-bootstrap-probe.json", "12,000",
         )),
         "high-level design": (design, (
@@ -1008,7 +1016,7 @@ def check_documentation() -> None:
             check(token in flat, f"{name} lacks catalog documentation: {token}")
     for name, text in (
         ("root README", root_readme),
-        ("CAPI README", readme),
+        ("README", readme),
         ("high-level design", design),
         ("Admin design", admin_design),
         ("Azure design", azure_design),
@@ -1025,7 +1033,6 @@ def check_documentation() -> None:
             f"{name} still asserts an obsolete single-cluster contract",
         )
     for path in (
-        ROOT.parent / "README.md",
         ROOT / "README.md",
         ROOT / "docs/high-level-design.md",
         ROOT / "docs/admin-ui-design.md",
@@ -1039,7 +1046,7 @@ def check_documentation() -> None:
                 linked = path.parent / relative
                 check(
                     linked.exists(),
-                    f"{path.relative_to(ROOT.parent)} has a broken link: {target}",
+                    f"{path.relative_to(ROOT)} has a broken link: {target}",
                 )
                 if match := re.fullmatch(r"L(\d+)(?:-L(\d+))?", anchor):
                     check(linked.is_file(), f"citation must target a file: {target}")
@@ -1048,7 +1055,7 @@ def check_documentation() -> None:
                     line_count = len(linked.read_text(encoding="utf-8").splitlines())
                     check(
                         1 <= first <= last <= line_count,
-                        f"{path.relative_to(ROOT.parent)} has an invalid citation: {target}",
+                        f"{path.relative_to(ROOT)} has an invalid citation: {target}",
                     )
     check(
         (ROOT / "licenses" / "README.md").is_file(),

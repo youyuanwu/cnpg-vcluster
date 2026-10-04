@@ -277,7 +277,7 @@ class CacheTests(unittest.TestCase):
     def test_cargo_lock_and_compiler_are_cache_requirements(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
-            root = repository / "capi"
+            root = repository
             controller = root / "controller"
             controller.mkdir(parents=True)
             (repository / "Cargo.toml").write_text("[workspace]\n")
@@ -313,7 +313,7 @@ class CacheTests(unittest.TestCase):
     def test_verified_cache_rejects_missing_offline_cargo_dependencies(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
-            root = repository / "capi"
+            root = repository
             (root / "controller").mkdir(parents=True)
             (repository / "Cargo.toml").write_text("[workspace]\n")
             (repository / "rust-toolchain.toml").write_text(
@@ -335,7 +335,7 @@ class CacheTests(unittest.TestCase):
     def test_online_cache_does_not_publish_before_locked_cargo_fetch(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             repository = Path(temporary)
-            root = repository / "capi"
+            root = repository
             (root / "controller").mkdir(parents=True)
             (repository / "Cargo.toml").write_text("[workspace]\n")
             (repository / "rust-toolchain.toml").write_text(

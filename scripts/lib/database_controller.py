@@ -194,7 +194,7 @@ def build_database_controller_image(
     )
 
     source = root / "database-controller"
-    repository = root.parent
+    repository = root
     inputs = [
         *source.joinpath("src").rglob("*.rs"),
         source / "Cargo.toml",

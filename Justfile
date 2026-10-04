@@ -127,8 +127,8 @@ database-controller-lint:
 # Build the standalone database-controller observer manager.
 database-controller-build:
     @cargo rustc --locked --offline --release -p tenant-database-controller --bin manager -- -C target-feature=+crt-static
-    @! readelf -lW ../target/release/manager | grep -q ' INTERP '
-    @! readelf -dW ../target/release/manager | grep -q ' NEEDED '
+    @! readelf -lW target/release/manager | grep -q ' INTERP '
+    @! readelf -dW target/release/manager | grep -q ' NEEDED '
 
 # Build the pinned standalone database-controller image used by both providers.
 database-controller-image:
