@@ -4,6 +4,7 @@ import json
 import re
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 
 from scripts.lib.admin import (
@@ -51,6 +52,7 @@ ADMIN_CLASSIFICATIONS = {
 ADMIN_DATABASE_UNAVAILABLE_REASONS = {
     "pending",
     "management-resource-missing",
+    "management-inventory-unavailable",
     "tenant-access-invalid",
     "tenant-api-unavailable",
     "cluster-missing",
@@ -90,6 +92,23 @@ ADMIN_TOPOLOGY_EDGE_KINDS = {
     "provides",
     "represents",
     "depends-on",
+}
+ADMIN_LIFECYCLE_STAGES = (
+    "request-accepted",
+    "infrastructure",
+    "control-plane",
+    "workers",
+    "add-ons",
+    "databases",
+    "ready",
+)
+ADMIN_LIFECYCLE_STATES = {
+    "completed",
+    "current",
+    "blocked",
+    "pending",
+    "not-applicable",
+    "unknown",
 }
 
 
@@ -932,6 +951,7 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
         or not nodes
     ):
         raise RuntimeError("Tenant Admin Tenant topology response is invalid")
+    node_ids: set[str] = set()
     for value in nodes:
         node = _required_mapping(value, "topology node")
         if (
@@ -958,6 +978,9 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
             or not isinstance(node.get("attributes"), list)
         ):
             raise RuntimeError("Tenant Admin topology node response is invalid")
+        if node["id"] in node_ids:
+            raise RuntimeError("Tenant Admin topology node identity is duplicated")
+        node_ids.add(node["id"])
     for value in edges:
         edge = _required_mapping(value, "topology edge")
         if (
@@ -973,6 +996,99 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
             )
         ):
             raise RuntimeError("Tenant Admin topology edge response is invalid")
+        if edge["source"] not in node_ids or edge["target"] not in node_ids:
+            raise RuntimeError("Tenant Admin topology edge endpoint is missing")
+
+
+def _valid_timestamp(value: object) -> bool:
+    if not isinstance(value, str) or not value:
+        return False
+    try:
+        datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def _validate_section(value: object, name: str) -> None:
+    section = _required_mapping(value, f"{name} section")
+    state = section.get("state")
+    if state == "available":
+        if set(section) != {"state"}:
+            raise RuntimeError(f"Tenant Admin {name} section is invalid")
+        return
+    if (
+        state != "unavailable"
+        or set(section) != {"state", "code", "message", "retryable"}
+        or not isinstance(section.get("code"), str)
+        or not section["code"]
+        or not isinstance(section.get("message"), str)
+        or not section["message"]
+        or not isinstance(section.get("retryable"), bool)
+    ):
+        raise RuntimeError(f"Tenant Admin {name} section is invalid")
+
+
+def _validate_lifecycle(value: object) -> None:
+    if not isinstance(value, list) or len(value) != len(ADMIN_LIFECYCLE_STAGES):
+        raise RuntimeError("Tenant Admin lifecycle is invalid")
+    for expected, item in zip(ADMIN_LIFECYCLE_STAGES, value, strict=True):
+        stage = _required_mapping(item, "lifecycle stage")
+        if (
+            set(stage) != {"stage", "state", "message"}
+            or stage.get("stage") != expected
+            or stage.get("state") not in ADMIN_LIFECYCLE_STATES
+            or (
+                stage.get("message") is not None
+                and not isinstance(stage.get("message"), str)
+            )
+        ):
+            raise RuntimeError("Tenant Admin lifecycle stage is invalid")
+
+
+def _validate_worker_capacity(value: object) -> None:
+    capacity = _required_mapping(value, "worker capacity")
+    if set(capacity) != {
+        "desired",
+        "available",
+        "unavailable",
+        "diagnosticReadyMachines",
+    } or not _is_integer(capacity.get("desired")) or capacity["desired"] < 0:
+        raise RuntimeError("Tenant Admin worker capacity is invalid")
+    for key in ("available", "unavailable", "diagnosticReadyMachines"):
+        observed = capacity.get(key)
+        if observed is not None and (not _is_integer(observed) or observed < 0):
+            raise RuntimeError("Tenant Admin worker capacity is invalid")
+    if (
+        capacity["available"] is None
+        and capacity["unavailable"] is not None
+    ) or (
+        capacity["available"] is not None
+        and capacity["unavailable"] is None
+    ):
+        raise RuntimeError("Tenant Admin worker capacity is incomplete")
+
+
+def _validate_blockers(value: object, node_ids: set[str]) -> None:
+    if not isinstance(value, list):
+        raise RuntimeError("Tenant Admin blockers are invalid")
+    for item in value:
+        blocker = _required_mapping(item, "Tenant blocker")
+        if (
+            set(blocker)
+            != {"code", "message", "conditionType", "targetNodeId"}
+            or not isinstance(blocker.get("code"), str)
+            or not blocker["code"]
+            or not isinstance(blocker.get("message"), str)
+            or not blocker["message"]
+            or not _is_optional_string(blocker.get("conditionType"))
+            or not _is_optional_string(blocker.get("targetNodeId"))
+            or (
+                blocker.get("targetNodeId") is not None
+                and blocker["targetNodeId"] not in node_ids
+            )
+        ):
+            raise RuntimeError("Tenant Admin blocker is invalid")
 
 
 def _local_overview(
@@ -1076,17 +1192,15 @@ def verify_admin_api(
             "detail",
             "database",
             "topology",
-        } or not isinstance(snapshot.get("observedAt"), str):
+        } or not _valid_timestamp(snapshot.get("observedAt")):
             raise RuntimeError("Tenant Admin Tenant snapshot is invalid")
         sections = _required_mapping(
             snapshot.get("sections"), "Tenant snapshot sections"
         )
-        if set(sections) != {"resources", "databases"} or any(
-            _required_mapping(sections.get(section), f"{section} section").get("state")
-            not in {"available", "unavailable"}
-            for section in ("resources", "databases")
-        ):
+        if set(sections) != {"resources", "databases"}:
             raise RuntimeError("Tenant Admin Tenant snapshot sections are invalid")
+        _validate_section(sections.get("resources"), "resources")
+        _validate_section(sections.get("databases"), "databases")
         identity = _required_mapping(
             snapshot.get("identity"), "Tenant snapshot identity"
         )
@@ -1110,12 +1224,11 @@ def verify_admin_api(
             )
             or not isinstance(detail.get("specification"), dict)
             or not isinstance(detail.get("providerStatus"), dict)
-            or not isinstance(detail.get("lifecycle"), list)
-            or not isinstance(detail.get("workerCapacity"), dict)
-            or not isinstance(detail.get("blockers"), list)
             or not isinstance(detail.get("managementResources"), list)
         ):
             raise RuntimeError("Tenant Admin Tenant detail response is invalid")
+        _validate_lifecycle(detail.get("lifecycle"))
+        _validate_worker_capacity(detail.get("workerCapacity"))
         summary = _required_mapping(detail.get("summary"), "Tenant detail summary")
         detail_uid = _required_string(detail.get("uid"), "Tenant detail UID")
         if (
@@ -1131,6 +1244,13 @@ def verify_admin_api(
             snapshot.get("topology"), "Tenant topology data"
         )
         _validate_topology(snapshot_topology, name)
+        _validate_blockers(
+            detail.get("blockers"),
+            {
+                _required_mapping(node, "topology node")["id"]
+                for node in snapshot_topology["nodes"]
+            },
+        )
         catalog_client = CatalogClient(
             lambda path: _service_proxy(client, path),
             lambda method, path, body: client.request_json(

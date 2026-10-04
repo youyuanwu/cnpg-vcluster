@@ -349,10 +349,20 @@ fn lifecycle(
                 status_current(tenant)
                     && trusted_azure_status(tenant).is_some_and(|status| {
                         status.management.as_ref().is_some_and(|management| {
-                            management.status_probe_deployment_uid.is_some()
-                                && management.addon_job_uid.is_some()
+                            management
+                                .status_probe_deployment_uid
+                                .as_deref()
+                                .is_some_and(|value| !value.is_empty())
+                                && management
+                                    .addon_job_uid
+                                    .as_deref()
+                                    .is_some_and(|value| !value.is_empty())
                         }) && !status.addon_components.is_empty()
-                            && !status.provider_resources.is_empty()
+                            && status
+                                .addon_components
+                                .iter()
+                                .all(|(name, uid)| !name.is_empty() && !uid.is_empty())
+                            && !validated_azure_resources(status).is_empty()
                     }),
                 terminal,
             ),
@@ -2733,6 +2743,24 @@ mod tests {
         assert_eq!(capacity.available, None);
         assert_eq!(capacity.unavailable, None);
         assert_eq!(capacity.diagnostic_ready_machines, Some(1));
+
+        let mut stale = first.clone();
+        stale.data["status"]["observedGeneration"] = json!(0);
+        stale.data["status"]["conditions"][0]["observedGeneration"] = json!(0);
+        let second_ready = ready_machine("tenant-a-worker-1", "machine-1");
+        let accepted = vec![
+            AcceptedResource {
+                object: &stale,
+                definition: machine,
+            },
+            AcceptedResource {
+                object: &second_ready,
+                definition: machine,
+            },
+        ];
+        let capacity = worker_capacity(&local_tenant(TenantPhase::Ready, 2, true), &accepted, true);
+        assert_eq!(capacity.available, Some(2));
+        assert_eq!(capacity.diagnostic_ready_machines, Some(1));
     }
 
     #[test]
@@ -2775,6 +2803,36 @@ mod tests {
             LifecycleStageState::Completed
         );
         assert_eq!(worker_capacity(&tenant, &[], true).available, Some(1));
+
+        let Some(TenantProviderStatus::Azure(status)) = tenant
+            .status
+            .as_mut()
+            .and_then(|status| status.provider.as_mut())
+        else {
+            panic!("Azure status");
+        };
+        status
+            .addon_components
+            .insert("cloudController".into(), String::new());
+        let stages = lifecycle(&tenant, &[], None, true);
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.stage == LifecycleStage::AddOns)
+                .unwrap()
+                .state,
+            LifecycleStageState::Unknown
+        );
+        let Some(TenantProviderStatus::Azure(status)) = tenant
+            .status
+            .as_mut()
+            .and_then(|status| status.provider.as_mut())
+        else {
+            panic!("Azure status");
+        };
+        status
+            .addon_components
+            .insert("cloudController".into(), "addon-uid".into());
 
         tenant.status.as_mut().unwrap().observed_generation = Some(0);
         let stages = lifecycle(&tenant, &[], None, true);
@@ -2883,6 +2941,53 @@ mod tests {
                 .iter()
                 .any(|node| node.kind == TopologyNodeKind::Node)
         );
+    }
+
+    #[test]
+    fn lifecycle_state_precedence_and_blocker_targets_are_explicit() {
+        let mut tenant = local_tenant(TenantPhase::Progressing, 2, false);
+        let status = tenant.status.as_mut().unwrap();
+        status.conditions.extend([
+            condition("Accepted", "True", 2),
+            condition("FoundationReady", "False", 2),
+        ]);
+        assert_eq!(
+            condition_stage(&tenant, &["Accepted"], false, true),
+            LifecycleStageState::Completed
+        );
+        assert_eq!(
+            condition_stage(&tenant, &["FoundationReady"], false, false),
+            LifecycleStageState::Current
+        );
+        tenant.status.as_mut().unwrap().phase = Some(TenantPhase::Failed);
+        assert_eq!(
+            condition_stage(&tenant, &["FoundationReady"], true, false),
+            LifecycleStageState::Blocked
+        );
+        tenant.status.as_mut().unwrap().observed_generation = Some(1);
+        assert_eq!(
+            condition_stage(&tenant, &["Accepted"], true, false),
+            LifecycleStageState::Unknown
+        );
+
+        let mut tenant = local_tenant(TenantPhase::Progressing, 2, false);
+        tenant
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .iter_mut()
+            .find(|condition| condition.type_ == "WorkersReady")
+            .unwrap()
+            .status = "False".into();
+        let blockers = blockers(ProviderMode::Local, &tenant);
+        assert!(blockers.iter().any(|blocker| {
+            blocker.condition_type.as_deref() == Some("WorkersReady")
+                && blocker.target_node_id.is_none()
+        }));
+        assert!(blockers.iter().all(|blocker| {
+            blocker.target_node_id.is_none() || blocker.target_node_id.as_deref() == Some("tenant")
+        }));
     }
 
     #[test]
@@ -3067,6 +3172,18 @@ mod tests {
                 .iter()
                 .any(|node| node.kind == TopologyNodeKind::AddOn)
         );
+        assert!(projection.topology.nodes.iter().any(|node| {
+            node.kind == TopologyNodeKind::AddOn
+                && node.provenance == TopologyNodeProvenance::RecordedResourceRepresentation
+        }));
+        assert!(projection.topology.nodes.iter().any(|node| {
+            node.id == "provider:vmss"
+                && node.provenance == TopologyNodeProvenance::ExternalProviderRepresentation
+        }));
+        assert!(projection.topology.nodes.iter().any(|node| {
+            node.id == "provider:machine-uid"
+                && node.provenance == TopologyNodeProvenance::ExactKubernetesResource
+        }));
         assert!(
             projection
                 .topology

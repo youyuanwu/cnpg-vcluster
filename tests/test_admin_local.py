@@ -215,10 +215,19 @@ class FakeClient:
                 "providerStatus": {},
                 "lifecycle": [
                     {
-                        "stage": "ready",
+                        "stage": stage,
                         "state": "completed",
                         "message": None,
                     }
+                    for stage in (
+                        "request-accepted",
+                        "infrastructure",
+                        "control-plane",
+                        "workers",
+                        "add-ons",
+                        "databases",
+                        "ready",
+                    )
                 ],
                 "workerCapacity": {
                     "desired": 1,
@@ -1164,6 +1173,65 @@ class AdminLocalTests(unittest.TestCase):
             side_effect=malformed_response,
         ), self.assertRaisesRegex(RuntimeError, "overview data"):
             admin_local.verify_admin_api(malformed)
+
+    def test_api_verification_rejects_malformed_schema_v6_snapshot_fields(
+        self,
+    ) -> None:
+        def mutate_timestamp(body):
+            body["data"]["observedAt"] = "not-a-timestamp"
+
+        def mutate_section(body):
+            body["data"]["sections"]["resources"] = {
+                "state": "unavailable",
+                "retryable": True,
+            }
+
+        def mutate_lifecycle(body):
+            body["data"]["detail"]["lifecycle"][0]["stage"] = "ready"
+
+        def mutate_capacity(body):
+            body["data"]["detail"]["workerCapacity"]["unavailable"] = None
+
+        def mutate_blocker(body):
+            body["data"]["detail"]["blockers"] = [{
+                "code": "worker",
+                "message": "worker unavailable",
+                "conditionType": "WorkersReady",
+                "targetNodeId": "missing-node",
+            }]
+
+        def mutate_edge(body):
+            body["data"]["topology"]["edges"][0]["target"] = "missing-node"
+
+        for name, mutator in (
+            ("timestamp", mutate_timestamp),
+            ("section", mutate_section),
+            ("lifecycle", mutate_lifecycle),
+            ("capacity", mutate_capacity),
+            ("blocker", mutate_blocker),
+            ("edge", mutate_edge),
+        ):
+            with self.subTest(name=name):
+                client = FakeClient(tenant_names=("tenant-a",))
+                original = client._proxy_response
+
+                def malformed(path: str, mutate=mutator) -> str:
+                    response = original(path)
+                    if path.endswith("/api/v1/tenants/tenant-a"):
+                        body = json.loads(response)
+                        mutate(body)
+                        return json.dumps(body)
+                    return response
+
+                with patch.object(
+                    client,
+                    "_proxy_response",
+                    side_effect=malformed,
+                ), self.assertRaises(RuntimeError):
+                    admin_local.verify_admin_api(
+                        client,
+                        expected_tenant_names=("tenant-a",),
+                    )
 
     def test_api_verification_handles_tenant_deletion_race(self) -> None:
         for suffix in (
