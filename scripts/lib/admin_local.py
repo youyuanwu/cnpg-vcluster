@@ -76,6 +76,13 @@ ADMIN_TOPOLOGY_HEALTH = {
     "deleting",
     "unknown",
 }
+ADMIN_TOPOLOGY_PROVENANCE = {
+    "exact-kubernetes-resource",
+    "database-logical-representation",
+    "external-provider-representation",
+    "recorded-resource-representation",
+    "synthetic-summary",
+}
 ADMIN_TOPOLOGY_EDGE_KINDS = {
     "owns",
     "contains",
@@ -932,6 +939,7 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
             != {
                 "id",
                 "kind",
+                "provenance",
                 "label",
                 "health",
                 "resource",
@@ -940,6 +948,7 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
             or not isinstance(node.get("id"), str)
             or not node["id"]
             or node.get("kind") not in ADMIN_TOPOLOGY_NODE_KINDS
+            or node.get("provenance") not in ADMIN_TOPOLOGY_PROVENANCE
             or not isinstance(node.get("label"), str)
             or node.get("health") not in ADMIN_TOPOLOGY_HEALTH
             or (
@@ -1060,8 +1069,24 @@ def verify_admin_api(
             ),
             "Tenant snapshot data",
         )
-        if set(snapshot) != {"identity", "detail", "database", "topology"}:
+        if set(snapshot) != {
+            "observedAt",
+            "sections",
+            "identity",
+            "detail",
+            "database",
+            "topology",
+        } or not isinstance(snapshot.get("observedAt"), str):
             raise RuntimeError("Tenant Admin Tenant snapshot is invalid")
+        sections = _required_mapping(
+            snapshot.get("sections"), "Tenant snapshot sections"
+        )
+        if set(sections) != {"resources", "databases"} or any(
+            _required_mapping(sections.get(section), f"{section} section").get("state")
+            not in {"available", "unavailable"}
+            for section in ("resources", "databases")
+        ):
+            raise RuntimeError("Tenant Admin Tenant snapshot sections are invalid")
         identity = _required_mapping(
             snapshot.get("identity"), "Tenant snapshot identity"
         )
@@ -1073,6 +1098,8 @@ def verify_admin_api(
             "observedGeneration",
             "specification",
             "providerStatus",
+            "lifecycle",
+            "workerCapacity",
             "blockers",
             "managementResources",
         } or _validate_summary(detail.get("summary")) != name or (
@@ -1083,6 +1110,8 @@ def verify_admin_api(
             )
             or not isinstance(detail.get("specification"), dict)
             or not isinstance(detail.get("providerStatus"), dict)
+            or not isinstance(detail.get("lifecycle"), list)
+            or not isinstance(detail.get("workerCapacity"), dict)
             or not isinstance(detail.get("blockers"), list)
             or not isinstance(detail.get("managementResources"), list)
         ):

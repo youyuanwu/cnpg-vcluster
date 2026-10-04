@@ -1397,7 +1397,7 @@ mod tests {
         let tenant = ready_tenant();
         let source = MockSource {
             tenants: Ok(vec![tenant.clone()]),
-            tenant: Ok(Some(tenant)),
+            tenant: Ok(Some(tenant.clone())),
             resources: Ok(Vec::new()),
             database: Ok(database_observation()),
             query: Ok(query_response()),
@@ -1450,10 +1450,19 @@ mod tests {
 
     #[tokio::test]
     async fn inventory_failure_is_section_scoped_and_never_becomes_empty_success() {
-        let tenant = ready_tenant();
+        let mut tenant = ready_tenant();
+        tenant.status.as_mut().unwrap().database_capability =
+            Some(tenant_controller::api::DatabaseCapability {
+                available: true,
+                reason: "Ready".into(),
+                namespace: "tenant-db-tenant-a".into(),
+                namespace_uid: "namespace-uid".into(),
+                catalog_uid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                storage_namespace_uid: None,
+            });
         let source = MockSource {
             tenants: Ok(vec![tenant.clone()]),
-            tenant: Ok(Some(tenant)),
+            tenant: Ok(Some(tenant.clone())),
             resources: Err(SourceError::KubernetesUnavailable),
             database: Ok(database_observation()),
             query: Ok(query_response()),
@@ -1490,13 +1499,18 @@ mod tests {
         assert_eq!(detail.data.detail.worker_capacity.available, None);
         assert_eq!(detail.data.detail.worker_capacity.unavailable, None);
         assert!(matches!(
+            detail.data.sections.databases,
+            SectionAvailability::Available
+        ));
+        assert!(matches!(
             detail.data.database,
             DatabaseObservation::Unavailable {
-                reason: DatabaseUnavailableReason::ManagementInventoryUnavailable,
+                reason: DatabaseUnavailableReason::Pending,
                 ..
             }
         ));
         assert_eq!(calls.database_observations.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.catalog_reads.load(Ordering::Relaxed), 1);
 
         let topology = app
             .oneshot(
@@ -1507,6 +1521,43 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(topology.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let calls = Arc::new(SourceCalls::default());
+        *calls.catalog_failure.lock().unwrap() = Some(SourceError::KubernetesUnavailable);
+        let source = MockSource {
+            tenants: Ok(vec![tenant.clone()]),
+            tenant: Ok(Some(tenant)),
+            resources: Err(SourceError::KubernetesUnavailable),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls,
+        };
+        let detail = test_router(source)
+            .oneshot(
+                Request::get("/api/v1/tenants/tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: ApiEnvelope<TenantSnapshot> = response_json(detail).await;
+        assert!(matches!(
+            detail.data.sections.resources,
+            SectionAvailability::Unavailable { .. }
+        ));
+        assert!(matches!(
+            detail.data.sections.databases,
+            SectionAvailability::Unavailable { .. }
+        ));
+        assert!(matches!(
+            detail.data.database,
+            DatabaseObservation::Unavailable {
+                reason: DatabaseUnavailableReason::TenantApiUnavailable,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]

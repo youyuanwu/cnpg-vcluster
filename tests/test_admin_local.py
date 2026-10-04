@@ -162,6 +162,7 @@ class FakeClient:
                     {
                         "id": f"tenant:{name}",
                         "kind": "tenant",
+                        "provenance": "exact-kubernetes-resource",
                         "label": name,
                         "health": "ready",
                         "resource": None,
@@ -170,6 +171,7 @@ class FakeClient:
                     {
                         "id": "database:cluster",
                         "kind": "database",
+                        "provenance": "database-logical-representation",
                         "label": "capi-postgres",
                         "health": "ready",
                         "resource": None,
@@ -178,6 +180,7 @@ class FakeClient:
                     {
                         "id": "database:instance:capi-postgres-1",
                         "kind": "database",
+                        "provenance": "database-logical-representation",
                         "label": "capi-postgres-1",
                         "health": "ready",
                         "resource": None,
@@ -210,6 +213,19 @@ class FakeClient:
                 "observedGeneration": 1,
                 "specification": {},
                 "providerStatus": {},
+                "lifecycle": [
+                    {
+                        "stage": "ready",
+                        "state": "completed",
+                        "message": None,
+                    }
+                ],
+                "workerCapacity": {
+                    "desired": 1,
+                    "available": 1,
+                    "unavailable": 0,
+                    "diagnosticReadyMachines": 1,
+                },
                 "blockers": [],
                 "managementResources": [],
             }
@@ -330,6 +346,11 @@ class FakeClient:
                     {
                         "schemaVersion": 6,
                         "data": {
+                            "observedAt": "2026-09-29T20:00:00Z",
+                            "sections": {
+                                "resources": {"state": "available"},
+                                "databases": {"state": "available"},
+                            },
                             "identity": {
                                 "uid": f"{name}-uid",
                                 "generation": 1,
@@ -1001,6 +1022,7 @@ class AdminLocalTests(unittest.TestCase):
                 body = json.loads(response)
                 body["data"]["nodes"].append({
                     "id": f"database:{FIRST}", "kind": "database",
+                    "provenance": "database-logical-representation",
                     "label": "alpha", "health": "ready",
                     "resource": None, "attributes": [],
                 })
@@ -1096,6 +1118,7 @@ class AdminLocalTests(unittest.TestCase):
                 topology["nodes"].append({
                     "id": "database:unavailable",
                     "kind": "database",
+                    "provenance": "synthetic-summary",
                     "label": "Databases unavailable",
                     "health": "degraded",
                     "resource": None,

@@ -218,32 +218,43 @@ fn lifecycle(
                 )
             }
             TenantProviderSpec::Azure => {
-                let durable = trusted_azure_status(tenant).is_some_and(|status| {
-                    let management = status.management.as_ref();
-                    status.binding.is_some()
-                        && status.network_allocation.is_some()
-                        && management.is_some_and(|management| {
-                            management.namespace_uid.is_some()
-                                && management.azure_cluster_identity_uid.is_some()
-                                && management.cluster_uid.is_some()
-                                && management.azure_cluster_uid.is_some()
-                        })
-                });
-                if durable
-                    && has_kind(accepted, "Namespace")
-                    && has_kind(accepted, "AzureClusterIdentity")
-                    && has_kind(accepted, "Cluster")
-                    && has_kind(accepted, "AzureCluster")
-                {
-                    LifecycleStageState::Completed
-                } else if terminal {
-                    LifecycleStageState::Blocked
-                } else if trusted_azure_status(tenant).is_some_and(|status| {
-                    status.binding.is_some() || status.network_allocation.is_some()
-                }) {
-                    LifecycleStageState::Current
-                } else {
+                if !status_current(tenant) {
                     LifecycleStageState::Unknown
+                } else if current_condition(tenant, "AzureAllocationReady")
+                    .is_some_and(|condition| condition.status.as_str() == "False")
+                    && trusted_azure_status(tenant)
+                        .and_then(|status| status.network_allocation.as_ref())
+                        .is_none()
+                {
+                    LifecycleStageState::Blocked
+                } else {
+                    let durable = trusted_azure_status(tenant).is_some_and(|status| {
+                        let management = status.management.as_ref();
+                        status.binding.is_some()
+                            && status.network_allocation.is_some()
+                            && management.is_some_and(|management| {
+                                management.namespace_uid.is_some()
+                                    && management.azure_cluster_identity_uid.is_some()
+                                    && management.cluster_uid.is_some()
+                                    && management.azure_cluster_uid.is_some()
+                            })
+                    });
+                    if durable
+                        && has_kind(accepted, "Namespace")
+                        && has_kind(accepted, "AzureClusterIdentity")
+                        && has_kind(accepted, "Cluster")
+                        && has_kind(accepted, "AzureCluster")
+                    {
+                        LifecycleStageState::Completed
+                    } else if terminal {
+                        LifecycleStageState::Blocked
+                    } else if trusted_azure_status(tenant).is_some_and(|status| {
+                        status.binding.is_some() || status.network_allocation.is_some()
+                    }) {
+                        LifecycleStageState::Current
+                    } else {
+                        LifecycleStageState::Unknown
+                    }
                 }
             }
         }
@@ -259,18 +270,21 @@ fn lifecycle(
                 terminal,
             ),
             TenantProviderSpec::Azure => {
-                let durable = trusted_azure_status(tenant).is_some_and(|status| {
-                    status
-                        .endpoint
-                        .as_deref()
-                        .is_some_and(|value| !value.is_empty())
-                        && status.kubeconfig.is_some()
-                        && status
-                            .management
-                            .as_ref()
-                            .and_then(|management| management.kamaji_control_plane_uid.as_deref())
+                let durable = status_current(tenant)
+                    && trusted_azure_status(tenant).is_some_and(|status| {
+                        status
+                            .endpoint
+                            .as_deref()
                             .is_some_and(|value| !value.is_empty())
-                });
+                            && status.kubeconfig.is_some()
+                            && status
+                                .management
+                                .as_ref()
+                                .and_then(|management| {
+                                    management.kamaji_control_plane_uid.as_deref()
+                                })
+                                .is_some_and(|value| !value.is_empty())
+                    });
                 evidence_stage(
                     tenant,
                     &["AzureControlPlaneReady", "AzureKubeconfigReady"],
@@ -290,26 +304,30 @@ fn lifecycle(
                 let machines = accepted
                     .iter()
                     .filter(|resource| resource.definition.kind == "Machine")
-                    .count();
+                    .collect::<Vec<_>>();
                 evidence_stage(
                     tenant,
                     &["WorkersReady"],
-                    usize_u32(machines) == requested_workers,
+                    usize_u32(machines.len()) == requested_workers
+                        && machines
+                            .iter()
+                            .all(|resource| resource.object.metadata.deletion_timestamp.is_none()),
                     terminal,
                 )
             }
             TenantProviderSpec::Azure => {
-                let durable = trusted_azure_status(tenant).is_some_and(|status| {
-                    status.management.as_ref().is_some_and(|management| {
-                        management.machine_pool_uid.is_some()
-                            && management.azure_machine_pool_uid.is_some()
-                    }) && status
-                        .vmss
-                        .as_ref()
-                        .and_then(|vmss| vmss.id.as_ref())
-                        .is_some()
-                        && usize_u32(status.nodes.len()) == requested_workers
-                });
+                let durable = status_current(tenant)
+                    && trusted_azure_status(tenant).is_some_and(|status| {
+                        status.management.as_ref().is_some_and(|management| {
+                            management.machine_pool_uid.is_some()
+                                && management.azure_machine_pool_uid.is_some()
+                        }) && status
+                            .vmss
+                            .as_ref()
+                            .and_then(|vmss| vmss.id.as_ref())
+                            .is_some()
+                            && usize_u32(status.nodes.len()) == requested_workers
+                    });
                 evidence_stage(tenant, &["AzureWorkersReady"], durable, terminal)
             }
         }
@@ -328,7 +346,14 @@ fn lifecycle(
                     "AzureAddonsReady",
                     "AzureProviderResourcesReady",
                 ],
-                trusted_azure_status(tenant).is_some(),
+                status_current(tenant)
+                    && trusted_azure_status(tenant).is_some_and(|status| {
+                        status.management.as_ref().is_some_and(|management| {
+                            management.status_probe_deployment_uid.is_some()
+                                && management.addon_job_uid.is_some()
+                        }) && !status.addon_components.is_empty()
+                            && !status.provider_resources.is_empty()
+                    }),
                 terminal,
             ),
         }
@@ -476,6 +501,15 @@ fn current_condition<'a>(
     })
 }
 
+fn status_current(tenant: &Tenant) -> bool {
+    tenant.metadata.generation.is_some()
+        && tenant
+            .status
+            .as_ref()
+            .and_then(|status| status.observed_generation)
+            == tenant.metadata.generation
+}
+
 fn has_kind(accepted: &[AcceptedResource<'_>], kind: &str) -> bool {
     accepted
         .iter()
@@ -500,12 +534,15 @@ fn worker_capacity(
         TenantProviderSpec::Local => {
             let machines = accepted
                 .iter()
-                .filter(|resource| resource.definition.kind == "Machine")
+                .filter(|resource| {
+                    resource.definition.kind == "Machine"
+                        && resource.object.metadata.deletion_timestamp.is_none()
+                })
                 .collect::<Vec<_>>();
             let diagnostic_ready_machines = usize_u32(
                 machines
                     .iter()
-                    .filter(|resource| object_health(resource.object) == TopologyHealth::Ready)
+                    .filter(|resource| management_object_ready(resource.object))
                     .count(),
             );
             let complete = current_condition(tenant, "WorkersReady")
@@ -519,7 +556,9 @@ fn worker_capacity(
             }
         }
         TenantProviderSpec::Azure => {
-            let available = trusted_azure_status(tenant)
+            let available = status_current(tenant)
+                .then(|| trusted_azure_status(tenant))
+                .flatten()
                 .filter(|_| {
                     current_condition(tenant, "AzureWorkersReady")
                         .is_some_and(|condition| condition.status.as_str() == "True")
@@ -534,6 +573,39 @@ fn worker_capacity(
             }
         }
     }
+}
+
+fn management_object_ready(object: &DynamicObject) -> bool {
+    if object.metadata.deletion_timestamp.is_some() {
+        return false;
+    }
+    let generation = object.metadata.generation;
+    let status_generation = object
+        .data
+        .pointer("/status/observedGeneration")
+        .and_then(serde_json::Value::as_i64);
+    if generation.is_some() && status_generation.is_some_and(|observed| Some(observed) < generation)
+    {
+        return false;
+    }
+    object
+        .data
+        .pointer("/status/conditions")
+        .and_then(serde_json::Value::as_array)
+        .and_then(|conditions| {
+            conditions.iter().find(|condition| {
+                condition.get("type").and_then(serde_json::Value::as_str) == Some("Ready")
+            })
+        })
+        .is_some_and(|condition| {
+            if condition.get("status").and_then(serde_json::Value::as_str) != Some("True") {
+                return false;
+            }
+            let observed = condition
+                .get("observedGeneration")
+                .and_then(serde_json::Value::as_i64);
+            generation.is_none() || !observed.is_some_and(|value| Some(value) < generation)
+        })
 }
 
 #[derive(Clone, Copy)]
@@ -1376,7 +1448,7 @@ fn push_blocker(
 
 fn blocker_target(condition_type: Option<&str>) -> Option<&'static str> {
     match condition_type {
-        Some("WorkersReady" | "AzureWorkersReady") => Some("summary:workers"),
+        Some("WorkersReady" | "AzureWorkersReady") => None,
         Some("CatalogReady") => None,
         _ => Some("tenant"),
     }
@@ -2517,10 +2589,12 @@ mod tests {
                 name: Some(name.into()),
                 namespace: Some("tenant-a".into()),
                 uid: Some(uid.into()),
+                generation: Some(1),
                 ..Default::default()
             },
             data: json!({
                 "status": {
+                    "observedGeneration": 1,
                     "conditions": [{
                         "type": "Ready",
                         "status": "True",
@@ -2640,6 +2714,124 @@ mod tests {
         assert_eq!(capacity.available, None);
         assert_eq!(capacity.unavailable, None);
         assert_eq!(capacity.diagnostic_ready_machines, Some(2));
+
+        drop(accepted);
+        let mut deleting = second;
+        deleting.metadata.deletion_timestamp =
+            Some(serde_json::from_str::<Time>(r#""2026-01-01T00:00:00Z""#).unwrap());
+        let accepted = vec![
+            AcceptedResource {
+                object: &first,
+                definition: machine,
+            },
+            AcceptedResource {
+                object: &deleting,
+                definition: machine,
+            },
+        ];
+        let capacity = worker_capacity(&local_tenant(TenantPhase::Ready, 2, true), &accepted, true);
+        assert_eq!(capacity.available, None);
+        assert_eq!(capacity.unavailable, None);
+        assert_eq!(capacity.diagnostic_ready_machines, Some(1));
+    }
+
+    #[test]
+    fn azure_lifecycle_requires_current_status_and_recorded_addon_evidence() {
+        let mut tenant = azure_tenant();
+        {
+            let status = tenant.status.as_mut().unwrap();
+            status.conditions.extend([
+                condition("AzureStatusProbeReady", "True", 1),
+                condition("AzureAddonsReady", "True", 1),
+                condition("AzureProviderResourcesReady", "True", 1),
+            ]);
+        }
+        let stages = lifecycle(&tenant, &[], None, true);
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.stage == LifecycleStage::AddOns)
+                .unwrap()
+                .state,
+            LifecycleStageState::Unknown
+        );
+        let Some(TenantProviderStatus::Azure(status)) = tenant
+            .status
+            .as_mut()
+            .and_then(|status| status.provider.as_mut())
+        else {
+            panic!("Azure status");
+        };
+        let management = status.management.as_mut().unwrap();
+        management.status_probe_deployment_uid = Some("probe-uid".into());
+        management.addon_job_uid = Some("addon-job-uid".into());
+        let stages = lifecycle(&tenant, &[], None, true);
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.stage == LifecycleStage::AddOns)
+                .unwrap()
+                .state,
+            LifecycleStageState::Completed
+        );
+        assert_eq!(worker_capacity(&tenant, &[], true).available, Some(1));
+
+        tenant.status.as_mut().unwrap().observed_generation = Some(0);
+        let stages = lifecycle(&tenant, &[], None, true);
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.stage == LifecycleStage::Infrastructure)
+                .unwrap()
+                .state,
+            LifecycleStageState::Unknown
+        );
+        assert_eq!(worker_capacity(&tenant, &[], true).available, None);
+    }
+
+    #[test]
+    fn azure_allocation_failure_is_blocked_until_durable_allocation_exists() {
+        let mut tenant = azure_tenant();
+        tenant.status.as_mut().unwrap().phase = Some(TenantPhase::Progressing);
+        tenant.status.as_mut().unwrap().conditions.push(condition(
+            "AzureAllocationReady",
+            "False",
+            1,
+        ));
+        let Some(TenantProviderStatus::Azure(status)) = tenant
+            .status
+            .as_mut()
+            .and_then(|status| status.provider.as_mut())
+        else {
+            panic!("Azure status");
+        };
+        let allocation = status.network_allocation.take();
+        let stages = lifecycle(&tenant, &[], None, true);
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.stage == LifecycleStage::Infrastructure)
+                .unwrap()
+                .state,
+            LifecycleStageState::Blocked
+        );
+        let Some(TenantProviderStatus::Azure(status)) = tenant
+            .status
+            .as_mut()
+            .and_then(|status| status.provider.as_mut())
+        else {
+            panic!("Azure status");
+        };
+        status.network_allocation = allocation;
+        let stages = lifecycle(&tenant, &[], None, true);
+        assert_ne!(
+            stages
+                .iter()
+                .find(|stage| stage.stage == LifecycleStage::Infrastructure)
+                .unwrap()
+                .state,
+            LifecycleStageState::Blocked
+        );
     }
 
     #[test]
