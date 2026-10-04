@@ -51,11 +51,15 @@ observed instance identity. Tenant kubeconfig and per-cluster PostgreSQL
 credentials are validated and used only in memory; queries use an ephemeral
 Kubernetes port-forward. The SQL console limits requests to 128 KiB (64 KiB
 SQL), execution to 30 seconds, and retained results to 32 sets, 128 columns,
-1,000 rows, 16 KiB per value and 2 MiB response text. The frontend renders
-catalog-scoped cards, topology, and SQL controls instead of an implicit Tenant
-database. The service validates effective management permissions and has no
-Azure cloud credentials, application database, persistent cache, or browser
-credential exposure. See
+1,000 rows, 16 KiB per value and 2 MiB response text. The frontend organizes
+each Tenant into Overview, Resources, Databases, Status and Settings. Its
+tenant-scoped explorer provides grouped inventory, bounded focused topology,
+textual relationships and resource inspection; lifecycle, capacity and section
+availability remain authoritative current snapshots. Database list/detail
+locations retain the exact catalog, SQL and deletion safety contracts. The
+service validates effective management permissions and has no Azure cloud
+credentials, application database, persistent cache, or browser credential
+exposure. See
 [`docs/admin-ui-design.md`](docs/admin-ui-design.md).
 
 The Azure experiment is documented in

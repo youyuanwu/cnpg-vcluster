@@ -165,14 +165,44 @@ version, requested workers, endpoint, age, and summarized
 conditions. An empty management cluster produces a valid empty table and zero
 counts.
 
-### Tenant detail and topology
+### Tenant workspace
 
-The detail view shows the immutable specification, current conditions and
-blockers, provider-specific status, accepted management resources, and a
-provider-neutral topology. It independently reads the schema-v6 database
-catalog, showing at most three cards for either provider. Each card displays
-its logical UID, reconciliation phase, ready instances, storage, blockers,
-conditions, finalization progress, and an entry-scoped topology. Add accepts
+Each Tenant has stable **Overview**, **Resources**, **Databases**, **Status**,
+and **Settings** locations. The shell keeps the Tenant classification,
+provider, Kubernetes version, requested workers, age, UID, snapshot time and
+manual refresh action visible across sections.
+
+Overview shows current resource-health counts, representation-provenance
+subtotals, desired/available/unavailable worker capacity, the ordered
+Request accepted → Infrastructure → Control plane → Workers → Add-ons →
+Databases → Ready lifecycle, and Needs Attention links. These are
+point-in-time snapshot visualizations and never imply historical telemetry.
+Missing or stale authoritative evidence is Unknown rather than zero or
+inferred completion.
+
+Resources derives the approved Tenant, Control plane, Compute, Databases,
+Add-ons, Provider infrastructure and Other groups from the accepted topology.
+Search covers available name, kind, namespace, UID and display attributes;
+health and group filters are local operations over the loaded snapshot. The
+default graph contains the Tenant and group summaries. A selected resource,
+relationship, or expanded group produces a deterministic graph of at most 20
+resource nodes. The inventory, graph, textual relationship list and inspector
+share one selection. Exact Kubernetes resources, logical database
+representations, external provider representations, recorded representations
+and synthetic summaries are labeled separately. Synthetic summaries are not
+ordinary resource counts.
+
+Status shows current conditions, reconciliation blockers, section
+availability, and links to an affected snapshot node when the server can bind
+one safely. Settings contains the immutable specification, endpoint, sanitized
+provider status, and the Tenant danger zone. Tenant deletion is no longer
+adjacent to routine exploration.
+
+Databases independently reads the schema-v6 catalog, showing at most three
+compact list entries for either provider. A stable logical-UID location opens
+one detail containing identity, reconciliation phase, ready instances,
+storage, blockers, conditions, finalization progress, entry-scoped topology,
+SQL and deletion controls. Add accepts
 a lowercase DNS-label name and one to three instances when the Tenant and its
 database capability are Ready, the catalog is open and matches the Tenant
 UID, and fewer than three slots are occupied (including deleting entries).
@@ -192,7 +222,7 @@ leaves Tenant detail and topology usable with database controls disabled;
 Azure and local catalog cards use the same UI
 ([detail projection](../admin/server/src/app.rs#L427-L483)).
 
-The detail page also exposes destructive Tenant deletion. The administrator
+Settings exposes destructive Tenant deletion. The administrator
 must type the exact Tenant name, and the server binds deletion to the displayed
 UID and current resourceVersion. Same-name replacements are rejected.
 Deletion is asynchronous; refresh shows Deleting conditions and blockers.
@@ -216,10 +246,19 @@ bypassing the response-memory boundary.
 
 Refresh is manual. Loading a page or selecting **Refresh** issues new API
 requests; there is no polling, SSE stream, browser persistence, or server-side
-cache. Overview and list requests never fan out to Tenant APIs. Tenant or CNPG
-unavailability is represented as a bounded partial observation so the rest of
-the detail page remains usable. A Tenant deleted between list and detail
-returns a typed not-found response and a non-fatal link back to the overview.
+cache. On database locations the persistent action refreshes both the Tenant
+snapshot and catalog through distinct epochs. **Refresh catalog** reloads only
+catalog state. A successful catalog mutation updates authoritative catalog
+state and requests a snapshot refresh without clearing uncertain-outcome
+locks.
+
+The exact Tenant read remains mandatory. Management-inventory failure is
+all-or-nothing at the Admin boundary and returns a successful Tenant snapshot
+with Resources/live Topology explicitly unavailable. It is never converted to
+an empty successful inventory, zero capacity, healthy counts or inferred
+lifecycle completion. Tenant conditions/provider status and independently
+available catalog state remain usable. A Tenant deleted between list and
+detail returns a typed not-found response and recovery links.
 
 ## HTTP API and DTO contract
 
@@ -239,7 +278,7 @@ retryable flag, and optional bounded field errors. The routes are:
 | `GET /api/v1/overview` | One `OverviewSnapshot` containing the overview and sorted Tenant summaries from the same list operation. |
 | `GET /api/v1/tenants` | Sorted `TenantSummary[]`. |
 | `POST /api/v1/tenants` | Create one Tenant for the configured provider using the active supported version. |
-| `GET /api/v1/tenants/{name}` | One `TenantSnapshot` containing detail, live database observation, and topology from the same Tenant UID/generation/resource read. |
+| `GET /api/v1/tenants/{name}` | One `TenantSnapshot` containing observation time, section availability, exact identity, detail, lifecycle, capacity, compatibility database observation, and topology. |
 | `DELETE /api/v1/tenants/{name}` | Delete the exact displayed Tenant UID with typed-name confirmation. |
 | `GET /api/v1/tenants/{name}/topology` | `TopologyGraph`. |
 | `GET /api/v1/tenants/{name}/databases` | Current `CatalogView` with exact Tenant/catalog UIDs, capability availability, and at most three database entries. |
@@ -248,6 +287,13 @@ retryable flag, and optional bounded field errors. The routes are:
 | `POST /api/v1/tenants/{name}/databases/{uid}/query` | Execute unsafe SQL against the exact Ready entry and observed instance UID. |
 | `POST /api/v1/tenants/{name}/database/query` | Retained singular compatibility route; refuses catalog-capable Tenants because it cannot bind a logical UID. |
 | `GET /*` | Static asset or `index.html` fallback for browser routes. |
+
+Browser routes are `/tenants/{name}` (Overview alias),
+`/tenants/{name}/{overview|resources|databases|status|settings}`, and
+`/tenants/{name}/databases/{logical-uid}`. Resources accepts an optional
+bounded percent-encoded `select` query value. That graph node identity is
+snapshot-scoped; malformed or stale selections are explained and never
+retargeted.
 
 `/overview` and `/tenants/{name}` are the coherent snapshot routes. The
 `/tenants` and `/tenants/{name}/topology` compatibility routes are validated
@@ -260,8 +306,11 @@ the Tenant was concurrently deleted.
 The shared DTOs include:
 
 - `TenantSummary`, generation-aware classifications, and bounded conditions;
-- `TenantDetail`, `TenantSpecificationView`, provider status, blockers, and
-  accepted management-resource identities;
+- `TenantDetail`, `TenantSpecificationView`, provider status, lifecycle,
+  worker capacity, blockers with optional node targets, and accepted
+  management-resource identities;
+- top-level observation time and explicit Resources/Databases section
+  availability;
 - local allocation/foundation/Cluster identity;
 - explicit available, unavailable, or not-applicable database observation;
 - bounded CNPG identity, phase, primary/standby instances, placement, storage,
@@ -272,8 +321,8 @@ The shared DTOs include:
   delete request/result, and field-associated validation errors;
 - Azure binding, management roots, worker pool, Nodes, add-ons, and recorded
   provider resources;
-- topology nodes, edges, health, display attributes, and exact resource
-  identity.
+- topology nodes, edges, health, display attributes, exact resource identity,
+  and representation provenance.
 
 Catalog additions use `{"catalogUid","name","instances"}` and require a
 Ready Tenant, open catalog, available database capability and current
@@ -312,6 +361,13 @@ internal IPs, system IDs, managed roles, Secrets, and credentials are
 excluded.
 Partially reconciled Tenants retain available trusted nodes and show missing
 components as blockers rather than inventing topology.
+
+Every topology node is marked as an exact Kubernetes resource, database
+logical representation, external provider representation, recorded resource
+representation, or synthetic summary. Resource-health totals exclude the
+Tenant root and synthetic summaries. The client deduplicates by server-issued
+node ID, preserves directional typed edges, and provides textual relationship
+output for graph information.
 
 ## Build and packaging
 
