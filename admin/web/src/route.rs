@@ -389,6 +389,12 @@ mod tests {
             tenant_database_href("team-a", uid),
             Some(format!("/tenants/team-a/databases/{uid}"))
         );
+        assert_eq!(
+            parse_route("/tenants/team-a/databases/not-a-uid"),
+            AppRoute::TenantSectionNotFound {
+                name: "team-a".into()
+            }
+        );
         assert_eq!(databases_path("Team-A"), None);
         assert_eq!(
             databases_path("team-a"),

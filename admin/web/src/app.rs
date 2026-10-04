@@ -140,6 +140,7 @@ fn TenantPage(
     selected_database: Option<String>,
 ) -> impl IntoView {
     let refresh = RwSignal::new(0_u32);
+    let catalog_refresh = RwSignal::new(0_u32);
     let refreshing = RwSignal::new(false);
     let resource_selection = RwSignal::new(selected_resource);
     let state = RwSignal::new(LoadState::<TenantSnapshot>::Loading);
@@ -173,7 +174,12 @@ fn TenantPage(
                 </div>
                 <button type="button"
                     disabled=move || refreshing.get() || matches!(state.get(), LoadState::Loading)
-                    on:click=move |_| refresh.update(|version| *version = version.wrapping_add(1))>
+                    on:click=move |_| {
+                        refresh.update(|version| *version = version.wrapping_add(1));
+                        if section == TenantSection::Databases {
+                            catalog_refresh.update(|version| *version = version.wrapping_add(1));
+                        }
+                    }>
                     {move || if refreshing.get() { "Refreshing…" } else { "Refresh" }}
                 </button>
             </div>
@@ -187,6 +193,7 @@ fn TenantPage(
                         invalid_selection,
                         selected_database.clone(),
                         refresh,
+                        catalog_refresh,
                     ),
                     LoadState::Error(error) => error_state(error, refresh),
                 }}
@@ -586,6 +593,7 @@ fn tenant_workspace_view(
     invalid_selection: bool,
     selected_database: Option<String>,
     snapshot_refresh: RwSignal<u32>,
+    catalog_refresh: RwSignal<u32>,
 ) -> AnyView {
     let detail = data.detail.clone();
     let summary = detail.summary.clone();
@@ -627,7 +635,8 @@ fn tenant_workspace_view(
             ),
             TenantSection::Databases => view! {
                 <CatalogPanel name=tenant_name tenant_uid classification
-                    selected_uid=selected_database snapshot_refresh=Some(snapshot_refresh)/>
+                    selected_uid=selected_database snapshot_refresh=Some(snapshot_refresh)
+                    external_refresh=Some(catalog_refresh)/>
             }.into_any(),
             TenantSection::Status => tenant_status_view(&data),
             TenantSection::Settings => tenant_settings_view(data),

@@ -2267,6 +2267,7 @@ mod tests {
             "/tenants/tenant-a/resources?select=resource%3Auid",
             "/tenants/tenant-a/databases",
             "/tenants/tenant-a/databases/12345678-1234-1234-1234-123456789abc",
+            "/tenants/tenant-a/databases/not-a-uid",
             "/tenants/tenant-a/status",
             "/tenants/tenant-a/settings",
         ] {

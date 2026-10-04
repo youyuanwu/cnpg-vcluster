@@ -15,7 +15,7 @@ use crate::{
     catalog_state::{
         CatalogRecovery, add_disabled_reason, add_recovery, catalog_current, create_request,
         delete_recovery, delete_request, entry_actions_enabled, entry_deletable, query_instances,
-        query_request, query_response_matches, visible_databases,
+        query_request, query_response_matches, selected_database, visible_databases,
     },
     database_console::{
         DEFAULT_DATABASE, DEFAULT_SQL, QueryResultPresentation, format_query_duration,
@@ -115,6 +115,7 @@ pub fn CatalogPanel(
     classification: TenantClassification,
     selected_uid: Option<String>,
     snapshot_refresh: Option<RwSignal<u32>>,
+    external_refresh: Option<RwSignal<u32>>,
 ) -> impl IntoView {
     provide_context(snapshot_refresh);
     let state = RwSignal::new(CatalogLoad::Loading);
@@ -125,6 +126,9 @@ pub fn CatalogPanel(
     let requested_name = name.clone();
     Effect::new(move |_| {
         refresh.get();
+        if let Some(external_refresh) = external_refresh {
+            external_refresh.get();
+        }
         state.set(CatalogLoad::Loading);
         notice.set(None);
         locked.set(false);
@@ -195,9 +199,7 @@ fn CatalogContent(
     if let Some(selected_uid) = selected_uid {
         let list_href =
             tenant_section_href(&name, TenantSection::Databases).unwrap_or_else(|| "/".into());
-        let selected = entries
-            .into_iter()
-            .find(|entry| entry.logical_uid == selected_uid);
+        let selected = selected_database(&catalog, &selected_uid).cloned();
         return view! {
             <a class="back-link" href=list_href>"← All database clusters"</a>
             {selected.map_or_else(
