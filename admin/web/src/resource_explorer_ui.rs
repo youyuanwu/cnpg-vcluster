@@ -34,6 +34,9 @@ pub fn ResourceExplorer(
     let query = RwSignal::new(String::new());
     let group = RwSignal::new(None::<ResourceGroup>);
     let health = RwSignal::new(String::new());
+    let kind = RwSignal::new(String::new());
+    let namespace = RwSignal::new(String::new());
+    let namespace_not_applicable = RwSignal::new(false);
 
     let list_model = model.clone();
     let graph_model = model.clone();
@@ -70,6 +73,31 @@ pub fn ResourceExplorer(
                         <option value="unknown">"Unknown"</option>
                     </select>
                 </label>
+                <label>
+                    "Kind"
+                    <select on:change=move |event| kind.set(event_target_value(&event))>
+                        <option value="">"All kinds"</option>
+                        <option value="tenant">"Tenant"</option>
+                        <option value="control-plane">"Control plane"</option>
+                        <option value="worker-pool">"Worker pool"</option>
+                        <option value="machine">"Machine"</option>
+                        <option value="node">"Node"</option>
+                        <option value="provider-resource">"Provider resource"</option>
+                        <option value="add-on">"Add-on"</option>
+                        <option value="database">"Database"</option>
+                    </select>
+                </label>
+                <label>
+                    "Exact namespace"
+                    <input type="text" placeholder="tenant-a"
+                        disabled=move || namespace_not_applicable.get()
+                        on:input=move |event| namespace.set(event_target_value(&event))/>
+                </label>
+                <label class="explorer-checkbox">
+                    <input type="checkbox"
+                        on:change=move |event| namespace_not_applicable.set(event_target_checked(&event))/>
+                    "Namespace not applicable"
+                </label>
             </div>
             <div class="resource-group-tabs" role="group" aria-label="Resource groups">
                 <button type="button" class:button--secondary=true
@@ -82,16 +110,16 @@ pub fn ResourceExplorer(
                             aria-pressed=move || group.get() == Some(value)
                             on:click=move |_| {
                                 group.set(Some(value));
-                                selected.set(None);
                                 selected_relationship.set(None);
                             }>
                             <span>{format!("{} · {}", value.label(), summary.count)}</span>
                             <small>{format!(
-                                "{} exact · {} logical · {} external · {} recorded",
+                                "{} exact · {} logical · {} external · {} recorded · {} summaries",
                                 summary.provenance.exact,
                                 summary.provenance.database_logical,
                                 summary.provenance.external,
                                 summary.provenance.recorded,
+                                summary.provenance.synthetic,
                             )}</small>
                         </button>
                     }
@@ -101,14 +129,23 @@ pub fn ResourceExplorer(
                 <aside class="explorer-inventory" aria-label="Resource inventory">
                     <h3>"Inventory"</h3>
                     {move || {
+                        let not_applicable = namespace_not_applicable.get();
                         let filter = ExplorerFilter {
                             query: query.get(),
                             group: group.get(),
                             health: parse_health(&health.get()),
-                            namespace_not_applicable: false,
+                            kind: parse_kind(&kind.get()),
+                            namespace: (!not_applicable)
+                                .then(|| namespace.get())
+                                .filter(|value| !value.is_empty()),
+                            namespace_not_applicable: not_applicable,
                         };
                         let nodes = list_model.filtered_nodes(&filter);
-                        if nodes.is_empty() {
+                        let selection_hidden = selected.get().as_deref().is_some_and(|selected| {
+                            list_model.node(selected).is_some()
+                                && !nodes.iter().any(|node| node.id == selected)
+                        });
+                        let content = if nodes.is_empty() {
                             view! { <p class="empty">"No resources match these filters."</p> }.into_any()
                         } else {
                             view! {
@@ -138,7 +175,15 @@ pub fn ResourceExplorer(
                                     }).collect_view()}
                                 </ul>
                             }.into_any()
-                        }
+                        };
+                        view! {
+                            {selection_hidden.then(|| view! {
+                                <p class="lifecycle-notice" role="status">
+                                    "The active selection is hidden by the current filters. It remains visible in the graph and inspector."
+                                </p>
+                            })}
+                            {content}
+                        }.into_any()
                     }}
                 </aside>
                 <div class="explorer-graph">
@@ -185,7 +230,12 @@ fn graph_view(
                         |group| model.group_graph(group),
                     )
                 },
-                |_| model.focused_graph(selected_id),
+                |selected_id| {
+                    expanded_group.map_or_else(
+                        || model.focused_graph(Some(selected_id)),
+                        |group| model.selected_group_graph(selected_id, group),
+                    )
+                },
             )
         },
         |edge_id| model.relationship_graph(selected_id, edge_id),
@@ -354,6 +404,21 @@ fn parse_health(value: &str) -> Option<TopologyHealth> {
         "failed" => Some(TopologyHealth::Failed),
         "deleting" => Some(TopologyHealth::Deleting),
         "unknown" => Some(TopologyHealth::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_kind(value: &str) -> Option<tenant_admin_shared::query::TopologyNodeKind> {
+    use tenant_admin_shared::query::TopologyNodeKind;
+    match value {
+        "tenant" => Some(TopologyNodeKind::Tenant),
+        "control-plane" => Some(TopologyNodeKind::ControlPlane),
+        "worker-pool" => Some(TopologyNodeKind::WorkerPool),
+        "machine" => Some(TopologyNodeKind::Machine),
+        "node" => Some(TopologyNodeKind::Node),
+        "provider-resource" => Some(TopologyNodeKind::ProviderResource),
+        "add-on" => Some(TopologyNodeKind::AddOn),
+        "database" => Some(TopologyNodeKind::Database),
         _ => None,
     }
 }

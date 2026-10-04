@@ -1194,12 +1194,32 @@ tbody tr:hover {
   font: inherit;
 }
 
+.explorer-checkbox {
+  align-content: end;
+  grid-template-columns: auto 1fr !important;
+  align-items: center;
+}
+
+.explorer-checkbox input {
+  width: auto;
+}
+
 .resource-group-tabs {
   display: flex;
   gap: 0.45rem;
   margin-top: 0.9rem;
   overflow-x: auto;
   padding-bottom: 0.25rem;
+}
+
+.resource-group-tabs button {
+  display: grid;
+  gap: 0.1rem;
+  text-align: left;
+}
+
+.resource-group-tabs small {
+  font-weight: 600;
 }
 
 .button--secondary {

@@ -110,6 +110,7 @@ pub struct GroupSummary {
     pub count: usize,
     pub health: HealthCounts,
     pub provenance: ProvenanceCounts,
+    pub synthetic_health: HealthCounts,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -136,6 +137,8 @@ pub struct ExplorerFilter {
     pub query: String,
     pub group: Option<ResourceGroup>,
     pub health: Option<TopologyHealth>,
+    pub kind: Option<TopologyNodeKind>,
+    pub namespace: Option<String>,
     pub namespace_not_applicable: bool,
 }
 
@@ -176,6 +179,7 @@ impl ExplorerModel {
                         count: 0,
                         health: HealthCounts::default(),
                         provenance: ProvenanceCounts::default(),
+                        synthetic_health: HealthCounts::default(),
                     },
                 )
             })
@@ -187,10 +191,18 @@ impl ExplorerModel {
             if ordinary_resource(node) || node.kind == TopologyNodeKind::Tenant {
                 summary.count += 1;
                 summary.health.add(node.health);
+            } else if node.provenance == TopologyNodeProvenance::SyntheticSummary {
+                summary.synthetic_health.add(node.health);
             }
         }
         let mut values = summaries
             .into_values()
+            .map(|mut summary| {
+                if summary.count == 0 {
+                    summary.health = summary.synthetic_health.clone();
+                }
+                summary
+            })
             .filter(|summary| summary.count > 0 || summary.provenance.synthetic > 0)
             .collect::<Vec<_>>();
         values.sort_by_key(|summary| (usize::MAX - summary.health.attention(), summary.group));
@@ -209,6 +221,15 @@ impl ExplorerModel {
                     .is_none_or(|group| resource_group(node.kind) == group)
             })
             .filter(|node| filter.health.is_none_or(|health| node.health == health))
+            .filter(|node| filter.kind.is_none_or(|kind| node.kind == kind))
+            .filter(|node| {
+                filter.namespace.as_ref().is_none_or(|namespace| {
+                    node.resource
+                        .as_ref()
+                        .and_then(|resource| resource.namespace.as_ref())
+                        == Some(namespace)
+                })
+            })
             .filter(|node| {
                 !filter.namespace_not_applicable
                     || node
@@ -410,6 +431,43 @@ impl ExplorerModel {
         graph
     }
 
+    pub fn selected_group_graph(&self, selected: &str, group: ResourceGroup) -> TopologyGraph {
+        let mut graph = self.focused_graph(Some(selected));
+        let mut retained = graph
+            .nodes
+            .iter()
+            .map(|node| node.id.clone())
+            .collect::<BTreeSet<_>>();
+        let mut additions = self
+            .nodes
+            .values()
+            .filter(|node| resource_group(node.kind) == group && ordinary_resource(node))
+            .cloned()
+            .collect::<Vec<_>>();
+        additions.sort_by_key(|node| {
+            (
+                health_priority(node.health),
+                node.label.to_ascii_lowercase(),
+                node.id.clone(),
+            )
+        });
+        for node in additions {
+            if graph.nodes.len() >= MAX_VISIBLE_NODES {
+                break;
+            }
+            if retained.insert(node.id.clone()) {
+                graph.nodes.push(node);
+            }
+        }
+        graph.edges = self
+            .edges
+            .iter()
+            .filter(|edge| retained.contains(&edge.source) && retained.contains(&edge.target))
+            .cloned()
+            .collect();
+        graph
+    }
+
     pub fn attention_nodes(&self) -> Vec<TopologyNode> {
         let mut nodes = self
             .nodes
@@ -426,6 +484,17 @@ impl ExplorerModel {
             })
             .cloned()
             .collect::<Vec<_>>();
+        for node in self.nodes.values().filter(|node| {
+            node.provenance == TopologyNodeProvenance::SyntheticSummary && unhealthy(node.health)
+        }) {
+            let group = resource_group(node.kind);
+            if !nodes
+                .iter()
+                .any(|candidate| resource_group(candidate.kind) == group)
+            {
+                nodes.push(node.clone());
+            }
+        }
         nodes.sort_by_key(|node| (health_priority(node.health), node.id.clone()));
         nodes
     }
@@ -506,6 +575,16 @@ fn group_kind(group: ResourceGroup) -> TopologyNodeKind {
 fn ordinary_resource(node: &TopologyNode) -> bool {
     node.kind != TopologyNodeKind::Tenant
         && node.provenance != TopologyNodeProvenance::SyntheticSummary
+}
+
+fn unhealthy(health: TopologyHealth) -> bool {
+    matches!(
+        health,
+        TopologyHealth::Degraded
+            | TopologyHealth::Failed
+            | TopologyHealth::Deleting
+            | TopologyHealth::Unknown
+    )
 }
 
 fn searchable_text(node: &TopologyNode) -> String {
@@ -766,6 +845,39 @@ mod tests {
             ("Namespace".into(), "Not applicable".into())
         );
         assert!(model.inspection("missing").is_none());
+    }
+
+    #[test]
+    fn exact_kind_namespace_and_synthetic_attention_are_preserved() {
+        let exact = node(
+            "machine:a",
+            TopologyNodeKind::Machine,
+            TopologyHealth::Ready,
+            "duplicate",
+        );
+        let mut synthetic = node(
+            "database:unavailable",
+            TopologyNodeKind::Database,
+            TopologyHealth::Degraded,
+            "Databases unavailable",
+        );
+        synthetic.provenance = TopologyNodeProvenance::SyntheticSummary;
+        synthetic.resource = None;
+        let model = ExplorerModel::new(graph(vec![exact.clone(), synthetic.clone()], Vec::new()));
+        let filtered = model.filtered_nodes(&ExplorerFilter {
+            kind: Some(TopologyNodeKind::Machine),
+            namespace: Some("tenant-a".into()),
+            ..ExplorerFilter::default()
+        });
+        assert_eq!(filtered, vec![exact]);
+        let database = model
+            .group_summaries()
+            .into_iter()
+            .find(|summary| summary.group == ResourceGroup::Databases)
+            .unwrap();
+        assert_eq!(database.count, 0);
+        assert_eq!(database.health.degraded, 1);
+        assert_eq!(model.attention_nodes(), vec![synthetic]);
     }
 
     #[test]

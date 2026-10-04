@@ -189,7 +189,13 @@ fn lifecycle(
         Some(TenantPhase::Degraded | TenantPhase::Failed | TenantPhase::OwnershipInvalid)
     );
     let requested_workers = nonnegative(tenant.spec.workers);
-    let request = condition_stage(tenant, &["Accepted"], terminal, true);
+    let request = match current_condition(tenant, "Accepted") {
+        Some(condition) if condition.status.as_str() == "True" => LifecycleStageState::Completed,
+        Some(condition) if condition.status.as_str() == "False" => LifecycleStageState::Blocked,
+        Some(_) => LifecycleStageState::Unknown,
+        None if status_current(tenant) => LifecycleStageState::Unknown,
+        None => LifecycleStageState::Current,
+    };
     let infrastructure = if !inventory_available {
         LifecycleStageState::Unknown
     } else {
@@ -393,7 +399,7 @@ fn lifecycle(
             LifecycleStageState::Current
         }
     };
-    let mut stages = vec![
+    normalize_lifecycle(vec![
         stage(LifecycleStage::RequestAccepted, request),
         stage(LifecycleStage::Infrastructure, infrastructure),
         stage(LifecycleStage::ControlPlane, control_plane),
@@ -401,11 +407,14 @@ fn lifecycle(
         stage(LifecycleStage::AddOns, add_ons),
         stage(LifecycleStage::Databases, databases),
         stage(LifecycleStage::Ready, ready),
-    ];
+    ])
+}
+
+fn normalize_lifecycle(mut stages: Vec<LifecycleStageView>) -> Vec<LifecycleStageView> {
     let first_incomplete = stages.iter().position(|stage| {
-        !matches!(
+        matches!(
             stage.state,
-            LifecycleStageState::Completed | LifecycleStageState::NotApplicable
+            LifecycleStageState::Current | LifecycleStageState::Blocked
         )
     });
     if let Some(first) = first_incomplete {
@@ -431,7 +440,25 @@ fn database_stage(
     catalog: Option<&CatalogView>,
     terminal: bool,
 ) -> LifecycleStageState {
+    let catalog_ready = current_condition(tenant, "CatalogReady");
     if let Some(catalog) = catalog {
+        if catalog.closed || !catalog.capability_available {
+            return if terminal {
+                LifecycleStageState::Blocked
+            } else {
+                LifecycleStageState::Current
+            };
+        }
+        let Some(catalog_ready) = catalog_ready else {
+            return LifecycleStageState::Unknown;
+        };
+        if catalog_ready.status.as_str() != "True" {
+            return if terminal {
+                LifecycleStageState::Blocked
+            } else {
+                LifecycleStageState::Current
+            };
+        }
         if catalog.databases.is_empty() {
             return LifecycleStageState::NotApplicable;
         }
@@ -445,21 +472,20 @@ fn database_stage(
         }
         if catalog.databases.iter().any(|database| {
             matches!(database.phase.as_str(), "degraded" | "ownership-invalid")
-                || !database.blockers.is_empty()
+                || database
+                    .blockers
+                    .iter()
+                    .any(|blocker| blocker.code == "ProviderMismatch")
         }) {
             return LifecycleStageState::Blocked;
         }
         return LifecycleStageState::Current;
     }
-    if tenant
-        .status
-        .as_ref()
-        .and_then(|status| status.database_capability.as_ref())
-        .is_some()
-    {
-        return LifecycleStageState::Unknown;
+    if catalog_ready.is_some_and(|condition| condition.status.as_str() == "False") && terminal {
+        LifecycleStageState::Blocked
+    } else {
+        LifecycleStageState::Unknown
     }
-    condition_stage(tenant, &["CatalogReady"], terminal, false)
 }
 
 fn condition_stage(
@@ -530,9 +556,9 @@ fn status_current(tenant: &Tenant) -> bool {
 }
 
 fn has_kind(accepted: &[AcceptedResource<'_>], kind: &str) -> bool {
-    accepted
-        .iter()
-        .any(|resource| resource.definition.kind == kind)
+    accepted.iter().any(|resource| {
+        resource.definition.kind == kind && resource.object.metadata.deletion_timestamp.is_none()
+    })
 }
 
 fn worker_capacity(
@@ -1467,9 +1493,8 @@ fn push_blocker(
 
 fn blocker_target(condition_type: Option<&str>) -> Option<&'static str> {
     match condition_type {
-        Some("WorkersReady" | "AzureWorkersReady") => None,
-        Some("CatalogReady") => None,
-        _ => Some("tenant"),
+        None | Some("Accepted" | "Ready" | "OwnershipValid") => Some("tenant"),
+        Some(_) => None,
     }
 }
 
@@ -2062,7 +2087,7 @@ fn add_azure_status_nodes(
             kind: TopologyNodeKind::Node,
             provenance: TopologyNodeProvenance::ExactKubernetesResource,
             label: bounded(&node.name, MAX_IDENTITY),
-            health: TopologyHealth::Ready,
+            health: condition_health(tenant, "AzureWorkersReady"),
             resource: Some(ResourceIdentityView {
                 api_version: "v1".into(),
                 kind: "Node".into(),
@@ -2118,7 +2143,7 @@ fn add_azure_status_nodes(
             kind: TopologyNodeKind::AddOn,
             provenance: TopologyNodeProvenance::RecordedResourceRepresentation,
             label: bounded(component, MAX_IDENTITY),
-            health: TopologyHealth::Ready,
+            health: condition_health(tenant, "AzureAddonsReady"),
             resource: None,
             attributes: Vec::new(),
         });
@@ -2156,9 +2181,9 @@ fn add_azure_status_nodes(
                 "Machine" | "AzureMachinePoolMachine" | "MachineSet" => TopologyNodeKind::Machine,
                 _ => TopologyNodeKind::ProviderResource,
             },
-            provenance: TopologyNodeProvenance::ExactKubernetesResource,
+            provenance: TopologyNodeProvenance::RecordedResourceRepresentation,
             label: bounded(&resource.name, MAX_IDENTITY),
-            health: TopologyHealth::Ready,
+            health: condition_health(tenant, "AzureProviderResourcesReady"),
             resource: Some(ResourceIdentityView {
                 api_version: bounded(&resource.api_version, MAX_IDENTITY),
                 kind: bounded(&resource.kind, MAX_IDENTITY),
@@ -2349,7 +2374,7 @@ mod tests {
             conditions: vec![
                 condition("Ready", if ready { "True" } else { "False" }, observed),
                 condition("WorkersReady", "True", observed),
-                condition("DatabaseReady", "True", observed),
+                condition("CatalogReady", "True", observed),
             ],
             provider: Some(TenantProviderStatus::Local(LocalProviderStatus {
                 allocation: Some(AllocationStatus {
@@ -2496,6 +2521,7 @@ mod tests {
             conditions: vec![
                 condition("Ready", "True", 1),
                 condition("AzureWorkersReady", "True", 1),
+                condition("CatalogReady", "True", 1),
             ],
             provider: Some(TenantProviderStatus::Azure(Box::new(
                 AzureProviderStatus {
@@ -2692,6 +2718,23 @@ mod tests {
         assert_eq!(
             database_stage(&tenant, Some(&empty), false),
             LifecycleStageState::NotApplicable
+        );
+        let mut unavailable = empty.clone();
+        unavailable.capability_available = false;
+        assert_eq!(
+            database_stage(&tenant, Some(&unavailable), false),
+            LifecycleStageState::Current
+        );
+        unavailable.closed = true;
+        assert_eq!(
+            database_stage(&tenant, Some(&unavailable), true),
+            LifecycleStageState::Blocked
+        );
+        let mut stale = tenant.clone();
+        stale.status.as_mut().unwrap().observed_generation = Some(1);
+        assert_eq!(
+            database_stage(&stale, Some(&empty), false),
+            LifecycleStageState::Unknown
         );
     }
 
@@ -2994,6 +3037,17 @@ mod tests {
 
     #[test]
     fn lifecycle_state_precedence_and_blocker_targets_are_explicit() {
+        let independent = normalize_lifecycle(vec![
+            stage(LifecycleStage::Infrastructure, LifecycleStageState::Unknown),
+            stage(LifecycleStage::Databases, LifecycleStageState::Current),
+        ]);
+        assert_eq!(independent[1].state, LifecycleStageState::Current);
+        let ordered = normalize_lifecycle(vec![
+            stage(LifecycleStage::Infrastructure, LifecycleStageState::Current),
+            stage(LifecycleStage::Databases, LifecycleStageState::Current),
+        ]);
+        assert_eq!(ordered[1].state, LifecycleStageState::Pending);
+
         let mut tenant = local_tenant(TenantPhase::Progressing, 2, false);
         let status = tenant.status.as_mut().unwrap();
         status.conditions.extend([
@@ -3017,6 +3071,23 @@ mod tests {
         assert_eq!(
             condition_stage(&tenant, &["Accepted"], true, false),
             LifecycleStageState::Unknown
+        );
+
+        let mut rejected = local_tenant(TenantPhase::Progressing, 2, false);
+        rejected
+            .status
+            .as_mut()
+            .unwrap()
+            .conditions
+            .push(condition("Accepted", "False", 2));
+        let lifecycle = lifecycle(&rejected, &[], None, false);
+        assert_eq!(
+            lifecycle
+                .iter()
+                .find(|stage| stage.stage == LifecycleStage::RequestAccepted)
+                .unwrap()
+                .state,
+            LifecycleStageState::Blocked
         );
 
         let mut tenant = local_tenant(TenantPhase::Progressing, 2, false);
@@ -3231,7 +3302,8 @@ mod tests {
         }));
         assert!(projection.topology.nodes.iter().any(|node| {
             node.id == "provider:machine-uid"
-                && node.provenance == TopologyNodeProvenance::ExactKubernetesResource
+                && node.provenance == TopologyNodeProvenance::RecordedResourceRepresentation
+                && node.health == TopologyHealth::Unknown
         }));
         assert!(
             projection

@@ -34,7 +34,7 @@ use crate::{
         AppRoute, TenantSection, parse_location, tenant_create_path, tenant_delete_path,
         tenant_href, tenant_resource_href, tenant_section_href,
     },
-    tenant_ui::{lifecycle_stage_label, lifecycle_state_label},
+    tenant_ui::{lifecycle_stage_label, lifecycle_state_label, resource_target_exists},
     topology::layout_graph,
 };
 
@@ -666,32 +666,43 @@ fn tenant_overview_view(data: &TenantSnapshot) -> AnyView {
                     <p>"Readiness and lifecycle are current observations, not historical telemetry."</p>
                 </div>
             </div>
-            <div class="readiness-grid">
-                {summaries.into_iter()
-                    .filter(|summary| summary.group != crate::explorer::ResourceGroup::Tenant)
-                    .map(|summary| view! {
-                    <div class="readiness-card">
-                        <strong>{summary.group.label()}</strong>
-                        <span>{format!("{} resources", summary.count)}</span>
-                        <span class="secondary">{format!(
-                            "{} ready · {} progressing · {} degraded · {} failed · {} deleting · {} unknown",
-                            summary.health.ready,
-                            summary.health.progressing,
-                            summary.health.degraded,
-                            summary.health.failed,
-                            summary.health.deleting,
-                            summary.health.unknown,
-                        )}</span>
-                        <span class="secondary">{format!(
-                            "{} exact · {} logical · {} external · {} recorded",
-                            summary.provenance.exact,
-                            summary.provenance.database_logical,
-                            summary.provenance.external,
-                            summary.provenance.recorded,
-                        )}</span>
+            {if matches!(data.sections.resources, SectionAvailability::Available) {
+                view! {
+                    <div class="readiness-grid">
+                        {summaries.into_iter()
+                            .filter(|summary| summary.group != crate::explorer::ResourceGroup::Tenant)
+                            .map(|summary| view! {
+                            <div class="readiness-card">
+                                <strong>{summary.group.label()}</strong>
+                                <span>{format!("{} resources", summary.count)}</span>
+                                <span class="secondary">{format!(
+                                    "{} ready · {} progressing · {} degraded · {} failed · {} deleting · {} unknown",
+                                    summary.health.ready,
+                                    summary.health.progressing,
+                                    summary.health.degraded,
+                                    summary.health.failed,
+                                    summary.health.deleting,
+                                    summary.health.unknown,
+                                )}</span>
+                                <span class="secondary">{format!(
+                                    "{} exact · {} logical · {} external · {} recorded · {} summaries",
+                                    summary.provenance.exact,
+                                    summary.provenance.database_logical,
+                                    summary.provenance.external,
+                                    summary.provenance.recorded,
+                                    summary.provenance.synthetic,
+                                )}</span>
+                            </div>
+                        }).collect_view()}
                     </div>
-                }).collect_view()}
-            </div>
+                }.into_any()
+            } else {
+                view! {
+                    <p class="lifecycle-notice">
+                        "Resource health distribution is unavailable because the authoritative management inventory could not be read."
+                    </p>
+                }.into_any()
+            }}
         </section>
         <div class="detail-grid">
             <section class="panel" aria-labelledby="capacity-heading">
@@ -794,6 +805,7 @@ fn tenant_status_view(data: &TenantSnapshot) -> AnyView {
                             {data.detail.blockers.iter().cloned().map(|blocker| {
                                 let href = blocker.target_node_id.as_deref()
                                     .filter(|_| resource_available)
+                                    .filter(|target| resource_target_exists(data, Some(target)))
                                     .and_then(|target| tenant_resource_href(&name, target));
                                 view! {
                                     <li>
