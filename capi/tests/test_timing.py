@@ -305,13 +305,22 @@ class TimingTests(unittest.TestCase):
                 "name": name, "logicalUid": f"{name}-uid", "instances": 3,
                 "phase": "ready", "readyInstances": 3,
             }
-        complete = {"catalogUid": "catalog-uid", "databases": [
-            entry(name) for name in ("alpha", "beta", "gamma")
-        ]}
-        recreated = {"catalogUid": "catalog-uid", "databases": [
-            entry("alpha"), {**entry("beta"), "logicalUid": "new-beta-uid"},
-            entry("gamma"),
-        ]}
+        complete = {
+            "catalogUid": "catalog-uid",
+            "closed": False,
+            "capabilityAvailable": True,
+            "databases": [entry(name) for name in ("alpha", "beta", "gamma")],
+        }
+        recreated = {
+            "catalogUid": "catalog-uid",
+            "closed": False,
+            "capabilityAvailable": True,
+            "databases": [
+                entry("alpha"),
+                {**entry("beta"), "logicalUid": "new-beta-uid"},
+                entry("gamma"),
+            ],
+        }
         catalog = Mock()
         catalog.read.side_effect = [
             {"catalogUid": "catalog-uid", "databases": []},

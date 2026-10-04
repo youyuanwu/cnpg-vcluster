@@ -380,9 +380,16 @@ def _wait_databases_ready(
         projected = catalog.read(catalog_uid)
         databases = projected["databases"]
         if (
-            len(databases) == len(names)
+            projected["catalogUid"] == catalog_uid
+            and projected["closed"] is False
+            and projected["capabilityAvailable"] is True
+            and len(databases) == len(names)
             and {entry["name"] for entry in databases} == names
-            and all(entry["phase"] == "ready" for entry in databases)
+            and all(
+                entry["phase"] == "ready"
+                and entry["readyInstances"] == 3
+                for entry in databases
+            )
         ):
             return projected
         unknown = any(
@@ -530,10 +537,17 @@ def _restart_worker_and_verify_markers(
         raise RuntimeError("recorded Tenant worker/node identity changed after restart")
 
     ready = catalog.wait(
-        lambda item: len(item["databases"]) == 3
-        and all(entry["phase"] == "ready" and entry["readyInstances"] == 3
-                for entry in item["databases"]),
-        parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+        lambda item: item["catalogUid"] == catalog_uid
+        and item["closed"] is False
+        and item["capabilityAvailable"] is True
+        and len(item["databases"]) == 3
+        and {entry["name"] for entry in item["databases"]} == names
+        and all(
+            entry["phase"] == "ready" and entry["readyInstances"] == 3
+            for entry in item["databases"]
+        ),
+        parse_duration(config["CNPG_TIMEOUT"]) * 4,
+        catalog_uid,
     )
     recovered = ready_entries(ready, names, "local")
     for entry_name in sorted(names):
