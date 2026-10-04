@@ -27,8 +27,9 @@ use tenant_admin_shared::{
     query::{
         DatabaseObservation, DatabaseObservationFreshness, DatabaseQueryRequest,
         DatabaseQueryResponse, DatabaseUnavailableReason, ManagementComponentView,
-        ManagementOverview, OverviewSnapshot, ProviderMode, TenantClassification, TenantCounts,
-        TenantSnapshot, TenantSnapshotIdentity, TenantSummary, TopologyGraph,
+        ManagementOverview, OverviewSnapshot, ProviderMode, SectionAvailability,
+        TenantClassification, TenantCounts, TenantSnapshot, TenantSnapshotIdentity,
+        TenantSnapshotSections, TenantSummary, TopologyGraph,
     },
     routes::{
         API_DATABASE_PATH, API_DATABASE_QUERY_PATH, API_DATABASES_PATH, API_OVERVIEW_PATH,
@@ -387,17 +388,30 @@ async fn tenant_detail(
         .get_tenant(&name)
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant {name} was not found")))?;
-    let resources = state
+    let (resources, resource_section) = match state
         .source
         .list_management_resources(state.provider, &name)
-        .await?;
-    let projection = projected_tenant(&state, tenant, resources).await?;
+        .await
+    {
+        Ok(resources) => (Some(resources), SectionAvailability::Available),
+        Err(error @ (SourceError::KubernetesUnavailable | SourceError::ResponseTooLarge)) => {
+            tracing::warn!("management inventory unavailable while projecting Tenant detail");
+            (None, unavailable_section(&error))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let (projection, database_section) = projected_tenant(&state, tenant, resources).await?;
     let identity = TenantSnapshotIdentity {
         uid: projection.detail.uid.clone(),
         generation: projection.detail.generation,
         observed_generation: projection.detail.observed_generation,
     };
     Ok(Json(ApiEnvelope::new(TenantSnapshot {
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        sections: TenantSnapshotSections {
+            resources: resource_section,
+            databases: database_section,
+        },
         identity,
         detail: projection.detail,
         database: projection.database,
@@ -420,15 +434,20 @@ async fn tenant_topology(
         .list_management_resources(state.provider, &name)
         .await?;
     Ok(Json(ApiEnvelope::new(
-        projected_tenant(&state, tenant, resources).await?.topology,
+        projected_tenant(&state, tenant, Some(resources))
+            .await?
+            .0
+            .topology,
     )))
 }
 
 async fn projected_tenant(
     state: &AppState,
     tenant: Tenant,
-    resources: Vec<kube::core::DynamicObject>,
-) -> Result<TenantProjection, AppError> {
+    resources: Option<Vec<kube::core::DynamicObject>>,
+) -> Result<(TenantProjection, SectionAvailability), AppError> {
+    let inventory_available = resources.is_some();
+    let resources = resources.unwrap_or_default();
     let catalog = if tenant
         .status
         .as_ref()
@@ -444,6 +463,16 @@ async fn projected_tenant(
         }
     } else {
         Ok(None)
+    };
+    let database_section = match &catalog {
+        Ok(_) if inventory_available => SectionAvailability::Available,
+        Ok(Some(_)) => SectionAvailability::Available,
+        Ok(None) => SectionAvailability::Unavailable {
+            code: "management-inventory-unavailable".into(),
+            message: "Database observation requires management resource inventory".into(),
+            retryable: true,
+        },
+        Err(error) => unavailable_section(error),
     };
     let database = match &catalog {
         Ok(Some(_)) => DatabaseObservation::Unavailable {
@@ -467,18 +496,58 @@ async fn projected_tenant(
                     }
             ),
         },
-        Ok(None) => {
+        Ok(None) if inventory_available => {
             state
                 .source
                 .database_observation(state.provider, &tenant, &resources)
                 .await?
         }
+        Ok(None) => DatabaseObservation::Unavailable {
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            freshness: DatabaseObservationFreshness::Live,
+            reason: DatabaseUnavailableReason::ManagementInventoryUnavailable,
+            message: "Management resource inventory is unavailable".into(),
+            retryable: true,
+        },
     };
-    let mut projection = TenantProjection::new(state.provider, tenant, resources, database);
+    let catalog_view = catalog.as_ref().ok().and_then(Option::as_ref);
+    let mut projection = TenantProjection::new(
+        state.provider,
+        tenant,
+        resources,
+        database,
+        catalog_view,
+        inventory_available,
+    );
     if let Ok(Some(catalog)) = catalog {
         merge_catalog_topology(&mut projection.topology, &catalog);
     }
-    Ok(projection)
+    Ok((projection, database_section))
+}
+
+fn unavailable_section(error: &SourceError) -> SectionAvailability {
+    match error {
+        SourceError::KubernetesUnavailable => SectionAvailability::Unavailable {
+            code: "kubernetes-unavailable".into(),
+            message: error.to_string(),
+            retryable: true,
+        },
+        SourceError::ResponseTooLarge => SectionAvailability::Unavailable {
+            code: "response-too-large".into(),
+            message: error.to_string(),
+            retryable: false,
+        },
+        SourceError::DatabaseUnavailable { retryable, .. } => SectionAvailability::Unavailable {
+            code: "database-unavailable".into(),
+            message: error.to_string(),
+            retryable: *retryable,
+        },
+        _ => SectionAvailability::Unavailable {
+            code: "unavailable".into(),
+            message: error.to_string(),
+            retryable: false,
+        },
+    }
 }
 
 async fn database_query(
@@ -1380,6 +1449,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn inventory_failure_is_section_scoped_and_never_becomes_empty_success() {
+        let tenant = ready_tenant();
+        let source = MockSource {
+            tenants: Ok(vec![tenant.clone()]),
+            tenant: Ok(Some(tenant)),
+            resources: Err(SourceError::KubernetesUnavailable),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router(source);
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/tenants/tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: ApiEnvelope<TenantSnapshot> = response_json(detail).await;
+        assert!(matches!(
+            detail.data.sections.resources,
+            SectionAvailability::Unavailable {
+                ref code,
+                retryable: true,
+                ..
+            } if code == "kubernetes-unavailable"
+        ));
+        assert!(detail.data.detail.management_resources.is_empty());
+        assert!(detail.data.topology.nodes.iter().all(|node| {
+            node.id == "tenant"
+                || node.provenance
+                    == tenant_admin_shared::query::TopologyNodeProvenance::SyntheticSummary
+        }));
+        assert_eq!(detail.data.detail.worker_capacity.available, None);
+        assert_eq!(detail.data.detail.worker_capacity.unavailable, None);
+        assert!(matches!(
+            detail.data.database,
+            DatabaseObservation::Unavailable {
+                reason: DatabaseUnavailableReason::ManagementInventoryUnavailable,
+                ..
+            }
+        ));
+        assert_eq!(calls.database_observations.load(Ordering::Relaxed), 0);
+
+        let topology = app
+            .oneshot(
+                Request::get("/api/v1/tenants/tenant-a/topology")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(topology.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
     async fn catalog_failures_keep_tenant_detail_and_topology_available_for_both_providers() {
         for (provider, failure, status, retryable) in [
             (
@@ -1913,7 +2043,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: ApiEnvelope<CatalogView> = response_json(response).await;
-        assert_eq!(body.schema_version, 5);
+        assert_eq!(body.schema_version, 6);
         assert_eq!(body.data.catalog_uid, CATALOG);
         let add = format!(r#"{{"catalogUid":"{CATALOG}","name":"alpha","instances":2}}"#);
         let send = |path: &str, body: String| {

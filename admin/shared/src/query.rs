@@ -105,6 +105,8 @@ pub struct TenantDetail {
     pub observed_generation: Option<i64>,
     pub specification: TenantSpecificationView,
     pub provider_status: ProviderStatusView,
+    pub lifecycle: Vec<LifecycleStageView>,
+    pub worker_capacity: WorkerCapacityView,
     pub blockers: Vec<TenantBlocker>,
     pub management_resources: Vec<ManagementResourceView>,
 }
@@ -120,10 +122,74 @@ pub struct TenantSnapshotIdentity {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TenantSnapshot {
+    pub observed_at: String,
+    pub sections: TenantSnapshotSections,
     pub identity: TenantSnapshotIdentity,
     pub detail: TenantDetail,
     pub database: DatabaseObservation,
     pub topology: TopologyGraph,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TenantSnapshotSections {
+    pub resources: SectionAvailability,
+    pub databases: SectionAvailability,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(
+    tag = "state",
+    rename_all = "kebab-case",
+    rename_all_fields = "camelCase"
+)]
+pub enum SectionAvailability {
+    Available,
+    Unavailable {
+        code: String,
+        message: String,
+        retryable: bool,
+    },
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LifecycleStage {
+    RequestAccepted,
+    Infrastructure,
+    ControlPlane,
+    Workers,
+    AddOns,
+    Databases,
+    Ready,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LifecycleStageState {
+    Completed,
+    Current,
+    Blocked,
+    Pending,
+    NotApplicable,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LifecycleStageView {
+    pub stage: LifecycleStage,
+    pub state: LifecycleStageState,
+    pub message: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkerCapacityView {
+    pub desired: u32,
+    pub available: Option<u32>,
+    pub unavailable: Option<u32>,
+    pub diagnostic_ready_machines: Option<u32>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -163,6 +229,7 @@ pub enum DatabaseObservationFreshness {
 pub enum DatabaseUnavailableReason {
     Pending,
     ManagementResourceMissing,
+    ManagementInventoryUnavailable,
     TenantAccessInvalid,
     TenantApiUnavailable,
     ClusterMissing,
@@ -408,6 +475,7 @@ pub struct TenantBlocker {
     pub code: String,
     pub message: String,
     pub condition_type: Option<String>,
+    pub target_node_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -443,10 +511,21 @@ pub struct TopologyGraph {
 pub struct TopologyNode {
     pub id: String,
     pub kind: TopologyNodeKind,
+    pub provenance: TopologyNodeProvenance,
     pub label: String,
     pub health: TopologyHealth,
     pub resource: Option<ResourceIdentityView>,
     pub attributes: Vec<DisplayAttribute>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TopologyNodeProvenance {
+    ExactKubernetesResource,
+    DatabaseLogicalRepresentation,
+    ExternalProviderRepresentation,
+    RecordedResourceRepresentation,
+    SyntheticSummary,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

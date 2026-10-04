@@ -273,7 +273,7 @@ class FakeClient:
         if path.endswith("/api/v1/overview"):
             return json.dumps(
                 {
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": {
                         "overview": {
                             "providerMode": "local",
@@ -301,7 +301,7 @@ class FakeClient:
         if path.endswith("/api/v1/tenants"):
             return json.dumps(
                 {
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": [
                         tenant_summary(name) for name in self.tenant_names
                     ],
@@ -310,7 +310,7 @@ class FakeClient:
         for name in self.tenant_names:
             if path.endswith(f"/api/v1/tenants/{name}/databases"):
                 return json.dumps({
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": {
                         "tenant": name, "tenantUid": f"{name}-uid",
                         "catalogUid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -321,14 +321,14 @@ class FakeClient:
             if path.endswith(f"/api/v1/tenants/{name}/topology"):
                 return json.dumps(
                     {
-                        "schemaVersion": 5,
+                        "schemaVersion": 6,
                         "data": topology(name),
                     }
                 )
             if path.endswith(f"/api/v1/tenants/{name}"):
                 return json.dumps(
                     {
-                        "schemaVersion": 5,
+                        "schemaVersion": 6,
                         "data": {
                             "identity": {
                                 "uid": f"{name}-uid",
@@ -373,7 +373,7 @@ class FakeClient:
                 name = request["name"]
                 self.tenant_names = tuple(sorted((*self.tenant_names, name)))
                 return response(json.dumps({
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": {
                         "identity": {
                             "name": name,
@@ -386,7 +386,7 @@ class FakeClient:
                 }))
             tenant_name = arguments[2].split("/tenants/", 1)[1].split("/", 1)[0]
             return response(json.dumps({
-                "schemaVersion": 5,
+                "schemaVersion": 6,
                 "data": {
                     "tenant": tenant_name,
                     "cluster": "capi-postgres",
@@ -410,7 +410,7 @@ class FakeClient:
                 tenant for tenant in self.tenant_names if tenant != name
             )
             return response(json.dumps({
-                "schemaVersion": 5,
+                "schemaVersion": 6,
                 "data": {
                     "identity": {
                         "name": name,
@@ -439,7 +439,7 @@ class FakeClient:
             name = payload["name"]
             self.tenant_names = tuple(sorted((*self.tenant_names, name)))
             return response(json.dumps({
-                "schemaVersion": 5,
+                "schemaVersion": 6,
                 "data": {
                     "identity": {
                         "name": name,
@@ -456,7 +456,7 @@ class FakeClient:
                 tenant for tenant in self.tenant_names if tenant != name
             )
             return response(json.dumps({
-                "schemaVersion": 5,
+                "schemaVersion": 6,
                 "data": {
                     "identity": {
                         "name": name,
@@ -468,7 +468,7 @@ class FakeClient:
             }))
         tenant_name = path.split("/tenants/", 1)[1].split("/", 1)[0]
         return response(json.dumps({
-            "schemaVersion": 5,
+            "schemaVersion": 6,
             "data": {
                 "tenant": tenant_name,
                 "cluster": "capi-postgres",
@@ -1013,7 +1013,7 @@ class AdminLocalTests(unittest.TestCase):
                     ("raw-json", method, path, json.dumps(payload, sort_keys=True))
                 )
                 return response(json.dumps({
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": {
                         "catalogUid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                         "logicalUid": FIRST, "instance": "pg-alpha-1",
@@ -1050,11 +1050,11 @@ class AdminLocalTests(unittest.TestCase):
             if path.endswith("/api/v1/tenants"):
                 summary = tenant_summary("tenant-a")
                 summary["classification"] = "progressing"
-                return json.dumps({"schemaVersion": 5, "data": [summary]})
+                return json.dumps({"schemaVersion": 6, "data": [summary]})
             if path.endswith("/api/v1/tenants/tenant-a/topology"):
                 topology = json.loads(original_transition(path))["data"]
                 topology["nodes"][0]["health"] = "progressing"
-                return json.dumps({"schemaVersion": 5, "data": topology})
+                return json.dumps({"schemaVersion": 6, "data": topology})
             return original_transition(path)
 
         with patch.object(
@@ -1132,7 +1132,7 @@ class AdminLocalTests(unittest.TestCase):
 
         def malformed_response(path: str) -> str:
             if path.endswith("/api/v1/overview"):
-                return '{"schemaVersion":5,"data":[]}'
+                return '{"schemaVersion":6,"data":[]}'
             return original(path)
 
         with patch.object(

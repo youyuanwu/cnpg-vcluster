@@ -170,7 +170,7 @@ const fn layer(kind: TopologyNodeKind) -> u8 {
 mod tests {
     use tenant_admin_shared::query::{
         TenantProvider, TopologyEdge, TopologyEdgeKind, TopologyGraph, TopologyHealth,
-        TopologyNode, TopologyNodeKind,
+        TopologyNode, TopologyNodeKind, TopologyNodeProvenance,
     };
 
     use super::{layout_graph, node_width, safe_label};
@@ -179,6 +179,7 @@ mod tests {
         TopologyNode {
             id: id.to_owned(),
             kind,
+            provenance: TopologyNodeProvenance::ExactKubernetesResource,
             label: label.to_owned(),
             health: TopologyHealth::Ready,
             resource: None,

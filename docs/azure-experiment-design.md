@@ -307,7 +307,7 @@ owns the Kubernetes desired state, and CAPZ/ASO own Azure tenant mutation.
 The explicit JSON TenantSpec is translated to
 `tenancy.cnpg-vcluster.io/v1alpha4`; there is no second Python tenant runtime.
 Local allocation, Docker volume and hostPath storage remain local-only.
-The database catalog and Admin schema-v5 routes span both providers.
+The database catalog and Admin schema-v6 routes span both providers.
 
 Terraform/OpenTofu, Pulumi, Ansible, Crossplane, and Azure Developer CLI are
 not required for the first experiment. Terraform/OpenTofu would introduce a
@@ -529,7 +529,7 @@ The management installer stages a pinned CNPG operator and Azure Disk CSI
 controller/node runtime independently of Tenant infrastructure readiness.
 Tenant capability observes their current rollout and a non-default,
 `Retain`/`WaitForFirstConsumer` `cnpg-azure-disk` StorageClass. Catalog entries
-are created through Admin schema-v5 `GET/POST
+are created through Admin schema-v6 `GET/POST
 /api/v1/tenants/{name}/databases`; deletion uses exact catalog and logical
 UID plus typed-name confirmation, and SQL binds an observed Pod UID. The
 database-controller owns per-entry status and UID-derived workload namespaces,

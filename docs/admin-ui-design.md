@@ -169,7 +169,7 @@ counts.
 
 The detail view shows the immutable specification, current conditions and
 blockers, provider-specific status, accepted management resources, and a
-provider-neutral topology. It independently reads the schema-v5 database
+provider-neutral topology. It independently reads the schema-v6 database
 catalog, showing at most three cards for either provider. Each card displays
 its logical UID, reconciliation phase, ready instances, storage, blockers,
 conditions, finalization progress, and an entry-scoped topology. Add accepts
@@ -226,10 +226,10 @@ returns a typed not-found response and a non-fatal link back to the overview.
 Every successful JSON response is:
 
 ```json
-{"schemaVersion":5,"data":{}}
+{"schemaVersion":6,"data":{}}
 ```
 
-Errors use schema version 5 plus a typed error code, sanitized message,
+Errors use schema version 6 plus a typed error code, sanitized message,
 retryable flag, and optional bounded field errors. The routes are:
 
 | Route | Response |

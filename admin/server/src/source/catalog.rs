@@ -17,7 +17,7 @@ use tenant_admin_shared::{
     },
     query::{
         DisplayAttribute, ProviderMode, TenantProvider, TopologyEdge, TopologyEdgeKind,
-        TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind,
+        TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind, TopologyNodeProvenance,
     },
 };
 use tenant_controller::{
@@ -1096,6 +1096,7 @@ pub(super) fn project(
         let mut nodes = vec![TopologyNode {
             id: root_id.clone(),
             kind: TopologyNodeKind::Database,
+            provenance: TopologyNodeProvenance::DatabaseLogicalRepresentation,
             label: entry.name.clone(),
             health,
             resource: None,
@@ -1116,6 +1117,7 @@ pub(super) fn project(
             nodes.push(TopologyNode {
                 id: id.clone(),
                 kind: TopologyNodeKind::Database,
+                provenance: TopologyNodeProvenance::DatabaseLogicalRepresentation,
                 label: instance.name.clone(),
                 health: if instance.ready {
                     TopologyHealth::Ready
@@ -1485,6 +1487,7 @@ mod tests {
                 TopologyNode {
                     id: "tenant".into(),
                     kind: TopologyNodeKind::Tenant,
+                    provenance: TopologyNodeProvenance::ExactKubernetesResource,
                     label: "tenant-a".into(),
                     health: TopologyHealth::Ready,
                     resource: None,
@@ -1493,6 +1496,7 @@ mod tests {
                 TopologyNode {
                     id: "database:cluster".into(),
                     kind: TopologyNodeKind::Database,
+                    provenance: TopologyNodeProvenance::SyntheticSummary,
                     label: "legacy".into(),
                     health: TopologyHealth::Unknown,
                     resource: None,
