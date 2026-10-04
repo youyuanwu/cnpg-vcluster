@@ -137,18 +137,23 @@ fn TenantPage(
     invalid_selection: bool,
 ) -> impl IntoView {
     let refresh = RwSignal::new(0_u32);
+    let refreshing = RwSignal::new(false);
+    let resource_selection = RwSignal::new(selected_resource);
     let state = RwSignal::new(LoadState::<TenantSnapshot>::Loading);
     let requested_name = name.clone();
 
     Effect::new(move |_| {
         refresh.get();
-        state.set(LoadState::Loading);
+        if !matches!(state.get_untracked(), LoadState::Loading) {
+            refreshing.set(true);
+        }
         let name = requested_name.clone();
         spawn_local(async move {
             state.set(match fetch_tenant_page(&name).await {
                 Ok(data) => LoadState::Ready(data),
                 Err(error) => LoadState::Error(error),
             });
+            refreshing.set(false);
         });
     });
 
@@ -163,7 +168,11 @@ fn TenantPage(
                         "Current status, tenant-scoped resources, database operations, and guarded lifecycle controls."
                     </p>
                 </div>
-                <RefreshButton state refresh/>
+                <button type="button"
+                    disabled=move || refreshing.get() || matches!(state.get(), LoadState::Loading)
+                    on:click=move |_| refresh.update(|version| *version = version.wrapping_add(1))>
+                    {move || if refreshing.get() { "Refreshing…" } else { "Refresh" }}
+                </button>
             </div>
             <div aria-live="polite">
                 {move || match state.get() {
@@ -171,8 +180,9 @@ fn TenantPage(
                     LoadState::Ready(data) => tenant_workspace_view(
                         data,
                         section,
-                        selected_resource.clone(),
+                        resource_selection,
                         invalid_selection,
+                        refresh,
                     ),
                     LoadState::Error(error) => error_state(error, refresh),
                 }}
@@ -568,8 +578,9 @@ fn tenant_row(tenant: TenantSummary) -> AnyView {
 fn tenant_workspace_view(
     data: TenantSnapshot,
     section: TenantSection,
-    selected_resource: Option<String>,
+    resource_selection: RwSignal<Option<String>>,
     invalid_selection: bool,
+    snapshot_refresh: RwSignal<u32>,
 ) -> AnyView {
     let detail = data.detail.clone();
     let summary = detail.summary.clone();
@@ -606,11 +617,11 @@ fn tenant_workspace_view(
             TenantSection::Overview => tenant_overview_view(&data),
             TenantSection::Resources => resources_section_view(
                 &data,
-                selected_resource,
+                resource_selection,
                 invalid_selection,
             ),
             TenantSection::Databases => view! {
-                <CatalogPanel name=tenant_name tenant_uid classification/>
+                <CatalogPanel name=tenant_name tenant_uid classification snapshot_refresh=Some(snapshot_refresh)/>
             }.into_any(),
             TenantSection::Status => tenant_status_view(&data),
             TenantSection::Settings => tenant_settings_view(data),
@@ -641,15 +652,27 @@ fn tenant_overview_view(data: &TenantSnapshot) -> AnyView {
                 </div>
             </div>
             <div class="readiness-grid">
-                {summaries.into_iter().map(|summary| view! {
+                {summaries.into_iter()
+                    .filter(|summary| summary.group != crate::explorer::ResourceGroup::Tenant)
+                    .map(|summary| view! {
                     <div class="readiness-card">
                         <strong>{summary.group.label()}</strong>
                         <span>{format!("{} resources", summary.count)}</span>
                         <span class="secondary">{format!(
-                            "{} ready · {} progressing · {} attention",
+                            "{} ready · {} progressing · {} degraded · {} failed · {} deleting · {} unknown",
                             summary.health.ready,
                             summary.health.progressing,
-                            summary.health.attention(),
+                            summary.health.degraded,
+                            summary.health.failed,
+                            summary.health.deleting,
+                            summary.health.unknown,
+                        )}</span>
+                        <span class="secondary">{format!(
+                            "{} exact · {} logical · {} external · {} recorded",
+                            summary.provenance.exact,
+                            summary.provenance.database_logical,
+                            summary.provenance.external,
+                            summary.provenance.recorded,
                         )}</span>
                     </div>
                 }).collect_view()}
@@ -688,7 +711,13 @@ fn tenant_overview_view(data: &TenantSnapshot) -> AnyView {
                     <p>"Unhealthy tenant-associated resources in this snapshot."</p>
                 </div>
             </div>
-            {if attention.is_empty() {
+            {if !matches!(data.sections.resources, SectionAvailability::Available) {
+                view! {
+                    <p class="lifecycle-notice">
+                        "Resource inventory is unavailable. Attention links are disabled until an authoritative inventory can be read."
+                    </p>
+                }.into_any()
+            } else if attention.is_empty() {
                 view! { <p class="empty">"No resources need attention."</p> }.into_any()
             } else {
                 view! {
@@ -713,12 +742,12 @@ fn tenant_overview_view(data: &TenantSnapshot) -> AnyView {
 
 fn resources_section_view(
     data: &TenantSnapshot,
-    selected_resource: Option<String>,
+    resource_selection: RwSignal<Option<String>>,
     invalid_selection: bool,
 ) -> AnyView {
     match &data.sections.resources {
         SectionAvailability::Available => view! {
-            <ResourceExplorer graph=data.topology.clone() initial_selection=selected_resource invalid_selection/>
+            <ResourceExplorer graph=data.topology.clone() selection=resource_selection invalid_selection/>
         }.into_any(),
         SectionAvailability::Unavailable { message, retryable, .. } => view! {
             <section class="state-panel state-panel--error" role="alert">

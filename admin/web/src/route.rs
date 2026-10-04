@@ -130,6 +130,9 @@ fn selection_from_search(search: &str) -> (Option<String>, bool) {
     let mut selected = None;
     for item in query.split('&') {
         let Some((key, value)) = item.split_once('=') else {
+            if item == "select" {
+                return (None, true);
+            }
             continue;
         };
         if key != "select" {
@@ -292,6 +295,15 @@ mod tests {
         );
         assert_eq!(
             parse_location("/tenants/team-a/resources", "?select=%GG"),
+            AppRoute::Tenant {
+                name: "team-a".into(),
+                section: TenantSection::Resources,
+                selected_resource: None,
+                invalid_selection: true,
+            }
+        );
+        assert_eq!(
+            parse_location("/tenants/team-a/resources", "?select"),
             AppRoute::Tenant {
                 name: "team-a".into(),
                 section: TenantSection::Resources,

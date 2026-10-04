@@ -269,6 +269,13 @@ impl ExplorerModel {
         })
     }
 
+    pub fn relationship_by_id(&self, id: &str) -> Option<ResourceRelationship> {
+        self.edges
+            .iter()
+            .find(|edge| edge.id == id)
+            .and_then(|edge| self.relationship(edge))
+    }
+
     pub fn focused_graph(&self, selected: Option<&str>) -> TopologyGraph {
         let Some(selected) = selected.filter(|id| self.nodes.contains_key(*id)) else {
             return self.summary_graph();
@@ -309,6 +316,49 @@ impl ExplorerModel {
             tenant_name: self.graph.tenant_name.clone(),
             provider: self.graph.provider,
             nodes: ranked,
+            edges,
+        }
+    }
+
+    pub fn group_graph(&self, group: ResourceGroup) -> TopologyGraph {
+        let tenant = self
+            .nodes
+            .values()
+            .find(|node| node.kind == TopologyNodeKind::Tenant)
+            .cloned();
+        let mut nodes = tenant.into_iter().collect::<Vec<_>>();
+        let remaining = MAX_VISIBLE_NODES.saturating_sub(nodes.len());
+        let mut group_nodes = self
+            .nodes
+            .values()
+            .filter(|node| resource_group(node.kind) == group && ordinary_resource(node))
+            .cloned()
+            .collect::<Vec<_>>();
+        group_nodes.sort_by_key(|node| {
+            (
+                health_priority(node.health),
+                node.label.to_ascii_lowercase(),
+                node.id.clone(),
+            )
+        });
+        group_nodes.truncate(remaining);
+        nodes.extend(group_nodes);
+        let retained = nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let edges = self
+            .edges
+            .iter()
+            .filter(|edge| {
+                retained.contains(edge.source.as_str()) && retained.contains(edge.target.as_str())
+            })
+            .cloned()
+            .collect();
+        TopologyGraph {
+            tenant_name: self.graph.tenant_name.clone(),
+            provider: self.graph.provider,
+            nodes,
             edges,
         }
     }
@@ -707,6 +757,7 @@ mod tests {
             ..ExplorerFilter::default()
         });
         let _ = model.focused_graph(Some("machine:19"));
+        let _ = model.group_graph(ResourceGroup::Compute);
         let _ = model.inspection("machine:19");
         assert!(started.elapsed().as_secs_f32() < 1.0);
     }

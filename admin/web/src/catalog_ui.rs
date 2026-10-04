@@ -21,6 +21,7 @@ use crate::{
     },
     error::{UiError, UiErrorKind},
     format::{health_class, health_label, optional_text, provider_label},
+    mutation_ui_state::{RefreshIntent, refresh_effects},
     route::{database_path, database_query_path, databases_path},
     topology::layout_graph,
 };
@@ -105,7 +106,9 @@ pub fn CatalogPanel(
     name: String,
     tenant_uid: String,
     classification: TenantClassification,
+    snapshot_refresh: Option<RwSignal<u32>>,
 ) -> impl IntoView {
+    provide_context(snapshot_refresh);
     let state = RwSignal::new(CatalogLoad::Loading);
     let notice = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
@@ -222,6 +225,7 @@ fn DatabaseAddPanel(
     busy: RwSignal<bool>,
     locked: RwSignal<bool>,
 ) -> impl IntoView {
+    let snapshot_refresh = use_context::<Option<RwSignal<u32>>>().flatten();
     let cluster_name = RwSignal::new(String::new());
     let instances = RwSignal::new("1".to_owned());
     let error = RwSignal::new(None::<String>);
@@ -264,6 +268,11 @@ fn DatabaseAddPanel(
                             .any(|entry| entry.name == request.name) =>
                 {
                     state.set(CatalogLoad::Ready(current));
+                    if refresh_effects(RefreshIntent::MutationCommitted).snapshot {
+                        if let Some(snapshot_refresh) = snapshot_refresh {
+                            snapshot_refresh.update(|version| *version = version.wrapping_add(1));
+                        }
+                    }
                     notice.set(Some(format!(
                         "Cluster {} was accepted. Refresh to observe readiness.",
                         request.name
@@ -533,6 +542,7 @@ fn DatabaseDeletePanel(
     busy: RwSignal<bool>,
     locked: RwSignal<bool>,
 ) -> impl IntoView {
+    let snapshot_refresh = use_context::<Option<RwSignal<u32>>>().flatten();
     let confirmation = RwSignal::new(String::new());
     let heading = format!("cluster-{}-delete-heading", entry.logical_uid);
     let button_name = entry.name.clone();
@@ -582,6 +592,11 @@ fn DatabaseDeletePanel(
                         ) =>
                 {
                     state.set(CatalogLoad::Ready(current));
+                    if refresh_effects(RefreshIntent::MutationCommitted).snapshot {
+                        if let Some(snapshot_refresh) = snapshot_refresh {
+                            snapshot_refresh.update(|version| *version = version.wrapping_add(1));
+                        }
+                    }
                     notice.set(Some(format!(
                         "Deletion of {} was accepted for logical UID {}.",
                         entry.name, entry.logical_uid

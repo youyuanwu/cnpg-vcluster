@@ -7,21 +7,29 @@ use crate::{
         representation_label,
     },
     format::{edge_kind_label, health_class, health_label, node_kind_label},
+    mutation_ui_state::{SelectionRefresh, selection_after_refresh},
     topology::layout_graph,
 };
 
 #[component]
 pub fn ResourceExplorer(
     graph: TopologyGraph,
-    initial_selection: Option<String>,
+    selection: RwSignal<Option<String>>,
     invalid_selection: bool,
 ) -> impl IntoView {
     let model = ExplorerModel::new(graph);
-    let stale_selection = initial_selection
-        .as_deref()
-        .is_some_and(|selection| model.node(selection).is_none());
-    let selected =
-        RwSignal::new(initial_selection.filter(|selection| model.node(selection).is_some()));
+    let selection_ids = model
+        .filtered_nodes(&ExplorerFilter::default())
+        .into_iter()
+        .map(|node| node.id)
+        .collect::<Vec<_>>();
+    let stale_selection =
+        selection_after_refresh(selection.get_untracked().as_deref(), selection_ids.iter())
+            == SelectionRefresh::ClearedMissing;
+    if stale_selection {
+        selection.set(None);
+    }
+    let selected = selection;
     let selected_relationship = RwSignal::new(None::<String>);
     let query = RwSignal::new(String::new());
     let group = RwSignal::new(None::<ResourceGroup>);
@@ -72,8 +80,19 @@ pub fn ResourceExplorer(
                     view! {
                         <button type="button" class:button--secondary=true
                             aria-pressed=move || group.get() == Some(value)
-                            on:click=move |_| group.set(Some(value))>
-                            {format!("{} · {}", value.label(), summary.count)}
+                            on:click=move |_| {
+                                group.set(Some(value));
+                                selected.set(None);
+                                selected_relationship.set(None);
+                            }>
+                            <span>{format!("{} · {}", value.label(), summary.count)}</span>
+                            <small>{format!(
+                                "{} exact · {} logical · {} external · {} recorded",
+                                summary.provenance.exact,
+                                summary.provenance.database_logical,
+                                summary.provenance.external,
+                                summary.provenance.recorded,
+                            )}</small>
                         </button>
                     }
                 }).collect_view()}
@@ -127,6 +146,7 @@ pub fn ResourceExplorer(
                     {move || graph_view(
                         &graph_model,
                         selected.get().as_deref(),
+                        group.get(),
                         selected,
                         selected_relationship,
                     )}
@@ -148,10 +168,25 @@ pub fn ResourceExplorer(
 fn graph_view(
     model: &ExplorerModel,
     selected_id: Option<&str>,
+    expanded_group: Option<ResourceGroup>,
     selected: RwSignal<Option<String>>,
     selected_relationship: RwSignal<Option<String>>,
 ) -> AnyView {
-    let graph = model.focused_graph(selected_id);
+    let graph = selected_id.map_or_else(
+        || {
+            expanded_group.map_or_else(
+                || model.focused_graph(None),
+                |group| model.group_graph(group),
+            )
+        },
+        |_| model.focused_graph(selected_id),
+    );
+    let selected_edge = selected_relationship
+        .get()
+        .and_then(|id| model.relationship_by_id(&id));
+    let endpoint_ids = selected_edge
+        .as_ref()
+        .map(|edge| (edge.source_id.clone(), edge.target_id.clone()));
     let layout = layout_graph(&graph);
     let view_box = format!("0 0 {} {}", layout.width, layout.height);
     view! {
@@ -171,7 +206,6 @@ fn graph_view(
                     let accessible_label = label.clone();
                     view! {
                         <g class:edge--selected=move || selected_relationship.get().as_deref() == Some(selected_edge.as_str())
-                            role="button" tabindex="0"
                             aria-label=format!("Relationship {accessible_label}")
                             on:click=move |_| selected_relationship.set(Some(edge_id.clone()))>
                             <path class="edge" d=edge.path marker-end="url(#explorer-arrow)"/>
@@ -186,10 +220,12 @@ fn graph_view(
                     let kind = node_kind_label(node.kind);
                     let health = health_label(node.health);
                     let accessible_label = node.label.clone();
+                    let endpoint_node = endpoint_ids.as_ref().is_some_and(|(source, target)| {
+                        source == &node.id || target == &node.id
+                    });
                     view! {
                         <g class=format!("node node--{class}")
-                            class:node--selected=move || selected.get().as_deref() == Some(selected_node.as_str())
-                            role="button" tabindex="0"
+                            class:node--selected=move || selected.get().as_deref() == Some(selected_node.as_str()) || endpoint_node
                             aria-label=format!("{accessible_label}; {kind}; status {health}")
                             transform=format!("translate({}, {})", node.x, node.y)
                             on:click=move |_| {
@@ -215,13 +251,7 @@ fn inspector_view(
     relationship_signal: RwSignal<Option<String>>,
 ) -> AnyView {
     if let Some(edge_id) = selected_relationship {
-        if let Some(edge) = model
-            .focused_graph(selected_id)
-            .edges
-            .iter()
-            .find(|edge| edge.id == edge_id)
-            .and_then(|edge| model.relationship(edge))
-        {
+        if let Some(edge) = model.relationship_by_id(edge_id) {
             return relationship_view(edge, relationship_signal);
         }
     }
