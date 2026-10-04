@@ -363,6 +363,53 @@ impl ExplorerModel {
         }
     }
 
+    pub fn relationship_graph(
+        &self,
+        selected: Option<&str>,
+        relationship_id: &str,
+    ) -> TopologyGraph {
+        let mut graph = self.focused_graph(selected);
+        let Some(edge) = self.edges.iter().find(|edge| edge.id == relationship_id) else {
+            return graph;
+        };
+        let required = BTreeSet::from([
+            edge.source.as_str(),
+            edge.target.as_str(),
+            selected.unwrap_or_default(),
+        ]);
+        for endpoint in [&edge.source, &edge.target] {
+            if graph.nodes.iter().any(|node| node.id == *endpoint) {
+                continue;
+            }
+            if graph.nodes.len() >= MAX_VISIBLE_NODES
+                && let Some(index) = graph
+                    .nodes
+                    .iter()
+                    .rposition(|node| !required.contains(node.id.as_str()))
+            {
+                graph.nodes.remove(index);
+            }
+            if let Some(node) = self.nodes.get(endpoint) {
+                graph.nodes.push(node.clone());
+            }
+        }
+        let retained = graph
+            .nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+        graph.edges = self
+            .edges
+            .iter()
+            .filter(|candidate| {
+                retained.contains(candidate.source.as_str())
+                    && retained.contains(candidate.target.as_str())
+            })
+            .cloned()
+            .collect();
+        graph
+    }
+
     pub fn attention_nodes(&self) -> Vec<TopologyNode> {
         let mut nodes = self
             .nodes
@@ -679,6 +726,14 @@ mod tests {
         let model = ExplorerModel::new(graph(nodes, edges));
         let focused = model.focused_graph(Some("tenant"));
         assert_eq!(focused.nodes.len(), MAX_VISIBLE_NODES);
+        let relationship = model.relationship_graph(Some("tenant"), "edge:39");
+        assert!(
+            relationship
+                .nodes
+                .iter()
+                .any(|node| node.id == "machine:39")
+        );
+        assert!(relationship.edges.iter().any(|edge| edge.id == "edge:39"));
         let inspection = model.inspection("tenant").unwrap();
         assert!(inspection.incoming.iter().any(|edge| edge.id == "cycle"));
         assert!(

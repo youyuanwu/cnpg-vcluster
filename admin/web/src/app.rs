@@ -25,9 +25,10 @@ use crate::{
         provider_mode_label,
     },
     lifecycle::{
-        CreateRecovery, DeleteRecovery, create_recovery, create_request, delete_enabled,
-        delete_recovery, requires_authoritative_read,
+        CreateRecovery, DeleteRecovery, create_recovery, create_request, delete_recovery,
+        requires_authoritative_read,
     },
+    mutation_ui_state::exact_confirmation_enabled,
     resource_explorer_ui::ResourceExplorer,
     route::{
         AppRoute, TenantSection, parse_location, tenant_create_path, tenant_delete_path,
@@ -881,10 +882,11 @@ fn TenantDeletePanel(name: String, uid: String) -> impl IntoView {
     let requested_uid = uid.clone();
     let submit = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
-        if !delete_enabled(
+        if !exact_confirmation_enabled(
             &requested_name,
             &confirmation.get_untracked(),
             matches!(state.get_untracked(), MutationState::Running),
+            false,
         ) {
             return;
         }
@@ -976,10 +978,11 @@ fn TenantDeletePanel(name: String, uid: String) -> impl IntoView {
                     <button
                         class="button--danger"
                         type="submit"
-                        disabled=move || !delete_enabled(
+                        disabled=move || !exact_confirmation_enabled(
                             &button_name,
                             &confirmation.get(),
                             matches!(state.get(), MutationState::Running),
+                            false,
                         )
                     >
                         {move || if matches!(state.get(), MutationState::Running) {

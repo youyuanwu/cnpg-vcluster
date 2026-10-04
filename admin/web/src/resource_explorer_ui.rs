@@ -172,18 +172,24 @@ fn graph_view(
     selected: RwSignal<Option<String>>,
     selected_relationship: RwSignal<Option<String>>,
 ) -> AnyView {
-    let graph = selected_id.map_or_else(
+    let selected_edge_id = selected_relationship.get();
+    let selected_edge = selected_edge_id
+        .as_deref()
+        .and_then(|id| model.relationship_by_id(id));
+    let graph = selected_edge_id.as_deref().map_or_else(
         || {
-            expanded_group.map_or_else(
-                || model.focused_graph(None),
-                |group| model.group_graph(group),
+            selected_id.map_or_else(
+                || {
+                    expanded_group.map_or_else(
+                        || model.focused_graph(None),
+                        |group| model.group_graph(group),
+                    )
+                },
+                |_| model.focused_graph(selected_id),
             )
         },
-        |_| model.focused_graph(selected_id),
+        |edge_id| model.relationship_graph(selected_id, edge_id),
     );
-    let selected_edge = selected_relationship
-        .get()
-        .and_then(|id| model.relationship_by_id(&id));
     let endpoint_ids = selected_edge
         .as_ref()
         .map(|edge| (edge.source_id.clone(), edge.target_id.clone()));

@@ -21,7 +21,9 @@ use crate::{
     },
     error::{UiError, UiErrorKind},
     format::{health_class, health_label, optional_text, provider_label},
-    mutation_ui_state::{RefreshIntent, refresh_effects},
+    mutation_ui_state::{
+        RefreshIntent, exact_confirmation_enabled, refresh_effects, unsafe_operation_enabled,
+    },
     route::{database_path, database_query_path, databases_path},
     topology::layout_graph,
 };
@@ -268,7 +270,11 @@ fn DatabaseAddPanel(
                             .any(|entry| entry.name == request.name) =>
                 {
                     state.set(CatalogLoad::Ready(current));
-                    if refresh_effects(RefreshIntent::MutationCommitted).snapshot {
+                    let effects = refresh_effects(RefreshIntent::MutationCommitted);
+                    if !effects.preserve_catalog_lock {
+                        locked.set(false);
+                    }
+                    if effects.snapshot {
                         if let Some(snapshot_refresh) = snapshot_refresh {
                             snapshot_refresh.update(|version| *version = version.wrapping_add(1));
                         }
@@ -552,9 +558,12 @@ fn DatabaseDeletePanel(
     let submit = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
         if !can_act
-            || busy.get_untracked()
-            || locked.get_untracked()
-            || confirmation.get_untracked() != submit_entry.name
+            || !exact_confirmation_enabled(
+                &submit_entry.name,
+                &confirmation.get_untracked(),
+                busy.get_untracked(),
+                locked.get_untracked(),
+            )
         {
             return;
         }
@@ -592,7 +601,11 @@ fn DatabaseDeletePanel(
                         ) =>
                 {
                     state.set(CatalogLoad::Ready(current));
-                    if refresh_effects(RefreshIntent::MutationCommitted).snapshot {
+                    let effects = refresh_effects(RefreshIntent::MutationCommitted);
+                    if !effects.preserve_catalog_lock {
+                        locked.set(false);
+                    }
+                    if effects.snapshot {
                         if let Some(snapshot_refresh) = snapshot_refresh {
                             snapshot_refresh.update(|version| *version = version.wrapping_add(1));
                         }
@@ -656,7 +669,12 @@ fn DatabaseDeletePanel(
                         on:input=move |event| confirmation.set(event_target_value(&event))/>
                 </label>
                 <button class="button--danger" type="submit"
-                    disabled=move || !can_act || busy.get() || locked.get() || confirmation.get() != button_name
+                    disabled=move || !can_act || !exact_confirmation_enabled(
+                        &button_name,
+                        &confirmation.get(),
+                        busy.get(),
+                        locked.get(),
+                    )
                 >"Delete this cluster"</button>
             </form>
         </section>
@@ -683,15 +701,18 @@ fn DatabaseConsole(
     let sql = RwSignal::new(DEFAULT_SQL.to_owned());
     let result = RwSignal::new(QueryState::Idle);
     let query_enabled = can_act && !options.is_empty();
+    let has_ready_instance = !options.is_empty();
     let submit_entry = entry.clone();
     let submit_catalog = catalog.clone();
     let submit_name = name.clone();
     let submit = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
-        if !query_enabled
-            || busy.get_untracked()
-            || locked.get_untracked()
-            || matches!(result.get_untracked(), QueryState::Running)
+        if !unsafe_operation_enabled(
+            query_enabled,
+            has_ready_instance,
+            busy.get_untracked(),
+            locked.get_untracked(),
+        ) || matches!(result.get_untracked(), QueryState::Running)
         {
             return;
         }
