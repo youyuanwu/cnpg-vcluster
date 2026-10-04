@@ -2261,29 +2261,34 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("text/css")
         );
-        let nested = app
-            .clone()
-            .oneshot(
-                Request::get("/tenants/tenant-a")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(nested.status(), StatusCode::OK);
-        assert_eq!(
-            nested
-                .headers()
-                .get("cache-control")
-                .and_then(|value| value.to_str().ok()),
-            Some("no-store")
-        );
-        let nested_body = nested.into_body().collect().await.expect("body").to_bytes();
-        assert!(
-            nested_body
-                .windows(18)
-                .any(|value| value == b"tenant-admin-shell")
-        );
+        for path in [
+            "/tenants/tenant-a",
+            "/tenants/tenant-a/overview",
+            "/tenants/tenant-a/resources?select=resource%3Auid",
+            "/tenants/tenant-a/databases",
+            "/tenants/tenant-a/status",
+            "/tenants/tenant-a/settings",
+        ] {
+            let nested = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(nested.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                nested
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+            let nested_body = nested.into_body().collect().await.expect("body").to_bytes();
+            assert!(
+                nested_body
+                    .windows(18)
+                    .any(|value| value == b"tenant-admin-shell")
+            );
+        }
         let missing_asset = app
             .clone()
             .oneshot(

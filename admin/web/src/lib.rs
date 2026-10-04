@@ -3,9 +3,12 @@
 pub mod catalog_state;
 pub mod database_console;
 pub mod error;
+pub mod explorer;
 pub mod format;
 pub mod lifecycle;
+pub mod mutation_ui_state;
 pub mod route;
+pub mod tenant_ui;
 pub mod topology;
 
 #[cfg(any(target_arch = "wasm32", test))]
@@ -22,6 +25,8 @@ mod api;
 mod app;
 #[cfg(target_arch = "wasm32")]
 mod catalog_ui;
+#[cfg(target_arch = "wasm32")]
+mod resource_explorer_ui;
 
 #[cfg(target_arch = "wasm32")]
 pub fn mount() {
