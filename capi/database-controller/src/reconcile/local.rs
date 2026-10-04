@@ -9,7 +9,9 @@ use kube::{
 };
 use serde_json::{Value, json};
 
-use super::{ObserveError, Progress, next_action, verify_current};
+use super::{
+    ObserveError, Progress, creation_order, next_action, stop_after_progress, verify_current,
+};
 use crate::{
     api::{
         CreateIntent, CreateState, DatabasePhase, EntryStatus, FinalizationStatus,
@@ -278,6 +280,20 @@ pub(crate) async fn blocked(
         return Ok(true);
     }
     Ok(false)
+}
+
+pub(crate) async fn blocked_progress(
+    management: Client,
+    catalog: &mut TenantDatabaseCatalog,
+    uid: &str,
+    state: &mut EntryStatus,
+    reason: &str,
+) -> Result<Progress, ObserveError> {
+    Ok(if blocked(management, catalog, uid, state, reason).await? {
+        Progress::Changed
+    } else {
+        Progress::Waiting
+    })
 }
 
 pub(crate) async fn save(
@@ -952,7 +968,9 @@ pub async fn reconcile(
     }
     let access = tenant_access::load(management.clone(), &catalog).await?;
     let generation = catalog.metadata.generation.ok_or(ObserveError::Identity)?;
-    for (uid, spec) in catalog.spec.entries.clone() {
+    let mut entries: Vec<_> = catalog.spec.entries.clone().into_iter().collect();
+    entries.sort_by_key(|(_, spec)| creation_order(spec.deleting, catalog.spec.closed));
+    for (uid, spec) in entries {
         let (namespace, cluster) = ownership::names(
             catalog
                 .metadata
@@ -987,9 +1005,11 @@ pub async fn reconcile(
             .is_some_and(|s| s.entries.contains_key(&uid))
         {
             save(management.clone(), &mut catalog, &uid, &state).await?;
-            return Ok((Action::requeue(RETRY), catalog));
+            waiting = true;
+            continue;
         }
-        let result = if spec.deleting || catalog.spec.closed {
+        let creating = !spec.deleting && !catalog.spec.closed;
+        let result = if !creating {
             finalize(
                 management.clone(),
                 &mut catalog,
@@ -1013,18 +1033,13 @@ pub async fn reconcile(
                 &access,
             )
             .await
-            .map(|changed| {
-                if changed {
-                    Progress::Changed
-                } else {
-                    Progress::Stable
-                }
-            })
         };
         match result {
-            Ok(Progress::Changed) => return Ok((Action::requeue(RETRY), catalog)),
-            Ok(Progress::Waiting) => waiting = true,
-            Ok(Progress::Stable) => (),
+            Ok(progress) => {
+                if stop_after_progress(progress, creating, &mut waiting) {
+                    return Ok((Action::requeue(RETRY), catalog));
+                }
+            }
             Err(
                 ObserveError::Foreign
                 | ObserveError::Path(
@@ -1049,7 +1064,7 @@ pub async fn reconcile(
                     != Some(&state)
                 {
                     save(management.clone(), &mut catalog, &uid, &state).await?;
-                    return Ok((Action::requeue(RETRY), catalog));
+                    waiting = true;
                 }
             }
             Err(error) => return Err(error),
@@ -1071,7 +1086,7 @@ async fn ensure(
     state: &mut EntryStatus,
     instances: i32,
     access: &LocalAccess,
-) -> Result<bool, ObserveError> {
+) -> Result<Progress, ObserveError> {
     let ns_api = core(access.client.clone(), None, "Namespace", "namespaces");
     let ns = object("Namespace", namespace, None, identity(catalog, uid)?, None)?;
     let Some(id) = create(
@@ -1086,7 +1101,7 @@ async fn ensure(
     )
     .await?
     else {
-        return blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
+        return blocked_progress(management, catalog, uid, state, "UnknownCreateOutcome").await;
     };
     if state.namespace.as_ref() != Some(&id) {
         if state.namespace.is_some() {
@@ -1094,28 +1109,39 @@ async fn ensure(
         }
         state.namespace = Some(id);
         save(management, catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
+    let mut paths_changed = false;
     for ordinal in 1..=instances {
         let Some(path) = path(management.clone(), catalog, uid, state, access, ordinal).await?
         else {
-            return blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
+            return blocked_progress(management, catalog, uid, state, "UnknownCreateOutcome").await;
         };
         if storage(state, ordinal).path.as_deref() != Some(&path) {
             if storage(state, ordinal).path.is_some() {
                 return Err(ObserveError::Foreign);
             }
-            storage(state, ordinal).path = Some(path.clone());
-            save(management.clone(), catalog, uid, state).await?;
-            return Ok(true);
+            storage(state, ordinal).path = Some(path);
+            paths_changed = true;
         }
+    }
+    if paths_changed {
+        save(management.clone(), catalog, uid, state).await?;
+        return Ok(Progress::Changed);
+    }
+    let mut volumes_changed = false;
+    for ordinal in 1..=instances {
+        let path = storage(state, ordinal)
+            .path
+            .as_deref()
+            .ok_or(ObserveError::Foreign)?;
         let pv_api = core(
             access.client.clone(),
             None,
             "PersistentVolume",
             "persistentvolumes",
         );
-        let pv = cnpg::volume(catalog, uid, namespace, cluster, ordinal, access, &path)?;
+        let pv = cnpg::volume(catalog, uid, namespace, cluster, ordinal, access, path)?;
         let Some(id) = create(
             management.clone(),
             catalog,
@@ -1128,16 +1154,19 @@ async fn ensure(
         )
         .await?
         else {
-            return blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
+            return blocked_progress(management, catalog, uid, state, "UnknownCreateOutcome").await;
         };
         if storage(state, ordinal).pv.as_ref() != Some(&id) {
             if storage(state, ordinal).pv.is_some() {
                 return Err(ObserveError::Foreign);
             }
             storage(state, ordinal).pv = Some(id);
-            save(management.clone(), catalog, uid, state).await?;
-            return Ok(true);
+            volumes_changed = true;
         }
+    }
+    if volumes_changed {
+        save(management.clone(), catalog, uid, state).await?;
+        return Ok(Progress::Changed);
     }
     let cluster_api = api(
         access.client.clone(),
@@ -1160,7 +1189,7 @@ async fn ensure(
     )
     .await?
     else {
-        return blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
+        return blocked_progress(management, catalog, uid, state, "UnknownCreateOutcome").await;
     };
     if state.cnpg_cluster.as_ref() != Some(&id) {
         if state.cnpg_cluster.is_some() {
@@ -1168,8 +1197,10 @@ async fn ensure(
         }
         state.cnpg_cluster = Some(id);
         save(management.clone(), catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
+    let mut claims_waiting = false;
+    let mut claims_changed = false;
     for ordinal in 1..=instances {
         let desired = cnpg::claim(catalog, uid, namespace, cluster, ordinal)?;
         let Some(actual) = core(
@@ -1181,7 +1212,8 @@ async fn ensure(
         .get_opt(&desired.name_any())
         .await?
         else {
-            return blocked(management, catalog, uid, state, "ClaimPending").await;
+            claims_waiting = true;
+            continue;
         };
         let bound = state
             .storage
@@ -1196,9 +1228,15 @@ async fn ensure(
         }
         if storage(state, ordinal).pvc.as_ref() != Some(&claimed) {
             storage(state, ordinal).pvc = Some(claimed);
-            save(management.clone(), catalog, uid, state).await?;
-            return Ok(true);
+            claims_changed = true;
         }
+    }
+    if claims_waiting {
+        return blocked_progress(management, catalog, uid, state, "ClaimPending").await;
+    }
+    if claims_changed {
+        save(management.clone(), catalog, uid, state).await?;
+        return Ok(Progress::Changed);
     }
     let live = cluster_api.get(cluster).await?;
     check(&live, catalog, uid, cluster, state.cnpg_cluster.as_ref())?;
@@ -1314,9 +1352,13 @@ async fn ensure(
     state.observed_generation = generation;
     if catalog.status.as_ref().and_then(|s| s.entries.get(uid)) != Some(state) {
         save(management, catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
-    Ok(false)
+    Ok(if ready {
+        Progress::Stable
+    } else {
+        Progress::Waiting
+    })
 }
 
 pub(super) async fn delete_exact(
@@ -1957,7 +1999,9 @@ mod api_scenarios {
                                 }
                             }
                             (Method::GET, path)
-                                if path.starts_with("/api/v1/persistentvolumes/pv-")
+                                if path.starts_with("/api/v1/namespaces/db-")
+                                    && !path.contains("/persistentvolumeclaims/")
+                                    || path.starts_with("/api/v1/persistentvolumes/pv-")
                                     || path.starts_with("/api/v1/namespaces/db-")
                                         && path.contains("/persistentvolumeclaims/")
                                     || path.starts_with(
@@ -1974,7 +2018,8 @@ mod api_scenarios {
                                 }
                             }
                             (Method::POST, path)
-                                if path == "/api/v1/persistentvolumes"
+                                if path == "/api/v1/namespaces"
+                                    || path == "/api/v1/persistentvolumes"
                                     || path.starts_with(
                                         "/apis/postgresql.cnpg.io/v1/namespaces/db-",
                                     ) && path.ends_with("/clusters") =>
@@ -2064,6 +2109,89 @@ mod api_scenarios {
                 path.to_str().unwrap(),
             )
             .unwrap()
+        }
+
+        #[tokio::test]
+        async fn creation_batches_each_three_instance_preparation_barrier() {
+            let server = Arc::new(Mutex::new(Server::new()));
+            let client = client(server.clone());
+            let root = tempfile::tempdir().unwrap();
+            let mut access = access(client.clone());
+            access.root = root.path().to_path_buf();
+            access.worker_root = root.path().join("worker");
+            let uid = ENTRIES[0].0;
+            let (namespace, cluster) = ownership::names(CATALOG, uid).unwrap();
+            let mut catalog = server.lock().unwrap().catalog.clone();
+            let mut state = catalog.status.as_ref().unwrap().entries[uid].clone();
+
+            for expected in [
+                Progress::Changed,
+                Progress::Changed,
+                Progress::Changed,
+                Progress::Changed,
+            ] {
+                assert_eq!(
+                    ensure(
+                        client.clone(),
+                        &mut catalog,
+                        uid,
+                        &namespace,
+                        &cluster,
+                        &mut state,
+                        3,
+                        &access,
+                    )
+                    .await
+                    .unwrap(),
+                    expected,
+                );
+            }
+            assert_eq!(
+                ensure(
+                    client.clone(),
+                    &mut catalog,
+                    uid,
+                    &namespace,
+                    &cluster,
+                    &mut state,
+                    3,
+                    &access,
+                )
+                .await
+                .unwrap(),
+                Progress::Changed,
+            );
+            assert_eq!(
+                ensure(
+                    client.clone(),
+                    &mut catalog,
+                    uid,
+                    &namespace,
+                    &cluster,
+                    &mut state,
+                    3,
+                    &access,
+                )
+                .await
+                .unwrap(),
+                Progress::Waiting,
+            );
+
+            assert!(state.namespace.is_some());
+            assert_eq!(state.storage.len(), 3);
+            assert!(state.storage.iter().all(|item| item.path.is_some()));
+            assert!(state.storage.iter().all(|item| item.pv.is_some()));
+            assert!(state.cnpg_cluster.is_some());
+            let server = server.lock().unwrap();
+            assert_eq!(server.creates.len(), 5);
+            assert_eq!(
+                server
+                    .creates
+                    .keys()
+                    .filter(|path| path.starts_with("/api/v1/persistentvolumes/"))
+                    .count(),
+                3,
+            );
         }
 
         #[tokio::test]

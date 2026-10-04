@@ -11,7 +11,9 @@ use tenant_controller::{
 };
 use tenant_database_runtime::{azure_runtime, catalog_runtime};
 
-use super::{ObserveError, Progress, local, next_action, verify_current};
+use super::{
+    ObserveError, Progress, creation_order, local, next_action, stop_after_progress, verify_current,
+};
 use crate::{
     api::{
         CreateState, DatabasePhase, EntryStatus, FinalizationStatus, InstanceObservation,
@@ -761,6 +763,31 @@ fn set_id(
     }
 }
 
+fn initialize_arm_ids(
+    state: &mut EntryStatus,
+    group_id: &str,
+    cluster_name: &str,
+    instances: i32,
+) -> Result<bool, ObserveError> {
+    let mut changed = false;
+    for ordinal in 1..=instances {
+        let expected = arm_id(group_id, &disk_name(cluster_name, ordinal));
+        let item = storage(state, ordinal);
+        if item
+            .arm_id
+            .as_ref()
+            .is_some_and(|actual| !actual.eq_ignore_ascii_case(&expected))
+        {
+            return Err(ObserveError::Foreign);
+        }
+        if item.arm_id.is_none() {
+            item.arm_id = Some(expected);
+            changed = true;
+        }
+    }
+    Ok(changed)
+}
+
 pub async fn reconcile(
     management: Client,
     observed: &TenantDatabaseCatalog,
@@ -783,7 +810,9 @@ pub async fn reconcile(
     }
     let access = load(management.clone(), &catalog, replay_issued).await?;
     let generation = catalog.metadata.generation.ok_or(ObserveError::Identity)?;
-    for (uid, spec) in catalog.spec.entries.clone() {
+    let mut entries: Vec<_> = catalog.spec.entries.clone().into_iter().collect();
+    entries.sort_by_key(|(_, spec)| creation_order(spec.deleting, catalog.spec.closed));
+    for (uid, spec) in entries {
         let (namespace, cluster) = ownership::names(
             catalog.uid().as_deref().ok_or(ObserveError::Identity)?,
             &uid,
@@ -802,9 +831,11 @@ pub async fn reconcile(
             .is_none_or(|s| !s.entries.contains_key(&uid))
         {
             local::save(management.clone(), &mut catalog, &uid, &state).await?;
-            return Ok((Action::requeue(RETRY), catalog));
+            waiting = true;
+            continue;
         }
-        let result = if spec.deleting || catalog.spec.closed {
+        let creating = !spec.deleting && !catalog.spec.closed;
+        let result = if !creating {
             finalize(
                 management.clone(),
                 &mut catalog,
@@ -828,18 +859,13 @@ pub async fn reconcile(
                 &access,
             )
             .await
-            .map(|changed| {
-                if changed {
-                    Progress::Changed
-                } else {
-                    Progress::Stable
-                }
-            })
         };
         match result {
-            Ok(Progress::Changed) => return Ok((Action::requeue(RETRY), catalog)),
-            Ok(Progress::Waiting) => waiting = true,
-            Ok(Progress::Stable) => (),
+            Ok(progress) => {
+                if stop_after_progress(progress, creating, &mut waiting) {
+                    return Ok((Action::requeue(RETRY), catalog));
+                }
+            }
             Err(ObserveError::Foreign) => {
                 state.query = None;
                 state.observed_generation = generation;
@@ -847,7 +873,7 @@ pub async fn reconcile(
                 state.phase = DatabasePhase::OwnershipInvalid;
                 if catalog.status.as_ref().and_then(|s| s.entries.get(&uid)) != Some(&state) {
                     local::save(management.clone(), &mut catalog, &uid, &state).await?;
-                    return Ok((Action::requeue(RETRY), catalog));
+                    waiting = true;
                 }
             }
             Err(error) => return Err(error),
@@ -869,9 +895,9 @@ async fn ensure(
     state: &mut EntryStatus,
     instances: i32,
     access: &Access,
-) -> Result<bool, ObserveError> {
+) -> Result<Progress, ObserveError> {
     if let Some(reason) = access.prerequisite_reason() {
-        return local::blocked(management, catalog, uid, state, reason).await;
+        return local::blocked_progress(management, catalog, uid, state, reason).await;
     }
     let ns = local::object(
         "Namespace",
@@ -893,27 +919,28 @@ async fn ensure(
     )
     .await?;
     let Some(id) = id else {
-        return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
+        return local::blocked_progress(management, catalog, uid, state, "UnknownCreateOutcome")
+            .await;
     };
     if set_id(state, "Namespace", 0, id)? {
         local::save(management, catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
     let runtime = azure_runtime::observe(access.client.clone()).await;
     if let Err(error) = &runtime {
         tracing::warn!(%error, "Azure database runtime observation unavailable");
     }
     if !matches!(runtime, Ok("Ready")) {
-        return local::blocked(management, catalog, uid, state, "RuntimeNotReady").await;
+        return local::blocked_progress(management, catalog, uid, state, "RuntimeNotReady").await;
     }
+    if initialize_arm_ids(state, &access.group_id, cluster_name, instances)? {
+        local::save(management.clone(), catalog, uid, state).await?;
+        return Ok(Progress::Changed);
+    }
+    let mut disks_waiting = false;
     for ordinal in 1..=instances {
         let name = disk_name(cluster_name, ordinal);
         let expected_arm = arm_id(&access.group_id, &name);
-        if !state.storage.iter().any(|item| item.ordinal == ordinal) {
-            storage(state, ordinal).arm_id = Some(expected_arm.clone());
-            local::save(management.clone(), catalog, uid, state).await?;
-            return Ok(true);
-        }
         if !disk_ready(
             management.clone(),
             catalog,
@@ -926,8 +953,18 @@ async fn ensure(
         )
         .await?
         {
-            return local::blocked(management, catalog, uid, state, "DiskPending").await;
+            disks_waiting = true;
         }
+    }
+    if disks_waiting {
+        return local::blocked_progress(management, catalog, uid, state, "DiskPending").await;
+    }
+    let mut volumes_changed = false;
+    for ordinal in 1..=instances {
+        let expected_arm = storage(state, ordinal)
+            .arm_id
+            .clone()
+            .ok_or(ObserveError::Foreign)?;
         let pv = volume(
             catalog,
             uid,
@@ -954,12 +991,22 @@ async fn ensure(
         )
         .await?;
         let Some(id) = id else {
-            return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
+            return local::blocked_progress(
+                management,
+                catalog,
+                uid,
+                state,
+                "UnknownCreateOutcome",
+            )
+            .await;
         };
         if set_id(state, "PersistentVolume", ordinal, id)? {
-            local::save(management.clone(), catalog, uid, state).await?;
-            return Ok(true);
+            volumes_changed = true;
         }
+    }
+    if volumes_changed {
+        local::save(management.clone(), catalog, uid, state).await?;
+        return Ok(Progress::Changed);
     }
     let desired = cluster(catalog, uid, namespace, cluster_name, instances)?;
     let cluster_api = local::api(
@@ -983,12 +1030,15 @@ async fn ensure(
     )
     .await?;
     let Some(id) = id else {
-        return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
+        return local::blocked_progress(management, catalog, uid, state, "UnknownCreateOutcome")
+            .await;
     };
     if set_id(state, "Cluster", 0, id.clone())? {
         local::save(management.clone(), catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
+    let mut claims_waiting = false;
+    let mut claims_changed = false;
     for ordinal in 1..=instances {
         let desired = claim(catalog, uid, namespace, cluster_name, ordinal)?;
         let claims = local::core(
@@ -998,7 +1048,8 @@ async fn ensure(
             "persistentvolumeclaims",
         );
         let Some(actual) = claims.get_opt(&desired.name_any()).await? else {
-            return local::blocked(management, catalog, uid, state, "ClaimPending").await;
+            claims_waiting = true;
+            continue;
         };
         let bound = state
             .storage
@@ -1013,9 +1064,15 @@ async fn ensure(
         }
         if storage(state, ordinal).pvc.as_ref() != Some(&claimed) {
             storage(state, ordinal).pvc = Some(claimed);
-            local::save(management.clone(), catalog, uid, state).await?;
-            return Ok(true);
+            claims_changed = true;
         }
+    }
+    if claims_waiting {
+        return local::blocked_progress(management, catalog, uid, state, "ClaimPending").await;
+    }
+    if claims_changed {
+        local::save(management.clone(), catalog, uid, state).await?;
+        return Ok(Progress::Changed);
     }
     let live = cluster_api.get(cluster_name).await?;
     local::check(
@@ -1149,9 +1206,13 @@ async fn ensure(
     state.observed_generation = generation;
     if catalog.status.as_ref().and_then(|s| s.entries.get(uid)) != Some(state) {
         local::save(management, catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
-    Ok(false)
+    Ok(if ready {
+        Progress::Stable
+    } else {
+        Progress::Waiting
+    })
 }
 
 #[expect(
@@ -1472,6 +1533,28 @@ mod tests {
             }),
         };
         (catalog, access)
+    }
+
+    #[tokio::test]
+    async fn arm_identity_preparation_batches_all_instance_ordinals() {
+        let (_, access) = fixtures();
+        let uid = ENTRIES[0];
+        let (_, cluster_name) = ownership::names(CATALOG, uid).unwrap();
+        let mut state = entry(uid, 1, &access);
+        assert!(initialize_arm_ids(&mut state, GROUP, &cluster_name, 3).unwrap());
+        assert_eq!(state.storage.len(), 3);
+        for ordinal in 1..=3 {
+            assert_eq!(
+                storage(&mut state, ordinal).arm_id.as_deref(),
+                Some(arm_id(GROUP, &disk_name(&cluster_name, ordinal)).as_str()),
+            );
+        }
+        assert!(!initialize_arm_ids(&mut state, GROUP, &cluster_name, 3).unwrap());
+        storage(&mut state, 2).arm_id = Some("foreign".into());
+        assert!(matches!(
+            initialize_arm_ids(&mut state, GROUP, &cluster_name, 3),
+            Err(ObserveError::Foreign)
+        ));
     }
 
     #[tokio::test]

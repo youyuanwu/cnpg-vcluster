@@ -28,6 +28,21 @@ pub(crate) fn next_action(waiting: bool, retry: Duration, resync: Duration) -> A
     Action::requeue(if waiting { retry } else { resync })
 }
 
+pub(crate) fn creation_order(deleting: bool, closed: bool) -> bool {
+    deleting || closed
+}
+
+pub(crate) fn stop_after_progress(progress: Progress, creating: bool, waiting: &mut bool) -> bool {
+    match progress {
+        Progress::Changed if !creating => true,
+        Progress::Changed | Progress::Waiting => {
+            *waiting = true;
+            false
+        }
+        Progress::Stable => false,
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ObserveError {
     #[error("catalog, namespace, or Tenant identity is absent or inconsistent")]
@@ -443,6 +458,27 @@ mod tests {
             next_action(false, retry, resync),
             Action::requeue(Duration::from_secs(60))
         );
+    }
+
+    #[test]
+    fn creation_progress_advances_every_catalog_entry_before_retry() {
+        let mut waiting = false;
+        let visited = [Progress::Changed, Progress::Waiting, Progress::Changed]
+            .into_iter()
+            .take_while(|progress| !stop_after_progress(*progress, true, &mut waiting))
+            .count();
+        assert_eq!(visited, 3);
+        assert!(waiting);
+        assert!(stop_after_progress(Progress::Changed, false, &mut waiting));
+    }
+
+    #[test]
+    fn mixed_catalogs_schedule_creations_before_deletions() {
+        let mut entries = vec![true, false, true, false];
+        entries.sort_by_key(|deleting| creation_order(*deleting, false));
+        assert_eq!(entries, vec![false, false, true, true]);
+        entries.sort_by_key(|deleting| creation_order(*deleting, true));
+        assert_eq!(entries, vec![false, false, true, true]);
     }
 
     #[test]
