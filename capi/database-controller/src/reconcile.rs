@@ -17,6 +17,17 @@ const TENANT_FINALIZER: &str = "tenancy.cnpg-vcluster.io/finalizer";
 const RETRY: Duration = Duration::from_secs(15);
 const RESYNC: Duration = Duration::from_secs(60);
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum Progress {
+    Changed,
+    Waiting,
+    Stable,
+}
+
+pub(crate) fn next_action(waiting: bool, retry: Duration, resync: Duration) -> Action {
+    Action::requeue(if waiting { retry } else { resync })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ObserveError {
     #[error("catalog, namespace, or Tenant identity is absent or inconsistent")]
@@ -418,6 +429,20 @@ mod tests {
         }))
         .unwrap();
         (catalog, tenant, namespace)
+    }
+
+    #[test]
+    fn active_progress_uses_retry_instead_of_steady_resync() {
+        let retry = Duration::from_secs(10);
+        let resync = Duration::from_secs(60);
+        assert_eq!(
+            next_action(true, retry, resync),
+            Action::requeue(Duration::from_secs(10))
+        );
+        assert_eq!(
+            next_action(false, retry, resync),
+            Action::requeue(Duration::from_secs(60))
+        );
     }
 
     #[test]

@@ -11,7 +11,7 @@ use tenant_controller::{
 };
 use tenant_database_runtime::{azure_runtime, catalog_runtime};
 
-use super::{ObserveError, local, verify_current};
+use super::{ObserveError, Progress, local, next_action, verify_current};
 use crate::{
     api::{
         CreateState, DatabasePhase, EntryStatus, FinalizationStatus, InstanceObservation,
@@ -22,6 +22,7 @@ use crate::{
 
 const SIZE: i64 = 4 * 1024 * 1024 * 1024;
 const RETRY: Duration = Duration::from_secs(10);
+const RESYNC: Duration = Duration::from_secs(60);
 const POSTGRES_IMAGE: &str = "ghcr.io/cloudnative-pg/postgresql:18.4-system-trixie@sha256:42708a75345b7a48fdd9257b071830783a97fd228529196b6313187a7198e185";
 const DISK_VERSION: &str = "v1api20240302";
 const ARM_VERSION: &str = "2024-03-02";
@@ -766,6 +767,7 @@ pub async fn reconcile(
     replay_issued: bool,
 ) -> Result<(Action, TenantDatabaseCatalog), ObserveError> {
     let mut catalog = verify_current(management.clone(), observed).await?;
+    let mut waiting = false;
     if let Some(uid) = catalog
         .status
         .as_ref()
@@ -826,10 +828,18 @@ pub async fn reconcile(
                 &access,
             )
             .await
+            .map(|changed| {
+                if changed {
+                    Progress::Changed
+                } else {
+                    Progress::Stable
+                }
+            })
         };
         match result {
-            Ok(true) => return Ok((Action::requeue(RETRY), catalog)),
-            Ok(false) => (),
+            Ok(Progress::Changed) => return Ok((Action::requeue(RETRY), catalog)),
+            Ok(Progress::Waiting) => waiting = true,
+            Ok(Progress::Stable) => (),
             Err(ObserveError::Foreign) => {
                 state.query = None;
                 state.observed_generation = generation;
@@ -843,7 +853,7 @@ pub async fn reconcile(
             Err(error) => return Err(error),
         }
     }
-    Ok((Action::requeue(Duration::from_secs(60)), catalog))
+    Ok((next_action(waiting, RETRY, RESYNC), catalog))
 }
 
 #[expect(
@@ -1157,7 +1167,7 @@ async fn finalize(
     state: &mut EntryStatus,
     instances: i32,
     access: &Access,
-) -> Result<bool, ObserveError> {
+) -> Result<Progress, ObserveError> {
     let generation = catalog.metadata.generation.ok_or(ObserveError::Identity)?;
     local::set_health(state, false, generation, Some("Deleting"));
     state.phase = DatabasePhase::Deleting;
@@ -1174,7 +1184,7 @@ async fn finalize(
     }
     if catalog.status.as_ref().and_then(|s| s.entries.get(uid)) != Some(state) {
         local::save(management.clone(), catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
     let clusters = local::api(
         access.client.clone(),
@@ -1197,9 +1207,9 @@ async fn finalize(
     )
     .await?
     {
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
-    if !local::delete_exact(
+    if local::delete_exact(
         management.clone(),
         catalog,
         uid,
@@ -1208,9 +1218,11 @@ async fn finalize(
         state.cnpg_cluster.as_ref(),
     )
     .await?
+        == Progress::Waiting
     {
-        return Ok(false);
+        return Ok(Progress::Waiting);
     }
+    let mut dependent_waiting = false;
     let secret_name = format!("{cluster_name}-superuser");
     let secrets = local::core(access.client.clone(), Some(namespace), "Secret", "secrets");
     if let Some(secret) = secrets.get_opt(&secret_name).await? {
@@ -1230,7 +1242,7 @@ async fn finalize(
         if state.credentials.is_none() {
             state.credentials = Some(id.clone());
             local::save(management.clone(), catalog, uid, state).await?;
-            return Ok(true);
+            return Ok(Progress::Changed);
         }
         verify_current(management.clone(), catalog).await?;
         secrets
@@ -1245,7 +1257,7 @@ async fn finalize(
                 },
             )
             .await?;
-        return Ok(false);
+        dependent_waiting = true;
     }
     for ordinal in 1..=instances {
         let desired_claim = claim(catalog, uid, namespace, cluster_name, ordinal)?;
@@ -1267,9 +1279,9 @@ async fn finalize(
         )
         .await?
         {
-            return Ok(true);
+            return Ok(Progress::Changed);
         }
-        if !local::delete_exact(
+        if local::delete_exact(
             management.clone(),
             catalog,
             uid,
@@ -1282,9 +1294,16 @@ async fn finalize(
                 .and_then(|s| s.pvc.as_ref()),
         )
         .await?
+            == Progress::Waiting
         {
-            return Ok(false);
+            dependent_waiting = true;
         }
+    }
+    if dependent_waiting {
+        return Ok(Progress::Waiting);
+    }
+    let mut volume_waiting = false;
+    for ordinal in 1..=instances {
         let id = arm_id(&access.group_id, &disk_name(cluster_name, ordinal));
         let desired_volume = volume(catalog, uid, namespace, cluster_name, ordinal, &id)?;
         let volumes = local::core(
@@ -1305,9 +1324,9 @@ async fn finalize(
         )
         .await?
         {
-            return Ok(true);
+            return Ok(Progress::Changed);
         }
-        if !local::delete_exact(
+        if local::delete_exact(
             management.clone(),
             catalog,
             uid,
@@ -1320,9 +1339,13 @@ async fn finalize(
                 .and_then(|s| s.pv.as_ref()),
         )
         .await?
+            == Progress::Waiting
         {
-            return Ok(false);
+            volume_waiting = true;
         }
+    }
+    if volume_waiting {
+        return Ok(Progress::Waiting);
     }
     let namespaces = local::core(access.client.clone(), None, "Namespace", "namespaces");
     let desired_namespace = local::object(
@@ -1344,9 +1367,9 @@ async fn finalize(
     )
     .await?
     {
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
-    if !local::delete_exact(
+    if local::delete_exact(
         management.clone(),
         catalog,
         uid,
@@ -1355,8 +1378,9 @@ async fn finalize(
         state.namespace.as_ref(),
     )
     .await?
+        == Progress::Waiting
     {
-        return Ok(false);
+        return Ok(Progress::Waiting);
     }
 
     crate::finalize::azure::cleanup(
@@ -2235,7 +2259,7 @@ mod tests {
             "default",
         );
         let (namespace, _) = ownership::names(CATALOG, uid).unwrap();
-        assert!(
+        assert_eq!(
             finalize(
                 management.clone(),
                 &mut catalog,
@@ -2247,9 +2271,10 @@ mod tests {
                 &access
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Progress::Changed,
         );
-        assert!(
+        assert_eq!(
             finalize(
                 management.clone(),
                 &mut catalog,
@@ -2261,7 +2286,8 @@ mod tests {
                 &access
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Progress::Changed,
         );
         let order = workload_calls.lock().unwrap().clone();
         let paths = [
@@ -2300,7 +2326,7 @@ mod tests {
         ));
         access.arm = lost_identity;
         present.store(true, Ordering::SeqCst);
-        assert!(
+        assert_eq!(
             crate::finalize::azure::cleanup(
                 management.clone(),
                 &mut catalog,
@@ -2311,7 +2337,8 @@ mod tests {
                 &access
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Progress::Changed,
         );
         assert_eq!(state.create_intents[0].state, CreateState::Observed);
         assert_eq!(writes.lock().unwrap().1, 0);
@@ -2334,8 +2361,8 @@ mod tests {
             vec![id.clone()]
         );
         assert_eq!(writes.lock().unwrap().1, 0);
-        assert!(
-            !crate::finalize::azure::cleanup(
+        assert_eq!(
+            crate::finalize::azure::cleanup(
                 management.clone(),
                 &mut catalog,
                 uid,
@@ -2345,13 +2372,14 @@ mod tests {
                 &access
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Progress::Waiting,
         );
         assert_eq!(
             state.finalization.as_ref().unwrap().pending,
             vec![id.clone()]
         );
-        assert!(
+        assert_eq!(
             crate::finalize::azure::cleanup(
                 management.clone(),
                 &mut catalog,
@@ -2362,13 +2390,14 @@ mod tests {
                 &access
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Progress::Changed,
         );
         assert_eq!(
             state.finalization.as_ref().unwrap().verified_absent,
             vec![id.clone()]
         );
-        assert!(
+        assert_eq!(
             crate::finalize::azure::cleanup(
                 management.clone(),
                 &mut catalog,
@@ -2379,10 +2408,11 @@ mod tests {
                 &access
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Progress::Changed,
         );
         assert!(state.finalization.as_ref().unwrap().terminal_verified);
-        assert!(
+        assert_eq!(
             crate::finalize::azure::cleanup(
                 management,
                 &mut catalog,
@@ -2393,7 +2423,8 @@ mod tests {
                 &access
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Progress::Changed,
         );
         let current = current.lock().unwrap();
         assert!(!current.spec.entries.contains_key(uid));

@@ -7,7 +7,7 @@ use crate::{
     api::{CreateState, EntryStatus, TenantDatabaseCatalog},
     finalize::local::all_creates_resolved,
     reconcile::{
-        ObserveError,
+        ObserveError, Progress,
         azure::{
             Access, arm_disk, arm_id, disk, disk_api, disk_identity, disk_name, storage, tags,
         },
@@ -24,19 +24,13 @@ pub(crate) async fn cleanup(
     state: &mut EntryStatus,
     instances: i32,
     access: &Access,
-) -> Result<bool, ObserveError> {
+) -> Result<Progress, ObserveError> {
     let disks = disk_api(management.clone(), &access.storage_namespace);
+    let mut disk_waiting = false;
     for ordinal in 1..=instances {
         let name = disk_name(cluster_name, ordinal);
         let expected_arm = arm_id(&access.group_id, &name);
         let Some(item) = state.storage.iter().find(|s| s.ordinal == ordinal) else {
-            if access.arm()?.request(&expected_arm, false).await?.is_some() {
-                return Err(ObserveError::Foreign);
-            }
-            if record_absence(state, &expected_arm)? {
-                local::save(management.clone(), catalog, uid, state).await?;
-                return Ok(true);
-            }
             continue;
         };
         if item.arm_id.as_deref() != Some(expected_arm.as_str()) {
@@ -59,12 +53,19 @@ pub(crate) async fn cleanup(
             if item.disk.is_none() {
                 storage(state, ordinal).disk = Some(id);
                 local::save(management.clone(), catalog, uid, state).await?;
-                return Ok(true);
+                return Ok(Progress::Changed);
             }
             if previous == Some(CreateState::Issued) {
                 let Some(actual) = access.arm()?.request(&expected_arm, false).await? else {
                     return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome")
-                        .await;
+                        .await
+                        .map(|changed| {
+                            if changed {
+                                Progress::Changed
+                            } else {
+                                Progress::Waiting
+                            }
+                        });
                 };
                 arm_disk(
                     &actual,
@@ -83,7 +84,7 @@ pub(crate) async fn cleanup(
                     CreateState::Observed,
                 )
                 .await?;
-                return Ok(true);
+                return Ok(Progress::Changed);
             }
             verify_current(management.clone(), catalog).await?;
             disks
@@ -98,16 +99,52 @@ pub(crate) async fn cleanup(
                     },
                 )
                 .await?;
-            return Ok(false);
+            disk_waiting = true;
         }
+    }
+    if disk_waiting {
+        return Ok(Progress::Waiting);
+    }
+
+    let mut receipt_changed = false;
+    let mut arm_waiting = false;
+    for ordinal in 1..=instances {
+        let name = disk_name(cluster_name, ordinal);
+        let expected_arm = arm_id(&access.group_id, &name);
+        let Some(item) = state.storage.iter().find(|s| s.ordinal == ordinal) else {
+            if access.arm()?.request(&expected_arm, false).await?.is_some() {
+                return Err(ObserveError::Foreign);
+            }
+            receipt_changed |= record_absence(state, &expected_arm)?;
+            continue;
+        };
+        if item.arm_id.as_deref() != Some(expected_arm.as_str()) {
+            return Err(ObserveError::Foreign);
+        }
+        let previous = local::intent(state, "Disk", &name, ordinal)?;
         if previous == Some(CreateState::Planned) {
-            return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
+            return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome")
+                .await
+                .map(|changed| {
+                    if changed {
+                        Progress::Changed
+                    } else {
+                        Progress::Waiting
+                    }
+                });
         }
         let actual = access.arm()?.request(&expected_arm, false).await?;
         if previous == Some(CreateState::Issued) {
             let Some(actual) = actual else {
                 return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome")
-                    .await;
+                    .await
+                    .map(|changed| {
+                        if changed {
+                            Progress::Changed
+                        } else {
+                            Progress::Waiting
+                        }
+                    });
             };
             arm_disk(
                 &actual,
@@ -129,7 +166,7 @@ pub(crate) async fn cleanup(
                 CreateState::Observed,
             )
             .await?;
-            return Ok(true);
+            return Ok(Progress::Changed);
         }
         if let Some(actual) = actual {
             arm_disk(
@@ -143,15 +180,28 @@ pub(crate) async fn cleanup(
             }
             verify_current(management.clone(), catalog).await?;
             access.arm()?.request(&expected_arm, true).await?;
-            return Ok(false);
+            arm_waiting = true;
+            continue;
         }
-        if record_absence(state, &expected_arm)? {
-            local::save(management.clone(), catalog, uid, state).await?;
-            return Ok(true);
-        }
+        receipt_changed |= record_absence(state, &expected_arm)?;
+    }
+    if receipt_changed {
+        local::save(management.clone(), catalog, uid, state).await?;
+        return Ok(Progress::Changed);
+    }
+    if arm_waiting {
+        return Ok(Progress::Waiting);
     }
     if !all_creates_resolved(state) {
-        return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome").await;
+        return local::blocked(management, catalog, uid, state, "UnknownCreateOutcome")
+            .await
+            .map(|changed| {
+                if changed {
+                    Progress::Changed
+                } else {
+                    Progress::Waiting
+                }
+            });
     }
     let finalization = state.finalization.as_mut().ok_or(ObserveError::Foreign)?;
     if !finalization.pending.is_empty() || finalization.verified_absent.len() != instances as usize
@@ -161,10 +211,10 @@ pub(crate) async fn cleanup(
     finalization.terminal_verified = true;
     if catalog.status.as_ref().and_then(|s| s.entries.get(uid)) != Some(state) {
         local::save(management.clone(), catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
     *catalog = status::remove_spec(management, catalog, uid).await?;
-    Ok(true)
+    Ok(Progress::Changed)
 }
 
 fn record_absence(state: &mut EntryStatus, expected_arm: &str) -> Result<bool, ObserveError> {
