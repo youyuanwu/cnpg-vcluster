@@ -8,7 +8,7 @@ use tenant_admin_shared::{
     query::{
         AzureProviderView, ConditionStatus, LifecycleStageState, OverviewSnapshot,
         ProviderSpecificationView, ProviderStatusView, SectionAvailability, TenantCondition,
-        TenantSnapshot, TenantSummary, TopologyGraph, TopologyNodeProvenance,
+        TenantSnapshot, TenantSummary, TopologyNodeProvenance,
     },
     routes::{API_OVERVIEW_PATH, API_PREFIX},
 };
@@ -20,9 +20,8 @@ use crate::{
     error::{UiError, UiErrorKind},
     explorer::ExplorerModel,
     format::{
-        classification_class, classification_label, condition_status_label, edge_kind_label,
-        format_age, health_class, health_label, node_kind_label, optional_text, provider_label,
-        provider_mode_label,
+        classification_class, classification_label, condition_status_label, format_age,
+        health_class, health_label, optional_text, provider_label, provider_mode_label,
     },
     lifecycle::{
         CreateRecovery, DeleteRecovery, create_recovery, create_request, delete_recovery,
@@ -35,7 +34,6 @@ use crate::{
         tenant_href, tenant_resource_href, tenant_section_href,
     },
     tenant_ui::{lifecycle_stage_label, lifecycle_state_label, resource_target_exists},
-    topology::layout_graph,
 };
 
 #[derive(Clone)]
@@ -1108,36 +1106,6 @@ fn conditions_panel(conditions: Vec<TenantCondition>) -> AnyView {
     .into_any()
 }
 
-fn blockers_panel(blockers: Vec<tenant_admin_shared::query::TenantBlocker>) -> AnyView {
-    view! {
-        <section class="panel" aria-labelledby="blockers-heading">
-            <h2 id="blockers-heading">"Blockers"</h2>
-            {if blockers.is_empty() {
-                view! { <p class="empty">"No active blockers are reported."</p> }.into_any()
-            } else {
-                view! {
-                    <ul class="blocker-list">
-                        {blockers
-                            .into_iter()
-                            .map(|blocker| view! {
-                                <li>
-                                    <strong>{blocker.code}</strong>
-                                    {blocker.condition_type.map(|value| view! {
-                                        <span class="secondary">{format!(" · {value}")}</span>
-                                    })}
-                                    <p>{blocker.message}</p>
-                                </li>
-                            })
-                            .collect_view()}
-                    </ul>
-                }
-                .into_any()
-            }}
-        </section>
-    }
-    .into_any()
-}
-
 fn provider_panel(status: ProviderStatusView) -> AnyView {
     view! {
         <section class="panel" aria-labelledby="provider-heading">
@@ -1338,167 +1306,6 @@ fn azure_provider_view(mut azure: AzureProviderView) -> AnyView {
                 }}
             </div>
         </div>
-    }
-    .into_any()
-}
-
-fn management_resources_panel(
-    mut resources: Vec<tenant_admin_shared::query::ManagementResourceView>,
-) -> AnyView {
-    resources.sort_by(|left, right| {
-        left.role
-            .cmp(&right.role)
-            .then_with(|| identity_key(&left.identity).cmp(&identity_key(&right.identity)))
-    });
-    view! {
-        <section class="panel" aria-labelledby="resources-heading">
-            <div class="panel__header">
-                <div>
-                    <h2 id="resources-heading">"Management resources"</h2>
-                    <p>"Resources associated through exact status and ownership identities."</p>
-                </div>
-            </div>
-            {if resources.is_empty() {
-                view! { <p class="empty">"No linked management resources are reported."</p> }.into_any()
-            } else {
-                view! {
-                    <ul class="resource-list">
-                        {resources
-                            .into_iter()
-                            .map(|resource| {
-                                let class = health_class(resource.health);
-                                let status = health_label(resource.health);
-                                let name = namespaced_name(
-                                    resource.identity.namespace.as_deref(),
-                                    &resource.identity.name,
-                                );
-                                view! {
-                                    <li>
-                                        <div class="resource-heading">
-                                            <strong>{format!("{} · {}", resource.role, resource.identity.kind)}</strong>
-                                            <span class=format!("status status--{class}")>{status}</span>
-                                        </div>
-                                        <p>{name}</p>
-                                        {resource.message.map(|message| view! { <p>{message}</p> })}
-                                    </li>
-                                }
-                            })
-                            .collect_view()}
-                    </ul>
-                }
-                .into_any()
-            }}
-        </section>
-    }
-    .into_any()
-}
-
-fn topology_panel(graph: TopologyGraph) -> AnyView {
-    let layout = layout_graph(&graph);
-    let title_id = format!("topology-{}-title", graph.tenant_name);
-    let description_id = format!("topology-{}-description", graph.tenant_name);
-    let labelled_by = format!("{title_id} {description_id}");
-    let view_box = format!("0 0 {} {}", layout.width, layout.height);
-    let graph_title = format!("{} management topology", graph.tenant_name);
-    let provider = provider_label(graph.provider);
-
-    view! {
-        <section class="panel" aria-labelledby="topology-heading">
-            <div class="panel__header">
-                <div>
-                    <h2 id="topology-heading">"Topology"</h2>
-                    <p>{format!("{provider} management-plane resources; layout is deterministic.")}</p>
-                </div>
-            </div>
-            {if layout.nodes.is_empty() {
-                view! {
-                    <div class="empty">
-                        <h3>"Topology is not available yet"</h3>
-                        <p>"The Tenant can still be inspected while management resources reconcile."</p>
-                    </div>
-                }
-                .into_any()
-            } else {
-                view! {
-                    <div class="topology-scroll">
-                        <svg
-                            class="topology"
-                            viewBox=view_box
-                            role="img"
-                            aria-labelledby=labelled_by
-                            preserveAspectRatio="xMinYMin meet"
-                        >
-                            <title id=title_id>{graph_title}</title>
-                            <desc id=description_id>
-                                "A left-to-right graph of the Tenant and associated management resources. Each node includes its resource type and health."
-                            </desc>
-                            <defs>
-                                <marker
-                                    id="topology-arrow"
-                                    markerWidth="8"
-                                    markerHeight="8"
-                                    refX="7"
-                                    refY="4"
-                                    orient="auto"
-                                    markerUnits="strokeWidth"
-                                >
-                                    <path d="M 0 0 L 8 4 L 0 8 z" fill="#8296a5"/>
-                                </marker>
-                            </defs>
-                            {layout
-                                .edges
-                                .into_iter()
-                                .map(|edge| {
-                                    let label = edge
-                                        .label
-                                        .unwrap_or_else(|| edge_kind_label(edge.kind).to_owned());
-                                    view! {
-                                        <g>
-                                            <path
-                                                class="edge"
-                                                d=edge.path
-                                                marker-end="url(#topology-arrow)"
-                                            />
-                                            <text class="edge-label" x=edge.label_x y=edge.label_y>{label}</text>
-                                        </g>
-                                    }
-                                })
-                                .collect_view()}
-                            {layout
-                                .nodes
-                                .into_iter()
-                                .map(|node| {
-                                    let class = health_class(node.health);
-                                    let kind = node_kind_label(node.kind);
-                                    let health = health_label(node.health);
-                                    let accessible = format!("{}; {kind}; status {health}", node.label);
-                                    view! {
-                                        <g
-                                            class=format!("node node--{class}")
-                                            role="group"
-                                            aria-label=accessible
-                                            tabindex="0"
-                                            transform=format!("translate({}, {})", node.x, node.y)
-                                        >
-                                            <rect
-                                                width=node.width
-                                                height=node.height
-                                                rx="9"
-                                                ry="9"
-                                            />
-                                            <text class="node-label" x="14" y="29">{node.label}</text>
-                                            <text class="node-meta" x="14" y="53">{kind}</text>
-                                            <text class="node-meta" x="14" y="72">{health}</text>
-                                        </g>
-                                    }
-                                })
-                                .collect_view()}
-                        </svg>
-                    </div>
-                }
-                .into_any()
-            }}
-        </section>
     }
     .into_any()
 }
