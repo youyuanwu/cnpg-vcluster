@@ -9,7 +9,7 @@ use kube::{
 };
 use serde_json::{Value, json};
 
-use super::{ObserveError, verify_current};
+use super::{ObserveError, Progress, next_action, verify_current};
 use crate::{
     api::{
         CreateIntent, CreateState, DatabasePhase, EntryStatus, FinalizationStatus,
@@ -25,6 +25,7 @@ use crate::{
 
 const SIZE: i64 = 1024 * 1024 * 1024;
 const RETRY: Duration = Duration::from_secs(10);
+const RESYNC: Duration = Duration::from_secs(60);
 const CNPG_CLUSTER_VERSION: &str = "postgresql.cnpg.io/v1";
 
 pub(super) fn owned_by_cluster(
@@ -935,6 +936,7 @@ pub async fn reconcile(
     observed: &TenantDatabaseCatalog,
 ) -> Result<(Action, TenantDatabaseCatalog), ObserveError> {
     let mut catalog = verify_current(management.clone(), observed).await?;
+    let mut waiting = false;
     if let Some(uid) = catalog
         .status
         .as_ref()
@@ -1011,10 +1013,18 @@ pub async fn reconcile(
                 &access,
             )
             .await
+            .map(|changed| {
+                if changed {
+                    Progress::Changed
+                } else {
+                    Progress::Stable
+                }
+            })
         };
         match result {
-            Ok(true) => return Ok((Action::requeue(RETRY), catalog)),
-            Ok(false) => (),
+            Ok(Progress::Changed) => return Ok((Action::requeue(RETRY), catalog)),
+            Ok(Progress::Waiting) => waiting = true,
+            Ok(Progress::Stable) => (),
             Err(
                 ObserveError::Foreign
                 | ObserveError::Path(
@@ -1045,7 +1055,7 @@ pub async fn reconcile(
             Err(error) => return Err(error),
         }
     }
-    Ok((Action::requeue(Duration::from_secs(60)), catalog))
+    Ok((next_action(waiting, RETRY, RESYNC), catalog))
 }
 
 #[expect(
@@ -1316,10 +1326,10 @@ pub(super) async fn delete_exact(
     api: Api<DynamicObject>,
     desired: &DynamicObject,
     bound: Option<&ResourceIdentity>,
-) -> Result<bool, ObserveError> {
+) -> Result<Progress, ObserveError> {
     let name = desired.name_any();
     let Some(live) = api.get_opt(&name).await? else {
-        return Ok(true);
+        return Ok(Progress::Stable);
     };
     let Some(bound) = bound else {
         return Err(ObserveError::Foreign);
@@ -1337,7 +1347,7 @@ pub(super) async fn delete_exact(
         ..Default::default()
     };
     api.delete(&name, &params).await?;
-    Ok(false)
+    Ok(Progress::Waiting)
 }
 
 #[expect(
@@ -1417,7 +1427,7 @@ async fn finalize(
     state: &mut EntryStatus,
     instances: i32,
     access: &LocalAccess,
-) -> Result<bool, ObserveError> {
+) -> Result<Progress, ObserveError> {
     set_health(
         state,
         false,
@@ -1429,7 +1439,7 @@ async fn finalize(
     state.observed_generation = catalog.metadata.generation.ok_or(ObserveError::Identity)?;
     if catalog.status.as_ref().and_then(|s| s.entries.get(uid)) != Some(state) {
         save(management.clone(), catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
     let catalog_uid = catalog
         .metadata
@@ -1465,7 +1475,7 @@ async fn finalize(
                 CreateState::Observed,
             )
             .await?;
-            return Ok(true);
+            return Ok(Progress::Changed);
         }
     }
     let cluster_api = api(
@@ -1490,9 +1500,9 @@ async fn finalize(
     )
     .await?
     {
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
-    if !delete_exact(
+    if delete_exact(
         management.clone(),
         catalog,
         uid,
@@ -1501,9 +1511,11 @@ async fn finalize(
         state.cnpg_cluster.as_ref(),
     )
     .await?
+        == Progress::Waiting
     {
-        return Ok(false);
+        return Ok(Progress::Waiting);
     }
+    let mut dependent_waiting = false;
     let secret_name = format!("{cluster}-superuser");
     if let Some(secret) = core(access.client.clone(), Some(namespace), "Secret", "secrets")
         .get_opt(&secret_name)
@@ -1527,7 +1539,7 @@ async fn finalize(
                 uid: secret.metadata.uid.clone().ok_or(ObserveError::Foreign)?,
             });
             save(management.clone(), catalog, uid, state).await?;
-            return Ok(true);
+            return Ok(Progress::Changed);
         }
         let params = DeleteParams {
             preconditions: Some(Preconditions {
@@ -1540,7 +1552,7 @@ async fn finalize(
         core(access.client.clone(), Some(namespace), "Secret", "secrets")
             .delete(&secret_name, &params)
             .await?;
-        return Ok(false);
+        dependent_waiting = true;
     }
     for ordinal in 1..=instances {
         let desired_claim = cnpg::claim(catalog, uid, namespace, cluster, ordinal)?;
@@ -1562,9 +1574,9 @@ async fn finalize(
         )
         .await?
         {
-            return Ok(true);
+            return Ok(Progress::Changed);
         }
-        if !delete_exact(
+        if delete_exact(
             management.clone(),
             catalog,
             uid,
@@ -1577,9 +1589,16 @@ async fn finalize(
                 .and_then(|s| s.pvc.as_ref()),
         )
         .await?
+            == Progress::Waiting
         {
-            return Ok(false);
+            dependent_waiting = true;
         }
+    }
+    if dependent_waiting {
+        return Ok(Progress::Waiting);
+    }
+    let mut volume_waiting = false;
+    for ordinal in 1..=instances {
         let path = access
             .root
             .join("volumes/cnpg")
@@ -1613,9 +1632,9 @@ async fn finalize(
         )
         .await?
         {
-            return Ok(true);
+            return Ok(Progress::Changed);
         }
-        if !delete_exact(
+        if delete_exact(
             management.clone(),
             catalog,
             uid,
@@ -1628,9 +1647,13 @@ async fn finalize(
                 .and_then(|s| s.pv.as_ref()),
         )
         .await?
+            == Progress::Waiting
         {
-            return Ok(false);
+            volume_waiting = true;
         }
+    }
+    if volume_waiting {
+        return Ok(Progress::Waiting);
     }
     let namespaces = core(access.client.clone(), None, "Namespace", "namespaces");
     let desired_namespace = object("Namespace", namespace, None, identity(catalog, uid)?, None)?;
@@ -1646,9 +1669,9 @@ async fn finalize(
     )
     .await?
     {
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
-    if !delete_exact(
+    if delete_exact(
         management.clone(),
         catalog,
         uid,
@@ -1657,8 +1680,9 @@ async fn finalize(
         state.namespace.as_ref(),
     )
     .await?
+        == Progress::Waiting
     {
-        return Ok(false);
+        return Ok(Progress::Waiting);
     }
     let catalog_uid = catalog
         .metadata
@@ -1684,14 +1708,13 @@ async fn finalize(
             }
             verify_current(management.clone(), catalog).await?;
             local_path::remove(&access.root, catalog_uid, uid, ordinal)?;
-            return Ok(false);
         }
     }
     if !local_path::entry_absent(&access.root, catalog_uid, uid)? {
         return Err(ObserveError::Foreign);
     }
     if !all_creates_resolved(state) {
-        return Ok(false);
+        return Ok(Progress::Waiting);
     }
     state.finalization = Some(FinalizationStatus {
         terminal_verified: true,
@@ -1707,10 +1730,10 @@ async fn finalize(
     });
     if catalog.status.as_ref().and_then(|s| s.entries.get(uid)) != Some(state) {
         save(management.clone(), catalog, uid, state).await?;
-        return Ok(true);
+        return Ok(Progress::Changed);
     }
     *catalog = status::remove_spec(management, catalog, uid).await?;
-    Ok(true)
+    Ok(Progress::Changed)
 }
 
 #[cfg(test)]
@@ -2791,8 +2814,8 @@ mod api_scenarios {
             name: namespace.clone(),
             uid: "created-uid".into(),
         };
-        assert!(
-            !delete_exact(
+        assert_eq!(
+            delete_exact(
                 client.clone(),
                 &catalog,
                 ENTRY,
@@ -2801,10 +2824,11 @@ mod api_scenarios {
                 Some(&bound)
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Progress::Waiting,
         );
         assert_eq!(mock.lock().unwrap().deletes, 1);
-        assert!(
+        assert_eq!(
             delete_exact(
                 client.clone(),
                 &catalog,
@@ -2814,7 +2838,8 @@ mod api_scenarios {
                 Some(&bound)
             )
             .await
-            .unwrap()
+            .unwrap(),
+            Progress::Stable,
         );
     }
 

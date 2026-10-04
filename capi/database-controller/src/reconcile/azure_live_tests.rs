@@ -328,13 +328,6 @@ fn management_client(
                             .expect("all workload and disk resources bind an entry");
                         let kind = live.types.as_ref().unwrap().kind.clone();
                         let (namespace, cluster) = ownership::names(CATALOG, owner).unwrap();
-                        let secret =
-                            format!("/api/v1/namespaces/{namespace}/secrets/{cluster}-superuser");
-                        let ordinal = live
-                            .name_any()
-                            .rsplit('-')
-                            .next()
-                            .and_then(|last| last.parse::<i32>().ok());
                         match kind.as_str() {
                             "Cluster" => {}
                             "Secret" => require_absence(
@@ -344,24 +337,23 @@ fn management_client(
                                 ),
                             ),
                             "PersistentVolumeClaim" => {
-                                require_absence(&mock, &secret);
-                                if let Some(prior) = ordinal.filter(|n| *n > 1) {
+                                require_absence(
+                                    &mock,
+                                    &format!(
+                                        "/apis/postgresql.cnpg.io/v1/namespaces/{namespace}/clusters/{cluster}"
+                                    ),
+                                );
+                            }
+                            "PersistentVolume" => {
+                                for ordinal in 1..=3 {
                                     require_absence(
                                         &mock,
                                         &format!(
-                                            "/api/v1/persistentvolumes/pv-{cluster}-{}",
-                                            prior - 1
+                                            "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{cluster}-{ordinal}"
                                         ),
                                     );
                                 }
                             }
-                            "PersistentVolume" => require_absence(
-                                &mock,
-                                &format!(
-                                    "/api/v1/namespaces/{namespace}/persistentvolumeclaims/{cluster}-{}",
-                                    ordinal.unwrap()
-                                ),
-                            ),
                             "Namespace" => {
                                 for ordinal in 1..=3 {
                                     require_absence(
@@ -374,19 +366,6 @@ fn management_client(
                             }
                             "Disk" => {
                                 require_absence(&mock, &format!("/api/v1/namespaces/{namespace}"));
-                                if let Some(prior) = ordinal.filter(|n| *n > 1) {
-                                    require_absence(
-                                        &mock,
-                                        &format!(
-                                            "/apis/compute.azure.com/v1api20240302/namespaces/tenant-db-storage-tenant-a/disks/{cluster}-{}",
-                                            prior - 1
-                                        ),
-                                    );
-                                    assert!(mock.events.contains(&format!(
-                                        "ARM_GET_NOT_FOUND:{}",
-                                        arm_id(GROUP, &format!("{cluster}-{}", prior - 1))
-                                    )));
-                                }
                             }
                             _ => panic!("unexpected Kubernetes deletion kind {kind}"),
                         }
@@ -554,7 +533,7 @@ fn management_client(
 }
 
 #[tokio::test]
-async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_disk() {
+async fn three_three_instance_entries_batch_with_barrier_order_and_terminal_arm_proof() {
     let (initial, mut access, cloud) = initial_state();
     let cloud = Arc::new(Mutex::new(cloud));
     let mock = Arc::new(Mutex::new(initial));
@@ -641,7 +620,9 @@ async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_di
     let mut catalog = mock.lock().unwrap().catalog.clone();
     for (index, uid) in ENTRIES.iter().enumerate() {
         let (namespace, cluster_name) = ownership::names(CATALOG, uid).unwrap();
+        let mut passes = 0;
         for _ in 0..80 {
+            passes += 1;
             let mut state = catalog.status.as_ref().unwrap().entries[*uid].clone();
             finalize(
                 client.clone(),
@@ -659,6 +640,10 @@ async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_di
                 break;
             }
         }
+        assert!(
+            passes <= 14,
+            "batched deletion took {passes} reconcile passes"
+        );
         assert!(!catalog.spec.entries.contains_key(*uid));
         assert_eq!(catalog.spec.entries.len(), 2 - index);
         assert_eq!(cloud.lock().unwrap().len(), 6 - index * 3);
@@ -676,8 +661,12 @@ async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_di
         let namespace_absent = position(&format!("KUBE_NOT_FOUND:/api/v1/namespaces/{namespace}"));
         let removed = position(&format!("CATALOG_REMOVE:{uid}"));
         assert!(cluster < cluster_absent && cluster_absent < secret && secret < secret_absent);
-        let mut previous_pv_absent = secret_absent;
-        let mut previous_arm_absent = namespace_absent;
+        let mut dependent_absent = vec![secret_absent];
+        let mut pv_events = Vec::new();
+        let mut pv_absent_events = Vec::new();
+        let mut aso_absent_events = Vec::new();
+        let mut arm_events = Vec::new();
+        let mut arm_absent_events = Vec::new();
         for ordinal in 1..=3 {
             let pvc = position(&format!("PersistentVolumeClaim:{cluster_name}-{ordinal}"));
             let pvc_absent = position(&format!(
@@ -687,11 +676,10 @@ async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_di
             let pv_absent = position(&format!(
                 "KUBE_NOT_FOUND:/api/v1/persistentvolumes/pv-{cluster_name}-{ordinal}"
             ));
-            assert!(
-                previous_pv_absent < pvc && pvc < pvc_absent && pvc_absent < pv && pv < pv_absent
-            );
-            assert!(pv_absent < namespace_event);
-            previous_pv_absent = pv_absent;
+            assert!(cluster_absent < pvc && pvc < pvc_absent && pv < pv_absent);
+            dependent_absent.push(pvc_absent);
+            pv_events.push(pv);
+            pv_absent_events.push(pv_absent);
             let name = disk_name(&cluster_name, ordinal);
             let disk_path = format!(
                 "/apis/compute.azure.com/v1api20240302/namespaces/tenant-db-storage-tenant-a/disks/{name}"
@@ -703,16 +691,21 @@ async fn three_three_instance_entries_delete_workloads_then_aso_then_each_arm_di
             let arm = position(&format!("ARM:{id}"));
             let arm_absent = position(&format!("ARM_GET_NOT_FOUND:{id}"));
             assert!(namespace_absent < terminal_create && terminal_create < aso);
-            assert!(
-                previous_arm_absent < aso
-                    && aso < aso_absent
-                    && aso_absent < arm
-                    && arm < arm_absent
-                    && arm_absent < removed
-            );
-            previous_arm_absent = arm_absent;
+            assert!(aso < aso_absent && arm < arm_absent && arm_absent < removed);
+            aso_absent_events.push(aso_absent);
+            arm_events.push(arm);
+            arm_absent_events.push(arm_absent);
         }
-        assert!(previous_pv_absent < namespace_event && namespace_event < namespace_absent);
+        let dependents_absent = *dependent_absent.iter().max().unwrap();
+        let first_pv = *pv_events.iter().min().unwrap();
+        let volumes_absent = *pv_absent_events.iter().max().unwrap();
+        let disks_absent = *aso_absent_events.iter().max().unwrap();
+        let first_arm = *arm_events.iter().min().unwrap();
+        let arms_absent = *arm_absent_events.iter().max().unwrap();
+        assert!(dependents_absent < first_pv);
+        assert!(volumes_absent < namespace_event && namespace_event < namespace_absent);
+        assert!(disks_absent < first_arm);
+        assert!(arms_absent < removed);
     }
     assert_eq!(mock.lock().unwrap().spec_updates, 3);
     assert_eq!(mock.lock().unwrap().observed_cloud_creates, 9);
