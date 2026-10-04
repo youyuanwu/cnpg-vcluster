@@ -449,7 +449,7 @@ def check_repository_boundaries() -> None:
     e2e = jobs.split("  e2e:", 1)[1].split("  high-capacity:", 1)[0]
     check(
         re.search(r"(?m)^    needs: fast-checks$", e2e) is not None,
-        "PR E2E must depend exactly on fast-checks",
+        "standard E2E must depend exactly on fast-checks",
     )
     for token in (
         "actions/upload-artifact@v6",
@@ -478,7 +478,7 @@ def check_repository_boundaries() -> None:
         "CAPI_PREBUILT_DATABASE_CONTROLLER_BINARY",
         ".tools/artifacts/${{ github.sha }}",
     ):
-        check(token in e2e, f"PR E2E artifact wiring is missing {token}")
+        check(token in e2e, f"standard E2E artifact wiring is missing {token}")
     high_capacity = workflow.split("  high-capacity:", 1)[1].split(
         "  capi-tests:", 1
     )[0]

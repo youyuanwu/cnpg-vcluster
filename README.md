@@ -627,7 +627,7 @@ job. Fast checks explicitly repeat the offline Azure foundation packaging,
 operator command, proof, ownership, and gate contracts. They also verify
 database-controller generation, lint, tests, metrics, static build and image,
 admin generation/lint/tests/metrics, and offline reproducible server/Wasm
-packaging. PR E2E consumes the exact uploaded controller,
+packaging. PR and `main` push E2E consume the exact uploaded controller,
 database-controller and admin artifacts and runs `just test-e2e-offline`;
 scheduled/manual high-capacity CI rebuilds from the complete cache.
 The end-to-end and high-capacity jobs restore the complete verified generation
@@ -638,15 +638,16 @@ never trusted solely because the Actions cache key matched: `just cache` still
 validates the active inventory and local verification stamp, then reacquires
 online if the restored generation is missing or stale.
 The final **CAPI tests** check requires fast checks and offline E2E on PRs
-(including fork PRs), fast checks plus targeted/offline high-capacity and
-high-capacity jobs on manual dispatch and the weekly schedule, and fast checks
-alone on `main` pushes. Azure credentials are not available to GitHub Actions;
+(including fork PRs) and `main` pushes, plus targeted/offline high-capacity
+jobs on manual dispatch and the weekly schedule. Azure credentials are not
+available to GitHub Actions;
 destructive Azure validation remains operator-run outside CI. Keep **CAPI
 tests** as the required branch-protection check: its always-running gate rejects
 failed, cancelled, or unexpectedly skipped applicable jobs.
-Pushes to `main` run fast checks only, avoiding an immediate repeat of the PR's
-destructive E2E. Concurrency cancels superseded runs of the same event/ref,
-without a `main` push cancelling a scheduled or manually dispatched full gate.
+Pushes to `main` repeat the destructive E2E after fast checks so the merged
+state is validated independently of the pull request run. Concurrency cancels
+superseded runs of the same event/ref, without a `main` push cancelling a
+scheduled or manually dispatched full gate.
 
 CI installs stable Rust/Cargo with
 `actions-rust-lang/setup-rust-toolchain`, including its integrated
@@ -676,10 +677,10 @@ just admin-metrics
 just admin-package-check
 ```
 
-PRs require fast checks and one bounded online clean-to-clean E2E. Scheduled
-and manually dispatched high-capacity jobs run targeted live suites and
-enforced-offline E2E; pushes to `main` run fast checks. The **CAPI tests**
-gate requires the checks applicable to each event.
+PRs and pushes to `main` require fast checks and one bounded online
+clean-to-clean E2E. Scheduled and manually dispatched high-capacity jobs run
+targeted live suites and enforced-offline E2E. The **CAPI tests** gate requires
+the checks applicable to each event.
 
 ## Lifecycle timing
 

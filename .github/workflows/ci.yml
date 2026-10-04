@@ -121,7 +121,7 @@ jobs:
   e2e:
     name: CAPI end-to-end
     needs: fast-checks
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -271,11 +271,8 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
         run: |
           test "$FAST_RESULT" = success
-          if [ "$EVENT_NAME" = pull_request ]; then
+          if [ "$EVENT_NAME" = pull_request ] || [ "$EVENT_NAME" = push ]; then
             test "$E2E_RESULT" = success
-            test "$HIGH_CAPACITY_RESULT" = skipped
-          elif [ "$EVENT_NAME" = push ]; then
-            test "$E2E_RESULT" = skipped
             test "$HIGH_CAPACITY_RESULT" = skipped
           else
             test "$E2E_RESULT" = skipped
