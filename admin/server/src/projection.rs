@@ -357,12 +357,17 @@ fn lifecycle(
                                     .addon_job_uid
                                     .as_deref()
                                     .is_some_and(|value| !value.is_empty())
-                        }) && !status.addon_components.is_empty()
-                            && status
-                                .addon_components
-                                .iter()
-                                .all(|(name, uid)| !name.is_empty() && !uid.is_empty())
-                            && !validated_azure_resources(status).is_empty()
+                        }) && ["cloudController", "cloudNode", "calicoNode", "cnpg"]
+                            .iter()
+                            .all(|component| {
+                                status
+                                    .addon_components
+                                    .get(*component)
+                                    .is_some_and(|uid| !uid.is_empty())
+                            })
+                            && !status.provider_resources.is_empty()
+                            && validated_azure_resources(status).len()
+                                == status.provider_resources.len()
                     }),
                 terminal,
             ),
@@ -2793,6 +2798,30 @@ mod tests {
         let management = status.management.as_mut().unwrap();
         management.status_probe_deployment_uid = Some("probe-uid".into());
         management.addon_job_uid = Some("addon-job-uid".into());
+        let stages = lifecycle(&tenant, &[], None, true);
+        assert_eq!(
+            stages
+                .iter()
+                .find(|stage| stage.stage == LifecycleStage::AddOns)
+                .unwrap()
+                .state,
+            LifecycleStageState::Unknown
+        );
+        let Some(TenantProviderStatus::Azure(status)) = tenant
+            .status
+            .as_mut()
+            .and_then(|status| status.provider.as_mut())
+        else {
+            panic!("Azure status");
+        };
+        status.addon_components.extend([
+            ("cloudNode".into(), "cloud-node-uid".into()),
+            ("calicoNode".into(), "calico-node-uid".into()),
+            ("cnpg".into(), "cnpg-uid".into()),
+        ]);
+        status
+            .provider_resources
+            .retain(|resource| resource.uid != "foreign-machine-uid");
         let stages = lifecycle(&tenant, &[], None, true);
         assert_eq!(
             stages

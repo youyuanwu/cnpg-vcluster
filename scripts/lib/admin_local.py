@@ -717,8 +717,9 @@ def _validate_summary(value: object) -> str:
             or any(
                 condition.get(key) is not None
                 and not isinstance(condition.get(key), str)
-                for key in ("reason", "message", "lastTransitionTime")
+                for key in ("reason", "message")
             )
+            or not _is_optional_timestamp(condition.get("lastTransitionTime"))
             or (
                 condition.get("observedGeneration") is not None
                 and not _is_integer(condition.get("observedGeneration"))
@@ -736,6 +737,10 @@ def _is_optional_string(value: object) -> bool:
     return value is None or isinstance(value, str)
 
 
+def _is_optional_timestamp(value: object) -> bool:
+    return value is None or _valid_timestamp(value)
+
+
 def _validate_database_observation(
     value: object,
     *,
@@ -748,8 +753,7 @@ def _validate_database_observation(
         if (
             set(observation)
             != {"state", "observedAt", "freshness", "cluster"}
-            or not isinstance(observation.get("observedAt"), str)
-            or not observation["observedAt"]
+            or not _valid_timestamp(observation.get("observedAt"))
             or observation.get("freshness") != "live"
             or provider != "local"
         ):
@@ -830,15 +834,14 @@ def _validate_database_observation(
             )
             or not all(
                 _is_optional_string(cluster.get(key))
+                for key in ("phase", "reason", "currentPrimary", "targetPrimary", "image")
+            )
+            or not all(
+                _is_optional_timestamp(cluster.get(key))
                 for key in (
-                    "phase",
-                    "reason",
-                    "currentPrimary",
-                    "targetPrimary",
                     "currentPrimarySince",
                     "targetPrimaryRequestedAt",
                     "currentPrimaryFailingSince",
-                    "image",
                 )
             )
             or (
@@ -896,7 +899,7 @@ def _validate_database_observation(
                     condition.get("observedGeneration") is not None
                     and not _is_integer(condition.get("observedGeneration"))
                 )
-                or not _is_optional_string(condition.get("lastTransitionTime"))
+                or not _is_optional_timestamp(condition.get("lastTransitionTime"))
             ):
                 raise RuntimeError("Tenant Admin database condition response is invalid")
         return state, len(instances)
@@ -911,10 +914,8 @@ def _validate_database_observation(
                 "message",
                 "retryable",
             }
-            or provider != "local"
             or require_available
-            or not isinstance(observation.get("observedAt"), str)
-            or not observation["observedAt"]
+            or not _valid_timestamp(observation.get("observedAt"))
             or observation.get("freshness") != "live"
             or observation.get("reason")
             not in ADMIN_DATABASE_UNAVAILABLE_REASONS
@@ -929,8 +930,7 @@ def _validate_database_observation(
             set(observation)
             != {"state", "observedAt", "freshness", "reason"}
             or provider != "azure"
-            or not isinstance(observation.get("observedAt"), str)
-            or not observation["observedAt"]
+            or not _valid_timestamp(observation.get("observedAt"))
             or observation.get("freshness") != "live"
             or observation.get("reason") != "provider-unsupported"
         ):
@@ -1004,10 +1004,10 @@ def _valid_timestamp(value: object) -> bool:
     if not isinstance(value, str) or not value:
         return False
     try:
-        datetime.fromisoformat(value.replace("Z", "+00:00"))
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return False
-    return True
+    return "T" in value and parsed.tzinfo is not None
 
 
 def _validate_section(value: object, name: str) -> None:
@@ -1230,6 +1230,11 @@ def verify_admin_api(
         _validate_lifecycle(detail.get("lifecycle"))
         _validate_worker_capacity(detail.get("workerCapacity"))
         summary = _required_mapping(detail.get("summary"), "Tenant detail summary")
+        _validate_database_observation(
+            snapshot.get("database"),
+            provider=summary["provider"],
+            require_available=False,
+        )
         detail_uid = _required_string(detail.get("uid"), "Tenant detail UID")
         if (
             identity

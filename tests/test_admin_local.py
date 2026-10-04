@@ -1203,6 +1203,14 @@ class AdminLocalTests(unittest.TestCase):
         def mutate_edge(body):
             body["data"]["topology"]["edges"][0]["target"] = "missing-node"
 
+        def mutate_database_timestamp(body):
+            body["data"]["database"]["observedAt"] = "2026-01-01"
+
+        def mutate_nested_timestamp(body):
+            body["data"]["database"]["cluster"]["currentPrimarySince"] = (
+                "2026-01-01T00:00:00"
+            )
+
         for name, mutator in (
             ("timestamp", mutate_timestamp),
             ("section", mutate_section),
@@ -1210,6 +1218,8 @@ class AdminLocalTests(unittest.TestCase):
             ("capacity", mutate_capacity),
             ("blocker", mutate_blocker),
             ("edge", mutate_edge),
+            ("database-timestamp", mutate_database_timestamp),
+            ("nested-timestamp", mutate_nested_timestamp),
         ):
             with self.subTest(name=name):
                 client = FakeClient(tenant_names=("tenant-a",))
