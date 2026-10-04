@@ -943,6 +943,44 @@ def acquire_admin_build_cache(root: Path, config: dict[str, str]) -> None:
     print("prepared verified Trunk and wasm-bindgen admin build tools")
 
 
+def prune_cache_generations(root: Path, active: Path) -> int:
+    generations = _generation_root(root)
+    ensure_private_dir(generations)
+    if active.parent != generations:
+        raise IntegrityError(f"active cache generation is outside {generations}: {active}")
+    removed = 0
+    for candidate in generations.iterdir():
+        if candidate == active:
+            continue
+        details = candidate.lstat()
+        if (
+            not stat.S_ISDIR(details.st_mode)
+            or stat.S_ISLNK(details.st_mode)
+            or details.st_uid != os.getuid()
+            or details.st_mode & 0o077
+        ):
+            raise IntegrityError(
+                f"inactive cache generation is not an owner-only directory: {candidate}"
+            )
+        shutil.rmtree(candidate)
+        removed += 1
+    return removed
+
+
+def ensure_cache(root: Path, config: dict[str, str]) -> None:
+    try:
+        verified = verify_cache(root, config)
+    except (CommandError, IntegrityError) as exc:
+        print(f"cache refresh required: {exc}", file=sys.stderr)
+        acquire_cache(root, config)
+        return
+    materialize_inputs(root, config, verified=verified)
+    removed = prune_cache_generations(root, verified.generation)
+    print(f"reused verified cache generation {verified.generation.name}")
+    if removed:
+        print(f"pruned {removed} inactive cache generations")
+
+
 def acquire_cache(root: Path, config: dict[str, str]) -> None:
     timeout = parse_duration(config["DOWNLOAD_TIMEOUT"]) * 4
     generations = _generation_root(root)
@@ -997,10 +1035,13 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
             verified = verify_cache(root, config, force=True)
             materialize_inputs(root, config, verified=verified)
             shutil.rmtree(generation)
+            removed = prune_cache_generations(root, verified.generation)
             print(
                 f"reused verified cache generation {previous.name} "
                 f"with {len(entries)} images"
             )
+            if removed:
+                print(f"pruned {removed} inactive cache generations")
             return
         write_private_file(
             _active_path(root),
@@ -1014,6 +1055,7 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
         published = True
         verified = verify_cache(root, config, force=True)
         materialize_inputs(root, config, verified=verified)
+        removed = prune_cache_generations(root, verified.generation)
     except BaseException:
         if not published:
             shutil.rmtree(generation, ignore_errors=True)
@@ -1022,3 +1064,5 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
         f"prepared verified cache generation {generation_id} "
         f"with {len(entries)} images"
     )
+    if removed:
+        print(f"pruned {removed} inactive cache generations")

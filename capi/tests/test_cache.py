@@ -23,7 +23,9 @@ from scripts.cache import (
     _verify_archive_metadata,
     restore_host_image,
     acquire_cache,
+    ensure_cache,
     materialize_inputs,
+    prune_cache_generations,
     verify_cache,
 )
 from scripts.lib.files import IntegrityError
@@ -111,7 +113,7 @@ def write_archive(
 
 
 class CacheTests(unittest.TestCase):
-    def test_lab_cache_default_and_admin_scope_dispatch_exactly(self) -> None:
+    def test_lab_cache_and_refresh_dispatch_exactly(self) -> None:
         from scripts import lab
 
         original_umask = os.umask(0)
@@ -120,20 +122,106 @@ class CacheTests(unittest.TestCase):
             with (
                 patch.object(lab, "load_configuration", return_value={}),
                 patch.object(lab, "tools_lock", return_value=nullcontext()),
-                patch.object(lab, "acquire_cache") as full,
+                patch.object(lab, "ensure_cache") as ensure,
+                patch.object(lab, "acquire_cache") as refresh,
                 patch.object(lab, "acquire_admin_build_cache") as admin,
             ):
                 self.assertEqual(0, lab.main(["cache", ""]))
-                full.assert_called_once_with(lab.ROOT, {})
+                ensure.assert_called_once_with(lab.ROOT, {})
+                refresh.assert_not_called()
                 admin.assert_not_called()
-                full.reset_mock()
+                ensure.reset_mock()
                 self.assertEqual(0, lab.main(["cache", "admin-build"]))
                 admin.assert_called_once_with(lab.ROOT, {})
-                full.assert_not_called()
+                ensure.assert_not_called()
+                refresh.assert_not_called()
                 with self.assertRaisesRegex(RuntimeError, "optional admin-build"):
                     lab.main(["cache", "unexpected"])
+                self.assertEqual(0, lab.main(["cache-refresh"]))
+                refresh.assert_called_once_with(lab.ROOT, {})
+                with self.assertRaisesRegex(RuntimeError, "does not accept a scope"):
+                    lab.main(["cache-refresh", "admin-build"])
         finally:
             os.umask(original_umask)
+
+    def test_ensure_cache_reuses_verified_generation_without_acquisition(self) -> None:
+        verified = VerifiedCache(Path("/cache/generation"), {}, "state")
+        with (
+            patch("scripts.cache.verify_cache", return_value=verified) as verify,
+            patch("scripts.cache.materialize_inputs") as materialize,
+            patch("scripts.cache.prune_cache_generations", return_value=2) as prune,
+            patch("scripts.cache.acquire_cache") as acquire,
+        ):
+            ensure_cache(Path("/repo/capi"), {"key": "value"})
+        verify.assert_called_once_with(Path("/repo/capi"), {"key": "value"})
+        materialize.assert_called_once_with(
+            Path("/repo/capi"),
+            {"key": "value"},
+            verified=verified,
+        )
+        prune.assert_called_once_with(Path("/repo/capi"), verified.generation)
+        acquire.assert_not_called()
+
+    def test_ensure_cache_refreshes_missing_or_stale_generation(self) -> None:
+        with (
+            patch(
+                "scripts.cache.verify_cache",
+                side_effect=IntegrityError("stale cache"),
+            ),
+            patch("scripts.cache.materialize_inputs") as materialize,
+            patch("scripts.cache.acquire_cache") as acquire,
+        ):
+            ensure_cache(Path("/repo/capi"), {"key": "value"})
+        materialize.assert_not_called()
+        acquire.assert_called_once_with(Path("/repo/capi"), {"key": "value"})
+
+    def test_prune_cache_generations_removes_only_inactive_directories(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            generations = root / ".tools/cache/generations"
+            active = generations / "active"
+            inactive = generations / "inactive"
+            for directory in (
+                root / ".tools",
+                root / ".tools/cache",
+                generations,
+                active,
+                inactive,
+            ):
+                directory.mkdir(exist_ok=True, mode=0o700)
+                directory.chmod(0o700)
+            (inactive / "data").write_text("old", encoding="utf-8")
+            (inactive / "data").chmod(0o600)
+
+            self.assertEqual(1, prune_cache_generations(root, active))
+
+            self.assertTrue(active.is_dir())
+            self.assertFalse(inactive.exists())
+
+    def test_prune_cache_generations_rejects_symlink(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            generations = root / ".tools/cache/generations"
+            active = generations / "active"
+            for directory in (
+                root / ".tools",
+                root / ".tools/cache",
+                generations,
+                active,
+            ):
+                directory.mkdir(exist_ok=True, mode=0o700)
+                directory.chmod(0o700)
+            target = root / "target"
+            target.mkdir()
+            (generations / "foreign").symlink_to(target, target_is_directory=True)
+
+            with self.assertRaisesRegex(
+                IntegrityError,
+                "inactive cache generation is not an owner-only directory",
+            ):
+                prune_cache_generations(root, active)
+
+            self.assertTrue(target.is_dir())
 
     def test_admin_build_cache_acquires_only_pinned_wasm_tools(self) -> None:
         from scripts.cache import acquire_admin_build_cache
@@ -552,7 +640,12 @@ class CacheTests(unittest.TestCase):
                 self.assertEqual(verify.call_args_list[-1].args[2].name, first)
                 archive_content[0] = b"changed"
                 acquire_cache(root, config)
-                self.assertNotEqual(json.loads(active.read_text())["generation"], first)
+                current = json.loads(active.read_text())["generation"]
+                self.assertNotEqual(current, first)
+                self.assertEqual(
+                    [path.name for path in (root / ".tools/cache/generations").iterdir()],
+                    [current],
+                )
 
     def test_active_pointer_publication_failure_keeps_old_generation(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

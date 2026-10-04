@@ -70,6 +70,15 @@ class CIWorkflowTests(unittest.TestCase):
             fast.index("just admin-package-check"),
             fast.index("actions/upload-artifact@v6"),
         )
+        for live in (e2e, high):
+            self.assertIn("uses: actions/cache@v6", live)
+            self.assertIn("capi/.tools/cache", live)
+            self.assertNotIn("~/.cargo", live)
+            self.assertIn("key: capi-full-v1-", live)
+            self.assertLess(
+                live.index("uses: actions/cache@v6"),
+                live.index("run: just cache"),
+            )
         setup = (
             "just cache", "just tools", "just prepare-host",
             "just create-management",
@@ -142,7 +151,7 @@ class CIWorkflowTests(unittest.TestCase):
             self.assertNotIn(option, WORKFLOW)
         self.assertNotIn("Swatinem/rust-cache@", WORKFLOW)
         self.assertNotIn("dtolnay/rust-toolchain@", WORKFLOW)
-        self.assertNotIn("actions/cache@", WORKFLOW)
+        self.assertEqual(2, WORKFLOW.count("uses: actions/cache@v6"))
         self.assertNotRegex(WORKFLOW, r"go\.mod|go\.sum|envtest|controller-gen|"
                             r"controller-tools|controller-vet|go-mod-cache|"
                             r"GO_VERSION|GOCACHE|GOMODCACHE")

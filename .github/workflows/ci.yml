@@ -160,6 +160,12 @@ jobs:
       - name: Prepare repository-local working directory
         run: install -d -m 700 .tools .runtime
 
+      - name: Restore verified CAPI cache
+        uses: actions/cache@v6
+        with:
+          path: capi/.tools/cache
+          key: capi-full-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'capi/config/versions.env', 'capi/config/settings.env', 'capi/config/kind.yaml', 'capi/manifests/**', 'capi/scripts/cache.py', 'capi/scripts/tools.py') }}
+
       - name: Download static controller and Tenant Admin
         uses: actions/download-artifact@v7
         with:
@@ -224,9 +230,14 @@ jobs:
         uses: actions-rust-lang/setup-rust-toolchain@v2
       - name: Prepare repository-local working directory
         run: install -d -m 700 .tools .runtime
+      - name: Restore verified CAPI cache
+        uses: actions/cache@v6
+        with:
+          path: capi/.tools/cache
+          key: capi-full-v1-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', 'capi/config/versions.env', 'capi/config/settings.env', 'capi/config/kind.yaml', 'capi/manifests/**', 'capi/scripts/cache.py', 'capi/scripts/tools.py') }}
       - name: Show Docker capacity
         run: docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}} DockerRoot={{.DockerRootDir}}'
-      - name: Acquire complete cache including locked Cargo inputs
+      - name: Acquire complete verified cache
         run: just cache
       - name: Install pinned tools
         run: just tools

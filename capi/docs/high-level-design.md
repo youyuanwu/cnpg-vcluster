@@ -399,10 +399,13 @@ not an observed live pass
 
 ## Supply chain and offline operation
 
-`just cache` acquires pinned tools, manifests, charts, and OCI archives into an
-immutable verified generation. Ordinary preflight verifies the active
-generation without network acquisition. The scratch controller image contains
-the static manager plus checksum-verified Calico and CNPG assets.
+`just cache` reuses a stamped immutable generation when it still matches the
+current pins and verified file state, acquiring pinned tools, manifests,
+charts, and OCI archives only when the cache is absent or stale.
+`just cache-refresh` forces a new online provenance check and candidate
+generation. Ordinary preflight verifies the active generation without network
+acquisition. The scratch controller image contains the static manager plus
+checksum-verified Calico and CNPG assets.
 
 For enforced-offline execution, the management node denies external
 HTTP/HTTPS and uses an exactly owned Distribution registry on the private kind
