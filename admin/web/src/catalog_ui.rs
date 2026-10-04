@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use leptos::prelude::*;
 use tenant_admin_shared::{
     catalog::{
@@ -13,15 +15,21 @@ use crate::{
     catalog_state::{
         CatalogRecovery, add_disabled_reason, add_recovery, catalog_current, create_request,
         delete_recovery, delete_request, entry_actions_enabled, entry_deletable, query_instances,
-        query_request, query_response_matches, visible_databases,
+        query_request, query_response_matches, selected_database, visible_databases,
     },
     database_console::{
         DEFAULT_DATABASE, DEFAULT_SQL, QueryResultPresentation, format_query_duration,
         project_query_result,
     },
     error::{UiError, UiErrorKind},
-    format::{health_class, health_label, optional_text, provider_label},
-    route::{database_path, database_query_path, databases_path},
+    format::{edge_kind_label, health_class, health_label, optional_text, provider_label},
+    mutation_ui_state::{
+        RefreshIntent, exact_confirmation_enabled, refresh_effects, unsafe_operation_enabled,
+    },
+    route::{
+        TenantSection, database_path, database_query_path, databases_path, tenant_database_href,
+        tenant_section_href,
+    },
     topology::layout_graph,
 };
 
@@ -105,7 +113,11 @@ pub fn CatalogPanel(
     name: String,
     tenant_uid: String,
     classification: TenantClassification,
+    selected_uid: Option<String>,
+    snapshot_refresh: Option<RwSignal<u32>>,
+    external_refresh: Option<RwSignal<u32>>,
 ) -> impl IntoView {
+    provide_context(snapshot_refresh);
     let state = RwSignal::new(CatalogLoad::Loading);
     let notice = RwSignal::new(None::<String>);
     let busy = RwSignal::new(false);
@@ -114,6 +126,9 @@ pub fn CatalogPanel(
     let requested_name = name.clone();
     Effect::new(move |_| {
         refresh.get();
+        if let Some(external_refresh) = external_refresh {
+            external_refresh.get();
+        }
         state.set(CatalogLoad::Loading);
         notice.set(None);
         locked.set(false);
@@ -156,7 +171,8 @@ pub fn CatalogPanel(
                 }.into_any(),
                 CatalogLoad::Ready(catalog) => view! {
                     <CatalogContent name=name.clone() tenant_uid=tenant_uid.clone()
-                        classification catalog state notice busy locked/>
+                        classification selected_uid=selected_uid.clone()
+                        catalog state notice busy locked/>
                 }.into_any(),
             }}
         </section>
@@ -168,6 +184,7 @@ fn CatalogContent(
     name: String,
     tenant_uid: String,
     classification: TenantClassification,
+    selected_uid: Option<String>,
     catalog: CatalogView,
     state: RwSignal<CatalogLoad>,
     notice: RwSignal<Option<String>>,
@@ -179,6 +196,34 @@ fn CatalogContent(
     let add_reason = add_disabled_reason(&catalog, &name, &tenant_uid, classification);
     let entries = visible_databases(&catalog).to_vec();
     let capacity = format!("{count} of 3 slots occupied (deleting clusters retain their slot)");
+    if let Some(selected_uid) = selected_uid {
+        let list_href =
+            tenant_section_href(&name, TenantSection::Databases).unwrap_or_else(|| "/".into());
+        let selected = selected_database(&catalog, &selected_uid).cloned();
+        return view! {
+            <a class="back-link" href=list_href>"← All database clusters"</a>
+            {selected.map_or_else(
+                || view! {
+                    <div class="database-warning" role="alert">
+                        <h3>"Database cluster not found"</h3>
+                        <p>"The selected logical identity is not present in the authoritative catalog."</p>
+                    </div>
+                }.into_any(),
+                |entry| {
+                    let can_act = entry_actions_enabled(
+                        &catalog, &name, &tenant_uid, classification, &entry,
+                    ) && count <= 3;
+                    let can_delete = entry_deletable(
+                        &catalog, &name, &tenant_uid, &entry,
+                    ) && count <= 3;
+                    view! {
+                        <DatabaseCard name=name catalog entry can_act can_delete
+                            state notice busy locked/>
+                    }.into_any()
+                },
+            )}
+        }.into_any();
+    }
     view! {
         <p class="secondary" role="status">{capacity}</p>
         {(!current).then(|| view! {
@@ -193,22 +238,37 @@ fn CatalogContent(
             view! { <p class="empty">"No database clusters have been added to this Tenant."</p> }.into_any()
         } else {
             view! {
-                <div class="database-cluster-list">
+                <div class="database-summary-list">
                     {entries.into_iter().map(|entry| {
-                        let can_act = entry_actions_enabled(&catalog, &name, &tenant_uid, classification, &entry)
-                            && count <= 3;
-                        let can_delete = entry_deletable(&catalog, &name, &tenant_uid, &entry)
-                            && count <= 3;
+                        let href = tenant_database_href(&name, &entry.logical_uid)
+                            .unwrap_or_else(|| tenant_section_href(&name, TenantSection::Databases).unwrap());
+                        let phase = if entry.deleting { "deleting" } else { entry.phase.as_str() };
+                        let status_class = match phase {
+                            "ready" => "ready",
+                            "deleting" => "deleting",
+                            "degraded" | "ownership-invalid" => "degraded",
+                            _ => "progressing",
+                        };
                         view! {
-                            <DatabaseCard name=name.clone() catalog=catalog.clone() entry
-                                can_act can_delete state notice busy locked/>
+                            <article class="database-summary-card">
+                                <div class="resource-heading">
+                                    <h3><a href=href>{entry.name}</a></h3>
+                                    <span class=format!("status status--{status_class}")>{phase.to_owned()}</span>
+                                </div>
+                                <p class="secondary">{format!("Logical UID: {}", entry.logical_uid)}</p>
+                                <dl class="database-summary-metrics">
+                                    <div><dt>"Instances"</dt><dd>{format!("{} / {} ready", entry.ready_instances, entry.instances)}</dd></div>
+                                    <div><dt>"Storage"</dt><dd>{format!("{} / {} healthy", entry.storage_healthy, entry.storage.len())}</dd></div>
+                                    <div><dt>"Blockers"</dt><dd>{entry.blockers.len()}</dd></div>
+                                </dl>
+                            </article>
                         }
                     }).collect_view()}
                 </div>
             }.into_any()
         }}
         {add_reason.map(|reason| view! { <p class="secondary" role="status">{reason}</p> })}
-    }
+    }.into_any()
 }
 
 #[component]
@@ -222,6 +282,7 @@ fn DatabaseAddPanel(
     busy: RwSignal<bool>,
     locked: RwSignal<bool>,
 ) -> impl IntoView {
+    let snapshot_refresh = use_context::<Option<RwSignal<u32>>>().flatten();
     let cluster_name = RwSignal::new(String::new());
     let instances = RwSignal::new("1".to_owned());
     let error = RwSignal::new(None::<String>);
@@ -264,6 +325,15 @@ fn DatabaseAddPanel(
                             .any(|entry| entry.name == request.name) =>
                 {
                     state.set(CatalogLoad::Ready(current));
+                    let effects = refresh_effects(RefreshIntent::MutationCommitted);
+                    if !effects.preserve_catalog_lock {
+                        locked.set(false);
+                    }
+                    if effects.snapshot {
+                        if let Some(snapshot_refresh) = snapshot_refresh {
+                            snapshot_refresh.update(|version| *version = version.wrapping_add(1));
+                        }
+                    }
                     notice.set(Some(format!(
                         "Cluster {} was accepted. Refresh to observe readiness.",
                         request.name
@@ -500,6 +570,24 @@ fn topology_view(uid: &str, name: &str, graph: TopologyGraph) -> AnyView {
     let desc_id = format!("database-{uid}-svg-description");
     let label = format!("{title_id} {desc_id}");
     let view_box = format!("0 0 {} {}", layout.width, layout.height);
+    let labels = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node.label.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let relationships = graph
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            Some((
+                labels.get(edge.source.as_str())?.to_string(),
+                labels.get(edge.target.as_str())?.to_string(),
+                edge.label
+                    .clone()
+                    .unwrap_or_else(|| edge_kind_label(edge.kind).into()),
+            ))
+        })
+        .collect::<Vec<_>>();
     view! {
         <div class="topology-scroll">
             <svg class="topology" viewBox=view_box role="img" aria-labelledby=label preserveAspectRatio="xMinYMin meet">
@@ -519,6 +607,20 @@ fn topology_view(uid: &str, name: &str, graph: TopologyGraph) -> AnyView {
                 }).collect_view()}
             </svg>
         </div>
+        <div class="relationship-list">
+            <h5>"Relationships"</h5>
+            {if relationships.is_empty() {
+                view! { <p class="secondary">"No relationships are observed."</p> }.into_any()
+            } else {
+                view! {
+                    <ul>
+                        {relationships.into_iter().map(|(source, target, kind)| view! {
+                            <li>{format!("{source} → {target} · {kind}")}</li>
+                        }).collect_view()}
+                    </ul>
+                }.into_any()
+            }}
+        </div>
     }.into_any()
 }
 
@@ -533,6 +635,7 @@ fn DatabaseDeletePanel(
     busy: RwSignal<bool>,
     locked: RwSignal<bool>,
 ) -> impl IntoView {
+    let snapshot_refresh = use_context::<Option<RwSignal<u32>>>().flatten();
     let confirmation = RwSignal::new(String::new());
     let heading = format!("cluster-{}-delete-heading", entry.logical_uid);
     let button_name = entry.name.clone();
@@ -542,9 +645,12 @@ fn DatabaseDeletePanel(
     let submit = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
         if !can_act
-            || busy.get_untracked()
-            || locked.get_untracked()
-            || confirmation.get_untracked() != submit_entry.name
+            || !exact_confirmation_enabled(
+                &submit_entry.name,
+                &confirmation.get_untracked(),
+                busy.get_untracked(),
+                locked.get_untracked(),
+            )
         {
             return;
         }
@@ -582,6 +688,15 @@ fn DatabaseDeletePanel(
                         ) =>
                 {
                     state.set(CatalogLoad::Ready(current));
+                    let effects = refresh_effects(RefreshIntent::MutationCommitted);
+                    if !effects.preserve_catalog_lock {
+                        locked.set(false);
+                    }
+                    if effects.snapshot {
+                        if let Some(snapshot_refresh) = snapshot_refresh {
+                            snapshot_refresh.update(|version| *version = version.wrapping_add(1));
+                        }
+                    }
                     notice.set(Some(format!(
                         "Deletion of {} was accepted for logical UID {}.",
                         entry.name, entry.logical_uid
@@ -641,7 +756,12 @@ fn DatabaseDeletePanel(
                         on:input=move |event| confirmation.set(event_target_value(&event))/>
                 </label>
                 <button class="button--danger" type="submit"
-                    disabled=move || !can_act || busy.get() || locked.get() || confirmation.get() != button_name
+                    disabled=move || !can_act || !exact_confirmation_enabled(
+                        &button_name,
+                        &confirmation.get(),
+                        busy.get(),
+                        locked.get(),
+                    )
                 >"Delete this cluster"</button>
             </form>
         </section>
@@ -668,15 +788,18 @@ fn DatabaseConsole(
     let sql = RwSignal::new(DEFAULT_SQL.to_owned());
     let result = RwSignal::new(QueryState::Idle);
     let query_enabled = can_act && !options.is_empty();
+    let has_ready_instance = !options.is_empty();
     let submit_entry = entry.clone();
     let submit_catalog = catalog.clone();
     let submit_name = name.clone();
     let submit = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
-        if !query_enabled
-            || busy.get_untracked()
-            || locked.get_untracked()
-            || matches!(result.get_untracked(), QueryState::Running)
+        if !unsafe_operation_enabled(
+            query_enabled,
+            has_ready_instance,
+            busy.get_untracked(),
+            locked.get_untracked(),
+        ) || matches!(result.get_untracked(), QueryState::Running)
         {
             return;
         }

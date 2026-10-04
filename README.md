@@ -40,7 +40,7 @@ application: a Leptos/Axum Tenant Admin UI with an
 unsafe PostgreSQL superuser console, implemented as a WebAssembly frontend
 served by a kube-rs backend.
 It reads management topology and creates/deletes top-level Tenants through
-exact provider-specific lifecycle RBAC. The schema-v5 backend exposes
+exact provider-specific lifecycle RBAC. The schema-v6 backend exposes
 `GET/POST /api/v1/tenants/{name}/databases`,
 `DELETE /api/v1/tenants/{name}/databases/{uid}`, and
 `POST /api/v1/tenants/{name}/databases/{uid}/query`. Mutations require the
@@ -51,11 +51,15 @@ observed instance identity. Tenant kubeconfig and per-cluster PostgreSQL
 credentials are validated and used only in memory; queries use an ephemeral
 Kubernetes port-forward. The SQL console limits requests to 128 KiB (64 KiB
 SQL), execution to 30 seconds, and retained results to 32 sets, 128 columns,
-1,000 rows, 16 KiB per value and 2 MiB response text. The frontend renders
-catalog-scoped cards, topology, and SQL controls instead of an implicit Tenant
-database. The service validates effective management permissions and has no
-Azure cloud credentials, application database, persistent cache, or browser
-credential exposure. See
+1,000 rows, 16 KiB per value and 2 MiB response text. The frontend organizes
+each Tenant into Overview, Resources, Databases, Status and Settings. Its
+tenant-scoped explorer provides grouped inventory, bounded focused topology,
+textual relationships and resource inspection; lifecycle, capacity and section
+availability remain authoritative current snapshots. Database list/detail
+locations retain the exact catalog, SQL and deletion safety contracts. The
+service validates effective management permissions and has no Azure cloud
+credentials, application database, persistent cache, or browser credential
+exposure. See
 [`docs/admin-ui-design.md`](docs/admin-ui-design.md).
 
 The Azure experiment is documented in

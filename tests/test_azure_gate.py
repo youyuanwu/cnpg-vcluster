@@ -316,7 +316,7 @@ class AzureGateTests(unittest.TestCase):
         response = CompletedProcess(
             [],
             0,
-            json.dumps({"schemaVersion": 5, "data": {"state": "accepted"}}),
+            json.dumps({"schemaVersion": 6, "data": {"state": "accepted"}}),
             "",
         )
         with (

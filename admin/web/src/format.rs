@@ -60,6 +60,9 @@ pub const fn database_unavailable_reason_label(reason: DatabaseUnavailableReason
     match reason {
         DatabaseUnavailableReason::Pending => "Pending",
         DatabaseUnavailableReason::ManagementResourceMissing => "Management resource missing",
+        DatabaseUnavailableReason::ManagementInventoryUnavailable => {
+            "Management inventory unavailable"
+        }
         DatabaseUnavailableReason::TenantAccessInvalid => "Tenant access invalid",
         DatabaseUnavailableReason::TenantApiUnavailable => "Tenant API unavailable",
         DatabaseUnavailableReason::ClusterMissing => "Database cluster missing",

@@ -23,6 +23,16 @@ pub fn visible_databases(catalog: &CatalogView) -> &[DatabaseView] {
     &catalog.databases[..catalog.databases.len().min(MAX_DATABASES)]
 }
 
+pub fn selected_database<'a>(
+    catalog: &'a CatalogView,
+    logical_uid: &str,
+) -> Option<&'a DatabaseView> {
+    catalog
+        .databases
+        .iter()
+        .find(|entry| entry.logical_uid == logical_uid)
+}
+
 pub fn catalog_current(catalog: &CatalogView, tenant: &str, tenant_uid: &str) -> bool {
     catalog.tenant == tenant
         && !tenant_uid.is_empty()
@@ -289,6 +299,10 @@ mod tests {
             let mut state = catalog(provider);
             state.databases.push(entry("fourth", "dddd"));
             assert_eq!(visible_databases(&state).len(), 3);
+            assert_eq!(
+                selected_database(&state, "dddd").map(|entry| entry.name.as_str()),
+                Some("fourth")
+            );
             state.databases[0].deleting = true;
             assert!(
                 add_disabled_reason(

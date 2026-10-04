@@ -27,8 +27,9 @@ use tenant_admin_shared::{
     query::{
         DatabaseObservation, DatabaseObservationFreshness, DatabaseQueryRequest,
         DatabaseQueryResponse, DatabaseUnavailableReason, ManagementComponentView,
-        ManagementOverview, OverviewSnapshot, ProviderMode, TenantClassification, TenantCounts,
-        TenantSnapshot, TenantSnapshotIdentity, TenantSummary, TopologyGraph,
+        ManagementOverview, OverviewSnapshot, ProviderMode, SectionAvailability,
+        TenantClassification, TenantCounts, TenantSnapshot, TenantSnapshotIdentity,
+        TenantSnapshotSections, TenantSummary, TopologyGraph,
     },
     routes::{
         API_DATABASE_PATH, API_DATABASE_QUERY_PATH, API_DATABASES_PATH, API_OVERVIEW_PATH,
@@ -387,17 +388,30 @@ async fn tenant_detail(
         .get_tenant(&name)
         .await?
         .ok_or_else(|| AppError::not_found(format!("Tenant {name} was not found")))?;
-    let resources = state
+    let (resources, resource_section) = match state
         .source
         .list_management_resources(state.provider, &name)
-        .await?;
-    let projection = projected_tenant(&state, tenant, resources).await?;
+        .await
+    {
+        Ok(resources) => (Some(resources), SectionAvailability::Available),
+        Err(error @ (SourceError::KubernetesUnavailable | SourceError::ResponseTooLarge)) => {
+            tracing::warn!("management inventory unavailable while projecting Tenant detail");
+            (None, unavailable_section(&error))
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let (projection, database_section) = projected_tenant(&state, tenant, resources).await?;
     let identity = TenantSnapshotIdentity {
         uid: projection.detail.uid.clone(),
         generation: projection.detail.generation,
         observed_generation: projection.detail.observed_generation,
     };
     Ok(Json(ApiEnvelope::new(TenantSnapshot {
+        observed_at: chrono::Utc::now().to_rfc3339(),
+        sections: TenantSnapshotSections {
+            resources: resource_section,
+            databases: database_section,
+        },
         identity,
         detail: projection.detail,
         database: projection.database,
@@ -420,15 +434,20 @@ async fn tenant_topology(
         .list_management_resources(state.provider, &name)
         .await?;
     Ok(Json(ApiEnvelope::new(
-        projected_tenant(&state, tenant, resources).await?.topology,
+        projected_tenant(&state, tenant, Some(resources))
+            .await?
+            .0
+            .topology,
     )))
 }
 
 async fn projected_tenant(
     state: &AppState,
     tenant: Tenant,
-    resources: Vec<kube::core::DynamicObject>,
-) -> Result<TenantProjection, AppError> {
+    resources: Option<Vec<kube::core::DynamicObject>>,
+) -> Result<(TenantProjection, SectionAvailability), AppError> {
+    let inventory_available = resources.is_some();
+    let resources = resources.unwrap_or_default();
     let catalog = if tenant
         .status
         .as_ref()
@@ -444,6 +463,16 @@ async fn projected_tenant(
         }
     } else {
         Ok(None)
+    };
+    let database_section = match &catalog {
+        Ok(_) if inventory_available => SectionAvailability::Available,
+        Ok(Some(_)) => SectionAvailability::Available,
+        Ok(None) => SectionAvailability::Unavailable {
+            code: "management-inventory-unavailable".into(),
+            message: "Database observation requires management resource inventory".into(),
+            retryable: true,
+        },
+        Err(error) => unavailable_section(error),
     };
     let database = match &catalog {
         Ok(Some(_)) => DatabaseObservation::Unavailable {
@@ -467,18 +496,58 @@ async fn projected_tenant(
                     }
             ),
         },
-        Ok(None) => {
+        Ok(None) if inventory_available => {
             state
                 .source
                 .database_observation(state.provider, &tenant, &resources)
                 .await?
         }
+        Ok(None) => DatabaseObservation::Unavailable {
+            observed_at: chrono::Utc::now().to_rfc3339(),
+            freshness: DatabaseObservationFreshness::Live,
+            reason: DatabaseUnavailableReason::ManagementInventoryUnavailable,
+            message: "Management resource inventory is unavailable".into(),
+            retryable: true,
+        },
     };
-    let mut projection = TenantProjection::new(state.provider, tenant, resources, database);
+    let catalog_view = catalog.as_ref().ok().and_then(Option::as_ref);
+    let mut projection = TenantProjection::new(
+        state.provider,
+        tenant,
+        resources,
+        database,
+        catalog_view,
+        inventory_available,
+    );
     if let Ok(Some(catalog)) = catalog {
         merge_catalog_topology(&mut projection.topology, &catalog);
     }
-    Ok(projection)
+    Ok((projection, database_section))
+}
+
+fn unavailable_section(error: &SourceError) -> SectionAvailability {
+    match error {
+        SourceError::KubernetesUnavailable => SectionAvailability::Unavailable {
+            code: "kubernetes-unavailable".into(),
+            message: error.to_string(),
+            retryable: true,
+        },
+        SourceError::ResponseTooLarge => SectionAvailability::Unavailable {
+            code: "response-too-large".into(),
+            message: error.to_string(),
+            retryable: false,
+        },
+        SourceError::DatabaseUnavailable { retryable, .. } => SectionAvailability::Unavailable {
+            code: "database-unavailable".into(),
+            message: error.to_string(),
+            retryable: *retryable,
+        },
+        _ => SectionAvailability::Unavailable {
+            code: "unavailable".into(),
+            message: error.to_string(),
+            retryable: false,
+        },
+    }
 }
 
 async fn database_query(
@@ -1328,7 +1397,7 @@ mod tests {
         let tenant = ready_tenant();
         let source = MockSource {
             tenants: Ok(vec![tenant.clone()]),
-            tenant: Ok(Some(tenant)),
+            tenant: Ok(Some(tenant.clone())),
             resources: Ok(Vec::new()),
             database: Ok(database_observation()),
             query: Ok(query_response()),
@@ -1377,6 +1446,118 @@ mod tests {
         assert_eq!(calls.tenant_gets.load(Ordering::Relaxed), 2);
         assert_eq!(calls.resource_lists.load(Ordering::Relaxed), 2);
         assert_eq!(calls.database_observations.load(Ordering::Relaxed), 2);
+    }
+
+    #[tokio::test]
+    async fn inventory_failure_is_section_scoped_and_never_becomes_empty_success() {
+        let mut tenant = ready_tenant();
+        tenant.status.as_mut().unwrap().database_capability =
+            Some(tenant_controller::api::DatabaseCapability {
+                available: true,
+                reason: "Ready".into(),
+                namespace: "tenant-db-tenant-a".into(),
+                namespace_uid: "namespace-uid".into(),
+                catalog_uid: "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa".into(),
+                storage_namespace_uid: None,
+            });
+        let source = MockSource {
+            tenants: Ok(vec![tenant.clone()]),
+            tenant: Ok(Some(tenant.clone())),
+            resources: Err(SourceError::KubernetesUnavailable),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls: Arc::default(),
+        };
+        let calls = source.calls.clone();
+        let app = test_router(source);
+        let detail = app
+            .clone()
+            .oneshot(
+                Request::get("/api/v1/tenants/tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: ApiEnvelope<TenantSnapshot> = response_json(detail).await;
+        assert!(matches!(
+            detail.data.sections.resources,
+            SectionAvailability::Unavailable {
+                ref code,
+                retryable: true,
+                ..
+            } if code == "kubernetes-unavailable"
+        ));
+        assert!(detail.data.detail.management_resources.is_empty());
+        assert!(detail.data.topology.nodes.iter().all(|node| {
+            node.id == "tenant"
+                || node.provenance
+                    == tenant_admin_shared::query::TopologyNodeProvenance::SyntheticSummary
+        }));
+        assert_eq!(detail.data.detail.worker_capacity.available, None);
+        assert_eq!(detail.data.detail.worker_capacity.unavailable, None);
+        assert!(matches!(
+            detail.data.sections.databases,
+            SectionAvailability::Available
+        ));
+        assert!(matches!(
+            detail.data.database,
+            DatabaseObservation::Unavailable {
+                reason: DatabaseUnavailableReason::Pending,
+                ..
+            }
+        ));
+        assert_eq!(calls.database_observations.load(Ordering::Relaxed), 0);
+        assert_eq!(calls.catalog_reads.load(Ordering::Relaxed), 1);
+
+        let topology = app
+            .oneshot(
+                Request::get("/api/v1/tenants/tenant-a/topology")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(topology.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        let calls = Arc::new(SourceCalls::default());
+        *calls.catalog_failure.lock().unwrap() = Some(SourceError::KubernetesUnavailable);
+        let source = MockSource {
+            tenants: Ok(vec![tenant.clone()]),
+            tenant: Ok(Some(tenant)),
+            resources: Err(SourceError::KubernetesUnavailable),
+            database: Ok(database_observation()),
+            query: Ok(query_response()),
+            ready: Ok(()),
+            calls,
+        };
+        let detail = test_router(source)
+            .oneshot(
+                Request::get("/api/v1/tenants/tenant-a")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(detail.status(), StatusCode::OK);
+        let detail: ApiEnvelope<TenantSnapshot> = response_json(detail).await;
+        assert!(matches!(
+            detail.data.sections.resources,
+            SectionAvailability::Unavailable { .. }
+        ));
+        assert!(matches!(
+            detail.data.sections.databases,
+            SectionAvailability::Unavailable { .. }
+        ));
+        assert!(matches!(
+            detail.data.database,
+            DatabaseObservation::Unavailable {
+                reason: DatabaseUnavailableReason::TenantApiUnavailable,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -1913,7 +2094,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: ApiEnvelope<CatalogView> = response_json(response).await;
-        assert_eq!(body.schema_version, 5);
+        assert_eq!(body.schema_version, 6);
         assert_eq!(body.data.catalog_uid, CATALOG);
         let add = format!(r#"{{"catalogUid":"{CATALOG}","name":"alpha","instances":2}}"#);
         let send = |path: &str, body: String| {
@@ -2080,29 +2261,36 @@ mod tests {
                 .and_then(|value| value.to_str().ok()),
             Some("text/css")
         );
-        let nested = app
-            .clone()
-            .oneshot(
-                Request::get("/tenants/tenant-a")
-                    .body(Body::empty())
-                    .expect("request"),
-            )
-            .await
-            .expect("response");
-        assert_eq!(nested.status(), StatusCode::OK);
-        assert_eq!(
-            nested
-                .headers()
-                .get("cache-control")
-                .and_then(|value| value.to_str().ok()),
-            Some("no-store")
-        );
-        let nested_body = nested.into_body().collect().await.expect("body").to_bytes();
-        assert!(
-            nested_body
-                .windows(18)
-                .any(|value| value == b"tenant-admin-shell")
-        );
+        for path in [
+            "/tenants/tenant-a",
+            "/tenants/tenant-a/overview",
+            "/tenants/tenant-a/resources?select=resource%3Auid",
+            "/tenants/tenant-a/databases",
+            "/tenants/tenant-a/databases/12345678-1234-1234-1234-123456789abc",
+            "/tenants/tenant-a/databases/not-a-uid",
+            "/tenants/tenant-a/status",
+            "/tenants/tenant-a/settings",
+        ] {
+            let nested = app
+                .clone()
+                .oneshot(Request::get(path).body(Body::empty()).expect("request"))
+                .await
+                .expect("response");
+            assert_eq!(nested.status(), StatusCode::OK, "{path}");
+            assert_eq!(
+                nested
+                    .headers()
+                    .get("cache-control")
+                    .and_then(|value| value.to_str().ok()),
+                Some("no-store")
+            );
+            let nested_body = nested.into_body().collect().await.expect("body").to_bytes();
+            assert!(
+                nested_body
+                    .windows(18)
+                    .any(|value| value == b"tenant-admin-shell")
+            );
+        }
         let missing_asset = app
             .clone()
             .oneshot(

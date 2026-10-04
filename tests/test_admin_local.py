@@ -162,6 +162,7 @@ class FakeClient:
                     {
                         "id": f"tenant:{name}",
                         "kind": "tenant",
+                        "provenance": "exact-kubernetes-resource",
                         "label": name,
                         "health": "ready",
                         "resource": None,
@@ -170,6 +171,7 @@ class FakeClient:
                     {
                         "id": "database:cluster",
                         "kind": "database",
+                        "provenance": "database-logical-representation",
                         "label": "capi-postgres",
                         "health": "ready",
                         "resource": None,
@@ -178,6 +180,7 @@ class FakeClient:
                     {
                         "id": "database:instance:capi-postgres-1",
                         "kind": "database",
+                        "provenance": "database-logical-representation",
                         "label": "capi-postgres-1",
                         "health": "ready",
                         "resource": None,
@@ -208,8 +211,41 @@ class FakeClient:
                 "uid": f"{name}-uid",
                 "generation": 1,
                 "observedGeneration": 1,
-                "specification": {},
-                "providerStatus": {},
+                "specification": {
+                    "kubernetesVersion": "1.36.4",
+                    "workers": 1,
+                    "provider": {"provider": "local"},
+                },
+                "providerStatus": {
+                    "provider": "local",
+                    "status": {
+                        "allocation": None,
+                        "foundationHash": "foundation",
+                        "clusterUid": f"{name}-cluster-uid",
+                    },
+                },
+                "lifecycle": [
+                    {
+                        "stage": stage,
+                        "state": "completed",
+                        "message": None,
+                    }
+                    for stage in (
+                        "request-accepted",
+                        "infrastructure",
+                        "control-plane",
+                        "workers",
+                        "add-ons",
+                        "databases",
+                        "ready",
+                    )
+                ],
+                "workerCapacity": {
+                    "desired": 1,
+                    "available": 1,
+                    "unavailable": 0,
+                    "diagnosticReadyMachines": 1,
+                },
                 "blockers": [],
                 "managementResources": [],
             }
@@ -273,7 +309,7 @@ class FakeClient:
         if path.endswith("/api/v1/overview"):
             return json.dumps(
                 {
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": {
                         "overview": {
                             "providerMode": "local",
@@ -301,7 +337,7 @@ class FakeClient:
         if path.endswith("/api/v1/tenants"):
             return json.dumps(
                 {
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": [
                         tenant_summary(name) for name in self.tenant_names
                     ],
@@ -310,7 +346,7 @@ class FakeClient:
         for name in self.tenant_names:
             if path.endswith(f"/api/v1/tenants/{name}/databases"):
                 return json.dumps({
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": {
                         "tenant": name, "tenantUid": f"{name}-uid",
                         "catalogUid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
@@ -321,15 +357,20 @@ class FakeClient:
             if path.endswith(f"/api/v1/tenants/{name}/topology"):
                 return json.dumps(
                     {
-                        "schemaVersion": 5,
+                        "schemaVersion": 6,
                         "data": topology(name),
                     }
                 )
             if path.endswith(f"/api/v1/tenants/{name}"):
                 return json.dumps(
                     {
-                        "schemaVersion": 5,
+                        "schemaVersion": 6,
                         "data": {
+                            "observedAt": "2026-09-29T20:00:00Z",
+                            "sections": {
+                                "resources": {"state": "available"},
+                                "databases": {"state": "available"},
+                            },
                             "identity": {
                                 "uid": f"{name}-uid",
                                 "generation": 1,
@@ -373,7 +414,7 @@ class FakeClient:
                 name = request["name"]
                 self.tenant_names = tuple(sorted((*self.tenant_names, name)))
                 return response(json.dumps({
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": {
                         "identity": {
                             "name": name,
@@ -386,7 +427,7 @@ class FakeClient:
                 }))
             tenant_name = arguments[2].split("/tenants/", 1)[1].split("/", 1)[0]
             return response(json.dumps({
-                "schemaVersion": 5,
+                "schemaVersion": 6,
                 "data": {
                     "tenant": tenant_name,
                     "cluster": "capi-postgres",
@@ -410,7 +451,7 @@ class FakeClient:
                 tenant for tenant in self.tenant_names if tenant != name
             )
             return response(json.dumps({
-                "schemaVersion": 5,
+                "schemaVersion": 6,
                 "data": {
                     "identity": {
                         "name": name,
@@ -439,7 +480,7 @@ class FakeClient:
             name = payload["name"]
             self.tenant_names = tuple(sorted((*self.tenant_names, name)))
             return response(json.dumps({
-                "schemaVersion": 5,
+                "schemaVersion": 6,
                 "data": {
                     "identity": {
                         "name": name,
@@ -456,7 +497,7 @@ class FakeClient:
                 tenant for tenant in self.tenant_names if tenant != name
             )
             return response(json.dumps({
-                "schemaVersion": 5,
+                "schemaVersion": 6,
                 "data": {
                     "identity": {
                         "name": name,
@@ -468,7 +509,7 @@ class FakeClient:
             }))
         tenant_name = path.split("/tenants/", 1)[1].split("/", 1)[0]
         return response(json.dumps({
-            "schemaVersion": 5,
+            "schemaVersion": 6,
             "data": {
                 "tenant": tenant_name,
                 "cluster": "capi-postgres",
@@ -1001,6 +1042,7 @@ class AdminLocalTests(unittest.TestCase):
                 body = json.loads(response)
                 body["data"]["nodes"].append({
                     "id": f"database:{FIRST}", "kind": "database",
+                    "provenance": "database-logical-representation",
                     "label": "alpha", "health": "ready",
                     "resource": None, "attributes": [],
                 })
@@ -1013,7 +1055,7 @@ class AdminLocalTests(unittest.TestCase):
                     ("raw-json", method, path, json.dumps(payload, sort_keys=True))
                 )
                 return response(json.dumps({
-                    "schemaVersion": 5,
+                    "schemaVersion": 6,
                     "data": {
                         "catalogUid": "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa",
                         "logicalUid": FIRST, "instance": "pg-alpha-1",
@@ -1050,11 +1092,11 @@ class AdminLocalTests(unittest.TestCase):
             if path.endswith("/api/v1/tenants"):
                 summary = tenant_summary("tenant-a")
                 summary["classification"] = "progressing"
-                return json.dumps({"schemaVersion": 5, "data": [summary]})
+                return json.dumps({"schemaVersion": 6, "data": [summary]})
             if path.endswith("/api/v1/tenants/tenant-a/topology"):
                 topology = json.loads(original_transition(path))["data"]
                 topology["nodes"][0]["health"] = "progressing"
-                return json.dumps({"schemaVersion": 5, "data": topology})
+                return json.dumps({"schemaVersion": 6, "data": topology})
             return original_transition(path)
 
         with patch.object(
@@ -1096,6 +1138,7 @@ class AdminLocalTests(unittest.TestCase):
                 topology["nodes"].append({
                     "id": "database:unavailable",
                     "kind": "database",
+                    "provenance": "synthetic-summary",
                     "label": "Databases unavailable",
                     "health": "degraded",
                     "resource": None,
@@ -1132,7 +1175,7 @@ class AdminLocalTests(unittest.TestCase):
 
         def malformed_response(path: str) -> str:
             if path.endswith("/api/v1/overview"):
-                return '{"schemaVersion":5,"data":[]}'
+                return '{"schemaVersion":6,"data":[]}'
             return original(path)
 
         with patch.object(
@@ -1141,6 +1184,117 @@ class AdminLocalTests(unittest.TestCase):
             side_effect=malformed_response,
         ), self.assertRaisesRegex(RuntimeError, "overview data"):
             admin_local.verify_admin_api(malformed)
+
+    def test_api_verification_rejects_malformed_schema_v6_snapshot_fields(
+        self,
+    ) -> None:
+        def mutate_timestamp(body):
+            body["data"]["observedAt"] = "2026-01-01"
+
+        def mutate_missing_seconds(body):
+            body["data"]["observedAt"] = "2026-01-01T00:00Z"
+
+        def mutate_comma_fraction(body):
+            body["data"]["observedAt"] = "2026-01-01T00:00:00,5Z"
+
+        def mutate_compact_offset(body):
+            body["data"]["observedAt"] = "2026-01-01T00:00:00+0000"
+
+        def mutate_section(body):
+            body["data"]["sections"]["resources"] = {
+                "state": "unavailable",
+                "retryable": True,
+            }
+
+        def mutate_lifecycle(body):
+            body["data"]["detail"]["lifecycle"][0]["stage"] = "ready"
+
+        def mutate_capacity(body):
+            body["data"]["detail"]["workerCapacity"]["unavailable"] = None
+
+        def mutate_blocker(body):
+            body["data"]["detail"]["blockers"] = [{
+                "code": "worker",
+                "message": "worker unavailable",
+                "conditionType": "WorkersReady",
+                "targetNodeId": "missing-node",
+            }]
+
+        def mutate_edge(body):
+            body["data"]["topology"]["edges"][0]["target"] = "missing-node"
+
+        def mutate_database_timestamp(body):
+            body["data"]["database"]["observedAt"] = "2026-01-01"
+
+        def mutate_nested_timestamp(body):
+            body["data"]["database"]["cluster"]["currentPrimarySince"] = (
+                "2026-01-01T00:00:00"
+            )
+
+        def mutate_specification(body):
+            body["data"]["detail"]["specification"] = {}
+
+        def mutate_provider_status(body):
+            body["data"]["detail"]["providerStatus"] = {}
+
+        def mutate_created_at(body):
+            body["data"]["detail"]["summary"]["createdAt"] = "not-a-time"
+
+        def mutate_provider_allocation(body):
+            body["data"]["detail"]["providerStatus"]["status"]["allocation"] = 7
+
+        def mutate_management_resource(body):
+            body["data"]["detail"]["managementResources"] = [{"identity": {}}]
+
+        def mutate_node_resource(body):
+            body["data"]["topology"]["nodes"][0]["resource"] = {}
+
+        def mutate_attribute(body):
+            body["data"]["topology"]["nodes"][0]["attributes"] = [
+                {"label": "", "value": "bad"}
+            ]
+
+        for name, mutator in (
+            ("timestamp", mutate_timestamp),
+            ("missing-seconds", mutate_missing_seconds),
+            ("comma-fraction", mutate_comma_fraction),
+            ("compact-offset", mutate_compact_offset),
+            ("section", mutate_section),
+            ("lifecycle", mutate_lifecycle),
+            ("capacity", mutate_capacity),
+            ("blocker", mutate_blocker),
+            ("edge", mutate_edge),
+            ("database-timestamp", mutate_database_timestamp),
+            ("nested-timestamp", mutate_nested_timestamp),
+            ("specification", mutate_specification),
+            ("provider-status", mutate_provider_status),
+            ("created-at", mutate_created_at),
+            ("provider-allocation", mutate_provider_allocation),
+            ("management-resource", mutate_management_resource),
+            ("node-resource", mutate_node_resource),
+            ("attribute", mutate_attribute),
+        ):
+            with self.subTest(name=name):
+                client = FakeClient(tenant_names=("tenant-a",))
+                original = client._proxy_response
+
+                def malformed(path: str, mutate=mutator) -> str:
+                    response = original(path)
+                    if path.endswith("/api/v1/tenants/tenant-a"):
+                        body = json.loads(response)
+                        mutate(body)
+                        return json.dumps(body)
+                    return response
+
+                with patch.object(
+                    client,
+                    "_proxy_response",
+                    side_effect=malformed,
+                ), self.assertRaises(RuntimeError):
+                    admin_local.verify_admin_api(
+                        client,
+                        expected_tenant_names=("tenant-a",),
+                    )
 
     def test_api_verification_handles_tenant_deletion_race(self) -> None:
         for suffix in (

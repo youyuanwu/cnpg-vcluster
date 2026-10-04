@@ -6,8 +6,9 @@ use tenant_admin_shared::{
         TenantDeleteState, TenantField, TenantFieldError,
     },
     query::{
-        AzureProviderView, ConditionStatus, OverviewSnapshot, ProviderSpecificationView,
-        ProviderStatusView, TenantCondition, TenantSnapshot, TenantSummary, TopologyGraph,
+        AzureProviderView, ConditionStatus, LifecycleStageState, OverviewSnapshot,
+        ProviderSpecificationView, ProviderStatusView, SectionAvailability, TenantCondition,
+        TenantSnapshot, TenantSummary, TopologyNodeProvenance,
     },
     routes::{API_OVERVIEW_PATH, API_PREFIX},
 };
@@ -17,17 +18,22 @@ use crate::{
     api::{delete_envelope, get_envelope, post_envelope},
     catalog_ui::CatalogPanel,
     error::{UiError, UiErrorKind},
+    explorer::ExplorerModel,
     format::{
-        classification_class, classification_label, condition_status_label, edge_kind_label,
-        format_age, health_class, health_label, node_kind_label, optional_text, provider_label,
-        provider_mode_label,
+        classification_class, classification_label, condition_status_label, format_age,
+        health_class, health_label, optional_text, provider_label, provider_mode_label,
     },
     lifecycle::{
-        CreateRecovery, DeleteRecovery, create_recovery, create_request, delete_enabled,
-        delete_recovery, requires_authoritative_read,
+        CreateRecovery, DeleteRecovery, create_recovery, create_request, delete_recovery,
+        requires_authoritative_read,
     },
-    route::{AppRoute, parse_route, tenant_create_path, tenant_delete_path, tenant_href},
-    topology::layout_graph,
+    mutation_ui_state::exact_confirmation_enabled,
+    resource_explorer_ui::ResourceExplorer,
+    route::{
+        AppRoute, TenantSection, parse_location, tenant_create_path, tenant_delete_path,
+        tenant_href, tenant_resource_href, tenant_section_href,
+    },
+    tenant_ui::{lifecycle_stage_label, lifecycle_state_label, resource_target_exists},
 };
 
 #[derive(Clone)]
@@ -47,9 +53,12 @@ enum MutationState {
 
 #[component]
 pub fn App() -> impl IntoView {
-    let route = web_sys::window()
-        .and_then(|window| window.location().pathname().ok())
-        .map_or(AppRoute::NotFound, |path| parse_route(&path));
+    let route = web_sys::window().map_or(AppRoute::NotFound, |window| {
+        let location = window.location();
+        let path = location.pathname().unwrap_or_default();
+        let search = location.search().unwrap_or_default();
+        parse_location(&path, &search)
+    });
 
     view! {
         <div id=tenant_admin_shared::ADMIN_RESOURCE_NAME>
@@ -63,7 +72,18 @@ pub fn App() -> impl IntoView {
             </header>
             {match route {
                 AppRoute::Overview => view! { <OverviewPage/> }.into_any(),
-                AppRoute::Tenant(name) => view! { <TenantPage name/> }.into_any(),
+                AppRoute::Tenant {
+                    name,
+                    section,
+                    selected_resource,
+                    invalid_selection,
+                    selected_database,
+                } => view! {
+                    <TenantPage name section selected_resource invalid_selection selected_database/>
+                }.into_any(),
+                AppRoute::TenantSectionNotFound { name } => {
+                    view! { <TenantRouteNotFound name/> }.into_any()
+                }
                 AppRoute::NotFound => view! { <RouteNotFound/> }.into_any(),
             }}
         </div>
@@ -110,20 +130,32 @@ fn OverviewPage() -> impl IntoView {
 }
 
 #[component]
-fn TenantPage(name: String) -> impl IntoView {
+fn TenantPage(
+    name: String,
+    section: TenantSection,
+    selected_resource: Option<String>,
+    invalid_selection: bool,
+    selected_database: Option<String>,
+) -> impl IntoView {
     let refresh = RwSignal::new(0_u32);
+    let catalog_refresh = RwSignal::new(0_u32);
+    let refreshing = RwSignal::new(false);
+    let resource_selection = RwSignal::new(selected_resource);
     let state = RwSignal::new(LoadState::<TenantSnapshot>::Loading);
     let requested_name = name.clone();
 
     Effect::new(move |_| {
         refresh.get();
-        state.set(LoadState::Loading);
+        if !matches!(state.get_untracked(), LoadState::Loading) {
+            refreshing.set(true);
+        }
         let name = requested_name.clone();
         spawn_local(async move {
             state.set(match fetch_tenant_page(&name).await {
                 Ok(data) => LoadState::Ready(data),
                 Err(error) => LoadState::Error(error),
             });
+            refreshing.set(false);
         });
     });
 
@@ -132,18 +164,35 @@ fn TenantPage(name: String) -> impl IntoView {
             <a class="back-link" href="/">"← All Tenants"</a>
             <div class="page-header">
                 <div>
-                    <p class="eyebrow">"Tenant detail"</p>
+                    <p class="eyebrow">"Tenant workspace"</p>
                     <h1>{name}</h1>
                     <p class="lede">
-                        "Specification, lifecycle controls, database catalog, management resources, and provider-neutral topology. Credentials are excluded from browser responses."
+                        "Current status, tenant-scoped resources, database operations, and guarded lifecycle controls."
                     </p>
                 </div>
-                <RefreshButton state refresh/>
+                <button type="button"
+                    disabled=move || refreshing.get() || matches!(state.get(), LoadState::Loading)
+                    on:click=move |_| {
+                        refresh.update(|version| *version = version.wrapping_add(1));
+                        if section == TenantSection::Databases {
+                            catalog_refresh.update(|version| *version = version.wrapping_add(1));
+                        }
+                    }>
+                    {move || if refreshing.get() { "Refreshing…" } else { "Refresh" }}
+                </button>
             </div>
             <div aria-live="polite">
                 {move || match state.get() {
                     LoadState::Loading => loading_state("Loading Tenant detail"),
-                    LoadState::Ready(data) => tenant_detail_view(data),
+                    LoadState::Ready(data) => tenant_workspace_view(
+                        data,
+                        section,
+                        resource_selection,
+                        invalid_selection,
+                        selected_database.clone(),
+                        refresh,
+                        catalog_refresh,
+                    ),
                     LoadState::Error(error) => error_state(error, refresh),
                 }}
             </div>
@@ -535,16 +584,268 @@ fn tenant_row(tenant: TenantSummary) -> AnyView {
     .into_any()
 }
 
-fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
-    let detail = data.detail;
-    let topology = data.topology;
+fn tenant_workspace_view(
+    data: TenantSnapshot,
+    section: TenantSection,
+    resource_selection: RwSignal<Option<String>>,
+    invalid_selection: bool,
+    selected_database: Option<String>,
+    snapshot_refresh: RwSignal<u32>,
+    catalog_refresh: RwSignal<u32>,
+) -> AnyView {
+    let detail = data.detail.clone();
     let summary = detail.summary.clone();
     let tenant_name = summary.name.clone();
+    let tenant_uid = detail.uid.clone();
     let classification = summary.classification;
     let status_class = classification_class(classification);
-    let provider_specification = detail.specification.provider.clone();
-    let provider_status = detail.provider_status.clone();
-    let tenant_uid = detail.uid.clone();
+    let age = format_age(summary.created_at.as_deref());
+
+    view! {
+        <section class="tenant-context" aria-label="Tenant context">
+            <div>
+                <span class=format!("status status--{status_class}")>
+                    {classification_label(classification)}
+                </span>
+                <strong>{provider_label(summary.provider)}</strong>
+                <span>{format!("Kubernetes {}", summary.kubernetes_version)}</span>
+                <span>{format!("{} worker{}", summary.requested_workers, plural(summary.requested_workers))}</span>
+                <span>{format!("Age {age}")}</span>
+            </div>
+            <p class="secondary">{format!("UID {} · Snapshot {}", detail.uid, data.observed_at)}</p>
+        </section>
+        <nav class="tenant-nav" aria-label="Tenant sections">
+            {TenantSection::ALL.into_iter().map(|candidate| {
+                let href = tenant_section_href(&tenant_name, candidate).unwrap_or_else(|| "/".into());
+                view! {
+                    <a href=href aria-current=(candidate == section).then_some("page")>
+                        {tenant_section_label(candidate)}
+                    </a>
+                }
+            }).collect_view()}
+        </nav>
+        {match section {
+            TenantSection::Overview => tenant_overview_view(&data),
+            TenantSection::Resources => resources_section_view(
+                &data,
+                resource_selection,
+                invalid_selection,
+            ),
+            TenantSection::Databases => view! {
+                <CatalogPanel name=tenant_name tenant_uid classification
+                    selected_uid=selected_database snapshot_refresh=Some(snapshot_refresh)
+                    external_refresh=Some(catalog_refresh)/>
+            }.into_any(),
+            TenantSection::Status => tenant_status_view(&data),
+            TenantSection::Settings => tenant_settings_view(data),
+        }}
+    }
+    .into_any()
+}
+
+fn tenant_overview_view(data: &TenantSnapshot) -> AnyView {
+    let detail = &data.detail;
+    let model = ExplorerModel::new(data.topology.clone());
+    let summaries = model.group_summaries();
+    let attention = model.attention_nodes();
+    let capacity = &detail.worker_capacity;
+    let available = capacity
+        .available
+        .map_or_else(|| "Unknown".into(), |value| value.to_string());
+    let unavailable = capacity
+        .unavailable
+        .map_or_else(|| "Unknown".into(), |value| value.to_string());
+    let name = detail.summary.name.clone();
+    view! {
+        <section class="panel" aria-labelledby="readiness-heading">
+            <div class="panel__header">
+                <div>
+                    <h2 id="readiness-heading">"Current snapshot"</h2>
+                    <p>"Readiness and lifecycle are current observations, not historical telemetry."</p>
+                </div>
+            </div>
+            {if matches!(data.sections.resources, SectionAvailability::Available) {
+                view! {
+                    <div class="readiness-grid">
+                        {summaries.into_iter()
+                            .filter(|summary| summary.group != crate::explorer::ResourceGroup::Tenant)
+                            .map(|summary| view! {
+                            <div class="readiness-card">
+                                <strong>{summary.group.label()}</strong>
+                                <span>{format!("{} resources", summary.count)}</span>
+                                <span class="secondary">{format!(
+                                    "{} ready · {} progressing · {} degraded · {} failed · {} deleting · {} unknown",
+                                    summary.health.ready,
+                                    summary.health.progressing,
+                                    summary.health.degraded,
+                                    summary.health.failed,
+                                    summary.health.deleting,
+                                    summary.health.unknown,
+                                )}</span>
+                                <span class="secondary">{format!(
+                                    "{} exact · {} logical · {} external · {} recorded · {} summaries",
+                                    summary.provenance.exact,
+                                    summary.provenance.database_logical,
+                                    summary.provenance.external,
+                                    summary.provenance.recorded,
+                                    summary.provenance.synthetic,
+                                )}</span>
+                            </div>
+                        }).collect_view()}
+                    </div>
+                }.into_any()
+            } else {
+                view! {
+                    <p class="lifecycle-notice">
+                        "Resource health distribution is unavailable because the authoritative management inventory could not be read."
+                    </p>
+                }.into_any()
+            }}
+        </section>
+        <div class="detail-grid">
+            <section class="panel" aria-labelledby="capacity-heading">
+                <h2 id="capacity-heading">"Worker capacity"</h2>
+                <dl class="definition-list">
+                    <dt>"Desired"</dt><dd>{capacity.desired}</dd>
+                    <dt>"Available"</dt><dd>{available}</dd>
+                    <dt>"Unavailable"</dt><dd>{unavailable}</dd>
+                    <dt>"Ready Machines"</dt>
+                    <dd>{capacity.diagnostic_ready_machines.map_or_else(|| "Not applicable".into(), |value| value.to_string())}</dd>
+                </dl>
+            </section>
+            <section class="panel" aria-labelledby="lifecycle-heading">
+                <h2 id="lifecycle-heading">"Lifecycle"</h2>
+                <ol class="lifecycle-steps">
+                    {detail.lifecycle.iter().map(|stage| {
+                        let class = lifecycle_class(stage.state);
+                        view! {
+                            <li class=format!("lifecycle-step lifecycle-step--{class}")>
+                                <strong>{lifecycle_stage_label(stage.stage)}</strong>
+                                <span>{lifecycle_state_label(stage.state)}</span>
+                            </li>
+                        }
+                    }).collect_view()}
+                </ol>
+            </section>
+        </div>
+        <section class="panel" aria-labelledby="attention-heading">
+            <div class="panel__header">
+                <div>
+                    <h2 id="attention-heading">"Needs attention"</h2>
+                    <p>"Unhealthy tenant-associated resources in this snapshot."</p>
+                </div>
+            </div>
+            {if !matches!(data.sections.resources, SectionAvailability::Available) {
+                view! {
+                    <p class="lifecycle-notice">
+                        "Resource inventory is unavailable. Attention links are disabled until an authoritative inventory can be read."
+                    </p>
+                }.into_any()
+            } else if attention.is_empty() {
+                view! { <p class="empty">"No resources need attention."</p> }.into_any()
+            } else {
+                view! {
+                    <ul class="attention-list">
+                        {attention.into_iter().map(|node| {
+                            let class = health_class(node.health);
+                            if node.provenance == TopologyNodeProvenance::SyntheticSummary {
+                                view! {
+                                    <li>
+                                        <span>
+                                            <strong>{node.label}</strong>
+                                            <small class="secondary">" · Summary evidence; no exact resource target"</small>
+                                        </span>
+                                        <span class=format!("status status--{class}")>{health_label(node.health)}</span>
+                                    </li>
+                                }.into_any()
+                            } else {
+                                let href = tenant_resource_href(&name, &node.id)
+                                    .unwrap_or_else(|| tenant_section_href(&name, TenantSection::Resources).unwrap());
+                                view! {
+                                    <li>
+                                        <a href=href><strong>{node.label}</strong></a>
+                                        <span class=format!("status status--{class}")>{health_label(node.health)}</span>
+                                    </li>
+                                }.into_any()
+                            }
+                        }).collect_view()}
+                    </ul>
+                }.into_any()
+            }}
+        </section>
+    }.into_any()
+}
+
+fn resources_section_view(
+    data: &TenantSnapshot,
+    resource_selection: RwSignal<Option<String>>,
+    invalid_selection: bool,
+) -> AnyView {
+    match &data.sections.resources {
+        SectionAvailability::Available => view! {
+            <ResourceExplorer graph=data.topology.clone() selection=resource_selection invalid_selection/>
+        }.into_any(),
+        SectionAvailability::Unavailable { message, retryable, .. } => view! {
+            <section class="state-panel state-panel--error" role="alert">
+                <h2>"Resource inventory unavailable"</h2>
+                <p>{message.clone()}</p>
+                <p class="secondary">{if *retryable {
+                    "Refresh to retry the authoritative management inventory."
+                } else {
+                    "The inventory exceeded a service boundary and requires operator action."
+                }}</p>
+            </section>
+        }.into_any(),
+    }
+}
+
+fn tenant_status_view(data: &TenantSnapshot) -> AnyView {
+    let name = data.detail.summary.name.clone();
+    let resource_available = matches!(data.sections.resources, SectionAvailability::Available);
+    view! {
+        <div class="detail-grid">
+            {conditions_panel(data.detail.summary.conditions.clone())}
+            <section class="panel" aria-labelledby="blockers-heading">
+                <h2 id="blockers-heading">"Blockers"</h2>
+                {if data.detail.blockers.is_empty() {
+                    view! { <p class="empty">"No active blockers are reported."</p> }.into_any()
+                } else {
+                    view! {
+                        <ul class="blocker-list">
+                            {data.detail.blockers.iter().cloned().map(|blocker| {
+                                let href = blocker.target_node_id.as_deref()
+                                    .filter(|_| resource_available)
+                                    .filter(|target| resource_target_exists(data, Some(target)))
+                                    .and_then(|target| tenant_resource_href(&name, target));
+                                view! {
+                                    <li>
+                                        <strong>{blocker.code}</strong>
+                                        {blocker.condition_type.map(|value| view! {
+                                            <span class="secondary">{format!(" · {value}")}</span>
+                                        })}
+                                        <p>{blocker.message}</p>
+                                        {href.map(|href| view! { <a href=href>"Inspect affected resource"</a> })}
+                                    </li>
+                                }
+                            }).collect_view()}
+                        </ul>
+                    }.into_any()
+                }}
+            </section>
+        </div>
+        <section class="panel" aria-labelledby="availability-heading">
+            <h2 id="availability-heading">"Section availability"</h2>
+            <dl class="definition-list">
+                <dt>"Resources and topology"</dt><dd>{section_availability_label(&data.sections.resources)}</dd>
+                <dt>"Databases"</dt><dd>{section_availability_label(&data.sections.databases)}</dd>
+            </dl>
+        </section>
+    }.into_any()
+}
+
+fn tenant_settings_view(data: TenantSnapshot) -> AnyView {
+    let detail = data.detail;
+    let summary = detail.summary.clone();
     let generation_status = match detail.observed_generation {
         Some(observed) if observed == detail.generation => {
             format!("Current (generation {})", detail.generation)
@@ -555,71 +856,58 @@ fn tenant_detail_view(data: TenantSnapshot) -> AnyView {
         ),
         None => format!("Generation {} has not been observed", detail.generation),
     };
-
     view! {
-        <section class="metrics" aria-label="Tenant status summary">
-            <div class="metric">
-                <span class="metric__label">"Status"</span>
-                <span class=format!("status status--{status_class}")>
-                    {classification_label(classification)}
-                </span>
-            </div>
-            <div class="metric">
-                <span class="metric__label">"Provider"</span>
-                <strong class="metric__value">{provider_label(summary.provider)}</strong>
-            </div>
-            <div class="metric">
-                <span class="metric__label">"Workers"</span>
-                <strong class="metric__value">{summary.requested_workers}</strong>
-            </div>
-            <div class="metric">
-                <span class="metric__label">"Kubernetes"</span>
-                <strong>{summary.kubernetes_version.clone()}</strong>
-            </div>
-            <div class="metric">
-                <span class="metric__label">"Age"</span>
-                <strong>{format_age(summary.created_at.as_deref())}</strong>
-            </div>
-        </section>
-
-        <CatalogPanel name=tenant_name tenant_uid=tenant_uid.clone() classification/>
-
-        <TenantDeletePanel name=summary.name.clone() uid=tenant_uid/>
-
         <div class="detail-grid">
             <section class="panel" aria-labelledby="specification-heading">
                 <h2 id="specification-heading">"Immutable specification"</h2>
                 <dl class="definition-list">
-                    <dt>"Tenant UID"</dt><dd>{detail.uid}</dd>
+                    <dt>"Tenant UID"</dt><dd>{detail.uid.clone()}</dd>
                     <dt>"Generation"</dt><dd>{generation_status}</dd>
                     <dt>"Kubernetes version"</dt><dd>{detail.specification.kubernetes_version}</dd>
                     <dt>"Workers"</dt><dd>{detail.specification.workers}</dd>
-                    {provider_specification_rows(provider_specification)}
+                    {provider_specification_rows(detail.specification.provider)}
                 </dl>
             </section>
             <section class="panel" aria-labelledby="endpoint-heading">
                 <h2 id="endpoint-heading">"Access endpoint"</h2>
                 <dl class="definition-list">
-                    <dt>"Endpoint"</dt>
-                    <dd>{optional_text(summary.endpoint.as_deref()).to_owned()}</dd>
+                    <dt>"Endpoint"</dt><dd>{optional_text(summary.endpoint.as_deref()).to_owned()}</dd>
                     <dt>"Provider"</dt><dd>{provider_label(summary.provider)}</dd>
                 </dl>
-                <p class="secondary">
-                    "Credentials and kubeconfig material are never returned to this browser."
-                </p>
+                <p class="secondary">"Credentials and kubeconfig material are never returned to this browser."</p>
             </section>
         </div>
+        {provider_panel(detail.provider_status)}
+        <TenantDeletePanel name=summary.name uid=detail.uid/>
+    }.into_any()
+}
 
-        <div class="detail-grid">
-            {conditions_panel(summary.conditions)}
-            {blockers_panel(detail.blockers)}
-        </div>
-
-        {provider_panel(provider_status)}
-        {management_resources_panel(detail.management_resources)}
-        {topology_panel(topology)}
+fn tenant_section_label(section: TenantSection) -> &'static str {
+    match section {
+        TenantSection::Overview => "Overview",
+        TenantSection::Resources => "Resources",
+        TenantSection::Databases => "Databases",
+        TenantSection::Status => "Status",
+        TenantSection::Settings => "Settings",
     }
-    .into_any()
+}
+
+fn lifecycle_class(state: LifecycleStageState) -> &'static str {
+    match state {
+        LifecycleStageState::Completed => "completed",
+        LifecycleStageState::Current => "current",
+        LifecycleStageState::Blocked => "blocked",
+        LifecycleStageState::Pending => "pending",
+        LifecycleStageState::NotApplicable => "not-applicable",
+        LifecycleStageState::Unknown => "unknown",
+    }
+}
+
+fn section_availability_label(section: &SectionAvailability) -> String {
+    match section {
+        SectionAvailability::Available => "Available".into(),
+        SectionAvailability::Unavailable { message, .. } => format!("Unavailable · {message}"),
+    }
 }
 
 #[component]
@@ -630,10 +918,11 @@ fn TenantDeletePanel(name: String, uid: String) -> impl IntoView {
     let requested_uid = uid.clone();
     let submit = move |event: leptos::ev::SubmitEvent| {
         event.prevent_default();
-        if !delete_enabled(
+        if !exact_confirmation_enabled(
             &requested_name,
             &confirmation.get_untracked(),
             matches!(state.get_untracked(), MutationState::Running),
+            false,
         ) {
             return;
         }
@@ -725,10 +1014,11 @@ fn TenantDeletePanel(name: String, uid: String) -> impl IntoView {
                     <button
                         class="button--danger"
                         type="submit"
-                        disabled=move || !delete_enabled(
+                        disabled=move || !exact_confirmation_enabled(
                             &button_name,
                             &confirmation.get(),
                             matches!(state.get(), MutationState::Running),
+                            false,
                         )
                     >
                         {move || if matches!(state.get(), MutationState::Running) {
@@ -805,36 +1095,6 @@ fn conditions_panel(conditions: Vec<TenantCondition>) -> AnyView {
                                         {generation.map(|value| view! { <p class="secondary">{value}</p> })}
                                     </li>
                                 }
-                            })
-                            .collect_view()}
-                    </ul>
-                }
-                .into_any()
-            }}
-        </section>
-    }
-    .into_any()
-}
-
-fn blockers_panel(blockers: Vec<tenant_admin_shared::query::TenantBlocker>) -> AnyView {
-    view! {
-        <section class="panel" aria-labelledby="blockers-heading">
-            <h2 id="blockers-heading">"Blockers"</h2>
-            {if blockers.is_empty() {
-                view! { <p class="empty">"No active blockers are reported."</p> }.into_any()
-            } else {
-                view! {
-                    <ul class="blocker-list">
-                        {blockers
-                            .into_iter()
-                            .map(|blocker| view! {
-                                <li>
-                                    <strong>{blocker.code}</strong>
-                                    {blocker.condition_type.map(|value| view! {
-                                        <span class="secondary">{format!(" · {value}")}</span>
-                                    })}
-                                    <p>{blocker.message}</p>
-                                </li>
                             })
                             .collect_view()}
                     </ul>
@@ -1050,174 +1310,28 @@ fn azure_provider_view(mut azure: AzureProviderView) -> AnyView {
     .into_any()
 }
 
-fn management_resources_panel(
-    mut resources: Vec<tenant_admin_shared::query::ManagementResourceView>,
-) -> AnyView {
-    resources.sort_by(|left, right| {
-        left.role
-            .cmp(&right.role)
-            .then_with(|| identity_key(&left.identity).cmp(&identity_key(&right.identity)))
-    });
-    view! {
-        <section class="panel" aria-labelledby="resources-heading">
-            <div class="panel__header">
-                <div>
-                    <h2 id="resources-heading">"Management resources"</h2>
-                    <p>"Resources associated through exact status and ownership identities."</p>
-                </div>
-            </div>
-            {if resources.is_empty() {
-                view! { <p class="empty">"No linked management resources are reported."</p> }.into_any()
-            } else {
-                view! {
-                    <ul class="resource-list">
-                        {resources
-                            .into_iter()
-                            .map(|resource| {
-                                let class = health_class(resource.health);
-                                let status = health_label(resource.health);
-                                let name = namespaced_name(
-                                    resource.identity.namespace.as_deref(),
-                                    &resource.identity.name,
-                                );
-                                view! {
-                                    <li>
-                                        <div class="resource-heading">
-                                            <strong>{format!("{} · {}", resource.role, resource.identity.kind)}</strong>
-                                            <span class=format!("status status--{class}")>{status}</span>
-                                        </div>
-                                        <p>{name}</p>
-                                        {resource.message.map(|message| view! { <p>{message}</p> })}
-                                    </li>
-                                }
-                            })
-                            .collect_view()}
-                    </ul>
-                }
-                .into_any()
-            }}
-        </section>
-    }
-    .into_any()
-}
-
-fn topology_panel(graph: TopologyGraph) -> AnyView {
-    let layout = layout_graph(&graph);
-    let title_id = format!("topology-{}-title", graph.tenant_name);
-    let description_id = format!("topology-{}-description", graph.tenant_name);
-    let labelled_by = format!("{title_id} {description_id}");
-    let view_box = format!("0 0 {} {}", layout.width, layout.height);
-    let graph_title = format!("{} management topology", graph.tenant_name);
-    let provider = provider_label(graph.provider);
-
-    view! {
-        <section class="panel" aria-labelledby="topology-heading">
-            <div class="panel__header">
-                <div>
-                    <h2 id="topology-heading">"Topology"</h2>
-                    <p>{format!("{provider} management-plane resources; layout is deterministic.")}</p>
-                </div>
-            </div>
-            {if layout.nodes.is_empty() {
-                view! {
-                    <div class="empty">
-                        <h3>"Topology is not available yet"</h3>
-                        <p>"The Tenant can still be inspected while management resources reconcile."</p>
-                    </div>
-                }
-                .into_any()
-            } else {
-                view! {
-                    <div class="topology-scroll">
-                        <svg
-                            class="topology"
-                            viewBox=view_box
-                            role="img"
-                            aria-labelledby=labelled_by
-                            preserveAspectRatio="xMinYMin meet"
-                        >
-                            <title id=title_id>{graph_title}</title>
-                            <desc id=description_id>
-                                "A left-to-right graph of the Tenant and associated management resources. Each node includes its resource type and health."
-                            </desc>
-                            <defs>
-                                <marker
-                                    id="topology-arrow"
-                                    markerWidth="8"
-                                    markerHeight="8"
-                                    refX="7"
-                                    refY="4"
-                                    orient="auto"
-                                    markerUnits="strokeWidth"
-                                >
-                                    <path d="M 0 0 L 8 4 L 0 8 z" fill="#8296a5"/>
-                                </marker>
-                            </defs>
-                            {layout
-                                .edges
-                                .into_iter()
-                                .map(|edge| {
-                                    let label = edge
-                                        .label
-                                        .unwrap_or_else(|| edge_kind_label(edge.kind).to_owned());
-                                    view! {
-                                        <g>
-                                            <path
-                                                class="edge"
-                                                d=edge.path
-                                                marker-end="url(#topology-arrow)"
-                                            />
-                                            <text class="edge-label" x=edge.label_x y=edge.label_y>{label}</text>
-                                        </g>
-                                    }
-                                })
-                                .collect_view()}
-                            {layout
-                                .nodes
-                                .into_iter()
-                                .map(|node| {
-                                    let class = health_class(node.health);
-                                    let kind = node_kind_label(node.kind);
-                                    let health = health_label(node.health);
-                                    let accessible = format!("{}; {kind}; status {health}", node.label);
-                                    view! {
-                                        <g
-                                            class=format!("node node--{class}")
-                                            role="group"
-                                            aria-label=accessible
-                                            tabindex="0"
-                                            transform=format!("translate({}, {})", node.x, node.y)
-                                        >
-                                            <rect
-                                                width=node.width
-                                                height=node.height
-                                                rx="9"
-                                                ry="9"
-                                            />
-                                            <text class="node-label" x="14" y="29">{node.label}</text>
-                                            <text class="node-meta" x="14" y="53">{kind}</text>
-                                            <text class="node-meta" x="14" y="72">{health}</text>
-                                        </g>
-                                    }
-                                })
-                                .collect_view()}
-                        </svg>
-                    </div>
-                }
-                .into_any()
-            }}
-        </section>
-    }
-    .into_any()
-}
-
 #[component]
 fn RouteNotFound() -> impl IntoView {
     view! {
         <main class="page">
             <section class="state-panel state-panel--error">
                 <h1>"Page not found"</h1>
-                <p>"Tenant Admin supports the overview and individual Tenant detail pages."</p>
+                <p>"The requested Tenant Admin page does not exist."</p>
+                <p><a href="/">"Return to all Tenants"</a></p>
+            </section>
+        </main>
+    }
+}
+
+#[component]
+fn TenantRouteNotFound(name: String) -> impl IntoView {
+    let tenant = tenant_section_href(&name, TenantSection::Overview).unwrap_or_else(|| "/".into());
+    view! {
+        <main class="page">
+            <section class="state-panel state-panel--error">
+                <h1>"Tenant section not found"</h1>
+                <p>"The requested section is not available."</p>
+                <p><a href=tenant>"Return to Tenant overview"</a></p>
                 <p><a href="/">"Return to all Tenants"</a></p>
             </section>
         </main>

@@ -64,7 +64,7 @@ ADMIN_SERVICE_PROXY = (
     "/api/v1/namespaces/tenant-system/"
     "services/http:tenant-admin:http/proxy"
 )
-ADMIN_API_SCHEMA_VERSION = 5
+ADMIN_API_SCHEMA_VERSION = 6
 CAPI_CAPZ_DEPLOYMENTS = (
     ("capi-system", "capi-controller-manager"),
     (
