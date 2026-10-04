@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from scripts.test_e2e import (
     _restart_worker_and_verify_markers,
+    _wait_databases_ready,
     _verify_restarts_and_markers,
     capture_tenant_deletion_identity,
     verify_tenant_deletion,
@@ -83,6 +84,41 @@ class TenantDeletionProofTests(unittest.TestCase):
         snapshot.assert_called_once_with({"LAB_PREFIX": "lab"}, self.client, current)
         self.assertEqual("tenant-uid", captured["uid"])
         self.assertEqual(self.identity["allocationLease"], captured["allocationLease"])
+
+    def test_unknown_create_outcome_restarts_database_controller_once(self) -> None:
+        blocked = {
+            "databases": [
+                {
+                    "name": "alpha",
+                    "phase": "progressing",
+                    "blockers": [{"code": "UnknownCreateOutcome"}],
+                },
+                {"name": "beta", "phase": "ready", "blockers": []},
+                {"name": "gamma", "phase": "ready", "blockers": []},
+            ],
+        }
+        ready = {
+            "databases": [
+                {"name": name, "phase": "ready", "blockers": []}
+                for name in ("alpha", "beta", "gamma")
+            ],
+        }
+        catalog = Mock()
+        catalog.read.side_effect = [blocked, ready]
+        with (
+            patch("scripts.test_e2e._restart_database_controller") as restart,
+            patch("scripts.test_e2e.time.monotonic", side_effect=[0, 1]),
+            patch("scripts.test_e2e.time.sleep"),
+        ):
+            result = _wait_databases_ready(
+                self.client,
+                catalog,
+                "catalog-uid",
+                {"alpha", "beta", "gamma"},
+                30,
+            )
+        restart.assert_called_once_with(self.client)
+        self.assertEqual(ready, result)
 
     def test_capture_rejects_same_name_replacement_or_missing_tenant(self) -> None:
         for payload in (None, {"metadata": {"name": "tenant-a", "uid": "replacement"}}):

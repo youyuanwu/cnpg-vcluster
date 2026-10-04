@@ -313,12 +313,13 @@ class TimingTests(unittest.TestCase):
             entry("gamma"),
         ]}
         catalog = Mock()
-        catalog.read.return_value = {"catalogUid": "catalog-uid", "databases": []}
-        catalog.add.side_effect = ["alpha-uid", "beta-uid", "gamma-uid", "new-beta-uid"]
-        catalog.wait.side_effect = [
-            complete, {"databases": [entry("alpha"), entry("gamma")]},
+        catalog.read.side_effect = [
+            {"catalogUid": "catalog-uid", "databases": []},
+            complete,
             recreated,
         ]
+        catalog.add.side_effect = ["alpha-uid", "beta-uid", "gamma-uid", "new-beta-uid"]
+        catalog.wait.return_value = {"databases": [entry("alpha"), entry("gamma")]}
         catalog.query.side_effect = query
         catalog.assert_fresh = Mock()
         catalog.path = "api/v1/tenants/tenant-example/databases"

@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
 from datetime import datetime
 from pathlib import Path
 
@@ -366,6 +367,37 @@ def _restart_database_controller(client: ManagementClient) -> None:
     )
 
 
+def _wait_databases_ready(
+    client: ManagementClient,
+    catalog: CatalogClient,
+    catalog_uid: str,
+    names: set[str],
+    timeout: int,
+) -> dict[str, object]:
+    deadline = time.monotonic() + timeout
+    restarted = False
+    while True:
+        projected = catalog.read(catalog_uid)
+        databases = projected["databases"]
+        if (
+            len(databases) == len(names)
+            and {entry["name"] for entry in databases} == names
+            and all(entry["phase"] == "ready" for entry in databases)
+        ):
+            return projected
+        unknown = any(
+            blocker.get("code") == "UnknownCreateOutcome"
+            for entry in databases
+            for blocker in entry["blockers"]
+        )
+        if unknown and not restarted:
+            _restart_database_controller(client)
+            restarted = True
+        if time.monotonic() >= deadline:
+            raise RuntimeError("catalog did not converge before deadline")
+        time.sleep(5)
+
+
 def _restart_worker_and_verify_markers(
     root: Path, config: dict[str, str], client: ManagementClient,
     tenant, tenant_uid: str, catalog: CatalogClient, catalog_uid: str,
@@ -639,11 +671,12 @@ def run_e2e() -> int:
                 raise RuntimeError("Tenant implicitly created a database")
             catalog_uid = initial["catalogUid"]
             logical_uids = {name: catalog.add(catalog_uid, name) for name in sorted(entries)}
-            ready = catalog.wait(
-                lambda item: all(
-                    entry["phase"] == "ready" for entry in item["databases"]
-                ) and len(item["databases"]) == 3,
-                parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+            ready = _wait_databases_ready(
+                client,
+                catalog,
+                catalog_uid,
+                entries,
+                parse_duration(config["CNPG_TIMEOUT"]) * 4,
             )
             observed = ready_entries(ready, entries, "local")
             observed = _verify_restarts_and_markers(
@@ -664,10 +697,12 @@ def run_e2e() -> int:
             if replacement_uid == old_uid:
                 raise RuntimeError("recreated entry reused the deleted logical UID")
             catalog.require_stale_query(catalog_uid, old_entry)
-            ready = catalog.wait(
-                lambda item: len(item["databases"]) == 3
-                and all(entry["phase"] == "ready" for entry in item["databases"]),
-                parse_duration(config["CNPG_TIMEOUT"]) * 4, catalog_uid,
+            ready = _wait_databases_ready(
+                client,
+                catalog,
+                catalog_uid,
+                entries,
+                parse_duration(config["CNPG_TIMEOUT"]) * 4,
             )
             recreated = ready_entries(ready, entries, "local")
             if recreated["beta"]["logicalUid"] != replacement_uid:
