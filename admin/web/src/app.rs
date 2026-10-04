@@ -79,8 +79,9 @@ pub fn App() -> impl IntoView {
                     section,
                     selected_resource,
                     invalid_selection,
+                    selected_database,
                 } => view! {
-                    <TenantPage name section selected_resource invalid_selection/>
+                    <TenantPage name section selected_resource invalid_selection selected_database/>
                 }.into_any(),
                 AppRoute::TenantSectionNotFound { name } => {
                     view! { <TenantRouteNotFound name/> }.into_any()
@@ -136,6 +137,7 @@ fn TenantPage(
     section: TenantSection,
     selected_resource: Option<String>,
     invalid_selection: bool,
+    selected_database: Option<String>,
 ) -> impl IntoView {
     let refresh = RwSignal::new(0_u32);
     let refreshing = RwSignal::new(false);
@@ -183,6 +185,7 @@ fn TenantPage(
                         section,
                         resource_selection,
                         invalid_selection,
+                        selected_database.clone(),
                         refresh,
                     ),
                     LoadState::Error(error) => error_state(error, refresh),
@@ -581,6 +584,7 @@ fn tenant_workspace_view(
     section: TenantSection,
     resource_selection: RwSignal<Option<String>>,
     invalid_selection: bool,
+    selected_database: Option<String>,
     snapshot_refresh: RwSignal<u32>,
 ) -> AnyView {
     let detail = data.detail.clone();
@@ -622,7 +626,8 @@ fn tenant_workspace_view(
                 invalid_selection,
             ),
             TenantSection::Databases => view! {
-                <CatalogPanel name=tenant_name tenant_uid classification snapshot_refresh=Some(snapshot_refresh)/>
+                <CatalogPanel name=tenant_name tenant_uid classification
+                    selected_uid=selected_database snapshot_refresh=Some(snapshot_refresh)/>
             }.into_any(),
             TenantSection::Status => tenant_status_view(&data),
             TenantSection::Settings => tenant_settings_view(data),

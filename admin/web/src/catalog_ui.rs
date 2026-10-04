@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use leptos::prelude::*;
 use tenant_admin_shared::{
     catalog::{
@@ -20,11 +22,14 @@ use crate::{
         project_query_result,
     },
     error::{UiError, UiErrorKind},
-    format::{health_class, health_label, optional_text, provider_label},
+    format::{edge_kind_label, health_class, health_label, optional_text, provider_label},
     mutation_ui_state::{
         RefreshIntent, exact_confirmation_enabled, refresh_effects, unsafe_operation_enabled,
     },
-    route::{database_path, database_query_path, databases_path},
+    route::{
+        TenantSection, database_path, database_query_path, databases_path, tenant_database_href,
+        tenant_section_href,
+    },
     topology::layout_graph,
 };
 
@@ -108,6 +113,7 @@ pub fn CatalogPanel(
     name: String,
     tenant_uid: String,
     classification: TenantClassification,
+    selected_uid: Option<String>,
     snapshot_refresh: Option<RwSignal<u32>>,
 ) -> impl IntoView {
     provide_context(snapshot_refresh);
@@ -161,7 +167,8 @@ pub fn CatalogPanel(
                 }.into_any(),
                 CatalogLoad::Ready(catalog) => view! {
                     <CatalogContent name=name.clone() tenant_uid=tenant_uid.clone()
-                        classification catalog state notice busy locked/>
+                        classification selected_uid=selected_uid.clone()
+                        catalog state notice busy locked/>
                 }.into_any(),
             }}
         </section>
@@ -173,6 +180,7 @@ fn CatalogContent(
     name: String,
     tenant_uid: String,
     classification: TenantClassification,
+    selected_uid: Option<String>,
     catalog: CatalogView,
     state: RwSignal<CatalogLoad>,
     notice: RwSignal<Option<String>>,
@@ -184,6 +192,36 @@ fn CatalogContent(
     let add_reason = add_disabled_reason(&catalog, &name, &tenant_uid, classification);
     let entries = visible_databases(&catalog).to_vec();
     let capacity = format!("{count} of 3 slots occupied (deleting clusters retain their slot)");
+    if let Some(selected_uid) = selected_uid {
+        let list_href =
+            tenant_section_href(&name, TenantSection::Databases).unwrap_or_else(|| "/".into());
+        let selected = entries
+            .into_iter()
+            .find(|entry| entry.logical_uid == selected_uid);
+        return view! {
+            <a class="back-link" href=list_href>"← All database clusters"</a>
+            {selected.map_or_else(
+                || view! {
+                    <div class="database-warning" role="alert">
+                        <h3>"Database cluster not found"</h3>
+                        <p>"The selected logical identity is not present in the authoritative catalog."</p>
+                    </div>
+                }.into_any(),
+                |entry| {
+                    let can_act = entry_actions_enabled(
+                        &catalog, &name, &tenant_uid, classification, &entry,
+                    ) && count <= 3;
+                    let can_delete = entry_deletable(
+                        &catalog, &name, &tenant_uid, &entry,
+                    ) && count <= 3;
+                    view! {
+                        <DatabaseCard name=name catalog entry can_act can_delete
+                            state notice busy locked/>
+                    }.into_any()
+                },
+            )}
+        }.into_any();
+    }
     view! {
         <p class="secondary" role="status">{capacity}</p>
         {(!current).then(|| view! {
@@ -198,22 +236,37 @@ fn CatalogContent(
             view! { <p class="empty">"No database clusters have been added to this Tenant."</p> }.into_any()
         } else {
             view! {
-                <div class="database-cluster-list">
+                <div class="database-summary-list">
                     {entries.into_iter().map(|entry| {
-                        let can_act = entry_actions_enabled(&catalog, &name, &tenant_uid, classification, &entry)
-                            && count <= 3;
-                        let can_delete = entry_deletable(&catalog, &name, &tenant_uid, &entry)
-                            && count <= 3;
+                        let href = tenant_database_href(&name, &entry.logical_uid)
+                            .unwrap_or_else(|| tenant_section_href(&name, TenantSection::Databases).unwrap());
+                        let phase = if entry.deleting { "deleting" } else { entry.phase.as_str() };
+                        let status_class = match phase {
+                            "ready" => "ready",
+                            "deleting" => "deleting",
+                            "degraded" | "ownership-invalid" => "degraded",
+                            _ => "progressing",
+                        };
                         view! {
-                            <DatabaseCard name=name.clone() catalog=catalog.clone() entry
-                                can_act can_delete state notice busy locked/>
+                            <article class="database-summary-card">
+                                <div class="resource-heading">
+                                    <h3><a href=href>{entry.name}</a></h3>
+                                    <span class=format!("status status--{status_class}")>{phase.to_owned()}</span>
+                                </div>
+                                <p class="secondary">{format!("Logical UID: {}", entry.logical_uid)}</p>
+                                <dl class="database-summary-metrics">
+                                    <div><dt>"Instances"</dt><dd>{format!("{} / {} ready", entry.ready_instances, entry.instances)}</dd></div>
+                                    <div><dt>"Storage"</dt><dd>{format!("{} / {} healthy", entry.storage_healthy, entry.storage.len())}</dd></div>
+                                    <div><dt>"Blockers"</dt><dd>{entry.blockers.len()}</dd></div>
+                                </dl>
+                            </article>
                         }
                     }).collect_view()}
                 </div>
             }.into_any()
         }}
         {add_reason.map(|reason| view! { <p class="secondary" role="status">{reason}</p> })}
-    }
+    }.into_any()
 }
 
 #[component]
@@ -515,6 +568,24 @@ fn topology_view(uid: &str, name: &str, graph: TopologyGraph) -> AnyView {
     let desc_id = format!("database-{uid}-svg-description");
     let label = format!("{title_id} {desc_id}");
     let view_box = format!("0 0 {} {}", layout.width, layout.height);
+    let labels = graph
+        .nodes
+        .iter()
+        .map(|node| (node.id.as_str(), node.label.as_str()))
+        .collect::<BTreeMap<_, _>>();
+    let relationships = graph
+        .edges
+        .iter()
+        .filter_map(|edge| {
+            Some((
+                labels.get(edge.source.as_str())?.to_string(),
+                labels.get(edge.target.as_str())?.to_string(),
+                edge.label
+                    .clone()
+                    .unwrap_or_else(|| edge_kind_label(edge.kind).into()),
+            ))
+        })
+        .collect::<Vec<_>>();
     view! {
         <div class="topology-scroll">
             <svg class="topology" viewBox=view_box role="img" aria-labelledby=label preserveAspectRatio="xMinYMin meet">
@@ -533,6 +604,20 @@ fn topology_view(uid: &str, name: &str, graph: TopologyGraph) -> AnyView {
                     </g>
                 }).collect_view()}
             </svg>
+        </div>
+        <div class="relationship-list">
+            <h5>"Relationships"</h5>
+            {if relationships.is_empty() {
+                view! { <p class="secondary">"No relationships are observed."</p> }.into_any()
+            } else {
+                view! {
+                    <ul>
+                        {relationships.into_iter().map(|(source, target, kind)| view! {
+                            <li>{format!("{source} → {target} · {kind}")}</li>
+                        }).collect_view()}
+                    </ul>
+                }.into_any()
+            }}
         </div>
     }.into_any()
 }

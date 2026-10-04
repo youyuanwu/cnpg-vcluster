@@ -14,6 +14,11 @@ pub enum TenantSection {
     Settings,
 }
 
+pub fn tenant_database_href(name: &str, uid: &str) -> Option<String> {
+    (valid_tenant_name(name) && valid_database_uid(uid))
+        .then(|| format!("/tenants/{name}/databases/{uid}"))
+}
+
 impl TenantSection {
     pub const ALL: [Self; 5] = [
         Self::Overview,
@@ -42,6 +47,7 @@ pub enum AppRoute {
         section: TenantSection,
         selected_resource: Option<String>,
         invalid_selection: bool,
+        selected_database: Option<String>,
     },
     TenantSectionNotFound {
         name: String,
@@ -70,7 +76,8 @@ pub fn parse_location(path: &str, search: &str) -> AppRoute {
     if !valid_tenant_name(name) {
         return AppRoute::NotFound;
     }
-    let section = match segments.next() {
+    let section_segment = segments.next();
+    let section = match section_segment {
         None | Some("") | Some("overview") => TenantSection::Overview,
         Some("resources") => TenantSection::Resources,
         Some("databases") => TenantSection::Databases,
@@ -81,6 +88,19 @@ pub fn parse_location(path: &str, search: &str) -> AppRoute {
                 name: name.to_owned(),
             };
         }
+    };
+    let selected_database = if section == TenantSection::Databases {
+        match segments.next() {
+            Some(uid) if valid_database_uid(uid) => Some(uid.to_owned()),
+            Some(_) => {
+                return AppRoute::TenantSectionNotFound {
+                    name: name.to_owned(),
+                };
+            }
+            None => None,
+        }
+    } else {
+        None
     };
     if segments.next().is_some() {
         return AppRoute::TenantSectionNotFound {
@@ -97,6 +117,7 @@ pub fn parse_location(path: &str, search: &str) -> AppRoute {
         section,
         selected_resource,
         invalid_selection,
+        selected_database,
     }
 }
 
@@ -268,8 +289,8 @@ pub fn valid_tenant_name(name: &str) -> bool {
 mod tests {
     use super::{
         AppRoute, TenantSection, database_path, database_query_path, databases_path,
-        parse_location, parse_route, tenant_create_path, tenant_delete_path, tenant_href,
-        tenant_resource_href, tenant_section_href,
+        parse_location, parse_route, tenant_create_path, tenant_database_href, tenant_delete_path,
+        tenant_href, tenant_resource_href, tenant_section_href,
     };
 
     #[test]
@@ -282,6 +303,7 @@ mod tests {
                 section: TenantSection::Overview,
                 selected_resource: None,
                 invalid_selection: false,
+                selected_database: None,
             }
         );
         assert_eq!(
@@ -291,6 +313,7 @@ mod tests {
                 section: TenantSection::Resources,
                 selected_resource: Some("resource:1234".into()),
                 invalid_selection: false,
+                selected_database: None,
             }
         );
         assert_eq!(
@@ -300,6 +323,7 @@ mod tests {
                 section: TenantSection::Resources,
                 selected_resource: None,
                 invalid_selection: true,
+                selected_database: None,
             }
         );
         assert_eq!(
@@ -309,6 +333,7 @@ mod tests {
                 section: TenantSection::Resources,
                 selected_resource: None,
                 invalid_selection: true,
+                selected_database: None,
             }
         );
     }
@@ -350,6 +375,20 @@ mod tests {
             Some("/tenants/team-a/resources?select=resource%3Auid".into())
         );
         let uid = "12345678-1234-1234-1234-123456789abc";
+        assert_eq!(
+            parse_route(&format!("/tenants/team-a/databases/{uid}")),
+            AppRoute::Tenant {
+                name: "team-a".into(),
+                section: TenantSection::Databases,
+                selected_resource: None,
+                invalid_selection: false,
+                selected_database: Some(uid.into()),
+            }
+        );
+        assert_eq!(
+            tenant_database_href("team-a", uid),
+            Some(format!("/tenants/team-a/databases/{uid}"))
+        );
         assert_eq!(databases_path("Team-A"), None);
         assert_eq!(
             databases_path("team-a"),
