@@ -511,11 +511,46 @@ pub struct TopologyGraph {
 pub struct TopologyNode {
     pub id: String,
     pub kind: TopologyNodeKind,
+    pub semantic_kind: TopologySemanticKind,
+    pub ownership: TopologyOwnership,
     pub provenance: TopologyNodeProvenance,
+    pub database_role: Option<DatabaseInstanceRole>,
+    pub placement: Option<TopologyPlacement>,
     pub label: String,
     pub health: TopologyHealth,
     pub resource: Option<ResourceIdentityView>,
     pub attributes: Vec<DisplayAttribute>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TopologySemanticKind {
+    Tenant,
+    ControlPlane,
+    WorkerPool,
+    ComputeMachine,
+    WorkerNode,
+    DatabaseCluster,
+    DatabaseInstance,
+    AddOn,
+    ProviderInfrastructure,
+    Other,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum TopologyOwnership {
+    TenantOwned,
+    ProviderOwned,
+    Unknown,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TopologyPlacement {
+    pub worker_pool: Option<String>,
+    pub worker_node: Option<String>,
+    pub zone: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]

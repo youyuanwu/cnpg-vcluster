@@ -4,11 +4,15 @@ use tenant_admin_shared::query::{TopologyGraph, TopologyHealth};
 use crate::{
     explorer::{
         ExplorerFilter, ExplorerModel, ResourceGroup, ResourceRelationship, display_identity,
-        representation_label,
+        representation_class, representation_label, summary_group,
     },
-    format::{edge_kind_label, health_class, health_label, node_kind_label},
+    format::{
+        database_instance_role_class, database_instance_role_label, edge_kind_label, health_class,
+        health_label, node_kind_label, topology_ownership_class, topology_ownership_label,
+        topology_semantic_class, topology_semantic_label,
+    },
     mutation_ui_state::{SelectionRefresh, selection_after_refresh},
-    topology::layout_graph,
+    topology::{accessible_node_label, compact_placement, layout_graph},
 };
 
 #[component]
@@ -37,10 +41,44 @@ pub fn ResourceExplorer(
     let kind = RwSignal::new(String::new());
     let namespace = RwSignal::new(String::new());
     let namespace_not_applicable = RwSignal::new(false);
+    let applied_filter = RwSignal::new(ExplorerFilter::default());
 
     let list_model = model.clone();
     let graph_model = model.clone();
     let inspector_model = model.clone();
+    let selection_model = model.clone();
+
+    Effect::new(move |_| {
+        let filter = current_filter(
+            query.get(),
+            group.get(),
+            health.get(),
+            kind.get(),
+            namespace.get(),
+            namespace_not_applicable.get(),
+        );
+        let filter_changed = applied_filter.get_untracked() != filter;
+        applied_filter.set(filter.clone());
+        if filter_changed
+            && selected_relationship
+                .get_untracked()
+                .as_ref()
+                .is_some_and(|id| !selection_model.relationship_matches_filter(id, &filter))
+        {
+            selected_relationship.set(None);
+        }
+        let (next_selected, next_relationship) = selection_model.synchronized_focus(
+            &filter,
+            selected.get().as_deref(),
+            selected_relationship.get().as_deref(),
+        );
+        if selected.get() != next_selected {
+            selected.set(next_selected);
+        }
+        if selected_relationship.get() != next_relationship {
+            selected_relationship.set(next_relationship);
+        }
+    });
 
     view! {
         <section class="resource-explorer" aria-labelledby="resource-explorer-heading">
@@ -129,23 +167,16 @@ pub fn ResourceExplorer(
                 <aside class="explorer-inventory" aria-label="Resource inventory">
                     <h3>"Inventory"</h3>
                     {move || {
-                        let not_applicable = namespace_not_applicable.get();
-                        let filter = ExplorerFilter {
-                            query: query.get(),
-                            group: group.get(),
-                            health: parse_health(&health.get()),
-                            kind: parse_kind(&kind.get()),
-                            namespace: (!not_applicable)
-                                .then(|| namespace.get())
-                                .filter(|value| !value.is_empty()),
-                            namespace_not_applicable: not_applicable,
-                        };
+                        let filter = current_filter(
+                            query.get(),
+                            group.get(),
+                            health.get(),
+                            kind.get(),
+                            namespace.get(),
+                            namespace_not_applicable.get(),
+                        );
                         let nodes = list_model.filtered_nodes(&filter);
-                        let selection_hidden = selected.get().as_deref().is_some_and(|selected| {
-                            list_model.node(selected).is_some()
-                                && !nodes.iter().any(|node| node.id == selected)
-                        });
-                        let content = if nodes.is_empty() {
+                        if nodes.is_empty() {
                             view! { <p class="empty">"No resources match these filters."</p> }.into_any()
                         } else {
                             view! {
@@ -155,18 +186,32 @@ pub fn ResourceExplorer(
                                         let button_id = id.clone();
                                         let selected_id = id.clone();
                                         let class = health_class(node.health);
+                                        let semantic_details = inventory_semantic_details(&node);
                                         view! {
                                             <li>
                                                 <button type="button"
                                                     class="resource-select"
                                                     class:resource-select--selected=move || selected.get().as_deref() == Some(selected_id.as_str())
+                                                    aria-pressed=move || selected.get().as_deref() == Some(id.as_str())
                                                     on:click=move |_| {
                                                         selected.set(Some(button_id.clone()));
                                                         selected_relationship.set(None);
                                                     }>
                                                     <span>
                                                         <strong>{node.label}</strong>
-                                                        <small>{format!("{} · {}", node_kind_label(node.kind), representation_label(node.provenance))}</small>
+                                                        <small>{format!(
+                                                            "{} · {}",
+                                                            topology_semantic_label(node.semantic_kind),
+                                                            topology_ownership_label(node.ownership),
+                                                        )}</small>
+                                                        <small>{format!(
+                                                            "{} · {}",
+                                                            node_kind_label(node.kind),
+                                                            representation_label(node.provenance),
+                                                        )}</small>
+                                                        {semantic_details.map(|details| view! {
+                                                            <small>{details}</small>
+                                                        })}
                                                     </span>
                                                     <span class=format!("status status--{class}")>{health_label(node.health)}</span>
                                                 </button>
@@ -175,23 +220,23 @@ pub fn ResourceExplorer(
                                     }).collect_view()}
                                 </ul>
                             }.into_any()
-                        };
-                        view! {
-                            {selection_hidden.then(|| view! {
-                                <p class="lifecycle-notice" role="status">
-                                    "The active selection is hidden by the current filters. It remains visible in the graph and inspector."
-                                </p>
-                            })}
-                            {content}
-                        }.into_any()
+                        }
                     }}
                 </aside>
                 <div class="explorer-graph">
                     <h3>"Relationships"</h3>
                     {move || graph_view(
                         &graph_model,
+                        &current_filter(
+                            query.get(),
+                            group.get(),
+                            health.get(),
+                            kind.get(),
+                            namespace.get(),
+                            namespace_not_applicable.get(),
+                        ),
                         selected.get().as_deref(),
-                        group.get(),
+                        group,
                         selected,
                         selected_relationship,
                     )}
@@ -200,6 +245,14 @@ pub fn ResourceExplorer(
                     <h3>"Inspector"</h3>
                     {move || inspector_view(
                         &inspector_model,
+                        &current_filter(
+                            query.get(),
+                            group.get(),
+                            health.get(),
+                            kind.get(),
+                            namespace.get(),
+                            namespace_not_applicable.get(),
+                        ),
                         selected.get().as_deref(),
                         selected_relationship.get().as_deref(),
                         selected_relationship,
@@ -212,8 +265,9 @@ pub fn ResourceExplorer(
 
 fn graph_view(
     model: &ExplorerModel,
+    filter: &ExplorerFilter,
     selected_id: Option<&str>,
-    expanded_group: Option<ResourceGroup>,
+    group: RwSignal<Option<ResourceGroup>>,
     selected: RwSignal<Option<String>>,
     selected_relationship: RwSignal<Option<String>>,
 ) -> AnyView {
@@ -221,25 +275,7 @@ fn graph_view(
     let selected_edge = selected_edge_id
         .as_deref()
         .and_then(|id| model.relationship_by_id(id));
-    let graph = selected_edge_id.as_deref().map_or_else(
-        || {
-            selected_id.map_or_else(
-                || {
-                    expanded_group.map_or_else(
-                        || model.focused_graph(None),
-                        |group| model.group_graph(group),
-                    )
-                },
-                |selected_id| {
-                    expanded_group.map_or_else(
-                        || model.focused_graph(Some(selected_id)),
-                        |group| model.selected_group_graph(selected_id, group),
-                    )
-                },
-            )
-        },
-        |edge_id| model.relationship_graph(selected_id, edge_id),
-    );
+    let graph = model.graph_for_filter(filter, selected_id, selected_edge_id.as_deref());
     let endpoint_ids = selected_edge
         .as_ref()
         .map(|edge| (edge.source_id.clone(), edge.target_id.clone()));
@@ -255,17 +291,24 @@ fn graph_view(
                         <path d="M 0 0 L 8 4 L 0 8 z" fill="#8296a5"/>
                     </marker>
                 </defs>
+                {layout.bands.into_iter().map(|band| view! {
+                    <g class=format!("topology-band topology-band--{}", band.id)>
+                        <rect x=band.x y=band.y width=band.width height=band.height rx="12" ry="12"/>
+                        <text class="topology-band__label" x=band.x + 14.0 y=band.y + 22.0>{band.label}</text>
+                    </g>
+                }).collect_view()}
                 {layout.edges.into_iter().map(|edge| {
                     let edge_id = edge.id.clone();
                     let selected_edge = edge.id.clone();
-                    let label = edge.label.unwrap_or_else(|| edge_kind_label(edge.kind).into());
-                    let accessible_label = label.clone();
+                    let accessible_label = edge.label.clone().unwrap_or_else(|| edge_kind_label(edge.kind).into());
                     view! {
                         <g class:edge--selected=move || selected_relationship.get().as_deref() == Some(selected_edge.as_str())
                             aria-label=format!("Relationship {accessible_label}")
                             on:click=move |_| selected_relationship.set(Some(edge_id.clone()))>
                             <path class="edge" d=edge.path marker-end="url(#explorer-arrow)"/>
-                            <text class="edge-label" x=edge.label_x y=edge.label_y>{label}</text>
+                            {edge.label.map(|label| view! {
+                                <text class="edge-label" x=edge.label_x y=edge.label_y>{label}</text>
+                            })}
                         </g>
                     }
                 }).collect_view()}
@@ -273,25 +316,57 @@ fn graph_view(
                     let id = node.id.clone();
                     let selected_node = node.id.clone();
                     let class = health_class(node.health);
-                    let kind = node_kind_label(node.kind);
+                    let semantic = topology_semantic_label(node.semantic_kind);
                     let health = health_label(node.health);
-                    let accessible_label = node.label.clone();
+                    let ownership = topology_ownership_label(node.ownership);
+                    let role = node.database_role.map(database_instance_role_label);
+                    let role_class = node.database_role.map(database_instance_role_class);
+                    let placement = compact_placement(&node);
+                    let accessible_label = accessible_node_label(&node);
+                    let accessible_selected = accessible_label.clone();
+                    let accessible_id = node.id.clone();
+                    let summary_group = summary_group(&node.id);
                     let endpoint_node = endpoint_ids.as_ref().is_some_and(|(source, target)| {
                         source == &node.id || target == &node.id
                     });
                     view! {
-                        <g class=format!("node node--{class}")
+                        <g class=format!(
+                                "node node--{class} node-role--{} ownership--{} provenance--{}{}",
+                                topology_semantic_class(node.semantic_kind),
+                                topology_ownership_class(node.ownership),
+                                representation_class(node.provenance),
+                                role_class.map_or_else(String::new, |role| format!(" database-role--{role}")),
+                            )
                             class:node--selected=move || selected.get().as_deref() == Some(selected_node.as_str()) || endpoint_node
-                            aria-label=format!("{accessible_label}; {kind}; status {health}")
+                            aria-label=move || {
+                                if selected.get().as_deref() == Some(accessible_id.as_str()) {
+                                    format!("{accessible_selected}; selected")
+                                } else {
+                                    accessible_selected.clone()
+                                }
+                            }
                             transform=format!("translate({}, {})", node.x, node.y)
                             on:click=move |_| {
-                                selected.set(Some(id.clone()));
+                                if let Some(summary_group) = summary_group {
+                                    group.set(Some(summary_group));
+                                    selected.set(None);
+                                } else {
+                                    selected.set(Some(id.clone()));
+                                }
                                 selected_relationship.set(None);
                             }>
                             <rect width=node.width height=node.height rx="9" ry="9"/>
-                            <text class="node-label" x="14" y="29">{node.label}</text>
-                            <text class="node-meta" x="14" y="53">{kind}</text>
-                            <text class="node-meta" x="14" y="72">{health}</text>
+                            <text class="node-label" x="14" y="25">{node.label}</text>
+                            <text class="node-meta node-meta--role" x="14" y="47">
+                                {role.map_or_else(|| semantic.into(), |role| format!("{semantic} · {role}"))}
+                            </text>
+                            <text class="node-meta" x="14" y="68">{format!("{health} · {ownership}")}</text>
+                            {placement.first().map(|value| view! {
+                                <text class="node-meta" x="14" y="91">{value.clone()}</text>
+                            })}
+                            {placement.get(1).map(|value| view! {
+                                <text class="node-meta" x="14" y="111">{value.clone()}</text>
+                            })}
                         </g>
                     }
                 }).collect_view()}
@@ -302,14 +377,19 @@ fn graph_view(
 
 fn inspector_view(
     model: &ExplorerModel,
+    filter: &ExplorerFilter,
     selected_id: Option<&str>,
     selected_relationship: Option<&str>,
     relationship_signal: RwSignal<Option<String>>,
 ) -> AnyView {
-    if let Some(edge_id) = selected_relationship {
-        if let Some(edge) = model.relationship_by_id(edge_id) {
-            return relationship_view(edge, relationship_signal);
-        }
+    if let Some(edge_id) = selected_relationship
+        && let Some(edge) = model.relationship_by_id(edge_id)
+    {
+        return relationship_view(
+            edge,
+            relationship_signal,
+            model.relationship_matches_filter(edge_id, filter),
+        );
     }
     let Some(inspection) = selected_id.and_then(|id| model.inspection(id)) else {
         return view! {
@@ -379,6 +459,7 @@ fn RelationshipList(
 fn relationship_view(
     relationship: ResourceRelationship,
     signal: RwSignal<Option<String>>,
+    visible_in_graph: bool,
 ) -> AnyView {
     view! {
         <div class="resource-inspection">
@@ -386,6 +467,11 @@ fn relationship_view(
                 "← Resource details"
             </button>
             <p class="eyebrow">"Selected relationship"</p>
+            {(!visible_in_graph).then(|| view! {
+                <p class="lifecycle-notice" role="status">
+                    "This relationship remains inspectable, but an endpoint is hidden by the current filters."
+                </p>
+            })}
             <h4>{relationship.label.clone().unwrap_or_else(|| edge_kind_label(relationship.kind).into())}</h4>
             <dl class="definition-list">
                 <dt>"Source"</dt><dd>{relationship.source_label}</dd>
@@ -394,6 +480,45 @@ fn relationship_view(
             </dl>
         </div>
     }.into_any()
+}
+
+fn current_filter(
+    query: String,
+    group: Option<ResourceGroup>,
+    health: String,
+    kind: String,
+    namespace: String,
+    namespace_not_applicable: bool,
+) -> ExplorerFilter {
+    ExplorerFilter {
+        query,
+        group,
+        health: parse_health(&health),
+        kind: parse_kind(&kind),
+        namespace: (!namespace_not_applicable)
+            .then_some(namespace)
+            .filter(|value| !value.is_empty()),
+        namespace_not_applicable,
+    }
+}
+
+fn inventory_semantic_details(node: &tenant_admin_shared::query::TopologyNode) -> Option<String> {
+    let mut values = Vec::new();
+    if let Some(role) = node.database_role {
+        values.push(database_instance_role_label(role).to_owned());
+    }
+    if let Some(placement) = &node.placement {
+        if let Some(worker_pool) = &placement.worker_pool {
+            values.push(format!("Pool {worker_pool}"));
+        }
+        if let Some(worker_node) = &placement.worker_node {
+            values.push(format!("Node {worker_node}"));
+        }
+        if let Some(zone) = &placement.zone {
+            values.push(format!("Zone {zone}"));
+        }
+    }
+    (!values.is_empty()).then(|| values.join(" · "))
 }
 
 fn parse_health(value: &str) -> Option<TopologyHealth> {

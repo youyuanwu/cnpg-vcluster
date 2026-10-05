@@ -70,6 +70,7 @@ def write_archive(
     *,
     tagged: str = TAGGED,
     architecture: str = "amd64",
+    include_docker_manifest: bool = True,
 ) -> str:
     source_index = json.dumps(
         {
@@ -108,6 +109,23 @@ def write_archive(
         )
         add(f"blobs/sha256/{CONFIG_DIGEST.removeprefix('sha256:')}", CONFIG_BYTES)
         add(f"blobs/sha256/{LAYER_DIGEST.removeprefix('sha256:')}", LAYER_BYTES)
+        if include_docker_manifest:
+            add(
+                "manifest.json",
+                json.dumps(
+                    [
+                        {
+                            "Config": (
+                                f"blobs/sha256/{CONFIG_DIGEST.removeprefix('sha256:')}"
+                            ),
+                            "RepoTags": [tagged],
+                            "Layers": [
+                                f"blobs/sha256/{LAYER_DIGEST.removeprefix('sha256:')}"
+                            ],
+                        }
+                    ]
+                ).encode(),
+            )
     path.chmod(0o600)
     return f"example.invalid/lab/image:v1@{source_digest}"
 
@@ -420,6 +438,13 @@ class CacheTests(unittest.TestCase):
             exact = write_archive(archive, architecture="arm64")
             with self.assertRaises(IntegrityError):
                 _verify_archive_metadata(archive, TAGGED, exact)
+
+    def test_archive_requires_docker_compatible_manifest(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            archive = Path(temporary) / "image.tar"
+            write_archive(archive, include_docker_manifest=False)
+            with self.assertRaises(IntegrityError):
+                _verify_archive_metadata(archive, TAGGED, EXACT)
 
     def test_archive_rejects_symlink(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:

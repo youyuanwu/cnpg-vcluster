@@ -2,7 +2,7 @@ use tenant_admin_shared::query::{
     ConditionStatus, DatabaseInstanceObservation, DatabaseInstanceRole,
     DatabaseNotApplicableReason, DatabaseObservationFreshness, DatabaseUnavailableReason,
     ProviderMode, TenantClassification, TenantProvider, TopologyEdgeKind, TopologyHealth,
-    TopologyNodeKind,
+    TopologyNodeKind, TopologyOwnership, TopologySemanticKind,
 };
 
 pub const fn provider_mode_label(provider: ProviderMode) -> &'static str {
@@ -91,6 +91,52 @@ pub const fn database_instance_role_class(role: DatabaseInstanceRole) -> &'stati
         DatabaseInstanceRole::Primary => "primary",
         DatabaseInstanceRole::Standby => "standby",
         DatabaseInstanceRole::Unknown => "unknown",
+    }
+}
+
+pub const fn topology_semantic_label(kind: TopologySemanticKind) -> &'static str {
+    match kind {
+        TopologySemanticKind::Tenant => "Tenant",
+        TopologySemanticKind::ControlPlane => "Control plane",
+        TopologySemanticKind::WorkerPool => "Worker pool",
+        TopologySemanticKind::ComputeMachine => "Compute machine",
+        TopologySemanticKind::WorkerNode => "Worker node",
+        TopologySemanticKind::DatabaseCluster => "Database cluster",
+        TopologySemanticKind::DatabaseInstance => "Database instance",
+        TopologySemanticKind::AddOn => "Add-on",
+        TopologySemanticKind::ProviderInfrastructure => "Provider infrastructure",
+        TopologySemanticKind::Other => "Other",
+    }
+}
+
+pub const fn topology_semantic_class(kind: TopologySemanticKind) -> &'static str {
+    match kind {
+        TopologySemanticKind::Tenant => "tenant",
+        TopologySemanticKind::ControlPlane => "control-plane",
+        TopologySemanticKind::WorkerPool => "worker-pool",
+        TopologySemanticKind::ComputeMachine => "compute-machine",
+        TopologySemanticKind::WorkerNode => "worker-node",
+        TopologySemanticKind::DatabaseCluster => "database-cluster",
+        TopologySemanticKind::DatabaseInstance => "database-instance",
+        TopologySemanticKind::AddOn => "add-on",
+        TopologySemanticKind::ProviderInfrastructure => "provider-infrastructure",
+        TopologySemanticKind::Other => "other",
+    }
+}
+
+pub const fn topology_ownership_label(ownership: TopologyOwnership) -> &'static str {
+    match ownership {
+        TopologyOwnership::TenantOwned => "Tenant-owned",
+        TopologyOwnership::ProviderOwned => "Provider-owned",
+        TopologyOwnership::Unknown => "Ownership unknown",
+    }
+}
+
+pub const fn topology_ownership_class(ownership: TopologyOwnership) -> &'static str {
+    match ownership {
+        TopologyOwnership::TenantOwned => "tenant",
+        TopologyOwnership::ProviderOwned => "provider",
+        TopologyOwnership::Unknown => "unknown",
     }
 }
 
@@ -265,13 +311,16 @@ fn parse_number(bytes: &[u8]) -> Option<u32> {
 mod tests {
     use tenant_admin_shared::query::{
         DatabaseInstanceObservation, DatabaseInstanceRole, DatabaseNotApplicableReason,
-        DatabaseUnavailableReason, TenantClassification, TopologyHealth,
+        DatabaseUnavailableReason, TenantClassification, TopologyHealth, TopologyOwnership,
+        TopologySemanticKind,
     };
 
     use super::{
         classification_class, classification_label, database_instance_role_label,
         database_instance_summary, database_not_applicable_reason_label,
         database_unavailable_reason_label, format_age_at, health_class, sort_database_instances,
+        topology_ownership_class, topology_ownership_label, topology_semantic_class,
+        topology_semantic_label,
     };
 
     #[test]
@@ -285,6 +334,22 @@ mod tests {
             "progressing"
         );
         assert_eq!(health_class(TopologyHealth::Unknown), "unknown");
+        assert_eq!(
+            topology_semantic_label(TopologySemanticKind::DatabaseInstance),
+            "Database instance"
+        );
+        assert_eq!(
+            topology_semantic_class(TopologySemanticKind::ProviderInfrastructure),
+            "provider-infrastructure"
+        );
+        assert_eq!(
+            topology_ownership_label(TopologyOwnership::ProviderOwned),
+            "Provider-owned"
+        );
+        assert_eq!(
+            topology_ownership_class(TopologyOwnership::Unknown),
+            "unknown"
+        );
     }
 
     #[test]

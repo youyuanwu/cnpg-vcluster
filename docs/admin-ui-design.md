@@ -181,31 +181,52 @@ Missing or stale authoritative evidence is Unknown rather than zero or
 inferred completion.
 
 Resources derives the approved Tenant, Control plane, Compute, Databases,
-Add-ons, Provider infrastructure and Other groups from the accepted topology.
-Search covers available name, kind, namespace, UID and display attributes;
-health and group filters are local operations over the loaded snapshot. The
-default graph contains the Tenant and group summaries. A selected resource,
-relationship, or expanded group produces a deterministic graph of at most 20
-resource nodes. The inventory, graph, textual relationship list and inspector
-share one selection. Exact Kubernetes resources, logical database
+Add-ons, Provider infrastructure and Other groups from typed semantic kinds in
+the accepted topology. Search covers available name, generic and semantic
+kind, ownership, representation provenance, health, database role, placement,
+namespace, UID and display attributes; health, kind, namespace and group
+filters are local operations over the loaded snapshot. The default graph
+contains the Tenant and group summaries. Active filters instead produce a
+deterministic matching graph, and a selected resource, relationship or group
+expansion produces a deterministic graph of at most 20 resource nodes.
+Filtering away the selected resource or either focused relationship endpoint
+clears that focus across inventory, graph and inspector.
+
+The graph uses fixed Tenant, Control plane, Compute, Databases, Add-ons,
+Provider infrastructure and Other architecture bands rather than generic kind
+columns. Compute roles and database cluster/instance roles have stable
+positions inside their bands. Database instances are grouped with their
+surviving cluster parent and ordered Primary → Standby → Unknown; an omitted
+parent yields a stable orphan row. Available worker-pool, worker-node and zone
+placement is compact node metadata, not a set of additional graph edges.
+Azure pool placement is present only when the recorded pool UID resolves to an
+accepted pool resource. Unavailable placement remains `Not reported` in native
+details and is never inferred from names or display strings. Edges without an
+explicit source label have no visible label; relationship type remains in
+accessible and textual details.
+
+Ownership (`tenant-owned`, `provider-owned` or `unknown`) is independent of
+representation provenance. Exact Kubernetes resources, logical database
 representations, external provider representations, recorded representations
-and synthetic summaries are labeled separately. Synthetic summaries are not
-ordinary resource counts.
+and synthetic summaries remain labeled separately. Health, ownership,
+provenance, database role and selection use distinct text/style channels;
+synthetic summaries are not ordinary resource counts.
 
 Tenant navigation, inventory selection, filters, textual relationship
 selection and all lifecycle/database controls use native links, buttons and
 form controls with visible focus. Health always includes text and shape in
 addition to color. The SVG graph is supplemental rather than the sole
 interaction path: the keyboard-operable inventory and inspector expose the
-same identity, health, attributes and directional relationships. Loading,
+same semantic identity, ownership, representation provenance, health,
+placement, attributes and directional relationships. Loading,
 partial-failure, mutation and error changes retain status, alert and live
 region semantics. Reduced-motion preferences minimize animation.
 
 At the existing responsive breakpoints the Tenant context and explorer
 collapse from coordinated columns to sequential content. Tables and topology
-retain bounded internal overflow; primary navigation and page content remain
-reachable without page-level horizontal scrolling at the 320 CSS-pixel
-minimum viewport.
+retain bounded internal horizontal and vertical overflow, including tall
+architecture bands; primary navigation and page content remain reachable
+without page-level horizontal scrolling at the 320 CSS-pixel minimum viewport.
 
 Status shows current conditions, reconciliation blockers, section
 availability, and links to an affected snapshot node when the server can bind
@@ -213,7 +234,7 @@ one safely. Settings contains the immutable specification, endpoint, sanitized
 provider status, and the Tenant danger zone. Tenant deletion is no longer
 adjacent to routine exploration.
 
-Databases independently reads the schema-v6 catalog, showing at most three
+Databases independently reads the schema-v7 catalog, showing at most three
 compact list entries for either provider. A stable logical-UID location opens
 one detail containing identity, reconciliation phase, ready instances,
 storage, blockers, conditions, finalization progress, entry-scoped topology,
@@ -280,10 +301,10 @@ detail returns a typed not-found response and recovery links.
 Every successful JSON response is:
 
 ```json
-{"schemaVersion":6,"data":{}}
+{"schemaVersion":7,"data":{}}
 ```
 
-Errors use schema version 6 plus a typed error code, sanitized message,
+Errors use schema version 7 plus a typed error code, sanitized message,
 retryable flag, and optional bounded field errors. The routes are:
 
 | Route | Response |
@@ -336,8 +357,9 @@ The shared DTOs include:
   delete request/result, and field-associated validation errors;
 - Azure binding, management roots, worker pool, Nodes, add-ons, and recorded
   provider resources;
-- topology nodes, edges, health, display attributes, exact resource identity,
-  and representation provenance.
+- topology nodes, edges, generic and semantic kind, ownership, representation
+  provenance, database role, placement, health, display attributes and exact
+  resource identity.
 
 Catalog additions use `{"catalogUid","name","instances"}` and require a
 Ready Tenant, open catalog, available database capability and current

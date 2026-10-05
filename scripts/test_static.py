@@ -984,7 +984,7 @@ def check_documentation() -> None:
     contracts = (ROOT / "controller" / "CONTRACTS.md").read_text(encoding="utf-8")
     catalog_docs = {
         "README": (readme, (
-            "v1alpha4", "explicit catalog entries", "schema-v6",
+            "v1alpha4", "explicit catalog entries", "schema-v7",
             "three-by-three", "nine-disk", "passed manually",
             "catalog-bootstrap-probe.json", "12,000",
         )),
@@ -993,15 +993,16 @@ def check_documentation() -> None:
             "catalog entry health", "direct ARM NotFound",
         )),
         "Admin design": (admin_design, (
-            "schema version 6", "catalogUid", "logicalUid", "instanceUid",
-            "same-authority", "browser/service-proxy",
+            "schema version 7", "catalogUid", "logicalUid", "instanceUid",
+            "same-authority", "browser/service-proxy", "typed semantic kinds",
+            "tenant-owned", "Database cluster", "Not reported",
         )),
         "Azure design": (azure_design, (
             "TenantDatabaseCatalog", "4-GiB", "StandardSSD_LRS",
             "nine exact", "Release acceptance completed",
         )),
         "API compatibility": (compatibility, (
-            "v1alpha4", "v1alpha1", "resourceVersion", "schemaVersion: 6",
+            "v1alpha4", "v1alpha1", "resourceVersion", "schemaVersion: 7",
             "in-flight CREATE", "never automatically retired",
         )),
         "controller contracts": (contracts, (

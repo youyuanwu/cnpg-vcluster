@@ -78,7 +78,7 @@ admission webhook, reservation or quota
 The managed Azure API cannot use the local kind management-container restart
 protocol; it stays fenced until an independent terminal proof is available.
 
-The public Admin envelope uses `schemaVersion: 6`. Clients must switch from
+The public Admin envelope uses `schemaVersion: 7`. Clients must switch from
 the singular local-only query route to
 `GET/POST /api/v1/tenants/{name}/databases`,
 `DELETE /api/v1/tenants/{name}/databases/{uid}` and

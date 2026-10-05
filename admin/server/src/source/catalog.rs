@@ -16,8 +16,9 @@ use tenant_admin_shared::{
         FinalizationView, InstanceView, QueryIdentityView, StorageView,
     },
     query::{
-        DisplayAttribute, ProviderMode, TenantProvider, TopologyEdge, TopologyEdgeKind,
-        TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind, TopologyNodeProvenance,
+        DatabaseInstanceRole, DisplayAttribute, ProviderMode, TenantProvider, TopologyEdge,
+        TopologyEdgeKind, TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind,
+        TopologyNodeProvenance, TopologyOwnership, TopologySemanticKind,
     },
 };
 use tenant_controller::{
@@ -1096,7 +1097,11 @@ pub(super) fn project(
         let mut nodes = vec![TopologyNode {
             id: root_id.clone(),
             kind: TopologyNodeKind::Database,
+            semantic_kind: TopologySemanticKind::DatabaseCluster,
+            ownership: TopologyOwnership::TenantOwned,
             provenance: TopologyNodeProvenance::DatabaseLogicalRepresentation,
+            database_role: None,
+            placement: None,
             label: entry.name.clone(),
             health,
             resource: None,
@@ -1117,7 +1122,11 @@ pub(super) fn project(
             nodes.push(TopologyNode {
                 id: id.clone(),
                 kind: TopologyNodeKind::Database,
+                semantic_kind: TopologySemanticKind::DatabaseInstance,
+                ownership: TopologyOwnership::TenantOwned,
                 provenance: TopologyNodeProvenance::DatabaseLogicalRepresentation,
+                database_role: Some(catalog_database_role(&instance.role)),
+                placement: None,
                 label: instance.name.clone(),
                 health: if instance.ready {
                     TopologyHealth::Ready
@@ -1138,6 +1147,7 @@ pub(super) fn project(
                 label: None,
             });
         }
+
         databases.push(DatabaseView {
             logical_uid: logical_uid.clone(),
             name: entry.name.clone(),
@@ -1176,6 +1186,7 @@ pub(super) fn project(
             },
         });
     }
+
     Ok(CatalogView {
         tenant: catalog.spec.tenant_name.clone(),
         tenant_uid: catalog.spec.tenant_uid.clone(),
@@ -1185,6 +1196,14 @@ pub(super) fn project(
         capability_available,
         databases,
     })
+}
+
+fn catalog_database_role(role: &str) -> DatabaseInstanceRole {
+    match role {
+        "primary" => DatabaseInstanceRole::Primary,
+        "standby" => DatabaseInstanceRole::Standby,
+        _ => DatabaseInstanceRole::Unknown,
+    }
 }
 
 #[cfg(test)]
@@ -1423,6 +1442,15 @@ mod tests {
         state.conditions[0].reason = "password=hidden".into();
         state.conditions[0].message = "token=private".into();
         state.instances[0].role = "password=hidden".into();
+        catalog
+            .status
+            .as_mut()
+            .unwrap()
+            .entries
+            .get_mut(SECOND)
+            .unwrap()
+            .instances[0]
+            .role = "standby".into();
         let view = project(&catalog, ProviderMode::Local, true).unwrap();
         assert!(view.capability_available);
         assert!(
@@ -1432,6 +1460,27 @@ mod tests {
         );
         assert_eq!(view.databases.len(), 2);
         assert_eq!(view.databases[0].instance_topology[0].role, "unknown");
+        let database_instance = view.databases[0]
+            .topology
+            .nodes
+            .iter()
+            .find(|node| node.semantic_kind == TopologySemanticKind::DatabaseInstance)
+            .expect("catalog instance topology node");
+        assert_eq!(
+            database_instance.database_role,
+            Some(DatabaseInstanceRole::Unknown)
+        );
+        assert_eq!(database_instance.ownership, TopologyOwnership::TenantOwned);
+        assert!(database_instance.placement.is_none());
+        assert_eq!(
+            view.databases[1]
+                .topology
+                .nodes
+                .iter()
+                .find(|node| node.semantic_kind == TopologySemanticKind::DatabaseInstance)
+                .and_then(|node| node.database_role),
+            Some(DatabaseInstanceRole::Standby)
+        );
         assert_eq!(view.databases[0].phase, "progressing");
         assert_eq!(
             view.databases[0].topology.nodes[0].health,
@@ -1487,7 +1536,11 @@ mod tests {
                 TopologyNode {
                     id: "tenant".into(),
                     kind: TopologyNodeKind::Tenant,
+                    semantic_kind: TopologySemanticKind::Tenant,
+                    ownership: TopologyOwnership::TenantOwned,
                     provenance: TopologyNodeProvenance::ExactKubernetesResource,
+                    database_role: None,
+                    placement: None,
                     label: "tenant-a".into(),
                     health: TopologyHealth::Ready,
                     resource: None,
@@ -1496,7 +1549,11 @@ mod tests {
                 TopologyNode {
                     id: "database:cluster".into(),
                     kind: TopologyNodeKind::Database,
+                    semantic_kind: TopologySemanticKind::DatabaseCluster,
+                    ownership: TopologyOwnership::TenantOwned,
                     provenance: TopologyNodeProvenance::SyntheticSummary,
+                    database_role: None,
+                    placement: None,
                     label: "legacy".into(),
                     health: TopologyHealth::Unknown,
                     resource: None,
@@ -1516,6 +1573,18 @@ mod tests {
         );
         assert!(!graph.nodes.iter().any(|node| node.id == "database:cluster"));
         assert_eq!(graph.edges.len(), 4);
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.semantic_kind == TopologySemanticKind::DatabaseInstance)
+                .map(|node| node.database_role)
+                .collect::<Vec<_>>(),
+            [
+                Some(DatabaseInstanceRole::Primary),
+                Some(DatabaseInstanceRole::Primary)
+            ]
+        );
         for edge in &graph.edges {
             if edge.kind == TopologyEdgeKind::Represents {
                 assert!(edge.target.starts_with(&edge.source));

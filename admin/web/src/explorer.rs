@@ -1,8 +1,14 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use tenant_admin_shared::query::{
-    DisplayAttribute, ResourceIdentityView, TopologyEdge, TopologyEdgeKind, TopologyGraph,
-    TopologyHealth, TopologyNode, TopologyNodeKind, TopologyNodeProvenance,
+    DatabaseInstanceRole, DisplayAttribute, ResourceIdentityView, TopologyEdge, TopologyEdgeKind,
+    TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind, TopologyNodeProvenance,
+    TopologyOwnership, TopologySemanticKind,
+};
+
+use crate::format::{
+    database_instance_role_label, node_kind_label, topology_ownership_label,
+    topology_semantic_label,
 };
 
 pub const MAX_VISIBLE_NODES: usize = 20;
@@ -142,6 +148,12 @@ pub struct ExplorerFilter {
     pub namespace_not_applicable: bool,
 }
 
+impl ExplorerFilter {
+    pub fn is_active(&self) -> bool {
+        self != &Self::default()
+    }
+}
+
 #[derive(Clone)]
 pub struct ExplorerModel {
     graph: TopologyGraph,
@@ -150,13 +162,23 @@ pub struct ExplorerModel {
 }
 
 impl ExplorerModel {
-    pub fn new(graph: TopologyGraph) -> Self {
+    pub fn new(mut graph: TopologyGraph) -> Self {
         let nodes = graph
             .nodes
             .iter()
             .cloned()
             .map(|node| (node.id.clone(), node))
             .collect();
+        graph.edges.sort_by_key(|edge| {
+            (
+                edge.id.clone(),
+                edge.source.clone(),
+                edge.target.clone(),
+                edge_kind_rank(edge.kind),
+                edge.label.clone(),
+            )
+        });
+        graph.edges.dedup_by(|left, right| left.id == right.id);
         Self {
             edges: graph.edges.clone(),
             graph,
@@ -185,7 +207,7 @@ impl ExplorerModel {
             })
             .collect::<BTreeMap<_, _>>();
         for node in self.nodes.values() {
-            let group = resource_group(node.kind);
+            let group = resource_group(node.semantic_kind);
             let summary = summaries.get_mut(&group).expect("known group");
             summary.provenance.add(node.provenance);
             if ordinary_resource(node) || node.kind == TopologyNodeKind::Tenant {
@@ -214,11 +236,13 @@ impl ExplorerModel {
         let mut nodes = self
             .nodes
             .values()
-            .filter(|node| node.provenance != TopologyNodeProvenance::SyntheticSummary)
+            .filter(|node| {
+                node.provenance != TopologyNodeProvenance::SyntheticSummary || !filter.is_active()
+            })
             .filter(|node| {
                 filter
                     .group
-                    .is_none_or(|group| resource_group(node.kind) == group)
+                    .is_none_or(|group| resource_group(node.semantic_kind) == group)
             })
             .filter(|node| filter.health.is_none_or(|health| node.health == health))
             .filter(|node| filter.kind.is_none_or(|kind| node.kind == kind))
@@ -244,7 +268,7 @@ impl ExplorerModel {
         nodes.sort_by_key(|node| {
             (
                 health_priority(node.health),
-                resource_group(node.kind),
+                resource_group(node.semantic_kind),
                 node.label.to_ascii_lowercase(),
                 node.id.clone(),
             )
@@ -269,7 +293,7 @@ impl ExplorerModel {
         incoming.sort_by(|left, right| left.id.cmp(&right.id));
         outgoing.sort_by(|left, right| left.id.cmp(&right.id));
         Some(ResourceInspection {
-            group: resource_group(node.kind),
+            group: resource_group(node.semantic_kind),
             node,
             incoming,
             outgoing,
@@ -295,6 +319,107 @@ impl ExplorerModel {
             .iter()
             .find(|edge| edge.id == id)
             .and_then(|edge| self.relationship(edge))
+    }
+
+    pub fn relationship_matches_filter(&self, id: &str, filter: &ExplorerFilter) -> bool {
+        if !filter.is_active() {
+            return self.edges.iter().any(|edge| {
+                edge.id == id
+                    && self.nodes.contains_key(&edge.source)
+                    && self.nodes.contains_key(&edge.target)
+            });
+        }
+        let eligible = self
+            .filtered_nodes(filter)
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        self.edges.iter().any(|edge| {
+            edge.id == id && eligible.contains(&edge.source) && eligible.contains(&edge.target)
+        })
+    }
+
+    pub fn synchronized_focus(
+        &self,
+        filter: &ExplorerFilter,
+        selected: Option<&str>,
+        relationship_id: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let eligible = if filter.is_active() {
+            self.filtered_nodes(filter)
+                .into_iter()
+                .map(|node| node.id)
+                .collect::<BTreeSet<_>>()
+        } else {
+            self.nodes.keys().cloned().collect()
+        };
+        let selected = selected
+            .filter(|id| eligible.contains(*id))
+            .map(str::to_owned);
+        let visible_relationships = self
+            .graph_for_filter(filter, selected.as_deref(), None)
+            .edges
+            .into_iter()
+            .map(|edge| edge.id)
+            .collect::<BTreeSet<_>>();
+        let relationship = relationship_id
+            .filter(|id| {
+                visible_relationships.contains(*id)
+                    || selected.as_ref().is_some_and(|selected| {
+                        self.edges.iter().any(|edge| {
+                            edge.id.as_str() == *id
+                                && (edge.source == selected.as_str()
+                                    || edge.target == selected.as_str())
+                        })
+                    })
+            })
+            .map(str::to_owned);
+        (selected, relationship)
+    }
+
+    pub fn graph_for_filter(
+        &self,
+        filter: &ExplorerFilter,
+        selected: Option<&str>,
+        relationship_id: Option<&str>,
+    ) -> TopologyGraph {
+        if !filter.is_active() {
+            return relationship_id.map_or_else(
+                || self.focused_graph(selected),
+                |id| self.relationship_graph(selected, id),
+            );
+        }
+        let nodes = self.filtered_nodes(filter);
+        let eligible = nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let filtered = Self::new(TopologyGraph {
+            tenant_name: self.graph.tenant_name.clone(),
+            provider: self.graph.provider,
+            edges: self
+                .edges
+                .iter()
+                .filter(|edge| {
+                    eligible.contains(edge.source.as_str())
+                        && eligible.contains(edge.target.as_str())
+                })
+                .cloned()
+                .collect(),
+            nodes,
+        });
+        if let Some(id) = relationship_id
+            && filtered.relationship_by_id(id).is_some()
+        {
+            return filtered.relationship_graph(selected, id);
+        }
+        if let Some(id) = selected.filter(|id| filtered.nodes.contains_key(*id)) {
+            return filter.group.map_or_else(
+                || filtered.focused_graph(Some(id)),
+                |group| filtered.selected_group_graph(id, group),
+            );
+        }
+        filtered.ordinary_graph()
     }
 
     pub fn focused_graph(&self, selected: Option<&str>) -> TopologyGraph {
@@ -352,7 +477,7 @@ impl ExplorerModel {
         let mut group_nodes = self
             .nodes
             .values()
-            .filter(|node| resource_group(node.kind) == group && ordinary_resource(node))
+            .filter(|node| resource_group(node.semantic_kind) == group && ordinary_resource(node))
             .cloned()
             .collect::<Vec<_>>();
         group_nodes.sort_by_key(|node| {
@@ -389,7 +514,8 @@ impl ExplorerModel {
         selected: Option<&str>,
         relationship_id: &str,
     ) -> TopologyGraph {
-        let mut graph = self.focused_graph(selected);
+        let mut graph =
+            selected.map_or_else(|| self.ordinary_graph(), |id| self.focused_graph(Some(id)));
         let Some(edge) = self.edges.iter().find(|edge| edge.id == relationship_id) else {
             return graph;
         };
@@ -441,7 +567,7 @@ impl ExplorerModel {
         let mut additions = self
             .nodes
             .values()
-            .filter(|node| resource_group(node.kind) == group && ordinary_resource(node))
+            .filter(|node| resource_group(node.semantic_kind) == group && ordinary_resource(node))
             .cloned()
             .collect::<Vec<_>>();
         additions.sort_by_key(|node| {
@@ -497,16 +623,54 @@ impl ExplorerModel {
         for node in self.nodes.values().filter(|node| {
             node.provenance == TopologyNodeProvenance::SyntheticSummary && unhealthy(node.health)
         }) {
-            let group = resource_group(node.kind);
+            let group = resource_group(node.semantic_kind);
             if !nodes
                 .iter()
-                .any(|candidate| resource_group(candidate.kind) == group)
+                .any(|candidate| resource_group(candidate.semantic_kind) == group)
             {
                 nodes.push(node.clone());
             }
         }
         nodes.sort_by_key(|node| (health_priority(node.health), node.id.clone()));
         nodes
+    }
+
+    fn ordinary_graph(&self) -> TopologyGraph {
+        let mut nodes = self
+            .nodes
+            .values()
+            .filter(|node| {
+                ordinary_resource(node) || node.semantic_kind == TopologySemanticKind::Tenant
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        nodes.sort_by_key(|node| {
+            (
+                health_priority(node.health),
+                resource_group(node.semantic_kind),
+                node.label.to_ascii_lowercase(),
+                node.id.clone(),
+            )
+        });
+        nodes.truncate(MAX_VISIBLE_NODES);
+        let retained = nodes
+            .iter()
+            .map(|node| node.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let edges = self
+            .edges
+            .iter()
+            .filter(|edge| {
+                retained.contains(edge.source.as_str()) && retained.contains(edge.target.as_str())
+            })
+            .cloned()
+            .collect();
+        TopologyGraph {
+            tenant_name: self.graph.tenant_name.clone(),
+            provider: self.graph.provider,
+            nodes,
+            edges,
+        }
     }
 
     fn summary_graph(&self) -> TopologyGraph {
@@ -530,7 +694,11 @@ impl ExplorerModel {
             nodes.push(TopologyNode {
                 id: id.clone(),
                 kind: group_kind(summary.group),
+                semantic_kind: group_semantic_kind(summary.group),
+                ownership: group_ownership(summary.group),
                 provenance: TopologyNodeProvenance::SyntheticSummary,
+                database_role: None,
+                placement: None,
                 label: format!("{} ({})", summary.group.label(), summary.count),
                 health: summary_health(&summary.health),
                 resource: None,
@@ -556,16 +724,19 @@ impl ExplorerModel {
     }
 }
 
-pub const fn resource_group(kind: TopologyNodeKind) -> ResourceGroup {
+pub const fn resource_group(kind: TopologySemanticKind) -> ResourceGroup {
     match kind {
-        TopologyNodeKind::Tenant => ResourceGroup::Tenant,
-        TopologyNodeKind::ControlPlane => ResourceGroup::ControlPlane,
-        TopologyNodeKind::WorkerPool | TopologyNodeKind::Machine | TopologyNodeKind::Node => {
-            ResourceGroup::Compute
+        TopologySemanticKind::Tenant => ResourceGroup::Tenant,
+        TopologySemanticKind::ControlPlane => ResourceGroup::ControlPlane,
+        TopologySemanticKind::WorkerPool
+        | TopologySemanticKind::ComputeMachine
+        | TopologySemanticKind::WorkerNode => ResourceGroup::Compute,
+        TopologySemanticKind::DatabaseCluster | TopologySemanticKind::DatabaseInstance => {
+            ResourceGroup::Databases
         }
-        TopologyNodeKind::Database => ResourceGroup::Databases,
-        TopologyNodeKind::AddOn => ResourceGroup::AddOns,
-        TopologyNodeKind::ProviderResource => ResourceGroup::ProviderInfrastructure,
+        TopologySemanticKind::AddOn => ResourceGroup::AddOns,
+        TopologySemanticKind::ProviderInfrastructure => ResourceGroup::ProviderInfrastructure,
+        TopologySemanticKind::Other => ResourceGroup::Other,
     }
 }
 
@@ -579,6 +750,30 @@ fn group_kind(group: ResourceGroup) -> TopologyNodeKind {
         ResourceGroup::ProviderInfrastructure | ResourceGroup::Other => {
             TopologyNodeKind::ProviderResource
         }
+    }
+}
+
+const fn group_semantic_kind(group: ResourceGroup) -> TopologySemanticKind {
+    match group {
+        ResourceGroup::Tenant => TopologySemanticKind::Tenant,
+        ResourceGroup::ControlPlane => TopologySemanticKind::ControlPlane,
+        ResourceGroup::Compute => TopologySemanticKind::WorkerPool,
+        ResourceGroup::Databases => TopologySemanticKind::DatabaseCluster,
+        ResourceGroup::AddOns => TopologySemanticKind::AddOn,
+        ResourceGroup::ProviderInfrastructure => TopologySemanticKind::ProviderInfrastructure,
+        ResourceGroup::Other => TopologySemanticKind::Other,
+    }
+}
+
+const fn group_ownership(group: ResourceGroup) -> TopologyOwnership {
+    match group {
+        ResourceGroup::ProviderInfrastructure => TopologyOwnership::ProviderOwned,
+        ResourceGroup::Other => TopologyOwnership::Unknown,
+        ResourceGroup::Tenant
+        | ResourceGroup::ControlPlane
+        | ResourceGroup::Compute
+        | ResourceGroup::Databases
+        | ResourceGroup::AddOns => TopologyOwnership::TenantOwned,
     }
 }
 
@@ -601,9 +796,26 @@ fn searchable_text(node: &TopologyNode) -> String {
     let mut values = vec![
         node.label.clone(),
         format!("{:?}", node.kind),
+        format!("{:?}", node.semantic_kind),
+        format!("{:?}", node.ownership),
         format!("{:?}", node.health),
         format!("{:?}", node.provenance),
+        node_kind_label(node.kind).into(),
+        topology_semantic_label(node.semantic_kind).into(),
+        topology_ownership_label(node.ownership).into(),
+        representation_label(node.provenance).into(),
     ];
+    if let Some(role) = node.database_role {
+        values.push(format!("{role:?}"));
+        values.push(database_instance_role_label(role).into());
+    }
+    if let Some(placement) = &node.placement {
+        values.extend([
+            placement.worker_pool.clone().unwrap_or_default(),
+            placement.worker_node.clone().unwrap_or_default(),
+            placement.zone.clone().unwrap_or_default(),
+        ]);
+    }
     if let Some(resource) = &node.resource {
         values.extend([
             resource.api_version.clone(),
@@ -613,12 +825,24 @@ fn searchable_text(node: &TopologyNode) -> String {
             resource.uid.clone().unwrap_or_default(),
         ]);
     }
+
     values.extend(
         node.attributes
             .iter()
             .flat_map(|attribute| [attribute.label.clone(), attribute.value.clone()]),
     );
     values.join(" ").to_ascii_lowercase()
+}
+
+const fn edge_kind_rank(kind: TopologyEdgeKind) -> u8 {
+    match kind {
+        TopologyEdgeKind::Owns => 0,
+        TopologyEdgeKind::Contains => 1,
+        TopologyEdgeKind::Manages => 2,
+        TopologyEdgeKind::Provides => 3,
+        TopologyEdgeKind::Represents => 4,
+        TopologyEdgeKind::DependsOn => 5,
+    }
 }
 
 const fn health_priority(health: TopologyHealth) -> u8 {
@@ -662,7 +886,44 @@ pub fn representation_label(provenance: TopologyNodeProvenance) -> &'static str 
     }
 }
 
+pub fn summary_group(id: &str) -> Option<ResourceGroup> {
+    match id.strip_prefix("group:")? {
+        "tenant" => Some(ResourceGroup::Tenant),
+        "control-plane" => Some(ResourceGroup::ControlPlane),
+        "compute" => Some(ResourceGroup::Compute),
+        "databases" => Some(ResourceGroup::Databases),
+        "add-ons" => Some(ResourceGroup::AddOns),
+        "provider-infrastructure" => Some(ResourceGroup::ProviderInfrastructure),
+        "other" => Some(ResourceGroup::Other),
+        _ => None,
+    }
+}
+
+pub const fn representation_class(provenance: TopologyNodeProvenance) -> &'static str {
+    match provenance {
+        TopologyNodeProvenance::ExactKubernetesResource => "exact",
+        TopologyNodeProvenance::DatabaseLogicalRepresentation => "database-logical",
+        TopologyNodeProvenance::ExternalProviderRepresentation => "external-provider",
+        TopologyNodeProvenance::RecordedResourceRepresentation => "recorded",
+        TopologyNodeProvenance::SyntheticSummary => "summary",
+    }
+}
+
 pub fn display_identity(node: &TopologyNode) -> Vec<(String, String)> {
+    let mut values = vec![
+        (
+            "Architecture".into(),
+            topology_semantic_label(node.semantic_kind).into(),
+        ),
+        (
+            "Ownership".into(),
+            topology_ownership_label(node.ownership).into(),
+        ),
+        (
+            "Representation".into(),
+            representation_label(node.provenance).into(),
+        ),
+    ];
     if let Some(ResourceIdentityView {
         api_version,
         kind,
@@ -671,7 +932,7 @@ pub fn display_identity(node: &TopologyNode) -> Vec<(String, String)> {
         uid,
     }) = &node.resource
     {
-        return vec![
+        values.extend([
             ("API version".into(), api_version.clone()),
             ("Kind".into(), kind.clone()),
             (
@@ -683,18 +944,56 @@ pub fn display_identity(node: &TopologyNode) -> Vec<(String, String)> {
                 "UID".into(),
                 uid.clone().unwrap_or_else(|| "Not available".into()),
             ),
-        ];
+        ]);
+    } else {
+        values.extend([
+            ("Kind".into(), format!("{:?}", node.kind)),
+            ("Namespace".into(), "Not applicable".into()),
+            ("Name".into(), node.label.clone()),
+            ("Node ID".into(), node.id.clone()),
+        ]);
     }
-    vec![
-        (
-            "Representation".into(),
-            representation_label(node.provenance).into(),
-        ),
-        ("Kind".into(), format!("{:?}", node.kind)),
-        ("Namespace".into(), "Not applicable".into()),
-        ("Name".into(), node.label.clone()),
-        ("Node ID".into(), node.id.clone()),
-    ]
+    if node.semantic_kind == TopologySemanticKind::DatabaseInstance {
+        values.push((
+            "Database role".into(),
+            match node.database_role.unwrap_or(DatabaseInstanceRole::Unknown) {
+                DatabaseInstanceRole::Primary => "Primary",
+                DatabaseInstanceRole::Standby => "Standby",
+                DatabaseInstanceRole::Unknown => "Unknown",
+            }
+            .into(),
+        ));
+        values.push((
+            "Worker node".into(),
+            node.placement
+                .as_ref()
+                .and_then(|placement| placement.worker_node.clone())
+                .unwrap_or_else(|| "Not reported".into()),
+        ));
+        values.push((
+            "Zone".into(),
+            node.placement
+                .as_ref()
+                .and_then(|placement| placement.zone.clone())
+                .unwrap_or_else(|| "Not reported".into()),
+        ));
+    } else if node.semantic_kind == TopologySemanticKind::WorkerNode {
+        values.push((
+            "Worker pool".into(),
+            node.placement
+                .as_ref()
+                .and_then(|placement| placement.worker_pool.clone())
+                .unwrap_or_else(|| "Not reported".into()),
+        ));
+        values.push((
+            "Zone".into(),
+            node.placement
+                .as_ref()
+                .and_then(|placement| placement.zone.clone())
+                .unwrap_or_else(|| "Not reported".into()),
+        ));
+    }
+    values
 }
 
 #[cfg(test)]
@@ -703,13 +1002,32 @@ mod tests {
 
     use tenant_admin_shared::query::TenantProvider;
 
+    use crate::topology::layout_graph;
+
     use super::*;
 
     fn node(id: &str, kind: TopologyNodeKind, health: TopologyHealth, label: &str) -> TopologyNode {
         TopologyNode {
             id: id.into(),
             kind,
+            semantic_kind: match kind {
+                TopologyNodeKind::Tenant => TopologySemanticKind::Tenant,
+                TopologyNodeKind::ControlPlane => TopologySemanticKind::ControlPlane,
+                TopologyNodeKind::WorkerPool => TopologySemanticKind::WorkerPool,
+                TopologyNodeKind::Machine => TopologySemanticKind::ComputeMachine,
+                TopologyNodeKind::Node => TopologySemanticKind::WorkerNode,
+                TopologyNodeKind::ProviderResource => TopologySemanticKind::ProviderInfrastructure,
+                TopologyNodeKind::AddOn => TopologySemanticKind::AddOn,
+                TopologyNodeKind::Database => TopologySemanticKind::DatabaseCluster,
+            },
+            ownership: if kind == TopologyNodeKind::ProviderResource {
+                TopologyOwnership::ProviderOwned
+            } else {
+                TopologyOwnership::TenantOwned
+            },
             provenance: TopologyNodeProvenance::ExactKubernetesResource,
+            database_role: None,
+            placement: None,
             label: label.into(),
             health,
             resource: Some(ResourceIdentityView {
@@ -865,11 +1183,296 @@ mod tests {
             ..ExplorerFilter::default()
         });
         assert_eq!(filtered, vec![external.clone()]);
-        assert_eq!(
-            display_identity(&external)[2],
-            ("Namespace".into(), "Not applicable".into())
+        assert!(
+            display_identity(&external).contains(&("Namespace".into(), "Not applicable".into()))
         );
         assert!(model.inspection("missing").is_none());
+    }
+
+    #[test]
+    fn typed_semantics_drive_grouping_search_and_filtered_graphs() {
+        let mut instance = node(
+            "database:instance:one",
+            TopologyNodeKind::Database,
+            TopologyHealth::Ready,
+            "one",
+        );
+        instance.semantic_kind = TopologySemanticKind::DatabaseInstance;
+        instance.database_role = Some(DatabaseInstanceRole::Primary);
+        instance.placement = Some(tenant_admin_shared::query::TopologyPlacement {
+            worker_pool: None,
+            worker_node: Some("worker-a".into()),
+            zone: Some("zone-a".into()),
+        });
+        let mut cluster = node(
+            "database:cluster",
+            TopologyNodeKind::Database,
+            TopologyHealth::Ready,
+            "orders",
+        );
+        cluster.semantic_kind = TopologySemanticKind::DatabaseCluster;
+        let relationship = TopologyEdge {
+            id: "cluster-instance".into(),
+            source: cluster.id.clone(),
+            target: instance.id.clone(),
+            kind: TopologyEdgeKind::Represents,
+            label: None,
+        };
+        let model = ExplorerModel::new(graph(vec![instance.clone(), cluster], vec![relationship]));
+
+        for query in ["primary", "worker-a", "zone-a", "database instance"] {
+            let filtered = model.filtered_nodes(&ExplorerFilter {
+                query: query.into(),
+                ..ExplorerFilter::default()
+            });
+            assert_eq!(filtered, vec![instance.clone()]);
+        }
+        assert_eq!(
+            model
+                .filtered_nodes(&ExplorerFilter {
+                    query: "tenant-owned".into(),
+                    ..ExplorerFilter::default()
+                })
+                .len(),
+            2
+        );
+        let filter = ExplorerFilter {
+            group: Some(ResourceGroup::Databases),
+            ..ExplorerFilter::default()
+        };
+        assert_eq!(model.filtered_nodes(&filter).len(), 2);
+        let filtered_graph = model.graph_for_filter(&filter, None, None);
+        assert_eq!(filtered_graph.nodes.len(), 2);
+        assert_eq!(filtered_graph.edges.len(), 1);
+        let relationship_graph = model.graph_for_filter(&filter, None, Some("cluster-instance"));
+        assert_eq!(relationship_graph.nodes.len(), 2);
+        assert!(
+            relationship_graph
+                .nodes
+                .iter()
+                .all(|node| node.provenance != TopologyNodeProvenance::SyntheticSummary)
+        );
+    }
+
+    #[test]
+    fn filtered_default_is_bounded_and_relationship_filters_are_consistent() {
+        let nodes = (0..25)
+            .map(|index| {
+                node(
+                    &format!("node:{index:02}"),
+                    TopologyNodeKind::Node,
+                    TopologyHealth::Ready,
+                    &format!("worker-{index:02}"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let edge = TopologyEdge {
+            id: "parallel".into(),
+            source: "node:00".into(),
+            target: "node:01".into(),
+            kind: TopologyEdgeKind::Owns,
+            label: None,
+        };
+        let model = ExplorerModel::new(graph(
+            nodes,
+            vec![
+                edge.clone(),
+                edge.clone(),
+                TopologyEdge {
+                    kind: TopologyEdgeKind::DependsOn,
+                    label: Some("duplicate ID".into()),
+                    ..edge.clone()
+                },
+                TopologyEdge {
+                    id: "parallel-two".into(),
+                    ..edge
+                },
+            ],
+        ));
+        let filter = ExplorerFilter {
+            group: Some(ResourceGroup::Compute),
+            ..ExplorerFilter::default()
+        };
+        let filtered_graph = model.graph_for_filter(&filter, None, None);
+        assert_eq!(filtered_graph.nodes.len(), MAX_VISIBLE_NODES);
+        let selected_group = model.graph_for_filter(&filter, Some("node:00"), None);
+        assert_eq!(selected_group.nodes.len(), MAX_VISIBLE_NODES);
+        assert_eq!(
+            model.inspection("node:00").unwrap().outgoing.len(),
+            2,
+            "duplicate IDs are canonicalized while parallel unique IDs remain"
+        );
+        assert_eq!(
+            model.relationship_by_id("parallel").unwrap().kind,
+            TopologyEdgeKind::Owns
+        );
+        assert!(model.relationship_matches_filter("parallel", &filter));
+        assert_eq!(
+            model.synchronized_focus(&filter, None, Some("parallel")),
+            (None, Some("parallel".into()))
+        );
+        assert_eq!(
+            model.synchronized_focus(
+                &ExplorerFilter {
+                    query: "worker-00".into(),
+                    ..ExplorerFilter::default()
+                },
+                Some("node:00"),
+                Some("parallel"),
+            ),
+            (Some("node:00".into()), Some("parallel".into()))
+        );
+        assert!(!model.relationship_matches_filter(
+            "parallel",
+            &ExplorerFilter {
+                query: "worker-24".into(),
+                ..ExplorerFilter::default()
+            }
+        ));
+        assert_eq!(
+            model.synchronized_focus(
+                &ExplorerFilter {
+                    query: "worker-24".into(),
+                    ..ExplorerFilter::default()
+                },
+                Some("node:00"),
+                Some("parallel"),
+            ),
+            (None, None)
+        );
+    }
+
+    #[test]
+    fn unfiltered_source_summaries_remain_focusable() {
+        assert_eq!(summary_group("group:compute"), Some(ResourceGroup::Compute));
+        assert_eq!(summary_group("summary:workers"), None);
+        let mut summary = node(
+            "summary:workers",
+            TopologyNodeKind::WorkerPool,
+            TopologyHealth::Unknown,
+            "Workers",
+        );
+        summary.provenance = TopologyNodeProvenance::SyntheticSummary;
+        summary.semantic_kind = TopologySemanticKind::WorkerPool;
+        let mut unavailable = node(
+            "database:unavailable",
+            TopologyNodeKind::Database,
+            TopologyHealth::Unknown,
+            "Databases unavailable",
+        );
+        unavailable.provenance = TopologyNodeProvenance::SyntheticSummary;
+        unavailable.semantic_kind = TopologySemanticKind::DatabaseCluster;
+        let worker = node(
+            "node:one",
+            TopologyNodeKind::Node,
+            TopologyHealth::Ready,
+            "worker-one",
+        );
+        let model = ExplorerModel::new(graph(
+            vec![summary, unavailable, worker],
+            vec![TopologyEdge {
+                id: "summary-worker".into(),
+                source: "summary:workers".into(),
+                target: "node:one".into(),
+                kind: TopologyEdgeKind::Represents,
+                label: None,
+            }],
+        ));
+
+        assert_eq!(
+            model.synchronized_focus(&ExplorerFilter::default(), Some("summary:workers"), None),
+            (Some("summary:workers".into()), None)
+        );
+        assert_eq!(
+            model.synchronized_focus(
+                &ExplorerFilter::default(),
+                Some("database:unavailable"),
+                None
+            ),
+            (Some("database:unavailable".into()), None)
+        );
+        assert_eq!(
+            model.synchronized_focus(
+                &ExplorerFilter::default(),
+                Some("node:one"),
+                Some("summary-worker")
+            ),
+            (Some("node:one".into()), Some("summary-worker".into()))
+        );
+        assert_eq!(
+            model.filtered_nodes(&ExplorerFilter::default()),
+            vec![
+                model.node("summary:workers").unwrap().clone(),
+                model.node("database:unavailable").unwrap().clone(),
+                model.node("node:one").unwrap().clone()
+            ]
+        );
+        assert!(
+            model
+                .filtered_nodes(&ExplorerFilter {
+                    group: Some(ResourceGroup::Compute),
+                    ..ExplorerFilter::default()
+                })
+                .iter()
+                .all(|node| node.provenance != TopologyNodeProvenance::SyntheticSummary)
+        );
+    }
+
+    #[test]
+    fn visible_neighbor_relationships_survive_an_unrelated_selection() {
+        let tenant = node(
+            "tenant",
+            TopologyNodeKind::Tenant,
+            TopologyHealth::Ready,
+            "tenant-a",
+        );
+        let left = node(
+            "node:left",
+            TopologyNodeKind::Node,
+            TopologyHealth::Ready,
+            "left",
+        );
+        let right = node(
+            "node:right",
+            TopologyNodeKind::Node,
+            TopologyHealth::Ready,
+            "right",
+        );
+        let model = ExplorerModel::new(graph(
+            vec![tenant, left, right],
+            vec![
+                TopologyEdge {
+                    id: "tenant-left".into(),
+                    source: "tenant".into(),
+                    target: "node:left".into(),
+                    kind: TopologyEdgeKind::Owns,
+                    label: None,
+                },
+                TopologyEdge {
+                    id: "tenant-right".into(),
+                    source: "tenant".into(),
+                    target: "node:right".into(),
+                    kind: TopologyEdgeKind::Owns,
+                    label: None,
+                },
+                TopologyEdge {
+                    id: "neighbors".into(),
+                    source: "node:left".into(),
+                    target: "node:right".into(),
+                    kind: TopologyEdgeKind::DependsOn,
+                    label: None,
+                },
+            ],
+        ));
+
+        assert_eq!(
+            model.synchronized_focus(
+                &ExplorerFilter::default(),
+                Some("tenant"),
+                Some("neighbors")
+            ),
+            (Some("tenant".into()), Some("neighbors".into()))
+        );
     }
 
     #[test]
@@ -942,14 +1545,53 @@ mod tests {
         }
         let started = Instant::now();
         let model = ExplorerModel::new(graph(nodes, edges));
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
         let _ = model.group_summaries();
-        let _ = model.filtered_nodes(&ExplorerFilter {
+        let search_filter = ExplorerFilter {
             query: "worker-19".into(),
             health: Some(TopologyHealth::Ready),
             ..ExplorerFilter::default()
-        });
-        let _ = model.focused_graph(Some("machine:19"));
-        let _ = model.group_graph(ResourceGroup::Compute);
+        };
+        let search_graph = model.graph_for_filter(&search_filter, None, None);
+        let _ = layout_graph(&search_graph);
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
+        let selected_graph =
+            model.graph_for_filter(&ExplorerFilter::default(), Some("machine:19"), None);
+        let _ = layout_graph(&selected_graph);
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
+        let relationship_graph = model.graph_for_filter(
+            &ExplorerFilter::default(),
+            Some("machine:19"),
+            Some("edge:19"),
+        );
+        let _ = layout_graph(&relationship_graph);
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
+        let group_filter = ExplorerFilter {
+            group: Some(ResourceGroup::Compute),
+            ..ExplorerFilter::default()
+        };
+        let group_graph = model.graph_for_filter(&group_filter, Some("machine:19"), None);
+        let _ = layout_graph(&group_graph);
+        assert_eq!(group_graph.nodes.len(), MAX_VISIBLE_NODES);
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
+        let _ = model.synchronized_focus(
+            &ExplorerFilter {
+                query: "does-not-exist".into(),
+                ..ExplorerFilter::default()
+            },
+            Some("machine:19"),
+            Some("edge:19"),
+        );
         let _ = model.inspection("machine:19");
         assert!(started.elapsed().as_secs_f32() < 1.0);
     }

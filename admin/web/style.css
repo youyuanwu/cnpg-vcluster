@@ -840,6 +840,10 @@ button:disabled {
   overflow-x: auto;
 }
 
+.topology-scroll {
+  overflow-y: auto;
+}
+
 table {
   width: 100%;
   border-collapse: collapse;
@@ -999,6 +1003,27 @@ tbody tr:hover {
   background: #f7fafc;
 }
 
+.topology .topology-band rect {
+  fill: #f0f5f7;
+  stroke: #d8e3e8;
+  stroke-width: 1;
+}
+
+.topology .topology-band--databases rect {
+  fill: #f2f6ff;
+}
+
+.topology .topology-band--provider-infrastructure rect {
+  fill: #f6f2fb;
+}
+
+.topology .topology-band__label {
+  fill: var(--brand-strong);
+  font-size: 13px;
+  font-weight: 800;
+  letter-spacing: 0.025em;
+}
+
 .topology .edge {
   fill: none;
   stroke: #8296a5;
@@ -1014,6 +1039,26 @@ tbody tr:hover {
 .topology .node rect {
   fill: #fff;
   stroke-width: 3;
+}
+
+.topology .ownership--provider rect {
+  fill: #fbf7ff;
+}
+
+.topology .ownership--unknown rect {
+  fill: #f4f6f7;
+}
+
+.topology .provenance--external-provider rect {
+  stroke-dasharray: 9 4;
+}
+
+.topology .provenance--recorded rect {
+  stroke-dasharray: 4 3;
+}
+
+.topology .provenance--summary rect {
+  fill: #eef3f5;
 }
 
 .topology .node--ready rect {
@@ -1049,6 +1094,19 @@ tbody tr:hover {
 .topology .node-meta {
   fill: var(--muted);
   font-size: 12px;
+}
+
+.topology .node-meta--role {
+  fill: #334f61;
+  font-weight: 700;
+}
+
+.topology .database-role--primary .node-meta--role {
+  fill: #075d35;
+}
+
+.topology .database-role--standby .node-meta--role {
+  fill: #315f82;
 }
 
 .tenant-context {
@@ -1293,6 +1351,7 @@ tbody tr:hover {
 
 .explorer-graph__canvas {
   max-height: 42rem;
+  overflow: auto;
   border-radius: 0.5rem;
   background: #fff;
 }

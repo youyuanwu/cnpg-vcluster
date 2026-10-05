@@ -40,7 +40,7 @@ application: a Leptos/Axum Tenant Admin UI with an
 unsafe PostgreSQL superuser console, implemented as a WebAssembly frontend
 served by a kube-rs backend.
 It reads management topology and creates/deletes top-level Tenants through
-exact provider-specific lifecycle RBAC. The schema-v6 backend exposes
+exact provider-specific lifecycle RBAC. The schema-v7 backend exposes
 `GET/POST /api/v1/tenants/{name}/databases`,
 `DELETE /api/v1/tenants/{name}/databases/{uid}`, and
 `POST /api/v1/tenants/{name}/databases/{uid}/query`. Mutations require the
