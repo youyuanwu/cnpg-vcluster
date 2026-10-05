@@ -10,7 +10,9 @@ Use the following browser protocol after `just admin-build` when changing the
 explorer presentation:
 
 1. Serve the built Tenant Admin application with a fixture containing 2,000
-   resources and 5,000 relationships.
+   resources and 5,000 relationships. Include every architecture band, at
+   least two database clusters with primary/standby instances, authoritative
+   full and partial placement, provider-owned resources and unknown values.
 2. Open browser developer tools, enable performance recording, and load the
    Tenant **Resources** section.
 3. Record each operation separately: search, health filter, resource
