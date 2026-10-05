@@ -121,7 +121,6 @@ jobs:
   e2e:
     name: CAPI end-to-end
     needs: fast-checks
-    if: github.event_name == 'pull_request' || github.event_name == 'push'
     runs-on: ubuntu-latest
     timeout-minutes: 180
     env:
@@ -284,6 +283,6 @@ jobs:
             test "$E2E_RESULT" = success
             test "$HIGH_CAPACITY_RESULT" = skipped
           else
-            test "$E2E_RESULT" = skipped
+            test "$E2E_RESULT" = success
             test "$HIGH_CAPACITY_RESULT" = success
           fi

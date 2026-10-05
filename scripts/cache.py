@@ -922,7 +922,45 @@ def restore_host_image(
         ["docker", "image", "load", "--input", str(path)],
         timeout=effective_timeout,
     )
+    try:
+        _require_host_digest(config, key, effective_timeout)
+        return
+    except IntegrityError as exc:
+        if os.environ.get("CAPI_OFFLINE_ENFORCED") == "1":
+            raise IntegrityError(
+                f"host image {key} was loaded without its exact RepoDigest; "
+                "run cache acquisition before enabling offline enforcement"
+            ) from exc
+    run(
+        [
+            "docker",
+            "pull",
+            "--platform",
+            IMAGE_PLATFORM,
+            config[key],
+        ],
+        timeout=effective_timeout,
+    )
     _require_host_digest(config, key, effective_timeout)
+
+
+def hydrate_host_images(
+    root: Path,
+    config: dict[str, str],
+    *,
+    verified: VerifiedCache,
+) -> None:
+    timeout = parse_duration(config["DOWNLOAD_TIMEOUT"])
+    keys = image_keys(config)
+    for key in keys:
+        restore_host_image(
+            root,
+            config,
+            key,
+            timeout,
+            verified=verified,
+        )
+    print(f"hydrated {len(keys)} pinned host images")
 
 
 def _copy_private(source: Path, destination: Path) -> None:
@@ -1007,6 +1045,7 @@ def ensure_cache(root: Path, config: dict[str, str]) -> None:
         acquire_cache(root, config)
         return
     materialize_inputs(root, config, verified=verified)
+    hydrate_host_images(root, config, verified=verified)
     removed = prune_cache_generations(root, verified.generation)
     print(f"reused verified cache generation {verified.generation.name}")
     if removed:
