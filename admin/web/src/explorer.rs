@@ -236,7 +236,10 @@ impl ExplorerModel {
         let mut nodes = self
             .nodes
             .values()
-            .filter(|node| node.provenance != TopologyNodeProvenance::SyntheticSummary)
+            .filter(|node| {
+                node.provenance != TopologyNodeProvenance::SyntheticSummary
+                    || (!filter.is_active() && node.id.starts_with("summary:"))
+            })
             .filter(|node| {
                 filter
                     .group
@@ -354,18 +357,22 @@ impl ExplorerModel {
         let selected = selected
             .filter(|id| eligible.contains(*id))
             .map(str::to_owned);
+        let visible_relationships = self
+            .graph_for_filter(filter, selected.as_deref(), None)
+            .edges
+            .into_iter()
+            .map(|edge| edge.id)
+            .collect::<BTreeSet<_>>();
         let relationship = relationship_id
             .filter(|id| {
-                selected.as_ref().map_or_else(
-                    || self.relationship_matches_filter(id, filter),
-                    |selected| {
+                visible_relationships.contains(*id)
+                    || selected.as_ref().is_some_and(|selected| {
                         self.edges.iter().any(|edge| {
                             edge.id.as_str() == *id
                                 && (edge.source == selected.as_str()
                                     || edge.target == selected.as_str())
                         })
-                    },
-                )
+                    })
             })
             .map(str::to_owned);
         (selected, relationship)
@@ -508,7 +515,8 @@ impl ExplorerModel {
         selected: Option<&str>,
         relationship_id: &str,
     ) -> TopologyGraph {
-        let mut graph = self.focused_graph(selected);
+        let mut graph =
+            selected.map_or_else(|| self.ordinary_graph(), |id| self.focused_graph(Some(id)));
         let Some(edge) = self.edges.iter().find(|edge| edge.id == relationship_id) else {
             return graph;
         };
@@ -1237,6 +1245,14 @@ mod tests {
         let filtered_graph = model.graph_for_filter(&filter, None, None);
         assert_eq!(filtered_graph.nodes.len(), 2);
         assert_eq!(filtered_graph.edges.len(), 1);
+        let relationship_graph = model.graph_for_filter(&filter, None, Some("cluster-instance"));
+        assert_eq!(relationship_graph.nodes.len(), 2);
+        assert!(
+            relationship_graph
+                .nodes
+                .iter()
+                .all(|node| node.provenance != TopologyNodeProvenance::SyntheticSummary)
+        );
     }
 
     #[test]
@@ -1361,8 +1377,85 @@ mod tests {
             (Some("summary:workers".into()), None)
         );
         assert_eq!(
-            model.synchronized_focus(&ExplorerFilter::default(), None, Some("summary-worker")),
-            (None, Some("summary-worker".into()))
+            model.synchronized_focus(
+                &ExplorerFilter::default(),
+                Some("node:one"),
+                Some("summary-worker")
+            ),
+            (Some("node:one".into()), Some("summary-worker".into()))
+        );
+        assert_eq!(
+            model.filtered_nodes(&ExplorerFilter::default()),
+            vec![
+                model.node("summary:workers").unwrap().clone(),
+                model.node("node:one").unwrap().clone()
+            ]
+        );
+        assert!(
+            model
+                .filtered_nodes(&ExplorerFilter {
+                    group: Some(ResourceGroup::Compute),
+                    ..ExplorerFilter::default()
+                })
+                .iter()
+                .all(|node| node.provenance != TopologyNodeProvenance::SyntheticSummary)
+        );
+    }
+
+    #[test]
+    fn visible_neighbor_relationships_survive_an_unrelated_selection() {
+        let tenant = node(
+            "tenant",
+            TopologyNodeKind::Tenant,
+            TopologyHealth::Ready,
+            "tenant-a",
+        );
+        let left = node(
+            "node:left",
+            TopologyNodeKind::Node,
+            TopologyHealth::Ready,
+            "left",
+        );
+        let right = node(
+            "node:right",
+            TopologyNodeKind::Node,
+            TopologyHealth::Ready,
+            "right",
+        );
+        let model = ExplorerModel::new(graph(
+            vec![tenant, left, right],
+            vec![
+                TopologyEdge {
+                    id: "tenant-left".into(),
+                    source: "tenant".into(),
+                    target: "node:left".into(),
+                    kind: TopologyEdgeKind::Owns,
+                    label: None,
+                },
+                TopologyEdge {
+                    id: "tenant-right".into(),
+                    source: "tenant".into(),
+                    target: "node:right".into(),
+                    kind: TopologyEdgeKind::Owns,
+                    label: None,
+                },
+                TopologyEdge {
+                    id: "neighbors".into(),
+                    source: "node:left".into(),
+                    target: "node:right".into(),
+                    kind: TopologyEdgeKind::DependsOn,
+                    label: None,
+                },
+            ],
+        ));
+
+        assert_eq!(
+            model.synchronized_focus(
+                &ExplorerFilter::default(),
+                Some("tenant"),
+                Some("neighbors")
+            ),
+            (Some("tenant".into()), Some("neighbors".into()))
         );
     }
 

@@ -21,7 +21,7 @@ const NODE_HEIGHT: f32 = 124.0;
 const MIN_NODE_WIDTH: f32 = 208.0;
 const MAX_NODE_WIDTH: f32 = 286.0;
 const MAX_LABEL_CHARACTERS: usize = 30;
-const MAX_METADATA_CHARACTERS: usize = 20;
+const MAX_METADATA_CHARACTERS: usize = 9;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TopologyLayout {
@@ -766,7 +766,7 @@ mod tests {
             zone: Some("zone-with-a-very-long-authoritative-name".into()),
         });
         let compact = compact_placement(&long);
-        assert!(compact.iter().all(|line| line.chars().count() <= 28));
+        assert!(compact.iter().all(|line| line.chars().count() <= 17));
         assert!(compact.iter().all(|line| line.ends_with('…')));
         assert!(accessible_node_label(&long).contains(&full_worker));
     }

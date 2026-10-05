@@ -41,6 +41,7 @@ pub fn ResourceExplorer(
     let kind = RwSignal::new(String::new());
     let namespace = RwSignal::new(String::new());
     let namespace_not_applicable = RwSignal::new(false);
+    let applied_filter = RwSignal::new(ExplorerFilter::default());
 
     let list_model = model.clone();
     let graph_model = model.clone();
@@ -56,6 +57,16 @@ pub fn ResourceExplorer(
             namespace.get(),
             namespace_not_applicable.get(),
         );
+        let filter_changed = applied_filter.get_untracked() != filter;
+        applied_filter.set(filter.clone());
+        if filter_changed
+            && selected_relationship
+                .get_untracked()
+                .as_ref()
+                .is_some_and(|id| !selection_model.relationship_matches_filter(id, &filter))
+        {
+            selected_relationship.set(None);
+        }
         let (next_selected, next_relationship) = selection_model.synchronized_focus(
             &filter,
             selected.get().as_deref(),
@@ -234,6 +245,14 @@ pub fn ResourceExplorer(
                     <h3>"Inspector"</h3>
                     {move || inspector_view(
                         &inspector_model,
+                        &current_filter(
+                            query.get(),
+                            group.get(),
+                            health.get(),
+                            kind.get(),
+                            namespace.get(),
+                            namespace_not_applicable.get(),
+                        ),
                         selected.get().as_deref(),
                         selected_relationship.get().as_deref(),
                         selected_relationship,
@@ -358,6 +377,7 @@ fn graph_view(
 
 fn inspector_view(
     model: &ExplorerModel,
+    filter: &ExplorerFilter,
     selected_id: Option<&str>,
     selected_relationship: Option<&str>,
     relationship_signal: RwSignal<Option<String>>,
@@ -365,7 +385,11 @@ fn inspector_view(
     if let Some(edge_id) = selected_relationship
         && let Some(edge) = model.relationship_by_id(edge_id)
     {
-        return relationship_view(edge, relationship_signal);
+        return relationship_view(
+            edge,
+            relationship_signal,
+            model.relationship_matches_filter(edge_id, filter),
+        );
     }
     let Some(inspection) = selected_id.and_then(|id| model.inspection(id)) else {
         return view! {
@@ -435,6 +459,7 @@ fn RelationshipList(
 fn relationship_view(
     relationship: ResourceRelationship,
     signal: RwSignal<Option<String>>,
+    visible_in_graph: bool,
 ) -> AnyView {
     view! {
         <div class="resource-inspection">
@@ -442,6 +467,11 @@ fn relationship_view(
                 "← Resource details"
             </button>
             <p class="eyebrow">"Selected relationship"</p>
+            {(!visible_in_graph).then(|| view! {
+                <p class="lifecycle-notice" role="status">
+                    "This relationship remains inspectable, but an endpoint is hidden by the current filters."
+                </p>
+            })}
             <h4>{relationship.label.clone().unwrap_or_else(|| edge_kind_label(relationship.kind).into())}</h4>
             <dl class="definition-list">
                 <dt>"Source"</dt><dd>{relationship.source_label}</dd>
