@@ -371,7 +371,7 @@ pub async fn reconcile(
             .data,
         "/spec/provider/type",
     )? {
-        "local" => local::reconcile(client.clone(), &current).await,
+        "local" => local::reconcile(client.clone(), &current, replay_issued).await,
         "azure" => azure::reconcile(client.clone(), &current, replay_issued).await,
         _ => Err(ObserveError::UnsupportedEntries),
     }?;

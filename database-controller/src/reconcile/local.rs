@@ -368,6 +368,7 @@ pub(super) fn may_issue(previous: Option<CreateState>) -> bool {
     !matches!(previous, Some(CreateState::Issued | CreateState::Observed))
 }
 
+#[cfg(test)]
 #[expect(
     clippy::too_many_arguments,
     reason = "creation binds the exact catalog entry and named resource"
@@ -950,6 +951,7 @@ fn validate_state(
 pub async fn reconcile(
     management: Client,
     observed: &TenantDatabaseCatalog,
+    replay_issued: bool,
 ) -> Result<(Action, TenantDatabaseCatalog), ObserveError> {
     let mut catalog = verify_current(management.clone(), observed).await?;
     let mut waiting = false;
@@ -1031,6 +1033,7 @@ pub async fn reconcile(
                 &mut state,
                 spec.instances,
                 &access,
+                replay_issued,
             )
             .await
         };
@@ -1086,10 +1089,11 @@ async fn ensure(
     state: &mut EntryStatus,
     instances: i32,
     access: &LocalAccess,
+    replay_issued: bool,
 ) -> Result<Progress, ObserveError> {
     let ns_api = core(access.client.clone(), None, "Namespace", "namespaces");
     let ns = object("Namespace", namespace, None, identity(catalog, uid)?, None)?;
-    let Some(id) = create(
+    let Some(id) = create_with_replay(
         management.clone(),
         catalog,
         uid,
@@ -1098,6 +1102,7 @@ async fn ensure(
         ns,
         "Namespace",
         0,
+        replay_issued,
     )
     .await?
     else {
@@ -1142,7 +1147,7 @@ async fn ensure(
             "persistentvolumes",
         );
         let pv = cnpg::volume(catalog, uid, namespace, cluster, ordinal, access, path)?;
-        let Some(id) = create(
+        let Some(id) = create_with_replay(
             management.clone(),
             catalog,
             uid,
@@ -1151,6 +1156,7 @@ async fn ensure(
             pv,
             "PersistentVolume",
             ordinal,
+            replay_issued,
         )
         .await?
         else {
@@ -1177,7 +1183,7 @@ async fn ensure(
         "clusters",
     );
     let desired = cnpg::cluster(catalog, uid, namespace, cluster, instances, &access.image)?;
-    let Some(id) = create(
+    let Some(id) = create_with_replay(
         management.clone(),
         catalog,
         uid,
@@ -1186,6 +1192,7 @@ async fn ensure(
         desired,
         "Cluster",
         0,
+        replay_issued,
     )
     .await?
     else {
@@ -2140,6 +2147,7 @@ mod api_scenarios {
                         &mut state,
                         3,
                         &access,
+                        false,
                     )
                     .await
                     .unwrap(),
@@ -2156,6 +2164,7 @@ mod api_scenarios {
                     &mut state,
                     3,
                     &access,
+                    false,
                 )
                 .await
                 .unwrap(),
@@ -2171,6 +2180,7 @@ mod api_scenarios {
                     &mut state,
                     3,
                     &access,
+                    false,
                 )
                 .await
                 .unwrap(),
@@ -2824,16 +2834,24 @@ mod api_scenarios {
         .unwrap();
         assert!(missing.is_none());
         assert_eq!(mock.lock().unwrap().creates, 1);
+        let root = tempfile::tempdir().unwrap();
+        let access = LocalAccess {
+            client: client.clone(),
+            root: root.path().to_path_buf(),
+            worker_root: root.path().join("worker"),
+            image: "postgres:16".into(),
+        };
+        let (_, cluster) = ownership::names(CATALOG, ENTRY).unwrap();
         assert!(
-            create_with_replay(
+            ensure(
                 client.clone(),
                 &mut restarted,
                 ENTRY,
+                &name,
+                &cluster,
                 &mut state,
-                core(client.clone(), None, "Namespace", "namespaces"),
-                desired.clone(),
-                "Namespace",
-                0,
+                1,
+                &access,
                 true,
             )
             .await
