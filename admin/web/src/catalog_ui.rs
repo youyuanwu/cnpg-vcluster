@@ -22,7 +22,10 @@ use crate::{
         project_query_result,
     },
     error::{UiError, UiErrorKind},
-    format::{edge_kind_label, health_class, health_label, optional_text, provider_label},
+    format::{
+        database_instance_role_label, edge_kind_label, health_class, health_label, optional_text,
+        provider_label, topology_ownership_label, topology_semantic_label,
+    },
     mutation_ui_state::{
         RefreshIntent, exact_confirmation_enabled, refresh_effects, unsafe_operation_enabled,
     },
@@ -593,17 +596,42 @@ fn topology_view(uid: &str, name: &str, graph: TopologyGraph) -> AnyView {
             <svg class="topology" viewBox=view_box role="img" aria-labelledby=label preserveAspectRatio="xMinYMin meet">
                 <title id=title_id>{format!("{name} PostgreSQL topology")}</title>
                 <desc id=desc_id>"Exact database entry and its observed instances; status is also listed above."</desc>
+                {layout.bands.into_iter().map(|band| view! {
+                    <g class=format!("topology-band topology-band--{}", band.id)>
+                        <rect x=band.x y=band.y width=band.width height=band.height rx="12" ry="12"/>
+                        <text class="topology-band__label" x=band.x + 14.0 y=band.y + 22.0>{band.label}</text>
+                    </g>
+                }).collect_view()}
                 {layout.edges.into_iter().map(|edge| view! {
                     <path class="edge" d=edge.path/>
                 }).collect_view()}
-                {layout.nodes.into_iter().map(|node| view! {
-                    <g class=format!("node node--{}", health_class(node.health)) role="group"
-                        aria-label=format!("{}; status {}", node.label, health_label(node.health))
-                        tabindex="0" transform=format!("translate({}, {})", node.x, node.y)>
-                        <rect width=node.width height=node.height rx="9" ry="9"/>
-                        <text class="node-label" x="14" y="29">{node.label.clone()}</text>
-                        <text class="node-meta" x="14" y="53">{health_label(node.health)}</text>
-                    </g>
+                {layout.nodes.into_iter().map(|node| {
+                    let role = node.database_role.map(database_instance_role_label);
+                    let accessible = format!(
+                        "{}; {}; status {}; {}{}",
+                        node.label,
+                        topology_semantic_label(node.semantic_kind),
+                        health_label(node.health),
+                        topology_ownership_label(node.ownership),
+                        role.map_or_else(String::new, |role| format!("; database role {role}")),
+                    );
+                    view! {
+                        <g class=format!("node node--{}", health_class(node.health)) role="group"
+                            aria-label=accessible
+                            tabindex="0" transform=format!("translate({}, {})", node.x, node.y)>
+                            <rect width=node.width height=node.height rx="9" ry="9"/>
+                            <text class="node-label" x="14" y="25">{node.label.clone()}</text>
+                            <text class="node-meta" x="14" y="49">
+                                {role.map_or_else(
+                                    || topology_semantic_label(node.semantic_kind).into(),
+                                    |role| format!("{} · {role}", topology_semantic_label(node.semantic_kind)),
+                                )}
+                            </text>
+                            <text class="node-meta" x="14" y="72">
+                                {format!("{} · {}", health_label(node.health), topology_ownership_label(node.ownership))}
+                            </text>
+                        </g>
+                    }
                 }).collect_view()}
             </svg>
         </div>
