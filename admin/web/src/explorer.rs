@@ -237,8 +237,7 @@ impl ExplorerModel {
             .nodes
             .values()
             .filter(|node| {
-                node.provenance != TopologyNodeProvenance::SyntheticSummary
-                    || (!filter.is_active() && node.id.starts_with("summary:"))
+                node.provenance != TopologyNodeProvenance::SyntheticSummary || !filter.is_active()
             })
             .filter(|node| {
                 filter
@@ -1355,6 +1354,14 @@ mod tests {
         );
         summary.provenance = TopologyNodeProvenance::SyntheticSummary;
         summary.semantic_kind = TopologySemanticKind::WorkerPool;
+        let mut unavailable = node(
+            "database:unavailable",
+            TopologyNodeKind::Database,
+            TopologyHealth::Unknown,
+            "Databases unavailable",
+        );
+        unavailable.provenance = TopologyNodeProvenance::SyntheticSummary;
+        unavailable.semantic_kind = TopologySemanticKind::DatabaseCluster;
         let worker = node(
             "node:one",
             TopologyNodeKind::Node,
@@ -1362,7 +1369,7 @@ mod tests {
             "worker-one",
         );
         let model = ExplorerModel::new(graph(
-            vec![summary, worker],
+            vec![summary, unavailable, worker],
             vec![TopologyEdge {
                 id: "summary-worker".into(),
                 source: "summary:workers".into(),
@@ -1379,6 +1386,14 @@ mod tests {
         assert_eq!(
             model.synchronized_focus(
                 &ExplorerFilter::default(),
+                Some("database:unavailable"),
+                None
+            ),
+            (Some("database:unavailable".into()), None)
+        );
+        assert_eq!(
+            model.synchronized_focus(
+                &ExplorerFilter::default(),
                 Some("node:one"),
                 Some("summary-worker")
             ),
@@ -1388,6 +1403,7 @@ mod tests {
             model.filtered_nodes(&ExplorerFilter::default()),
             vec![
                 model.node("summary:workers").unwrap().clone(),
+                model.node("database:unavailable").unwrap().clone(),
                 model.node("node:one").unwrap().clone()
             ]
         );
