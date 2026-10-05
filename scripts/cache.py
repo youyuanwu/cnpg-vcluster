@@ -120,7 +120,7 @@ def _private_regular_file(path: Path) -> None:
         raise IntegrityError(f"cache file is not an owner-only regular file: {path}")
 
 
-def _requirements(config: dict[str, str], root: Path | None = None) -> dict[str, object]:
+def _requirements(config: dict[str, str]) -> dict[str, object]:
     inputs = [
         {"path": filename, "sha256": config[sha_key]}
         for filename, _, sha_key in DOWNLOADS
@@ -733,7 +733,7 @@ def verify_generation(
         raise IntegrityError("unsupported cache inventory schema")
     if inventory.get("platform") != IMAGE_PLATFORM:
         raise IntegrityError("cache platform does not match linux/amd64")
-    if inventory.get("requirements") != _requirements(config, root):
+    if inventory.get("requirements") != _requirements(config):
         raise IntegrityError("cache inventory does not match current pinned requirements")
     images = inventory.get("imageArchives")
     if not isinstance(images, list):
@@ -799,7 +799,7 @@ def verify_cache(
     force: bool = False,
 ) -> VerifiedCache:
     generation = active_generation(root)
-    requirements = _requirements(config, root)
+    requirements = _requirements(config)
     inventory = _load_inventory_header(generation, requirements)
     requirements_sha256 = _requirements_sha256(requirements)
     state_sha256 = _cache_state_sha256(root, generation, requirements)
@@ -980,7 +980,7 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
         inventory = {
             "schema": CACHE_SCHEMA,
             "platform": IMAGE_PLATFORM,
-            "requirements": _requirements(config, root),
+            "requirements": _requirements(config),
             "imageArchives": entries,
         }
         write_private_file(

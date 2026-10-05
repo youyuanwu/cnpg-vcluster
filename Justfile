@@ -150,7 +150,7 @@ database-controller-metrics:
 admin-metrics:
     @python3 scripts/admin_metrics.py
 
-# Fetch locked admin Cargo dependencies.
+# Fetch locked Rust workspace dependencies into Cargo's shared home.
 admin-fetch:
     @python3 scripts/admin.py fetch
 

@@ -292,14 +292,13 @@ just test-tenant-lifecycle
 | `just cache` | Reuse the stamped verified generation, acquiring pinned inputs and OCI images online only when it is absent or stale. |
 | `just cache-refresh` | Force online provenance refresh of every pinned input and OCI image while preserving the prior generation until replacement verifies. |
 | `just controller-fetch` | Fetch the locked Rust workspace dependencies into Cargo's shared home. |
-| `just admin-fetch` | Fetch the locked Admin workspace dependencies into Cargo's shared home. |
+| `just admin-fetch` | Fetch the locked Rust workspace dependencies into Cargo's shared home. |
 | `just tools` | Install and verify tools and inputs from the active local cache without provenance refresh. |
 | `just prepare-host` | Securely record and raise runtime inotify values. |
 | `just preflight` | Check tools, inputs, Docker capacity, CIDRs, image digests, ownership collisions, and privileged-container support. |
 | `just create-management` | Reconcile the kind management cluster and lifecycle controllers. |
 | `just admin-status` | Validate the local admin Deployment, Service, provider-specific effective RBAC, health, and typed API responses. |
 | `just admin-port-forward` | Forward `tenant-system/tenant-admin` to `127.0.0.1:8080` until interrupted. |
-| `just admin-fetch` | Fetch the locked workspace dependency graph. |
 | `just admin-generate-check` | Verify generated least-privilege admin lifecycle resources are current. |
 | `just admin-lint` | Run Rust formatting and Clippy for all admin crates. |
 | `just admin-test` | Run locked/offline tests for shared DTOs, Axum projection, and Leptos view logic. |

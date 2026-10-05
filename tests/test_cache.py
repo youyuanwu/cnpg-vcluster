@@ -275,24 +275,12 @@ class CacheTests(unittest.TestCase):
             )
 
     def test_cargo_state_is_not_a_cache_requirement(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            root = Path(temporary)
-            controller = root / "controller"
-            controller.mkdir(parents=True)
-            (root / "Cargo.toml").write_text("[workspace]\n")
-            (controller / "Cargo.toml").write_text("[package]\n")
-            (root / "Cargo.lock").write_text("locked inputs")
-            (root / "rust-toolchain.toml").write_text(
-                '[toolchain]\nchannel = "stable"\n'
-            )
-            config = load_configuration(Path(__file__).resolve().parents[1])
-            original = _requirements(config, root)
-            self.assertNotIn("cargo", original)
-            (root / "Cargo.lock").write_text("changed")
-            (root / "rust-toolchain.toml").write_text(
-                '[toolchain]\nchannel = "beta"\n'
-            )
-            self.assertEqual(original, _requirements(config, root))
+        config = load_configuration(Path(__file__).resolve().parents[1])
+        requirements = _requirements(config)
+        self.assertNotIn("cargo", requirements)
+        encoded = json.dumps(requirements, sort_keys=True)
+        for cargo_input in ("Cargo.lock", "rust-toolchain.toml", "compiler"):
+            self.assertNotIn(cargo_input, encoded)
 
     def test_verified_cache_reuse_does_not_invoke_cargo(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
