@@ -83,7 +83,7 @@ local-tenant-kubeconfig-clear-all:
 controller-generate:
     @python3 scripts/generate_controller.py
 
-# Fetch locked Cargo dependencies into the repository-local Cargo home.
+# Fetch locked workspace dependencies into Cargo's shared home.
 controller-fetch:
     @python3 scripts/fetch_controller.py
 
@@ -150,7 +150,7 @@ database-controller-metrics:
 admin-metrics:
     @python3 scripts/admin_metrics.py
 
-# Fetch locked admin Cargo dependencies.
+# Fetch locked Rust workspace dependencies into Cargo's shared home.
 admin-fetch:
     @python3 scripts/admin.py fetch
 

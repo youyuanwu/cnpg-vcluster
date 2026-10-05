@@ -173,6 +173,8 @@ manifests, source provenance, and OCI images under ignored owner-only
 
 ```bash
 just cache
+just controller-fetch
+just admin-fetch
 just tools
 just prepare-host
 just preflight
@@ -255,7 +257,9 @@ inventory, permissions, and file metadata remain current; it acquires a new
 generation online only when that cache is absent or stale. `just cache-refresh`
 is the explicit forced online provenance-refresh step. After either succeeds,
 `just tools` and `just preflight` verify and use the local cache without Git or
-registry lookups. `just test-e2e-offline` applies the same policy to the
+registry lookups. Rust dependencies remain separate: run `just
+controller-fetch` and `just admin-fetch` before an enforced-offline build.
+`just test-e2e-offline` applies the same policy to the
 clean-to-clean gate by blocking acquisition commands, forcing Docker consumers
 to `--pull=never`, and denying external HTTP/HTTPS inside the disposable nodes.
 The pinned Kamaji release renders tenant API-server and Konnectivity containers
@@ -287,13 +291,14 @@ just test-tenant-lifecycle
 |---|---|
 | `just cache` | Reuse the stamped verified generation, acquiring pinned inputs and OCI images online only when it is absent or stale. |
 | `just cache-refresh` | Force online provenance refresh of every pinned input and OCI image while preserving the prior generation until replacement verifies. |
+| `just controller-fetch` | Fetch the locked Rust workspace dependencies into Cargo's shared home. |
+| `just admin-fetch` | Fetch the locked Rust workspace dependencies into Cargo's shared home. |
 | `just tools` | Install and verify tools and inputs from the active local cache without provenance refresh. |
 | `just prepare-host` | Securely record and raise runtime inotify values. |
 | `just preflight` | Check tools, inputs, Docker capacity, CIDRs, image digests, ownership collisions, and privileged-container support. |
 | `just create-management` | Reconcile the kind management cluster and lifecycle controllers. |
 | `just admin-status` | Validate the local admin Deployment, Service, provider-specific effective RBAC, health, and typed API responses. |
 | `just admin-port-forward` | Forward `tenant-system/tenant-admin` to `127.0.0.1:8080` until interrupted. |
-| `just admin-fetch` | Fetch the locked workspace dependency graph. |
 | `just admin-generate-check` | Verify generated least-privilege admin lifecycle resources are current. |
 | `just admin-lint` | Run Rust formatting and Clippy for all admin crates. |
 | `just admin-test` | Run locked/offline tests for shared DTOs, Axum projection, and Leptos view logic. |
@@ -603,7 +608,8 @@ and checksum-verified Calico and CNPG assets.
 Trunk `0.21.14` and wasm-bindgen CLI `0.2.129` are checksum-pinned cache
 inputs. `just cache` and `just cache-refresh` acquire them when needed
 (`just cache admin-build` is the CI-focused subset); admin builds consume the
-verified binaries with locked Cargo dependencies and Trunk offline. Generated
+verified binaries with locked Cargo dependencies prepared by `just
+admin-fetch`, and run Trunk offline. Generated
 HTML, JavaScript, Wasm, and CSS bundles under `.runtime/` are ignored build
 output.
 
@@ -628,15 +634,17 @@ operator command, proof, ownership, and gate contracts. They also verify
 database-controller generation, lint, tests, metrics, static build and image,
 admin generation/lint/tests/metrics, and offline reproducible server/Wasm
 packaging. PR and `main` push E2E consume the exact uploaded controller,
-database-controller and admin artifacts and runs `just test-e2e-offline`;
+database-controller and admin artifacts and run `just test-e2e-offline`;
 scheduled/manual high-capacity CI rebuilds from the complete cache.
 The end-to-end and high-capacity jobs restore the complete verified generation
-through `actions/cache`, keyed by the pinned versions, toolchain, lockfile,
-authored manifests, and cache implementation. Cargo's shared cache remains
-owned by `actions-rust-lang/setup-rust-toolchain`. Restored CAPI content is
-never trusted solely because the Actions cache key matched: `just cache` still
-validates the active inventory and local verification stamp, then reacquires
-online if the restored generation is missing or stale.
+through `actions/cache`, keyed by pinned configuration, authored manifests,
+and cache implementation. Cargo's shared cache remains owned by
+`actions-rust-lang/setup-rust-toolchain`; each live job explicitly runs
+`just controller-fetch` and `just admin-fetch` before its offline Rust
+consumers. Restored CAPI content is never trusted solely because the Actions
+cache key matched: `just cache` still validates the active inventory and local
+verification stamp, then reacquires online if the restored generation is
+missing or stale.
 The final **CAPI tests** check requires fast checks and offline E2E on PRs
 (including fork PRs) and `main` pushes, plus targeted/offline high-capacity
 jobs on manual dispatch and the weekly schedule. Azure credentials are not
@@ -652,7 +660,8 @@ scheduled or manually dispatched full gate.
 CI installs stable Rust/Cargo with
 `actions-rust-lang/setup-rust-toolchain`, including its integrated
 `Swatinem/rust-cache` for Cargo's shared home and default controller target.
-Cache misses are filled by `just controller-fetch`. Python wrappers leave
+Cache misses are filled explicitly by `just controller-fetch` and `just
+admin-fetch`. Python wrappers leave
 Cargo configuration, environment, home, target, and temporary locations at
 their system defaults; enforced-offline commands use explicit `--locked
 --offline`.

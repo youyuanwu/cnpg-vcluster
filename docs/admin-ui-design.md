@@ -390,7 +390,9 @@ Rust `1.98.1`, the `wasm32-unknown-unknown` target, Trunk `0.21.14`, and
 wasm-bindgen CLI `0.2.129` are pinned. `just cache` is the only online
 acquisition path for Trunk and wasm-bindgen; `just cache admin-build` is the
 CI-focused subset. Admin builds then use locked Cargo dependencies, Trunk
-`--locked --offline`, and the verified local binaries.
+`--locked --offline`, and the verified local binaries. Run `just admin-fetch`
+before an enforced-offline build to prepare the locked workspace dependency
+graph in Cargo's shared home.
 
 Useful commands are:
 
@@ -472,8 +474,7 @@ the local SQL console as PostgreSQL superuser and can destroy Tenant data.
 ## Troubleshooting
 
 - **`admin-fetch` fails offline**: refresh Cargo dependencies with the explicit
-  online `just admin-fetch`, or run the complete `just cache` before an
-  enforced-offline gate.
+  online `just admin-fetch` before an enforced-offline gate.
 - **Trunk or wasm-bindgen is missing or has the wrong version**: run
   `just cache` followed by `just tools`; do not install an unpinned global
   replacement.

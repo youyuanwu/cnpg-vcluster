@@ -120,7 +120,7 @@ def _private_regular_file(path: Path) -> None:
         raise IntegrityError(f"cache file is not an owner-only regular file: {path}")
 
 
-def _requirements(config: dict[str, str], root: Path | None = None) -> dict[str, object]:
+def _requirements(config: dict[str, str]) -> dict[str, object]:
     inputs = [
         {"path": filename, "sha256": config[sha_key]}
         for filename, _, sha_key in DOWNLOADS
@@ -158,32 +158,12 @@ def _requirements(config: dict[str, str], root: Path | None = None) -> dict[str,
         }
         for key in image_keys(config)
     ]
-    requirements = {
+    return {
         "inputs": inputs,
         "authoredInputs": authored,
         "provenance": provenance,
         "images": images,
     }
-    if (
-        root is not None
-        and (root / "Cargo.toml").is_file()
-        and (root / "controller" / "Cargo.toml").is_file()
-    ):
-        from scripts.lib.controller import rust_toolchain
-
-        lock = root / "Cargo.lock"
-        if not lock.is_file():
-            raise IntegrityError("workspace Cargo.lock is missing")
-        toolchain = root / "rust-toolchain.toml"
-        if not toolchain.is_file():
-            raise IntegrityError("workspace rust-toolchain.toml is missing")
-        _, compiler = rust_toolchain(root)
-        requirements["cargo"] = {
-            "lockSha256": sha256_file(lock),
-            "toolchainSha256": sha256_file(toolchain),
-            "compiler": compiler,
-        }
-    return requirements
 
 
 def _remote_image_digest(tagged: str, timeout: int) -> str:
@@ -753,7 +733,7 @@ def verify_generation(
         raise IntegrityError("unsupported cache inventory schema")
     if inventory.get("platform") != IMAGE_PLATFORM:
         raise IntegrityError("cache platform does not match linux/amd64")
-    if inventory.get("requirements") != _requirements(config, root):
+    if inventory.get("requirements") != _requirements(config):
         raise IntegrityError("cache inventory does not match current pinned requirements")
     images = inventory.get("imageArchives")
     if not isinstance(images, list):
@@ -819,17 +799,10 @@ def verify_cache(
     force: bool = False,
 ) -> VerifiedCache:
     generation = active_generation(root)
-    requirements = _requirements(config, root)
+    requirements = _requirements(config)
     inventory = _load_inventory_header(generation, requirements)
     requirements_sha256 = _requirements_sha256(requirements)
     state_sha256 = _cache_state_sha256(root, generation, requirements)
-    if (
-        (root / "Cargo.toml").is_file()
-        and (root / "controller" / "Cargo.toml").is_file()
-    ):
-        from scripts.lib.controller import fetch_controller_dependencies
-
-        fetch_controller_dependencies(root, config, offline=True)
     if (
         not force
         and _verification_matches(
@@ -991,13 +964,6 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
     published = False
     try:
         acquire_tools(root, config, tools_dir=generation)
-        if (
-            (root / "Cargo.toml").is_file()
-            and (root / "controller" / "Cargo.toml").is_file()
-        ):
-            from scripts.lib.controller import fetch_controller_dependencies
-
-            fetch_controller_dependencies(root, config)
         shutil.rmtree(generation / "bin")
         entries = []
         for key in image_keys(config):
@@ -1014,7 +980,7 @@ def acquire_cache(root: Path, config: dict[str, str]) -> None:
         inventory = {
             "schema": CACHE_SCHEMA,
             "platform": IMAGE_PLATFORM,
-            "requirements": _requirements(config, root),
+            "requirements": _requirements(config),
             "imageArchives": entries,
         }
         write_private_file(

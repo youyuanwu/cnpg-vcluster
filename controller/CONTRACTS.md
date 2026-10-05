@@ -5,7 +5,8 @@ packaged, leader-elected Rust binaries in the root Cargo workspace. Both
 are pinned to Rust 1.98.1 and independently checked against a 12,000-line
 production-Rust ceiling. Run these commands from the repository root after `just cache`
 (or `just cache-refresh` when an explicit online provenance refresh is
-required) and `just controller-fetch`:
+required) prepares the pinned tools and images, then run `just
+controller-fetch` to prepare the locked Rust workspace dependencies:
 
 ```sh
 just controller-verify
