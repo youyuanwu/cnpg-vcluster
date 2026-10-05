@@ -21,6 +21,7 @@ const NODE_HEIGHT: f32 = 124.0;
 const MIN_NODE_WIDTH: f32 = 208.0;
 const MAX_NODE_WIDTH: f32 = 286.0;
 const MAX_LABEL_CHARACTERS: usize = 30;
+const MAX_METADATA_CHARACTERS: usize = 20;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TopologyLayout {
@@ -165,6 +166,7 @@ pub fn layout_graph(graph: &TopologyGraph) -> TopologyLayout {
             edge.source.as_str(),
             edge.target.as_str(),
             edge_kind_rank(edge.kind),
+            edge.label.as_deref().unwrap_or_default(),
             edge.id.as_str(),
         )
     });
@@ -261,31 +263,31 @@ pub fn compact_placement(node: &LayoutNode) -> Vec<String> {
     match node.semantic_kind {
         TopologySemanticKind::DatabaseInstance => {
             if let Some(worker_node) = &placement.worker_node {
-                values.push(format!("Node · {worker_node}"));
+                values.push(format!("Node · {}", safe_metadata_value(worker_node)));
             }
             if let Some(zone) = &placement.zone {
-                values.push(format!("Zone · {zone}"));
+                values.push(format!("Zone · {}", safe_metadata_value(zone)));
             }
         }
         TopologySemanticKind::WorkerNode => {
             if let Some(worker_pool) = &placement.worker_pool {
-                values.push(format!("Pool · {worker_pool}"));
+                values.push(format!("Pool · {}", safe_metadata_value(worker_pool)));
             }
             if let Some(zone) = &placement.zone {
-                values.push(format!("Zone · {zone}"));
+                values.push(format!("Zone · {}", safe_metadata_value(zone)));
             }
         }
         _ => {
             if let Some(worker_pool) = &placement.worker_pool {
-                values.push(format!("Pool · {worker_pool}"));
+                values.push(format!("Pool · {}", safe_metadata_value(worker_pool)));
             }
             if let Some(worker_node) = &placement.worker_node {
-                values.push(format!("Node · {worker_node}"));
+                values.push(format!("Node · {}", safe_metadata_value(worker_node)));
             }
             if values.len() < 2
                 && let Some(zone) = &placement.zone
             {
-                values.push(format!("Zone · {zone}"));
+                values.push(format!("Zone · {}", safe_metadata_value(zone)));
             }
         }
     }
@@ -367,7 +369,7 @@ fn database_row_assignments(
         .iter()
         .map(|node| (node.id.as_str(), *node))
         .collect::<BTreeMap<_, _>>();
-    let mut parent_candidates = BTreeMap::<&str, Vec<(&str, &str)>>::new();
+    let mut parent_candidates = BTreeMap::<&str, Vec<(&str, &str, &str)>>::new();
     for edge in &graph.edges {
         if edge.kind != TopologyEdgeKind::Represents {
             continue;
@@ -384,7 +386,11 @@ fn database_row_assignments(
             parent_candidates
                 .entry(edge.target.as_str())
                 .or_default()
-                .push((edge.id.as_str(), edge.source.as_str()));
+                .push((
+                    edge.id.as_str(),
+                    edge.source.as_str(),
+                    edge.label.as_deref().unwrap_or_default(),
+                ));
         }
     }
     let parents = parent_candidates
@@ -393,7 +399,7 @@ fn database_row_assignments(
             candidates.sort_unstable();
             candidates
                 .first()
-                .map(|(_, source)| (target, source.to_string()))
+                .map(|(_, source, _)| (target, source.to_string()))
         })
         .collect::<BTreeMap<_, _>>();
 
@@ -485,6 +491,24 @@ pub fn safe_label(value: &str) -> String {
         .filter(|character| !character.is_control())
         .count()
         > MAX_LABEL_CHARACTERS
+    {
+        format!("{cleaned}…")
+    } else {
+        cleaned
+    }
+}
+
+fn safe_metadata_value(value: &str) -> String {
+    let cleaned = value
+        .chars()
+        .filter(|character| !character.is_control())
+        .take(MAX_METADATA_CHARACTERS)
+        .collect::<String>();
+    if value
+        .chars()
+        .filter(|character| !character.is_control())
+        .count()
+        > MAX_METADATA_CHARACTERS
     {
         format!("{cleaned}…")
     } else {
@@ -734,6 +758,17 @@ mod tests {
         let accessible = accessible_node_label(&missing);
         assert!(accessible.contains("worker node not reported"));
         assert!(accessible.contains("zone not reported"));
+        let full_worker = "worker-".to_owned() + &"x".repeat(120);
+        let mut long = missing;
+        long.placement = Some(TopologyPlacement {
+            worker_pool: None,
+            worker_node: Some(full_worker.clone()),
+            zone: Some("zone-with-a-very-long-authoritative-name".into()),
+        });
+        let compact = compact_placement(&long);
+        assert!(compact.iter().all(|line| line.chars().count() <= 28));
+        assert!(compact.iter().all(|line| line.ends_with('…')));
+        assert!(accessible_node_label(&long).contains(&full_worker));
     }
 
     #[test]

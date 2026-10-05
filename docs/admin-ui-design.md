@@ -199,9 +199,11 @@ positions inside their bands. Database instances are grouped with their
 surviving cluster parent and ordered Primary → Standby → Unknown; an omitted
 parent yields a stable orphan row. Available worker-pool, worker-node and zone
 placement is compact node metadata, not a set of additional graph edges.
-Unavailable placement remains `Not reported` in native details and is never
-inferred from display strings. Edges without an explicit source label have no
-visible label; relationship type remains in accessible and textual details.
+Azure pool placement is present only when the recorded pool UID resolves to an
+accepted pool resource. Unavailable placement remains `Not reported` in native
+details and is never inferred from names or display strings. Edges without an
+explicit source label have no visible label; relationship type remains in
+accessible and textual details.
 
 Ownership (`tenant-owned`, `provider-owned` or `unknown`) is independent of
 representation provenance. Exact Kubernetes resources, logical database

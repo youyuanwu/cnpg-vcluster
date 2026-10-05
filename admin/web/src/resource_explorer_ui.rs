@@ -4,7 +4,7 @@ use tenant_admin_shared::query::{TopologyGraph, TopologyHealth};
 use crate::{
     explorer::{
         ExplorerFilter, ExplorerModel, ResourceGroup, ResourceRelationship, display_identity,
-        representation_class, representation_label,
+        representation_class, representation_label, summary_group,
     },
     format::{
         database_instance_role_class, database_instance_role_label, edge_kind_label, health_class,
@@ -181,6 +181,7 @@ pub fn ResourceExplorer(
                                                 <button type="button"
                                                     class="resource-select"
                                                     class:resource-select--selected=move || selected.get().as_deref() == Some(selected_id.as_str())
+                                                    aria-pressed=move || selected.get().as_deref() == Some(id.as_str())
                                                     on:click=move |_| {
                                                         selected.set(Some(button_id.clone()));
                                                         selected_relationship.set(None);
@@ -224,6 +225,7 @@ pub fn ResourceExplorer(
                             namespace_not_applicable.get(),
                         ),
                         selected.get().as_deref(),
+                        group,
                         selected,
                         selected_relationship,
                     )}
@@ -246,6 +248,7 @@ fn graph_view(
     model: &ExplorerModel,
     filter: &ExplorerFilter,
     selected_id: Option<&str>,
+    group: RwSignal<Option<ResourceGroup>>,
     selected: RwSignal<Option<String>>,
     selected_relationship: RwSignal<Option<String>>,
 ) -> AnyView {
@@ -301,6 +304,9 @@ fn graph_view(
                     let role_class = node.database_role.map(database_instance_role_class);
                     let placement = compact_placement(&node);
                     let accessible_label = accessible_node_label(&node);
+                    let accessible_selected = accessible_label.clone();
+                    let accessible_id = node.id.clone();
+                    let summary_group = summary_group(&node.id);
                     let endpoint_node = endpoint_ids.as_ref().is_some_and(|(source, target)| {
                         source == &node.id || target == &node.id
                     });
@@ -313,10 +319,21 @@ fn graph_view(
                                 role_class.map_or_else(String::new, |role| format!(" database-role--{role}")),
                             )
                             class:node--selected=move || selected.get().as_deref() == Some(selected_node.as_str()) || endpoint_node
-                            aria-label=accessible_label
+                            aria-label=move || {
+                                if selected.get().as_deref() == Some(accessible_id.as_str()) {
+                                    format!("{accessible_selected}; selected")
+                                } else {
+                                    accessible_selected.clone()
+                                }
+                            }
                             transform=format!("translate({}, {})", node.x, node.y)
                             on:click=move |_| {
-                                selected.set(Some(id.clone()));
+                                if let Some(summary_group) = summary_group {
+                                    group.set(Some(summary_group));
+                                    selected.set(None);
+                                } else {
+                                    selected.set(Some(id.clone()));
+                                }
                                 selected_relationship.set(None);
                             }>
                             <rect width=node.width height=node.height rx="9" ry="9"/>

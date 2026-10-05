@@ -171,14 +171,14 @@ impl ExplorerModel {
             .collect();
         graph.edges.sort_by_key(|edge| {
             (
+                edge.id.clone(),
                 edge.source.clone(),
                 edge.target.clone(),
                 edge_kind_rank(edge.kind),
                 edge.label.clone(),
-                edge.id.clone(),
             )
         });
-        graph.edges.dedup();
+        graph.edges.dedup_by(|left, right| left.id == right.id);
         Self {
             edges: graph.edges.clone(),
             graph,
@@ -320,6 +320,13 @@ impl ExplorerModel {
     }
 
     pub fn relationship_matches_filter(&self, id: &str, filter: &ExplorerFilter) -> bool {
+        if !filter.is_active() {
+            return self.edges.iter().any(|edge| {
+                edge.id == id
+                    && self.nodes.contains_key(&edge.source)
+                    && self.nodes.contains_key(&edge.target)
+            });
+        }
         let eligible = self
             .filtered_nodes(filter)
             .into_iter()
@@ -336,16 +343,30 @@ impl ExplorerModel {
         selected: Option<&str>,
         relationship_id: Option<&str>,
     ) -> (Option<String>, Option<String>) {
-        let eligible = self
-            .filtered_nodes(filter)
-            .into_iter()
-            .map(|node| node.id)
-            .collect::<BTreeSet<_>>();
+        let eligible = if filter.is_active() {
+            self.filtered_nodes(filter)
+                .into_iter()
+                .map(|node| node.id)
+                .collect::<BTreeSet<_>>()
+        } else {
+            self.nodes.keys().cloned().collect()
+        };
         let selected = selected
             .filter(|id| eligible.contains(*id))
             .map(str::to_owned);
         let relationship = relationship_id
-            .filter(|id| selected.is_some() && self.relationship_matches_filter(id, filter))
+            .filter(|id| {
+                selected.as_ref().map_or_else(
+                    || self.relationship_matches_filter(id, filter),
+                    |selected| {
+                        self.edges.iter().any(|edge| {
+                            edge.id.as_str() == *id
+                                && (edge.source == selected.as_str()
+                                    || edge.target == selected.as_str())
+                        })
+                    },
+                )
+            })
             .map(str::to_owned);
         (selected, relationship)
     }
@@ -858,6 +879,19 @@ pub fn representation_label(provenance: TopologyNodeProvenance) -> &'static str 
     }
 }
 
+pub fn summary_group(id: &str) -> Option<ResourceGroup> {
+    match id.strip_prefix("group:")? {
+        "tenant" => Some(ResourceGroup::Tenant),
+        "control-plane" => Some(ResourceGroup::ControlPlane),
+        "compute" => Some(ResourceGroup::Compute),
+        "databases" => Some(ResourceGroup::Databases),
+        "add-ons" => Some(ResourceGroup::AddOns),
+        "provider-infrastructure" => Some(ResourceGroup::ProviderInfrastructure),
+        "other" => Some(ResourceGroup::Other),
+        _ => None,
+    }
+}
+
 pub const fn representation_class(provenance: TopologyNodeProvenance) -> &'static str {
     match provenance {
         TopologyNodeProvenance::ExactKubernetesResource => "exact",
@@ -960,6 +994,8 @@ mod tests {
     use std::time::Instant;
 
     use tenant_admin_shared::query::TenantProvider;
+
+    use crate::topology::layout_graph;
 
     use super::*;
 
@@ -1228,6 +1264,11 @@ mod tests {
                 edge.clone(),
                 edge.clone(),
                 TopologyEdge {
+                    kind: TopologyEdgeKind::DependsOn,
+                    label: Some("duplicate ID".into()),
+                    ..edge.clone()
+                },
+                TopologyEdge {
                     id: "parallel-two".into(),
                     ..edge
                 },
@@ -1244,9 +1285,28 @@ mod tests {
         assert_eq!(
             model.inspection("node:00").unwrap().outgoing.len(),
             2,
-            "exact duplicate relationships are canonicalized while parallel IDs remain"
+            "duplicate IDs are canonicalized while parallel unique IDs remain"
+        );
+        assert_eq!(
+            model.relationship_by_id("parallel").unwrap().kind,
+            TopologyEdgeKind::Owns
         );
         assert!(model.relationship_matches_filter("parallel", &filter));
+        assert_eq!(
+            model.synchronized_focus(&filter, None, Some("parallel")),
+            (None, Some("parallel".into()))
+        );
+        assert_eq!(
+            model.synchronized_focus(
+                &ExplorerFilter {
+                    query: "worker-00".into(),
+                    ..ExplorerFilter::default()
+                },
+                Some("node:00"),
+                Some("parallel"),
+            ),
+            (Some("node:00".into()), Some("parallel".into()))
+        );
         assert!(!model.relationship_matches_filter(
             "parallel",
             &ExplorerFilter {
@@ -1264,6 +1324,45 @@ mod tests {
                 Some("parallel"),
             ),
             (None, None)
+        );
+    }
+
+    #[test]
+    fn unfiltered_source_summaries_remain_focusable() {
+        assert_eq!(summary_group("group:compute"), Some(ResourceGroup::Compute));
+        assert_eq!(summary_group("summary:workers"), None);
+        let mut summary = node(
+            "summary:workers",
+            TopologyNodeKind::WorkerPool,
+            TopologyHealth::Unknown,
+            "Workers",
+        );
+        summary.provenance = TopologyNodeProvenance::SyntheticSummary;
+        summary.semantic_kind = TopologySemanticKind::WorkerPool;
+        let worker = node(
+            "node:one",
+            TopologyNodeKind::Node,
+            TopologyHealth::Ready,
+            "worker-one",
+        );
+        let model = ExplorerModel::new(graph(
+            vec![summary, worker],
+            vec![TopologyEdge {
+                id: "summary-worker".into(),
+                source: "summary:workers".into(),
+                target: "node:one".into(),
+                kind: TopologyEdgeKind::Represents,
+                label: None,
+            }],
+        ));
+
+        assert_eq!(
+            model.synchronized_focus(&ExplorerFilter::default(), Some("summary:workers"), None),
+            (Some("summary:workers".into()), None)
+        );
+        assert_eq!(
+            model.synchronized_focus(&ExplorerFilter::default(), None, Some("summary-worker")),
+            (None, Some("summary-worker".into()))
         );
     }
 
@@ -1337,14 +1436,53 @@ mod tests {
         }
         let started = Instant::now();
         let model = ExplorerModel::new(graph(nodes, edges));
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
         let _ = model.group_summaries();
-        let _ = model.filtered_nodes(&ExplorerFilter {
+        let search_filter = ExplorerFilter {
             query: "worker-19".into(),
             health: Some(TopologyHealth::Ready),
             ..ExplorerFilter::default()
-        });
-        let _ = model.focused_graph(Some("machine:19"));
-        let _ = model.group_graph(ResourceGroup::Compute);
+        };
+        let search_graph = model.graph_for_filter(&search_filter, None, None);
+        let _ = layout_graph(&search_graph);
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
+        let selected_graph =
+            model.graph_for_filter(&ExplorerFilter::default(), Some("machine:19"), None);
+        let _ = layout_graph(&selected_graph);
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
+        let relationship_graph = model.graph_for_filter(
+            &ExplorerFilter::default(),
+            Some("machine:19"),
+            Some("edge:19"),
+        );
+        let _ = layout_graph(&relationship_graph);
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
+        let group_filter = ExplorerFilter {
+            group: Some(ResourceGroup::Compute),
+            ..ExplorerFilter::default()
+        };
+        let group_graph = model.graph_for_filter(&group_filter, Some("machine:19"), None);
+        let _ = layout_graph(&group_graph);
+        assert_eq!(group_graph.nodes.len(), MAX_VISIBLE_NODES);
+        assert!(started.elapsed().as_secs_f32() < 1.0);
+
+        let started = Instant::now();
+        let _ = model.synchronized_focus(
+            &ExplorerFilter {
+                query: "does-not-exist".into(),
+                ..ExplorerFilter::default()
+            },
+            Some("machine:19"),
+            Some("edge:19"),
+        );
         let _ = model.inspection("machine:19");
         assert!(started.elapsed().as_secs_f32() < 1.0);
     }

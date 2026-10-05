@@ -1594,12 +1594,12 @@ fn topology(
         let id = format!("resource:{}", bounded(uid, MAX_IDENTITY));
         ids_by_uid.insert(uid, id.clone());
         let kind = topology_kind(resource.definition);
-        let semantic_kind = semantic_kind(kind);
+        let (semantic_kind, ownership) = management_semantics(resource.definition);
         nodes.push(TopologyNode {
             id,
             kind,
             semantic_kind,
-            ownership: semantic_ownership(semantic_kind),
+            ownership,
             provenance: TopologyNodeProvenance::ExactKubernetesResource,
             database_role: None,
             placement: None,
@@ -2110,6 +2110,16 @@ fn add_azure_status_nodes(
         Some(worker_id) => worker_id,
         None => "summary:workers".into(),
     };
+    let worker_pool_label = (worker_id != "summary:workers")
+        .then(|| {
+            nodes
+                .iter()
+                .find(|node| {
+                    node.id == worker_id && node.semantic_kind == TopologySemanticKind::WorkerPool
+                })
+                .map(|node| node.label.clone())
+        })
+        .flatten();
     if worker_id == "summary:workers" {
         add_summary_node(
             nodes,
@@ -2133,14 +2143,13 @@ fn add_azure_status_nodes(
             ownership: TopologyOwnership::TenantOwned,
             provenance: TopologyNodeProvenance::ExactKubernetesResource,
             database_role: None,
-            placement: Some(TopologyPlacement {
-                worker_pool: Some(format!(
-                    "{}-worker",
-                    bounded(&tenant.name_any(), MAX_IDENTITY)
-                )),
-                worker_node: None,
-                zone: None,
-            }),
+            placement: worker_pool_label
+                .as_ref()
+                .map(|worker_pool| TopologyPlacement {
+                    worker_pool: Some(worker_pool.clone()),
+                    worker_node: None,
+                    zone: None,
+                }),
             label: bounded(&node.name, MAX_IDENTITY),
             health: condition_health(tenant, "AzureWorkersReady"),
             resource: Some(ResourceIdentityView {
@@ -2292,6 +2301,60 @@ fn topology_kind(definition: ManagementResource) -> TopologyNodeKind {
         "machine" | "machine-set" | "azure-machine-pool-machine" => TopologyNodeKind::Machine,
         "addon-values" | "status-probe" | "addon-job" => TopologyNodeKind::AddOn,
         _ => TopologyNodeKind::ProviderResource,
+    }
+}
+
+fn management_semantics(
+    definition: ManagementResource,
+) -> (TopologySemanticKind, TopologyOwnership) {
+    match definition.role {
+        "namespace" => (TopologySemanticKind::Tenant, TopologyOwnership::TenantOwned),
+        "cluster"
+        | "dev-cluster"
+        | "azure-cluster"
+        | "kamaji-control-plane"
+        | "tenant-kubeconfig" => (
+            TopologySemanticKind::ControlPlane,
+            TopologyOwnership::TenantOwned,
+        ),
+        "provider"
+        | "provider-certificate"
+        | "provider-certificate-request"
+        | "provider-issuer"
+        | "provider-service"
+        | "provider-stateful-set"
+        | "provider-pvc"
+        | "provider-pdb"
+        | "provider-role"
+        | "provider-role-binding" => (
+            TopologySemanticKind::ControlPlane,
+            TopologyOwnership::ProviderOwned,
+        ),
+        "machine-deployment" | "machine-pool" | "azure-machine-pool" => (
+            TopologySemanticKind::WorkerPool,
+            TopologyOwnership::TenantOwned,
+        ),
+        "kubeadm-config-template"
+        | "dev-machine-template"
+        | "kubeadm-config"
+        | "machine"
+        | "machine-set"
+        | "azure-machine-pool-machine" => (
+            TopologySemanticKind::ComputeMachine,
+            TopologyOwnership::TenantOwned,
+        ),
+        "addon-values" | "status-probe" | "addon-job" => {
+            (TopologySemanticKind::AddOn, TopologyOwnership::TenantOwned)
+        }
+        "azure-cluster-identity"
+        | "aso-resource-group"
+        | "aso-virtual-network"
+        | "aso-subnet"
+        | "aso-nat-gateway" => (
+            TopologySemanticKind::ProviderInfrastructure,
+            TopologyOwnership::ProviderOwned,
+        ),
+        _ => (TopologySemanticKind::Other, TopologyOwnership::Unknown),
     }
 }
 
@@ -3515,10 +3578,7 @@ mod tests {
                 && node.semantic_kind == TopologySemanticKind::WorkerNode
                 && node.ownership == TopologyOwnership::TenantOwned
                 && node.label == "node-a"
-                && node.placement.as_ref().is_some_and(|placement| {
-                    placement.worker_pool.as_deref() == Some("tenant-a-worker")
-                        && placement.zone.is_none()
-                })
+                && node.placement.is_none()
         }));
         assert!(
             projection
@@ -3549,6 +3609,112 @@ mod tests {
                 .iter()
                 .all(|node| node.kind != TopologyNodeKind::Database)
         );
+    }
+
+    #[test]
+    fn management_roles_map_to_authoritative_semantics_and_ownership() {
+        let definitions = MANAGEMENT_RESOURCES
+            .iter()
+            .chain(AZURE_MANAGEMENT_RESOURCES.iter())
+            .copied()
+            .collect::<Vec<_>>();
+        let expected = [
+            (
+                "namespace",
+                TopologySemanticKind::Tenant,
+                TopologyOwnership::TenantOwned,
+            ),
+            (
+                "cluster",
+                TopologySemanticKind::ControlPlane,
+                TopologyOwnership::TenantOwned,
+            ),
+            (
+                "kubeadm-config-template",
+                TopologySemanticKind::ComputeMachine,
+                TopologyOwnership::TenantOwned,
+            ),
+            (
+                "machine-pool",
+                TopologySemanticKind::WorkerPool,
+                TopologyOwnership::TenantOwned,
+            ),
+            (
+                "addon-values",
+                TopologySemanticKind::AddOn,
+                TopologyOwnership::TenantOwned,
+            ),
+            (
+                "provider-service",
+                TopologySemanticKind::ControlPlane,
+                TopologyOwnership::ProviderOwned,
+            ),
+            (
+                "aso-resource-group",
+                TopologySemanticKind::ProviderInfrastructure,
+                TopologyOwnership::ProviderOwned,
+            ),
+            (
+                "allocation-lease",
+                TopologySemanticKind::Other,
+                TopologyOwnership::Unknown,
+            ),
+        ];
+        for (role, semantic, ownership) in expected {
+            let definition = definitions
+                .iter()
+                .find(|definition| definition.role == role)
+                .copied()
+                .expect("management role");
+            assert_eq!(management_semantics(definition), (semantic, ownership));
+        }
+        assert!(definitions.iter().all(|definition| {
+            definition.role == "allocation-lease"
+                || management_semantics(*definition)
+                    != (TopologySemanticKind::Other, TopologyOwnership::Unknown)
+        }));
+    }
+
+    #[test]
+    fn azure_node_pool_placement_requires_an_accepted_pool_node() {
+        let tenant = azure_tenant();
+        let Some(TenantProviderStatus::Azure(status)) = tenant
+            .status
+            .as_ref()
+            .and_then(|status| status.provider.as_ref())
+        else {
+            panic!("azure status");
+        };
+        let worker_id = "resource:pool-uid".to_owned();
+        let mut nodes = vec![TopologyNode {
+            id: worker_id.clone(),
+            kind: TopologyNodeKind::WorkerPool,
+            semantic_kind: TopologySemanticKind::WorkerPool,
+            ownership: TopologyOwnership::TenantOwned,
+            provenance: TopologyNodeProvenance::ExactKubernetesResource,
+            database_role: None,
+            placement: None,
+            label: "accepted-pool".into(),
+            health: TopologyHealth::Ready,
+            resource: None,
+            attributes: Vec::new(),
+        }];
+        let mut edges = Vec::new();
+        let ids = BTreeMap::from([("pool-uid", worker_id)]);
+
+        add_azure_status_nodes(&tenant, status, &mut nodes, &mut edges, "tenant", &ids);
+
+        let node = nodes
+            .iter()
+            .find(|node| node.semantic_kind == TopologySemanticKind::WorkerNode)
+            .expect("worker node");
+        assert_eq!(
+            node.placement
+                .as_ref()
+                .and_then(|placement| placement.worker_pool.as_deref()),
+            Some("accepted-pool")
+        );
+        assert!(node.placement.as_ref().unwrap().zone.is_none());
     }
 
     #[test]
