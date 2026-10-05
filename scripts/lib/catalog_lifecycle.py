@@ -8,7 +8,7 @@ from subprocess import CompletedProcess
 
 
 UUID = re.compile(r"^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$")
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 Get = Callable[[str], str]
 Mutate = Callable[[str, str, dict[str, object]], CompletedProcess[str]]
 

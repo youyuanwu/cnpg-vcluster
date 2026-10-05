@@ -60,7 +60,7 @@ from scripts.tenant import supported_versions
 
 
 T = TypeVar("T")
-ADMIN_API_SCHEMA_VERSION = 6
+ADMIN_API_SCHEMA_VERSION = 7
 
 
 def _tenant_command(*arguments: str) -> str:

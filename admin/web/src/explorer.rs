@@ -2,7 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use tenant_admin_shared::query::{
     DisplayAttribute, ResourceIdentityView, TopologyEdge, TopologyEdgeKind, TopologyGraph,
-    TopologyHealth, TopologyNode, TopologyNodeKind, TopologyNodeProvenance,
+    TopologyHealth, TopologyNode, TopologyNodeKind, TopologyNodeProvenance, TopologyOwnership,
+    TopologySemanticKind,
 };
 
 pub const MAX_VISIBLE_NODES: usize = 20;
@@ -530,7 +531,11 @@ impl ExplorerModel {
             nodes.push(TopologyNode {
                 id: id.clone(),
                 kind: group_kind(summary.group),
+                semantic_kind: group_semantic_kind(summary.group),
+                ownership: group_ownership(summary.group),
                 provenance: TopologyNodeProvenance::SyntheticSummary,
+                database_role: None,
+                placement: None,
                 label: format!("{} ({})", summary.group.label(), summary.count),
                 health: summary_health(&summary.health),
                 resource: None,
@@ -579,6 +584,30 @@ fn group_kind(group: ResourceGroup) -> TopologyNodeKind {
         ResourceGroup::ProviderInfrastructure | ResourceGroup::Other => {
             TopologyNodeKind::ProviderResource
         }
+    }
+}
+
+const fn group_semantic_kind(group: ResourceGroup) -> TopologySemanticKind {
+    match group {
+        ResourceGroup::Tenant => TopologySemanticKind::Tenant,
+        ResourceGroup::ControlPlane => TopologySemanticKind::ControlPlane,
+        ResourceGroup::Compute => TopologySemanticKind::WorkerPool,
+        ResourceGroup::Databases => TopologySemanticKind::DatabaseCluster,
+        ResourceGroup::AddOns => TopologySemanticKind::AddOn,
+        ResourceGroup::ProviderInfrastructure => TopologySemanticKind::ProviderInfrastructure,
+        ResourceGroup::Other => TopologySemanticKind::Other,
+    }
+}
+
+const fn group_ownership(group: ResourceGroup) -> TopologyOwnership {
+    match group {
+        ResourceGroup::ProviderInfrastructure => TopologyOwnership::ProviderOwned,
+        ResourceGroup::Other => TopologyOwnership::Unknown,
+        ResourceGroup::Tenant
+        | ResourceGroup::ControlPlane
+        | ResourceGroup::Compute
+        | ResourceGroup::Databases
+        | ResourceGroup::AddOns => TopologyOwnership::TenantOwned,
     }
 }
 
@@ -709,7 +738,24 @@ mod tests {
         TopologyNode {
             id: id.into(),
             kind,
+            semantic_kind: match kind {
+                TopologyNodeKind::Tenant => TopologySemanticKind::Tenant,
+                TopologyNodeKind::ControlPlane => TopologySemanticKind::ControlPlane,
+                TopologyNodeKind::WorkerPool => TopologySemanticKind::WorkerPool,
+                TopologyNodeKind::Machine => TopologySemanticKind::ComputeMachine,
+                TopologyNodeKind::Node => TopologySemanticKind::WorkerNode,
+                TopologyNodeKind::ProviderResource => TopologySemanticKind::ProviderInfrastructure,
+                TopologyNodeKind::AddOn => TopologySemanticKind::AddOn,
+                TopologyNodeKind::Database => TopologySemanticKind::DatabaseCluster,
+            },
+            ownership: if kind == TopologyNodeKind::ProviderResource {
+                TopologyOwnership::ProviderOwned
+            } else {
+                TopologyOwnership::TenantOwned
+            },
             provenance: TopologyNodeProvenance::ExactKubernetesResource,
+            database_role: None,
+            placement: None,
             label: label.into(),
             health,
             resource: Some(ResourceIdentityView {

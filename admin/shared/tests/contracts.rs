@@ -17,7 +17,8 @@ use tenant_admin_shared::{
         SectionAvailability, TenantCounts, TenantDetail, TenantProvider, TenantSnapshot,
         TenantSnapshotIdentity, TenantSnapshotSections, TenantSummary, TopologyEdge,
         TopologyEdgeKind, TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind,
-        TopologyNodeProvenance, UnknownProviderView, WorkerCapacityView,
+        TopologyNodeProvenance, TopologyOwnership, TopologyPlacement, TopologySemanticKind,
+        UnknownProviderView, WorkerCapacityView,
     },
     routes::{
         API_DATABASE_PATH, API_DATABASE_QUERY_PATH, API_DATABASES_PATH, API_OVERVIEW_PATH,
@@ -31,7 +32,7 @@ use tenant_admin_shared::{
 #[test]
 fn deployment_and_route_constants_are_exact() {
     assert_eq!(API_SCHEMA_NAME, "tenant-admin");
-    assert_eq!(API_SCHEMA_VERSION, 6);
+    assert_eq!(API_SCHEMA_VERSION, 7);
     assert_eq!(ADMIN_RESOURCE_NAME, "tenant-admin");
     assert_eq!(ADMIN_NAMESPACE, "tenant-system");
     assert_eq!(ADMIN_CONTAINER_PORT, 8080);
@@ -86,7 +87,7 @@ fn catalog_contracts_carry_exact_catalog_entry_and_instance_identities() {
         sql: "select 1".into(),
     };
     let create_json = serde_json::to_value(ApiEnvelope::new(create)).unwrap();
-    assert_eq!(create_json["schemaVersion"], 6);
+    assert_eq!(create_json["schemaVersion"], 7);
     assert_eq!(create_json["data"]["catalogUid"], catalog);
     assert_eq!(serde_json::to_value(delete).unwrap()["logicalUid"], logical);
     assert_eq!(
@@ -153,7 +154,7 @@ fn lifecycle_contracts_are_versioned_provider_neutral_and_uid_bound() {
         uid: "tenant-uid".into(),
         confirmation: "demo".into(),
     };
-    assert_eq!(serde_json::to_value(created).unwrap()["schemaVersion"], 6);
+    assert_eq!(serde_json::to_value(created).unwrap()["schemaVersion"], 7);
     assert_eq!(
         serde_json::to_value(deleted).unwrap()["data"]["state"],
         "accepted"
@@ -179,7 +180,7 @@ fn envelopes_have_stable_versioned_json() {
     let success = ApiEnvelope::new(vec!["alpha", "beta"]);
     assert_eq!(
         serde_json::to_string(&success).expect("success envelope serializes"),
-        r#"{"schemaVersion":6,"data":["alpha","beta"]}"#
+        r#"{"schemaVersion":7,"data":["alpha","beta"]}"#
     );
 
     let error = ApiErrorEnvelope::new(ApiError::new(
@@ -189,7 +190,7 @@ fn envelopes_have_stable_versioned_json() {
     ));
     assert_eq!(
         serde_json::to_string(&error).expect("error envelope serializes"),
-        r#"{"schemaVersion":6,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
+        r#"{"schemaVersion":7,"error":{"code":"kubernetes-unavailable","message":"management API unavailable","retryable":true}}"#
     );
 
     let decoded: ApiErrorEnvelope =
@@ -206,7 +207,15 @@ fn topology_serialization_is_deterministic() {
         nodes: vec![TopologyNode {
             id: "tenant/demo".into(),
             kind: TopologyNodeKind::Tenant,
+            semantic_kind: TopologySemanticKind::Tenant,
+            ownership: TopologyOwnership::TenantOwned,
             provenance: TopologyNodeProvenance::ExactKubernetesResource,
+            database_role: None,
+            placement: Some(TopologyPlacement {
+                worker_pool: None,
+                worker_node: None,
+                zone: Some("test-zone".into()),
+            }),
             label: "demo".into(),
             health: TopologyHealth::Ready,
             resource: None,
@@ -229,7 +238,7 @@ fn topology_serialization_is_deterministic() {
     assert_eq!(first, second);
     assert_eq!(
         first,
-        r#"{"tenantName":"demo","provider":"local","nodes":[{"id":"tenant/demo","kind":"tenant","provenance":"exact-kubernetes-resource","label":"demo","health":"ready","resource":null,"attributes":[{"label":"Kubernetes","value":"v1.36.0"}]}],"edges":[{"id":"tenant-to-control-plane","source":"tenant/demo","target":"control-plane/demo","kind":"owns","label":null}]}"#
+        r#"{"tenantName":"demo","provider":"local","nodes":[{"id":"tenant/demo","kind":"tenant","semanticKind":"tenant","ownership":"tenant-owned","provenance":"exact-kubernetes-resource","databaseRole":null,"placement":{"workerPool":null,"workerNode":null,"zone":"test-zone"},"label":"demo","health":"ready","resource":null,"attributes":[{"label":"Kubernetes","value":"v1.36.0"}]}],"edges":[{"id":"tenant-to-control-plane","source":"tenant/demo","target":"control-plane/demo","kind":"owns","label":null}]}"#
     );
 
     let decoded: TopologyGraph = serde_json::from_str(&first).expect("topology round trips");
@@ -512,7 +521,7 @@ fn database_query_contract_supports_unrestricted_multi_result_sql_without_creden
         .expect("query response serializes");
     assert_eq!(
         json,
-        r#"{"schemaVersion":6,"data":{"tenant":"demo","cluster":"capi-postgres","instance":"capi-postgres-1","database":"postgres","executedAt":"2026-09-29T22:40:00Z","durationMs":17,"truncated":false,"results":[{"columns":[],"rows":[],"affectedRows":0,"truncated":false},{"columns":["value"],"rows":[[null]],"affectedRows":1,"truncated":false}]}}"#
+        r#"{"schemaVersion":7,"data":{"tenant":"demo","cluster":"capi-postgres","instance":"capi-postgres-1","database":"postgres","executedAt":"2026-09-29T22:40:00Z","durationMs":17,"truncated":false,"results":[{"columns":[],"rows":[],"affectedRows":0,"truncated":false},{"columns":["value"],"rows":[[null]],"affectedRows":1,"truncated":false}]}}"#
     );
     for forbidden in ["password", "username", "uri", "pgpass", "kubeconfig"] {
         assert!(

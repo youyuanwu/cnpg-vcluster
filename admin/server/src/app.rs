@@ -2094,7 +2094,7 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body: ApiEnvelope<CatalogView> = response_json(response).await;
-        assert_eq!(body.schema_version, 6);
+        assert_eq!(body.schema_version, 7);
         assert_eq!(body.data.catalog_uid, CATALOG);
         let add = format!(r#"{{"catalogUid":"{CATALOG}","name":"alpha","instances":2}}"#);
         let send = |path: &str, body: String| {

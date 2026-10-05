@@ -11,7 +11,8 @@ use tenant_admin_shared::query::{
     ProviderStatusView, ResourceIdentityView, TenantBlocker, TenantClassification, TenantCondition,
     TenantDetail, TenantProvider, TenantSpecificationView, TenantSummary, TopologyEdge,
     TopologyEdgeKind, TopologyGraph, TopologyHealth, TopologyNode, TopologyNodeKind,
-    TopologyNodeProvenance, UnknownProviderView, WorkerCapacityView,
+    TopologyNodeProvenance, TopologyOwnership, TopologyPlacement, TopologySemanticKind,
+    UnknownProviderView, WorkerCapacityView,
 };
 use tenant_controller::{
     api::{
@@ -1553,7 +1554,11 @@ fn topology(
     let mut nodes = vec![TopologyNode {
         id: tenant_id.clone(),
         kind: TopologyNodeKind::Tenant,
+        semantic_kind: TopologySemanticKind::Tenant,
+        ownership: TopologyOwnership::TenantOwned,
         provenance: TopologyNodeProvenance::ExactKubernetesResource,
+        database_role: None,
+        placement: None,
         label: summary.name.clone(),
         health: classification_health(summary.classification),
         resource: Some(ResourceIdentityView {
@@ -1588,10 +1593,16 @@ fn topology(
         };
         let id = format!("resource:{}", bounded(uid, MAX_IDENTITY));
         ids_by_uid.insert(uid, id.clone());
+        let kind = topology_kind(resource.definition);
+        let semantic_kind = semantic_kind(kind);
         nodes.push(TopologyNode {
             id,
-            kind: topology_kind(resource.definition),
+            kind,
+            semantic_kind,
+            ownership: semantic_ownership(semantic_kind),
             provenance: TopologyNodeProvenance::ExactKubernetesResource,
+            database_role: None,
+            placement: None,
             label: resource
                 .object
                 .metadata
@@ -1687,7 +1698,11 @@ fn add_summary_node(
     nodes.push(TopologyNode {
         id: node_id.clone(),
         kind: summary.kind,
+        semantic_kind: semantic_kind(summary.kind),
+        ownership: semantic_ownership(semantic_kind(summary.kind)),
         provenance: TopologyNodeProvenance::SyntheticSummary,
+        database_role: None,
+        placement: None,
         label: summary.label.into(),
         health: summary.health,
         resource: None,
@@ -1726,7 +1741,11 @@ fn add_database_nodes(
             nodes.push(TopologyNode {
                 id: node_id.clone(),
                 kind: TopologyNodeKind::Database,
+                semantic_kind: TopologySemanticKind::DatabaseCluster,
+                ownership: TopologyOwnership::TenantOwned,
                 provenance: TopologyNodeProvenance::SyntheticSummary,
+                database_role: None,
+                placement: None,
                 label: "Databases unavailable".into(),
                 health: unavailable_database_health(*reason),
                 resource: None,
@@ -1806,7 +1825,11 @@ fn add_available_database(
     nodes.push(TopologyNode {
         id: cluster_id.clone(),
         kind: TopologyNodeKind::Database,
+        semantic_kind: TopologySemanticKind::DatabaseCluster,
+        ownership: TopologyOwnership::TenantOwned,
         provenance: TopologyNodeProvenance::ExactKubernetesResource,
+        database_role: None,
+        placement: None,
         label: bounded(&cluster.identity.name, MAX_IDENTITY),
         health: database_cluster_health(cluster),
         resource: Some(ResourceIdentityView {
@@ -1869,7 +1892,26 @@ fn add_available_database(
         nodes.push(TopologyNode {
             id: instance_id.clone(),
             kind: TopologyNodeKind::Database,
+            semantic_kind: TopologySemanticKind::DatabaseInstance,
+            ownership: TopologyOwnership::TenantOwned,
             provenance: TopologyNodeProvenance::DatabaseLogicalRepresentation,
+            database_role: Some(instance.role),
+            placement: Some(TopologyPlacement {
+                worker_pool: None,
+                worker_node: instance
+                    .node
+                    .as_deref()
+                    .map(|value| bounded(value, MAX_IDENTITY)),
+                zone: instance
+                    .zone
+                    .as_deref()
+                    .map(|value| bounded(value, MAX_IDENTITY)),
+            })
+            .filter(|placement| {
+                placement.worker_pool.is_some()
+                    || placement.worker_node.is_some()
+                    || placement.zone.is_some()
+            }),
             label: bounded(&instance.name, MAX_IDENTITY),
             health: database_instance_health(instance),
             resource: None,
@@ -1880,7 +1922,7 @@ fn add_available_database(
             source: cluster_id.clone(),
             target: instance_id,
             kind: TopologyEdgeKind::Represents,
-            label: Some(role.into()),
+            label: None,
         });
     }
 }
@@ -2087,7 +2129,18 @@ fn add_azure_status_nodes(
         nodes.push(TopologyNode {
             id: id.clone(),
             kind: TopologyNodeKind::Node,
+            semantic_kind: TopologySemanticKind::WorkerNode,
+            ownership: TopologyOwnership::TenantOwned,
             provenance: TopologyNodeProvenance::ExactKubernetesResource,
+            database_role: None,
+            placement: Some(TopologyPlacement {
+                worker_pool: Some(format!(
+                    "{}-worker",
+                    bounded(&tenant.name_any(), MAX_IDENTITY)
+                )),
+                worker_node: None,
+                zone: None,
+            }),
             label: bounded(&node.name, MAX_IDENTITY),
             health: condition_health(tenant, "AzureWorkersReady"),
             resource: Some(ResourceIdentityView {
@@ -2121,7 +2174,11 @@ fn add_azure_status_nodes(
         nodes.push(TopologyNode {
             id: id.clone(),
             kind: TopologyNodeKind::ProviderResource,
+            semantic_kind: TopologySemanticKind::ProviderInfrastructure,
+            ownership: TopologyOwnership::ProviderOwned,
             provenance: TopologyNodeProvenance::ExternalProviderRepresentation,
+            database_role: None,
+            placement: None,
             label: resource_name(vmss),
             health: condition_health(tenant, "AzureWorkersReady"),
             resource: None,
@@ -2143,7 +2200,11 @@ fn add_azure_status_nodes(
         nodes.push(TopologyNode {
             id: id.clone(),
             kind: TopologyNodeKind::AddOn,
+            semantic_kind: TopologySemanticKind::AddOn,
+            ownership: TopologyOwnership::TenantOwned,
             provenance: TopologyNodeProvenance::RecordedResourceRepresentation,
+            database_role: None,
+            placement: None,
             label: bounded(component, MAX_IDENTITY),
             health: condition_health(tenant, "AzureAddonsReady"),
             resource: None,
@@ -2177,13 +2238,18 @@ fn add_azure_status_nodes(
             continue;
         };
         let id = format!("provider:{}", bounded(&resource.uid, MAX_IDENTITY));
+        let kind = match resource.kind.as_str() {
+            "Machine" | "AzureMachinePoolMachine" | "MachineSet" => TopologyNodeKind::Machine,
+            _ => TopologyNodeKind::ProviderResource,
+        };
         nodes.push(TopologyNode {
             id: id.clone(),
-            kind: match resource.kind.as_str() {
-                "Machine" | "AzureMachinePoolMachine" | "MachineSet" => TopologyNodeKind::Machine,
-                _ => TopologyNodeKind::ProviderResource,
-            },
+            kind,
+            semantic_kind: semantic_kind(kind),
+            ownership: TopologyOwnership::ProviderOwned,
             provenance: TopologyNodeProvenance::RecordedResourceRepresentation,
+            database_role: None,
+            placement: None,
             label: bounded(&resource.name, MAX_IDENTITY),
             health: condition_health(tenant, "AzureProviderResourcesReady"),
             resource: Some(ResourceIdentityView {
@@ -2226,6 +2292,34 @@ fn topology_kind(definition: ManagementResource) -> TopologyNodeKind {
         "machine" | "machine-set" | "azure-machine-pool-machine" => TopologyNodeKind::Machine,
         "addon-values" | "status-probe" | "addon-job" => TopologyNodeKind::AddOn,
         _ => TopologyNodeKind::ProviderResource,
+    }
+}
+
+const fn semantic_kind(kind: TopologyNodeKind) -> TopologySemanticKind {
+    match kind {
+        TopologyNodeKind::Tenant => TopologySemanticKind::Tenant,
+        TopologyNodeKind::ControlPlane => TopologySemanticKind::ControlPlane,
+        TopologyNodeKind::WorkerPool => TopologySemanticKind::WorkerPool,
+        TopologyNodeKind::Machine => TopologySemanticKind::ComputeMachine,
+        TopologyNodeKind::Node => TopologySemanticKind::WorkerNode,
+        TopologyNodeKind::ProviderResource => TopologySemanticKind::ProviderInfrastructure,
+        TopologyNodeKind::AddOn => TopologySemanticKind::AddOn,
+        TopologyNodeKind::Database => TopologySemanticKind::Other,
+    }
+}
+
+const fn semantic_ownership(semantic_kind: TopologySemanticKind) -> TopologyOwnership {
+    match semantic_kind {
+        TopologySemanticKind::ProviderInfrastructure => TopologyOwnership::ProviderOwned,
+        TopologySemanticKind::Other => TopologyOwnership::Unknown,
+        TopologySemanticKind::Tenant
+        | TopologySemanticKind::ControlPlane
+        | TopologySemanticKind::WorkerPool
+        | TopologySemanticKind::ComputeMachine
+        | TopologySemanticKind::WorkerNode
+        | TopologySemanticKind::DatabaseCluster
+        | TopologySemanticKind::DatabaseInstance
+        | TopologySemanticKind::AddOn => TopologyOwnership::TenantOwned,
     }
 }
 
@@ -3211,6 +3305,8 @@ mod tests {
             .find(|node| node.id == "database:cluster")
             .expect("CNPG cluster node");
         assert_eq!(cluster.health, TopologyHealth::Ready);
+        assert_eq!(cluster.semantic_kind, TopologySemanticKind::DatabaseCluster);
+        assert_eq!(cluster.ownership, TopologyOwnership::TenantOwned);
         assert_eq!(
             cluster
                 .resource
@@ -3233,14 +3329,27 @@ mod tests {
         );
         assert!(instances.iter().all(|node| node.resource.is_none()));
         assert_eq!(
+            instances
+                .iter()
+                .map(|node| node.database_role)
+                .collect::<Vec<_>>(),
+            [
+                Some(DatabaseInstanceRole::Primary),
+                Some(DatabaseInstanceRole::Standby),
+                Some(DatabaseInstanceRole::Standby)
+            ]
+        );
+        assert!(instances.iter().all(|node| {
+            node.placement.as_ref().is_some_and(|placement| {
+                placement.worker_node.is_some() && placement.zone.as_deref() == Some("local-a")
+            })
+        }));
+        assert!(
             projection
                 .topology
                 .edges
                 .iter()
-                .filter(|edge| edge.source == "database:cluster")
-                .filter_map(|edge| edge.label.as_deref())
-                .collect::<Vec<_>>(),
-            ["Primary", "Standby", "Standby"]
+                .all(|edge| { edge.source != "database:cluster" || edge.label.is_none() })
         );
     }
 
@@ -3265,15 +3374,24 @@ mod tests {
             .find(|node| node.id == "database:instance:capi-postgres-1")
             .expect("primary instance");
         assert_eq!(instance.health, TopologyHealth::Ready);
+        assert_eq!(
+            instance.semantic_kind,
+            TopologySemanticKind::DatabaseInstance
+        );
+        assert_eq!(instance.database_role, Some(DatabaseInstanceRole::Primary));
         assert!(
             instance
                 .attributes
                 .iter()
                 .any(|attribute| { attribute.label == "Role" && attribute.value == "Primary" })
         );
-        assert!(projection.topology.edges.iter().any(|edge| {
-            edge.target == instance.id && edge.label.as_deref() == Some("Primary")
-        }));
+        assert!(
+            projection
+                .topology
+                .edges
+                .iter()
+                .any(|edge| { edge.target == instance.id && edge.label.is_none() })
+        );
     }
 
     #[test]
@@ -3357,13 +3475,16 @@ mod tests {
                 .and_then(|worker| worker.scale_set_name.as_deref()),
             Some("pool")
         );
-        assert!(
-            projection
-                .topology
-                .nodes
-                .iter()
-                .any(|node| node.kind == TopologyNodeKind::Node && node.label == "node-a")
-        );
+        assert!(projection.topology.nodes.iter().any(|node| {
+            node.kind == TopologyNodeKind::Node
+                && node.semantic_kind == TopologySemanticKind::WorkerNode
+                && node.ownership == TopologyOwnership::TenantOwned
+                && node.label == "node-a"
+                && node.placement.as_ref().is_some_and(|placement| {
+                    placement.worker_pool.as_deref() == Some("tenant-a-worker")
+                        && placement.zone.is_none()
+                })
+        }));
         assert!(
             projection
                 .topology
@@ -3378,10 +3499,12 @@ mod tests {
         assert!(projection.topology.nodes.iter().any(|node| {
             node.id == "provider:vmss"
                 && node.provenance == TopologyNodeProvenance::ExternalProviderRepresentation
+                && node.ownership == TopologyOwnership::ProviderOwned
         }));
         assert!(projection.topology.nodes.iter().any(|node| {
             node.id == "provider:machine-uid"
                 && node.provenance == TopologyNodeProvenance::RecordedResourceRepresentation
+                && node.ownership == TopologyOwnership::ProviderOwned
                 && node.health == TopologyHealth::Unknown
         }));
         assert!(

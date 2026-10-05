@@ -9,7 +9,7 @@ pub mod routes;
 pub use api::{ApiEnvelope, ApiError, ApiErrorCode, ApiErrorEnvelope};
 
 pub const API_SCHEMA_NAME: &str = "tenant-admin";
-pub const API_SCHEMA_VERSION: u16 = 6;
+pub const API_SCHEMA_VERSION: u16 = 7;
 
 pub const ADMIN_RESOURCE_NAME: &str = "tenant-admin";
 pub const ADMIN_NAMESPACE: &str = "tenant-system";

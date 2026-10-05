@@ -1175,7 +1175,7 @@ class AdminLocalTests(unittest.TestCase):
 
         def malformed_response(path: str) -> str:
             if path.endswith("/api/v1/overview"):
-                return '{"schemaVersion":6,"data":[]}'
+                return '{"schemaVersion":7,"data":[]}'
             return original(path)
 
         with patch.object(

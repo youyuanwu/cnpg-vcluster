@@ -170,7 +170,8 @@ const fn layer(kind: TopologyNodeKind) -> u8 {
 mod tests {
     use tenant_admin_shared::query::{
         TenantProvider, TopologyEdge, TopologyEdgeKind, TopologyGraph, TopologyHealth,
-        TopologyNode, TopologyNodeKind, TopologyNodeProvenance,
+        TopologyNode, TopologyNodeKind, TopologyNodeProvenance, TopologyOwnership,
+        TopologySemanticKind,
     };
 
     use super::{layout_graph, node_width, safe_label};
@@ -179,7 +180,24 @@ mod tests {
         TopologyNode {
             id: id.to_owned(),
             kind,
+            semantic_kind: match kind {
+                TopologyNodeKind::Tenant => TopologySemanticKind::Tenant,
+                TopologyNodeKind::ControlPlane => TopologySemanticKind::ControlPlane,
+                TopologyNodeKind::WorkerPool => TopologySemanticKind::WorkerPool,
+                TopologyNodeKind::Machine => TopologySemanticKind::ComputeMachine,
+                TopologyNodeKind::Node => TopologySemanticKind::WorkerNode,
+                TopologyNodeKind::ProviderResource => TopologySemanticKind::ProviderInfrastructure,
+                TopologyNodeKind::AddOn => TopologySemanticKind::AddOn,
+                TopologyNodeKind::Database => TopologySemanticKind::DatabaseCluster,
+            },
+            ownership: if kind == TopologyNodeKind::ProviderResource {
+                TopologyOwnership::ProviderOwned
+            } else {
+                TopologyOwnership::TenantOwned
+            },
             provenance: TopologyNodeProvenance::ExactKubernetesResource,
+            database_role: None,
+            placement: None,
             label: label.to_owned(),
             health: TopologyHealth::Ready,
             resource: None,
