@@ -6,7 +6,10 @@ use tenant_admin_shared::query::{
     TopologyOwnership, TopologySemanticKind,
 };
 
-use crate::format::{topology_ownership_label, topology_semantic_label};
+use crate::format::{
+    database_instance_role_label, node_kind_label, topology_ownership_label,
+    topology_semantic_label,
+};
 
 pub const MAX_VISIBLE_NODES: usize = 20;
 
@@ -327,6 +330,26 @@ impl ExplorerModel {
         })
     }
 
+    pub fn synchronized_focus(
+        &self,
+        filter: &ExplorerFilter,
+        selected: Option<&str>,
+        relationship_id: Option<&str>,
+    ) -> (Option<String>, Option<String>) {
+        let eligible = self
+            .filtered_nodes(filter)
+            .into_iter()
+            .map(|node| node.id)
+            .collect::<BTreeSet<_>>();
+        let selected = selected
+            .filter(|id| eligible.contains(*id))
+            .map(str::to_owned);
+        let relationship = relationship_id
+            .filter(|id| selected.is_some() && self.relationship_matches_filter(id, filter))
+            .map(str::to_owned);
+        (selected, relationship)
+    }
+
     pub fn graph_for_filter(
         &self,
         filter: &ExplorerFilter,
@@ -364,7 +387,10 @@ impl ExplorerModel {
             return filtered.relationship_graph(selected, id);
         }
         if let Some(id) = selected.filter(|id| filtered.nodes.contains_key(*id)) {
-            return filtered.focused_graph(Some(id));
+            return filter.group.map_or_else(
+                || filtered.focused_graph(Some(id)),
+                |group| filtered.selected_group_graph(id, group),
+            );
         }
         filtered.ordinary_graph()
     }
@@ -746,9 +772,14 @@ fn searchable_text(node: &TopologyNode) -> String {
         format!("{:?}", node.ownership),
         format!("{:?}", node.health),
         format!("{:?}", node.provenance),
+        node_kind_label(node.kind).into(),
+        topology_semantic_label(node.semantic_kind).into(),
+        topology_ownership_label(node.ownership).into(),
+        representation_label(node.provenance).into(),
     ];
     if let Some(role) = node.database_role {
         values.push(format!("{role:?}"));
+        values.push(database_instance_role_label(role).into());
     }
     if let Some(placement) = &node.placement {
         values.extend([
@@ -1146,13 +1177,22 @@ mod tests {
         };
         let model = ExplorerModel::new(graph(vec![instance.clone(), cluster], vec![relationship]));
 
-        for query in ["primary", "worker-a", "zone-a", "databaseinstance"] {
+        for query in ["primary", "worker-a", "zone-a", "database instance"] {
             let filtered = model.filtered_nodes(&ExplorerFilter {
                 query: query.into(),
                 ..ExplorerFilter::default()
             });
             assert_eq!(filtered, vec![instance.clone()]);
         }
+        assert_eq!(
+            model
+                .filtered_nodes(&ExplorerFilter {
+                    query: "tenant-owned".into(),
+                    ..ExplorerFilter::default()
+                })
+                .len(),
+            2
+        );
         let filter = ExplorerFilter {
             group: Some(ResourceGroup::Databases),
             ..ExplorerFilter::default()
@@ -1199,6 +1239,8 @@ mod tests {
         };
         let filtered_graph = model.graph_for_filter(&filter, None, None);
         assert_eq!(filtered_graph.nodes.len(), MAX_VISIBLE_NODES);
+        let selected_group = model.graph_for_filter(&filter, Some("node:00"), None);
+        assert_eq!(selected_group.nodes.len(), MAX_VISIBLE_NODES);
         assert_eq!(
             model.inspection("node:00").unwrap().outgoing.len(),
             2,
@@ -1212,6 +1254,17 @@ mod tests {
                 ..ExplorerFilter::default()
             }
         ));
+        assert_eq!(
+            model.synchronized_focus(
+                &ExplorerFilter {
+                    query: "worker-24".into(),
+                    ..ExplorerFilter::default()
+                },
+                Some("node:00"),
+                Some("parallel"),
+            ),
+            (None, None)
+        );
     }
 
     #[test]

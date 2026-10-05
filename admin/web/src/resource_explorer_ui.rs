@@ -12,7 +12,7 @@ use crate::{
         topology_semantic_class, topology_semantic_label,
     },
     mutation_ui_state::{SelectionRefresh, selection_after_refresh},
-    topology::{LayoutNode, layout_graph},
+    topology::{accessible_node_label, compact_placement, layout_graph},
 };
 
 #[component]
@@ -56,25 +56,16 @@ pub fn ResourceExplorer(
             namespace.get(),
             namespace_not_applicable.get(),
         );
-        let eligible = selection_model
-            .filtered_nodes(&filter)
-            .into_iter()
-            .map(|node| node.id)
-            .collect::<std::collections::BTreeSet<_>>();
-        if selected
-            .get()
-            .as_ref()
-            .is_some_and(|id| !eligible.contains(id))
-        {
-            selected.set(None);
-            selected_relationship.set(None);
+        let (next_selected, next_relationship) = selection_model.synchronized_focus(
+            &filter,
+            selected.get().as_deref(),
+            selected_relationship.get().as_deref(),
+        );
+        if selected.get() != next_selected {
+            selected.set(next_selected);
         }
-        if selected_relationship
-            .get()
-            .as_ref()
-            .is_some_and(|id| !selection_model.relationship_matches_filter(id, &filter))
-        {
-            selected_relationship.set(None);
+        if selected_relationship.get() != next_relationship {
+            selected_relationship.set(next_relationship);
         }
     });
 
@@ -174,7 +165,7 @@ pub fn ResourceExplorer(
                             namespace_not_applicable.get(),
                         );
                         let nodes = list_model.filtered_nodes(&filter);
-                        let content = if nodes.is_empty() {
+                        if nodes.is_empty() {
                             view! { <p class="empty">"No resources match these filters."</p> }.into_any()
                         } else {
                             view! {
@@ -217,8 +208,7 @@ pub fn ResourceExplorer(
                                     }).collect_view()}
                                 </ul>
                             }.into_any()
-                        };
-                        content
+                        }
                     }}
                 </aside>
                 <div class="explorer-graph">
@@ -310,7 +300,7 @@ fn graph_view(
                     let role = node.database_role.map(database_instance_role_label);
                     let role_class = node.database_role.map(database_instance_role_class);
                     let placement = compact_placement(&node);
-                    let accessible_label = node_accessible_label(&node);
+                    let accessible_label = accessible_node_label(&node);
                     let endpoint_node = endpoint_ids.as_ref().is_some_and(|(source, target)| {
                         source == &node.id || target == &node.id
                     });
@@ -355,10 +345,10 @@ fn inspector_view(
     selected_relationship: Option<&str>,
     relationship_signal: RwSignal<Option<String>>,
 ) -> AnyView {
-    if let Some(edge_id) = selected_relationship {
-        if let Some(edge) = model.relationship_by_id(edge_id) {
-            return relationship_view(edge, relationship_signal);
-        }
+    if let Some(edge_id) = selected_relationship
+        && let Some(edge) = model.relationship_by_id(edge_id)
+    {
+        return relationship_view(edge, relationship_signal);
     }
     let Some(inspection) = selected_id.and_then(|id| model.inspection(id)) else {
         return view! {
@@ -465,46 +455,6 @@ fn current_filter(
     }
 }
 
-fn compact_placement(node: &LayoutNode) -> Vec<String> {
-    let Some(placement) = &node.placement else {
-        return Vec::new();
-    };
-    let mut values = Vec::new();
-    match node.semantic_kind {
-        tenant_admin_shared::query::TopologySemanticKind::DatabaseInstance => {
-            if let Some(worker_node) = &placement.worker_node {
-                values.push(format!("Node · {worker_node}"));
-            }
-            if let Some(zone) = &placement.zone {
-                values.push(format!("Zone · {zone}"));
-            }
-        }
-        tenant_admin_shared::query::TopologySemanticKind::WorkerNode => {
-            if let Some(worker_pool) = &placement.worker_pool {
-                values.push(format!("Pool · {worker_pool}"));
-            }
-            if let Some(zone) = &placement.zone {
-                values.push(format!("Zone · {zone}"));
-            }
-        }
-        _ => {
-            if let Some(worker_pool) = &placement.worker_pool {
-                values.push(format!("Pool · {worker_pool}"));
-            }
-            if let Some(worker_node) = &placement.worker_node {
-                values.push(format!("Node · {worker_node}"));
-            }
-            if values.len() < 2
-                && let Some(zone) = &placement.zone
-            {
-                values.push(format!("Zone · {zone}"));
-            }
-        }
-    }
-    values.truncate(2);
-    values
-}
-
 fn inventory_semantic_details(node: &tenant_admin_shared::query::TopologyNode) -> Option<String> {
     let mut values = Vec::new();
     if let Some(role) = node.database_role {
@@ -522,58 +472,6 @@ fn inventory_semantic_details(node: &tenant_admin_shared::query::TopologyNode) -
         }
     }
     (!values.is_empty()).then(|| values.join(" · "))
-}
-
-fn node_accessible_label(node: &LayoutNode) -> String {
-    let mut values = vec![
-        node.label.clone(),
-        topology_semantic_label(node.semantic_kind).into(),
-        format!("status {}", health_label(node.health)),
-        topology_ownership_label(node.ownership).into(),
-        representation_label(node.provenance).into(),
-    ];
-    if let Some(role) = node.database_role {
-        values.push(format!(
-            "database role {}",
-            database_instance_role_label(role)
-        ));
-    }
-    match node.semantic_kind {
-        tenant_admin_shared::query::TopologySemanticKind::DatabaseInstance => {
-            values.push(format!(
-                "worker node {}",
-                node.placement
-                    .as_ref()
-                    .and_then(|placement| placement.worker_node.as_deref())
-                    .unwrap_or("not reported")
-            ));
-            values.push(format!(
-                "zone {}",
-                node.placement
-                    .as_ref()
-                    .and_then(|placement| placement.zone.as_deref())
-                    .unwrap_or("not reported")
-            ));
-        }
-        tenant_admin_shared::query::TopologySemanticKind::WorkerNode => {
-            values.push(format!(
-                "worker pool {}",
-                node.placement
-                    .as_ref()
-                    .and_then(|placement| placement.worker_pool.as_deref())
-                    .unwrap_or("not reported")
-            ));
-            values.push(format!(
-                "zone {}",
-                node.placement
-                    .as_ref()
-                    .and_then(|placement| placement.zone.as_deref())
-                    .unwrap_or("not reported")
-            ));
-        }
-        _ => {}
-    }
-    values.join("; ")
 }
 
 fn parse_health(value: &str) -> Option<TopologyHealth> {
@@ -600,57 +498,5 @@ fn parse_kind(value: &str) -> Option<tenant_admin_shared::query::TopologyNodeKin
         "add-on" => Some(TopologyNodeKind::AddOn),
         "database" => Some(TopologyNodeKind::Database),
         _ => None,
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use tenant_admin_shared::query::{
-        DatabaseInstanceRole, TopologyHealth, TopologyNodeKind, TopologyNodeProvenance,
-        TopologyOwnership, TopologyPlacement, TopologySemanticKind,
-    };
-
-    use super::{LayoutNode, compact_placement, node_accessible_label};
-
-    fn instance(placement: Option<TopologyPlacement>) -> LayoutNode {
-        LayoutNode {
-            id: "database:instance:one".into(),
-            kind: TopologyNodeKind::Database,
-            semantic_kind: TopologySemanticKind::DatabaseInstance,
-            ownership: TopologyOwnership::TenantOwned,
-            provenance: TopologyNodeProvenance::DatabaseLogicalRepresentation,
-            database_role: Some(DatabaseInstanceRole::Primary),
-            placement,
-            health: TopologyHealth::Ready,
-            label: "orders-1".into(),
-            x: 0.0,
-            y: 0.0,
-            width: 220.0,
-            height: 124.0,
-        }
-    }
-
-    #[test]
-    fn database_placement_is_compact_and_accessible_when_partial_or_missing() {
-        let placed = instance(Some(TopologyPlacement {
-            worker_pool: None,
-            worker_node: Some("worker-a".into()),
-            zone: Some("zone-a".into()),
-        }));
-        assert_eq!(
-            compact_placement(&placed),
-            ["Node · worker-a", "Zone · zone-a"]
-        );
-        let partial = instance(Some(TopologyPlacement {
-            worker_pool: None,
-            worker_node: Some("worker-a".into()),
-            zone: None,
-        }));
-        assert_eq!(compact_placement(&partial), ["Node · worker-a"]);
-        assert!(node_accessible_label(&partial).contains("zone not reported"));
-        let missing = instance(None);
-        let accessible = node_accessible_label(&missing);
-        assert!(accessible.contains("worker node not reported"));
-        assert!(accessible.contains("zone not reported"));
     }
 }

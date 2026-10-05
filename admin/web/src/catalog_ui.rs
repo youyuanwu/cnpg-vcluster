@@ -332,10 +332,10 @@ fn DatabaseAddPanel(
                     if !effects.preserve_catalog_lock {
                         locked.set(false);
                     }
-                    if effects.snapshot {
-                        if let Some(snapshot_refresh) = snapshot_refresh {
-                            snapshot_refresh.update(|version| *version = version.wrapping_add(1));
-                        }
+                    if effects.snapshot
+                        && let Some(snapshot_refresh) = snapshot_refresh
+                    {
+                        snapshot_refresh.update(|version| *version = version.wrapping_add(1));
                     }
                     notice.set(Some(format!(
                         "Cluster {} was accepted. Refresh to observe readiness.",
@@ -720,10 +720,10 @@ fn DatabaseDeletePanel(
                     if !effects.preserve_catalog_lock {
                         locked.set(false);
                     }
-                    if effects.snapshot {
-                        if let Some(snapshot_refresh) = snapshot_refresh {
-                            snapshot_refresh.update(|version| *version = version.wrapping_add(1));
-                        }
+                    if effects.snapshot
+                        && let Some(snapshot_refresh) = snapshot_refresh
+                    {
+                        snapshot_refresh.update(|version| *version = version.wrapping_add(1));
                     }
                     notice.set(Some(format!(
                         "Deletion of {} was accepted for logical UID {}.",
