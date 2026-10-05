@@ -472,8 +472,7 @@ the local SQL console as PostgreSQL superuser and can destroy Tenant data.
 ## Troubleshooting
 
 - **`admin-fetch` fails offline**: refresh Cargo dependencies with the explicit
-  online `just admin-fetch`, or run the complete `just cache` before an
-  enforced-offline gate.
+  online `just admin-fetch` before an enforced-offline gate.
 - **Trunk or wasm-bindgen is missing or has the wrong version**: run
   `just cache` followed by `just tools`; do not install an unpinned global
   replacement.

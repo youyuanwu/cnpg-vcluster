@@ -274,84 +274,93 @@ class CacheTests(unittest.TestCase):
                 copied,
             )
 
-    def test_cargo_lock_and_compiler_are_cache_requirements(self) -> None:
+    def test_cargo_state_is_not_a_cache_requirement(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary)
-            root = repository
+            root = Path(temporary)
             controller = root / "controller"
             controller.mkdir(parents=True)
-            (repository / "Cargo.toml").write_text("[workspace]\n")
+            (root / "Cargo.toml").write_text("[workspace]\n")
             (controller / "Cargo.toml").write_text("[package]\n")
-            (repository / "Cargo.lock").write_text("locked inputs")
-            (repository / "rust-toolchain.toml").write_text(
+            (root / "Cargo.lock").write_text("locked inputs")
+            (root / "rust-toolchain.toml").write_text(
                 '[toolchain]\nchannel = "stable"\n'
             )
             config = load_configuration(Path(__file__).resolve().parents[1])
-            with patch("scripts.lib.controller.rust_toolchain",
-                       return_value=("cargo", "compiler A")):
-                original = _requirements(config, root)
-                self.assertEqual(original["cargo"]["lockSha256"],
-                                 hashlib.sha256(b"locked inputs").hexdigest())
-            with patch("scripts.lib.controller.rust_toolchain",
-                       return_value=("cargo", "compiler B")):
-                self.assertNotEqual(original, _requirements(config, root))
-            (repository / "Cargo.lock").write_text("changed")
-            with patch("scripts.lib.controller.rust_toolchain",
-                       return_value=("cargo", "compiler A")):
-                self.assertNotEqual(original, _requirements(config, root))
-            (repository / "Cargo.lock").write_text("locked inputs")
-            (repository / "rust-toolchain.toml").write_text(
+            original = _requirements(config, root)
+            self.assertNotIn("cargo", original)
+            (root / "Cargo.lock").write_text("changed")
+            (root / "rust-toolchain.toml").write_text(
                 '[toolchain]\nchannel = "beta"\n'
             )
-            with patch("scripts.lib.controller.rust_toolchain",
-                       return_value=("cargo", "compiler A")):
-                self.assertNotEqual(original, _requirements(config, root))
-            (repository / "Cargo.lock").unlink()
-            with self.assertRaisesRegex(IntegrityError, "Cargo.lock"):
-                _requirements(config, root)
+            self.assertEqual(original, _requirements(config, root))
 
-    def test_verified_cache_rejects_missing_offline_cargo_dependencies(self) -> None:
+    def test_verified_cache_reuse_does_not_invoke_cargo(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary)
-            root = repository
-            (root / "controller").mkdir(parents=True)
-            (repository / "Cargo.toml").write_text("[workspace]\n")
-            (repository / "rust-toolchain.toml").write_text(
-                '[toolchain]\nchannel = "stable"\n'
-            )
-            (root / "controller/Cargo.toml").write_text("[package]\n")
+            root = Path(temporary)
+
+            def guard(command, *args, **kwargs):
+                self.assertNotEqual("cargo", Path(command[0]).name)
+                return CompletedProcess(command, 0, "", "")
+
             with (
                 patch("scripts.cache.active_generation", return_value=root),
-                patch("scripts.cache._requirements", return_value={"cargo": {}}),
+                patch("scripts.cache._requirements", return_value={"inputs": []}),
                 patch("scripts.cache._load_inventory_header", return_value={}),
                 patch("scripts.cache._cache_state_sha256", return_value="state"),
+                patch("scripts.cache._verification_matches", return_value=True),
                 patch("scripts.lib.controller.fetch_controller_dependencies",
-                      side_effect=RuntimeError("missing locked crate")) as fetch,
+                      side_effect=AssertionError("Cargo fetch is not allowed")) as fetch,
+                patch("scripts.lib.process.subprocess.run", side_effect=guard) as process,
             ):
-                with self.assertRaisesRegex(RuntimeError, "missing locked crate"):
-                    verify_cache(root, {})
-                fetch.assert_called_once_with(root, {}, offline=True)
-
-    def test_online_cache_does_not_publish_before_locked_cargo_fetch(self) -> None:
-        with tempfile.TemporaryDirectory() as temporary:
-            repository = Path(temporary)
-            root = repository
-            (root / "controller").mkdir(parents=True)
-            (repository / "Cargo.toml").write_text("[workspace]\n")
-            (repository / "rust-toolchain.toml").write_text(
-                '[toolchain]\nchannel = "stable"\n'
+                verified = verify_cache(root, {})
+            self.assertEqual(root, verified.generation)
+            fetch.assert_not_called()
+            self.assertFalse(
+                any(Path(call.args[0][0]).name == "cargo" for call in process.call_args_list)
             )
-            (root / "controller/Cargo.toml").write_text("[package]\n")
-            with (
-                patch("scripts.cache.acquire_tools"),
-                patch("scripts.lib.controller.fetch_controller_dependencies",
-                      side_effect=RuntimeError("locked fetch failed")) as fetch,
+
+    def test_cache_acquisition_does_not_invoke_cargo(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            generations = root / ".tools/cache/generations"
+            generations.mkdir(parents=True, mode=0o700)
+            for directory in (
+                root / ".tools",
+                root / ".tools/cache",
+                generations,
             ):
-                with self.assertRaisesRegex(RuntimeError, "locked fetch failed"):
-                    acquire_cache(root, {"DOWNLOAD_TIMEOUT": "1s"})
-            fetch.assert_called_once_with(root, {"DOWNLOAD_TIMEOUT": "1s"})
-            self.assertFalse((root / ".tools/cache/active.json").exists())
-            self.assertEqual([], list((root / ".tools/cache/generations").iterdir()))
+                directory.chmod(0o700)
+
+            def tools(*_, tools_dir: Path, **__) -> None:
+                (tools_dir / "bin").mkdir()
+
+            def verified(path, _config, *, force=False):
+                active = json.loads((path / ".tools/cache/active.json").read_text())
+                generation = path / ".tools/cache/generations" / active["generation"]
+                return VerifiedCache(generation, {"imageArchives": []}, "state")
+
+            def guard(command, *args, **kwargs):
+                self.assertNotEqual("cargo", Path(command[0]).name)
+                return CompletedProcess(command, 0, "", "")
+
+            with (
+                patch("scripts.cache.acquire_tools", side_effect=tools),
+                patch("scripts.cache.image_keys", return_value=()),
+                patch("scripts.cache._requirements", return_value={"inputs": []}),
+                patch("scripts.cache.verify_generation"),
+                patch("scripts.cache.verify_cache", side_effect=verified),
+                patch("scripts.cache.materialize_inputs"),
+                patch("scripts.cache.prune_cache_generations", return_value=0),
+                patch("scripts.lib.controller.fetch_controller_dependencies",
+                      side_effect=AssertionError("Cargo fetch is not allowed")) as fetch,
+                patch("scripts.lib.process.subprocess.run", side_effect=guard) as process,
+            ):
+                acquire_cache(root, {"DOWNLOAD_TIMEOUT": "1s"})
+            fetch.assert_not_called()
+            self.assertTrue((root / ".tools/cache/active.json").is_file())
+            self.assertFalse(
+                any(Path(call.args[0][0]).name == "cargo" for call in process.call_args_list)
+            )
 
     def test_registry_get_retries_incomplete_response_body(self) -> None:
         incomplete = MagicMock()

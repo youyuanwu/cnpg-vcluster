@@ -55,7 +55,16 @@ class CIWorkflowTests(unittest.TestCase):
             self.assertIn(command, fast)
         self.assertIn("just cache admin-build", fast)
         self.assertNotIn("run: just cache\n", fast)
-        self.assertLess(e2e.index("just cache"), e2e.index("just test-e2e"))
+        e2e_sequence = (
+            "just cache", "just controller-fetch", "just admin-fetch",
+            "just test-e2e-offline",
+        )
+        for command in e2e_sequence:
+            self.assertIn(command, e2e)
+        self.assertEqual(
+            sorted(e2e.index(command) for command in e2e_sequence),
+            [e2e.index(command) for command in e2e_sequence],
+        )
         self.assertIn("just test-e2e-offline", e2e)
         self.assertIn("name: Diagnose failed end-to-end", e2e)
         self.assertIn("if: failure()", e2e)
@@ -77,14 +86,31 @@ class CIWorkflowTests(unittest.TestCase):
             self.assertIn("uses: actions/cache@v6", live)
             self.assertIn("path: .tools/cache", live)
             self.assertNotIn("~/.cargo", live)
-            self.assertIn("key: capi-full-v2-", live)
+            self.assertIn("key: capi-full-v3-", live)
+            key = next(
+                line.strip() for line in live.splitlines()
+                if line.strip().startswith("key: capi-full-v3-")
+            )
+            self.assertEqual(
+                (
+                    "config/versions.env",
+                    "config/settings.env",
+                    "config/kind.yaml",
+                    "manifests/**",
+                    "scripts/cache.py",
+                    "scripts/tools.py",
+                ),
+                tuple(re.findall(r"'([^']+)'", key)),
+            )
+            self.assertNotIn("Cargo.lock", key)
+            self.assertNotIn("rust-toolchain.toml", key)
             self.assertLess(
                 live.index("uses: actions/cache@v6"),
                 live.index("run: just cache"),
             )
         setup = (
-            "just cache", "just tools", "just prepare-host",
-            "just create-management",
+            "just cache", "just controller-fetch", "just admin-fetch",
+            "just tools", "just prepare-host", "just create-management",
         )
         for command in setup:
             self.assertIn(command, high)
