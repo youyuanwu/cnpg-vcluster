@@ -38,7 +38,7 @@ from scripts.tools import (
 )
 
 
-CACHE_SCHEMA = 1
+CACHE_SCHEMA = 2
 ACTIVE_SCHEMA = 1
 CACHE_VERIFICATION_SCHEMA = 1
 IMAGE_PLATFORM = "linux/amd64"
@@ -443,6 +443,25 @@ def _write_registry_oci_archive(
             index, sort_keys=True, separators=(",", ":")
         ).encode()
         + b"\n",
+        "manifest.json": json.dumps(
+            [
+                {
+                    "Config": (
+                        "blobs/sha256/"
+                        + platform_manifest["config"]["digest"].removeprefix("sha256:")
+                    ),
+                    "RepoTags": [canonical_tagged(tagged)],
+                    "Layers": [
+                        "blobs/sha256/"
+                        + layer["digest"].removeprefix("sha256:")
+                        for layer in platform_manifest.get("layers", [])
+                    ],
+                }
+            ],
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode()
+        + b"\n",
     }
     entries.update(
         {
@@ -524,6 +543,46 @@ def _verify_archive_metadata(path: Path, tagged: str, exact: str) -> None:
             )
             for digest in required_blobs:
                 read_blob(digest)
+            docker_member = archive.getmember("manifest.json")
+            if not docker_member.isfile():
+                raise IntegrityError(
+                    f"image archive Docker manifest is not a regular file: {path}"
+                )
+            docker_extracted = archive.extractfile(docker_member)
+            if docker_extracted is None:
+                raise IntegrityError(
+                    f"image archive Docker manifest cannot be read: {path}"
+                )
+            docker_manifest = json.loads(docker_extracted.read())
+            if not isinstance(docker_manifest, list) or len(docker_manifest) != 1:
+                raise IntegrityError(
+                    f"image archive Docker manifest is invalid: {path}"
+                )
+            docker_entry = docker_manifest[0]
+            expected_config = (
+                "blobs/sha256/"
+                + manifest.get("config", {}).get("digest", "").removeprefix("sha256:")
+            )
+            expected_layers = [
+                "blobs/sha256/"
+                + layer.get("digest", "").removeprefix("sha256:")
+                for layer in manifest.get("layers", [])
+            ]
+            repo_tags = docker_entry.get("RepoTags")
+            if (
+                docker_entry.get("Config") != expected_config
+                or docker_entry.get("Layers") != expected_layers
+                or not isinstance(repo_tags, list)
+                or canonical_tagged(tagged)
+                not in {
+                    canonical_tagged(value)
+                    for value in repo_tags
+                    if isinstance(value, str)
+                }
+            ):
+                raise IntegrityError(
+                    f"image archive Docker manifest does not match OCI metadata: {path}"
+                )
     except (KeyError, tarfile.TarError, json.JSONDecodeError) as exc:
         raise IntegrityError(f"invalid OCI image archive {path}: {exc}") from exc
     descriptors = index.get("manifests") or []
