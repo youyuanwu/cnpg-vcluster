@@ -61,7 +61,7 @@ def entry(name, uid):
 class CatalogLifecycleTests(unittest.TestCase):
     def test_stale_identity_must_be_exact_schema_v5_conflict(self):
         expected = CompletedProcess([], 1, json.dumps({
-            "schemaVersion": 6, "error": {
+            "schemaVersion": 7, "error": {
                 "code": "stale-identity", "message": "stale", "retryable": False,
             },
         }), "HTTP 409: Conflict")
@@ -80,14 +80,14 @@ class CatalogLifecycleTests(unittest.TestCase):
                 ))
 
     def test_exact_schema_and_tenant_identity(self):
-        response = {"schemaVersion": 6, "data": view()}
+        response = {"schemaVersion": 7, "data": view()}
         self.assertEqual(view(), validate_catalog(
             envelope(json.dumps(response), "catalog"), "tenant-a", "tenant-uid",
         ))
         for bad in (
             {"schemaVersion": 4, "data": view()},
-            {"schemaVersion": 6, "data": []},
-            {"schemaVersion": 6, "data": view(), "password": "secret"},
+            {"schemaVersion": 7, "data": []},
+            {"schemaVersion": 7, "data": view(), "password": "secret"},
         ):
             with self.subTest(bad=bad), self.assertRaises(RuntimeError):
                 envelope(json.dumps(bad), "catalog")
@@ -129,10 +129,10 @@ class CatalogLifecycleTests(unittest.TestCase):
         deleted = view([{**entry("alpha", FIRST), "deleting": True}])
         responses = iter((added, deleted))
         mutate = Mock(side_effect=lambda *_: CompletedProcess(
-            [], 0, json.dumps({"schemaVersion": 6, "data": next(responses)}), "",
+            [], 0, json.dumps({"schemaVersion": 7, "data": next(responses)}), "",
         ))
         client = CatalogClient(
-            lambda _: json.dumps({"schemaVersion": 6, "data": initial}),
+            lambda _: json.dumps({"schemaVersion": 7, "data": initial}),
             mutate, "tenant-a", "tenant-uid",
         )
         self.assertEqual(FIRST, client.add(CATALOG, "alpha"))
@@ -153,7 +153,7 @@ class CatalogLifecycleTests(unittest.TestCase):
             }],
         }
         mutate = Mock(side_effect=lambda *_: CompletedProcess(
-            [], 0, json.dumps({"schemaVersion": 6, "data": result}), "",
+            [], 0, json.dumps({"schemaVersion": 7, "data": result}), "",
         ))
         client = CatalogClient(lambda _: "", mutate, "tenant-a", "tenant-uid")
         client.probe(CATALOG, value)

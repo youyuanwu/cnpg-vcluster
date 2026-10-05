@@ -205,28 +205,28 @@ fn topology_serialization_is_deterministic() {
         tenant_name: "demo".into(),
         provider: TenantProvider::Local,
         nodes: vec![TopologyNode {
-            id: "tenant/demo".into(),
-            kind: TopologyNodeKind::Tenant,
-            semantic_kind: TopologySemanticKind::Tenant,
+            id: "database:instance:one".into(),
+            kind: TopologyNodeKind::Database,
+            semantic_kind: TopologySemanticKind::DatabaseInstance,
             ownership: TopologyOwnership::TenantOwned,
-            provenance: TopologyNodeProvenance::ExactKubernetesResource,
-            database_role: None,
+            provenance: TopologyNodeProvenance::DatabaseLogicalRepresentation,
+            database_role: Some(DatabaseInstanceRole::Primary),
             placement: Some(TopologyPlacement {
                 worker_pool: None,
-                worker_node: None,
+                worker_node: Some("worker-a".into()),
                 zone: Some("test-zone".into()),
             }),
-            label: "demo".into(),
+            label: "one".into(),
             health: TopologyHealth::Ready,
             resource: None,
             attributes: vec![DisplayAttribute {
-                label: "Kubernetes".into(),
-                value: "v1.36.0".into(),
+                label: "Role".into(),
+                value: "Primary".into(),
             }],
         }],
         edges: vec![TopologyEdge {
             id: "tenant-to-control-plane".into(),
-            source: "tenant/demo".into(),
+            source: "tenant".into(),
             target: "control-plane/demo".into(),
             kind: TopologyEdgeKind::Owns,
             label: None,
@@ -238,11 +238,36 @@ fn topology_serialization_is_deterministic() {
     assert_eq!(first, second);
     assert_eq!(
         first,
-        r#"{"tenantName":"demo","provider":"local","nodes":[{"id":"tenant/demo","kind":"tenant","semanticKind":"tenant","ownership":"tenant-owned","provenance":"exact-kubernetes-resource","databaseRole":null,"placement":{"workerPool":null,"workerNode":null,"zone":"test-zone"},"label":"demo","health":"ready","resource":null,"attributes":[{"label":"Kubernetes","value":"v1.36.0"}]}],"edges":[{"id":"tenant-to-control-plane","source":"tenant/demo","target":"control-plane/demo","kind":"owns","label":null}]}"#
+        r#"{"tenantName":"demo","provider":"local","nodes":[{"id":"database:instance:one","kind":"database","semanticKind":"database-instance","ownership":"tenant-owned","provenance":"database-logical-representation","databaseRole":"primary","placement":{"workerPool":null,"workerNode":"worker-a","zone":"test-zone"},"label":"one","health":"ready","resource":null,"attributes":[{"label":"Role","value":"Primary"}]}],"edges":[{"id":"tenant-to-control-plane","source":"tenant","target":"control-plane/demo","kind":"owns","label":null}]}"#
     );
 
     let decoded: TopologyGraph = serde_json::from_str(&first).expect("topology round trips");
     assert_eq!(decoded, graph);
+}
+
+#[test]
+fn topology_ownership_is_independent_from_representation_provenance() {
+    let node = TopologyNode {
+        id: "other".into(),
+        kind: TopologyNodeKind::ProviderResource,
+        semantic_kind: TopologySemanticKind::Other,
+        ownership: TopologyOwnership::Unknown,
+        provenance: TopologyNodeProvenance::RecordedResourceRepresentation,
+        database_role: Some(DatabaseInstanceRole::Unknown),
+        placement: None,
+        label: "Other".into(),
+        health: TopologyHealth::Unknown,
+        resource: None,
+        attributes: vec![],
+    };
+    let encoded = serde_json::to_value(&node).expect("topology node serializes");
+    assert_eq!(encoded["ownership"], "unknown");
+    assert_eq!(encoded["provenance"], "recorded-resource-representation");
+    assert_eq!(encoded["databaseRole"], "unknown");
+    assert_eq!(
+        serde_json::from_value::<TopologyNode>(encoded).expect("topology node round trips"),
+        node
+    );
 }
 
 #[test]

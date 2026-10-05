@@ -2246,7 +2246,7 @@ fn add_azure_status_nodes(
             id: id.clone(),
             kind,
             semantic_kind: semantic_kind(kind),
-            ownership: TopologyOwnership::ProviderOwned,
+            ownership: semantic_ownership(semantic_kind(kind)),
             provenance: TopologyNodeProvenance::RecordedResourceRepresentation,
             database_role: None,
             placement: None,
@@ -3354,6 +3354,34 @@ mod tests {
     }
 
     #[test]
+    fn database_topology_is_independent_from_instance_source_order() {
+        let first = TenantProjection::new(
+            ProviderMode::Local,
+            local_tenant(TenantPhase::Ready, 2, true),
+            Vec::new(),
+            available_database(vec![
+                database_instance("capi-postgres-2", DatabaseInstanceRole::Standby),
+                database_instance("capi-postgres-1", DatabaseInstanceRole::Primary),
+            ]),
+            None,
+            true,
+        );
+        let second = TenantProjection::new(
+            ProviderMode::Local,
+            local_tenant(TenantPhase::Ready, 2, true),
+            Vec::new(),
+            available_database(vec![
+                database_instance("capi-postgres-1", DatabaseInstanceRole::Primary),
+                database_instance("capi-postgres-2", DatabaseInstanceRole::Standby),
+            ]),
+            None,
+            true,
+        );
+
+        assert_eq!(first.topology, second.topology);
+    }
+
+    #[test]
     fn one_instance_database_primary_is_ready_and_explicit() {
         let projection = TenantProjection::new(
             ProviderMode::Local,
@@ -3446,6 +3474,13 @@ mod tests {
             .find(|node| node.id == "database:cluster")
             .expect("CNPG cluster node");
         assert_eq!(cluster.health, TopologyHealth::Unknown);
+        let instance = projection
+            .topology
+            .nodes
+            .iter()
+            .find(|node| node.semantic_kind == TopologySemanticKind::DatabaseInstance)
+            .expect("unknown-role instance");
+        assert_eq!(instance.database_role, Some(DatabaseInstanceRole::Unknown));
     }
 
     #[test]
@@ -3504,7 +3539,7 @@ mod tests {
         assert!(projection.topology.nodes.iter().any(|node| {
             node.id == "provider:machine-uid"
                 && node.provenance == TopologyNodeProvenance::RecordedResourceRepresentation
-                && node.ownership == TopologyOwnership::ProviderOwned
+                && node.ownership == TopologyOwnership::TenantOwned
                 && node.health == TopologyHealth::Unknown
         }));
         assert!(

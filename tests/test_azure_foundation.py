@@ -1889,7 +1889,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                         return completed(json.dumps(payload))
                 if path.endswith("/api/v1/overview"):
                     return completed(json.dumps({
-                        "schemaVersion": 6,
+                        "schemaVersion": 7,
                         "data": {
                             "overview": {
                                 "providerMode": "azure",
@@ -1900,7 +1900,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                     }))
                 if path.endswith("/api/v1/tenants"):
                     return completed(
-                        json.dumps({"schemaVersion": 6, "data": []})
+                        json.dumps({"schemaVersion": 7, "data": []})
                     )
                 return completed()
 
@@ -1964,7 +1964,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
         }
         api_overrides = {
             "/api/v1/overview": {
-                "schemaVersion": 6,
+                "schemaVersion": 7,
                 "data": {
                     "overview": {
                         "providerMode": "azure",
@@ -1974,14 +1974,14 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 },
             },
             "/api/v1/tenants": {
-                "schemaVersion": 6,
+                "schemaVersion": 7,
                 "data": [{
                     "name": "tenant-a",
                     "classification": "progressing",
                 }],
             },
             "/api/v1/tenants/tenant-a": {
-                "schemaVersion": 6,
+                "schemaVersion": 7,
                 "data": {
                     "identity": {
                         "uid": "tenant-uid",
@@ -2009,7 +2009,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
                 },
             },
             "/api/v1/tenants/tenant-a/topology": {
-                "schemaVersion": 6,
+                "schemaVersion": 7,
                 "data": {
                     "tenantName": "tenant-a",
                     "provider": "azure",
@@ -2039,7 +2039,7 @@ class AzureFoundationTests(AzureFixtureMixin, unittest.TestCase):
 
         populated_overview = api_overrides["/api/v1/overview"]
         empty_overview = {
-            "schemaVersion": 6,
+            "schemaVersion": 7,
             "data": {
                 "overview": {
                     "providerMode": "azure",

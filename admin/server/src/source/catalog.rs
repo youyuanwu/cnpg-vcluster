@@ -1442,6 +1442,15 @@ mod tests {
         state.conditions[0].reason = "password=hidden".into();
         state.conditions[0].message = "token=private".into();
         state.instances[0].role = "password=hidden".into();
+        catalog
+            .status
+            .as_mut()
+            .unwrap()
+            .entries
+            .get_mut(SECOND)
+            .unwrap()
+            .instances[0]
+            .role = "standby".into();
         let view = project(&catalog, ProviderMode::Local, true).unwrap();
         assert!(view.capability_available);
         assert!(
@@ -1463,6 +1472,15 @@ mod tests {
         );
         assert_eq!(database_instance.ownership, TopologyOwnership::TenantOwned);
         assert!(database_instance.placement.is_none());
+        assert_eq!(
+            view.databases[1]
+                .topology
+                .nodes
+                .iter()
+                .find(|node| node.semantic_kind == TopologySemanticKind::DatabaseInstance)
+                .and_then(|node| node.database_role),
+            Some(DatabaseInstanceRole::Standby)
+        );
         assert_eq!(view.databases[0].phase, "progressing");
         assert_eq!(
             view.databases[0].topology.nodes[0].health,
@@ -1555,6 +1573,18 @@ mod tests {
         );
         assert!(!graph.nodes.iter().any(|node| node.id == "database:cluster"));
         assert_eq!(graph.edges.len(), 4);
+        assert_eq!(
+            graph
+                .nodes
+                .iter()
+                .filter(|node| node.semantic_kind == TopologySemanticKind::DatabaseInstance)
+                .map(|node| node.database_role)
+                .collect::<Vec<_>>(),
+            [
+                Some(DatabaseInstanceRole::Primary),
+                Some(DatabaseInstanceRole::Primary)
+            ]
+        );
         for edge in &graph.edges {
             if edge.kind == TopologyEdgeKind::Represents {
                 assert!(edge.target.starts_with(&edge.source));

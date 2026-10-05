@@ -37,7 +37,7 @@ def envelope(raw: str, description: str) -> dict[str, object]:
         or response["schemaVersion"] != SCHEMA_VERSION
         or not isinstance(response["data"], dict)
     ):
-        raise RuntimeError(f"{description} is not a schema-v6 envelope")
+        raise RuntimeError(f"{description} is not a schema-v7 envelope")
     return response["data"]
 
 
@@ -45,7 +45,7 @@ def require_stale_identity(response: CompletedProcess[str]) -> None:
     try:
         body = json.loads(response.stdout)
     except ValueError as exc:
-        raise RuntimeError("stale identity rejection was not a schema-v6 error") from exc
+        raise RuntimeError("stale identity rejection was not a schema-v7 error") from exc
     if (
         response.returncode == 0 or not response.stderr.startswith("HTTP 409:")
         or not isinstance(body, dict)

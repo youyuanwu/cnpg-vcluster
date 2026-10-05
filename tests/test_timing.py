@@ -335,7 +335,7 @@ class TimingTests(unittest.TestCase):
         client.request_json.return_value = CompletedProcess(
             [], 1,
             json.dumps({
-                "schemaVersion": 6,
+                "schemaVersion": 7,
                 "error": {"code": "stale-identity", "retryable": False},
             }), "HTTP 409: Conflict",
         )

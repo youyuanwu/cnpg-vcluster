@@ -396,7 +396,7 @@ class WorkerRestartPersistenceTests(unittest.TestCase):
                 return response(error=self.query_error[name])
             values = self.marker_results[name]
             return response({
-                "schemaVersion": 6,
+                "schemaVersion": 7,
                 "data": {
                     "catalogUid": "catalog-uid", "logicalUid": payload["logicalUid"],
                     "instance": payload["instance"], "instanceUid": payload["instanceUid"],
