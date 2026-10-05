@@ -74,6 +74,23 @@ ADMIN_TOPOLOGY_NODE_KINDS = {
     "add-on",
     "database",
 }
+ADMIN_TOPOLOGY_SEMANTIC_KINDS = {
+    "tenant",
+    "control-plane",
+    "worker-pool",
+    "compute-machine",
+    "worker-node",
+    "database-cluster",
+    "database-instance",
+    "add-on",
+    "provider-infrastructure",
+    "other",
+}
+ADMIN_TOPOLOGY_OWNERSHIP = {
+    "tenant-owned",
+    "provider-owned",
+    "unknown",
+}
 ADMIN_TOPOLOGY_HEALTH = {
     "ready",
     "progressing",
@@ -1151,7 +1168,11 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
             != {
                 "id",
                 "kind",
+                "semanticKind",
+                "ownership",
                 "provenance",
+                "databaseRole",
+                "placement",
                 "label",
                 "health",
                 "resource",
@@ -1160,7 +1181,17 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
             or not isinstance(node.get("id"), str)
             or not node["id"]
             or node.get("kind") not in ADMIN_TOPOLOGY_NODE_KINDS
+            or node.get("semanticKind") not in ADMIN_TOPOLOGY_SEMANTIC_KINDS
+            or node.get("ownership") not in ADMIN_TOPOLOGY_OWNERSHIP
             or node.get("provenance") not in ADMIN_TOPOLOGY_PROVENANCE
+            or (
+                node.get("databaseRole") is not None
+                and node.get("databaseRole") not in ADMIN_DATABASE_INSTANCE_ROLES
+            )
+            or (
+                node.get("placement") is not None
+                and not isinstance(node.get("placement"), dict)
+            )
             or not isinstance(node.get("label"), str)
             or node.get("health") not in ADMIN_TOPOLOGY_HEALTH
             or (
@@ -1170,6 +1201,19 @@ def _validate_topology(topology: dict[str, object], name: str) -> None:
             or not isinstance(node.get("attributes"), list)
         ):
             raise RuntimeError("Tenant Admin topology node response is invalid")
+        if node.get("placement") is not None:
+            placement = _required_mapping(
+                node["placement"], "topology node placement"
+            )
+            if (
+                set(placement) != {"workerPool", "workerNode", "zone"}
+                or not _is_optional_string(placement.get("workerPool"))
+                or not _is_optional_string(placement.get("workerNode"))
+                or not _is_optional_string(placement.get("zone"))
+            ):
+                raise RuntimeError(
+                    "Tenant Admin topology node placement is invalid"
+                )
         if node.get("resource") is not None:
             _validate_resource_identity(node["resource"], "topology resource identity")
         for attribute_value in node["attributes"]:

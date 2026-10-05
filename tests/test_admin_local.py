@@ -162,7 +162,11 @@ class FakeClient:
                     {
                         "id": f"tenant:{name}",
                         "kind": "tenant",
+                        "semanticKind": "tenant",
+                        "ownership": "tenant-owned",
                         "provenance": "exact-kubernetes-resource",
+                        "databaseRole": None,
+                        "placement": None,
                         "label": name,
                         "health": "ready",
                         "resource": None,
@@ -171,7 +175,11 @@ class FakeClient:
                     {
                         "id": "database:cluster",
                         "kind": "database",
+                        "semanticKind": "database-cluster",
+                        "ownership": "tenant-owned",
                         "provenance": "database-logical-representation",
+                        "databaseRole": None,
+                        "placement": None,
                         "label": "capi-postgres",
                         "health": "ready",
                         "resource": None,
@@ -180,7 +188,11 @@ class FakeClient:
                     {
                         "id": "database:instance:capi-postgres-1",
                         "kind": "database",
+                        "semanticKind": "database-instance",
+                        "ownership": "tenant-owned",
                         "provenance": "database-logical-representation",
+                        "databaseRole": "primary",
+                        "placement": None,
                         "label": "capi-postgres-1",
                         "health": "ready",
                         "resource": None,
@@ -529,6 +541,43 @@ class FakeClient:
 
 
 class AdminLocalTests(unittest.TestCase):
+    def test_topology_validator_requires_schema_v7_semantics(self) -> None:
+        topology = {
+            "tenantName": "tenant-a",
+            "provider": "local",
+            "nodes": [
+                {
+                    "id": "database:instance:one",
+                    "kind": "database",
+                    "semanticKind": "database-instance",
+                    "ownership": "tenant-owned",
+                    "provenance": "database-logical-representation",
+                    "databaseRole": "primary",
+                    "placement": {
+                        "workerPool": None,
+                        "workerNode": "worker-a",
+                        "zone": "zone-a",
+                    },
+                    "label": "one",
+                    "health": "ready",
+                    "resource": None,
+                    "attributes": [],
+                }
+            ],
+            "edges": [],
+        }
+        admin_local._validate_topology(topology, "tenant-a")
+
+        missing_semantics = copy.deepcopy(topology)
+        del missing_semantics["nodes"][0]["semanticKind"]
+        with self.assertRaisesRegex(RuntimeError, "topology node response"):
+            admin_local._validate_topology(missing_semantics, "tenant-a")
+
+        invalid_placement = copy.deepcopy(topology)
+        invalid_placement["nodes"][0]["placement"]["zone"] = 1
+        with self.assertRaisesRegex(RuntimeError, "placement"):
+            admin_local._validate_topology(invalid_placement, "tenant-a")
+
     def test_management_json_request_sends_post_and_delete_bodies(self):
         received = []
 
@@ -1042,7 +1091,10 @@ class AdminLocalTests(unittest.TestCase):
                 body = json.loads(response)
                 body["data"]["nodes"].append({
                     "id": f"database:{FIRST}", "kind": "database",
+                    "semanticKind": "database-cluster",
+                    "ownership": "tenant-owned",
                     "provenance": "database-logical-representation",
+                    "databaseRole": None, "placement": None,
                     "label": "alpha", "health": "ready",
                     "resource": None, "attributes": [],
                 })
@@ -1138,7 +1190,11 @@ class AdminLocalTests(unittest.TestCase):
                 topology["nodes"].append({
                     "id": "database:unavailable",
                     "kind": "database",
+                    "semanticKind": "database-cluster",
+                    "ownership": "tenant-owned",
                     "provenance": "synthetic-summary",
+                    "databaseRole": None,
+                    "placement": None,
                     "label": "Databases unavailable",
                     "health": "degraded",
                     "resource": None,
