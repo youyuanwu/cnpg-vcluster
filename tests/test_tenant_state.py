@@ -315,13 +315,22 @@ class TenantStateTests(unittest.TestCase):
         tenant = type("Tenant", (), {"name": "tenant-a"})()
         evidence = {"cluster": "pg", "nodes": {"worker": "uid"}}
         output = io.StringIO()
+
+        def wait(description, timeout, interval, predicate):
+            self.assertEqual("controller-created CNPG topology", description)
+            self.assertEqual(30, timeout)
+            self.assertEqual(5, interval)
+            self.assertIsNone(predicate())
+            self.assertTrue(predicate())
+
         with (
             tempfile.TemporaryDirectory() as temporary,
             patch(
                 "scripts.cnpg.run_storage_gate",
                 return_value=(object(), tenant, {}),
             ),
-            patch("scripts.cnpg._cnpg_ready", return_value=True),
+            patch("scripts.cnpg._cnpg_ready", side_effect=[False, True]),
+            patch("scripts.cnpg.wait_for", side_effect=wait),
             patch(
                 "scripts.cnpg._storage_identity",
                 side_effect=[{"pv": "uid"}, {"pv": "uid"}],
@@ -338,7 +347,7 @@ class TenantStateTests(unittest.TestCase):
             redirect_stdout(output),
         ):
             root = Path(temporary)
-            run_cnpg_gate(root, {})
+            run_cnpg_gate(root, {"CNPG_TIMEOUT": "30s"})
             self.assertFalse((root / ".runtime").exists())
         self.assertEqual(evidence, json.loads(output.getvalue()))
 

@@ -699,8 +699,12 @@ def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
     evidence = None
     try:
         client, tenant, _ = run_storage_gate(root, config, cleanup=False)
-        if not _cnpg_ready(root, config, tenant):
-            raise RuntimeError("controller-created CNPG topology is not healthy")
+        wait_for(
+            "controller-created CNPG topology",
+            parse_duration(config["CNPG_TIMEOUT"]),
+            5,
+            lambda: True if _cnpg_ready(root, config, tenant) else None,
+        )
         before = _storage_identity(root, config, tenant)
         _write_marker(root, config, tenant)
         _verify_filesystem(config, tenant)
