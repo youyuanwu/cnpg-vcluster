@@ -1596,6 +1596,32 @@ class PackagingTests(unittest.TestCase):
         packaging.ensure_catalog_cutover_lock(client)
         packaging.verify_catalog_cutover_lock(client, namespace="tenant-system")
         self.assertEqual(len([args for args, _ in calls if args[0] == "create"]), 5)
+        pending_policy = copy.deepcopy(policy)
+        pending_policy.pop("status")
+        policy_reads = 0
+
+        def delayed(*args, **kwargs):
+            nonlocal policy_reads
+            if args[:2] == (
+                "get",
+                f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}",
+            ):
+                policy_reads += 1
+                return response(pending_policy if policy_reads == 1 else policy)
+            return reject(*args, **kwargs)
+
+        def wait_for_observation(description, timeout, interval, predicate):
+            self.assertEqual("catalog cutover CREATE fence observation", description)
+            self.assertEqual((90, 2), (timeout, interval))
+            self.assertIsNone(predicate())
+            return predicate()
+
+        with patch.object(
+            packaging, "wait_for", side_effect=wait_for_observation,
+        ):
+            packaging.verify_catalog_cutover_lock(
+                Client(delayed), namespace="tenant-system",
+            )
         def webhook_first(*args, **kwargs):
             result = reject(*args, **kwargs)
             if args[:2] == ("create", "--dry-run=server"):
@@ -1623,9 +1649,7 @@ class PackagingTests(unittest.TestCase):
                 )), namespace="tenant-system",
             )
         for mutation in (
-            lambda p, b: p.pop("status"),
             lambda p, b: p.update(spec=[]),
-            lambda p, b: p["status"].update(observedGeneration=0),
             lambda p, b: p["status"]["typeChecking"].update(
                 expressionWarnings="invalid",
             ),
@@ -1638,14 +1662,38 @@ class PackagingTests(unittest.TestCase):
             lambda p, b: b["spec"].update(validationActions=["Warn"]),
             lambda p, b: b["spec"].update(policyName="different-policy"),
             lambda p, b: b["spec"].update(matchResources={"namespaceSelector": {}}),
-            lambda p, b: p["status"].update(conditions=[{
-                "type": "Ready", "status": "True", "observedGeneration": 0,
-            }]),
             lambda p, b: p["spec"]["matchConstraints"].update(matchPolicy="Exact"),
         ):
             changed_policy, changed_binding = active_catalog_lock()
             mutation(changed_policy, changed_binding)
             with self.assertRaisesRegex(RuntimeError, "contract is malformed"):
+                packaging.verify_catalog_cutover_lock(
+                    Client(lambda *args, **kwargs: (
+                        response(changed_policy) if args[:2] == (
+                            "get", f"validatingadmissionpolicy/{packaging.CATALOG_CUTOVER_POLICY}"
+                        ) else response(changed_binding) if args[:2] == (
+                            "get", f"validatingadmissionpolicybinding/{packaging.CATALOG_CUTOVER_POLICY}"
+                        ) else reject(*args, **kwargs)
+                    )), namespace="tenant-system",
+                )
+        for mutation in (
+            lambda p: p.pop("status"),
+            lambda p: p["status"].update(observedGeneration=0),
+            lambda p: p["status"].update(conditions=[{
+                "type": "Ready", "status": "True", "observedGeneration": 0,
+            }]),
+        ):
+            changed_policy, changed_binding = active_catalog_lock()
+            mutation(changed_policy)
+
+            def pending(_description, _timeout, _interval, predicate):
+                self.assertIsNone(predicate())
+                raise RuntimeError("timed out waiting for catalog cutover observation")
+
+            with (
+                patch.object(packaging, "wait_for", side_effect=pending),
+                self.assertRaisesRegex(RuntimeError, "timed out waiting"),
+            ):
                 packaging.verify_catalog_cutover_lock(
                     Client(lambda *args, **kwargs: (
                         response(changed_policy) if args[:2] == (

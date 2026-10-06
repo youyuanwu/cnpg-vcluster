@@ -231,7 +231,7 @@ async fn counts_and_stopped_containers_are_pending_only_after_all_identity_check
 }
 
 #[tokio::test]
-async fn cross_resource_list_skew_rechecks_machine_without_weakening_missing_owner_rejection() {
+async fn cross_resource_list_skew_and_absent_parent_are_pending_but_mismatch_is_invalid() {
     let fixture = Fixture::new();
     let machine_list = path(&fixture.machine)
         .rsplit_once('/')
@@ -267,6 +267,13 @@ async fn cross_resource_list_skew_rechecks_machine_without_weakening_missing_own
         .unwrap()
         .objects
         .remove(&path(&fixture.machine));
+    let error = fixture.observe(1, &fixture.network).await.unwrap_err();
+    assert!(error.pending(), "{error}");
+
+    let fixture = Fixture::new();
+    let mut dev = fixture.dev.clone();
+    dev.metadata.owner_references.as_mut().unwrap()[0].uid = "replacement".into();
+    fixture.management.insert(&path(&dev), dev);
     let error = fixture.observe(1, &fixture.network).await.unwrap_err();
     assert!(error.ownership_invalid(), "{error}");
 }

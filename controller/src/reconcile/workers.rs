@@ -140,7 +140,9 @@ pub async fn observe_workers<D: DockerClient>(
             .get_opt(&owner.name)
             .await?;
             let Some(current) = current else {
-                return Err(ownership_invalid("DevMachine has no exact Machine"));
+                return Err(ReconcileError::Pending(
+                    "DevMachine owner Machine is not currently observable".into(),
+                ));
             };
             if owner.name != machine.name_any()
                 || owner.api_version != machine_definition.api_version
@@ -153,7 +155,9 @@ pub async fn observe_workers<D: DockerClient>(
                 || current.metadata.name.as_deref() != Some(owner.name.as_str())
                 || current.metadata.uid.as_deref() != Some(owner.uid.as_str())
             {
-                return Err(ownership_invalid("DevMachine has no exact Machine"));
+                return Err(ownership_invalid(
+                    "DevMachine owner does not match live Machine",
+                ));
             }
             ownership::validate_root_ownership(&current.metadata, identity, "machine")?;
             let mut current_inventory = inventory.clone();
