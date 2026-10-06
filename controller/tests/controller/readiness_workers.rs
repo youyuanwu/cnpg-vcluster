@@ -231,6 +231,54 @@ async fn counts_and_stopped_containers_are_pending_only_after_all_identity_check
 }
 
 #[tokio::test]
+async fn cross_resource_list_skew_and_absent_parent_are_pending_but_mismatch_is_invalid() {
+    let fixture = Fixture::new();
+    let machine_list = path(&fixture.machine)
+        .rsplit_once('/')
+        .unwrap()
+        .0
+        .to_owned();
+    fixture.management.respond(
+        "GET",
+        &machine_list,
+        200,
+        json!({
+            "apiVersion":"cluster.x-k8s.io/v1beta2",
+            "kind":"MachineList",
+            "metadata":{"resourceVersion":"1"},
+            "items":[]
+        }),
+    );
+    let error = fixture.observe(1, &fixture.network).await.unwrap_err();
+    assert!(error.pending(), "{error}");
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| call.path == path(&fixture.machine) && call.method == "GET")
+    );
+
+    let fixture = Fixture::new();
+    fixture
+        .management
+        .0
+        .lock()
+        .unwrap()
+        .objects
+        .remove(&path(&fixture.machine));
+    let error = fixture.observe(1, &fixture.network).await.unwrap_err();
+    assert!(error.pending(), "{error}");
+
+    let fixture = Fixture::new();
+    let mut dev = fixture.dev.clone();
+    dev.metadata.owner_references.as_mut().unwrap()[0].uid = "replacement".into();
+    fixture.management.insert(&path(&dev), dev);
+    let error = fixture.observe(1, &fixture.network).await.unwrap_err();
+    assert!(error.ownership_invalid(), "{error}");
+}
+
+#[tokio::test]
 async fn extra_and_unlabeled_foreign_inventory_is_never_hidden_by_count_mismatch() {
     for kind in ["Machine", "MachineSet", "DevMachine", "Node"] {
         let fixture = Fixture::new();

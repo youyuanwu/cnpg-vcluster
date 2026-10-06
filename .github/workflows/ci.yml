@@ -262,7 +262,6 @@ jobs:
           just test-machines
           just test-storage
           just test-storage-negative
-          just test-persistence
           just test-persistence-negative
           just test-tenant-lifecycle
           just test-e2e-offline

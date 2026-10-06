@@ -170,7 +170,7 @@ def verify_catalog_cutover_lock(
     expected_policy, expected_binding = catalog_cutover_lock_documents(probe)
     expected_spec = expected_policy["spec"]
 
-    def current_identity() -> tuple[str, int, str, int]:
+    def current_identity() -> tuple[str, int, str, int] | None:
         policy = client.json(
             "get", f"validatingadmissionpolicy/{CATALOG_CUTOVER_POLICY}",
         )
@@ -185,29 +185,17 @@ def verify_catalog_cutover_lock(
         constraints = policy_spec.get("matchConstraints", {})
         policy_meta = policy.get("metadata", {})
         binding_meta = binding.get("metadata", {})
-        policy_status = policy.get("status", {})
-        conditions = policy_status.get("conditions", []) if isinstance(policy_status, dict) else None
+        policy_status = policy.get("status")
         if (
             not isinstance(policy_meta, dict)
             or not isinstance(binding_meta, dict)
             or not isinstance(constraints, dict)
-            or not isinstance(policy_status, dict)
-            or not isinstance(conditions, list)
             or policy_meta.get("name") != CATALOG_CUTOVER_POLICY
             or not isinstance(policy_meta.get("uid"), str)
             or not policy_meta["uid"]
             or not isinstance(policy_meta.get("generation"), int)
             or isinstance(policy_meta["generation"], bool)
             or policy_meta["generation"] < 1
-            or policy_status.get("observedGeneration") != policy_meta["generation"]
-            or not isinstance(policy_status.get("typeChecking"), dict)
-            or policy_status["typeChecking"].get("expressionWarnings", []) != []
-            or any(
-                not isinstance(condition, dict)
-                or condition.get("observedGeneration") != policy_meta["generation"]
-                or condition.get("status") != "True"
-                for condition in conditions
-            )
             or binding_meta.get("name") != CATALOG_CUTOVER_POLICY
             or not isinstance(binding_meta.get("uid"), str)
             or not binding_meta["uid"]
@@ -230,12 +218,38 @@ def verify_catalog_cutover_lock(
             or binding.get("spec") != expected_binding["spec"]
         ):
             raise RuntimeError("catalog cutover CREATE fence contract is malformed")
+        if policy_status is None:
+            return None
+        if not isinstance(policy_status, dict):
+            raise RuntimeError("catalog cutover CREATE fence contract is malformed")
+        conditions = policy_status.get("conditions", [])
+        type_checking = policy_status.get("typeChecking")
+        if not isinstance(conditions, list):
+            raise RuntimeError("catalog cutover CREATE fence contract is malformed")
+        if (
+            policy_status.get("observedGeneration") != policy_meta["generation"]
+            or not isinstance(type_checking, dict)
+            or any(
+                not isinstance(condition, dict)
+                or condition.get("observedGeneration") != policy_meta["generation"]
+                or condition.get("status") != "True"
+                for condition in conditions
+            )
+        ):
+            return None
+        if type_checking.get("expressionWarnings", []) != []:
+            raise RuntimeError("catalog cutover CREATE fence contract is malformed")
         return (
             policy_meta["uid"], policy_meta["generation"],
             binding_meta["uid"], binding_meta["generation"],
         )
 
-    identity = current_identity()
+    timeout = parse_duration(
+        getattr(client, "config", {}).get("CONDITION_TIMEOUT", "90s")
+    )
+    identity = wait_for(
+        "catalog cutover CREATE fence observation", timeout, 2, current_identity,
+    )
     if expected_identity is not None and identity != expected_identity:
         raise RuntimeError("catalog cutover CREATE fence identity changed before release")
     name = f"database-lock-probe-{uuid.uuid4().hex[:8]}"

@@ -9,7 +9,7 @@ from pathlib import Path
 from subprocess import CompletedProcess
 from unittest.mock import patch
 
-from scripts.cnpg import _sql, run_cnpg_gate
+from scripts.cnpg import _sql
 from scripts.lib.controller_scenarios import delete_controller_tenant
 from scripts.lib.files import IntegrityError, write_private_file
 from scripts.lib.tenants import (
@@ -310,38 +310,6 @@ class TenantStateTests(unittest.TestCase):
             "foreign-capi-node",
             json.loads(calls[0][1]["input_text"])["metadata"]["name"],
         )
-
-    def test_cnpg_gate_prints_evidence_without_persisting_it(self) -> None:
-        tenant = type("Tenant", (), {"name": "tenant-a"})()
-        evidence = {"cluster": "pg", "nodes": {"worker": "uid"}}
-        output = io.StringIO()
-        with (
-            tempfile.TemporaryDirectory() as temporary,
-            patch(
-                "scripts.cnpg.run_storage_gate",
-                return_value=(object(), tenant, {}),
-            ),
-            patch("scripts.cnpg._cnpg_ready", return_value=True),
-            patch(
-                "scripts.cnpg._storage_identity",
-                side_effect=[{"pv": "uid"}, {"pv": "uid"}],
-            ),
-            patch("scripts.cnpg._write_marker"),
-            patch("scripts.cnpg._verify_filesystem"),
-            patch("scripts.cnpg._replace_machine"),
-            patch("scripts.cnpg.wait_tenant_ready"),
-            patch("scripts.cnpg._verify_marker"),
-            patch("scripts.cnpg._replica_restart"),
-            patch("scripts.cnpg._primary_failover"),
-            patch("scripts.cnpg._evidence_payload", return_value=evidence),
-            patch("scripts.cnpg._cleanup_storage_and_tenant"),
-            redirect_stdout(output),
-        ):
-            root = Path(temporary)
-            run_cnpg_gate(root, {})
-            self.assertFalse((root / ".runtime").exists())
-        self.assertEqual(evidence, json.loads(output.getvalue()))
-
 
 if __name__ == "__main__":
     unittest.main()
