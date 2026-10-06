@@ -167,14 +167,21 @@ class CacheTests(unittest.TestCase):
         with (
             patch("scripts.cache.verify_cache", return_value=verified) as verify,
             patch("scripts.cache.materialize_inputs") as materialize,
+            patch("scripts.cache.hydrate_host_images") as hydrate,
             patch("scripts.cache.prune_cache_generations", return_value=2) as prune,
             patch("scripts.cache.acquire_cache") as acquire,
         ):
-            ensure_cache(Path("/repo/capi"), {"key": "value"})
-        verify.assert_called_once_with(Path("/repo/capi"), {"key": "value"})
+            config = {"key": "value"}
+            ensure_cache(Path("/repo/capi"), config)
+        verify.assert_called_once_with(Path("/repo/capi"), config)
         materialize.assert_called_once_with(
             Path("/repo/capi"),
-            {"key": "value"},
+            config,
+            verified=verified,
+        )
+        hydrate.assert_called_once_with(
+            Path("/repo/capi"),
+            config,
             verified=verified,
         )
         prune.assert_called_once_with(Path("/repo/capi"), verified.generation)
@@ -734,6 +741,72 @@ class CacheTests(unittest.TestCase):
         self.assertIn(
             ["docker", "image", "load", "--input", "/cache/image.tar"],
             [call.args[0] for call in run.call_args_list],
+        )
+
+    def test_restore_pulls_digest_metadata_after_legacy_archive_load(self) -> None:
+        config = {
+            "DOWNLOAD_TIMEOUT": "1s",
+            "TEST_IMAGE": EXACT,
+            "TEST_IMAGE_TAGGED": TAGGED,
+        }
+        missing = CompletedProcess([], 1, stdout="", stderr="missing")
+        present = CompletedProcess(
+            [],
+            0,
+            stdout=json.dumps([f"example.invalid/lab/image@{SOURCE_DIGEST}"]),
+            stderr="",
+        )
+        with (
+            patch("scripts.cache.archive_path", return_value=Path("/cache/image.tar")),
+            patch(
+                "scripts.cache.run",
+                side_effect=[
+                    missing,
+                    CompletedProcess([], 0, "", ""),
+                    missing,
+                    CompletedProcess([], 0, "", ""),
+                    present,
+                ],
+            ) as run,
+        ):
+            restore_host_image(Path("/repo"), config, "TEST_IMAGE")
+        self.assertIn(
+            [
+                "docker",
+                "pull",
+                "--platform",
+                IMAGE_PLATFORM,
+                EXACT,
+            ],
+            [call.args[0] for call in run.call_args_list],
+        )
+
+    def test_restore_rejects_legacy_archive_load_after_offline_enforcement(self) -> None:
+        config = {
+            "DOWNLOAD_TIMEOUT": "1s",
+            "TEST_IMAGE": EXACT,
+            "TEST_IMAGE_TAGGED": TAGGED,
+        }
+        missing = CompletedProcess([], 1, stdout="", stderr="missing")
+        with (
+            patch("scripts.cache.archive_path", return_value=Path("/cache/image.tar")),
+            patch(
+                "scripts.cache.run",
+                side_effect=[
+                    missing,
+                    CompletedProcess([], 0, "", ""),
+                    missing,
+                ],
+            ) as run,
+            patch.dict(os.environ, {"CAPI_OFFLINE_ENFORCED": "1"}),
+        ):
+            with self.assertRaisesRegex(
+                IntegrityError,
+                "run cache acquisition before enabling offline enforcement",
+            ):
+                restore_host_image(Path("/repo"), config, "TEST_IMAGE")
+        self.assertFalse(
+            any(call.args[0][:2] == ["docker", "pull"] for call in run.call_args_list)
         )
 
 
