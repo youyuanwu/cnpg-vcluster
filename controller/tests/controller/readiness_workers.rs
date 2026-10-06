@@ -231,6 +231,47 @@ async fn counts_and_stopped_containers_are_pending_only_after_all_identity_check
 }
 
 #[tokio::test]
+async fn cross_resource_list_skew_rechecks_machine_without_weakening_missing_owner_rejection() {
+    let fixture = Fixture::new();
+    let machine_list = path(&fixture.machine)
+        .rsplit_once('/')
+        .unwrap()
+        .0
+        .to_owned();
+    fixture.management.respond(
+        "GET",
+        &machine_list,
+        200,
+        json!({
+            "apiVersion":"cluster.x-k8s.io/v1beta2",
+            "kind":"MachineList",
+            "metadata":{"resourceVersion":"1"},
+            "items":[]
+        }),
+    );
+    let error = fixture.observe(1, &fixture.network).await.unwrap_err();
+    assert!(error.pending(), "{error}");
+    assert!(
+        fixture
+            .management
+            .calls()
+            .iter()
+            .any(|call| call.path == path(&fixture.machine) && call.method == "GET")
+    );
+
+    let fixture = Fixture::new();
+    fixture
+        .management
+        .0
+        .lock()
+        .unwrap()
+        .objects
+        .remove(&path(&fixture.machine));
+    let error = fixture.observe(1, &fixture.network).await.unwrap_err();
+    assert!(error.ownership_invalid(), "{error}");
+}
+
+#[tokio::test]
 async fn extra_and_unlabeled_foreign_inventory_is_never_hidden_by_count_mismatch() {
     for kind in ["Machine", "MachineSet", "DevMachine", "Node"] {
         let fixture = Fixture::new();

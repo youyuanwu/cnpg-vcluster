@@ -88,7 +88,11 @@ pub async fn observe_workers<D: DockerClient>(
     })?;
     let sets = list(management.clone(), "MachineSet", Some(identity.tenant_name)).await?;
     let machines = list(management.clone(), "Machine", Some(identity.tenant_name)).await?;
-    let dev_machines = list(management, "DevMachine", Some(identity.tenant_name)).await?;
+    let dev_machines = list(management.clone(), "DevMachine", Some(identity.tenant_name)).await?;
+    let machine_definition = MANAGEMENT_RESOURCES
+        .iter()
+        .find(|resource| resource.kind == "Machine")
+        .ok_or_else(|| ReconcileError::InvalidInput("unknown management kind Machine".into()))?;
     let mut inventory = vec![deployment.clone()];
     inventory.extend(sets.iter().chain(&machines).cloned());
     let mut uids = BTreeSet::new();
@@ -129,9 +133,46 @@ pub async fn observe_workers<D: DockerClient>(
                 "DevMachine must have one exact Machine owner".into(),
             ));
         };
-        let root = by_uid.get(&owner.uid).ok_or_else(|| {
-            ReconcileError::OwnershipInvalid("DevMachine has no exact Machine".into())
-        })?;
+        if owner.api_version != machine_definition.api_version
+            || owner.kind != machine_definition.kind
+            || owner.name != machine.name_any()
+        {
+            return Err(ReconcileError::OwnershipInvalid(
+                "DevMachine does not reference its exact Machine".into(),
+            ));
+        }
+        let Some(root) = by_uid.get(&owner.uid) else {
+            let current = api_for(
+                management.clone(),
+                &machine_definition.api_resource(),
+                Some(identity.tenant_name),
+            )
+            .get_opt(&owner.name)
+            .await?;
+            let Some(current) = current else {
+                return Err(ReconcileError::OwnershipInvalid(
+                    "DevMachine has no exact Machine".into(),
+                ));
+            };
+            if current.types.as_ref().is_none_or(|types| {
+                types.api_version != machine_definition.api_version
+                    || types.kind != machine_definition.kind
+            }) || current.metadata.namespace.as_deref() != Some(identity.tenant_name)
+                || current.metadata.name.as_deref() != Some(owner.name.as_str())
+                || current.metadata.uid.as_deref() != Some(owner.uid.as_str())
+            {
+                return Err(ReconcileError::OwnershipInvalid(
+                    "DevMachine has no exact Machine".into(),
+                ));
+            }
+            ownership::validate_root_ownership(&current.metadata, identity, "machine")?;
+            let mut current_inventory = inventory.clone();
+            current_inventory.push(current.clone());
+            ownership::validate_owner_chain(&current, &deployment_uid, &current_inventory)?;
+            return Err(ReconcileError::Pending(
+                "worker inventory changed while it was observed".into(),
+            ));
+        };
         if machine.name_any() != root.name_any() || !dev_names.insert(machine.name_any()) {
             return Err(ReconcileError::OwnershipInvalid(
                 "DevMachine name does not match its exact Machine".into(),
