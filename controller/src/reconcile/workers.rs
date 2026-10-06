@@ -29,6 +29,10 @@ pub struct WorkerInputs<'a> {
     pub network_objects: &'a [DynamicObject],
 }
 
+fn ownership_invalid(message: impl Into<String>) -> ReconcileError {
+    ReconcileError::OwnershipInvalid(message.into())
+}
+
 async fn list(
     client: Client,
     kind: &str,
@@ -57,7 +61,7 @@ async fn list(
             || item.metadata.name.as_deref().is_none_or(str::is_empty)
             || item.metadata.uid.as_deref().is_none_or(str::is_empty)
         {
-            return Err(ReconcileError::OwnershipInvalid(format!(
+            return Err(ownership_invalid(format!(
                 "{kind} inventory identity is invalid"
             )));
         }
@@ -83,9 +87,9 @@ pub async fn observe_workers<D: DockerClient>(
         network_objects,
     } = inputs;
     ownership::validate_root_ownership(&deployment.metadata, identity, "machine-deployment")?;
-    let deployment_uid = deployment.uid().ok_or_else(|| {
-        ReconcileError::OwnershipInvalid("MachineDeployment UID is missing".into())
-    })?;
+    let deployment_uid = deployment
+        .uid()
+        .ok_or_else(|| ownership_invalid("MachineDeployment UID is missing"))?;
     let sets = list(management.clone(), "MachineSet", Some(identity.tenant_name)).await?;
     let machines = list(management.clone(), "Machine", Some(identity.tenant_name)).await?;
     let dev_machines = list(management.clone(), "DevMachine", Some(identity.tenant_name)).await?;
@@ -98,9 +102,7 @@ pub async fn observe_workers<D: DockerClient>(
     let mut uids = BTreeSet::new();
     for object in &inventory {
         if !uids.insert(object.uid()) {
-            return Err(ReconcileError::OwnershipInvalid(
-                "duplicate worker inventory UID".into(),
-            ));
+            return Err(ownership_invalid("duplicate worker inventory UID"));
         }
     }
     for set in &sets {
@@ -116,31 +118,19 @@ pub async fn observe_workers<D: DockerClient>(
                 .insert(machine.uid().unwrap_or_default(), machine)
                 .is_some()
         {
-            return Err(ReconcileError::OwnershipInvalid(
-                "duplicate Machine identity".into(),
-            ));
+            return Err(ownership_invalid("duplicate Machine identity"));
         }
     }
     let mut dev_names = BTreeSet::new();
     for machine in &dev_machines {
         if !uids.insert(machine.uid()) {
-            return Err(ReconcileError::OwnershipInvalid(
-                "duplicate DevMachine inventory UID".into(),
-            ));
+            return Err(ownership_invalid("duplicate DevMachine inventory UID"));
         }
         let [owner] = machine.owner_references() else {
-            return Err(ReconcileError::OwnershipInvalid(
-                "DevMachine must have one exact Machine owner".into(),
+            return Err(ownership_invalid(
+                "DevMachine must have one exact Machine owner",
             ));
         };
-        if owner.api_version != machine_definition.api_version
-            || owner.kind != machine_definition.kind
-            || owner.name != machine.name_any()
-        {
-            return Err(ReconcileError::OwnershipInvalid(
-                "DevMachine does not reference its exact Machine".into(),
-            ));
-        }
         let Some(root) = by_uid.get(&owner.uid) else {
             let current = api_for(
                 management.clone(),
@@ -150,20 +140,20 @@ pub async fn observe_workers<D: DockerClient>(
             .get_opt(&owner.name)
             .await?;
             let Some(current) = current else {
-                return Err(ReconcileError::OwnershipInvalid(
-                    "DevMachine has no exact Machine".into(),
-                ));
+                return Err(ownership_invalid("DevMachine has no exact Machine"));
             };
-            if current.types.as_ref().is_none_or(|types| {
-                types.api_version != machine_definition.api_version
-                    || types.kind != machine_definition.kind
-            }) || current.metadata.namespace.as_deref() != Some(identity.tenant_name)
+            if owner.name != machine.name_any()
+                || owner.api_version != machine_definition.api_version
+                || owner.kind != machine_definition.kind
+                || current.types.as_ref().is_none_or(|types| {
+                    types.api_version != machine_definition.api_version
+                        || types.kind != machine_definition.kind
+                })
+                || current.metadata.namespace.as_deref() != Some(identity.tenant_name)
                 || current.metadata.name.as_deref() != Some(owner.name.as_str())
                 || current.metadata.uid.as_deref() != Some(owner.uid.as_str())
             {
-                return Err(ReconcileError::OwnershipInvalid(
-                    "DevMachine has no exact Machine".into(),
-                ));
+                return Err(ownership_invalid("DevMachine has no exact Machine"));
             }
             ownership::validate_root_ownership(&current.metadata, identity, "machine")?;
             let mut current_inventory = inventory.clone();
@@ -174,8 +164,8 @@ pub async fn observe_workers<D: DockerClient>(
             ));
         };
         if machine.name_any() != root.name_any() || !dev_names.insert(machine.name_any()) {
-            return Err(ReconcileError::OwnershipInvalid(
-                "DevMachine name does not match its exact Machine".into(),
+            return Err(ownership_invalid(
+                "DevMachine name does not match its exact Machine",
             ));
         }
         ownership::validate_owner_chain(machine, &owner.uid, &inventory)?;
@@ -207,9 +197,7 @@ pub async fn observe_workers<D: DockerClient>(
             || node.metadata.name.as_deref().is_none_or(str::is_empty)
             || node.metadata.uid.as_deref().is_none_or(str::is_empty)
         {
-            return Err(ReconcileError::OwnershipInvalid(
-                "Node inventory identity is invalid".into(),
-            ));
+            return Err(ownership_invalid("Node inventory identity is invalid"));
         }
         node.types.get_or_insert(kube::core::TypeMeta {
             api_version: "v1".into(),
@@ -223,9 +211,7 @@ pub async fn observe_workers<D: DockerClient>(
             || !node_names.insert(node.name_any())
             || !node_uids.insert(node.uid())
         {
-            return Err(ReconcileError::OwnershipInvalid(
-                "Node has no unique exact Machine".into(),
-            ));
+            return Err(ownership_invalid("Node has no unique exact Machine"));
         }
     }
     let count = usize::try_from(desired_count)
