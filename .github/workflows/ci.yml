@@ -157,7 +157,10 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .tools/cache
-          key: capi-full-v3-${{ runner.os }}-${{ hashFiles('config/versions.env', 'config/settings.env', 'config/kind.yaml', 'manifests/**', 'scripts/cache.py', 'scripts/tools.py') }}
+          # Bump capi-full-v3 when cached archive compatibility changes.
+          key: capi-full-v3-${{ runner.os }}-${{ hashFiles('config/versions.env', 'config/settings.env', 'config/kind.yaml', 'manifests/**', 'scripts/tools.py') }}-${{ hashFiles('scripts/cache.py') }}
+          restore-keys: |
+            capi-full-v3-${{ runner.os }}-${{ hashFiles('config/versions.env', 'config/settings.env', 'config/kind.yaml', 'manifests/**', 'scripts/tools.py') }}-
 
       - name: Download static controller and Tenant Admin
         uses: actions/download-artifact@v7
@@ -229,7 +232,10 @@ jobs:
         uses: actions/cache@v6
         with:
           path: .tools/cache
-          key: capi-full-v3-${{ runner.os }}-${{ hashFiles('config/versions.env', 'config/settings.env', 'config/kind.yaml', 'manifests/**', 'scripts/cache.py', 'scripts/tools.py') }}
+          # Bump capi-full-v3 when cached archive compatibility changes.
+          key: capi-full-v3-${{ runner.os }}-${{ hashFiles('config/versions.env', 'config/settings.env', 'config/kind.yaml', 'manifests/**', 'scripts/tools.py') }}-${{ hashFiles('scripts/cache.py') }}
+          restore-keys: |
+            capi-full-v3-${{ runner.os }}-${{ hashFiles('config/versions.env', 'config/settings.env', 'config/kind.yaml', 'manifests/**', 'scripts/tools.py') }}-
       - name: Show Docker capacity
         run: docker info --format 'CPUs={{.NCPU}} Memory={{.MemTotal}} DockerRoot={{.DockerRootDir}}'
       - name: Acquire complete verified cache

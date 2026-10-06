@@ -84,20 +84,32 @@ class CIWorkflowTests(unittest.TestCase):
             self.assertIn("path: .tools/cache", live)
             self.assertNotIn("~/.cargo", live)
             self.assertIn("key: capi-full-v3-", live)
+            self.assertIn(
+                "restore-keys: |\n"
+                "            capi-full-v3-${{ runner.os }}-"
+                "${{ hashFiles('config/versions.env', 'config/settings.env', "
+                "'config/kind.yaml', 'manifests/**', 'scripts/tools.py') }}-",
+                live,
+            )
             key = next(
                 line.strip() for line in live.splitlines()
                 if line.strip().startswith("key: capi-full-v3-")
             )
             self.assertEqual(
-                (
-                    "config/versions.env",
-                    "config/settings.env",
-                    "config/kind.yaml",
-                    "manifests/**",
-                    "scripts/cache.py",
-                    "scripts/tools.py",
-                ),
-                tuple(re.findall(r"'([^']+)'", key)),
+                [
+                    (
+                        "config/versions.env",
+                        "config/settings.env",
+                        "config/kind.yaml",
+                        "manifests/**",
+                        "scripts/tools.py",
+                    ),
+                    ("scripts/cache.py",),
+                ],
+                [
+                    tuple(re.findall(r"'([^']+)'", expression))
+                    for expression in re.findall(r"hashFiles\((.*?)\)", key)
+                ],
             )
             self.assertNotIn("Cargo.lock", key)
             self.assertNotIn("rust-toolchain.toml", key)
