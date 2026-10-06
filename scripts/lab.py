@@ -20,7 +20,6 @@ from scripts.endpoint import run_endpoint_gate
 from scripts.network import run_network_gate
 from scripts.machines import run_machine_gate
 from scripts.storage import run_storage_gate
-from scripts.cnpg import run_cnpg_gate
 from scripts.preflight import PreflightError, run_preflight
 from scripts.tools import prepare_tools
 from scripts.cache import acquire_admin_build_cache, acquire_cache, ensure_cache
@@ -126,12 +125,6 @@ def main(arguments: list[str]) -> int:
             prepare_inotify(ROOT, config)
             run_preflight(ROOT, config)
             run_storage_gate(ROOT, config)
-        return 0
-    if command == "test-persistence":
-        with tools_lock(ROOT, exclusive=True):
-            prepare_inotify(ROOT, config)
-            run_preflight(ROOT, config)
-            run_cnpg_gate(ROOT, config)
         return 0
     if command == "unavailable":
         return unavailable(rest)

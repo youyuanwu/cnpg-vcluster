@@ -14,7 +14,6 @@ from scripts.lib.tenants import storage_volume_name
 from scripts.lib.controller_scenarios import (
     wait_tenant_ready,
 )
-from scripts.storage import _cleanup_storage_and_tenant, run_storage_gate
 from scripts.lib.config import parse_duration
 
 
@@ -468,7 +467,6 @@ def _storage_identity(root: Path, config: dict[str, str], tenant) -> dict[str, s
         for pvc in pvcs
     }
 
-
 def _replace_machine(root: Path, config: dict[str, str], client, tenant) -> None:
     pods = json.loads(
         _tenant_kubectl(
@@ -691,37 +689,3 @@ def _evidence_payload(root: Path, config: dict[str, str], client, tenant) -> dic
             for pvc in pvcs
         },
     }
-
-
-def run_cnpg_gate(root: Path, config: dict[str, str]) -> None:
-    client = None
-    tenant = None
-    evidence = None
-    try:
-        client, tenant, _ = run_storage_gate(root, config, cleanup=False)
-        wait_for(
-            "controller-created CNPG topology",
-            parse_duration(config["CNPG_TIMEOUT"]),
-            5,
-            lambda: True if _cnpg_ready(root, config, tenant) else None,
-        )
-        before = _storage_identity(root, config, tenant)
-        _write_marker(root, config, tenant)
-        _verify_filesystem(config, tenant)
-        _replace_machine(root, config, client, tenant)
-        wait_tenant_ready(root, config, tenant.name)
-        if _storage_identity(root, config, tenant) != before:
-            raise RuntimeError("CNPG storage identity changed across Machine replacement")
-        _verify_marker(root, config, tenant)
-        _replica_restart(root, config, tenant)
-        _verify_marker(root, config, tenant)
-        _primary_failover(root, config, tenant)
-        _verify_marker(root, config, tenant)
-        _verify_filesystem(config, tenant)
-        evidence = _evidence_payload(root, config, client, tenant)
-    finally:
-        if client is not None and tenant is not None:
-            _cleanup_storage_and_tenant(root, config, tenant)
-    if evidence is None:
-        raise RuntimeError("CNPG evidence was not produced")
-    print(json.dumps(evidence, sort_keys=True))

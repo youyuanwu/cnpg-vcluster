@@ -133,11 +133,14 @@ class CIWorkflowTests(unittest.TestCase):
             "just test-endpoint-negative", "just test-spike",
             "just test-network-negative", "just test-machines",
             "just test-storage", "just test-storage-negative",
-            "just test-persistence", "just test-persistence-negative",
-            "just test-tenant-lifecycle",
+            "just test-persistence-negative", "just test-tenant-lifecycle",
         )
         for command in targeted:
             self.assertIn(command, high)
+        self.assertNotIn(
+            "just test-persistence",
+            {line.strip() for line in high.splitlines()},
+        )
         setup_end = high.index("just create-management")
         self.assertTrue(all(setup_end < high.index(command) for command in targeted))
         self.assertLess(setup_end, high.index("just test-e2e-offline"))

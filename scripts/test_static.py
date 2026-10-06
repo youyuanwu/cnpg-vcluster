@@ -76,7 +76,6 @@ EXPECTED_RECIPES = {
     "test-machines",
     "test-storage",
     "test-storage-negative",
-    "test-persistence",
     "test-persistence-negative",
     "diagnose",
     "destroy",

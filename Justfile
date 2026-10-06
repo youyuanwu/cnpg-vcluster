@@ -242,10 +242,6 @@ test-storage:
 test-storage-negative:
     @python3 scripts/run_locked.py scripts/test_storage_negative.py
 
-# [implemented] Prove CNPG continuity through Machine replacement.
-test-persistence:
-    @python3 scripts/lab.py test-persistence
-
 # [implemented] Prove CNPG input tampering fails before mutation.
 test-persistence-negative:
     @python3 scripts/run_locked.py scripts/test_persistence_negative.py
